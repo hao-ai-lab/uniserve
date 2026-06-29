@@ -1,0 +1,16 @@
+[package]
+name = "uniserve-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+uniserve-core.workspace = true
+uniserve-worker-wire.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+
+[lints]
+workspace = true

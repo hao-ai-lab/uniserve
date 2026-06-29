@@ -1,0 +1,47 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Compiled native extensions built in-tree by setuptools-rust (editable installs)
+uniserve_worker/_uniserve_ipc*.so
+
+# Virtual environments
+.venv
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.tox/
+
+# Local config and logs
+.env
+.env.*
+*.log
+logs/
+
+# Rust/profiling
+*.profraw
+*.profdata
+flamegraph.svg
+
+# UniServe generated artifacts
+results/
+benchmark-results/
+benchmarks/results/
+artifacts/
+e2e-artifacts/
+
+target/
+refs/
+specs/

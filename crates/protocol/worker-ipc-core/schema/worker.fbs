@@ -1,0 +1,326 @@
+namespace uniserve.wire;
+
+// There is no standalone `VaeDecode` op (image decode runs via commit_gen ->
+// decode_image). Sample / EncodeFrame are appended after the existing variants
+// so prior ordinals are preserved. Sample: Logits handle -> sampled token
+// (Sampler stage). EncodeFrame: finished image/video frame -> encoded output
+// (PostProcess stage). (Keep comments outside the enum braces — the
+// cross-language contract test parses the brace body verbatim.)
+enum OpKind : ubyte {
+  PrefillUnd,
+  DecodeUnd,
+  DenoiseGen,
+  CommitGen,
+  CommitWriteback,
+  VaeEncode,
+  VitEncode,
+  TargetVerifyUnd,
+  Sample,
+  EncodeFrame
+}
+
+enum Modality : ubyte { Und, Gen }
+
+enum TokenSource : ubyte {
+  Wire,
+  LastSampled
+}
+
+// Host-internal request cancellation lives in `engine-api` `Command::Cancel`
+// and reaches the worker as `drop_request`; the worker-wire schema exposes
+// only the supported ReqKind values.
+enum ReqKind : ubyte {
+  GetCaps,
+  Execute,
+  DropRequest,
+  Shutdown,
+  CopyBlocks,
+  LoadLora,
+  UnloadLora,
+  FreeEncoder,
+  ResetPrefixCache,
+  Sleep,
+  WakeUp,
+  GetMetrics,
+  GetPressure
+}
+
+enum RespKind : ubyte { Caps, Result, Ok, Error, Metrics, Pressure }
+
+enum AdapterMode : ubyte { None, EngineWide, PerRequest, MultiAdapter }
+
+enum ResourceClass : ubyte {
+  KvBlock,
+  EncoderOutput,
+  ImageLatent,
+  Scratch,
+  Adapter
+}
+
+enum LeasePolicy : ubyte { PerRequest, Evictable, Pinned }
+enum ResourceEventKind : ubyte { Issued, Released, Evicted, InvariantViolation }
+enum KvGroupKind : ubyte { Full, SlidingWindow }
+
+table U32List { items:[uint]; }
+table U64List { items:[ulong]; }
+table TokenBias { token_id:uint; bias:float; }
+table TokenLogprob { token_id:uint; logprob:float; }
+table BlockPair { src:uint; dst:uint; }
+table StringU64Pair { key:string; value:ulong; }
+
+table SamplingParams {
+  temperature:float;
+  top_k:uint;
+  top_p:float;
+  ignore_eos:bool;
+  seed:ulong = null;
+  min_p:float;
+  repetition_penalty:float = 1.0;
+  frequency_penalty:float;
+  presence_penalty:float;
+  logit_bias:[TokenBias];
+  min_tokens:ulong;
+  n_logprobs:uint;
+  bad_words_ids:[U32List];
+  allowed_token_ids:[uint];
+}
+
+table ImageParams {
+  steps:ushort;
+  cfg_text_scale:float;
+  cfg_img_scale:float;
+  cfg_renorm_type:string;
+  cfg_renorm_min:float;
+  cfg_interval_lo:float;
+  cfg_interval_hi:float;
+  timestep_shift:float = 1.0;
+  height:uint;
+  width:uint;
+  seed:ulong = null;
+  negative_prompt:string;
+  max_images:ushort;
+  image_prompts:[string];
+  retain_images:bool = true;
+}
+
+table CfgParams {
+  branch_count:ubyte;
+  text_scale:float;
+  img_scale:float;
+  renorm_type:string;
+  renorm_min:float;
+  interval_lo:float;
+  interval_hi:float;
+}
+
+table KvGroupSpec {
+  group_id:uint;
+  block_offset:uint;
+  num_blocks:uint;
+  kind:KvGroupKind;
+  window:uint;
+  sink:uint;
+}
+
+table RankInfo {
+  tp_rank:uint;
+  tp_size:uint = 1;
+  pp_rank:uint;
+  pp_size:uint = 1;
+  dp_rank:uint;
+  dp_size:uint = 1;
+}
+
+// und/gen mixed-batch single-forward is a non-negotiable model invariant, not a
+// negotiable capability: there is deliberately no `supports_mixed_op_kinds` flag
+// (its mere existence would imply mixing could be disabled). The scheduler mixes
+// unconditionally; any worker receiving a mixed batch processes it in one forward.
+table ExecutionConstraints {
+  max_batch_ops:uint;
+}
+
+table ResourcePressure {
+  class:ResourceClass;
+  total:ulong;
+  used:ulong;
+  evictable:ulong;
+  free:ulong;
+}
+
+table EngineCaps {
+  block_size:uint;
+  num_blocks:uint;
+  num_layers:uint;
+  scratch_capacity_tokens:ulong;
+  supported_ops:[OpKind];
+  max_latent_size:uint;
+  latent_downsample:uint;
+  bytes_per_token:ulong;
+  groups:[KvGroupSpec];
+  kv_dtype:string;
+  attention_backend:string;
+  quantization:string;
+  rank:RankInfo;
+  pipeline_depth:uint;
+  encoder_cache_budget:uint;
+  supported_controls:[ReqKind];
+  adapter_mode:AdapterMode;
+  execution_constraints:ExecutionConstraints;
+  resource_classes:[ResourceClass];
+}
+
+table NewRequestData {
+  req_id:ulong;
+  sampling:SamplingParams;
+  image:ImageParams;
+  neg_token_ids:[uint];
+  lora_id:uint = null;
+  block_ids:[uint];
+  group_id:uint;
+}
+
+table ForwardOp {
+  req_id:ulong;
+  kind:OpKind;
+  modality:Modality;
+  new_block_ids:[uint];
+  pos_lo:uint;
+  pos_hi:uint;
+  token_ids:[uint];
+  token_source:TokenSource = Wire;
+  timestep_idx:ushort = null;
+  cond_pos:uint = null;
+  cfg:CfgParams;
+  image_in:ulong = null;
+  image_prompt:string;
+  image_b64:string;
+  group_id:uint;
+  allowed_tokens:[uint];
+  suppress_tokens:[uint];
+  recent_tokens:[uint];
+  mm_hash:ulong = null;
+  spec_token_ids:[uint];
+  op_id:ulong = null;
+  // Sampler stage: handle to the logits a `sample` op consumes. Scalar id;
+  // routing key.
+  logits_handle:ulong = null;
+  // Data-plane locator the consumer resolves to fetch the input tensor (e.g.
+  // the logits a `sample` op reads). base64 of the opaque Locator bytes — a
+  // small descriptor, like image_b64; the host never parses it.
+  locator:string;
+}
+
+table ForwardBatch {
+  step_id:ulong;
+  new_reqs:[NewRequestData];
+  ops:[ForwardOp];
+}
+
+table SeqResult {
+  req_id:ulong;
+  sampled_token_id:uint = null;
+  denoise_done:bool;
+  num_steps_done:ushort = null;
+  image_png_b64:string;
+  image_hw_w:uint = null;
+  image_hw_h:uint = null;
+  sampled_logprob:float = null;
+  top_logprobs:[TokenLogprob];
+  encoder_handle:ulong = null;
+  num_tokens:uint = null;
+  num_accepted_tokens:uint = null;
+  op_id:ulong = null;
+  // Sampler stage: handle to the logits this op produced, when sampling is
+  // peeled into a separate Sampler pool. Scalar id; routing key.
+  logits_handle:ulong = null;
+  // Data-plane locator for the tensor this op produced (e.g. published logits
+  // / embedding). base64 of the opaque Locator bytes; the host routes it to the
+  // consumer op verbatim.
+  locator:string;
+}
+
+table ForwardResult {
+  step_id:ulong;
+  per_seq:[SeqResult];
+  worker_exec_us:ulong = null;
+  forward_stats:WorkerForwardStats;
+}
+
+table WorkerForwardStats {
+  mode_counts:[StringU64Pair];
+  mode_tokens:[StringU64Pair];
+  mode_us:[StringU64Pair];
+  attention_launches:ulong;
+  attention_us:ulong;
+  attention_backend_counts:[StringU64Pair];
+  cuda_graph_captures:ulong;
+  cuda_graph_replays:ulong;
+  cuda_graph_misses:ulong;
+  cuda_graph_fallbacks:ulong;
+  cuda_graph_unpadded_tokens:ulong;
+  cuda_graph_padded_tokens:ulong;
+  cuda_graph_runtime_mode_counts:[StringU64Pair];
+  text_decode_token_relay_hits:ulong;
+  text_decode_token_relay_misses:ulong;
+  text_decode_position_relay_hits:ulong;
+  text_decode_position_relay_misses:ulong;
+  flashinfer_decode_plan_calls:ulong;
+  flashinfer_decode_plan_reuses:ulong;
+  flashinfer_decode_plan_rows:ulong;
+  flashinfer_decode_plan_indices:ulong;
+  flashinfer_decode_graph_plan_calls:ulong;
+  flashinfer_decode_graph_plan_reuses:ulong;
+  spec_verify_rows:ulong;
+  spec_verify_draft_tokens:ulong;
+  spec_verify_accepted_tokens:ulong;
+  spec_verify_rejected_tokens:ulong;
+  spec_verify_committed_tokens:ulong;
+  spec_verify_path_counts:[StringU64Pair];
+  component_us:[StringU64Pair];
+}
+
+table WorkerMetrics {
+  executes:ulong;
+  ops_total:ulong;
+  exec_us_total:ulong;
+  last_exec_us:ulong;
+  op_kind_counts:[StringU64Pair];
+  op_kind_us:[StringU64Pair];
+  control_ok:[StringU64Pair];
+  control_err:[StringU64Pair];
+  error_counts:[StringU64Pair];
+  cuda_graph_captures:ulong;
+  cuda_graph_replays:ulong;
+  cuda_graph_misses:ulong;
+  cuda_graph_fallbacks:ulong;
+  cuda_graph_unpadded_tokens:ulong;
+  cuda_graph_padded_tokens:ulong;
+  cuda_graph_runtime_mode_counts:[StringU64Pair];
+  forward:WorkerForwardStats;
+}
+
+table WorkerRequest {
+  kind:ReqKind;
+  call_id:ulong = null;
+  batch:ForwardBatch;
+  req_id:ulong = null;
+  copies:[BlockPair];
+  lora_id:uint = null;
+  lora_path:string;
+  free_handles:[ulong];
+}
+
+table WorkerResponse {
+  kind:RespKind;
+  call_id:ulong = null;
+  caps:EngineCaps;
+  result:ForwardResult;
+  metrics:WorkerMetrics;
+  pressure:[ResourcePressure];
+  message:string;
+  code:string;
+  retryable:bool = null;
+  fatal:bool = null;
+}
+
+root_type WorkerRequest;

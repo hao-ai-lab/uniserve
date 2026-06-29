@@ -1,0 +1,31 @@
+[package]
+name = "uniserve-server-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures.workspace = true
+prost-types.workspace = true
+serde_json.workspace = true
+thiserror-ext.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+uniserve-engine-client.workspace = true
+uniserve-grpc-proto.workspace = true
+uniserve-server-app.workspace = true
+uniserve-text.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+serial_test.workspace = true
+uniserve-chat.workspace = true
+uniserve-chat-template.workspace = true
+uniserve-engine-client = { workspace = true, features = ["test-util"] }
+uniserve-llm.workspace = true
+
+[lints]
+workspace = true

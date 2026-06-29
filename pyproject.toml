@@ -1,0 +1,133 @@
+[build-system]
+requires = ["setuptools>=70", "wheel", "setuptools-rust>=1.7"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uniserve"
+version = "0.1.0"
+description = "UniServe Python worker runtime with internal BAGEL and SenseNova backends. The Rust host/server is built with cargo."
+readme = "README.md"
+requires-python = ">=3.11"
+# torch/torchvision are pinned for source installs; in a container that already
+# provides them, use a `--system-site-packages` venv so they stay satisfied.
+dependencies = [
+    "torch>=2.8.0a0,<2.12",
+    "torchvision>=0.23.0a0,<0.27",
+    "transformers>=4.57.1",
+    "safetensors",
+    "einops",
+    "accelerate",
+    "numpy",
+    "pillow",
+    "packaging<=25.0",
+    "tqdm",
+    "sentencepiece",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+test = [
+    "coverage[toml]>=7.6",
+    "pytest>=8.1",
+    "pytest-rerunfailures>=14",
+    "pytest-shard>=0.1",
+    "pytest-timeout>=2.3",
+    "pytest-xdist>=3.6",
+]
+dev = [
+    "build>=1.2",
+    "markdown-it-py<4.0",
+    "mypy>=1.11",
+    "pyright>=1.1",
+    "ruff>=0.6",
+]
+bench = [
+    "datasets>=2.0",
+    "httpx>=0.27",
+    "jsonschema>=4.22",
+    "pillow>=10.4",
+]
+# Optional accelerator kernels. Worker imports are guarded and fall back to a
+# pure-PyTorch attention path when absent. Install only wheels that exist for
+# your platform.
+gpu = [
+    "flashinfer-python",
+]
+
+[project.scripts]
+uniserve-worker = "uniserve_worker.main:main"
+uniserve-bench = "benchmarks.serving.uniserve_bench.cli:main"
+
+[tool.setuptools.packages.find]
+# Optional kernel provider packs are packaged independently (for example
+# `uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
+# a missing provider install.
+include = ["uniserve_worker*", "benchmarks*"]
+
+# Native worker IPC extension (PyO3).
+[[tool.setuptools-rust.ext-modules]]
+target = "uniserve_worker._uniserve_ipc"
+path = "crates/protocol/worker-ipc-py/Cargo.toml"
+binding = "PyO3"
+
+# Server/scheduler binary, installed onto PATH as `uniserve`.
+[[tool.setuptools-rust.bins]]
+target = "uniserve"
+path = "crates/bin/uniserve/Cargo.toml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "-ra"
+markers = [
+    "unit: pure local tests without server, GPU, or external model files",
+    "contract: public schema/protocol/API compatibility tests",
+    "integration: multi-component tests using fake/simulated backends",
+    "architecture: repository import/layering rules",
+    "e2e: black-box server or worker tests",
+    "gpu: requires real GPU model execution",
+    "slow: excluded from the fast local and presubmit suites",
+    "model(name): selects a concrete model backend such as sensenova or bagel",
+    "sensenova: SenseNova-U1-specific test",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "refs",
+    "target",
+    ".venv",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+# Source of truth for the type-check scope. Must match the explicit paths
+# passed by CI (.github/workflows/ci.yml) and the Makefile `lint` target
+# (`mypy uniserve_worker benchmarks`) so bare/editor invocations agree with CI.
+files = ["uniserve_worker", "benchmarks"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+# Keep aligned with [tool.mypy].files and the CI/Makefile type-check scope.
+include = ["uniserve_worker", "benchmarks"]
+exclude = ["refs", "target", ".venv"]
+reportMissingImports = "warning"
+
+[tool.coverage.run]
+branch = true
+source = ["uniserve_worker", "benchmarks"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

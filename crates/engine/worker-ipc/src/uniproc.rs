@@ -1,0 +1,756 @@
+//! Single-worker executor over the iceoryx2 request-response service.
+//!
+//! The host sends FlatBuffers descriptors and receives small scalar/image
+//! results. Worker-resident tensors, KV pages, and latents never cross this
+//! boundary.
+
+use std::collections::{HashMap, VecDeque};
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, bail};
+use uniserve_core::CommandWaker;
+use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError};
+use uniserve_worker_ipc_core::{ClientEndpoint, Frame, Pending, event_driven_enabled, service_name};
+use uniserve_worker_wire::{
+    EngineCaps, ForwardBatch, ForwardResult, WorkerRequest, WorkerResponse,
+};
+
+use crate::death_watch::DeathWatcher;
+
+/// Deadline for the initial worker connect / caps handshake, where the worker may still
+/// be loading a large model and the IPC server may not yet be connected.
+const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Per-call backpressure deadline for steady-state sends (batch submit / control). The
+/// IPC server is already connected by this point, so a missing server connection means
+/// the worker has dropped off and we should fail fast rather than block for the full
+/// startup grace period.
+const WORKER_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum time `shutdown` will spend draining in-flight responses from a still-alive
+/// worker before falling through to the graceful-shutdown request and kill fallback. A
+/// hung (alive but unresponsive) worker must not be able to block shutdown forever.
+const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Single-process worker executor over iceoryx2 IPC.
+pub struct UniprocExecutor {
+    client: ClientEndpoint,
+    caps: EngineCaps,
+    child: Child,
+    depth: usize,
+    rank: u32,
+    tp_size: u32,
+    pending: HashMap<u64, PendingRecord>,
+    ready: VecDeque<ForwardResult>,
+    acks: HashMap<u64, ControlAck>,
+    awaited: Option<u64>,
+    next_call_id: u64,
+    shutdown_sent: bool,
+    /// Edge-triggered worker-death watcher: fires the scheduler park's death
+    /// wake when the child exits. `None` when polling or when `pidfd` could not
+    /// be opened (falls back to the bounded liveness probe).
+    death_watcher: Option<DeathWatcher>,
+}
+
+struct PendingRecord {
+    kind: OutstandingKind,
+    pending: Pending,
+}
+
+enum OutstandingKind {
+    Batch { step_id: u64 },
+    Control,
+}
+
+impl UniprocExecutor {
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_ranked(
+            python,
+            model_dir,
+            device,
+            pipeline_depth,
+            req_slot_cap,
+            resp_slot_cap,
+            kv_token_capacity,
+            block_size,
+            attention_backend,
+            0,
+            1,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_ranked(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+        tp_rank: u32,
+        tp_size: u32,
+        tp_init_method: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut me = Self::spawn_ranked_deferred(
+            python,
+            model_dir,
+            device,
+            pipeline_depth,
+            req_slot_cap,
+            resp_slot_cap,
+            kv_token_capacity,
+            block_size,
+            attention_backend,
+            tp_rank,
+            tp_size,
+            tp_init_method,
+            None,
+            None,
+            false,
+        )?;
+        me.finish_startup()?;
+        Ok(me)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_ranked_deferred(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+        tp_rank: u32,
+        tp_size: u32,
+        tp_init_method: Option<&str>,
+        worker_kind: Option<&str>,
+        transfer_backend: Option<&str>,
+        defer_sampling: bool,
+    ) -> anyhow::Result<Self> {
+        let depth = pipeline_depth.max(1);
+        let max_payload = req_slot_cap.max(resp_slot_cap).max(1);
+        let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
+ // The host is authoritative for the boundary mode: resolve it once and
+ // force the worker to match (env var on the child) so the two ends never
+ // disagree on whether to run event-driven or polled.
+        let event_driven = event_driven_enabled();
+
+        let mut cmd = Command::new(python);
+        cmd.arg("-m")
+            .arg("uniserve_worker.main")
+            .arg("--service-name")
+            .arg(&service)
+            .arg("--pipeline-depth")
+            .arg(depth.to_string())
+            .arg("--ipc-payload-cap")
+            .arg(max_payload.to_string())
+            .arg("--ipc-max-inflight")
+            .arg(depth.to_string())
+            .arg("--model")
+            .arg(model_dir)
+            .arg("--device")
+            .arg(device)
+            .arg("--attention-backend")
+            .arg(attention_backend)
+            .arg("--block-size")
+            .arg(block_size.to_string())
+            .arg("--tp-rank")
+            .arg(tp_rank.to_string())
+            .arg("--tp-size")
+            .arg(tp_size.to_string());
+        // Staged topology: tell the worker which pipeline stage it serves.
+        // Omitted for the default `full` worker so the command line stays
+        // byte-identical to the non-disaggregated path.
+        if let Some(kind) = worker_kind {
+            cmd.arg("--worker-kind").arg(kind);
+        }
+        // Data-plane Tier-2 backend for this stage's tensor handoffs. The
+        // default (in-process) is omitted so the non-disaggregated worker command
+        // line stays byte-identical.
+        if let Some(backend) = transfer_backend.filter(|b| *b != "inproc") {
+            cmd.arg("--transfer-backend").arg(backend);
+        }
+        // Sampler-stage split: a model pool peeled from its sampler publishes
+        // logits + defers sampling.
+        if defer_sampling {
+            cmd.arg("--defer-sampling");
+        }
+        cmd.env("RANK", tp_rank.to_string())
+            .env("WORLD_SIZE", tp_size.to_string())
+            .env("LOCAL_RANK", tp_rank.to_string())
+            .env("LOCAL_WORLD_SIZE", tp_size.to_string())
+            .env("UNISERVE_TP_RANK", tp_rank.to_string())
+            .env("UNISERVE_TP_SIZE", tp_size.to_string())
+            .env(
+                uniserve_worker_ipc_core::EVENT_DRIVEN_ENV,
+                if event_driven { "1" } else { "0" },
+            );
+        if tp_size > 1 {
+            if let Some(init_method) = tp_init_method {
+                cmd.env("UNISERVE_TP_INIT_METHOD", init_method);
+            }
+        }
+        if let Some(c) = kv_token_capacity {
+            cmd.arg("--kv-token-capacity").arg(c.to_string());
+        }
+        if std::env::var("UNISERVE_WORKER_STUB").is_ok() {
+            cmd.arg("--no-model");
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            let pp = std::env::var("PYTHONPATH").unwrap_or_default();
+            cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
+            cmd.env("UNISERVE_REPO_ROOT", cwd);
+        }
+        let child = cmd.spawn().context("spawning python worker")?;
+
+        let client = ClientEndpoint::connect_with(&service, max_payload, depth, event_driven)
+            .context("connecting to worker IPC service")?;
+ // Wire the edge-triggered death watcher onto the park's death wake. Only
+ // meaningful on the event-driven path (the wake feeds the park
+ // listener); on the polling path the scheduler probes liveness on its
+ // own timer.
+        let death_watcher = client
+            .death_wake()
+            .and_then(|wake| DeathWatcher::spawn(child.id(), wake));
+        Ok(Self {
+            client,
+            caps: EngineCaps::default(),
+            child,
+            depth,
+            rank: tp_rank,
+            tp_size,
+            pending: HashMap::new(),
+            ready: VecDeque::new(),
+            acks: HashMap::new(),
+            awaited: None,
+            next_call_id: 1,
+            shutdown_sent: false,
+            death_watcher,
+        })
+    }
+
+    pub(crate) fn finish_startup(&mut self) -> anyhow::Result<()> {
+        tracing::info!(
+            tp_rank = self.rank,
+            tp_size = self.tp_size,
+            "waiting for worker to load model + report caps..."
+        );
+        let call_id = self.alloc_call_id();
+        let mut req = WorkerRequest::get_caps();
+        req.call_id = Some(call_id);
+        let pending =
+            self.send_request_with_timeout(&req, "caps handshake", WORKER_CONNECT_TIMEOUT)?;
+        let resp = self.wait_pending_response(&pending, "caps handshake")?;
+        let wr = resp.decode_response()?;
+        let mut caps = match wr.kind.as_str() {
+            "caps" => wr
+                .caps
+                .ok_or_else(|| anyhow::anyhow!("caps response missing caps"))?,
+            "error" => bail!(
+                "worker error during caps: {}",
+                wr.message.unwrap_or_default()
+            ),
+            k => bail!("unexpected caps response kind: {k}"),
+        };
+ // The host is authoritative for pipeline depth and TP topology: it spawned the
+ // worker with these values on the command line, so we overwrite the worker-echoed
+ // caps with the host's own view. If the worker reports something different it
+ // indicates a launch/version mismatch worth surfacing, but the host value wins.
+        let host_depth = self.depth as u32;
+        if caps.pipeline_depth != 0 && caps.pipeline_depth != host_depth {
+            tracing::warn!(
+                worker_declared = caps.pipeline_depth,
+                host_authoritative = host_depth,
+                "worker-declared pipeline_depth disagrees with host; using host value"
+            );
+        }
+        if caps.rank.tp_rank != self.rank || caps.rank.tp_size != self.tp_size {
+            tracing::warn!(
+                worker_tp_rank = caps.rank.tp_rank,
+                worker_tp_size = caps.rank.tp_size,
+                host_tp_rank = self.rank,
+                host_tp_size = self.tp_size,
+                "worker-declared TP rank/size disagrees with host; using host values"
+            );
+        }
+        caps.pipeline_depth = host_depth;
+        caps.rank.tp_rank = self.rank;
+        caps.rank.tp_size = self.tp_size;
+        self.caps = caps;
+        tracing::info!(?self.caps, "worker ready");
+        Ok(())
+    }
+
+    fn alloc_call_id(&mut self) -> u64 {
+        let id = self.next_call_id;
+        self.next_call_id += 1;
+        id
+    }
+
+    fn check_worker(&mut self, context: &str) -> anyhow::Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            bail!("worker process exited during {context}: {status}");
+        }
+        Ok(())
+    }
+
+    fn send_request_checked(
+        &mut self,
+        req: &WorkerRequest,
+        context: &str,
+    ) -> anyhow::Result<Pending> {
+        self.send_request_with_timeout(req, context, WORKER_SEND_TIMEOUT)
+    }
+
+    fn send_request_with_timeout(
+        &mut self,
+        req: &WorkerRequest,
+        context: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<Pending> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let pending = self.client.send_request_attempt(req)?;
+            if pending.number_of_server_connections() > 0 {
+                return Ok(pending);
+            }
+            drop(pending);
+            self.check_worker(context)?;
+            if Instant::now() >= deadline {
+                bail!("worker IPC service had no connected server during {context}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_pending_response(&mut self, pending: &Pending, context: &str) -> anyhow::Result<Frame> {
+        let started = Instant::now();
+        let mut last_log = started;
+        loop {
+            if let Some(frame) = self
+                .client
+                .recv_response_timeout(pending, WORKER_CHECK_INTERVAL)?
+            {
+                return Ok(frame);
+            }
+            self.check_worker(context)?;
+            if last_log.elapsed() >= STARTUP_LOG_INTERVAL {
+                tracing::info!(
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "worker still busy during {context}"
+                );
+                last_log = Instant::now();
+            }
+        }
+    }
+
+    fn drain_ready(&mut self) -> anyhow::Result<usize> {
+        let ids = self.pending.keys().copied().collect::<Vec<_>>();
+        let mut drained = 0usize;
+        for call_id in ids {
+            let Some(record) = self.pending.get(&call_id) else {
+                continue;
+            };
+            let Some(frame) = self.client.try_recv_response(&record.pending)? else {
+                continue;
+            };
+            let record = self
+                .pending
+                .remove(&call_id)
+                .expect("pending record disappeared while routing response");
+            self.route(call_id, record.kind, frame)?;
+            drained += 1;
+        }
+        Ok(drained)
+    }
+
+    fn route(&mut self, call_id: u64, kind: OutstandingKind, frame: Frame) -> anyhow::Result<()> {
+        if frame.header.call_id != 0 && frame.header.call_id != call_id {
+            bail!(
+                "worker response call id mismatch: expected {call_id}, got {}",
+                frame.header.call_id
+            );
+        }
+        let wr = frame.decode_response()?;
+        if let Some(echoed) = wr.call_id
+            && echoed != call_id
+        {
+            bail!("worker response echoed call id {echoed}, expected {call_id}");
+        }
+        match kind {
+            OutstandingKind::Batch { step_id } => self.route_batch(step_id, wr),
+            OutstandingKind::Control => {
+                let ok = wr.kind != "error";
+                if !ok {
+                    tracing::error!(
+                        call_id,
+                        "worker control call error: {}",
+                        wr.message.clone().unwrap_or_default()
+                    );
+                }
+                if self.awaited == Some(call_id) {
+                    self.acks.insert(
+                        call_id,
+                        ControlAck {
+                            rank: self.rank,
+                            ok,
+                            message: wr.message,
+                        },
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn route_batch(&mut self, step_id: u64, wr: WorkerResponse) -> anyhow::Result<()> {
+        match wr.kind.as_str() {
+            "result" => {
+                let r = wr.result.ok_or_else(|| anyhow::anyhow!("result missing"))?;
+                if r.step_id != step_id {
+                    bail!(
+                        "worker result step id mismatch: expected {step_id}, got {}",
+                        r.step_id
+                    );
+                }
+                let pos = self
+                    .ready
+                    .iter()
+                    .position(|ready| ready.step_id > r.step_id)
+                    .unwrap_or(self.ready.len());
+                self.ready.insert(pos, r);
+                Ok(())
+            }
+            "error" => Err(WorkerExecError {
+                fatal: wr.is_fatal_error(),
+                // Carry the worker's retryability bit; default is non-retryable.
+                retryable: wr.retryable.unwrap_or(false),
+                code: wr.code.clone(),
+                message: wr.message.clone().unwrap_or_default(),
+            }
+            .into()),
+            k => bail!("unexpected execute response kind: {k}"),
+        }
+    }
+
+    fn wait_for_one_response(&mut self) -> anyhow::Result<()> {
+        if self.pending.is_empty() {
+            bail!("no pending worker requests to wait for");
+        }
+        loop {
+            let drained = self.drain_ready()?;
+            if drained > 0 {
+                return Ok(());
+            }
+            self.check_worker("worker response wait")?;
+            // Park on the worker's result wake instead of polling on a fixed
+            // 1ms interval: the worker fires EVT_RESULT the instant it responds,
+            // so the submitter wakes in ~event latency rather than waiting out
+            // the poll. `wait_wake` degrades to a bounded sleep on a
+            // non-event-driven endpoint, so the safety-net slice still bounds
+            // latency if a notification is missed.
+            self.client.wait_wake(RESPONSE_POLL_INTERVAL)?;
+        }
+    }
+
+    fn ensure_slot(&mut self) -> anyhow::Result<()> {
+        self.drain_ready()?;
+        while self.pending.len() >= self.depth {
+            self.wait_for_one_response()?;
+        }
+        Ok(())
+    }
+
+    fn submit_control_request(&mut self, req: &WorkerRequest, call_id: u64) -> anyhow::Result<()> {
+        if self.shutdown_sent {
+ // The worker is being torn down; drop the control op rather than send onto a
+ // closing IPC channel. Log so this is observable instead of a silent no-op.
+            tracing::debug!(
+                call_id,
+                "dropping control request: executor already shutting down"
+            );
+            return Ok(());
+        }
+ // Control ops deliberately share the pipeline-depth slot budget with batches: the
+ // worker is launched with --ipc-max-inflight = depth, so total outstanding requests
+ // (batch + control) must not exceed `depth` or we would overflow the IPC ring.
+        self.ensure_slot()?;
+        let pending = self.send_request_checked(req, "control request")?;
+        self.pending.insert(
+            call_id,
+            PendingRecord {
+                kind: OutstandingKind::Control,
+                pending,
+            },
+        );
+        Ok(())
+    }
+
+    fn batch_pending_count(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|record| matches!(record.kind, OutstandingKind::Batch { .. }))
+            .count()
+    }
+}
+
+impl Executor for UniprocExecutor {
+    fn caps(&self) -> EngineCaps {
+        self.caps.clone()
+    }
+
+    fn pipeline_depth(&self) -> usize {
+        self.depth
+    }
+
+    fn in_flight(&self) -> usize {
+        self.batch_pending_count() + self.ready.len()
+    }
+
+    fn can_submit(&self) -> bool {
+        self.pending.len() < self.depth
+    }
+
+    fn event_driven(&self) -> bool {
+        self.client.is_event_driven()
+    }
+
+    fn command_waker(&self) -> CommandWaker {
+        match self.client.command_wake() {
+            Some(sender) => CommandWaker::new(move || sender.wake()),
+            None => CommandWaker::noop(),
+        }
+    }
+
+    fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
+ // Park over {result, command, death} without consuming anything: the
+ // scheduler drains results, drains commands, and probes liveness after
+ // we return, so a spurious wake is harmless. The wait carries its own
+ // safety-net slice, so a missed notification degrades to poll latency.
+        self.client.wait_wake(timeout)?;
+        Ok(())
+    }
+
+    fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
+        self.drain_ready()?;
+        if !self.can_submit() {
+            self.ensure_slot()?;
+        }
+        let step_id = batch.step_id;
+        let call_id = self.alloc_call_id();
+        let mut req = WorkerRequest::execute(batch);
+        req.call_id = Some(call_id);
+        let pending = self.send_request_checked(&req, "batch submit")?;
+        self.pending.insert(
+            call_id,
+            PendingRecord {
+                kind: OutstandingKind::Batch { step_id },
+                pending,
+            },
+        );
+        Ok(())
+    }
+
+    fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+        self.drain_ready()?;
+        Ok(self.ready.pop_front())
+    }
+
+    fn check_liveness(&mut self) -> anyhow::Result<()> {
+        // Non-blocking reap of the worker child so death is observed even when
+        // no requests are in flight.
+        self.check_worker("idle liveness check")
+    }
+
+    fn wait_result_timeout(&mut self, timeout: Duration) -> anyhow::Result<Option<ForwardResult>> {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            self.drain_ready()?;
+            return Ok(self.ready.pop_front());
+        };
+        loop {
+            self.drain_ready()?;
+            if let Some(r) = self.ready.pop_front() {
+                return Ok(Some(r));
+            }
+            if self.batch_pending_count() == 0 {
+                return Ok(None);
+            }
+            self.check_worker("worker result timed wait")?;
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            // Event-driven wake on EVT_RESULT; bounded by the remaining deadline
+            // so the timeout contract is preserved.
+            self.client.wait_wake((deadline - now).min(RESPONSE_POLL_INTERVAL))?;
+        }
+    }
+
+    fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+        loop {
+            self.drain_ready()?;
+            if let Some(r) = self.ready.pop_front() {
+                return Ok(r);
+            }
+            if self.batch_pending_count() == 0 {
+                bail!("next_result called with no in-flight batches");
+            }
+            self.wait_for_one_response()?;
+        }
+    }
+
+ /// Fire-and-forget control op. The returned `u64` MUST be treated as opaque: callers
+ /// should discard it and use [`Executor::control_wait`] when they need to correlate an
+ /// ack. In this single-worker transport the value happens to be the genuine wire
+ /// call_id the worker echoes, but the multiproc/disagg transports return a private
+ /// counter that matches no worker request, so no caller may assume these semantics.
+ /// `0` is returned for no-op ops (empty CopyBlocks/FreeEncoder) that are never sent.
+    fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
+        match &op {
+            ControlOp::CopyBlocks(c) if c.is_empty() => return Ok(0),
+            ControlOp::FreeEncoder(h) if h.is_empty() => return Ok(0),
+            _ => {}
+        }
+        let call_id = self.alloc_call_id();
+        self.submit_control_request(&op.to_request(call_id), call_id)?;
+        Ok(call_id)
+    }
+
+    fn control_wait(
+        &mut self,
+        op: ControlOp,
+        _targets: Option<&[u32]>,
+    ) -> anyhow::Result<Vec<ControlAck>> {
+        let call_id = self.alloc_call_id();
+        self.awaited = Some(call_id);
+        self.submit_control_request(&op.to_request(call_id), call_id)?;
+        loop {
+            self.drain_ready()?;
+            if let Some(ack) = self.acks.remove(&call_id) {
+                self.awaited = None;
+                return Ok(vec![ack]);
+            }
+            self.wait_for_one_response()?;
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.shutdown_sent {
+            return;
+        }
+        self.shutdown_sent = true;
+ // Stop the death watcher before we intentionally tear the worker down,
+ // so its exit does not fire a spurious death wake during shutdown.
+        let _ = self.death_watcher.take();
+        let exited = matches!(self.child.try_wait(), Ok(Some(_)));
+        if !exited {
+ // Drain in-flight responses, but do NOT block indefinitely on a worker that is
+ // alive yet hung: bound the drain with a deadline so we always fall through to
+ // the graceful shutdown request and, ultimately, the kill fallback below.
+            let drain_deadline = Instant::now() + WORKER_DRAIN_TIMEOUT;
+            while !self.pending.is_empty() {
+                if Instant::now() >= drain_deadline {
+                    tracing::warn!(
+                        pending = self.pending.len(),
+                        "worker did not drain in-flight responses before shutdown deadline"
+                    );
+                    break;
+                }
+                match self.drain_ready() {
+                    Ok(0) => {
+                        if self.check_worker("shutdown drain").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(RESPONSE_POLL_INTERVAL);
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let call_id = self.alloc_call_id();
+                let mut req = WorkerRequest::shutdown();
+                req.call_id = Some(call_id);
+                if let Ok(pending) = self.send_request_checked(&req, "shutdown") {
+                    let _ = self
+                        .client
+                        .recv_response_timeout(&pending, Duration::from_secs(5));
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                _ => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for UniprocExecutor {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn nano_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+ // Build an id from a wall-clock timestamp in the high bits plus a process-wide
+ // monotonic counter in the low 16 bits. subsec_nanos alone wraps every second and
+ // would collide for workers spawned within the same wall-clock second; the counter
+ // makes ids produced within any 65536-call window distinct regardless of clock
+ // resolution or non-monotonicity, while the timestamp separates ids across windows.
+ // The full service name also includes pid + tp_rank, so any residual aliasing in the
+ // shifted timestamp bits cannot produce a real cross-worker collision.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    (nanos << 16) | (seq & 0xffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nano_id;
+    use std::collections::HashSet;
+
+    #[test]
+    fn nano_id_is_unique_within_a_tight_loop() {
+ // subsec_nanos alone would collide here because the loop runs faster than a
+ // second; the monotonic counter must make every id distinct.
+        let n = 10_000;
+        let ids: HashSet<u64> = (0..n).map(|_| nano_id()).collect();
+        assert_eq!(ids.len(), n, "nano_id produced a collision within a tight loop");
+    }
+}

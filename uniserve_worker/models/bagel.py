@@ -1,0 +1,1095 @@
+"""BAGEL UniModel entry backed by the shared runner."""
+from __future__ import annotations
+
+import base64
+import io
+import json
+import logging
+import math
+import os
+import threading
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn as nn
+from PIL import Image
+
+from ..contracts.batches import UniForwardBatch
+from ..contracts.resource_plan import (
+    AdapterResourcePolicy,
+    CapsDescriptor,
+    EncoderResourcePolicy,
+    KvBlockResourcePolicy,
+    LatentTokens,
+    PerBranch,
+    ResourcePlan,
+)
+from ..execution.denoise_driver import TextImageDenoiseStep
+from ..execution.model_base import UniModelBase
+from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS, derive_num_blocks
+from ..loader.weight_utils import iter_weights, stacked_params_mapping_loop, tensor_shape
+from ..nn import LinearBase, MLPConnector, ParallelLMHead
+from ..nn.decoder import KVCache, MoTModel, Segment
+from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, TimestepEmbedder, init_latent
+from ..nn.diffusion.cfg import CfgRecipe
+from ..nn.quant import (
+    QuantizationConfig,
+    get_current_kv_cache_dtype,
+    kv_cache_bytes_per_token,
+    use_quantization_config,
+)
+from ..nn.vae import AutoEncoder, default_ae_params
+from ..nn.vision import (
+    PositionEmbedding,
+    SiglipNavitConfig,
+    SiglipNavitEncoder,
+    get_flattened_position_ids_extrapolate,
+    patchify,
+)
+from ..processors.bagel import BagelImageProcessor
+from ..runtime.kv_pool import PagedKVPool
+from ..runtime.lora import MergeOnLoadLoRA
+from ..runtime.request_state import RequestState
+from ..runtime.residency import GenResidencySpec, KvCacheSpec, ResidencyManager
+
+__all__ = [
+    'LLMConfig',
+    'BagelConfig',
+    'NEW_TOKEN_IDS',
+    'GenState',
+    'BagelForUnifiedGeneration',
+    'EntryClass',
+]
+
+logger = logging.getLogger(__name__)
+
+_BAGEL_RMS_NORM_EPS = 1e-6
+_BAGEL_ROPE_THETA = 1_000_000.0
+_BAGEL_VIT_LAYER_NORM_EPS = 1e-6
+_BAGEL_DEFAULT_KV_TOKEN_CAPACITY_BLOCKS = 4096
+_BAGEL_CUDA_FREE_MEMORY_KV_FRACTION = 0.40
+
+
+def _weights_file(model_dir: str) -> str:
+    for name in ("ema.safetensors", "model.safetensors"):
+        path = os.path.join(model_dir, name)
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"no ema.safetensors or model.safetensors under {model_dir}")
+
+
+@dataclass
+class LLMConfig:
+    """Language-model hyperparameters for the BAGEL stack."""
+
+    hidden_size: int = 3584
+    intermediate_size: int = 18944
+    num_hidden_layers: int = 28
+    num_attention_heads: int = 28
+    num_key_value_heads: int = 4
+    vocab_size: int = 152064
+    rms_norm_eps: float = _BAGEL_RMS_NORM_EPS
+    rope_theta: float = _BAGEL_ROPE_THETA
+    qk_norm: bool = True
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+
+@dataclass
+class BagelConfig:
+    """Top-level BAGEL model configuration (LLM, ViT, VAE, and latent settings)."""
+
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    visual_gen: bool = True
+    visual_und: bool = True
+    vae_z_channels: int = 16
+    vae_downsample: int = 8
+    latent_patch_size: int = 2
+    max_latent_size: int = 32
+    timestep_shift: float = 1.0
+    vit_hidden_size: int = 1152
+    vit_intermediate_size: int = 4304
+    vit_num_hidden_layers: int = 26
+    vit_num_attention_heads: int = 16
+    vit_patch_size: int = 14
+    vit_image_size: int = 980
+    vit_layer_norm_eps: float = _BAGEL_VIT_LAYER_NORM_EPS
+    vit_max_num_patch_per_side: int = 70
+    connector_act: str = "gelu_pytorch_tanh"
+
+    @property
+    def latent_downsample(self) -> int:
+        return self.vae_downsample * self.latent_patch_size
+
+    @property
+    def latent_token_capacity(self) -> int:
+        return self.max_latent_size * self.max_latent_size
+
+    @property
+    def latent_channel(self) -> int:
+        return self.vae_z_channels
+
+    @property
+    def patch_latent_dim(self) -> int:
+        return self.latent_patch_size**2 * self.latent_channel
+
+    @classmethod
+    def from_pretrained(cls, model_dir: str) -> "BagelConfig":
+        try:
+            with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError) as exc:
+            logger.warning(
+                "BAGEL config.json missing or invalid under %s (%s); "
+                "falling back to default model dimensions",
+                model_dir,
+                exc,
+            )
+            raw = {}
+
+        def side(name: str) -> dict[str, Any]:
+            path = os.path.join(model_dir, name)
+            if not os.path.exists(path):
+                return {}
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+
+        if "llm_config" not in raw:
+            raw = dict(raw)
+            raw["llm_config"] = side("llm_config.json")
+            raw["vit_config"] = side("vit_config.json")
+            raw.setdefault("vae_config", side("vae_config.json"))
+
+        llm_raw = raw["llm_config"]
+        llm = LLMConfig(
+            hidden_size=llm_raw["hidden_size"],
+            intermediate_size=llm_raw["intermediate_size"],
+            num_hidden_layers=llm_raw["num_hidden_layers"],
+            num_attention_heads=llm_raw["num_attention_heads"],
+            num_key_value_heads=llm_raw["num_key_value_heads"],
+            vocab_size=llm_raw["vocab_size"],
+            rms_norm_eps=llm_raw.get("rms_norm_eps", _BAGEL_RMS_NORM_EPS),
+            rope_theta=llm_raw.get("rope_theta", 1e6),
+            qk_norm=llm_raw.get("qk_norm", True),
+        )
+        vae = raw.get("vae_config", {})
+        vit = raw.get("vit_config", {})
+        max_latent = raw.get("max_latent_size", 32)
+        try:
+            rows = tensor_shape(_weights_file(model_dir), "latent_pos_embed.pos_embed")[0]
+            max_latent = int(math.isqrt(rows))
+        except Exception as exc:
+            logger.warning(
+                "BAGEL could not infer max_latent_size from latent_pos_embed (%s); "
+                "using configured value %s",
+                exc,
+                max_latent,
+            )
+        return cls(
+            llm=llm,
+            visual_gen=raw.get("visual_gen", True),
+            visual_und=raw.get("visual_und", True),
+            vae_z_channels=vae.get("z_channels", 16),
+            vae_downsample=vae.get("downsample", 8),
+            latent_patch_size=raw.get("latent_patch_size", 2),
+            max_latent_size=max_latent,
+            timestep_shift=raw.get("timestep_shift", 1.0),
+            vit_hidden_size=vit.get("hidden_size", 1152),
+            vit_intermediate_size=vit.get("intermediate_size", 4304),
+            vit_num_hidden_layers=vit.get("num_hidden_layers", 27) - 1,
+            vit_num_attention_heads=vit.get("num_attention_heads", 16),
+            vit_patch_size=vit.get("patch_size", 14),
+            vit_image_size=vit.get("image_size", 980),
+            vit_layer_norm_eps=vit.get("layer_norm_eps", _BAGEL_VIT_LAYER_NORM_EPS),
+            vit_max_num_patch_per_side=raw.get("vit_max_num_patch_per_side", 70),
+            connector_act=raw.get("connector_act", "gelu_pytorch_tanh"),
+        )
+
+
+NEW_TOKEN_IDS = {
+    "bos_token_id": 151644,
+    "eos_token_id": 151645,
+    "start_of_image": 151652,
+    "end_of_image": 151653,
+}
+
+
+class _BagelGraph(nn.Module):
+    """BAGEL neural graph: MoT language model, VAE, ViT, and flow-matching connectors."""
+
+    def __init__(self, cfg: BagelConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        hidden = cfg.llm.hidden_size
+        # Install checkpoint quantization context during layer construction.
+        self._quant_config = QuantizationConfig.from_model_config(cfg)
+        with use_quantization_config(self._quant_config):
+            self.lm = MoTModel(cfg.llm)
+            self.lm_head = ParallelLMHead(hidden, cfg.llm.vocab_size, bias=False)
+            self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden)
+            self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim)
+            self.time_embedder = TimestepEmbedder(hidden)
+            self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
+            self.vae = AutoEncoder(default_ae_params())
+            self.vit_model = SiglipNavitEncoder(
+                SiglipNavitConfig(
+                    patch_size=cfg.vit_patch_size,
+                    hidden_size=cfg.vit_hidden_size,
+                    image_size=cfg.vit_image_size,
+                    num_attention_heads=cfg.vit_num_attention_heads,
+                    intermediate_size=cfg.vit_intermediate_size,
+                    num_hidden_layers=cfg.vit_num_hidden_layers,
+                    layer_norm_eps=cfg.vit_layer_norm_eps,
+                )
+            )
+            self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
+            self.vit_pos_embed = PositionEmbedding(cfg.vit_max_num_patch_per_side, hidden, init_sincos=False)
+
+    @property
+    def num_layers(self) -> int:
+        return self.cfg.llm.num_hidden_layers
+
+    @property
+    def device(self) -> torch.device:
+        return self.lm_head.weight.device
+
+    def new_cache(self) -> KVCache:
+        return KVCache(self.num_layers)
+
+    def embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.lm.embed_tokens(ids)
+
+    def build_und_segment(self, token_ids, start_pos, cache, update=True) -> Segment:
+        ids = torch.as_tensor(token_ids, dtype=torch.long, device=self.device)
+        n_tokens = ids.shape[0]
+        positions = torch.arange(start_pos, start_pos + n_tokens, device=self.device)
+        embeds = self.embed_tokens(ids).to(torch.bfloat16)
+        is_gen = torch.zeros(n_tokens, dtype=torch.bool, device=self.device)
+        return Segment(
+            embeds=embeds,
+            positions=positions,
+            is_gen=is_gen,
+            cache=cache,
+            causal=True,
+            update_cache=update,
+        )
+
+    def build_gen_segment(self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False) -> Segment:
+        hidden = self.cfg.llm.hidden_size
+        total = int(num_vae) + 2
+        marker_ids = torch.tensor(
+            [NEW_TOKEN_IDS["start_of_image"], NEW_TOKEN_IDS["end_of_image"]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        marker_emb = self.embed_tokens(marker_ids).to(torch.bfloat16)
+        x_t = x_t.to(self.device)
+        timesteps = torch.full((int(num_vae),), float(timestep), device=self.device)
+        vae_emb = (
+            self.vae2llm(x_t)
+            + self.time_embedder(timesteps)
+            + self.latent_pos_embed(vae_pos_ids.to(self.device))
+        ).to(torch.bfloat16)
+        embeds = torch.empty(total, hidden, dtype=torch.bfloat16, device=self.device)
+        embeds[0] = marker_emb[0]
+        embeds[1 : 1 + int(num_vae)] = vae_emb
+        embeds[1 + int(num_vae)] = marker_emb[1]
+        positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
+        is_gen = torch.zeros(total, dtype=torch.bool, device=self.device)
+        is_gen[1 : 1 + int(num_vae)] = True
+        return Segment(
+            embeds=embeds,
+            positions=positions,
+            is_gen=is_gen,
+            cache=cache,
+            causal=False,
+            update_cache=update,
+        )
+
+    @torch.no_grad()
+    def run(self, segments) -> list[torch.Tensor]:
+        return self.lm.forward_segments(segments)
+
+    @torch.no_grad()
+    def logits(self, hidden_last_row: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(hidden_last_row)
+
+    @torch.no_grad()
+    def velocity_from_hidden(self, hidden, num_vae) -> torch.Tensor:
+        return self.llm2vae(hidden[1 : 1 + int(num_vae)].to(torch.bfloat16))
+
+    def latent_position_ids(self, height: int, width: int) -> torch.Tensor:
+        return get_flattened_position_ids_extrapolate(
+            height,
+            width,
+            self.cfg.latent_downsample,
+            self.cfg.max_latent_size,
+        )
+
+    def latent_hw(self, height: int, width: int) -> tuple[int, int]:
+        return height // self.cfg.latent_downsample, width // self.cfg.latent_downsample
+
+    @torch.no_grad()
+    def vit_encode(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        image_tensor = image_tensor.to(self.device)
+        height, width = image_tensor.shape[1], image_tensor.shape[2]
+        patch = self.cfg.vit_patch_size
+        pos_ids = get_flattened_position_ids_extrapolate(
+            height,
+            width,
+            patch,
+            self.cfg.vit_max_num_patch_per_side,
+        ).to(self.device)
+        patches = patchify(image_tensor, patch).to(self.device, torch.bfloat16)
+        cu_seqlens = torch.tensor([0, patches.shape[0]], dtype=torch.int32, device=self.device)
+        vit_out = self.vit_model(
+            patches,
+            {"position_ids": pos_ids, "cu_seqlens": cu_seqlens},
+        )
+        emb = self.connector(vit_out) + self.vit_pos_embed(pos_ids)
+        return emb.to(torch.bfloat16)
+
+    @torch.no_grad()
+    def vae_encode_clean(self, image_tensor: torch.Tensor):
+        image_tensor = image_tensor.to(self.device)
+        height, width = image_tensor.shape[1], image_tensor.shape[2]
+        vae_dtype = next(self.vae.parameters()).dtype
+        latent_image = self.vae.encode(image_tensor.unsqueeze(0).to(vae_dtype))[0]
+        patch = self.cfg.latent_patch_size
+        channels = self.cfg.latent_channel
+        h = height // self.cfg.latent_downsample
+        w = width // self.cfg.latent_downsample
+        latent = latent_image[:, : h * patch, : w * patch].reshape(channels, h, patch, w, patch)
+        latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, patch * patch * channels)
+        pos_ids = get_flattened_position_ids_extrapolate(
+            height,
+            width,
+            self.cfg.latent_downsample,
+            self.cfg.max_latent_size,
+        ).to(self.device)
+        return latent.to(torch.bfloat16), pos_ids, (h, w)
+
+    def build_und_image_segment(self, vit_embeds, position_id, cache, update=True) -> Segment:
+        n_tokens = vit_embeds.shape[0]
+        hidden = self.cfg.llm.hidden_size
+        marker_ids = torch.tensor(
+            [NEW_TOKEN_IDS["start_of_image"], NEW_TOKEN_IDS["end_of_image"]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        marker_emb = self.embed_tokens(marker_ids).to(torch.bfloat16)
+        total = n_tokens + 2
+        embeds = torch.empty(total, hidden, dtype=torch.bfloat16, device=self.device)
+        embeds[0] = marker_emb[0]
+        embeds[1 : 1 + n_tokens] = vit_embeds.to(self.device)
+        embeds[1 + n_tokens] = marker_emb[1]
+        positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
+        is_gen = torch.zeros(total, dtype=torch.bool, device=self.device)
+        return Segment(
+            embeds=embeds,
+            positions=positions,
+            is_gen=is_gen,
+            cache=cache,
+            causal=False,
+            update_cache=update,
+        )
+
+    @torch.no_grad()
+    def vae_decode(self, latent: torch.Tensor, height: int, width: int) -> Image.Image:
+        h, w = self.latent_hw(height, width)
+        patch = self.cfg.latent_patch_size
+        channels = self.cfg.latent_channel
+        latent = latent.reshape(1, h, w, patch, patch, channels)
+        latent = torch.einsum("nhwpqc->nchpwq", latent)
+        latent = latent.reshape(1, channels, h * patch, w * patch)
+        latent = latent.to(next(self.vae.parameters()).dtype)
+        img = self.vae.decode(latent)
+        img = (img * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
+        return Image.fromarray(img.to(torch.uint8).cpu().numpy())
+
+    def load_weights(self, weights, *, dtype: torch.dtype = torch.bfloat16) -> None:
+        exact = {
+            "language_model.model.embed_tokens.weight": "lm.embed_tokens.weight",
+            "language_model.model.norm.weight": "lm.norm.weight",
+            "language_model.model.norm_moe_gen.weight": "lm.norm_moe_gen.weight",
+            "language_model.lm_head.weight": "lm_head.weight",
+            "vae2llm.weight": "vae2llm.weight",
+            "vae2llm.bias": "vae2llm.bias",
+            "llm2vae.weight": "llm2vae.weight",
+            "llm2vae.bias": "llm2vae.bias",
+            "time_embedder.mlp.0.weight": "time_embedder.mlp.0.weight",
+            "time_embedder.mlp.0.bias": "time_embedder.mlp.0.bias",
+            "time_embedder.mlp.2.weight": "time_embedder.mlp.2.weight",
+            "time_embedder.mlp.2.bias": "time_embedder.mlp.2.bias",
+            "latent_pos_embed.pos_embed": "latent_pos_embed.pos_embed",
+        }
+        stacked = [
+            ("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
+            ("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
+            ("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        def map_name(name: str) -> str | None:
+            if name in exact:
+                return exact[name]
+            if name.startswith("language_model.model.layers."):
+                mapped = name.replace("language_model.model.layers.", "lm.layers.", 1)
+                return mapped.replace(".self_attn.", ".")
+            if name.startswith("vit_model.vision_model.embeddings."):
+                return name.replace("vit_model.vision_model.embeddings.", "vit_model.", 1)
+            if name.startswith("vit_model.vision_model.encoder."):
+                mapped = name.replace("vit_model.vision_model.", "vit_model.", 1)
+                mapped = mapped.replace(".mlp.fc1.", ".mlp.0.")
+                return mapped.replace(".mlp.fc2.", ".mlp.2.")
+            if name.startswith("vit_model.vision_model.post_layernorm."):
+                return name.replace(
+                    "vit_model.vision_model.post_layernorm.",
+                    "vit_model.encoder.post_layernorm.",
+                    1,
+                )
+            if name.startswith(("connector.", "vit_pos_embed.")):
+                return name
+            return None
+
+        all_weights = list(weights)
+        loaded, ignored = stacked_params_mapping_loop(
+            self,
+            all_weights,
+            stacked,
+            name_mapper=map_name,
+            dtype=dtype,
+        )
+        expected = {name for name, _ in self.named_parameters() if not name.startswith("vae.")}
+        missing = sorted(expected - loaded)
+        if missing:
+            raise capability_mismatch(
+                "BAGEL weight load mismatch: "
+                f"missing={missing[:8]} ({len(missing)}) ignored={ignored[:8]}"
+            )
+        logger.info("loaded BAGEL graph weights (%d params)", len(loaded))
+
+    def load_vae_weights(self, weights) -> None:
+        state_dict = dict(weights)
+        missing, unexpected = self.vae.load_state_dict(state_dict, strict=False)
+        real_missing = [name for name in missing if "reg" not in name]
+        if real_missing or unexpected:
+            raise capability_mismatch(
+                "BAGEL VAE weight load mismatch: "
+                f"missing={real_missing[:8]} unexpected={unexpected[:8]}"
+            )
+        logger.info("loaded BAGEL VAE weights (%d tensors)", len(state_dict))
+
+
+def _load_bagel(model_dir: str, device: str = "cuda") -> _BagelGraph:
+    cfg = BagelConfig.from_pretrained(model_dir)
+    model = _BagelGraph(cfg).eval()
+    model.load_weights(iter_weights([Path(_weights_file(model_dir))]))
+    model.load_vae_weights(iter_weights([Path(model_dir) / "ae.safetensors"]))
+    model.to(device=device, dtype=torch.bfloat16)
+    return model
+
+
+class GenState:
+    """Mutable image-generation state for one BAGEL denoise/commit cycle."""
+
+    __slots__ = ("x_t", "vae_pos_ids", "num_vae", "H", "W", "schedule",
+                 "cfg_cache", "cfg_pos", "cfg_text_scale", "cfg_img_scale",
+                 "cfg_renorm_type", "cfg_renorm_min", "cfg_interval", "cond_pos",
+                 "understanding", "cond_branch_kvlen", "text_branch_pos", "text_branch_kvlen",
+                 "cfg_img_cache", "cfg_img_pos")
+
+
+class BagelForUnifiedGeneration(UniModelBase):
+    """BAGEL unified text/image model with VAE denoise and ViT/VAE encode paths."""
+
+    architectures = ("BagelForUnifiedGeneration", "BAGEL", "bagel")
+    supported_ops = (
+        "prefill_und",
+        "decode_und",
+        "denoise_gen",
+        "commit_gen",
+        "vit_encode",
+        "vae_encode",
+    )
+    supported_controls = ("free_encoder", "load_lora", "unload_lora")
+    adapter_mode = "engine_wide"
+    resource_plan = ResourcePlan(
+        kv_block=KvBlockResourcePolicy.PER_BLOCK,
+        encoder_output=EncoderResourcePolicy.PER_HANDLE,
+        image_latent=LatentTokens(downsample=16),
+        scratch=PerBranch(),
+        adapter=AdapterResourcePolicy.PER_ADAPTER,
+    )
+    velocity_parameterization = "velocity"
+    # Encoder-output cache capacity reported to the host scheduler.
+    ENCODER_CACHE_BUDGET = 256
+
+    @classmethod
+    def recognizes(cls, model_path: str | Path) -> bool:
+        root = Path(model_path)
+        return (
+            (root / "ema.safetensors").exists() or (root / "model.safetensors").exists()
+        ) and (root / "ae.safetensors").exists()
+
+    def __init__(
+        self,
+        config: Any | None = None,
+        *,
+        model: Any | None = None,
+        image_processor: Any | None = None,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+        kv_token_capacity: int | None = None,
+        attention_backend: str | None = None,
+        device: str = "cuda",
+    ) -> None:
+        self.config = config
+        self.model = model
+        self.block_size = int(block_size)
+        self.kv_token_capacity = int(kv_token_capacity) if kv_token_capacity is not None else None
+        self.attention_backend = attention_backend or "auto"
+        self.device = str(device)
+        self.cfg = model.cfg if model is not None else (
+            config if isinstance(config, BagelConfig) else BagelConfig()
+        )
+        self.resource_plan = self._build_resource_plan()
+        self.image_processor = image_processor or (BagelImageProcessor() if model is not None else None)
+        self.states: dict[int, RequestState] = {}
+        # Per-request generation side tables, keyed by req_id; cleared in drop_request.
+        self._gen_records: dict[int, dict] = {}
+        self._gen_states: dict[int, GenState] = {}
+        self.pool: PagedKVPool | None = None
+        self.residency = ResidencyManager()
+        self.lora: MergeOnLoadLoRA | None = None
+        # engine_wide LoRA merges/unmerges mutate shared model weights in place;
+        # serialize load/unload so a concurrent control op cannot interleave a
+        # half-applied delta with another adapter's merge.
+        self._lora_lock = threading.Lock()
+        c = self.cfg.llm
+        self.kv_cache_dtype = get_current_kv_cache_dtype(config)
+        self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
+        if self.model is not None:
+            self.kv_token_capacity = self._resolve_kv_token_capacity()
+            self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
+            self.residency = self._build_residency(c)
+            self.pool = self.residency.kv
+            self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
+            self.lora = MergeOnLoadLoRA(self.model)
+        else:
+            self.num_blocks = derive_num_blocks(
+                self.block_size, self.kv_token_capacity, floor=64
+            )
+
+    def _build_resource_plan(self) -> ResourcePlan:
+        return ResourcePlan(
+            kv_block=KvBlockResourcePolicy.PER_BLOCK,
+            encoder_output=EncoderResourcePolicy.PER_HANDLE,
+            image_latent=LatentTokens(downsample=int(self.cfg.latent_downsample)),
+            scratch=PerBranch(),
+            adapter=AdapterResourcePolicy.PER_ADAPTER,
+        )
+
+    def _resolve_kv_token_capacity(self) -> int:
+        if self.kv_token_capacity is not None:
+            return int(self.kv_token_capacity)
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            free, _ = torch.cuda.mem_get_info()
+            return int(free * _BAGEL_CUDA_FREE_MEMORY_KV_FRACTION / self.bytes_per_token)
+        return self.block_size * _BAGEL_DEFAULT_KV_TOKEN_CAPACITY_BLOCKS
+
+    def _build_residency(self, cfg: LLMConfig) -> ResidencyManager:
+        # System-owned residency: the worker-owned ResidencyManager constructs
+        # and owns the KV pool; the model declares only geometry/sizing here.
+        # (Bagel's CFG uncond branches use transient KVCaches, not a scratch
+        # pool, so scratch_num_blocks=0.)
+        return ResidencyManager.build_gen(
+            GenResidencySpec(
+                kv=KvCacheSpec(
+                    num_layers=cfg.num_hidden_layers,
+                    num_kv_heads=cfg.num_key_value_heads,
+                    head_dim=cfg.head_dim,
+                    dtype=torch.bfloat16,
+                    store_dtype=self._kv_store_dtype_for(torch.bfloat16),
+                ),
+                num_blocks=self.num_blocks,
+                block_size=self.block_size,
+                device=self.device,
+                scratch_num_blocks=0,
+            )
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: str,
+        *,
+        device: str,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+        kv_token_capacity: int | None = None,
+        attention_backend: str | None = None,
+        **_kwargs: Any,
+    ) -> "BagelForUnifiedGeneration":
+        model = _load_bagel(model_path, device=device)
+        return cls(
+            model.cfg,
+            model=model,
+            device=device,
+            block_size=block_size,
+            kv_token_capacity=kv_token_capacity,
+            image_processor=BagelImageProcessor(),
+            attention_backend=attention_backend,
+        )
+
+    def _caps_descriptor(
+        self,
+        *,
+        block_size: int | None = None,
+        kv_token_capacity: int | None = None,
+    ) -> CapsDescriptor:
+        block = int(block_size or self.block_size)
+        cap = kv_token_capacity if kv_token_capacity is not None else self.kv_token_capacity
+        if self.model is not None:
+            cap = int(cap or self.kv_token_capacity or self.block_size * self.num_blocks)
+            num_blocks = int(self.num_blocks)
+        else:
+            num_blocks = derive_num_blocks(block, cap, floor=64)
+        c = self.cfg.llm
+        return CapsDescriptor(
+            block_size=block,
+            num_blocks=num_blocks,
+            num_layers=c.num_hidden_layers,
+            scratch_capacity_tokens=int(cap or block * num_blocks),
+            max_latent_size=self.cfg.latent_token_capacity,
+            latent_downsample=self.cfg.latent_downsample,
+            bytes_per_token=self._kv_bytes_per_token(torch.bfloat16),
+            max_batch_ops=DEFAULT_MAX_BATCH_OPS,
+            attention_backend=self.attention_backend,
+            kv_dtype=self._kv_dtype_name_for(torch.bfloat16),
+            encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
+        )
+
+    def _kv_bytes_per_token(self, compute_dtype: torch.dtype) -> int:
+        c = self.cfg.llm
+        return kv_cache_bytes_per_token(
+            num_kv_heads=c.num_key_value_heads,
+            head_dim=c.head_dim,
+            num_layers=c.num_hidden_layers,
+            compute_dtype=compute_dtype,
+            store_dtype=self.kv_cache_dtype,
+        )
+
+    def on_new_request(self, req_id: int, state: RequestState) -> None:
+        r = int(req_id)
+        self.states[r] = state
+        self._gen_records[r] = {
+            "sampling": dict(state.sampling or {}),
+            "image": dict(state.image or {}),
+            "neg_token_ids": list(state.neg_token_ids or []),
+            "lora_id": state.lora_id,
+            "dims": None,
+        }
+
+    def drop_request(self, req_id: int) -> None:
+        r = int(req_id)
+        state = self.states.pop(r, None)
+        self._gen_states.pop(r, None)
+        self._gen_records.pop(r, None)
+        if state is not None:
+            state.kv_lengths.pop("default", None)
+
+    def free_encoder(self, handles) -> None:
+        # Encoder-output residency is system-owned: the handle→embedding store lives
+        # on the ResidencyManager, not the model.
+        for h in handles or []:
+            self.residency.encoder.pop(int(h))
+
+    def load_lora(self, lora_id, lora_path) -> None:
+        if self.lora is None:
+            raise capability_mismatch("BAGEL model weights are not loaded")
+        with self._lora_lock:
+            count = self.lora.load(lora_id, lora_path)
+        logger.info("merged LoRA adapter %s into %d parameters", lora_id, count)
+
+    def unload_lora(self, lora_id) -> None:
+        if self.lora is None:
+            raise capability_mismatch("BAGEL model weights are not loaded")
+        with self._lora_lock:
+            count = self.lora.unload(lora_id)
+        if count:
+            logger.info("unmerged LoRA adapter %s", lora_id)
+
+    def _record(self, req_id: int) -> dict:
+        return self._gen_records.setdefault(int(req_id), {})
+
+    def _state(self, req_id: int) -> RequestState:
+        req_id = int(req_id)
+        state = self.states.get(req_id)
+        if state is None:
+            state = RequestState()
+            state.seed = req_id
+            state.rng = torch.Generator(device="cpu").manual_seed(req_id)
+            self.states[req_id] = state
+        return state
+
+    def _length(self, req_id: int) -> int:
+        return self._state(req_id).kv_length()
+
+    def _set_length(self, req_id: int, value: int) -> None:
+        self._state(req_id).set_kv_length(value)
+
+    def _gen_state(self, req_id: int) -> GenState | None:
+        return self._gen_states.get(int(req_id))
+
+    def _set_gen_state(self, req_id: int, value: GenState) -> None:
+        self._gen_states[int(req_id)] = value
+
+    def _pop_gen_state(self, req_id: int) -> GenState | None:
+        return self._gen_states.pop(int(req_id), None)
+
+    def _extend_blocks(self, op) -> list[int]:
+        state = self._state(int(op["req_id"]))
+        state.append_new_block_ids(op.get("new_block_ids"))
+        return state.block_ids
+
+    @staticmethod
+    def _encoder_handle(mm_hash: Any) -> int:
+        """Derive a stable, nonzero 64-bit encoder handle from the image hash.
+
+        The handle must be deterministic from ``mm_hash`` and nonzero (0 means
+        no handle). A SplitMix64 finalizer spreads the hash across the u64 space.
+        """
+        x = int(mm_hash or 0) & 0xFFFFFFFFFFFFFFFF
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
+        x = (x ^ (x >> 31)) & 0xFFFFFFFFFFFFFFFF
+        return x or 0x9E3779B97F4A7C15
+
+    def run_encode(self, op):
+        self._ensure_loaded()
+        m = self.model
+        r = op["req_id"]
+        blocks = self._extend_blocks(op)
+        base_len = self._length(r)
+        view = self.pool.view(blocks, base_len)
+        rope = int(op["cond_pos"])
+        pre = self.image_processor.prepare_from_b64(op["image_b64"])
+        image_hw = [pre.size[1], pre.size[0]]
+        if op["kind"] == "vae_encode":
+            clean_lat, vpos, _ = m.vae_encode_clean(self.image_processor.vae_tensor(pre))
+            n = clean_lat.shape[0]
+            seg = m.build_gen_segment(n, vpos, clean_lat, 0.0, rope, view, update=True)
+            m.run([seg])
+            added = n + 2
+        else:
+            vemb = m.vit_encode(self.image_processor.vit_tensor(pre))
+            n = vemb.shape[0]
+            m.run([m.build_und_image_segment(vemb, rope, view, update=True)])
+            added = n + 2
+        new_len = base_len + added
+        self._set_length(r, new_len)
+        rec = self._record(r)
+        rec["dims"] = image_hw
+        if op["kind"] == "vit_encode":
+            rec["understanding_interleave"] = True
+            rec["text_branch_kvlen"] = new_len
+            rec["text_branch_pos"] = rope + 1
+        handle = self._encoder_handle(op.get("mm_hash"))
+        self.residency.encoder.put(handle, {"kind": op["kind"], "num_tokens": added})
+        return {"req_id": r, "encoder_handle": handle, "num_tokens": added,
+                "image_hw": image_hw}
+
+    def encode_image(self, pixels=None, grid=None, *, op):
+        del pixels, grid
+        return self.run_encode(dict(op))
+
+    def encode_latents(self, pixels=None, grid=None, *, op):
+        del pixels, grid
+        return self.run_encode(dict(op))
+
+    def _cache_view(self, op):
+        self._ensure_loaded()
+        r = op["req_id"]
+        blocks = self._extend_blocks(op)
+        base_len = self._length(r)
+        return self.pool.view(blocks, base_len)
+
+    def run_text_logits_batch(self, ops):
+        self._ensure_loaded()
+        m = self.model
+        segs, views = [], []
+        for op in ops:
+            view = self._cache_view(op)
+            pos_start = op["pos_range"][0]
+            seg = m.build_und_segment(op["token_ids"], pos_start, view, update=True)
+            segs.append(seg)
+            views.append((op, view))
+        hiddens = m.run(segs)
+        out = []
+        for (op, view), hidden in zip(views, hiddens):
+            logits = m.logits(hidden[-1:]).float().squeeze(0)
+            self._set_length(op["req_id"], view.base_len + len(op["token_ids"]))
+            out.append(logits)
+        return out
+
+    def run_text_logits(self, op):
+        return self.run_text_logits_batch([dict(op)])[0]
+
+    @staticmethod
+    def _require_image_param(ip: dict, key: str, req_id: Any):
+        """Fetch a client-controlled image param, failing loudly if absent.
+
+        These come straight from the request's `image` dict; a missing key is a
+        malformed request rather than a worker bug, so raise a descriptive error
+        instead of letting a bare KeyError surface as an opaque crash.
+        """
+        if key not in ip:
+            raise invalid_descriptor(
+                f"BAGEL image generation request {req_id} is missing "
+                f"required image param {key!r}"
+            )
+        return ip[key]
+
+    def _init_gen(self, op):
+        self._ensure_loaded()
+        m = self.model
+        state = self._state(int(op["req_id"]))
+        rec = self._record(op["req_id"])
+        ip = rec.get("image") or {}
+        req_id = op["req_id"]
+        gs = GenState()
+        gs.cond_pos = op["cond_pos"]
+        dims = rec.get("dims")
+        if dims is not None:
+            gs.H, gs.W = int(dims[0]), int(dims[1])
+        else:
+            gs.H = self._require_image_param(ip, "height", req_id)
+            gs.W = self._require_image_param(ip, "width", req_id)
+        h, w = m.latent_hw(gs.H, gs.W)
+        gs.num_vae = h * w
+        gs.vae_pos_ids = m.latent_position_ids(gs.H, gs.W).to(self.device)
+        g = state.device_rng(self.device)
+        gs.x_t = init_latent(
+            (gs.num_vae, m.cfg.patch_latent_dim),
+            rng=g,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        gs.schedule = FlowMatchSchedule(
+            num_steps=int(self._require_image_param(ip, "steps", req_id)),
+            shift=float(ip.get("timestep_shift", m.cfg.timestep_shift)),
+            direction=ScheduleDirection.DESCENDING,
+        )
+        cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
+        gs.cfg_text_scale = float(
+            cfg.get("text_scale", self._require_image_param(ip, "cfg_text_scale", req_id))
+        )
+        gs.cfg_img_scale = float(
+            cfg.get("img_scale", self._require_image_param(ip, "cfg_img_scale", req_id))
+        )
+        gs.cfg_renorm_type = str(
+            cfg.get("renorm_type", cfg.get("renorm", self._require_image_param(ip, "cfg_renorm_type", req_id)))
+        )
+        gs.cfg_renorm_min = float(
+            cfg.get("renorm_min", self._require_image_param(ip, "cfg_renorm_min", req_id))
+        )
+        gs.cfg_interval = tuple(cfg.get("interval") or self._require_image_param(ip, "cfg_interval", req_id))
+        gs.understanding = bool(rec.get("understanding_interleave"))
+        if gs.understanding:
+            gs.cond_branch_kvlen = int(self._length(op["req_id"]) or gs.cond_pos)
+            gs.text_branch_pos = int(rec["text_branch_pos"])
+            gs.text_branch_kvlen = int(rec["text_branch_kvlen"])
+            gs.cfg_img_cache = m.new_cache()
+            neg = rec.get("neg_token_ids") or []
+            m.run([m.build_und_segment(neg, 0, gs.cfg_img_cache, update=True)])
+            gs.cfg_img_pos = len(neg)
+            gs.cfg_cache = None
+            gs.cfg_pos = 0
+        else:
+            gs.cond_branch_kvlen = gs.cond_pos
+            gs.text_branch_pos = gs.text_branch_kvlen = 0
+            gs.cfg_img_cache = None
+            gs.cfg_img_pos = 0
+            gs.cfg_cache = m.new_cache()
+            gs.cfg_pos = 0
+            neg = rec.get("neg_token_ids")
+            if gs.cfg_text_scale > 1.0 and neg:
+                m.run([m.build_und_segment(neg, 0, gs.cfg_cache, update=True)])
+                gs.cfg_pos = len(neg)
+        self._set_gen_state(op["req_id"], gs)
+
+    def prepare_denoise_step(self, req_id: int, state, op: dict) -> TextImageDenoiseStep:
+        r = int(req_id)
+        self._extend_blocks(op)
+        if int(op.get("timestep_idx") or 0) == 0 and self._gen_state(r) is None:
+            self._init_gen(op)
+        gs = self._gen_state(r)
+        if gs is None:
+            raise invalid_descriptor("denoise generation state is not initialized")
+        i = int(op.get("timestep_idx") or 0)
+        t, t_next = gs.schedule.pair(i, device=self.device, dtype=torch.float32)
+        total_steps = int(gs.schedule.num_steps)
+        return TextImageDenoiseStep(
+            req_id=r,
+            state=state,
+            op=op,
+            latent=gs.x_t,
+            t=t,
+            t_next=t_next,
+            step_index=i,
+            total_steps=total_steps,
+            cfg_text_scale=float(gs.cfg_text_scale),
+            cfg_img_scale=float(gs.cfg_img_scale),
+            cfg_interval=(float(gs.cfg_interval[0]), float(gs.cfg_interval[1])),
+            cfg_renorm_type=str(gs.cfg_renorm_type),
+            cfg_renorm_min=float(gs.cfg_renorm_min),
+            image_scale_applies_to_text=CfgRecipe.IMAGE_OVER_TEXT,
+            extra={"gs": gs},
+        )
+
+    def prepare_denoise(self, state: RequestState, op: dict) -> TextImageDenoiseStep:
+        return self.prepare_denoise_step(int(op["req_id"]), state, dict(op))
+
+    def predict_velocity(
+        self,
+        ctx: TextImageDenoiseStep,
+        t: torch.Tensor,
+        latent: torch.Tensor,
+        branch: str,
+    ) -> torch.Tensor:
+        del t, latent
+        return self.predict_denoise_velocity(ctx, branch)
+
+    def predict_denoise_velocity(self, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:
+        self._ensure_loaded()
+        m = self.model
+        gs = step.extra["gs"]
+        if branch == "cond":
+            cache = self.pool.view(self._state(step.req_id).block_ids, gs.cond_branch_kvlen)
+            position = gs.cond_pos
+        elif branch == "text_uncond":
+            if gs.understanding:
+                cache = self.pool.view(self._state(step.req_id).block_ids, gs.text_branch_kvlen)
+                position = gs.text_branch_pos
+            else:
+                cache = gs.cfg_cache
+                position = gs.cfg_pos
+        elif branch == "img_uncond":
+            cache = gs.cfg_img_cache
+            position = gs.cfg_img_pos
+        else:
+            raise invalid_descriptor(f"unknown denoise branch {branch!r}")
+        if cache is None:
+            raise invalid_descriptor(f"denoise branch {branch!r} is not initialized")
+        seg = m.build_gen_segment(
+            gs.num_vae,
+            gs.vae_pos_ids,
+            step.latent,
+            float(step.t.detach().float().item()),
+            position,
+            cache,
+        )
+        hidden = m.run([seg])[0]
+        return m.velocity_from_hidden(hidden, gs.num_vae)
+
+    def apply_denoise_update(self, step: TextImageDenoiseStep, latent: torch.Tensor) -> None:
+        gs = step.extra["gs"]
+        gs.x_t = latent.to(dtype=gs.x_t.dtype, device=gs.x_t.device)
+
+    def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
+        self.apply_denoise_update(ctx, latent)
+
+    def commit_generated_image(self, req_id: int, state, op) -> dict:
+        return self._commit_generated_image(dict(op))
+
+    def decode_image(self, latent, *, req_id: int, state, op) -> dict:
+        del latent, state
+        return self._commit_generated_image(dict(op))
+
+    def _commit_generated_image(self, op):
+        self._ensure_loaded()
+        m = self.model
+        r = op["req_id"]
+        gs = self._gen_state(r)
+        if gs is None:
+            return {"req_id": r}
+        self._extend_blocks(op)
+        img = m.vae_decode(gs.x_t, gs.H, gs.W)
+        if gs.understanding:
+            base = self._length(r) or gs.cond_branch_kvlen
+            rope = gs.cond_pos
+            pre = self.image_processor.resize_for_vae(img)
+            clean_lat, vpos, _ = m.vae_encode_clean(self.image_processor.vae_tensor(pre))
+            nv = clean_lat.shape[0]
+            v1 = self.pool.view(self._state(r).block_ids, base)
+            s1 = m.build_gen_segment(nv, vpos, clean_lat, 0.0, rope, v1, update=True)
+            m.run([s1])
+            base += nv + 2
+            vemb = m.vit_encode(self.image_processor.vit_tensor(pre))
+            nt = vemb.shape[0]
+            v2 = self.pool.view(self._state(r).block_ids, base)
+            m.run([m.build_und_image_segment(vemb, rope + 1, v2, update=True)])
+            base += nt + 2
+            self._set_length(r, base)
+            added = (nv + 2) + (nt + 2)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            self._pop_gen_state(r)
+            return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W],
+                    "num_tokens": added}
+        view = self.pool.view(self._state(r).block_ids, gs.cond_pos)
+        commit_seg = m.build_gen_segment(gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True)
+        m.run([commit_seg])
+        self._set_length(r, gs.cond_pos + gs.num_vae + 2)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        self._pop_gen_state(r)
+        return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W]}
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: Any,
+        positions: Any | None = None,
+        *,
+        kv: Any = None,
+        mode: str | None = None,
+        input_embeds: torch.Tensor | None = None,
+        op: dict[str, Any] | None = None,
+        request_state: RequestState | None = None,
+    ) -> Any:
+        loaded = self._ensure_loaded()
+        with self._autocast():
+            if isinstance(input_ids, UniForwardBatch):
+                batch = input_ids
+                raise capability_mismatch(f"BAGEL direct batch forward is unsupported for {batch.mode}")
+            del loaded, positions, kv, mode, input_embeds, request_state
+            if op is None:
+                raise invalid_descriptor("BAGEL text forward requires the source op")
+            return self.run_text_logits(dict(op))
+
+    def _ensure_loaded(self) -> "BagelForUnifiedGeneration":
+        if self.model is None or self.pool is None:
+            raise capability_mismatch("BAGEL model weights are not loaded")
+        return self
+
+    def _autocast(self):
+        self._ensure_loaded()
+        device = str(self.device)
+        if device.startswith("cuda"):
+            return torch.autocast("cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
+
+EntryClass = BagelForUnifiedGeneration

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uniserve-kernel"
+version = "0.1.0"
+description = "UniServe optional CUTE/Triton kernel provider pack"
+requires-python = ">=3.10"
+dependencies = [
+  "nvidia-cutlass-dsl==4.2.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["uniserve_kernel*"]

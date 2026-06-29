@@ -1,0 +1,113 @@
+# Canonical worker error taxonomy: the cross-language single source of truth.
+#
+# Transcribed from (and guarded against) the hand-written definitions:
+#   - Python `ErrorCode` (StrEnum) + `_POLICY`  uniserve_worker/foundation/errors.py
+#   - Rust `WorkerExecError`                     crates/engine/executor/src/lib.rs
+#
+# The Rust side carries the taxonomy structurally: `WorkerExecError` holds the
+# `code` as an opaque string plus the `(retryable, fatal)` policy bits the worker
+# stamped onto the wire (`WorkerResponse.{code,retryable,fatal}`). It has no Rust
+# `ErrorCode` enum, so this file guards the Python definition: every `[[error]]`
+# must equal one `ErrorCode` member and its `_POLICY` entry exactly.
+#
+# Each `[[error]]` entry pins one error class by:
+#   - `python`        : the Python `ErrorCode` member identifier (UPPER_SNAKE).
+#   - `code`          : the stable wire-string value (`ErrorCode` member value;
+#                       crosses the wire as `WorkerResponse.code`).
+#   - `retryable`     : `ErrorPolicy.retryable` — whether retrying the same op
+#                       could succeed.
+#   - `fatal`         : `ErrorPolicy.fatal` — whether the worker must be torn down
+#                       (vs failing only the offending request/op).
+#   - `capture_trace` : `ErrorPolicy.capture_trace` — whether the log line for
+#                       this class should include a stack trace.
+
+[[error]]
+python = "UNSUPPORTED_OPERATION"
+code = "UnsupportedOperation"
+retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "UNSUPPORTED_CONTROL"
+code = "UnsupportedControl"
+retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "INVALID_DESCRIPTOR"
+code = "InvalidDescriptor"
+retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "CAPABILITY_MISMATCH"
+code = "CapabilityMismatch"
+retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "RESOURCE_LEASE_VIOLATION"
+code = "ResourceLeaseViolation"
+retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "WORKER_OOM"
+code = "WorkerOOM"
+retryable = true
+fatal = false
+capture_trace = true
+
+[[error]]
+python = "BACKEND_OOM"
+code = "BackendOOM"
+retryable = true
+fatal = false
+capture_trace = true
+
+[[error]]
+python = "MODEL_EXECUTION_ERROR"
+code = "ModelExecutionError"
+retryable = false
+fatal = false
+capture_trace = true
+
+[[error]]
+python = "INVARIANT_VIOLATION"
+code = "InvariantViolation"
+retryable = false
+fatal = true
+capture_trace = true
+
+[[error]]
+python = "TRANSIENT_WORKER_FAILURE"
+code = "TransientWorkerFailure"
+retryable = true
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "FATAL_WORKER_FAILURE"
+code = "FatalWorkerFailure"
+retryable = false
+fatal = true
+capture_trace = true
+
+[[error]]
+python = "USER_INPUT_ERROR"
+code = "UserInputError"
+retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "SCHEDULER_BUG"
+code = "SchedulerBug"
+retryable = false
+fatal = false
+capture_trace = false
