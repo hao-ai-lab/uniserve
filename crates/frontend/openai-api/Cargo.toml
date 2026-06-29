@@ -1,0 +1,20 @@
+[package]
+name = "uniserve-openai-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+itertools.workspace = true
+serde_json.workspace = true
+uniserve-chat.workspace = true
+uniserve-engine-client.workspace = true
+uniserve-openai-types.workspace = true
+uniserve-text.workspace = true
+
+[dev-dependencies]
+expect-test.workspace = true
+llm-multimodal.workspace = true
+
+[lints]
+workspace = true

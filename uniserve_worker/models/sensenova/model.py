@@ -1,0 +1,3030 @@
+"""SenseNova-U1 UniModel entry.
+
+This is the registry/runner-facing model port. Execution is driven by
+``ModelRunner`` and selected by ``models.registry``; text and denoise attention
+use the worker-owned paged KV pool through the shared ``RadixAttention`` seam.
+"""
+from __future__ import annotations
+
+import bisect
+import copy
+import logging
+from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from types import SimpleNamespace
+from typing import Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+
+import uniserve_worker.ops as ops
+from ...contracts.batches import UniForwardBatch
+from ...contracts.forward_mode import ForwardMode
+from ...contracts.outputs import TextTokenOutput
+from ...contracts.resource_plan import (
+    CapsDescriptor,
+    KvBlockResourcePolicy,
+    LatentTokens,
+    PerBranch,
+    ResourcePlan,
+)
+from ...execution.denoise_driver import (
+    TextImageDenoiseStep,
+    combine_text_image_velocity,
+    text_image_branches,
+)
+from ...execution.forward_stream import (
+    ForwardPagedKVSegment,
+    ForwardPagedKVView,
+    ForwardStream,
+    ForwardStreamBuilder,
+)
+from ...execution.model_base import UniModelBase
+from ...foundation.sizing import (
+    DEFAULT_BLOCK_SIZE,
+    DEFAULT_MAX_BATCH_OPS,
+    ceil_div,
+    derive_num_blocks,
+)
+from ...foundation.errors import capability_mismatch, invalid_descriptor
+from ...loader.transformers import NativeLoadSpec
+from ...nn import (
+    LinearBase,
+    MergedColumnParallelLinear,
+    ParallelLMHead,
+    QKVParallelLinear,
+    RadixAttention,
+    RMSNorm,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+    WeightMode,
+    apply_rotary_pos_emb,
+    get_current_mesh,
+    get_rope,
+    place_towers,
+    Sampler,
+    set_tower_coord,
+)
+from ...nn.decoder import Modality, route_by_modality, tower_modality_coords
+from ...nn.diffusion import ConvDecoder, FlowMatchingHead, TimestepEmbedder
+from ...nn.quant import (
+    QuantizationConfig,
+    get_current_kv_cache_dtype,
+    kv_cache_bytes_per_token,
+    use_quantization_config,
+)
+from ...nn.vision import NeoVitConfig, NeoVitEncoder
+from ...runtime.compile import CompileTarget, TorchCompileConfig, compile_model_pieces
+from ...runtime.kv_pool import PagedKVPool
+from ...runtime.paged_text_cache import PagedTextCache
+from ...runtime.request_state import RequestState as RunnerRequestState
+from ...runtime.residency import GenResidencySpec, KvCacheSpec, ResidencyManager
+from ...runtime.tower_handoff import (
+    ConditioningSnapshot,
+    DataPlaneTowerHandoff,
+    LocalP2PTowerHandoff,
+    TowerBinding,
+    TowerHandoff,
+)
+from .config import NeoChatConfig, NeoMoeLlmConfig
+from .interleaved_image import (
+    GeneratedImageCommitDriver,
+    ImageState,
+    InterleavedImageRequestState,
+    InterleavedTextCacheDriver,
+    TextCache,
+    TextImageDenoiseOps,
+)
+
+__all__ = [
+    'IMG_START_TOKEN',
+    'IMG_END_TOKEN',
+    'SENSENOVA_MODEL_CODE_VERSION',
+    'DEFAULT_EOS_TOKEN_ID',
+    'DEFAULT_IMG_START_TOKEN_ID',
+    'DEFAULT_NUM_HIDDEN_LAYERS',
+    'DEFAULT_NUM_KEY_VALUE_HEADS',
+    'DEFAULT_HEAD_DIM',
+    'DEFAULT_MAX_IMAGE_SEQ_LEN',
+    'MAX_BATCH_OPS',
+    'patch_sensenova_config',
+    'NeoVisionModel',
+    'NEOChatModel',
+    'check_checkpoint_compatibility',
+    'SenseNovaU1ForUnifiedGeneration',
+    'EntryClass',
+]
+
+IMG_START_TOKEN = "<img>"
+IMG_END_TOKEN = "</img>"
+
+# Version of this SenseNova-U1 model port. A checkpoint may declare a minimum
+# required model-code version via ``uniserve_sensenova_min_version``; bump this
+# constant when the served graph/loader contract changes.
+SENSENOVA_MODEL_CODE_VERSION = "0.1.0"
+
+# Default served NEOChat token ids, used only when no tokenizer/checkpoint is
+# available (CPU/dummy construction); real serving resolves these from the
+# tokenizer/config. img_start is the <img> sentinel that opens an image span.
+DEFAULT_EOS_TOKEN_ID = 151645
+DEFAULT_IMG_START_TOKEN_ID = 151670
+
+# Fallback shape defaults when config omits them; not used for KV pool sizing.
+DEFAULT_NUM_HIDDEN_LAYERS = 36
+DEFAULT_NUM_KEY_VALUE_HEADS = 8
+DEFAULT_HEAD_DIM = 128
+DEFAULT_MAX_IMAGE_SEQ_LEN = 4096
+
+# Worker batching limit for capability reporting.
+MAX_BATCH_OPS = DEFAULT_MAX_BATCH_OPS
+
+logger = logging.getLogger(__name__)
+
+def patch_sensenova_config(config) -> None:
+    llm = getattr(config, "llm_config", None)
+    if llm is None or hasattr(llm, "rope_theta"):
+        return
+    rope = getattr(llm, "rope_parameters", None) or getattr(llm, "rope_scaling", None) or {}
+    llm.rope_theta = rope.get("rope_theta", 10000.0) if isinstance(rope, dict) else 10000.0
+
+
+def _config_int(config: Any | None, key: str, default: int) -> int:
+    if isinstance(config, dict):
+        return int(config.get(key, default) or default)
+    return int(getattr(config, key, default) or default)
+
+
+def _axis_position_ids(indexes: torch.Tensor, axis: int) -> torch.Tensor:
+    positions = indexes[int(axis)]
+    if positions.ndim == 1:
+        return positions.unsqueeze(0)
+    if positions.ndim == 2:
+        return positions
+    raise ValueError("SenseNova 3D RoPE indexes must be shaped [3, L] or [3, B, L]")
+
+
+def _flatten_3d_indexes(indexes: torch.Tensor, batch: int, seq_len: int) -> torch.Tensor:
+    if indexes.ndim == 2:
+        if indexes.shape != (3, seq_len):
+            raise ValueError("SenseNova 3D RoPE indexes must be shaped [3, L]")
+        expanded = indexes[:, None, :].expand(3, batch, seq_len)
+    elif indexes.ndim == 3:
+        if indexes.shape != (3, batch, seq_len):
+            raise ValueError("SenseNova batched 3D RoPE indexes must be shaped [3, B, L]")
+        expanded = indexes
+    else:
+        raise ValueError("SenseNova 3D RoPE indexes must be shaped [3, L] or [3, B, L]")
+    return expanded.reshape(3, batch * seq_len)
+
+
+@dataclass(frozen=True)
+class SenseNovaPackedRope:
+    cos: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    sin: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+    def select(self, mask: torch.Tensor) -> "SenseNovaPackedRope":
+        positions = mask.nonzero(as_tuple=False).flatten()
+        return SenseNovaPackedRope(
+            tuple(axis.index_select(0, positions) for axis in self.cos),
+            tuple(axis.index_select(0, positions) for axis in self.sin),
+        )
+
+
+def _neo_prompt(
+    template: str | None,
+    prompt_text: str,
+    *,
+    system_message: str = "",
+    append_text: str | None = None,
+) -> str:
+    # The served checkpoint uses the chatml-shaped neo1_0 template.
+    template = template or "neo1_0"
+    if template != "neo1_0":
+        raise RuntimeError(f"unsupported native prompt template {template!r}")
+    out = ""
+    if system_message:
+        out += f"<|im_start|>system\n{system_message}<|im_end|>\n"
+    out += f"<|im_start|>user\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
+    if append_text is not None:
+        out += append_text
+    return out
+
+
+class NeoVisionModel(nn.Module):
+    """NEO ViT tower for image understanding embeddings."""
+
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        self.config = config
+        self.embeddings = NeoVitEncoder(
+            NeoVitConfig(
+                hidden_size=int(config.hidden_size),
+                llm_hidden_size=int(config.llm_hidden_size),
+                downsample_ratio=float(config.downsample_ratio),
+                patch_size=int(config.patch_size),
+                num_channels=int(config.num_channels),
+                rope_theta_vision=float(config.rope_theta_vision),
+            )
+        )
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        *,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        pixel_embeds: torch.Tensor | None = None,
+        grid_hw: torch.Tensor | None = None,
+    ) -> BaseModelOutputWithPast:
+        del output_hidden_states, return_dict
+        if pixel_values is None and pixel_embeds is None:
+            raise ValueError("pixel_values or pixel_embeds is required")
+        hidden = pixel_embeds if pixel_embeds is not None else self.embeddings(pixel_values, grid_hw)
+        return BaseModelOutputWithPast(last_hidden_state=hidden)
+
+
+def _resolve_tower(mesh: Any | None = None) -> tuple[Any | None, dict[Modality, int] | None]:
+    """Resolve the ``tower`` axis transport + per-modality coordinates from the mesh.
+
+    Returns ``(None, None)`` for a trivial/absent tower, which makes every
+    :func:`route_by_modality` call below take the in-place single-device path
+    (byte-identical). With a tower, mixed-modality batches route each modality's
+    tokens to its coordinate's device via the transport (handled by the shared
+    Router instead of model-private routing)."""
+    mesh = mesh if mesh is not None else get_current_mesh()
+    coords = tower_modality_coords(mesh)
+    transport = mesh.axis("tower").transport if coords is not None else None
+    return transport, coords
+
+
+class _NativeQwen3MLP(nn.Module):
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            config.hidden_size,
+            (config.intermediate_size, config.intermediate_size),
+            bias=False,
+            weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
+        )
+        self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(ops.silu_and_mul(self.gate_up_proj(x)))
+
+
+class _NativeQwen3Attention(nn.Module):
+    def __init__(self, config: Any, layer_idx: int) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_idx = int(layer_idx)
+        self.head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+        self.num_heads = int(config.num_attention_heads)
+        self.num_kv_heads = int(config.num_key_value_heads)
+        self.scaling = self.head_dim**-0.5
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            layer_id=self.layer_idx,
+        )
+
+        q_out = self.num_heads * self.head_dim
+        self.qkv_proj = QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            bias=config.attention_bias,
+        )
+        self.qkv_proj_mot_gen = QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            bias=config.attention_bias,
+        )
+        self.o_proj = RowParallelLinear(q_out, config.hidden_size, bias=config.attention_bias)
+        self.o_proj_mot_gen = RowParallelLinear(q_out, config.hidden_size, bias=config.attention_bias)
+
+        self.q_norm = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.q_norm_mot_gen = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.q_norm_hw = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.q_norm_hw_mot_gen = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.k_norm_mot_gen = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.k_norm_hw = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        self.k_norm_hw_mot_gen = RMSNorm(self.head_dim // 2, eps=config.rms_norm_eps)
+        # SenseNova-U1 is served as full attention: RadixAttention has no per-layer
+        # sliding-window channel and the worker emits an empty caps groups list,
+        # so the host always builds a single full-attention BlockManager. The
+        # config's per-layer sliding_window is therefore intentionally not honored
+        # here. If sliding-window support is ever added it must be wired end to end
+        # (caps groups + per-layer window in attention + host block trimming), not
+        # reintroduced as a dead per-layer attribute. config.layer_types is still
+        # consulted by the decoder layer for the causal-mask mapping only.
+
+        # get_rope / HFRotaryEmbedding only reads scalar fields from the config,
+        # so a shallow copy with overridden scalars is sufficient and avoids a
+        # full deep-copy of the (large, nested) config in every one of the
+        # num_layers attention modules. The shallow copy gives each rope table
+        # its own __dict__, so these scalar overrides do not mutate ``config``.
+        t_config = copy.copy(config)
+        t_config.head_dim = self.head_dim // 2
+        self.rotary_emb = get_rope(config=t_config, keep_freq_range=True)
+        hw_config = copy.copy(config)
+        hw_config.head_dim = self.head_dim // 4
+        hw_config.rope_theta = config.rope_theta_hw
+        hw_config.max_position_embeddings = config.max_position_embeddings_hw
+        self.rotary_emb_hw = get_rope(config=hw_config, keep_freq_range=True)
+        # Tower-axis routing for the o_proj scatter (no-op on a trivial tower).
+        self._tower_transport, self._tower_coords = _resolve_tower()
+
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        *,
+        gen_branch: bool,
+        packed_rope: SenseNovaPackedRope | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        if gen_branch:
+            q_norm, k_norm = self.q_norm_mot_gen, self.k_norm_mot_gen
+            q_norm_hw, k_norm_hw = self.q_norm_hw_mot_gen, self.k_norm_hw_mot_gen
+            qkv_proj = self.qkv_proj_mot_gen
+        else:
+            q_norm, k_norm = self.q_norm, self.k_norm
+            q_norm_hw, k_norm_hw = self.q_norm_hw, self.k_norm_hw
+            qkv_proj = self.qkv_proj
+
+        split_sizes = [int(size) for size in qkv_proj.output_sizes]
+        if int(hidden_states.shape[-2]) == 1:
+            q_w, k_w, v_w = qkv_proj.weight.split(split_sizes, dim=0)
+            if getattr(qkv_proj, "bias", None) is not None:
+                q_b, k_b, v_b = qkv_proj.bias.split(split_sizes, dim=0)
+            else:
+                q_b = k_b = v_b = None
+            # One-token autoregressive image decode is numerically sensitive to
+            # GEMM reassociation; use the same per-projection accumulation order
+            # for that decode shape while bulk prefill/denoise uses packed QKV.
+            q_flat = F.linear(hidden_states, q_w, q_b)
+            k_flat = F.linear(hidden_states, k_w, k_b)
+            v_flat = F.linear(hidden_states, v_w, v_b)
+        else:
+            q_flat, k_flat, v_flat = qkv_proj(hidden_states).split(split_sizes, dim=-1)
+        query_states = q_flat.view(hidden_shape)
+        local_kv_heads = int(k_flat.shape[-1]) // self.head_dim
+        key_states = k_flat.view(*input_shape, local_kv_heads, self.head_dim)
+        value_states = v_flat.view(*input_shape, local_kv_heads, self.head_dim).transpose(1, 2)
+
+        (query_states_t, query_states_h, query_states_w), (key_states_t, key_states_h, key_states_w) = self._qk_norm_rope_3d(
+            query_states,
+            key_states,
+            indexes,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            q_norm_hw=q_norm_hw,
+            k_norm_hw=k_norm_hw,
+            packed_rope=packed_rope,
+        )
+        query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
+        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
+        return query_states, key_states, value_states
+
+    def _qk_norm_rope_3d(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        indexes: torch.Tensor,
+        *,
+        q_norm: RMSNorm,
+        k_norm: RMSNorm,
+        q_norm_hw: RMSNorm,
+        k_norm_hw: RMSNorm,
+        packed_rope: SenseNovaPackedRope | None = None,
+        override: str | None = None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if packed_rope is None:
+            packed_rope = self._packed_rope(indexes)
+        query_states, key_states = ops.qk_norm_rope(
+            query_states.transpose(1, 2),
+            key_states.transpose(1, 2),
+            (q_norm.weight, q_norm_hw.weight, q_norm_hw.weight),
+            (k_norm.weight, k_norm_hw.weight, k_norm_hw.weight),
+            packed_rope.cos,
+            packed_rope.sin,
+            q_norm.eps,
+            axis_dims=(self.head_dim // 2, self.head_dim // 4, self.head_dim // 4),
+            override=override,
+        )
+        query_states_t, query_states_h, query_states_w = query_states.split(
+            [self.head_dim // 2, self.head_dim // 4, self.head_dim // 4], dim=-1
+        )
+        key_states_t, key_states_h, key_states_w = key_states.split(
+            [self.head_dim // 2, self.head_dim // 4, self.head_dim // 4], dim=-1
+        )
+        return (query_states_t, query_states_h, query_states_w), (key_states_t, key_states_h, key_states_w)
+
+    def _packed_rope(self, indexes: torch.Tensor) -> SenseNovaPackedRope:
+        if indexes.ndim != 2 or indexes.shape[0] != 3:
+            raise ValueError("SenseNova packed RoPE expects flat indexes [3, N]")
+        cos_t, sin_t = self.rotary_emb.cos_sin_1d(indexes[0].to(device=self.rotary_emb.inv_freq.device))
+        cos_h, sin_h = self.rotary_emb_hw.cos_sin_1d(indexes[1].to(device=self.rotary_emb_hw.inv_freq.device))
+        cos_w, sin_w = self.rotary_emb_hw.cos_sin_1d(indexes[2].to(device=self.rotary_emb_hw.inv_freq.device))
+        device = indexes.device
+        return SenseNovaPackedRope(
+            (cos_t.to(device=device), cos_h.to(device=device), cos_w.to(device=device)),
+            (sin_t.to(device=device), sin_h.to(device=device), sin_w.to(device=device)),
+        )
+
+    def _project_qkv_routed(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        *,
+        exist_non_image_gen_tokens: bool | None = None,
+        exist_image_gen_tokens: bool | None = None,
+        packed_rope: SenseNovaPackedRope | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hidden_states.ndim != 3:
+            raise ValueError("SenseNova routed QKV expects hidden_states [B, L, C]")
+        batch, seq_len, _ = hidden_states.shape
+        flat_hidden = hidden_states.reshape(batch * seq_len, -1)
+        flat_indexes = _flatten_3d_indexes(indexes, batch, seq_len)
+        flat_gen = image_gen_indicators.reshape(batch * seq_len).to(dtype=torch.bool)
+
+        # Callers on the packed forward path know the und/gen split for the whole
+        # batch up front; reuse it to skip the per-branch device->host sync that
+        # bool(mask.any()) would otherwise force every layer.
+        branch_exists = {
+            False: exist_non_image_gen_tokens,
+            True: exist_image_gen_tokens,
+        }
+        projected = []
+        for gen_branch, mask in ((False, ~flat_gen), (True, flat_gen)):
+            exists = branch_exists[gen_branch]
+            if exists is None:
+                exists = bool(mask.any())
+            if not exists:
+                continue
+            branch_rope = packed_rope.select(mask) if packed_rope is not None else None
+            try:
+                q, k, v = self._project_qkv(
+                    flat_hidden[mask].unsqueeze(0),
+                    flat_indexes[:, mask],
+                    gen_branch=gen_branch,
+                    packed_rope=branch_rope,
+                )
+            except TypeError as exc:
+                if "packed_rope" not in str(exc):
+                    raise
+                q, k, v = self._project_qkv(
+                    flat_hidden[mask].unsqueeze(0),
+                    flat_indexes[:, mask],
+                    gen_branch=gen_branch,
+                )
+            projected.append(
+                (
+                    mask,
+                    q.squeeze(0).transpose(0, 1).contiguous(),
+                    k.squeeze(0).transpose(0, 1).contiguous(),
+                    v.squeeze(0).transpose(0, 1).contiguous(),
+                )
+            )
+
+        if not projected:
+            raise ValueError("SenseNova routed QKV requires at least one token")
+        q_dim = int(projected[0][1].shape[-1])
+        k_dim = int(projected[0][2].shape[-1])
+        v_dim = int(projected[0][3].shape[-1])
+        q_flat = hidden_states.new_empty(batch * seq_len, self.num_heads, q_dim)
+        k_flat = hidden_states.new_empty(batch * seq_len, self.num_kv_heads, k_dim)
+        v_flat = hidden_states.new_empty(batch * seq_len, self.num_kv_heads, v_dim)
+        for mask, q_part, k_part, v_part in projected:
+            if q_part.shape[-1] != q_dim or k_part.shape[-1] != k_dim or v_part.shape[-1] != v_dim:
+                raise ValueError("SenseNova routed QKV expert projections produced mismatched head dims")
+            q_flat[mask] = q_part
+            k_flat[mask] = k_part
+            v_flat[mask] = v_part
+
+        q = q_flat.view(batch, seq_len, self.num_heads, q_dim).transpose(1, 2).contiguous()
+        k = k_flat.view(batch, seq_len, self.num_kv_heads, k_dim).transpose(1, 2).contiguous()
+        v = v_flat.view(batch, seq_len, self.num_kv_heads, v_dim).transpose(1, 2).contiguous()
+        return q, k, v
+
+    def _project_qkv_flat_routed(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        *,
+        exist_non_image_gen_tokens: bool | None = None,
+        exist_image_gen_tokens: bool | None = None,
+        und: torch.Tensor | None = None,
+        packed_rope: SenseNovaPackedRope | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del und  # accepted for call-site symmetry; routing uses the gen mask
+        if hidden_states.ndim != 2:
+            raise ValueError("SenseNova packed routed QKV expects hidden_states [N, C]")
+        if indexes.shape != (3, hidden_states.shape[0]):
+            raise ValueError("SenseNova packed routed QKV expects indexes [3, N]")
+        if image_gen_indicators.shape != (hidden_states.shape[0],):
+            raise ValueError("SenseNova packed routed QKV expects image_gen_indicators [N]")
+        q, k, v = self._project_qkv_routed(
+            hidden_states.unsqueeze(0),
+            indexes,
+            image_gen_indicators.unsqueeze(0),
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+            packed_rope=packed_rope,
+        )
+        return (
+            q.squeeze(0).transpose(0, 1).contiguous(),
+            k.squeeze(0).transpose(0, 1).contiguous(),
+            v.squeeze(0).transpose(0, 1).contiguous(),
+        )
+
+    def _attend_bhld(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, None]:
+        out = self.attn(q, k, v, causal=False, scale=self.scaling, attn_mask=attention_mask)
+        return out.transpose(1, 2).contiguous(), None
+
+    def _attend_bshd(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        out = self.attn(
+            q.transpose(1, 2).contiguous(),
+            k.transpose(1, 2).contiguous(),
+            v.transpose(1, 2).contiguous(),
+            causal=False,
+            scale=self.scaling,
+        )
+        return out.transpose(1, 2).contiguous()
+
+    def _attend_packed_visible(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+    ) -> torch.Tensor:
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+            raise ValueError("SenseNova packed visible attention expects [N, H, D] tensors")
+        kv_view.append_packed(self.layer_idx, k, v)
+        k_cache, v_cache = kv_view.pool.layer_cache(self.layer_idx)
+        cache_after = kv_view.cache_seqlens_after(device=q.device)
+        # max_seqlen_k is identical for every layer of the packed forward; derive
+        # it on the host from the segment metadata (Python ints) instead of
+        # forcing a per-layer device->host sync via cache_after.max().item().
+        max_seqlen_k = max(
+            (seg.base_len + seg.q_len for seg in kv_view.segments),
+            default=0,
+        )
+        # Route visible_end attention through RadixAttention (backend resolution + stats).
+        out = self.attn.forward_visible_end(
+            q,
+            k_cache,
+            v_cache,
+            visible_end=forward_stream.visible_end,
+            cu_seqlens_q=forward_stream.cu_seqlens_q,
+            page_table=kv_view.block_table(device=q.device),
+            seqused_k=cache_after,
+            max_seqlen_q=int(forward_stream.visible_end.shape[1]),
+            max_seqlen_k=int(max_seqlen_k),
+            scale=self.scaling,
+            use_prefix_bounds=False,
+        )
+        return out.contiguous()
+
+    def forward_packed_visible(
+        self,
+        hidden_states: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        *,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        und: torch.Tensor,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+        packed_rope: SenseNovaPackedRope | None = None,
+    ) -> torch.Tensor:
+        # gen mask (image_gen_indicators) and its complement (und) plus the exist
+        # flags are precomputed once by the model; reuse them so the o_proj
+        # routing avoids a per-layer device->host sync.
+        gen = image_gen_indicators
+        q, k, v = self._project_qkv_flat_routed(
+            hidden_states,
+            indexes,
+            gen,
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+            und=und,
+            packed_rope=packed_rope,
+        )
+        out = self._attend_packed_visible(q, k, v, forward_stream=forward_stream, kv_view=kv_view)
+        out = out.reshape(hidden_states.shape[0], -1).contiguous()
+        return self._route_o_proj(
+            out,
+            text_mask=und,
+            gen_mask=gen,
+            exist_text=exist_non_image_gen_tokens,
+            exist_gen=exist_image_gen_tokens,
+            out=out.new_empty((out.shape[0], self.config.hidden_size)),
+        )
+
+    def _attend_paged_update(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        past_key_values: Any,
+        *,
+        attention_mask: torch.Tensor | None,
+        causal: bool = False,
+    ) -> tuple[torch.Tensor, None] | None:
+        if attention_mask is not None or past_key_values is None or q.ndim != 4:
+            return None
+        if q.shape[0] != 1 and not getattr(past_key_values, "supports_batched_paged", False):
+            return None
+        request_cache = getattr(past_key_values, "request_cache_for_update", None)
+        finish = getattr(past_key_values, "finish_layer_update", None)
+        cancel = getattr(past_key_values, "cancel_layer_update", None)
+        if not callable(request_cache) or not callable(finish):
+            return None
+        if not self.attn.can_run_paged_attention(q, None):
+            return None
+        n_tokens = int(q.shape[2])
+        cache = request_cache(self.layer_idx, n_tokens)
+        try:
+            out = self.attn(
+                q,
+                k,
+                v,
+                kv_cache=cache,
+                update_cache=True,
+                causal=causal,
+                scale=self.scaling,
+            )
+        except Exception:
+            if callable(cancel):
+                cancel(self.layer_idx)
+            raise
+        finish(self.layer_idx, n_tokens)
+        return out.transpose(1, 2).contiguous(), None
+
+    def _attend_paged_transient(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        past_key_values: Any,
+        *,
+        attention_mask: torch.Tensor | None,
+        causal: bool = False,
+    ) -> tuple[torch.Tensor, None] | None:
+        if attention_mask is not None or past_key_values is None or q.ndim != 4:
+            return None
+        if q.shape[0] != 1 and not getattr(past_key_values, "supports_batched_paged", False):
+            return None
+        request_cache = getattr(past_key_values, "request_cache_for_transient", None)
+        if not callable(request_cache):
+            return None
+        if not self.attn.can_run_paged_attention(q, None):
+            return None
+        n_tokens = int(q.shape[2])
+        cache = request_cache(self.layer_idx, n_tokens)
+        pool = getattr(cache, "pool", None)
+        cache_dtype = getattr(pool, "dtype", None)
+        if cache_dtype is not None:
+            q = q.to(dtype=cache_dtype)
+            k = k.to(dtype=cache_dtype)
+            v = v.to(dtype=cache_dtype)
+        out = self.attn(
+            q,
+            k,
+            v,
+            kv_cache=cache,
+            update_cache=True,
+            causal=causal,
+            scale=self.scaling,
+        )
+        return out.transpose(1, 2).contiguous(), None
+
+    def forward_und(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any = None,
+        packed_rope: SenseNovaPackedRope | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None]:
+        input_shape = hidden_states.shape[:-1]
+        q, k, v = self._project_qkv(hidden_states, indexes, gen_branch=False, packed_rope=packed_rope)
+        if past_key_values is not None:
+            update_cache = kwargs.get("update_cache", True)
+            if update_cache:
+                paged = self._attend_paged_update(q, k, v, past_key_values, attention_mask=attention_mask)
+                if paged is not None:
+                    out, weights = paged
+                    return self.o_proj(out.reshape(*input_shape, -1).contiguous()), weights
+                k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs=None)
+            else:
+                layer = past_key_values.layers[self.layer_idx]
+                past_k, past_v = layer.keys, layer.values
+                if past_k is not None:
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+        out, weights = self._attend_bhld(q, k, v, attention_mask)
+        return self.o_proj(out.reshape(*input_shape, -1).contiguous()), weights
+
+    def forward_gen(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any = None,
+        packed_rope: SenseNovaPackedRope | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None]:
+        input_shape = hidden_states.shape[:-1]
+        q, k, v = self._project_qkv(hidden_states, indexes, gen_branch=True, packed_rope=packed_rope)
+        update_cache = kwargs.get("update_cache", True)
+        if attention_mask is None:
+            q_bshd = q.transpose(1, 2).contiguous()
+            k_cur = k.transpose(1, 2).contiguous()
+            v_cur = v.transpose(1, 2).contiguous()
+            if past_key_values is not None:
+                if update_cache:
+                    paged = self._attend_paged_update(q, k, v, past_key_values, attention_mask=None)
+                    if paged is not None:
+                        out, _ = paged
+                        return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), None
+                    k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs=None)
+                    k_attn = k.transpose(1, 2).contiguous()
+                    v_attn = v.transpose(1, 2).contiguous()
+                else:
+                    paged = self._attend_paged_transient(q, k, v, past_key_values, attention_mask=None)
+                    if paged is not None:
+                        out, _ = paged
+                        return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), None
+                    layer = past_key_values.layers[self.layer_idx]
+                    past_k, past_v = layer.keys, layer.values
+                    if past_k is not None:
+                        k_attn = torch.cat([past_k.transpose(1, 2).contiguous(), k_cur], dim=1)
+                        v_attn = torch.cat([past_v.transpose(1, 2).contiguous(), v_cur], dim=1)
+                    else:
+                        k_attn, v_attn = k_cur, v_cur
+            else:
+                k_attn, v_attn = k_cur, v_cur
+            out = self._attend_bshd(q_bshd, k_attn, v_attn)
+            return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), None
+
+        if past_key_values is not None:
+            if update_cache:
+                k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs=None)
+            else:
+                layer = past_key_values.layers[self.layer_idx]
+                past_k, past_v = layer.keys, layer.values
+                if past_k is not None:
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+        out, weights = self._attend_bhld(q, k, v, attention_mask)
+        return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), weights
+
+    def _route_o_proj(
+        self,
+        attn_out: torch.Tensor,
+        *,
+        text_mask: torch.Tensor,
+        gen_mask: torch.Tensor,
+        exist_text: bool,
+        exist_gen: bool,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Scatter the per-modality output projection via the shared Router.
+
+        ``self.o_proj``/``self.o_proj_mot_gen`` are this attention's per-modality
+        experts; routing through :func:`route_by_modality` makes the modality
+        dispatch the shared primitive (and tower-aware for mixed batches) instead
+        of model-private mask indexing. Only present modalities are routed."""
+        routes: dict[Modality, tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]] = {}
+        if exist_text:
+            routes[Modality.TEXT] = (text_mask, self.o_proj)
+        if exist_gen:
+            routes[Modality.GEN] = (gen_mask, self.o_proj_mot_gen)
+        return route_by_modality(
+            attn_out,
+            routes,
+            out=out,
+            transport=self._tower_transport,
+            coords=self._tower_coords,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any = None,
+        packed_rope: SenseNovaPackedRope | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, None]:
+        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
+            return self.forward_und(hidden_states, indexes, attention_mask, past_key_values, packed_rope=packed_rope, **kwargs)
+        if not exist_non_image_gen_tokens and exist_image_gen_tokens:
+            return self.forward_gen(hidden_states, indexes, attention_mask, past_key_values, packed_rope=packed_rope, **kwargs)
+
+        input_shape = hidden_states.shape[:-1]
+        text_mask = ~image_gen_indicators
+        if packed_rope is None:
+            packed_rope = self._packed_rope(_flatten_3d_indexes(indexes, hidden_states.shape[0], hidden_states.shape[1]))
+        q, k, v = self._project_qkv_routed(hidden_states, indexes, image_gen_indicators, packed_rope=packed_rope)
+
+        if past_key_values is not None:
+            update_cache = kwargs.get("update_cache", True)
+            if update_cache:
+                paged = self._attend_paged_update(q, k, v, past_key_values, attention_mask=attention_mask)
+                if paged is not None:
+                    out, weights = paged
+                    out = out.reshape(*input_shape, -1).contiguous()
+                    routed = self._route_o_proj(
+                        out,
+                        text_mask=text_mask,
+                        gen_mask=image_gen_indicators,
+                        exist_text=exist_non_image_gen_tokens,
+                        exist_gen=exist_image_gen_tokens,
+                        out=out.new_zeros((*input_shape, self.config.hidden_size)),
+                    )
+                    return routed, weights
+                k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs=None)
+            else:
+                layer = past_key_values.layers[self.layer_idx]
+                past_k, past_v = layer.keys, layer.values
+                if past_k is not None:
+                    k = torch.cat([past_k, k], dim=2)
+                    v = torch.cat([past_v, v], dim=2)
+        out, weights = self._attend_bhld(q, k, v, attention_mask)
+        out = out.reshape(*input_shape, -1).contiguous()
+        routed = self._route_o_proj(
+            out,
+            text_mask=text_mask,
+            gen_mask=image_gen_indicators,
+            exist_text=exist_non_image_gen_tokens,
+            exist_gen=exist_image_gen_tokens,
+            out=out.new_zeros((*input_shape, self.config.hidden_size)),
+        )
+        return routed, weights
+
+
+class _NativeQwen3DecoderLayer(nn.Module):
+    def __init__(self, config: Any, layer_idx: int) -> None:
+        super().__init__()
+        self.self_attn = _NativeQwen3Attention(config, layer_idx)
+        self.mlp = _NativeQwen3MLP(config)
+        self.mlp_mot_gen = _NativeQwen3MLP(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_type = config.layer_types[layer_idx]
+        # Per-modality sublayers as the SenseNova expert flavor, routed by the
+        # shared route_by_modality primitive; tower routing is a no-op when trivial.
+        self._tower_transport, self._tower_coords = _resolve_tower()
+        self._input_norm_by_modality = {
+            Modality.TEXT: self.input_layernorm,
+            Modality.GEN: self.input_layernorm_mot_gen,
+        }
+        self._mlp_by_modality = {
+            Modality.TEXT: (self.post_attention_layernorm, self.mlp),
+            Modality.GEN: (self.post_attention_layernorm_mot_gen, self.mlp_mot_gen),
+        }
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any = None,
+        use_cache: bool | None = False,
+        packed_rope: SenseNovaPackedRope | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del use_cache
+        if exist_non_image_gen_tokens != exist_image_gen_tokens:
+            hidden_states, residual = self.forward_with_residual(
+                hidden_states,
+                None,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+            return hidden_states + residual
+
+        text_mask = ~image_gen_indicators
+        residual = hidden_states
+        routed = route_by_modality(
+            hidden_states,
+            {
+                Modality.TEXT: (text_mask, self._input_norm_by_modality[Modality.TEXT]),
+                Modality.GEN: (image_gen_indicators, self._input_norm_by_modality[Modality.GEN]),
+            },
+            out=hidden_states.new_zeros(hidden_states.shape),
+            transport=self._tower_transport,
+            coords=self._tower_coords,
+        )
+        hidden_states, _ = self.self_attn(
+            routed,
+            image_gen_indicators,
+            exist_non_image_gen_tokens,
+            exist_image_gen_tokens,
+            indexes,
+            attention_mask,
+            past_key_values=past_key_values,
+            packed_rope=packed_rope,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+
+        def _mlp(modality: Modality) -> Callable[[torch.Tensor], torch.Tensor]:
+            post_norm, mlp = self._mlp_by_modality[modality]
+            return lambda x: mlp(post_norm(x))
+
+        routed = route_by_modality(
+            hidden_states,
+            {
+                Modality.TEXT: (text_mask, _mlp(Modality.TEXT)),
+                Modality.GEN: (image_gen_indicators, _mlp(Modality.GEN)),
+            },
+            out=hidden_states.new_zeros(hidden_states.shape),
+            transport=self._tower_transport,
+            coords=self._tower_coords,
+        )
+        return residual + routed
+
+    def forward_with_residual(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        *,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Any = None,
+        packed_rope: SenseNovaPackedRope | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
+            return self._forward_single_modality_with_residual(
+                hidden_states,
+                residual,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                attention_mask=attention_mask,
+                input_norm=self.input_layernorm,
+                post_norm=self.post_attention_layernorm,
+                mlp=self.mlp,
+                past_key_values=past_key_values,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+        if not exist_non_image_gen_tokens and exist_image_gen_tokens:
+            return self._forward_single_modality_with_residual(
+                hidden_states,
+                residual,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                attention_mask=attention_mask,
+                input_norm=self.input_layernorm_mot_gen,
+                post_norm=self.post_attention_layernorm_mot_gen,
+                mlp=self.mlp_mot_gen,
+                past_key_values=past_key_values,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+        return self(
+            hidden_states,
+            image_gen_indicators=image_gen_indicators,
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+            indexes=indexes,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            packed_rope=packed_rope,
+            **kwargs,
+        ), None
+
+    def _forward_single_modality_with_residual(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        *,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        input_norm: RMSNorm,
+        post_norm: RMSNorm,
+        mlp: nn.Module,
+        past_key_values: Any,
+        packed_rope: SenseNovaPackedRope | None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            attn_in = input_norm(hidden_states)
+        else:
+            attn_in, residual = input_norm.forward_with_residual(
+                hidden_states,
+                residual,
+                in_place=True,
+            )
+        attn_out, _ = self.self_attn(
+            attn_in,
+            image_gen_indicators,
+            exist_non_image_gen_tokens,
+            exist_image_gen_tokens,
+            indexes,
+            attention_mask,
+            past_key_values=past_key_values,
+            packed_rope=packed_rope,
+            **kwargs,
+        )
+        mlp_in, residual = post_norm.forward_with_residual(
+            attn_out,
+            residual,
+            in_place=True,
+        )
+        return mlp(mlp_in), residual
+
+    def forward_packed_visible(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        gen: torch.Tensor,
+        und: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+        packed_rope: SenseNovaPackedRope | None = None,
+    ) -> torch.Tensor:
+        # gen/und masks and the exist flags are precomputed once by the model
+        # and threaded down so each layer avoids per-layer device->host syncs.
+        if hidden_states.ndim != 2:
+            raise ValueError("SenseNova packed layer expects hidden_states [N, C]")
+
+        residual = hidden_states
+        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
+            routed = self.input_layernorm(hidden_states)
+        elif not exist_non_image_gen_tokens and exist_image_gen_tokens:
+            routed = self.input_layernorm_mot_gen(hidden_states)
+        else:
+            routed = route_by_modality(
+                hidden_states,
+                {
+                    Modality.TEXT: (und, self._input_norm_by_modality[Modality.TEXT]),
+                    Modality.GEN: (gen, self._input_norm_by_modality[Modality.GEN]),
+                },
+                out=hidden_states.new_empty(hidden_states.shape),
+                transport=self._tower_transport,
+                coords=self._tower_coords,
+            )
+
+        attn_out = self.self_attn.forward_packed_visible(
+            routed,
+            gen,
+            indexes,
+            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+            exist_image_gen_tokens=exist_image_gen_tokens,
+            und=und,
+            forward_stream=forward_stream,
+            kv_view=kv_view,
+            packed_rope=packed_rope,
+        )
+        hidden_states = residual + attn_out
+        residual = hidden_states
+
+        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
+            mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
+        elif not exist_non_image_gen_tokens and exist_image_gen_tokens:
+            mlp_out = self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states))
+        else:
+
+            def _mlp(modality: Modality) -> Callable[[torch.Tensor], torch.Tensor]:
+                post_norm, mlp = self._mlp_by_modality[modality]
+                return lambda x: mlp(post_norm(x))
+
+            mlp_out = route_by_modality(
+                hidden_states,
+                {
+                    Modality.TEXT: (und, _mlp(Modality.TEXT)),
+                    Modality.GEN: (gen, _mlp(Modality.GEN)),
+                },
+                out=hidden_states.new_empty(hidden_states.shape),
+                transport=self._tower_transport,
+                coords=self._tower_coords,
+            )
+        return residual + mlp_out
+
+
+class _NativeQwen3Model(nn.Module):
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            self.padding_idx,
+        )
+        self.layers = nn.ModuleList(
+            [_NativeQwen3DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.current_index = -1
+        # Final-norm routing uses the shared primitive; tower-aware when split.
+        self._tower_transport, self._tower_coords = _resolve_tower()
+        self._final_norm_by_modality = {
+            Modality.TEXT: self.norm,
+            Modality.GEN: self.norm_mot_gen,
+        }
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        image_gen_indicators: torch.Tensor | None = None,
+        indexes: torch.Tensor | None = None,
+        attention_mask: Any = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> BaseModelOutputWithPast:
+        del position_ids
+        inputs_embeds = self._resolve_inputs_embeds(input_ids, inputs_embeds)
+        image_gen_indicators = self._resolve_image_gen_indicators(image_gen_indicators, inputs_embeds)
+        exist_non_image_gen_tokens = bool((~image_gen_indicators).any())
+        exist_image_gen_tokens = bool(image_gen_indicators.any())
+        if use_cache and past_key_values is None:
+            raise RuntimeError("native decoder serving requires an explicit paged cache")
+        cache_position = self._resolve_cache_position(cache_position, past_key_values, inputs_embeds)
+        indexes, causal_mask_mapping = self._resolve_indexes_and_masks(indexes, attention_mask, inputs_embeds)
+        flat_indexes = _flatten_3d_indexes(indexes, inputs_embeds.shape[0], inputs_embeds.shape[1])
+        packed_rope = self.layers[0].self_attn._packed_rope(flat_indexes) if self.layers else None
+
+        if exist_non_image_gen_tokens != exist_image_gen_tokens:
+            hidden_states = self._forward_single_modality_layers(
+                inputs_embeds,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                causal_mask_mapping=causal_mask_mapping,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+        else:
+            hidden_states = self._forward_mixed_modality_layers(
+                inputs_embeds,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                causal_mask_mapping=causal_mask_mapping,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
+
+    def _resolve_inputs_embeds(
+        self,
+        input_ids: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError("exactly one of input_ids or inputs_embeds is required")
+        return self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
+
+    def _resolve_image_gen_indicators(
+        self,
+        image_gen_indicators: torch.Tensor | None,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        if image_gen_indicators is not None:
+            return image_gen_indicators
+        return torch.zeros(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
+
+    def _resolve_cache_position(
+        self,
+        cache_position: torch.Tensor | None,
+        past_key_values: Any,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        if cache_position is not None:
+            return cache_position
+        past_seen = past_key_values.get_seq_length() if past_key_values is not None else 0
+        return torch.arange(
+            past_seen,
+            past_seen + inputs_embeds.shape[1],
+            device=inputs_embeds.device,
+        )
+
+    def _resolve_indexes_and_masks(
+        self,
+        indexes: torch.Tensor | None,
+        attention_mask: Any,
+        inputs_embeds: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if isinstance(attention_mask, dict):
+            self.current_index = int(indexes[0].max().item())
+            return indexes, attention_mask
+        if indexes is None:
+            self.current_index += 1
+            indexes = torch.tensor(
+                [[self.current_index], [0], [0]],
+                dtype=torch.long,
+                device=inputs_embeds.device,
+            )
+        return indexes, {"full_attention": None}
+
+    def _forward_single_modality_layers(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        causal_mask_mapping: dict[str, Any],
+        past_key_values: Any,
+        cache_position: torch.Tensor,
+        packed_rope: SenseNovaPackedRope | None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        residual = None
+        for layer in self.layers:
+            hidden_states, residual = layer.forward_with_residual(
+                hidden_states,
+                residual,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                attention_mask=causal_mask_mapping[layer.attention_type],
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+        norm = self.norm_mot_gen if exist_image_gen_tokens else self.norm
+        if residual is None:
+            return norm(hidden_states)
+        hidden_states, _ = norm.forward_with_residual(hidden_states, residual, in_place=True)
+        return hidden_states
+
+    def _forward_mixed_modality_layers(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        exist_non_image_gen_tokens: bool,
+        exist_image_gen_tokens: bool,
+        indexes: torch.Tensor,
+        causal_mask_mapping: dict[str, Any],
+        past_key_values: Any,
+        use_cache: bool | None,
+        cache_position: torch.Tensor,
+        packed_rope: SenseNovaPackedRope | None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                image_gen_indicators=image_gen_indicators,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                attention_mask=causal_mask_mapping[layer.attention_type],
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                packed_rope=packed_rope,
+                **kwargs,
+            )
+        return route_by_modality(
+            hidden_states,
+            {
+                Modality.TEXT: (~image_gen_indicators, self._final_norm_by_modality[Modality.TEXT]),
+                Modality.GEN: (image_gen_indicators, self._final_norm_by_modality[Modality.GEN]),
+            },
+            out=hidden_states.new_zeros(hidden_states.shape),
+            transport=self._tower_transport,
+            coords=self._tower_coords,
+        )
+
+    def forward_packed_visible(
+        self,
+        inputs_embeds: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+    ) -> torch.Tensor:
+        if inputs_embeds.ndim != 2:
+            raise ValueError("SenseNova packed model expects inputs_embeds [N, C]")
+        if image_gen_indicators.shape != (inputs_embeds.shape[0],):
+            raise ValueError("SenseNova packed model expects image_gen_indicators [N]")
+        if indexes.shape != (3, inputs_embeds.shape[0]):
+            raise ValueError("SenseNova packed model expects indexes [3, N]")
+        gen = image_gen_indicators.to(dtype=torch.bool)
+        und = ~gen
+        exist_non_image_gen_tokens = bool(und.any())
+        exist_image_gen_tokens = bool(gen.any())
+        packed_rope = self.layers[0].self_attn._packed_rope(indexes) if self.layers else None
+
+        hidden_states = inputs_embeds
+        # The und/gen split is constant for the whole packed batch, so compute
+        # the masks/exist flags once here and thread them into every layer
+        # instead of re-deriving them per layer (each bool(.any()) on a CUDA
+        # tensor forces a host sync, serializing the kernel chain).
+        for layer in self.layers:
+            hidden_states = layer.forward_packed_visible(
+                hidden_states,
+                gen=gen,
+                und=und,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                indexes=indexes,
+                forward_stream=forward_stream,
+                kv_view=kv_view,
+                packed_rope=packed_rope,
+            )
+        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
+            return self.norm(hidden_states)
+        if not exist_non_image_gen_tokens and exist_image_gen_tokens:
+            return self.norm_mot_gen(hidden_states)
+        return route_by_modality(
+            hidden_states,
+            {
+                Modality.TEXT: (und, self._final_norm_by_modality[Modality.TEXT]),
+                Modality.GEN: (gen, self._final_norm_by_modality[Modality.GEN]),
+            },
+            out=hidden_states.new_empty(hidden_states.shape),
+            transport=self._tower_transport,
+            coords=self._tower_coords,
+        )
+
+
+class _NativeQwen3ForCausalLM(nn.Module):
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        self.config = config
+        self.model = _NativeQwen3Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
+    def set_output_embeddings(self, value: nn.Module) -> None:
+        self.lm_head = value
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        *,
+        indexes: torch.Tensor | None = None,
+        attention_mask: Any = None,
+        past_key_values: Any = None,
+        inputs_embeds: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        logits_to_keep: int | torch.Tensor = 0,
+        **kwargs: Any,
+    ) -> CausalLMOutputWithPast:
+        outputs = self.model(
+            input_ids=input_ids,
+            indexes=indexes,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            **kwargs,
+        )
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(outputs.last_hidden_state[:, slice_indices, :])
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.last_hidden_state,
+        )
+
+
+class NEOChatModel(nn.Module):
+    """Native SenseNova language model with interleaved vision and flow-matching heads."""
+
+    config_class = NeoChatConfig
+
+    def __init__(self, config: NeoChatConfig) -> None:
+        super().__init__()
+        self.config = config
+        patch_size = int(config.vision_config.patch_size)
+        self.patch_size = patch_size
+        self.template = config.template
+        self.downsample_ratio = config.downsample_ratio
+        # The native decoder routes attention through the worker-owned
+        # RadixAttention seam, so HF's own attention dispatch must stay out of the
+        # way: force "eager" to disable transformers' internal SDPA/flash paths.
+        config.llm_config._attn_implementation = "eager"
+        if isinstance(config.llm_config, NeoMoeLlmConfig):
+            raise RuntimeError("native SenseNova MoE checkpoints are not yet wired in this model entry")
+        # Enter the checkpoint quantization context for all layer construction so
+        # the model is self-contained instead of relying on an ambient context.
+        self._quant_config = QuantizationConfig.from_model_config(config)
+        merge_size = int(1 / self.downsample_ratio)
+        output_dim = 3 * (patch_size * merge_size) ** 2
+        hidden = int(config.llm_config.hidden_size)
+        self.use_deep_fm_head = bool(config.fm_head_layers > 2)
+        self.use_pixel_head = bool(config.use_pixel_head)
+        with use_quantization_config(self._quant_config):
+            self._build_backbone(config, hidden=hidden, output_dim=output_dim)
+
+        self._init_flow_params(config, hidden=hidden)
+
+        self.img_context_token_id = None
+        self.img_start_token_id = DEFAULT_IMG_START_TOKEN_ID
+        self.system_message = ""
+
+    def _build_fm_head(self, config: NeoChatConfig, *, hidden: int, output_dim: int) -> nn.Module:
+        """Construct the flow-matching head module (deep vs. shallow variant).
+
+        Called inside the checkpoint quantization context so its ``LinearBase``
+        layers pick up the active quant config.
+        """
+        if self.use_deep_fm_head:
+            return FlowMatchingHead(
+                hidden,
+                output_dim,
+                dim=config.fm_head_dim,
+                layers=config.fm_head_layers,
+                mlp_ratio=config.fm_head_mlp_ratio,
+            )
+        return nn.Sequential(
+            LinearBase(hidden, 4096, bias=True),
+            nn.GELU(),
+            LinearBase(4096, output_dim, bias=True),
+        )
+
+    def _build_backbone(self, config: NeoChatConfig, *, hidden: int, output_dim: int) -> None:
+        """Build and register the vision towers, language model, and fm modules.
+
+        Must run inside the ``use_quantization_config`` context so every
+        constructed layer is materialized against the checkpoint quant config.
+        """
+        self.vision_model = NeoVisionModel(config.vision_config)
+        vision_model_mot_gen = NeoVisionModel(config.vision_config)
+        self.language_model = _NativeQwen3ForCausalLM(config.llm_config)
+
+        fm_head = self._build_fm_head(config, hidden=hidden, output_dim=output_dim)
+
+        self.fm_modules = nn.ModuleDict(
+            {
+                "vision_model_mot_gen": vision_model_mot_gen,
+                "timestep_embedder": TimestepEmbedder(hidden),
+                "fm_head": fm_head,
+            }
+        )
+        if self.use_pixel_head:
+            self.fm_modules["fm_head"] = ConvDecoder(hidden)
+
+    def _init_flow_params(self, config: NeoChatConfig, *, hidden: int) -> None:
+        """Copy the flow-matching scalar config and add the optional embedder."""
+        self.concat_time_token_num = config.concat_time_token_num
+        self.noise_scale = config.noise_scale
+        self.noise_scale_mode = config.noise_scale_mode
+        self.noise_scale_base_image_seq_len = config.noise_scale_base_image_seq_len
+        self.add_noise_scale_embedding = config.add_noise_scale_embedding
+        self.noise_scale_max_value = config.noise_scale_max_value
+        self.time_schedule = config.time_schedule
+        self.time_shift_type = config.time_shift_type
+        self.base_shift = config.base_shift
+        self.max_shift = config.max_shift
+        self.base_image_seq_len = config.base_image_seq_len
+        self.max_image_seq_len = config.max_image_seq_len
+        if self.add_noise_scale_embedding:
+            self.fm_modules["noise_scale_embedder"] = TimestepEmbedder(hidden)
+
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
+    def extract_feature(
+        self,
+        pixel_values: torch.Tensor,
+        gen_model: bool = False,
+        grid_hw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        tower = self.fm_modules["vision_model_mot_gen"] if gen_model else self.vision_model
+        return tower(
+            pixel_values=pixel_values,
+            output_hidden_states=False,
+            return_dict=True,
+            grid_hw=grid_hw,
+        ).last_hidden_state
+
+    def _build_t2i_query(
+        self,
+        prompt_text: str,
+        system_message: str | None = None,
+        append_text: str | None = None,
+    ) -> str:
+        return _neo_prompt(
+            self.template,
+            prompt_text,
+            system_message=self.system_message if system_message is None else system_message,
+            append_text=append_text,
+        )
+
+    def _build_t2i_text_inputs(self, tokenizer: Any, query: str):
+        model_inputs = tokenizer(query, return_tensors="pt")
+        input_ids = model_inputs["input_ids"].to(self.device)
+        t_idx = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
+        h_idx = torch.zeros_like(t_idx)
+        w_idx = torch.zeros_like(t_idx)
+        indexes = torch.stack([t_idx, h_idx, w_idx], dim=0)
+        from ...runtime.masks import create_block_causal_mask
+
+        return input_ids, indexes, {"full_attention": create_block_causal_mask(indexes[0])}
+
+    def _build_t2i_image_indexes(
+        self,
+        token_h: int,
+        token_w: int,
+        text_len: int,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        t_image = torch.full((token_h * token_w,), text_len, dtype=torch.long, device=device)
+        idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
+        h_image = idx // token_w
+        w_image = idx % token_w
+        return torch.stack([t_image, h_image, w_image], dim=0)
+
+    def _t2i_predict_v(
+        self,
+        input_embeds: torch.Tensor,
+        indexes_image: torch.Tensor,
+        attn_mask: Any,
+        past_key_values: Any,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        image_token_num: int,
+        timestep_embeddings: torch.Tensor | None = None,
+        image_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        # timestep_embeddings is part of the cross-file _t2i_predict_v call
+        # contract (interleaved_image / reference denoise drivers pass it) but
+        # this native path conditions on t inside _t2i_hidden_to_x_pred, so the
+        # precomputed embedding is unused here.
+        del timestep_embeddings
+        outputs = self.language_model.model(
+            inputs_embeds=input_embeds,
+            image_gen_indicators=torch.ones(
+                input_embeds.shape[:2],
+                dtype=torch.bool,
+                device=input_embeds.device,
+            ),
+            indexes=indexes_image,
+            attention_mask=attn_mask,
+            past_key_values=past_key_values,
+            update_cache=False,
+            use_cache=True,
+        )
+        x_pred = self._t2i_hidden_to_x_pred(
+            outputs.last_hidden_state,
+            t,
+            z,
+            image_token_num=image_token_num,
+            image_size=image_size,
+        )
+        return (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
+
+    def _t2i_hidden_to_x_pred(
+        self,
+        hidden_states: torch.Tensor,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        batch, latent_len = z.shape[0], z.shape[1]
+        if self.use_pixel_head:
+            if image_size is None:
+                raise RuntimeError("pixel head requires image_size")
+            merge_size = int(1 / self.downsample_ratio)
+            token_h = image_size[1] // (self.patch_size * merge_size)
+            token_w = image_size[0] // (self.patch_size * merge_size)
+            img = hidden_states[:, -image_token_num:].view(batch, token_h, token_w, -1)
+            img = torch.einsum("b h w c -> b c h w", img).contiguous()
+            smoothed = self.fm_modules["fm_head"](img.view(batch, -1, token_h, token_w))
+            smoothed = smoothed.view(
+                batch,
+                3,
+                token_h,
+                self.patch_size * merge_size,
+                token_w,
+                self.patch_size * merge_size,
+            )
+            smoothed = torch.einsum("b c h p w q -> b h w p q c", smoothed)
+            return smoothed.contiguous().view(
+                batch,
+                latent_len,
+                self.patch_size * merge_size * self.patch_size * merge_size * 3,
+            )
+        if self.use_deep_fm_head:
+            return self.fm_modules["fm_head"](
+                hidden_states[:, -image_token_num:].view(batch * latent_len, -1),
+                t.repeat(batch * latent_len),
+            ).view(batch, latent_len, -1)
+        return self.fm_modules["fm_head"](
+            hidden_states[:, -image_token_num:].view(batch, latent_len, -1)
+        ).view(batch, latent_len, -1)
+
+    def _t2i_hidden_to_velocity(
+        self,
+        hidden_states: torch.Tensor,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        x_pred = self._t2i_hidden_to_x_pred(
+            hidden_states,
+            t,
+            z,
+            image_token_num=image_token_num,
+            image_size=image_size,
+        )
+        return (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
+
+    def get_output_embeddings(self) -> nn.Module:
+        return self.language_model.get_output_embeddings()
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.language_model.get_input_embeddings()
+
+
+def check_checkpoint_compatibility(config_or_dict: Any) -> None:
+    try:
+        from packaging.version import Version
+    except ImportError:  # pragma: no cover
+        return
+    cfg = config_or_dict.to_dict() if hasattr(config_or_dict, "to_dict") else config_or_dict
+    if not isinstance(cfg, dict):
+        return
+    required = cfg.get("uniserve_sensenova_min_version")
+    if required and Version(SENSENOVA_MODEL_CODE_VERSION) < Version(str(required)):
+        raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
+
+
+class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
+    """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
+
+    architectures = ("NEOChatModel", "neo_chat", "neo-unify", "neo_unify")
+    supported_ops = ("prefill_und", "decode_und", "denoise_gen", "commit_gen", "commit_writeback")
+    supported_controls: tuple[str, ...] = ()
+    adapter_mode = "none"
+    resource_plan = ResourcePlan(
+        kv_block=KvBlockResourcePolicy.PER_BLOCK,
+        image_latent=LatentTokens(downsample=16),
+        scratch=PerBranch(),
+    )
+    velocity_parameterization = "velocity"
+
+    def __init__(
+        self,
+        config: Any | None = None,
+        *,
+        model=None,
+        tokenizer=None,
+        device: str = "cpu",
+        gen_snapshot_kv_capacity: int | None = None,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+        kv_token_capacity: int | None = None,
+        attention_backend: str | None = None,
+        tower_role: str | None = None,
+    ) -> None:
+        self.config = config
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = str(device)
+        # Tower device profile: when set ("und"/"gen"), only this tower's modules
+        # were materialized by the loader; the other tower's params stay on
+        # ``meta`` (no memory, never read by this worker's ops).
+        # ``None`` (default / single-device) materializes the whole model.
+        self.tower_role = tower_role
+        self._init_tower_profile()
+        self.gen_snapshot_kv_capacity = gen_snapshot_kv_capacity
+        self.block_size = int(block_size)
+        self.kv_token_capacity = kv_token_capacity
+        self.attention_backend = attention_backend or "auto"
+        self.runner_states: dict[int, RunnerRequestState] = {}
+        # Model-owned per-request interleaved image state, keyed by req_id and
+        # cleared in drop_request (the authoritative owner).
+        self.reqs: dict[int, InterleavedImageRequestState] = {}
+
+        llm_cfg = self._init_token_geometry(config)
+        self.resource_plan = ResourcePlan(
+            kv_block=KvBlockResourcePolicy.PER_BLOCK,
+            image_latent=LatentTokens(downsample=int(self.latent_downsample)),
+            scratch=PerBranch(),
+        )
+
+        n_kv, head_dim = self._init_kv_geometry(config, llm_cfg, kv_token_capacity)
+        self._init_empty_residency_state()
+        self._torch_compile_applied = False
+        if self.model is not None:
+            self._init_loaded_model_residency(n_kv, head_dim, gen_snapshot_kv_capacity)
+            self._maybe_compile_piecewise()
+        # The und↔gen crossing is one model-facing object over the tower axis.
+        # In-process transport binds NVLink peer copy; a trivial tower binds None
+        # and degrades to a same-device scratch copy. The binding resolves live
+        # so destination residency tracks the tower-vs-trivial choice.
+        self._tower_handoff: TowerHandoff = LocalP2PTowerHandoff(self._resolve_tower_binding)
+        # Mode A (tower disaggregation): the cross-process conditioning crossing is a
+        # separate object bound to the worker's data-plane transport by the runner
+        # driver (``bind_data_plane_handoff``). ``None`` in Mode C / single-device,
+        # where the per-branch staging above is the whole crossing.
+        self._dataplane_handoff: DataPlaneTowerHandoff | None = None
+        self._img_start_token = IMG_START_TOKEN
+
+    def _init_tower_profile(self) -> None:
+        # The generation tower is the ``tower`` mesh axis. A trivial/absent tower
+        # leaves coords/transport unset and ``gen_device == device``.
+        self.mesh = get_current_mesh()
+        self._tower_coords = tower_modality_coords(self.mesh)
+        self._tower_transport = (
+            self.mesh.axis("tower").transport if self._tower_coords is not None else None
+        )
+        tower_devices = (
+            getattr(self._tower_transport, "devices", None)
+            if self._tower_transport is not None
+            else None
+        )
+        self.gen_device = (
+            str(tower_devices[self._tower_coords[Modality.GEN]])
+            if tower_devices is not None and self._tower_coords is not None
+            else self.device
+        )
+
+    def _init_token_geometry(self, config: Any | None) -> Any:
+        if self.model is not None and self.tokenizer is not None:
+            self.img_start_id = self.tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
+            self.img_end_id = self.tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+            self.eos_id = self.tokenizer.eos_token_id
+            self.merge_size = int(1 / self.model.downsample_ratio)
+            self.latent_downsample = int(self.model.patch_size * self.merge_size)
+            self.max_latent_size = int(
+                getattr(self.model.config, "max_image_seq_len", DEFAULT_MAX_IMAGE_SEQ_LEN)
+                or DEFAULT_MAX_IMAGE_SEQ_LEN
+            )
+            return getattr(self.model.config, "llm_config", None)
+        self.img_start_id = 0
+        self.img_end_id = 0
+        self.eos_id = DEFAULT_EOS_TOKEN_ID
+        self.merge_size = 2
+        self.latent_downsample = 16
+        self.max_latent_size = _config_int(config, "max_image_seq_len", DEFAULT_MAX_IMAGE_SEQ_LEN)
+        if isinstance(config, dict):
+            return config.get("llm_config") or {}
+        return getattr(config, "llm_config", None) if config is not None else None
+
+    def _init_kv_geometry(
+        self,
+        config: Any | None,
+        llm_cfg: Any,
+        kv_token_capacity: int | None,
+    ) -> tuple[int, int]:
+        getter = llm_cfg.get if isinstance(llm_cfg, dict) else lambda key, default=None: getattr(llm_cfg, key, default)
+        self.num_layers = int(getter("num_hidden_layers", DEFAULT_NUM_HIDDEN_LAYERS) or DEFAULT_NUM_HIDDEN_LAYERS)
+        n_kv = int(getter("num_key_value_heads", DEFAULT_NUM_KEY_VALUE_HEADS) or DEFAULT_NUM_KEY_VALUE_HEADS)
+        head_dim = int(getter("head_dim", DEFAULT_HEAD_DIM) or DEFAULT_HEAD_DIM)
+        self.kv_cache_dtype = get_current_kv_cache_dtype(config)
+        if self.kv_cache_dtype in {None, "auto", "native", "compute"}:
+            self.kv_cache_dtype = "bf16"
+        self._kv_num_heads = n_kv
+        self._kv_head_dim = head_dim
+        self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
+        self.num_blocks = derive_num_blocks(self.block_size, kv_token_capacity)
+        return n_kv, head_dim
+
+    def _init_empty_residency_state(self) -> None:
+        self.kv_pool: PagedKVPool | None = None
+        self.scratch_pool: PagedKVPool | None = None
+        self.gen_scratch_pool: PagedKVPool | None = None
+        self._scratch_free: list[int] = []
+        self._gen_scratch_free: list[int] = []
+        self._scratch_blocks = 0
+        self.residency = ResidencyManager()
+
+    def _init_loaded_model_residency(
+        self,
+        n_kv: int,
+        head_dim: int,
+        gen_snapshot_kv_capacity: int | None,
+    ) -> None:
+        dtype = torch.bfloat16
+        self._tag_generation_towers()
+        place_towers(self.model, self.mesh)
+        self.bytes_per_token = self._kv_bytes_per_token(dtype)
+        scratch_blocks, gen_blocks = self._scratch_block_counts(gen_snapshot_kv_capacity)
+        self.residency = ResidencyManager.build_gen(
+            GenResidencySpec(
+                kv=KvCacheSpec(
+                    num_layers=self.num_layers,
+                    num_kv_heads=n_kv,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    store_dtype=self._kv_store_dtype_for(dtype),
+                ),
+                num_blocks=self.num_blocks,
+                block_size=self.block_size,
+                device=self.device,
+                scratch_num_blocks=scratch_blocks,
+                gen_scratch_num_blocks=gen_blocks,
+                gen_device=self.gen_device if gen_blocks is not None else None,
+                gen_tower_coord=(
+                    self._tower_coords[Modality.GEN]
+                    if self._tower_coords is not None
+                    else None
+                ),
+            )
+        )
+        self.kv_pool = self.residency.kv
+        self.scratch_pool = self.residency.scratch
+        self.gen_scratch_pool = self.residency.gen_scratch
+        self._scratch_free = list(range(scratch_blocks))
+        self._scratch_blocks = scratch_blocks
+        if gen_blocks is not None:
+            self._gen_scratch_free = list(range(gen_blocks))
+
+    def _scratch_block_counts(self, gen_snapshot_kv_capacity: int | None) -> tuple[int, int | None]:
+        image_scratch_blocks = max(1, ceil_div(self.max_latent_size, self.block_size))
+        scratch_blocks = max(8, self.num_blocks + image_scratch_blocks * 4)
+        gen_blocks: int | None = None
+        if self._tower_coords is not None:
+            gen_blocks = scratch_blocks
+            if gen_snapshot_kv_capacity is not None:
+                gen_blocks = max(1, int(gen_snapshot_kv_capacity) // self.block_size)
+        return scratch_blocks, gen_blocks
+
+    @classmethod
+    def native_load_spec(cls) -> NativeLoadSpec:
+        """Declare how the native HF checkpoint is materialized.
+
+        ``NativeTransformersLoader`` drives the meta-init + per-tensor streaming
+        from this spec; ``from_native`` then builds the serving wrapper.
+        """
+        from transformers import AutoTokenizer
+
+        return NativeLoadSpec(
+            config_cls=NeoChatConfig,
+            model_cls=NEOChatModel,
+            tokenizer_cls=AutoTokenizer,
+            attention_env="UNISERVE_SENSENOVA_ATTN",
+            dtype_env="UNISERVE_SENSENOVA_DTYPE",
+            config_patch=patch_sensenova_config,
+            compatibility_check=check_checkpoint_compatibility,
+            stacked_params_mapping=(
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
+                ("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
+                ("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ),
+        )
+
+    @staticmethod
+    def _is_gen_tower_param(name: str) -> bool:
+        """True for a checkpoint param that belongs to the generation tower.
+
+        The gen tower is exactly the modules tagged by ``_tag_generation_towers``:
+        the ``*_mot_gen`` attn/mlp/norm branch (incl. ``norm_mot_gen`` and the gen
+        ViT ``vision_model_mot_gen``) plus ``fm_modules`` (fm_head, timestep
+        embedder). Every such param's name carries ``_mot_gen`` or sits under
+        ``fm_modules``; the complement is the understanding tower."""
+        return "_mot_gen" in name or name.startswith("fm_modules.")
+
+    @classmethod
+    def tower_role_param_filter(cls, tower_role: str | None) -> Any:
+        """Map a tower role to a checkpoint-param predicate for partial load.
+
+        ``"gen"`` keeps only the generation-tower params; ``"und"`` keeps the
+        complement (embed/lm_head/und attn-mlp-norm/model norm/und ViT). ``None``
+        returns ``None`` (no filter — the whole model loads).
+        """
+        if tower_role is None:
+            return None
+        if tower_role == "gen":
+            return cls._is_gen_tower_param
+        if tower_role == "und":
+            return lambda name: not cls._is_gen_tower_param(name)
+        raise ValueError(f"unknown tower_role {tower_role!r}")
+
+    @classmethod
+    def from_native(
+        cls,
+        inner: nn.Module,
+        *,
+        tokenizer: Any,
+        device: str,
+        gen_snapshot_kv_capacity: int | None = None,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+        kv_token_capacity: int | None = None,
+        attention_backend: str | None = None,
+        tower_role: str | None = None,
+        **_kwargs: Any,
+    ) -> "SenseNovaU1ForUnifiedGeneration":
+        """Wrap the natively-materialized inner model into the serving model."""
+        return cls(
+            inner.config,
+            model=inner,
+            tokenizer=tokenizer,
+            device=device,
+            gen_snapshot_kv_capacity=gen_snapshot_kv_capacity,
+            block_size=block_size,
+            kv_token_capacity=kv_token_capacity,
+            attention_backend=attention_backend,
+            tower_role=tower_role,
+        )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_path: str,
+        *,
+        device: str,
+        gen_snapshot_kv_capacity: int | None = None,
+        block_size: int = DEFAULT_BLOCK_SIZE,
+        kv_token_capacity: int | None = None,
+        attention_backend: str | None = None,
+        tower_role: str | None = None,
+        **_kwargs: Any,
+    ) -> "SenseNovaU1ForUnifiedGeneration":
+        # Route the heavy materialization through the registered native loader so
+        # it is governed by the BaseModelLoader contract; ``from_native`` builds
+        # the serving wrapper from the loader's result. ``tower_role`` selects the
+        # loader's partial-load filter and is threaded to the wrapper.
+        from ...loader import get_loader
+
+        return get_loader("native").load_model(
+            cls,
+            None,
+            device=device,
+            model_path=model_path,
+            gen_snapshot_kv_capacity=gen_snapshot_kv_capacity,
+            block_size=block_size,
+            kv_token_capacity=kv_token_capacity,
+            attention_backend=attention_backend,
+            tower_role=tower_role,
+        ).model
+
+    def _caps_descriptor(
+        self,
+        *,
+        block_size: int | None = None,
+        kv_token_capacity: int | None = None,
+    ) -> CapsDescriptor:
+        block = int(block_size or self.block_size)
+        token_capacity = kv_token_capacity if kv_token_capacity is not None else self.kv_token_capacity
+        num_blocks = max(1, int(token_capacity) // block) if token_capacity else int(self.num_blocks)
+        # Report scratch pool capacity in tokens; use a large sentinel when no pool exists.
+        scratch_capacity_tokens = (
+            int(self._scratch_blocks) * block if self._scratch_blocks > 0 else 1 << 24
+        )
+        return CapsDescriptor(
+            block_size=block,
+            num_blocks=num_blocks,
+            num_layers=self.num_layers,
+            scratch_capacity_tokens=scratch_capacity_tokens,
+            max_latent_size=int(self.max_latent_size),
+            latent_downsample=int(self.latent_downsample),
+            bytes_per_token=int(self.bytes_per_token),
+            max_batch_ops=MAX_BATCH_OPS,
+            attention_backend=self.attention_backend,
+            kv_dtype=self._kv_dtype_name_for(torch.bfloat16),
+        )
+
+    def compile_targets(self) -> tuple[CompileTarget, ...]:
+        language_model = getattr(self.model, "language_model", None)
+        decoder = getattr(language_model, "model", None)
+        if not isinstance(decoder, nn.Module):
+            return ()
+        return (
+            CompileTarget(
+                label="sensenova.language_model.model",
+                module=decoder,
+                owner=language_model if isinstance(language_model, nn.Module) else None,
+                attr_name="model" if isinstance(language_model, nn.Module) else None,
+            ),
+        )
+
+    def _kv_bytes_per_token(self, compute_dtype: torch.dtype) -> int:
+        return kv_cache_bytes_per_token(
+            num_kv_heads=self._kv_num_heads,
+            head_dim=self._kv_head_dim,
+            num_layers=self.num_layers,
+            compute_dtype=compute_dtype,
+            store_dtype=self.kv_cache_dtype,
+        )
+
+    def _maybe_compile_piecewise(self) -> None:
+        if self._torch_compile_applied:
+            return
+        cfg = TorchCompileConfig.from_env()
+        if not cfg.enabled:
+            return
+        report = compile_model_pieces(self, config=cfg)
+        self._torch_compile_applied = True
+        if report.compiled:
+            logger.info(
+                "enabled SenseNova native Qwen3 model-stack torch.compile pieces count=%s",
+                report.compiled,
+            )
+
+    def _tag_generation_towers(self) -> None:
+        """Tag the generation-tower modules ``Pinned(tower, gen)`` for placement.
+
+        Declares which modules belong to the gen tower; the generic
+        :func:`place_towers` pass realizes device placement from these tags.
+        A trivial/absent tower leaves the model untagged (a no-op).
+        """
+        if self.model is None or self._tower_coords is None:
+            return
+        gen = self._tower_coords[Modality.GEN]
+        set_tower_coord(self.model.fm_modules, gen)
+        decoder = self.model.language_model.model
+        set_tower_coord(decoder.norm_mot_gen, gen)
+        for layer in decoder.layers:
+            set_tower_coord(layer.input_layernorm_mot_gen, gen)
+            set_tower_coord(layer.post_attention_layernorm_mot_gen, gen)
+            set_tower_coord(layer.mlp_mot_gen, gen)
+            attn = layer.self_attn
+            attn_modules = [
+                attn.qkv_proj_mot_gen,
+                attn.o_proj_mot_gen,
+                attn.q_norm_mot_gen,
+                attn.k_norm_mot_gen,
+                attn.q_norm_hw_mot_gen,
+                attn.k_norm_hw_mot_gen,
+            ]
+            for module in attn_modules:
+                set_tower_coord(module, gen)
+
+    def _wait_gen_cache_ready(self, cache: Any) -> None:
+        """Gen tower waits until the staged snapshot is fully written."""
+        self._tower_handoff.await_ready(cache)
+
+    def _prepare_generated_image_for_commit(self, image_state: ImageState) -> torch.Tensor:
+        """Bring the finished latent back to the understanding device for commit."""
+        if self._dataplane_handoff is not None:
+            return image_state.x_t[0].unsqueeze(0).to(
+                device=self.device, dtype=torch.bfloat16, non_blocking=True
+            )
+        return self._tower_handoff.writeback_commit(
+            image_state.x_t[0].unsqueeze(0),
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+
+    def publish_generated_latent_for_commit(self, image_state: ImageState) -> Any:
+        if self._dataplane_handoff is None:
+            return self._prepare_generated_image_for_commit(image_state)
+        return self._dataplane_handoff.publish_commit_latent(image_state.x_t[0].unsqueeze(0))
+
+    def fetch_commit_latent(self, locator: Any) -> torch.Tensor:
+        if self._dataplane_handoff is None:
+            raise RuntimeError("commit_writeback requires a data-plane handoff")
+        if isinstance(locator, str):
+            import base64
+            import pickle
+
+            locator = pickle.loads(base64.b64decode(locator.encode("ascii")))
+        latent = self._dataplane_handoff.data_plane.fetch(locator)
+        return latent.to(device=self.device, dtype=torch.bfloat16, non_blocking=True)
+
+    @staticmethod
+    def encode_commit_locator(locator: Any) -> str:
+        import base64
+        import pickle
+
+        return base64.b64encode(pickle.dumps(locator, protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")
+
+    @staticmethod
+    def _alloc_from_free_list(free_list: list[int], count: int, *, label: str) -> list[int]:
+        """Pop ``count`` block ids off a scratch free-list (shared by the
+        understanding and generation-device scratch pools)."""
+        count = int(count)
+        if count <= 0:
+            return []
+        if len(free_list) < count:
+            raise RuntimeError(
+                f"SenseNova {label} KV pool exhausted: need {count}, have {len(free_list)}"
+            )
+        out = free_list[:count]
+        del free_list[:count]
+        return out
+
+    @staticmethod
+    def _release_to_free_list(free_list: list[int], block_ids: Sequence[int]) -> None:
+        """Return block ids to a sorted, deduplicated scratch free-list.
+
+        Shared by both scratch pools. The list is kept sorted-and-unique by
+        merge-inserting only the not-yet-present ids, so a release is linear in
+        the free-list size instead of re-sorting the whole growing list each
+        time.         Already-present ids (double-free) are dropped without error.
+        """
+        for block_id in block_ids:
+            block_id = int(block_id)
+            position = bisect.bisect_left(free_list, block_id)
+            if position < len(free_list) and free_list[position] == block_id:
+                continue
+            free_list.insert(position, block_id)
+
+    def allocate_gen_scratch_blocks(self, count: int) -> list[int]:
+        if self.gen_scratch_pool is None:
+            raise RuntimeError("SenseNova gen snapshot KV pool is not initialized")
+        return self._alloc_from_free_list(
+            self._gen_scratch_free, count, label="gen snapshot"
+        )
+
+    def _resolve_tower_binding(self) -> TowerBinding:
+        """Resolve the live destination residency + coordinates for a crossing.
+
+        A tower split stages into the gen-tower KV residency over the tower
+        transport with copy barriers; a trivial tower stages a same-device copy into
+        the per-branch scratch pool as a writable replica, byte-identical to the
+        single-device path."""
+        if self._tower_coords is not None:
+            return TowerBinding(
+                transport=self._tower_transport,
+                primary_coord=self._tower_coords[Modality.TEXT],
+                gen_coord=self._tower_coords[Modality.GEN],
+                num_layers=self.num_layers,
+                block_size=self.block_size,
+                target_pool=self.gen_scratch_pool,
+                target_device=self.gen_device,
+                allocate_blocks=self.allocate_gen_scratch_blocks,
+            )
+        return TowerBinding(
+            transport=None,
+            primary_coord=0,
+            gen_coord=0,
+            num_layers=self.num_layers,
+            block_size=self.block_size,
+            target_pool=self.scratch_pool,
+            target_device=self.device,
+            allocate_blocks=self.allocate_scratch_blocks,
+        )
+
+    def _denoise_cache(self, cache: Any) -> Any:
+        """Snapshot the cond-KV into a writable replica for denoising.
+
+        The whole und->gen KV crossing is owned by :class:`TowerHandoff`."""
+        return self._tower_handoff.stage_conditioning(cache)
+
+    def _allocator_for_cache(self, cache: Any) -> Any:
+        pool = getattr(cache, "pool", None)
+        if pool is self.kv_pool:
+            return None
+        if pool is self.gen_scratch_pool:
+            return self.allocate_gen_scratch_blocks
+        if pool is self.scratch_pool:
+            return self.allocate_scratch_blocks
+        return None
+
+    def bind_data_plane_handoff(self, transport: Any) -> None:
+        """Bind the Mode-A cross-process und<->gen handoff to a data-plane transport.
+
+        Called by the runner driver on a tower-disaggregated (und/gen) worker. The
+        per-branch :attr:`_tower_handoff` (local, same-device) is unchanged; this
+        adds the cross-process publish (und) / fetch (gen) of the conditioning KV
+        over the registered ``cuda_ipc`` / ``mooncake`` transport."""
+        self._dataplane_handoff = DataPlaneTowerHandoff(
+            data_plane=transport, bind=self._resolve_tower_binding
+        )
+
+    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
+        """und side: when text decode emits ``img_start``, publish ``st.cond``.
+
+        Returns the wire locator (for ``SeqResult.locator``) the gen pool will fetch
+        and rebuild ``st.cond`` from, or ``None`` outside Mode A / a non-image token.
+        A no-op unless a data-plane handoff is bound (Mode A)."""
+        if self._dataplane_handoff is None:
+            return None
+        if int(sampled_token_id) != int(self.img_start_id):
+            return None
+        st = self.reqs.get(int(req_id))
+        if st is None or st.cond.past is None:
+            return None
+        # Guarantee the conditioning ends with img_start (idempotent text append) so
+        # the gen side's img-start guard is satisfied without an und text forward.
+        self._ensure_img_start(st.cond)
+        params = self._parse_image_params(st.image or {})
+        need_tu = params.cfg_text > 1.0 or (
+            params.cfg_img > 1.0 and params.cfg_text != params.cfg_img
+        )
+        if need_tu:
+            if st.tu.past is None:
+                st.tu = self._empty_img_start_prefix()
+            else:
+                self._ensure_img_start(st.tu)
+        need_iu = params.cfg_img > 1.0
+        if need_iu:
+            if st.iu.past is None:
+                st.iu = self._empty_img_start_prefix()
+            else:
+                self._ensure_img_start(st.iu)
+        snapshot = self._dataplane_handoff.publish_conditioning(
+            st.cond.past, t_index=int(st.cond.t_index), last_token_id=st.cond.last_token_id,
+            tu_cache=st.tu.past if need_tu else None,
+            tu_t_index=int(st.tu.t_index),
+            tu_last_token_id=st.tu.last_token_id,
+            iu_cache=st.iu.past if need_iu else None,
+            iu_t_index=int(st.iu.t_index),
+            iu_last_token_id=st.iu.last_token_id,
+        )
+        return snapshot.to_wire() if snapshot is not None else None
+
+    def _stage_text_cache_from_snapshot(
+        self,
+        target: TextCache,
+        snapshot: ConditioningSnapshot,
+        *,
+        locators: tuple[Any, ...],
+        length: int,
+        t_index: int,
+        last_token_id: int | None,
+    ) -> None:
+        if self._dataplane_handoff is None or not locators:
+            return
+        branch = ConditioningSnapshot(
+            locators=tuple(locators),
+            length=int(length),
+            num_layers=int(snapshot.num_layers),
+            t_index=int(t_index),
+            last_token_id=last_token_id,
+        )
+        replica = self._dataplane_handoff.stage_conditioning(branch)
+        if replica is None:
+            return
+        target.past = replica
+        target.past.allocate_blocks = self._allocator_for_cache(replica)
+        target.block_ids = list(replica.block_ids)
+        target.t_index = int(t_index)
+        target.last_token_id = (
+            int(last_token_id) if last_token_id is not None else int(self.img_start_id)
+        )
+
+    def _maybe_stage_conditioning_from_op(self, st: Any, op: dict[str, Any]) -> None:
+        """gen side: rebuild ``st.cond`` from the fetched conditioning snapshot.
+
+        When a ``denoise_gen`` op carries the und pool's conditioning locator and
+        this request has no local ``st.cond`` (the gen pool never ran the und text),
+        fetch the published KV into the gen replica and populate the decode-state
+        scalars the denoise setup reads. A no-op in Mode C / single-device."""
+        if self._dataplane_handoff is None:
+            return
+        locator = op.get("locator") if isinstance(op, dict) else None
+        if not locator:
+            return
+        snapshot = ConditioningSnapshot.from_wire(locator)
+        for cache in (st.cond, st.tu, st.iu):
+            self._release_scratch_cache(getattr(cache, "past", None))
+        st.cond = TextCache()
+        st.tu = TextCache()
+        st.iu = TextCache()
+        replica = self._dataplane_handoff.stage_conditioning(snapshot)
+        if replica is None:
+            return
+        st.cond.past = replica
+        st.cond.past.allocate_blocks = self._allocator_for_cache(replica)
+        st.cond.block_ids = list(replica.block_ids)
+        st.cond.t_index = int(snapshot.t_index)
+        st.cond.last_token_id = (
+            int(snapshot.last_token_id) if snapshot.last_token_id is not None else int(self.img_start_id)
+        )
+        # ``last_logits`` is consumed only for its dtype (latent init); a 1-element
+        # carrier of the model's compute dtype suffices on the gen side.
+        st.cond.last_logits = torch.zeros(
+            1, dtype=next(self.model.parameters()).dtype, device=self.gen_device
+        )
+        self._stage_text_cache_from_snapshot(
+            st.tu,
+            snapshot,
+            locators=snapshot.tu_locators,
+            length=snapshot.tu_length,
+            t_index=snapshot.tu_t_index,
+            last_token_id=snapshot.tu_last_token_id,
+        )
+        self._stage_text_cache_from_snapshot(
+            st.iu,
+            snapshot,
+            locators=snapshot.iu_locators,
+            length=snapshot.iu_length,
+            t_index=snapshot.iu_t_index,
+            last_token_id=snapshot.iu_last_token_id,
+        )
+
+    def _release_image_state_caches(self, image_state: ImageState | None) -> None:
+        if image_state is None:
+            return
+        # The latent trajectory lives in the system LatentPool; free its handle
+        # so the buffer is reclaimed at commit/drop.
+        self.residency.latent.free(image_state.latent_handle)
+        live_cache_ids: set[int] = set()
+        for state in self.reqs.values():
+            for text_cache in (state.cond, state.tu, state.iu):
+                cache = getattr(text_cache, "past", None)
+                if cache is not None:
+                    live_cache_ids.add(id(cache))
+        seen: set[int] = set()
+        for cache in (image_state.cond_cache, image_state.tu_cache, image_state.iu_cache):
+            cache_id = id(cache)
+            if cache is None or cache_id in seen or cache_id in live_cache_ids:
+                continue
+            seen.add(cache_id)
+            self._release_scratch_cache(cache)
+
+    def _text_driver(self) -> InterleavedTextCacheDriver:
+        driver = getattr(self, "_shared_text_driver", None)
+        if driver is None:
+            driver = InterleavedTextCacheDriver(
+                self,
+                request_state_factory=InterleavedImageRequestState,
+                image_start_token=self._img_start_token,
+            )
+            self._shared_text_driver = driver
+        return driver
+
+    def _commit_driver(self) -> GeneratedImageCommitDriver:
+        driver = getattr(self, "_shared_commit_driver", None)
+        if driver is None:
+            driver = GeneratedImageCommitDriver(self)
+            self._shared_commit_driver = driver
+        return driver
+
+    def _state(self, op: dict[str, Any]) -> InterleavedImageRequestState:
+        return self._text_driver().state(op)
+
+    def run_text_logits(self, op: dict[str, Any]):
+        return self._text_driver().run_text_logits(op)
+
+    def _text_indexes(self, start: int, seq_len: int, *, device: torch.device | str | None = None) -> torch.Tensor:
+        target = device if device is not None else self.device
+        return self._text_driver().text_indexes(int(start), int(seq_len)).to(target)
+
+    def _extend_cache_blocks(self, cache: TextCache, op: dict[str, Any]) -> None:
+        self._text_driver().extend_cache_blocks(cache, op)
+
+    def _ensure_host_cache(self, cache: TextCache) -> None:
+        self._text_driver().ensure_host_cache(cache)
+
+    def _prefix_from_query(self, query: str) -> TextCache:
+        return self._text_driver().prefix_from_query(query)
+
+    def _ensure_img_start(self, cache: TextCache | None) -> None:
+        self._text_driver().ensure_img_start(cache)
+
+    def _empty_img_start_prefix(self) -> TextCache:
+        return self._text_driver().empty_img_start_prefix()
+
+    def commit_generated_image(self, req_id: int, state: Any, op: dict[str, Any]) -> dict[str, Any]:
+        op = dict(op)
+        if op.get("kind") == "commit_writeback":
+            return self._commit_driver().commit_writeback(op)
+        return self._commit_driver().commit_generated_image(op)
+
+    def allocate_scratch_blocks(self, count: int) -> list[int]:
+        if self.scratch_pool is None:
+            raise RuntimeError("SenseNova scratch KV pool is not initialized")
+        return self._alloc_from_free_list(self._scratch_free, count, label="scratch")
+
+    def _copy_cache_prefix(self, source: Any, target: PagedTextCache, length: int) -> None:
+        length = int(length)
+        if length <= 0:
+            return
+        source_pool = getattr(source, "pool", None)
+        source_blocks = list(getattr(source, "block_ids", []) or [])
+        if source_pool is None or not source_blocks:
+            raise RuntimeError("cannot stage mixed forward prefix without a paged source cache")
+        target.ensure_capacity(length)
+        for layer_idx in range(self.num_layers):
+            k, v = source_pool.read(layer_idx, source_blocks, start=0, length=length)
+            if k is None or v is None:
+                raise RuntimeError("source prefix KV is missing for mixed forward")
+            target.pool.write(
+                layer_idx,
+                target.block_ids,
+                start=0,
+                k=k.to(target.pool.k.device),
+                v=v.to(target.pool.v.device),
+            )
+
+    def on_new_request(self, req_id: int, state: RunnerRequestState) -> None:
+        self.runner_states[int(req_id)] = state
+        image_state = self._new_interleaved_image_state(state)
+        self.reqs[int(req_id)] = image_state
+
+    def _new_interleaved_image_state(self, state: RunnerRequestState) -> InterleavedImageRequestState:
+        image_state = InterleavedImageRequestState(
+            sampling=dict(state.sampling or {}),
+            image=dict(state.image or {}),
+            neg_token_ids=list(state.neg_token_ids or []),
+        )
+        image_state.cond.block_ids = list(state.block_ids or [])
+        image_state.rng = state.device_rng(self.gen_device)
+        return image_state
+
+    def interleaved_image_state(self, req_id: int) -> InterleavedImageRequestState:
+        req_id = int(req_id)
+        existing = self.reqs.get(req_id)
+        if isinstance(existing, InterleavedImageRequestState):
+            return existing
+        state = self.runner_states.get(req_id)
+        if state is None:
+            return self.reqs.setdefault(req_id, InterleavedImageRequestState())
+        created = self._new_interleaved_image_state(state)
+        self.reqs[req_id] = created
+        return created
+
+    transformers_image_state = interleaved_image_state
+
+    def drop_request(self, req_id: int) -> None:
+        req_id = int(req_id)
+        self.runner_states.pop(req_id, None)
+        st = self.reqs.pop(req_id, None)
+        if st is not None:
+            self._release_image_state_caches(st.image_state)
+            self._release_scratch_cache(st.tu.past)
+            self._release_scratch_cache(st.iu.past)
+
+    def _release_scratch_cache(self, cache: Any) -> None:
+        if cache is None:
+            return
+        pool = getattr(cache, "pool", None)
+        block_ids = [int(block_id) for block_id in getattr(cache, "block_ids", [])]
+        if self.scratch_pool is not None and pool is self.scratch_pool:
+            self._release_to_free_list(self._scratch_free, block_ids)
+        elif self.gen_scratch_pool is not None and pool is self.gen_scratch_pool:
+            self._release_to_free_list(self._gen_scratch_free, block_ids)
+
+    def prepare_denoise(self, state: RunnerRequestState, op: dict[str, Any] | Any) -> TextImageDenoiseStep:
+        req_id = int(op["req_id"])
+        return self.prepare_denoise_step(req_id, state, dict(op))
+
+    def predict_velocity(
+        self,
+        ctx: TextImageDenoiseStep,
+        t: torch.Tensor,
+        latent: torch.Tensor,
+        branch: str,
+    ) -> torch.Tensor:
+        del t, latent
+        return self.predict_denoise_velocity(ctx, branch)
+
+    def predict_text_image_velocity_batch(self, steps, branches_by_step):
+        return TextImageDenoiseOps.predict_text_image_velocity_batch(self, steps, branches_by_step)
+
+    def _sample_text_logits(self, req_id: int, logits: torch.Tensor, request_states: Any) -> TextTokenOutput:
+        state = request_states.get(int(req_id))
+        sampling = dict(state.sampling or {})
+        token, logprob, top_logprobs = Sampler().sample(
+            logits.reshape(-1, logits.shape[-1])[-1],
+            sampling,
+            n_logprobs=int(sampling.get("n_logprobs", 0) or 0),
+        )
+        return TextTokenOutput(
+            req_id=int(req_id),
+            sampled_token_id=int(token),
+            sampled_logprob=logprob,
+            top_logprobs=top_logprobs,
+        )
+
+    @staticmethod
+    def _store_forward_sampled_token_relay(
+        state: Any,
+        *,
+        token_id: int,
+        device: torch.device,
+        position_id: int | None = None,
+    ) -> None:
+        relay = getattr(state, "decode_relay", None)
+        if relay is None:
+            return
+        token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+        if token_tensor.device.type == "cuda":
+            token_tensor.record_stream(torch.cuda.current_stream(token_tensor.device))
+        relay.token_id = int(token_id)
+        relay.token_tensor = token_tensor
+        if position_id is not None:
+            position_tensor = torch.tensor([int(position_id)], dtype=torch.long, device=device)
+            if position_tensor.device.type == "cuda":
+                position_tensor.record_stream(torch.cuda.current_stream(position_tensor.device))
+            relay.position_id = int(position_id)
+            relay.position_tensor = position_tensor
+
+    @staticmethod
+    def _forward_text_input_ids(
+        op: Mapping[str, Any],
+        *,
+        req_id: int,
+        tokens: Sequence[int],
+        request_states: Any,
+        device: torch.device,
+    ) -> torch.Tensor:
+        source = str(op.get("token_source") or "wire")
+        if source not in {"wire", "last_sampled"}:
+            raise invalid_descriptor(f"unsupported text token_source {source!r}")
+        if source == "wire":
+            return torch.tensor(list(tokens), dtype=torch.long, device=device)
+        if len(tokens) != 1:
+            raise invalid_descriptor(
+                "decode op requested token_source='last_sampled' but does not have exactly one token"
+            )
+        state = request_states.get(int(req_id))
+        relay = getattr(getattr(state, "decode_relay", None), "token_tensor", None)
+        if not isinstance(relay, torch.Tensor) or relay.dtype != torch.long or relay.device != device:
+            raise invalid_descriptor(
+                "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
+            )
+        return relay.reshape(1)
+
+    @staticmethod
+    def _append_packed_chunk(
+        embed_chunks: list[torch.Tensor],
+        indicators: list[torch.Tensor],
+        embeds: torch.Tensor,
+        *,
+        image_tokens: bool,
+        device: torch.device,
+    ) -> int:
+        start = sum(chunk.shape[0] for chunk in embed_chunks)
+        q_len = int(embeds.shape[0])
+        embed_chunks.append(embeds)
+        indicators.append(torch.full((q_len,), bool(image_tokens), dtype=torch.bool, device=device))
+        return start
+
+    @staticmethod
+    def _same_kv_pool(pool: Any, first_pool: Any) -> bool:
+        return first_pool is None or pool is first_pool
+
+    def _stage_text_cache_for_forward(
+        self,
+        source: PagedTextCache,
+        *,
+        target_pool: PagedKVPool,
+        end_len: int,
+    ) -> PagedTextCache:
+        if target_pool is self.gen_scratch_pool:
+            allocator = self.allocate_gen_scratch_blocks
+        elif target_pool is self.scratch_pool:
+            allocator = self.allocate_scratch_blocks
+        else:
+            raise RuntimeError("forward text staging target must be a scratch KV pool")
+        staged = PagedTextCache(
+            target_pool,
+            [],
+            num_layers=self.num_layers,
+            allocate_blocks=allocator,
+        )
+        staged.ensure_capacity(int(end_len))
+        staged.length = int(source.length)
+        self._copy_cache_prefix(source, staged, int(source.length))
+        return staged
+
+    @staticmethod
+    def _copy_cache_span(
+        source: PagedTextCache,
+        target: PagedTextCache,
+        *,
+        start: int,
+        length: int,
+        num_layers: int,
+    ) -> None:
+        start = int(start)
+        length = int(length)
+        if length <= 0:
+            return
+        target.ensure_capacity(start + length)
+        for layer_idx in range(int(num_layers)):
+            k, v = source.pool.read(layer_idx, source.block_ids, start=start, length=length)
+            if k is None or v is None:
+                raise RuntimeError("forward text K/V span is missing from staged cache")
+            target.pool.write(
+                layer_idx,
+                target.block_ids,
+                start=start,
+                k=k.to(target.pool.k.device),
+                v=v.to(target.pool.v.device),
+            )
+
+    def _forward_target_pool(self, denoise_steps: list[tuple[int, TextImageDenoiseStep]]) -> PagedKVPool | None:
+        target_pool = None
+        for _row_index, step in denoise_steps:
+            img = step.extra["img"]
+            for branch in text_image_branches(step):
+                _indexes, cache = self._denoise_branch_inputs(img, branch)
+                pool = getattr(cache, "pool", None)
+                if pool is None:
+                    return None
+                if target_pool is None:
+                    target_pool = pool
+                elif pool is not target_pool:
+                    return None
+        return target_pool
+
+    def _add_text_forward_segment(
+        self,
+        *,
+        builder: ForwardStreamBuilder,
+        kv_segments: list[ForwardPagedKVSegment],
+        row_index: int,
+        req_id: int,
+        op: dict[str, Any],
+        mode: ForwardMode,
+        cache: Any,
+        q_len: int,
+        start_pos: int,
+        device: torch.device,
+    ) -> None:
+        builder.add_segment(
+            op_index=row_index,
+            req_id=req_id,
+            kind=str(op["kind"]),
+            mode=mode,
+            modality="und",
+            segment_class="decode" if mode is ForwardMode.DECODE else "extend",
+            q_len=q_len,
+            prefix_len=int(cache.past.length),
+            visible_policy="causal",
+            indexes=self._text_indexes(start_pos, q_len, device=device),
+        )
+        kv_segments.append(
+            ForwardPagedKVSegment(
+                block_ids=tuple(cache.past.block_ids),
+                base_len=int(cache.past.length),
+                q_len=q_len,
+                write_kv=True,
+            )
+        )
+
+    def _add_denoise_forward_segment(
+        self,
+        *,
+        builder: ForwardStreamBuilder,
+        kv_segments: list[ForwardPagedKVSegment],
+        row_index: int,
+        req_id: int,
+        op: dict[str, Any],
+        cache: Any,
+        indexes: torch.Tensor,
+        q_len: int,
+        branch_index: int,
+        device: torch.device,
+    ) -> None:
+        builder.add_segment(
+            op_index=row_index,
+            req_id=req_id,
+            kind=str(op["kind"]),
+            mode=ForwardMode.DENOISE,
+            modality="gen",
+            segment_class="denoise",
+            q_len=q_len,
+            prefix_len=int(cache.length),
+            branch_id=branch_index,
+            visible_policy="bidirectional",
+            indexes=indexes.to(device=device),
+        )
+        kv_segments.append(
+            ForwardPagedKVSegment(
+                block_ids=tuple(cache.block_ids),
+                base_len=int(cache.length),
+                q_len=q_len,
+                # Denoise K/V is transient, not persistent: write the physical
+                # image-token span so the bidirectional visible_end segment can
+                # attend it, but leave the branch cache length owned by the
+                # denoise state unchanged.
+                write_kv=True,
+                persist_kv=False,
+                branch_id=branch_index,
+            )
+        )
+
+    def _try_run_packed_forward(
+        self,
+        batch: UniForwardBatch,
+        request_states: Any,
+        denoise_steps: list[tuple[int, TextImageDenoiseStep]],
+        results: list[Any],
+    ) -> bool:
+        if self.model is None or not denoise_steps:
+            return False
+        language = self.model.language_model
+        decoder = language.model
+        embed = language.get_input_embeddings()
+        builder = ForwardStreamBuilder()
+        kv_segments: list[ForwardPagedKVSegment] = []
+        embed_chunks: list[torch.Tensor] = []
+        indicators: list[torch.Tensor] = []
+        text_result_slots: list[tuple[int, int, int, PagedTextCache, PagedTextCache, int]] = []
+        denoise_result_slots: list[tuple[int, TextImageDenoiseStep, int, int]] = []
+        first_pool = self._forward_target_pool(denoise_steps)
+        staged_text_caches: list[PagedTextCache] = []
+        device = torch.device(str(self.device))
+
+        try:
+            for row_index, op in enumerate(batch.ops):
+                mode = batch.op_modes[row_index]
+                req_id = int(op["req_id"])
+                if mode in {ForwardMode.EXTEND, ForwardMode.DECODE}:
+                    state = self.interleaved_image_state(req_id)
+                    cache = state.cond
+                    self._extend_cache_blocks(cache, dict(op))
+                    self._ensure_host_cache(cache)
+                    if cache.past is None:
+                        return False
+                    tokens = list(op.get("token_ids") or [])
+                    if not tokens:
+                        tokens = [int(self.eos_id or 0)]
+                    pos = op.get("pos_range") or [cache.t_index + 1, cache.t_index + 1 + len(tokens)]
+                    start = int(pos[0])
+                    q_len = len(tokens)
+                    cache.past.ensure_capacity(cache.past.length + q_len)
+                    persistent_cache = cache.past
+                    staged_cache = persistent_cache
+                    if first_pool is not None and persistent_cache.pool is not first_pool:
+                        staged_cache = self._stage_text_cache_for_forward(
+                            persistent_cache,
+                            target_pool=first_pool,
+                            end_len=persistent_cache.length + q_len,
+                        )
+                        staged_text_caches.append(staged_cache)
+                    pool = staged_cache.pool
+                    if not self._same_kv_pool(pool, first_pool):
+                        return False
+                    first_pool = pool if first_pool is None else first_pool
+                    ids = self._forward_text_input_ids(
+                        op,
+                        req_id=req_id,
+                        tokens=tokens,
+                        request_states=request_states,
+                        device=device,
+                    )
+                    embeds = embed(ids).reshape(q_len, -1)
+                    segment_start = self._append_packed_chunk(
+                        embed_chunks,
+                        indicators,
+                        embeds,
+                        image_tokens=False,
+                        device=device,
+                    )
+                    self._add_text_forward_segment(
+                        builder=builder,
+                        kv_segments=kv_segments,
+                        row_index=row_index,
+                        req_id=req_id,
+                        op=dict(op),
+                        mode=mode,
+                        cache=SimpleNamespace(past=staged_cache),
+                        q_len=q_len,
+                        start_pos=start,
+                        device=device,
+                    )
+                    text_result_slots.append(
+                        (row_index, segment_start, q_len, persistent_cache, staged_cache, int(persistent_cache.length))
+                    )
+                elif mode is ForwardMode.DENOISE:
+                    step = next(step for result_index, step in denoise_steps if result_index == row_index)
+                    branches = text_image_branches(step)
+                    for branch_index, branch in enumerate(branches):
+                        img = step.extra["img"]
+                        indexes, cache = self._denoise_branch_inputs(img, branch)
+                        if cache is None or getattr(cache, "pool", None) is None:
+                            return False
+                        self._wait_gen_cache_ready(cache)
+                        pool = cache.pool
+                        if not self._same_kv_pool(pool, first_pool):
+                            return False
+                        first_pool = pool if first_pool is None else first_pool
+                        q_len = int(step.extra["image_embeds"].shape[1])
+                        if indexes is None or tuple(indexes.shape) != (3, q_len):
+                            return False
+                        segment_start = self._append_packed_chunk(
+                            embed_chunks,
+                            indicators,
+                            step.extra["image_embeds"].reshape(q_len, -1),
+                            image_tokens=True,
+                            device=device,
+                        )
+                        self._add_denoise_forward_segment(
+                            builder=builder,
+                            kv_segments=kv_segments,
+                            row_index=row_index,
+                            req_id=req_id,
+                            op=dict(op),
+                            cache=cache,
+                            indexes=indexes,
+                            q_len=q_len,
+                            branch_index=branch_index,
+                            device=device,
+                        )
+                        denoise_result_slots.append((row_index, step, segment_start, q_len))
+                else:
+                    return False
+            if first_pool is None or not embed_chunks:
+                return False
+            forward_stream = builder.build(device=device)
+            kv_view = ForwardPagedKVView(first_pool, kv_segments)
+            hidden = decoder.forward_packed_visible(
+                torch.cat(embed_chunks, dim=0),
+                image_gen_indicators=torch.cat(indicators, dim=0),
+                indexes=forward_stream.indexes,
+                forward_stream=forward_stream,
+                kv_view=kv_view,
+            )
+            for row_index, start, q_len, persistent_cache, staged_cache, base_len in text_result_slots:
+                op = batch.ops[row_index]
+                req_id = int(op["req_id"])
+                logits = language.lm_head(hidden[start:start + q_len].unsqueeze(0))
+                results[row_index] = self._sample_text_logits(req_id, logits, request_states)
+                if staged_cache is not persistent_cache:
+                    self._copy_cache_span(
+                        staged_cache,
+                        persistent_cache,
+                        start=base_len,
+                        length=q_len,
+                        num_layers=self.num_layers,
+                    )
+                state = self.interleaved_image_state(req_id)
+                position_id = int((op.get("pos_range") or [0, state.cond.t_index + q_len])[1])
+                state.cond.t_index = position_id - 1
+                state.cond.last_logits = logits
+                state.cond.last_token_id = int(results[row_index].sampled_token_id)
+                self._store_forward_sampled_token_relay(
+                    request_states.get(req_id),
+                    token_id=int(results[row_index].sampled_token_id),
+                    device=device,
+                    position_id=position_id,
+                )
+                if state.cond.past is not None:
+                    state.cond.past.length += q_len
+            branch_velocities: dict[int, dict[str, torch.Tensor]] = {}
+            for row_index, step, start, q_len in denoise_result_slots:
+                img = step.extra["img"]
+                branch = text_image_branches(step)[len(branch_velocities.setdefault(row_index, {}))]
+                velocity = self.model._t2i_hidden_to_velocity(
+                    hidden[start:start + q_len].unsqueeze(0),
+                    step.t,
+                    step.latent,
+                    image_token_num=img.token_h * img.token_w,
+                    image_size=(img.width, img.height),
+                )
+                branch_velocities[row_index][branch] = velocity
+            for result_index, step in denoise_steps:
+                velocities = branch_velocities.get(result_index)
+                if not velocities:
+                    return False
+                velocity = combine_text_image_velocity(step, velocities)
+                from ...nn.diffusion import euler_step
+
+                updated = euler_step(step.latent, velocity, step.t, step.t_next)
+                self.accept_denoise_update(step, updated)
+                results[result_index] = {
+                    "req_id": step.req_id,
+                    "denoise_done": step.step_index + 1 >= step.total_steps,
+                    "num_steps_done": step.step_index + 1,
+                }
+            return True
+        except Exception as exc:
+            raise capability_mismatch("packed SenseNova forward failed for an admitted mixed batch") from exc
+        finally:
+            for staged in staged_text_caches:
+                self._release_scratch_cache(staged)
+
+    def run_forward(self, batch: UniForwardBatch, *, request_states: Any, group: Any) -> list[Any]:
+        results: list[Any] = [None] * len(batch.ops)
+        denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
+        for row_index, op in enumerate(batch.ops):
+            mode = batch.op_modes[row_index]
+            req_id = int(op["req_id"])
+            if mode is ForwardMode.DENOISE:
+                step = self.prepare_denoise(request_states.get(req_id), dict(op))
+                denoise_steps.append((row_index, step))
+            elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
+                raise RuntimeError(f"unsupported mixed SenseNova mode {mode.value!r}")
+        if self._try_run_packed_forward(batch, request_states, denoise_steps, results):
+            return results
+        raise capability_mismatch(
+            "admitted mixed SenseNova batch could not be packed; split-mode fallback is disabled"
+        )
+
+    def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
+        self.apply_denoise_update(ctx, latent)
+
+    def decode_image(
+        self,
+        latent: Any,
+        *,
+        req_id: int,
+        state: RunnerRequestState,
+        op: dict[str, Any] | Any,
+    ) -> dict[str, Any]:
+        del latent, state
+        return self.commit_generated_image(int(req_id), None, dict(op))
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: Any,
+        positions: Any | None = None,
+        *,
+        kv: Any = None,
+        mode: str | None = None,
+        input_embeds: torch.Tensor | None = None,
+        op: dict[str, Any] | None = None,
+        request_state: RunnerRequestState | None = None,
+    ) -> Any:
+        if self.model is None:
+            raise RuntimeError("SenseNova model weights are not loaded")
+        if isinstance(input_ids, UniForwardBatch):
+            batch = input_ids
+            if batch.mode == ForwardMode.ENCODE:
+                return [{"req_id": req_id} for req_id in batch.as_encode().req_ids]
+            raise RuntimeError(f"SenseNova direct batch forward is unsupported for {batch.mode}")
+        del positions, kv, mode, input_embeds, request_state
+        if op is None:
+            raise RuntimeError("SenseNova text forward requires the source op")
+        return self.run_text_logits(dict(op))
+
+
+EntryClass = SenseNovaU1ForUnifiedGeneration

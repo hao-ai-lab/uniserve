@@ -1,0 +1,104 @@
+{
+  "artifact_root": "e2e-artifacts/current-verify",
+  "python": ".venv/bin/python",
+  "server_bin": "target/debug/uniserve",
+  "servers": {
+    "qwen3-32b": {
+      "model": "/home/hal-ysun/models/Qwen3-32B",
+      "served_model_name": "Qwen3-32B",
+      "host": "127.0.0.1",
+      "port": 18081,
+      "cuda_visible_devices": "0",
+      "serve_args": []
+    },
+    "sensenova-u1-single": {
+      "model": "/home/hal-ysun/models/SenseNova-U1-8B-MoT-Interleaved-local",
+      "served_model_name": "SenseNova-U1",
+      "host": "127.0.0.1",
+      "port": 18082,
+      "cuda_visible_devices": "0",
+      "serve_args": [
+        "--kv-token-capacity",
+        "65536",
+        "--max-num-seqs",
+        "1",
+        "--max-batch",
+        "4",
+        "--max-num-batched-tokens",
+        "4096"
+      ]
+    },
+    "sensenova-u1-mode-a-cuda-ipc": {
+      "extends": "sensenova-u1-single",
+      "cuda_visible_devices": "0,1",
+      "serve_args": [
+        "--workers",
+        "und:1,gen:1",
+        "--transfer",
+        "und->gen=cuda_ipc",
+        "--kv-token-capacity",
+        "65536",
+        "--max-num-seqs",
+        "1",
+        "--max-batch",
+        "4",
+        "--max-num-batched-tokens",
+        "1024"
+      ]
+    }
+  },
+  "workloads": {
+    "sensenova-travel-interleave-4x": {
+      "type": "generate",
+      "server": "sensenova-u1-single",
+      "output_dir": "sensenova-travel-interleave-4x",
+      "payload": {
+        "mode": "interleave",
+        "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
+        "max_tokens": 4096,
+        "temperature": 0,
+        "image": {
+          "resolution": "16:9",
+          "width": 2048,
+          "height": 1152,
+          "steps": 50,
+          "max_images": 4,
+          "retain_images": true
+        }
+      },
+      "expect_images": 4,
+      "expect_image_width": 2048,
+      "expect_image_height": 1152,
+      "expect_image_steps": 50,
+      "timeout_s": 900
+    },
+    "qwen3-sharegpt-stress": {
+      "type": "bench",
+      "server": "qwen3-32b",
+      "script": "benchmarks/serving/bench_serving.py",
+      "dataset_name": "sharegpt",
+      "num_prompts": 200,
+      "request_rate": 16,
+      "max_tokens": 4096,
+      "seed": 0,
+      "output_file": "qwen3-sharegpt-stress.json",
+      "expect_completed": 200,
+      "expect_failed": 0
+    },
+    "uniserve-kernel-provider-smoke": {
+      "type": "script",
+      "script": "scripts/verify_uniserve_kernel_provider.py"
+    }
+  },
+  "suites": {
+    "qwen3-32b": [
+      "qwen3-sharegpt-stress"
+    ],
+    "sensenova-u1-mode-a": [
+      "sensenova-travel-interleave-4x"
+    ],
+    "kernel-provider-smoke": [
+      "uniserve-kernel-provider-smoke"
+    ]
+  }
+}

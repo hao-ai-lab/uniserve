@@ -1,0 +1,12 @@
+[package]
+name = "uniserve-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prometheus-client.workspace = true
+uniserve-observability-derive.workspace = true
+
+[lints]
+workspace = true

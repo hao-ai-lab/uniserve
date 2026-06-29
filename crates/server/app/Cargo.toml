@@ -1,0 +1,35 @@
+[package]
+name = "uniserve-server-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rmpv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uniserve-chat.workspace = true
+uniserve-core.workspace = true
+uniserve-engine-client.workspace = true
+uniserve-engine-api.workspace = true
+uniserve-executor.workspace = true
+uniserve-engine-runtime.workspace = true
+uniserve-engine-wire.workspace = true
+uniserve-llm.workspace = true
+uniserve-native-api.workspace = true
+uniserve-observability.workspace = true
+uniserve-openai-api.workspace = true
+uniserve-scheduler.workspace = true
+uniserve-sim.workspace = true
+uniserve-text.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+futures.workspace = true
+uniserve-engine-client = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,41 @@
+[package]
+name = "uniserve-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "uniserve"
+path = "src/main.rs"
+
+[features]
+default = []
+native-tls-vendored = ["dep:native-tls-vendored"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+educe.workspace = true
+mimalloc.workspace = true
+native-tls-vendored = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror-ext.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uniserve-engine-runtime.workspace = true
+uniserve-engine-process.workspace = true
+uniserve-managed-engine.workspace = true
+uniserve-server-app.workspace = true
+uniserve-server-http.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+uniserve-engine-client.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }

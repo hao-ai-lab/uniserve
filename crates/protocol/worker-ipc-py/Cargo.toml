@@ -1,0 +1,19 @@
+[package]
+name = "uniserve-ipc-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "_uniserve_ipc"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow.workspace = true
+pyo3.workspace = true
+pythonize.workspace = true
+uniserve-worker-ipc-core.workspace = true
+uniserve-worker-wire.workspace = true
+
+[lints]
+workspace = true

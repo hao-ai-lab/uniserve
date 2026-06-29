@@ -1,0 +1,66 @@
+"""CPU model-target registry + contract vocabulary for worker contract tests."""
+from __future__ import annotations
+
+import importlib
+
+import pytest
+
+# All model runtime classes by short name. Class-level introspection
+# (supported_ops / supported_controls / adapter_mode / resource_plan) needs no
+# GPU; full instantiation (model load) does and is exercised in the e2e GPU run.
+BACKEND_CLASSES: dict[str, tuple[str, str]] = {
+    "stub": ("uniserve_worker.server.stub", "StubEngine"),
+    "sensenova": ("uniserve_worker.models.sensenova.model", "SenseNovaU1ForUnifiedGeneration"),
+    "bagel": ("uniserve_worker.models.bagel", "BagelForUnifiedGeneration"),
+}
+
+KNOWN_OP_KINDS = {
+    "prefill_und",
+    "decode_und",
+    "target_verify_und",
+    "denoise_gen",
+    "commit_gen",
+    "vit_encode",
+    "vae_encode",
+    "vae_decode",
+}
+KNOWN_CONTROLS = {
+    "copy_blocks", "load_lora", "unload_lora", "free_encoder",
+    "reset_prefix_cache", "sleep", "wake_up",
+}
+# control wire name -> engine method name (here they coincide).
+CONTROL_METHODS = {name: name for name in KNOWN_CONTROLS}
+ADAPTER_MODES = {"none", "engine_wide", "per_request", "multi_adapter"}
+KNOWN_RESOURCE_CLASSES = {"kv_block", "encoder_output", "image_latent", "scratch", "adapter"}
+
+
+def load_backend_class(name: str):
+    """Import a model runtime class.
+
+    A genuinely-absent optional dependency (e.g. ``torch`` is not installed in
+    a CPU-only env) is the only legitimate reason to skip. Anything else -- an
+    ``ImportError``/``ModuleNotFoundError`` for a first-party ``uniserve_worker``
+    module, a missing class attribute, or any error raised while executing the
+    module body -- is real breakage of sensenova/bagel construction and MUST
+    surface as a failure rather than be silently skipped.
+    """
+    mod, cls = BACKEND_CLASSES[name]
+    try:
+        return getattr(importlib.import_module(mod), cls)
+    except ModuleNotFoundError as exc:  # pragma: no cover - env-dependent
+        # A first-party module failing to import is a real defect, not a
+        # missing optional dependency; only skip when an external package is
+        # genuinely absent.
+        missing = (exc.name or "").split(".", 1)[0]
+        if missing and missing != "uniserve_worker":
+            pytest.skip(
+                f"backend {name!r} optional dependency {missing!r} absent in this env: {exc}"
+            )
+        raise
+
+
+def cpu_engine():
+    """A fully-constructible IPC-facing adapter for runtime conformance."""
+    from uniserve_worker.server.stub import StubEngine
+
+    return StubEngine(block_size=256)
