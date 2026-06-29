@@ -1,0 +1,80 @@
+# Canonical forward op-kind vocabulary: the cross-language single source of truth.
+#
+# Transcribed from (and guarded against) the four hand-written definitions:
+#   - Rust `OpKind`               crates/protocol/worker-wire/src/lib.rs
+#   - Rust `WorkerKind::supported_ops` arrays crates/engine/executor/src/lib.rs
+#   - Python `OP_KIND_TABLE`/`OP_KINDS`       uniserve_worker/contracts/op_kinds.py
+#   - FlatBuffers `OpKind`        crates/protocol/worker-ipc-core/schema/worker.fbs
+#
+# Each `[[op]]` entry pins one op kind by:
+#   - `wire`   : the snake_case wire string (Python `OpKindSpec.wire`,
+#                serde-snake_case of the Rust `OpKind` variant, snake_case of the
+#                FlatBuffers `OpKind` member).
+#   - `rust`   : the Rust `OpKind` variant identifier (CamelCase).
+#   - `mode`   : the `ForwardMode` wire value Python `OP_KIND_TABLE` maps it to.
+#
+# `flatbuffers_order` lists the FlatBuffers `OpKind` enum members in *declaration
+# order* — the ubyte ordinals are a wire contract and must not be reordered.
+
+flatbuffers_order = [
+  "PrefillUnd",
+  "DecodeUnd",
+  "DenoiseGen",
+  "CommitGen",
+  "CommitWriteback",
+  "VaeEncode",
+  "VitEncode",
+  "TargetVerifyUnd",
+  "Sample",
+  "EncodeFrame",
+]
+
+[[op]]
+wire = "prefill_und"
+rust = "PrefillUnd"
+mode = "extend"
+
+[[op]]
+wire = "decode_und"
+rust = "DecodeUnd"
+mode = "decode"
+
+[[op]]
+wire = "target_verify_und"
+rust = "TargetVerifyUnd"
+mode = "target_verify"
+
+[[op]]
+wire = "denoise_gen"
+rust = "DenoiseGen"
+mode = "denoise"
+
+[[op]]
+wire = "commit_gen"
+rust = "CommitGen"
+mode = "commit"
+
+[[op]]
+wire = "commit_writeback"
+rust = "CommitWriteback"
+mode = "commit"
+
+[[op]]
+wire = "vae_encode"
+rust = "VaeEncode"
+mode = "encode"
+
+[[op]]
+wire = "vit_encode"
+rust = "VitEncode"
+mode = "encode"
+
+[[op]]
+wire = "sample"
+rust = "Sample"
+mode = "sample"
+
+[[op]]
+wire = "encode_frame"
+rust = "EncodeFrame"
+mode = "encode_frame"

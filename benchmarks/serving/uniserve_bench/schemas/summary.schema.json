@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UniServe serving benchmark summary",
+  "type": "object",
+  "required": [
+    "harness_status",
+    "task",
+    "dataset",
+    "request_count",
+    "ok_count",
+    "failed_count",
+    "metric_family",
+    "metrics",
+    "load"
+  ],
+  "properties": {
+    "harness_status": {"type": "string"},
+    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "interleave"]},
+    "dataset": {"type": "string"},
+    "endpoint": {"type": "string"},
+    "model": {"type": "string"},
+    "base_url": {"type": "string"},
+    "server_info": {"type": ["object", "null"]},
+    "spec": {"type": "object"},
+    "load": {
+      "type": "object",
+      "required": ["mode", "request_rate", "num_prompts"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["open_loop_poisson", "closed_loop", "saturation"]},
+        "request_rate": {"type": ["number", "string"]},
+        "max_concurrency": {"type": ["integer", "null"]},
+        "warmup_requests": {"type": "integer"},
+        "num_prompts": {"type": "integer"},
+        "seed": {"type": "integer"}
+      }
+    },
+    "elapsed_s": {"type": "number"},
+    "request_count": {"type": "integer", "minimum": 0},
+    "ok_count": {"type": "integer", "minimum": 0},
+    "failed_count": {"type": "integer", "minimum": 0},
+    "classifiers": {"type": "object"},
+    "metric_family": {"type": "string", "enum": ["stream", "image"]},
+    "metrics": {"type": "object"}
+  }
+}
