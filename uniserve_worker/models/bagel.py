@@ -59,7 +59,6 @@ from ..runtime.residency import GenResidencySpec, KvCacheSpec, ResidencyManager
 __all__ = [
     'LLMConfig',
     'BagelConfig',
-    'NEW_TOKEN_IDS',
     'GenState',
     'BagelForUnifiedGeneration',
     'EntryClass',
@@ -95,6 +94,8 @@ class LLMConfig:
     rms_norm_eps: float = _BAGEL_RMS_NORM_EPS
     rope_theta: float = _BAGEL_ROPE_THETA
     qk_norm: bool = True
+    bos_token_id: int = 151644
+    eos_token_id: int = 151645
 
     @property
     def head_dim(self) -> int:
@@ -108,6 +109,8 @@ class BagelConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     visual_gen: bool = True
     visual_und: bool = True
+    start_of_image_id: int = 151652
+    end_of_image_id: int = 151653
     vae_z_channels: int = 16
     vae_downsample: int = 8
     latent_patch_size: int = 2
@@ -177,6 +180,8 @@ class BagelConfig:
             rms_norm_eps=llm_raw.get("rms_norm_eps", _BAGEL_RMS_NORM_EPS),
             rope_theta=llm_raw.get("rope_theta", 1e6),
             qk_norm=llm_raw.get("qk_norm", True),
+            bos_token_id=llm_raw.get("bos_token_id", 151644),
+            eos_token_id=llm_raw.get("eos_token_id", 151645),
         )
         vae = raw.get("vae_config", {})
         vit = raw.get("vit_config", {})
@@ -195,6 +200,8 @@ class BagelConfig:
             llm=llm,
             visual_gen=raw.get("visual_gen", True),
             visual_und=raw.get("visual_und", True),
+            start_of_image_id=raw.get("start_of_image_id", 151652),
+            end_of_image_id=raw.get("end_of_image_id", 151653),
             vae_z_channels=vae.get("z_channels", 16),
             vae_downsample=vae.get("downsample", 8),
             latent_patch_size=raw.get("latent_patch_size", 2),
@@ -210,14 +217,6 @@ class BagelConfig:
             vit_max_num_patch_per_side=raw.get("vit_max_num_patch_per_side", 70),
             connector_act=raw.get("connector_act", "gelu_pytorch_tanh"),
         )
-
-
-NEW_TOKEN_IDS = {
-    "bos_token_id": 151644,
-    "eos_token_id": 151645,
-    "start_of_image": 151652,
-    "end_of_image": 151653,
-}
 
 
 class _BagelGraph(nn.Module):
@@ -284,7 +283,7 @@ class _BagelGraph(nn.Module):
         hidden = self.cfg.llm.hidden_size
         total = int(num_vae) + 2
         marker_ids = torch.tensor(
-            [NEW_TOKEN_IDS["start_of_image"], NEW_TOKEN_IDS["end_of_image"]],
+            [self.cfg.start_of_image_id, self.cfg.end_of_image_id],
             dtype=torch.long,
             device=self.device,
         )
@@ -379,7 +378,7 @@ class _BagelGraph(nn.Module):
         n_tokens = vit_embeds.shape[0]
         hidden = self.cfg.llm.hidden_size
         marker_ids = torch.tensor(
-            [NEW_TOKEN_IDS["start_of_image"], NEW_TOKEN_IDS["end_of_image"]],
+            [self.cfg.start_of_image_id, self.cfg.end_of_image_id],
             dtype=torch.long,
             device=self.device,
         )

@@ -102,12 +102,6 @@ __all__ = [
     'IMG_START_TOKEN',
     'IMG_END_TOKEN',
     'SENSENOVA_MODEL_CODE_VERSION',
-    'DEFAULT_EOS_TOKEN_ID',
-    'DEFAULT_IMG_START_TOKEN_ID',
-    'DEFAULT_NUM_HIDDEN_LAYERS',
-    'DEFAULT_NUM_KEY_VALUE_HEADS',
-    'DEFAULT_HEAD_DIM',
-    'DEFAULT_MAX_IMAGE_SEQ_LEN',
     'MAX_BATCH_OPS',
     'patch_sensenova_config',
     'NeoVisionModel',
@@ -124,18 +118,6 @@ IMG_END_TOKEN = "</img>"
 # required model-code version via ``uniserve_sensenova_min_version``; bump this
 # constant when the served graph/loader contract changes.
 SENSENOVA_MODEL_CODE_VERSION = "0.1.0"
-
-# Default served NEOChat token ids, used only when no tokenizer/checkpoint is
-# available (CPU/dummy construction); real serving resolves these from the
-# tokenizer/config. img_start is the <img> sentinel that opens an image span.
-DEFAULT_EOS_TOKEN_ID = 151645
-DEFAULT_IMG_START_TOKEN_ID = 151670
-
-# Fallback shape defaults when config omits them; not used for KV pool sizing.
-DEFAULT_NUM_HIDDEN_LAYERS = 36
-DEFAULT_NUM_KEY_VALUE_HEADS = 8
-DEFAULT_HEAD_DIM = 128
-DEFAULT_MAX_IMAGE_SEQ_LEN = 4096
 
 # Worker batching limit for capability reporting.
 MAX_BATCH_OPS = DEFAULT_MAX_BATCH_OPS
@@ -1503,7 +1485,6 @@ class NEOChatModel(nn.Module):
         self._init_flow_params(config, hidden=hidden)
 
         self.img_context_token_id = None
-        self.img_start_token_id = DEFAULT_IMG_START_TOKEN_ID
         self.system_message = ""
 
     def _build_fm_head(self, config: NeoChatConfig, *, hidden: int, output_dim: int) -> nn.Module:
@@ -1840,17 +1821,14 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self.eos_id = self.tokenizer.eos_token_id
             self.merge_size = int(1 / self.model.downsample_ratio)
             self.latent_downsample = int(self.model.patch_size * self.merge_size)
-            self.max_latent_size = int(
-                getattr(self.model.config, "max_image_seq_len", DEFAULT_MAX_IMAGE_SEQ_LEN)
-                or DEFAULT_MAX_IMAGE_SEQ_LEN
-            )
+            self.max_latent_size = int(self.model.config.max_image_seq_len)
             return getattr(self.model.config, "llm_config", None)
         self.img_start_id = 0
         self.img_end_id = 0
-        self.eos_id = DEFAULT_EOS_TOKEN_ID
+        self.eos_id = 0
         self.merge_size = 2
         self.latent_downsample = 16
-        self.max_latent_size = _config_int(config, "max_image_seq_len", DEFAULT_MAX_IMAGE_SEQ_LEN)
+        self.max_latent_size = _config_int(config, "max_image_seq_len", 0)
         if isinstance(config, dict):
             return config.get("llm_config") or {}
         return getattr(config, "llm_config", None) if config is not None else None
@@ -1861,10 +1839,14 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         llm_cfg: Any,
         kv_token_capacity: int | None,
     ) -> tuple[int, int]:
-        getter = llm_cfg.get if isinstance(llm_cfg, dict) else lambda key, default=None: getattr(llm_cfg, key, default)
-        self.num_layers = int(getter("num_hidden_layers", DEFAULT_NUM_HIDDEN_LAYERS) or DEFAULT_NUM_HIDDEN_LAYERS)
-        n_kv = int(getter("num_key_value_heads", DEFAULT_NUM_KEY_VALUE_HEADS) or DEFAULT_NUM_KEY_VALUE_HEADS)
-        head_dim = int(getter("head_dim", DEFAULT_HEAD_DIM) or DEFAULT_HEAD_DIM)
+        if isinstance(llm_cfg, dict):
+            self.num_layers = int(llm_cfg["num_hidden_layers"])
+            n_kv = int(llm_cfg["num_key_value_heads"])
+            head_dim = int(llm_cfg["head_dim"])
+        else:
+            self.num_layers = int(llm_cfg.num_hidden_layers)
+            n_kv = int(llm_cfg.num_key_value_heads)
+            head_dim = int(llm_cfg.head_dim)
         self.kv_cache_dtype = get_current_kv_cache_dtype(config)
         if self.kv_cache_dtype in {None, "auto", "native", "compute"}:
             self.kv_cache_dtype = "bf16"
