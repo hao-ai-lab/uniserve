@@ -16,16 +16,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ...contracts.forward_mode import ForwardMode
-from ...foundation.env import env_flag, env_int
+from ...foundation.runtime_config import get_worker_config
 
 if TYPE_CHECKING:
     from ...contracts.batches import TextBatch
 
 __all__ = ["TextBackendGate"]
 
-_DEFAULT_MIXED_TEXT_MAX_TOKENS = 8192
-_MIXED_TEXT_MAX_TOKENS_ENV = "UNISERVE_MIXED_TEXT_MAX_TOKENS"
-_VARLEN_PREFILL_ENV = "UNISERVE_VARLEN_PREFILL"
 _TEXT_MODES = frozenset({ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY})
 
 
@@ -108,7 +105,7 @@ class TextBackendGate:
             modes.append(mode)
         if not modes or ForwardMode.EXTEND not in modes or ForwardMode.DECODE not in modes:
             return False
-        max_tokens = max(0, env_int(_MIXED_TEXT_MAX_TOKENS_ENV, default=_DEFAULT_MIXED_TEXT_MAX_TOKENS))
+        max_tokens = max(0, get_worker_config().mixed_text_max_tokens)
         if max_tokens <= 0 or total_tokens > max_tokens:
             return False
         return self._varlen_available(attention_backend_name, needs_paged_kv=True)
@@ -146,7 +143,7 @@ class TextBackendGate:
         return False
 
     def _varlen_available(self, preferred: str | None, *, needs_paged_kv: bool = False) -> bool:
-        if not env_flag(_VARLEN_PREFILL_ENV, default=True):
+        if not get_worker_config().varlen_prefill:
             return False
         if needs_paged_kv and not self.paged_storage_ok:
             return False

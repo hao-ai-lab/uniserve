@@ -6,7 +6,6 @@ from typing import Any, Sequence
 
 import torch
 
-from ..foundation.env import env_optional_float
 from ..foundation.errors import invalid_descriptor
 from ..nn.sampler import shape_logits_for_sampling, sync_tp_sampled_tokens
 
@@ -17,10 +16,6 @@ __all__ = [
     'accept_chain',
 ]
 
-_THRESHOLD_SINGLE_ENV = "UNISERVE_SPEC_ACCEPT_THRESHOLD_SINGLE"
-_THRESHOLD_ACC_ENV = "UNISERVE_SPEC_ACCEPT_THRESHOLD_ACC"
-
-
 @dataclass(frozen=True)
 class SpeculativeSampleResult:
     sampled_token_id: int
@@ -30,7 +25,7 @@ class SpeculativeSampleResult:
 
 @dataclass(frozen=True)
 class SpecSampleConfig:
-    """Env-derived accept thresholds, resolved once per sample call."""
+    """Explicit accept thresholds, resolved once per sample call."""
 
     threshold_single: float
     threshold_acc: float
@@ -45,12 +40,10 @@ class SpecSampleConfig:
         return cls(
             threshold_single=_resolve_threshold(
                 threshold_single,
-                _THRESHOLD_SINGLE_ENV,
                 default=1.0,
             ),
             threshold_acc=_resolve_threshold(
                 threshold_acc,
-                _THRESHOLD_ACC_ENV,
                 default=1.0,
             ),
         )
@@ -251,11 +244,7 @@ def _uniform_samples(
     return samples.to(device=device, dtype=torch.float32)
 
 
-def _resolve_threshold(value: float | None, env_name: str, *, default: float) -> float:
+def _resolve_threshold(value: float | None, *, default: float) -> float:
     if value is not None:
         return float(value)
-    try:
-        resolved = env_optional_float(env_name, default=default)
-    except ValueError as exc:
-        raise invalid_descriptor(str(exc)) from exc
-    return default if resolved is None else resolved
+    return default

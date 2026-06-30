@@ -7,7 +7,7 @@
 //! the park via the executor's command waker. It also exercises the idle path
 //! (submit after the engine has gone idle and parked) and graceful shutdown.
 //!
-//! Run with UNISERVE_WORKER_STUB=1 and PYTHONPATH set to the repo root.
+//! Run with PYTHONPATH set to the repo root.
 use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{Command, EngineHandle, GenEvent, GenerateRequest};
 use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
-use uniserve_worker_ipc::UniprocExecutor;
+use uniserve_worker_ipc::{UniprocExecutor, WorkerLaunchConfig};
 
 type Rxs = HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>>;
 
@@ -67,8 +67,22 @@ fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::WARN)
         .init();
 
-    let engine =
-        UniprocExecutor::spawn("python3", "", "cpu", 2, 1 << 20, 8 << 20, None, 256, "auto")?;
+    let worker_config = WorkerLaunchConfig {
+        stub: true,
+        ..WorkerLaunchConfig::default()
+    };
+    let engine = UniprocExecutor::spawn_with_config(
+        "python3",
+        "",
+        "cpu",
+        2,
+        1 << 20,
+        8 << 20,
+        None,
+        256,
+        "auto",
+        &worker_config,
+    )?;
     let event_driven = engine.event_driven();
     println!("event_driven = {event_driven}");
     let waker = engine.command_waker();
@@ -81,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     let mut rxs: Rxs = HashMap::new();
     let mut ok = true;
 
- // Round 1: three concurrent requests.
+    // Round 1: three concurrent requests.
     let r1 = [RequestId(1), RequestId(2), RequestId(3)];
     for id in &r1 {
         submit_text(&handle, &mut rxs, id.0)?;
@@ -90,8 +104,8 @@ fn main() -> anyhow::Result<()> {
     println!("round 1 finished: {}/{}", done.len(), r1.len());
     ok &= done.len() == r1.len();
 
- // Let the engine go fully idle and park, then submit again: this only
- // completes promptly if the command waker interrupts the idle park.
+    // Let the engine go fully idle and park, then submit again: this only
+    // completes promptly if the command waker interrupts the idle park.
     thread::sleep(Duration::from_millis(300));
     let r2 = [RequestId(4)];
     let t_submit = Instant::now();
@@ -107,10 +121,15 @@ fn main() -> anyhow::Result<()> {
     ok &= done2.len() == r2.len();
 
     handle.shutdown();
-    let fatal = jh.join().map_err(|_| anyhow::anyhow!("scheduler thread panicked"))?;
+    let fatal = jh
+        .join()
+        .map_err(|_| anyhow::anyhow!("scheduler thread panicked"))?;
     ok &= !fatal;
 
-    println!("\nEVENT-DRIVEN RUN SMOKE: {}", if ok { "PASS" } else { "FAIL" });
+    println!(
+        "\nEVENT-DRIVEN RUN SMOKE: {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
     if !ok {
         std::process::exit(1);
     }

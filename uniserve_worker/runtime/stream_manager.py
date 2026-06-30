@@ -13,8 +13,8 @@ extended to SM10 (Blackwell / GB200). When green contexts are unavailable the
 manager degrades to full-SM torch streams for every group, so selection still
 works (with no real partitioning) and the caller needs no special-casing.
 
-The feature is gated by callers on ``UNISERVE_GREEN_CONTEXTS``; nothing here runs
-unless a :class:`StreamManager` is constructed.
+The feature is gated by worker runtime config; nothing here runs unless a
+:class:`StreamManager` is constructed.
 """
 from __future__ import annotations
 

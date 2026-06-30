@@ -1,7 +1,6 @@
 """CUDA graph plumbing for text decode (re-exports the shared and prefill surface)."""
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -61,9 +60,6 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         self,
         *,
         name: str,
-        enabled_env: str,
-        warmup_env: str,
-        warmup_batches_env: str,
         default_enabled: bool = True,
         default_warmup: bool = True,
         default_warmup_batch_sizes: tuple[int, ...] = _DEFAULT_DECODE_GRAPH_BATCH_SIZES,
@@ -71,9 +67,6 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         logger: Any = None,
     ) -> None:
         self.name = str(name)
-        self.enabled_env = enabled_env
-        self.warmup_env = warmup_env
-        self.warmup_batches_env = warmup_batches_env
         self.default_enabled = bool(default_enabled)
         self.default_warmup = bool(default_warmup)
         self.default_warmup_batch_sizes = tuple(
@@ -87,11 +80,6 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
 
     def warmup_batch_sizes(self) -> tuple[int, ...]:
-        raw = os.environ.get(self.warmup_batches_env)
-        if raw:
-            sizes = _parse_positive_int_csv(raw)
-            if sizes:
-                return sizes
         return self.default_warmup_batch_sizes
 
     def warmup_capture_batch_sizes(self) -> tuple[int, ...]:

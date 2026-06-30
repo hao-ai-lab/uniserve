@@ -1,21 +1,34 @@
 //! Two-process IPC smoke test: spawn the (stub) Python worker, handshake caps,
 //! and drive a few requests through the scheduler over the shared-memory ring.
-//! Run with UNISERVE_WORKER_STUB=1 so the worker is the GPU-free echo engine.
 use std::collections::HashMap;
 
 use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{GenEvent, GenerateRequest};
 use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
-use uniserve_worker_ipc::UniprocExecutor;
+use uniserve_worker_ipc::{UniprocExecutor, WorkerLaunchConfig};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
- // pipeline_depth=2 exercises the descriptor ring with batches in flight.
-    let engine =
-        UniprocExecutor::spawn("python3", "", "cpu", 2, 1 << 20, 8 << 20, None, 256, "auto")?;
+    // pipeline_depth=2 exercises the descriptor ring with batches in flight.
+    let worker_config = WorkerLaunchConfig {
+        stub: true,
+        ..WorkerLaunchConfig::default()
+    };
+    let engine = UniprocExecutor::spawn_with_config(
+        "python3",
+        "",
+        "cpu",
+        2,
+        1 << 20,
+        8 << 20,
+        None,
+        256,
+        "auto",
+        &worker_config,
+    )?;
     println!("caps from worker: {:?}", engine.caps());
 
     let ctrl = ControlTokens {
@@ -26,7 +39,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut rxs: HashMap<RequestId, (&str, tokio::sync::mpsc::UnboundedReceiver<GenEvent>)> =
         HashMap::new();
- // we drive step directly here instead of the run thread
+    // we drive step directly here instead of the run thread
     let mut reqs = Vec::new();
     let mk = |id: u64,
               mode: GenMode,

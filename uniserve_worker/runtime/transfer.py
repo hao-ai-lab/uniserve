@@ -29,6 +29,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.runtime_config import get_worker_config
 
 if TYPE_CHECKING:
     import torch
@@ -477,9 +478,10 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     if kind is TransportKind.CUDA_IPC:
         return CudaIpcTransport()
     if kind is TransportKind.MOONCAKE:
+        runtime = get_worker_config()
         return MooncakeTransport(
-            device_name=cfg.get("device_name", os.environ.get("UNISERVE_MOONCAKE_DEVICE", "")),
-            protocol=cfg.get("protocol", os.environ.get("UNISERVE_MOONCAKE_PROTOCOL", "rdma")),
+            device_name=cfg.get("device_name", runtime.mooncake_device),
+            protocol=cfg.get("protocol", runtime.mooncake_protocol),
             hostname=cfg.get("hostname"),
         )
     raise AssertionError(f"unhandled transport kind {kind!r}")

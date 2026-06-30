@@ -19,7 +19,7 @@ __all__ = [
 
 
 def triton_fused_layers_enabled() -> bool:
-    return env_flag("UNISERVE_TRITON_FUSED_LAYERS")
+    return True
 
 
 @lru_cache(maxsize=1)

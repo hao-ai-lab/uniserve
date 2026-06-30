@@ -38,6 +38,18 @@ CAPS_REQUIRED = {
 }
 
 
+def _minimal_model_config(name):
+    if name == "sensenova":
+        return {
+            "llm_config": {
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+            }
+        }
+    return {}
+
+
 @pytest.mark.parametrize("name", ALL_BACKENDS)
 def test_capability_declaration_wellformed(name):
     cls = load_backend_class(name)
@@ -113,7 +125,7 @@ def test_caps_matches_class_declaration():
 @pytest.mark.parametrize("name", ["bagel", "sensenova"])
 def test_new_model_caps_match_batch_policy(name):
     cls = load_backend_class(name)
-    model = cls(config={})
+    model = cls(config=_minimal_model_config(name))
     caps = model.caps().to_wire()
     policy = model.batch_policy()
     assert caps["execution_constraints"]["max_batch_ops"] == policy.max_batch_ops
@@ -124,18 +136,18 @@ def test_new_model_caps_match_batch_policy(name):
 @pytest.mark.parametrize("name", ["bagel", "sensenova"])
 def test_new_models_declare_mixed_batch_envelopes(name):
     cls = load_backend_class(name)
-    policy = cls(config={}).batch_policy()
+    policy = cls(config=_minimal_model_config(name)).batch_policy()
     assert policy.supports_mixed_modes
     assert policy.max_batch_ops >= 8
 
 
 def test_runner_caps_declare_mixed_batch_envelope():
-    # und/gen mixing is non-negotiable (§9.6): there is no env that can disable
-    # it (the former UNISERVE_DISABLE_MIXED_OP_BATCHES override was deleted).
+    # und/gen mixing is non-negotiable (§9.6): there is no worker launch override
+    # that can disable it.
     from uniserve_worker.server.runner_driver import RunnerDriver
 
     cls = load_backend_class("sensenova")
-    caps = RunnerDriver(cls(config={})).caps().to_wire()
+    caps = RunnerDriver(cls(config=_minimal_model_config("sensenova"))).caps().to_wire()
 
     assert caps["execution_constraints"]["max_batch_ops"] >= 8
     assert "supports_mixed_op_kinds" not in caps["execution_constraints"]

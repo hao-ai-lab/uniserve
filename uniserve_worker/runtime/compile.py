@@ -10,14 +10,9 @@ from weakref import WeakSet
 import torch
 import torch.nn as nn
 
-from ..foundation.env import (
-    DEFAULT_COMPILE_BACKEND,
-    env_flag,
-    env_optional_flag,
-    env_optional_str,
-    env_str,
-)
+from ..foundation.env import DEFAULT_COMPILE_BACKEND
 from ..foundation.errors import capability_mismatch
+from ..foundation.runtime_config import get_worker_config
 
 __all__ = [
     'is_compiled',
@@ -56,7 +51,7 @@ def _mark_compiled(module: nn.Module) -> None:
 
 @dataclass(frozen=True)
 class TorchCompileConfig:
-    """Opt-in torch.compile settings read from environment."""
+    """Opt-in torch.compile settings read from worker runtime config."""
 
     enabled: bool = False
     backend: str = DEFAULT_COMPILE_BACKEND
@@ -68,13 +63,14 @@ class TorchCompileConfig:
     dynamic: bool | None = None
 
     @classmethod
-    def from_env(cls) -> "TorchCompileConfig":
+    def from_runtime_config(cls) -> "TorchCompileConfig":
+        cfg = get_worker_config().torch_compile
         return cls(
-            enabled=_env_truthy("UNISERVE_TORCH_COMPILE"),
-            backend=env_str("UNISERVE_TORCH_COMPILE_BACKEND", default=DEFAULT_COMPILE_BACKEND),
-            mode=_env_optional("UNISERVE_TORCH_COMPILE_MODE", default=None),
-            fullgraph=_env_truthy("UNISERVE_TORCH_COMPILE_FULLGRAPH"),
-            dynamic=_env_optional_bool("UNISERVE_TORCH_COMPILE_DYNAMIC"),
+            enabled=cfg.enabled,
+            backend=cfg.backend,
+            mode=cfg.mode,
+            fullgraph=cfg.fullgraph,
+            dynamic=cfg.dynamic,
         )
 
 
@@ -105,7 +101,7 @@ def maybe_compile_module(
 ) -> nn.Module:
     """Compile ``module`` when explicitly enabled; otherwise return it unchanged."""
 
-    cfg = config or TorchCompileConfig.from_env()
+    cfg = config or TorchCompileConfig.from_runtime_config()
     if not cfg.enabled:
         return module
     # UniServe owns explicit CUDA-graph capture; reject cudagraph-tree modes.
@@ -118,7 +114,7 @@ def maybe_compile_module(
         return module
     compile_fn = getattr(torch, "compile", None)
     if not callable(compile_fn):
-        raise capability_mismatch("UNISERVE_TORCH_COMPILE is enabled but torch.compile is unavailable")
+        raise capability_mismatch("torch.compile is enabled but torch.compile is unavailable")
     kwargs: dict[str, Any] = {
         "backend": cfg.backend,
         "fullgraph": cfg.fullgraph,
@@ -155,7 +151,7 @@ def compile_targets(
     semantics so each model does not grow its own compile loop.
     """
 
-    cfg = config or TorchCompileConfig.from_env()
+    cfg = config or TorchCompileConfig.from_runtime_config()
     if not cfg.enabled:
         return CompileReport(attempted=0, compiled=0, labels=())
     attempted = 0
@@ -181,7 +177,7 @@ def compile_model_pieces(
 ) -> CompileReport:
     """Compile model-declared piecewise targets when the opt-in flag is set."""
 
-    cfg = config or TorchCompileConfig.from_env()
+    cfg = config or TorchCompileConfig.from_runtime_config()
     if not cfg.enabled:
         return CompileReport(attempted=0, compiled=0, labels=())
     hook = getattr(model, "compile_targets", None)
@@ -214,15 +210,3 @@ def named_child_compile_targets(
                     )
                 )
     return tuple(targets)
-
-
-def _env_truthy(name: str) -> bool:
-    return env_flag(name)
-
-
-def _env_optional(name: str, *, default: str | None) -> str | None:
-    return env_optional_str(name, default=default)
-
-
-def _env_optional_bool(name: str) -> bool | None:
-    return env_optional_flag(name)

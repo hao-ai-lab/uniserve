@@ -1,6 +1,7 @@
 """Conformance for new-style model discovery and dummy loading."""
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -9,10 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors.torch import save_file
 
+import uniserve_worker.foundation.runtime_config as runtime_config
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints, validate_caps
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
+from uniserve_worker.foundation.runtime_config import TorchCompileRuntimeConfig
 from uniserve_worker.loader import get_loader
 from uniserve_worker.loader.transformers import (
     dtype_from_name,
@@ -26,6 +29,14 @@ from uniserve_worker.server.app import dispatch
 from uniserve_worker.server.runner_driver import RunnerDriver, _architectures
 
 pytestmark = pytest.mark.integration
+
+
+def _set_worker_runtime(monkeypatch, **kwargs):
+    monkeypatch.setattr(
+        runtime_config,
+        "_CURRENT_CONFIG",
+        replace(runtime_config.get_worker_config(), **kwargs),
+    )
 
 
 def test_stub_fixture_is_runtime_owned_not_model_discovered():
@@ -410,8 +421,8 @@ def test_qwen3_always_advertises_mixed_batch(monkeypatch):
     # und/gen (here prefill/decode) mixed-batch single-forward is a
     # non-negotiable invariant (§9.6): qwen3 advertises mixed-mode grouping
     # unconditionally, regardless of the worker-side fused-kernel token budget.
-    # ``UNISERVE_QWEN3_MIXED_TEXT_MAX_TOKENS`` now only narrows the fused-kernel
-    # gate (``can_run_mixed_batch``), not the advertised capability.
+    # The runtime mixed-token budget only narrows fused-kernel eligibility, not the
+    # advertised capability.
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 
     model = Qwen3ForCausalLM(
@@ -427,11 +438,10 @@ def test_qwen3_always_advertises_mixed_batch(monkeypatch):
         },
     )
 
-    monkeypatch.delenv("UNISERVE_QWEN3_MIXED_TEXT_MAX_TOKENS", raising=False)
     assert not hasattr(model.caps().execution_constraints, "supports_mixed_op_kinds")
     assert model.batch_policy().supports_mixed_modes
 
-    monkeypatch.setenv("UNISERVE_QWEN3_MIXED_TEXT_MAX_TOKENS", "256")
+    _set_worker_runtime(monkeypatch, mixed_text_max_tokens=256)
     assert model.batch_policy().supports_mixed_modes
 
 
@@ -446,10 +456,11 @@ def test_qwen3_runtime_applies_opt_in_model_stack_compile(monkeypatch):
         return module
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE", "1")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_BACKEND", "eager")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_MODE", "none")
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH_WARMUP", "0")
+    _set_worker_runtime(
+        monkeypatch,
+        torch_compile=TorchCompileRuntimeConfig(enabled=True, backend="eager", mode=None),
+        cuda_graph_warmup=False,
+    )
     model = Qwen3ForCausalLM(
         config={
             "vocab_size": 32,
@@ -487,9 +498,10 @@ def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
         return module
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE", "1")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_BACKEND", "eager")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_MODE", "none")
+    _set_worker_runtime(
+        monkeypatch,
+        torch_compile=TorchCompileRuntimeConfig(enabled=True, backend="eager", mode=None),
+    )
 
     layer_cfg = SimpleNamespace(
         hidden_size=16,
@@ -538,10 +550,13 @@ def test_qwen3_mixed_prefill_decode_runs_flashinfer_paged_varlen_cuda(monkeypatc
     pytest.importorskip("flashinfer")
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 
-    monkeypatch.setenv("UNISERVE_QWEN3_VARLEN_PREFILL", "1")
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH_WARMUP", "0")
+    _set_worker_runtime(
+        monkeypatch,
+        varlen_prefill=True,
+        cuda_graph_warmup=False,
+        mixed_text_max_tokens=256,
+    )
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
-    monkeypatch.setenv("UNISERVE_QWEN3_MIXED_TEXT_MAX_TOKENS", "256")
     torch.manual_seed(125)
     model = Qwen3ForCausalLM(
         config={
@@ -612,11 +627,13 @@ def test_qwen3_initial_prefill_cuda_graph_replay_preserves_raw_kv_lengths(monkey
         "head_dim": 64,
         "attention_bias": False,
     }
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH", "0")
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH_WARMUP", "0")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH_WARMUP", "0")
-    monkeypatch.setenv("UNISERVE_QWEN3_PREFILL_TOKEN_BUCKETS", "1")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_WARMUP_TOKENS", "4,8")
+    _set_worker_runtime(
+        monkeypatch,
+        cuda_graph=False,
+        cuda_graph_warmup=False,
+        prefill_cuda_graph_warmup=False,
+        prefill_cuda_graph_warmup_tokens=(4, 8),
+    )
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
 
     torch.manual_seed(777)
@@ -625,7 +642,7 @@ def test_qwen3_initial_prefill_cuda_graph_replay_preserves_raw_kv_lengths(monkey
     graph_model.load_state_dict(eager_model.state_dict())
 
     def run_initial_prefills(model, *, graph_enabled: bool):
-        monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH", "1" if graph_enabled else "0")
+        _set_worker_runtime(monkeypatch, prefill_cuda_graph=graph_enabled)
         driver = RunnerDriver(model, block_size=256, kv_token_capacity=2048)
         outputs = []
         for step, tokens, blocks in (
@@ -680,15 +697,15 @@ def test_qwen3_initial_prefill_cuda_graph_buckets_do_not_share_static_metadata(m
         "head_dim": 64,
         "attention_bias": False,
     }
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH", "0")
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH_WARMUP", "0")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH", "1")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH_WARMUP", "0")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH_WARMUP_TOKENS", "8,16")
+    _set_worker_runtime(
+        monkeypatch,
+        cuda_graph=False,
+        cuda_graph_warmup=False,
+        prefill_cuda_graph=True,
+        prefill_cuda_graph_warmup=False,
+        prefill_cuda_graph_warmup_tokens=(8, 16),
+    )
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
-    monkeypatch.delenv("UNISERVE_QWEN3_PREFILL_TOKEN_BUCKETS", raising=False)
-    monkeypatch.delenv("UNISERVE_TORCH_COMPILE", raising=False)
-    monkeypatch.delenv("UNISERVE_TORCH_COMPILE_WARMUP", raising=False)
 
     torch.manual_seed(778)
     eager_model = Qwen3ForCausalLM(config=cfg).cuda()
@@ -701,7 +718,7 @@ def test_qwen3_initial_prefill_cuda_graph_buckets_do_not_share_static_metadata(m
     )
 
     def run(model, *, graph_enabled: bool):
-        monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH", "1" if graph_enabled else "0")
+        _set_worker_runtime(monkeypatch, prefill_cuda_graph=graph_enabled)
         driver = RunnerDriver(model, block_size=256, kv_token_capacity=2048)
         outputs = []
         for step, tokens, blocks in requests:
@@ -755,15 +772,15 @@ def test_qwen3_initial_prefill_cuda_graph_replays_multi_row_initial_prefill(monk
         "head_dim": 64,
         "attention_bias": False,
     }
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH", "0")
-    monkeypatch.setenv("UNISERVE_CUDA_GRAPH_WARMUP", "0")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH", "1")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH_WARMUP", "0")
-    monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH_WARMUP_TOKENS", "8")
+    _set_worker_runtime(
+        monkeypatch,
+        cuda_graph=False,
+        cuda_graph_warmup=False,
+        prefill_cuda_graph=True,
+        prefill_cuda_graph_warmup=False,
+        prefill_cuda_graph_warmup_tokens=(8,),
+    )
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
-    monkeypatch.delenv("UNISERVE_QWEN3_PREFILL_TOKEN_BUCKETS", raising=False)
-    monkeypatch.delenv("UNISERVE_TORCH_COMPILE", raising=False)
-    monkeypatch.delenv("UNISERVE_TORCH_COMPILE_WARMUP", raising=False)
 
     torch.manual_seed(779)
     eager_model = Qwen3ForCausalLM(config=cfg).cuda()
@@ -781,7 +798,7 @@ def test_qwen3_initial_prefill_cuda_graph_replays_multi_row_initial_prefill(monk
     )
 
     def run(model, *, graph_enabled: bool):
-        monkeypatch.setenv("UNISERVE_PREFILL_CUDA_GRAPH", "1" if graph_enabled else "0")
+        _set_worker_runtime(monkeypatch, prefill_cuda_graph=graph_enabled)
         driver = RunnerDriver(model, block_size=256, kv_token_capacity=2048)
         rows = []
         for step, batch_rows in enumerate(batches, start=1):

@@ -1046,7 +1046,6 @@ def attention_dispatcher():
     return Dispatcher(
         "attention",
         providers,
-        env_override="UNISERVE_ATTENTION_PROVIDER",
         fallback_names=("torch_sdpa",),
     )
 

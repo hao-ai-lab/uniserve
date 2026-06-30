@@ -13,8 +13,8 @@ Capability requirements (CUDA Green Contexts):
 Everything degrades gracefully: when the ``cuda.bindings`` driver module is
 absent, the driver is too old, or partitioning fails, the helpers raise
 :class:`GreenContextError` and the :class:`~uniserve_worker.runtime.stream_manager.StreamManager`
-falls back to plain full-SM torch streams. The feature is gated by the manager on
-``UNISERVE_GREEN_CONTEXTS`` and a capability probe.
+falls back to plain full-SM torch streams. The feature is gated by runtime config
+and a capability probe.
 """
 from __future__ import annotations
 

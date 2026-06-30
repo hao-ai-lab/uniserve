@@ -1,6 +1,7 @@
 """Parity tests for the shared layer library."""
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import uniserve_worker.foundation.runtime_config as runtime_config
 from uniserve_worker.backends.attention import (
     AttentionCapabilities,
     get_attention_backend,
@@ -15,6 +17,7 @@ from uniserve_worker.backends.attention import (
 )
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.foundation.runtime_config import TorchCompileRuntimeConfig
 from uniserve_worker.foundation.triton_compat import triton_device_supported
 from uniserve_worker.nn import (
     DeviceMesh,
@@ -48,6 +51,14 @@ from uniserve_worker.nn.diffusion import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+def _set_worker_runtime(monkeypatch, **kwargs):
+    monkeypatch.setattr(
+        runtime_config,
+        "_CURRENT_CONFIG",
+        replace(runtime_config.get_worker_config(), **kwargs),
+    )
 
 
 def test_rmsnorm_matches_manual_fp32_reference():
@@ -113,7 +124,6 @@ def test_triton_packed_rotary_matches_eager_formula_cuda(monkeypatch):
     pytest.importorskip("triton")
     if not triton_device_supported(torch.device("cuda")):
         pytest.skip("Triton cannot compile kernels for this CUDA device in this environment")
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(203)
     x = torch.randn(7, 5, 16, device="cuda", dtype=torch.bfloat16)
     cos = torch.randn(7, 8, device="cuda", dtype=torch.float32)
@@ -331,7 +341,7 @@ def test_quantization_config_rejects_unsupported_checkpoint_method():
         QuantizationConfig.from_model_config(cfg)
 
 
-def test_decode_cuda_graph_runner_env_and_copy_contract(monkeypatch):
+def test_decode_cuda_graph_runner_config_and_copy_contract(monkeypatch):
     from uniserve_worker.contracts.forward_context import TextAttentionMetadata
     from uniserve_worker.execution.cuda_graph_base import _DECODE_GRAPH_INPUT_BUFFER_POOL
     from uniserve_worker.execution.decode_cuda_graph import (
@@ -344,9 +354,6 @@ def test_decode_cuda_graph_runner_env_and_copy_contract(monkeypatch):
 
     runner = DecodeCudaGraphRunner(
         name="unit",
-        enabled_env="UNISERVE_TEST_GRAPH",
-        warmup_env="UNISERVE_TEST_GRAPH_WARMUP",
-        warmup_batches_env="UNISERVE_TEST_GRAPH_BATCHES",
         default_warmup_batch_sizes=(1, 2),
     )
     assert runner.enabled()
@@ -368,14 +375,17 @@ def test_decode_cuda_graph_runner_env_and_copy_contract(monkeypatch):
     assert runner.capture_pool() is pools[0]
     assert len(pools) == 1
 
-    monkeypatch.setenv("UNISERVE_TEST_GRAPH", "0")
-    monkeypatch.setenv("UNISERVE_TEST_GRAPH_WARMUP", "off")
-    monkeypatch.setenv("UNISERVE_TEST_GRAPH_BATCHES", "4,bad,2,4")
-    assert not runner.enabled()
-    assert not runner.warmup_enabled()
-    assert runner.warmup_batch_sizes() == (2, 4)
-    assert runner.warmup_capture_batch_sizes() == (4, 2)
-    assert runner.bucket_batch_size(3) == 4
+    configured_runner = DecodeCudaGraphRunner(
+        name="unit-configured",
+        default_enabled=False,
+        default_warmup=False,
+        default_warmup_batch_sizes=(4, 2, 4),
+    )
+    assert not configured_runner.enabled()
+    assert not configured_runner.warmup_enabled()
+    assert configured_runner.warmup_batch_sizes() == (2, 4)
+    assert configured_runner.warmup_capture_batch_sizes() == (4, 2)
+    assert configured_runner.bucket_batch_size(3) == 4
 
     _DECODE_GRAPH_INPUT_BUFFER_POOL.clear()
     large = _share_decode_graph_input_buffer("unit.input_ids", torch.empty((8, 1), dtype=torch.long))
@@ -396,9 +406,6 @@ def test_decode_cuda_graph_runner_env_and_copy_contract(monkeypatch):
 
     default_runner = DecodeCudaGraphRunner(
         name="unit-default",
-        enabled_env="UNISERVE_TEST_DEFAULT_GRAPH",
-        warmup_env="UNISERVE_TEST_DEFAULT_GRAPH_WARMUP",
-        warmup_batches_env="UNISERVE_TEST_DEFAULT_GRAPH_BATCHES",
     )
     assert default_runner.warmup_batch_sizes() == (
         1,
@@ -575,7 +582,6 @@ def test_flashinfer_graph_prepare_uses_fast_plan_after_seed(monkeypatch):
         fake_wrapper_factory,
     )
     monkeypatch.setattr(flashinfer_mod, "_fast_decode_plan", fake_fast_plan)
-    monkeypatch.delenv("UNISERVE_FLASHINFER_FAST_DECODE_PLAN", raising=False)
 
     metadata = TextAttentionMetadata(
         cache=None,
@@ -775,22 +781,13 @@ def test_flashinfer_paged_varlen_prefill_matches_causal_reference_cuda():
     assert stats.flashinfer_prefill_plan_reuses == 1
 
 
-def test_torch_compile_helper_is_default_off_and_env_driven(monkeypatch):
+def test_torch_compile_helper_is_default_off_and_config_driven(monkeypatch):
     from uniserve_worker.runtime.compile import (
         TorchCompileConfig,
         compile_targets,
         maybe_compile_module,
         named_child_compile_targets,
     )
-
-    for name in (
-        "UNISERVE_TORCH_COMPILE",
-        "UNISERVE_TORCH_COMPILE_BACKEND",
-        "UNISERVE_TORCH_COMPILE_MODE",
-        "UNISERVE_TORCH_COMPILE_FULLGRAPH",
-        "UNISERVE_TORCH_COMPILE_DYNAMIC",
-    ):
-        monkeypatch.delenv(name, raising=False)
 
     module = nn.Linear(2, 2)
     assert maybe_compile_module(module, label="unit") is module
@@ -802,13 +799,18 @@ def test_torch_compile_helper_is_default_off_and_env_driven(monkeypatch):
         return target
 
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE", "1")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_BACKEND", "eager")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_MODE", "none")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_FULLGRAPH", "true")
-    monkeypatch.setenv("UNISERVE_TORCH_COMPILE_DYNAMIC", "false")
+    _set_worker_runtime(
+        monkeypatch,
+        torch_compile=TorchCompileRuntimeConfig(
+            enabled=True,
+            backend="eager",
+            mode=None,
+            fullgraph=True,
+            dynamic=False,
+        ),
+    )
 
-    cfg = TorchCompileConfig.from_env()
+    cfg = TorchCompileConfig.from_runtime_config()
     assert cfg.enabled
     assert cfg.backend == "eager"
     assert cfg.mode is None
@@ -2170,7 +2172,6 @@ def test_qwen_attention_paged_update_is_not_env_gated(monkeypatch):
     cfg._attn_implementation = "eager"
     attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
     backend = FakePagedBackend()
-    monkeypatch.delenv("UNISERVE_ENABLE_TRANSFORMERS_PAGED_ATTENTION", raising=False)
 
     query = torch.randn(1, 4, 2, 8)
     key = torch.randn(1, 2, 2, 8)

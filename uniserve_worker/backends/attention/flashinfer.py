@@ -11,7 +11,7 @@ __all__ = [
 ]
 
 from ...contracts.forward_context import get_forward_context
-from ...foundation.env import env_flag, env_optional_int
+from ...foundation.runtime_config import get_worker_config
 from .base import AttentionCapabilities
 from .flashinfer_kernels import (
     _fill_paged_decode_plan_tensors,
@@ -49,10 +49,6 @@ _BatchPrefillWithPagedKVCacheWrapper = (
     getattr(_flashinfer, "BatchPrefillWithPagedKVCacheWrapper", None) if _flashinfer is not None else None
 )
 _fast_decode_plan = getattr(_flashinfer, "fast_decode_plan", None) if _flashinfer is not None else None
-
-_PREFILL_SPLIT_TILE_ENV = "UNISERVE_FLASHINFER_PREFILL_SPLIT_TILE_SIZE"
-_DISABLE_SPLIT_KV_ENV = "UNISERVE_FLASHINFER_DISABLE_SPLIT_KV"
-
 
 class _PagedDecodeInputs(NamedTuple):
     q_bhd: torch.Tensor
@@ -455,8 +451,8 @@ class FlashInferAttentionBackend(_WrapperPool):
             seq_lens=kv_seqlens,
             seq_lens_q=query_lens,
             block_tables=block_table,
-            fixed_split_size=_optional_int_env(_PREFILL_SPLIT_TILE_ENV),
-            disable_split_kv=_env_flag(_DISABLE_SPLIT_KV_ENV),
+            fixed_split_size=get_worker_config().flashinfer.prefill_split_tile_size,
+            disable_split_kv=get_worker_config().flashinfer.disable_split_kv,
         )
         return plan.index_count
 
@@ -741,11 +737,3 @@ class FlashInferAttentionBackend(_WrapperPool):
 
 if _flashinfer is not None:  # pragma: no cover - availability-specific.
     register_attention_backend("flashinfer", FlashInferAttentionBackend())
-
-
-def _optional_int_env(name: str) -> int | None:
-    return env_optional_int(name)
-
-
-def _env_flag(name: str) -> bool:
-    return env_flag(name)
