@@ -1,0 +1,10 @@
+{
+  "added_tokens_decoder": {
+    "258": { "content": "<think>", "special": false },
+    "259": { "content": "</think>", "special": false },
+    "260": { "content": "<|tool_calls_section_begin|>", "special": false },
+    "261": { "content": "<|tool_calls_section_end|>", "special": false },
+    "262": { "content": "[BOS]", "special": true },
+    "263": { "content": "[EOS]", "special": true }
+  }
+}

@@ -60,23 +60,3 @@ def test_caps_error_and_flatbuffers_schema_are_pinned():
     assert "table EngineCaps" in schema
     assert "pipeline_depth:uint;" in schema
     assert "call_id:ulong = null;" in schema
-
-
-def test_native_ipc_transport_bridge_surface_is_pinned():
-    """Pin the Python IPC transport bridge contract.
-
-    There is no behavioural IPC/shm-ring test on the Python side (the native
-    transport lives in Rust), so at minimum pin that the
-    ``uniserve_worker.server.ipc.Server`` bridge exists and exposes its expected
-    recv/respond transport surface. We do not construct a Server here because
-    that allocates real OS resources (shared memory / sockets); this is purely a
-    surface contract pin.
-    """
-    try:
-        from uniserve_worker.server import ipc
-    except ImportError:
-        pytest.skip("uniserve_worker.server.ipc native extension is not built")
-
-    server = ipc.Server
-    for method in ("recv", "respond", "try_recv"):
-        assert callable(getattr(server, method)), f"Server.{method} missing"

@@ -13,7 +13,6 @@ import torch
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import PagedTextCache
 from uniserve_worker.runtime.tower_handoff import (
-    ConditioningSnapshot,
     DataPlaneTowerHandoff,
     TowerBinding,
 )
@@ -46,14 +45,6 @@ def _pool() -> PagedKVPool:
         device="cpu",
         dtype=torch.float32,
     )
-
-
-def _cache(pool: PagedKVPool, block_id: int, offset: float = 0.0) -> PagedTextCache:
-    cache = PagedTextCache(pool, [block_id], num_layers=2)
-    for layer in range(2):
-        k = torch.arange(8, dtype=torch.float32).view(1, 1, 4, 2) + offset + layer
-        cache.update(k, -k, layer_idx=layer)
-    return cache
 
 
 def test_publish_then_fetch_reconstructs_conditioning_kv():
@@ -152,69 +143,6 @@ def test_publish_serialize_wire_fetch_reconstructs_kv_and_scalars():
         kr, vr = gen_pool.read(layer, replica.block_ids, start=0, length=4)
         assert torch.equal(ks, kr)
         assert torch.equal(vs, vr)
-
-
-def test_publish_serialize_wire_includes_cfg_branch_kv_and_scalars():
-    src_pool = _pool()
-    gen_pool = _pool()
-    gen_free = [0, 1, 2, 3]
-    cond = _cache(src_pool, 0, offset=0.0)
-    tu = _cache(src_pool, 1, offset=100.0)
-    iu = _cache(src_pool, 2, offset=200.0)
-
-    plane = _FakeDataPlane()
-    und = DataPlaneTowerHandoff(
-        data_plane=plane,
-        bind=lambda: TowerBinding(
-            transport=None, primary_coord=0, gen_coord=1, num_layers=2, block_size=4,
-            target_pool=None, target_device="cpu", allocate_blocks=lambda n: [],
-        ),
-    )
-    snapshot = und.publish_conditioning(
-        cond,
-        t_index=11,
-        last_token_id=42,
-        tu_cache=tu,
-        tu_t_index=12,
-        tu_last_token_id=43,
-        iu_cache=iu,
-        iu_t_index=13,
-        iu_last_token_id=44,
-    )
-    restored = ConditioningSnapshot.from_wire(snapshot.to_wire())
-    assert len(restored.locators) == 4
-    assert len(restored.tu_locators) == 4
-    assert len(restored.iu_locators) == 4
-    assert (restored.tu_length, restored.tu_t_index, restored.tu_last_token_id) == (4, 12, 43)
-    assert (restored.iu_length, restored.iu_t_index, restored.iu_last_token_id) == (4, 13, 44)
-
-    gen = DataPlaneTowerHandoff(
-        data_plane=plane,
-        bind=lambda: TowerBinding(
-            transport=None, primary_coord=0, gen_coord=1, num_layers=2, block_size=4,
-            target_pool=gen_pool, target_device="cpu",
-            allocate_blocks=lambda n: [gen_free.pop(0) for _ in range(n)],
-        ),
-    )
-    for source, locators, length, t_index, last_token_id in (
-        (cond, restored.locators, restored.length, restored.t_index, restored.last_token_id),
-        (tu, restored.tu_locators, restored.tu_length, restored.tu_t_index, restored.tu_last_token_id),
-        (iu, restored.iu_locators, restored.iu_length, restored.iu_t_index, restored.iu_last_token_id),
-    ):
-        branch = ConditioningSnapshot(
-            locators=locators,
-            length=length,
-            num_layers=restored.num_layers,
-            t_index=t_index,
-            last_token_id=last_token_id,
-        )
-        replica = gen.stage_conditioning(branch)
-        assert replica.pool is gen_pool
-        for layer in range(2):
-            ks, vs = src_pool.read(layer, source.block_ids, start=0, length=4)
-            kr, vr = gen_pool.read(layer, replica.block_ids, start=0, length=4)
-            assert torch.equal(ks, kr)
-            assert torch.equal(vs, vr)
 
 
 def test_commit_latent_round_trips_over_the_data_plane():

@@ -305,3 +305,217 @@ impl EngineHandle {
         let _ = self.send(Command::Shutdown);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+
+    use super::*;
+
+    fn test_request(request_id: u64) -> GenerateRequest {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        GenerateRequest::new(
+            RequestId(request_id),
+            vec![1, 2, 3],
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenMode::Text,
+            32,
+            event_tx,
+        )
+    }
+
+ /// The convenience constructor fills the request-shaping defaults: no stops,
+ /// zero priority, no LoRA, and empty multimodal/grammar fields.
+    #[test]
+    fn generate_request_new_applies_minimal_defaults() {
+        let request = test_request(7);
+
+        assert_eq!(request.request_id, RequestId(7));
+        assert_eq!(request.prompt_ids, vec![1, 2, 3]);
+        assert_eq!(request.max_tokens, 32);
+        assert_eq!(request.mode, GenMode::Text);
+        assert!(request.neg_prompt_ids.is_empty());
+        assert!(request.stop_strings.is_empty());
+        assert!(request.stop_token_ids.is_empty());
+        assert_eq!(request.priority, 0);
+        assert_eq!(request.lora_id, None);
+        assert!(request.mm_items.is_empty());
+        assert_eq!(request.grammar, None);
+        assert!(!request.skip_reading_prefix_cache);
+    }
+
+ /// `submit` enqueues a `Command::Submit` carrying the request, and the
+ /// scheduler side receives exactly that request id.
+    #[test]
+    fn submit_enqueues_submit_command_with_request() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+
+        handle.submit(test_request(11)).unwrap();
+
+        match rx.recv().unwrap() {
+            Command::Submit(request) => assert_eq!(request.request_id, RequestId(11)),
+            _ => panic!("expected Submit command"),
+        }
+    }
+
+ /// `cancel` and `abort` send distinct commands (client cancel vs server
+ /// abort) carrying the target request id.
+    #[test]
+    fn cancel_and_abort_send_distinct_commands() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+
+        handle.cancel(RequestId(1));
+        handle.abort(RequestId(2));
+
+        match rx.recv().unwrap() {
+            Command::Cancel(id) => assert_eq!(id, RequestId(1)),
+            _ => panic!("expected Cancel command"),
+        }
+        match rx.recv().unwrap() {
+            Command::Abort(id) => assert_eq!(id, RequestId(2)),
+            _ => panic!("expected Abort command"),
+        }
+    }
+
+ /// LoRA load/unload map onto their respective commands with id and path
+ /// preserved.
+    #[test]
+    fn load_and_unload_lora_send_lora_commands() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+
+        handle.load_lora(3, "/adapters/x".to_string());
+        handle.unload_lora(3);
+
+        match rx.recv().unwrap() {
+            Command::LoadLora { id, path } => {
+                assert_eq!(id, 3);
+                assert_eq!(path, "/adapters/x");
+            }
+            _ => panic!("expected LoadLora command"),
+        }
+        match rx.recv().unwrap() {
+            Command::UnloadLora { id } => assert_eq!(id, 3),
+            _ => panic!("expected UnloadLora command"),
+        }
+    }
+
+ /// After the scheduler side of the channel is dropped, `submit` reports an
+ /// error rather than panicking or silently dropping the request.
+    #[test]
+    fn submit_after_receiver_dropped_returns_error() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        drop(rx);
+
+        let result = handle.submit(test_request(99));
+        assert!(result.is_err());
+    }
+
+ /// The waker fires exactly once per successful enqueue, and not at all when
+ /// the channel is closed (no scheduler to wake).
+    #[test]
+    fn waker_fires_on_successful_enqueue_only() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_clone = Arc::clone(&wakes);
+        let waker = uniserve_core::CommandWaker::new(move || {
+            wakes_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::with_waker(tx, waker);
+
+        handle.reset_prefix_cache();
+        handle.set_sleeping(true);
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+
+ // Closing the channel means there is no scheduler to wake.
+        drop(rx);
+        handle.reset_encoder_cache();
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+ /// `collective_rpc` delivers the method to the scheduler side and returns
+ /// the per-rank acks the scheduler replies with.
+    #[test]
+    fn collective_rpc_round_trips_method_and_reply() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+
+ // Stand in for the scheduler: receive the command, reply with acks.
+        let scheduler = std::thread::spawn(move || match rx.recv().unwrap() {
+            Command::CollectiveRpc { method, reply } => {
+                assert_eq!(method, "warmup");
+                reply
+                    .send(Ok(vec![(0, true, None), (1, false, Some("oops".to_string()))]))
+                    .unwrap();
+            }
+            _ => panic!("expected CollectiveRpc command"),
+        });
+
+        let acks = handle.collective_rpc("warmup").unwrap();
+        scheduler.join().unwrap();
+
+        assert_eq!(acks.len(), 2);
+        assert_eq!(acks[0], (0, true, None));
+        assert_eq!(acks[1], (1, false, Some("oops".to_string())));
+    }
+
+ /// Cloned handles share the same underlying channel: a command sent through
+ /// the clone is observed by the original's receiver.
+    #[test]
+    fn cloned_handle_shares_channel() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let clone = handle.clone();
+
+        clone.shutdown();
+
+        assert!(matches!(rx.recv().unwrap(), Command::Shutdown));
+    }
+
+ /// Finish reasons are distinct values, so a client-side cancel never
+ /// compares equal to a server-side abort.
+    #[test]
+    fn finish_reason_variants_are_distinct() {
+        assert_ne!(FinishReason::Cancelled, FinishReason::Aborted);
+        assert_ne!(FinishReason::Eos, FinishReason::Stop);
+        assert_eq!(FinishReason::MaxTokens, FinishReason::MaxTokens);
+    }
+
+ /// A `GenEvent::Finished` carries the finish reason and terminal token
+ /// counts as its payload (the type is not `PartialEq`, so match on it).
+    #[test]
+    fn gen_event_finished_carries_reason_and_counts() {
+        let event = GenEvent::Finished {
+            reason: FinishReason::Stop,
+            stop_reason: Some("</s>".to_string()),
+            prompt_tokens: 4,
+            completion_tokens: 9,
+            images: 0,
+        };
+
+        match event {
+            GenEvent::Finished {
+                reason,
+                stop_reason,
+                prompt_tokens,
+                completion_tokens,
+                images,
+            } => {
+                assert_eq!(reason, FinishReason::Stop);
+                assert_eq!(stop_reason, Some("</s>".to_string()));
+                assert_eq!(prompt_tokens, 4);
+                assert_eq!(completion_tokens, 9);
+                assert_eq!(images, 0);
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+}

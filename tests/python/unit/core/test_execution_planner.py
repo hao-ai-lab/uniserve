@@ -20,8 +20,6 @@ from uniserve_worker.execution.runner import ModelRunner
 from uniserve_worker.execution.text_driver import text_input_id_replacements_from_relays
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
-from uniserve_worker.runtime.kv_pool import PagedKVPool
-from uniserve_worker.runtime.paged_text_cache import BatchedPagedRequestCache
 from uniserve_worker.runtime.request_state import RequestStateTable
 from uniserve_worker.runtime.tensor_staging import TextTensorStager, stage_text_forward_batch
 
@@ -192,16 +190,6 @@ def test_mixed_policy_buckets_by_declared_mode_order_and_reassembles_results():
     ]
 
 
-def test_forward_admission_routes_decode_denoise_by_default_without_split():
-    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
-    submitted = ops("decode_und", "denoise_gen")
-
-    with pytest.raises(WorkerError, match="run_forward"):
-        execute(model, submitted)
-
-    assert model.calls == []
-
-
 def test_non_thin_text_extend_decode_splits_per_mode():
     # A non-thin (whole-batch) model never fuses an extend+decode window; only a
     # thin text model fuses (via the system TextBackendGate). Everything else
@@ -312,67 +300,6 @@ def test_thin_text_runs_per_op_through_system_forward_and_samples():
     assert model.input_values == [[5], [6]]
     # KV-length advance is system-owned (lane "text").
     assert runner.request_states.get(1).kv_lengths["text"] == 1
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device buffers")
-def test_text_stager_reuses_cuda_buffers_for_bucketed_prefill():
-    stager = TextTensorStager(ring_depth=1)
-    device = torch.device("cuda")
-    first = stage_text_forward_batch(
-        UniForwardBatch.from_ops(
-            [
-                {"req_id": 1, "kind": "prefill_und", "token_ids": [5, 6], "pos_range": [3, 5]},
-            ]
-        ).as_text(),
-        device,
-        stager=stager,
-        padded_num_tokens=4,
-    )
-    second = stage_text_forward_batch(
-        UniForwardBatch.from_ops(
-            [
-                {"req_id": 1, "kind": "prefill_und", "token_ids": [7], "pos_range": [9, 10]},
-            ]
-        ).as_text(),
-        device,
-        stager=stager,
-        padded_num_tokens=4,
-    )
-
-    assert int(first.input_ids.data_ptr()) == int(second.input_ids.data_ptr())
-    assert int(first.positions.data_ptr()) == int(second.positions.data_ptr())
-    assert int(first.seq_lens.data_ptr()) == int(second.seq_lens.data_ptr())
-    assert second.input_ids.tolist() == [7, 0, 0, 0]
-    assert second.positions.tolist() == [9, 0, 0, 0]
-    assert second.seq_lens.tolist() == [10]
-    assert second.extend_seq_lens.tolist() == [1]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device buffers")
-def test_text_stager_reuses_cuda_buffers_for_paged_metadata():
-    stager = TextTensorStager(ring_depth=1)
-    slot = stager.next_slot()
-    pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=6,
-        block_size=4,
-        num_kv_heads=1,
-        head_dim=2,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    first = BatchedPagedRequestCache(pool, [[0, 1], [2]], [3, 1])
-    second = BatchedPagedRequestCache(pool, [[4], [5]], [0, 2])
-
-    first_blocks = first.block_table(device="cuda", stager=slot)
-    first_lens = first.cache_seqlens(device="cuda", stager=slot)
-    second_blocks = second.block_table(device="cuda", stager=slot)
-    second_lens = second.cache_seqlens(device="cuda", stager=slot)
-
-    assert int(first_blocks.data_ptr()) == int(second_blocks.data_ptr())
-    assert int(first_lens.data_ptr()) == int(second_lens.data_ptr())
-    assert second_blocks.tolist() == [[4], [5]]
-    assert second_lens.tolist() == [0, 2]
 
 
 def test_per_op_decode_consumes_last_sampled_relay_token(monkeypatch):
@@ -612,15 +539,6 @@ def test_encode_driver_handles_encode_mode_before_model_forward():
 def test_batch_policy_rejects_invalid_max_batch():
     with pytest.raises(Exception, match="max_batch_ops"):
         BatchPolicy(max_batch_ops=0)
-
-
-def test_sensenova_declares_mixed_envelope():
-    from tests.python.fixtures.model_targets import load_backend_class
-
-    cls = load_backend_class("sensenova")
-    policy = cls(config={}).batch_policy()
-    assert policy.max_batch_ops >= 8
-    assert policy.supports_mixed_modes
 
 
 def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):

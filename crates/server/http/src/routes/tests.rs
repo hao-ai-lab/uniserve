@@ -18,9 +18,9 @@ use serde_json::json;
 use serial_test::serial;
 use tower::{Service as _, ServiceExt as _};
 use uniserve_chat::{
-    ChatBackend, ChatContent, ChatContentPart, ChatEvent, ChatLlm, ChatMessage, ChatRenderer,
-    ChatRequest, ChatRole, ChatTextBackend, DefaultChatOutputProcessor, DynChatOutputProcessor,
-    DynChatRenderer, NewChatOutputProcessorOptions, SamplingParams,
+    ChatBackend, ChatContent, ChatContentPart, ChatLlm, ChatMessage, ChatRenderer, ChatRequest,
+    ChatTextBackend, DefaultChatOutputProcessor, DynChatOutputProcessor, DynChatRenderer,
+    NewChatOutputProcessorOptions,
 };
 use uniserve_engine_client::protocol::logprobs::{
     Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob,
@@ -36,9 +36,7 @@ use uniserve_text::tokenizer::{DynTokenizer, Tokenizer};
 use uniserve_text::{Prompt, TextBackend};
 
 use super::{build_router, build_router_with_dev_mode, build_router_with_dev_mode_and_lora};
-use uniserve_openai_api::chat_completions::prepare_chat_request;
 use uniserve_server_app::AppState;
-use uniserve_server_app::LoraModelResolution;
 
 fn request_output(
     request_id: &str,
@@ -148,6 +146,38 @@ fn sse_data_payloads(text: &str) -> Vec<&str> {
     text.lines()
         .filter_map(|line| line.strip_prefix("data: "))
         .collect()
+}
+
+/// Decode the non-sentinel SSE payloads of a streamed response into JSON.
+fn sse_json_chunks(text: &str) -> Vec<serde_json::Value> {
+    sse_data_payloads(text)
+        .into_iter()
+        .filter(|payload| *payload != "[DONE]")
+        .map(|payload| serde_json::from_str(payload).expect("sse chunk json"))
+        .collect()
+}
+
+/// Concatenate the streamed chat-completion text content across SSE chunks.
+fn streamed_chat_content(text: &str) -> String {
+    sse_json_chunks(text)
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Concatenate the streamed text-completion text across SSE chunks.
+fn streamed_completion_text(text: &str) -> String {
+    sse_json_chunks(text)
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Find the single finish_reason emitted across the streamed SSE chunks.
+fn streamed_finish_reason(text: &str) -> Option<String> {
+    sse_json_chunks(text)
+        .iter()
+        .find_map(|chunk| chunk["choices"][0]["finish_reason"].as_str().map(str::to_owned))
 }
 
 type TestFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -2344,94 +2374,6 @@ async fn non_stream_completions_include_prompt_logprobs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn non_stream_chat_completions_still_succeed() {
-    let (client, mock) = EngineCoreClient::connect_mock("test-model");
-
-    let engine_task = MockEngineTask::new(spawn_mock_engine_task(mock, |mut mock| {
-        boxed_test_future(async move {
-            let request = mock.recv_request().await;
-            mock.send_outputs(engine_outputs_for_request(
-                &request.request_id,
-                default_stream_output_specs(),
-            ));
-        })
-    }));
-
-    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
-    let mut app = build_router(Arc::new(AppState::new(
-        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
-        chat,
-    )));
-
-    let response = app
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "stream": false,
-                        "messages": [{"role": "user", "content": "hello"}]
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    engine_task.await.expect("mock engine task");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn non_stream_completions_still_succeed() {
-    let (client, mock) = EngineCoreClient::connect_mock("test-model");
-
-    let engine_task = MockEngineTask::new(spawn_mock_engine_task(mock, |mut mock| {
-        boxed_test_future(async move {
-            let request = mock.recv_request().await;
-            mock.send_outputs(engine_outputs_for_request(
-                &request.request_id,
-                default_stream_output_specs(),
-            ));
-        })
-    }));
-
-    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
-    let mut app = build_router(Arc::new(AppState::new(
-        vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
-        chat,
-    )));
-
-    let response = app
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "prompt": "hello",
-                        "stream": false
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    engine_task.await.expect("mock engine task");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn chat_completions_header_request_id_takes_precedence() {
     let (client, mock) = EngineCoreClient::connect_mock("test-model");
 
@@ -3060,95 +3002,6 @@ async fn completions_echo_stream_emits_separate_prompt_chunk() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn chat_harness_streams_text_events() {
-    let (chat, engine_task) = test_chat_with_engine_handle().await;
-    let mut stream = chat
-        .chat(ChatRequest {
-            messages: vec![ChatMessage::text(ChatRole::User, "hello")],
-            sampling_params: SamplingParams {
-                max_tokens: Some(8),
-                ..Default::default()
-            },
-            request_id: "chat-harness".to_string(),
-            ..ChatRequest::for_test()
-        })
-        .await
-        .expect("submit chat request");
-
-    let mut saw_text = false;
-    let mut saw_done = false;
-    while let Some(event) = stream.next().await {
-        match event.expect("chat event") {
-            ChatEvent::BlockDelta { .. } => saw_text = true,
-            ChatEvent::Done { .. } => {
-                saw_done = true;
-                break;
-            }
-            ChatEvent::Start { .. }
-            | ChatEvent::LogprobsDelta { .. }
-            | ChatEvent::BlockStart { .. }
-            | ChatEvent::BlockEnd { .. }
-            | ChatEvent::ToolCallStart { .. }
-            | ChatEvent::ToolCallArgumentsDelta { .. }
-            | ChatEvent::ToolCallEnd { .. } => {}
-        }
-    }
-    engine_task.await.expect("mock engine task");
-
-    assert!(saw_text);
-    assert!(saw_done);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn prepared_openai_request_streams_text_events() {
-    let (chat, engine_task) = test_chat_with_engine_handle().await;
-    let prepared = prepare_chat_request(
-        serde_json::from_value(json!({
-            "model": "Qwen/Qwen1.5-0.5B-Chat",
-            "stream": true,
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .expect("decode request"),
-        &LoraModelResolution {
-            model_names: vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()],
-            lora_request: None,
-        },
-        crate::utils::ResolvedRequestContext::default(),
-    )
-    .expect("prepare request");
-
-    let mut stream = chat
-        .chat(prepared.chat_request)
-        .await
-        .expect("submit chat request");
-
-    let mut saw_text = false;
-    let mut saw_done = false;
-    while let Some(event) = stream.next().await {
-        match event.expect("chat event") {
-            ChatEvent::BlockDelta { .. } => saw_text = true,
-            ChatEvent::Done { .. } => {
-                saw_done = true;
-                break;
-            }
-            ChatEvent::Start { .. }
-            | ChatEvent::LogprobsDelta { .. }
-            | ChatEvent::BlockStart { .. }
-            | ChatEvent::BlockEnd { .. }
-            | ChatEvent::ToolCallStart { .. }
-            | ChatEvent::ToolCallArgumentsDelta { .. }
-            | ChatEvent::ToolCallEnd { .. } => {}
-        }
-    }
-    engine_task.await.expect("mock engine task");
-
-    assert!(saw_text);
-    assert!(saw_done);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn reasoning_blocks_are_mapped_to_reasoning_sse_chunks() {
     let (app, engine_task) = test_app_with_backend_and_stream_output_specs(
         Arc::new(FakeChatBackend::with_model_id("Qwen/Qwen3-0.6B")),
@@ -3737,6 +3590,114 @@ async fn admin_routes_are_hidden_when_dev_mode_is_disabled() {
     engine_task.abort_and_join().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn streaming_chat_concatenated_content_and_stop_finish_reason() {
+    // The mock engine emits "h", "i", then "!" with a terminal Stop. The "!" token
+    // is the EOS-driven stop token and is suppressed from the visible output, so the
+    // streamed chat content concatenates to "hi" and the single finish_reason is
+    // "stop".
+    let (app, engine_task) = test_app_with_engine_handle().await;
+    let mut app = app;
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+
+    assert_eq!(streamed_chat_content(&text), "hi");
+    assert_eq!(streamed_finish_reason(&text).as_deref(), Some("stop"));
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_request_sampling_fields_are_mapped_into_engine_request() {
+    // prepare_chat_request field mapping: temperature/top_p/top_k/seed/max_tokens
+    // from the OpenAI chat body must reach the engine-core request unchanged.
+    let (mut app, engine_task) = test_app_with_backend_and_engine_request_check(
+        Arc::new(FakeChatBackend::new()),
+        |request| {
+            let sampling = request
+                .sampling_params
+                .as_ref()
+                .expect("sampling_params present");
+            assert!(
+                (sampling.temperature - 0.5).abs() < 1e-6,
+                "temperature was {}",
+                sampling.temperature
+            );
+            assert!(
+                (sampling.top_p - 0.8).abs() < 1e-6,
+                "top_p was {}",
+                sampling.top_p
+            );
+            assert_eq!(sampling.top_k, 7);
+            assert_eq!(sampling.seed, Some(99));
+            assert_eq!(sampling.max_tokens, 16);
+        },
+    )
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": false,
+                        "temperature": 0.5,
+                        "top_p": 0.8,
+                        "top_k": 7,
+                        "seed": 99,
+                        "max_completion_tokens": 16,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+}
+
 // ========================= Stop string tests =========================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3834,137 +3795,6 @@ async fn non_stream_completions_stop_string_included_in_output() {
     assert_eq!(json["choices"][0]["text"], "say wor");
     assert_eq!(json["choices"][0]["finish_reason"], "stop");
     assert_eq!(json["choices"][0]["stop_reason"], "wor");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn stream_completions_stop_string_excluded_from_output() {
-    let output_specs = vec![
-        (bytes_to_token_ids(b"say"), None),
-        (
-            bytes_to_token_ids(b" world"),
-            Some(EngineCoreFinishReason::Length),
-        ),
-    ];
-    let (app, engine_task) = test_app_with_stream_output_specs(output_specs).await;
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "prompt": "hello",
-                        "stream": true,
-                        "stop": ["wor"]
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    engine_task.await.expect("mock engine task");
-    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let payloads = sse_data_payloads(&text);
-
- // Collect all text deltas from the SSE chunks.
-    let mut full_text = String::new();
-    for payload in &payloads {
-        if *payload == "[DONE]" {
-            continue;
-        }
-        let chunk: serde_json::Value = serde_json::from_str(payload).expect("json chunk");
-        if let Some(text) = chunk["choices"][0]["text"].as_str() {
-            full_text.push_str(text);
-        }
-    }
-
- // The concatenated text deltas should equal "say " (stop string excluded).
-    assert_eq!(full_text, "say ", "full streamed text: {text}");
-
- // The final chunk should have finish_reason "stop".
-    assert!(
-        payloads
-            .iter()
-            .any(|p| p.contains("\"finish_reason\":\"stop\"")),
-        "{text}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn stream_completions_stop_string_included_in_output() {
-    let output_specs = vec![
-        (bytes_to_token_ids(b"say"), None),
-        (
-            bytes_to_token_ids(b" world"),
-            Some(EngineCoreFinishReason::Length),
-        ),
-    ];
-    let (app, engine_task) = test_app_with_stream_output_specs(output_specs).await;
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "prompt": "hello",
-                        "stream": true,
-                        "stop": ["wor"],
-                        "include_stop_str_in_output": true
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
-
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    engine_task.await.expect("mock engine task");
-    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
-    let payloads = sse_data_payloads(&text);
-
-    let mut full_text = String::new();
-    for payload in &payloads {
-        if *payload == "[DONE]" {
-            continue;
-        }
-        let chunk: serde_json::Value = serde_json::from_str(payload).expect("json chunk");
-        if let Some(text) = chunk["choices"][0]["text"].as_str() {
-            full_text.push_str(text);
-        }
-    }
-
- // With include_stop_str_in_output, the stop string "wor" should be included.
-    assert_eq!(full_text, "say wor", "full streamed text: {text}");
-
-    assert!(
-        payloads
-            .iter()
-            .any(|p| p.contains("\"finish_reason\":\"stop\"")),
-        "{text}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4083,4 +3913,131 @@ async fn completions_empty_stop_string_returns_validation_error() {
         .expect("call app");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ============== Streaming completions stop-string trimming ==============
+
+/// Drive a streaming `/v1/completions` request with the given engine output
+/// specs and stop options, returning the full SSE body text. Uses
+/// `Service::call` (not `oneshot`) so the streaming body drains before the
+/// router/state is dropped.
+async fn stream_completion_with_stop(
+    output_specs: Vec<(Vec<u32>, Option<EngineCoreFinishReason>)>,
+    stop: &str,
+    include_stop_str_in_output: bool,
+) -> String {
+    let (mut app, engine_task) = test_app_with_stream_output_specs(output_specs).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "prompt": "hello",
+                        "stream": true,
+                        "stop": [stop],
+                        "include_stop_str_in_output": include_stop_str_in_output
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+    String::from_utf8(body.to_vec()).expect("utf8 body")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn stream_completions_stop_string_excluded_single_chunk() {
+    // Engine emits "say world" in one decode step; stop "wor" truncates the
+    // streamed text to "say " with finish_reason "stop".
+    let text = stream_completion_with_stop(
+        vec![(
+            bytes_to_token_ids(b"say world"),
+            Some(EngineCoreFinishReason::Length),
+        )],
+        "wor",
+        false,
+    )
+    .await;
+
+    assert_eq!(streamed_completion_text(&text), "say ");
+    assert_eq!(streamed_finish_reason(&text).as_deref(), Some("stop"));
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn stream_completions_stop_string_included_single_chunk() {
+    // Same single-chunk emission, but include_stop_str_in_output keeps "wor".
+    let text = stream_completion_with_stop(
+        vec![(
+            bytes_to_token_ids(b"say world"),
+            Some(EngineCoreFinishReason::Length),
+        )],
+        "wor",
+        true,
+    )
+    .await;
+
+    assert_eq!(streamed_completion_text(&text), "say wor");
+    assert_eq!(streamed_finish_reason(&text).as_deref(), Some("stop"));
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn stream_completions_stop_string_excluded_split_across_chunks() {
+    // Stop "wor" straddles two decode steps: "say wo" then "rld". Trimming must
+    // span the chunk boundary, yielding "say " without dropping the SSE body.
+    let text = stream_completion_with_stop(
+        vec![
+            (bytes_to_token_ids(b"say wo"), None),
+            (
+                bytes_to_token_ids(b"rld"),
+                Some(EngineCoreFinishReason::Length),
+            ),
+        ],
+        "wor",
+        false,
+    )
+    .await;
+
+    assert_eq!(streamed_completion_text(&text), "say ");
+    assert_eq!(streamed_finish_reason(&text).as_deref(), Some("stop"));
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn stream_completions_stop_string_included_split_across_chunks() {
+    // Same cross-boundary emission, but include_stop_str_in_output keeps "wor".
+    let text = stream_completion_with_stop(
+        vec![
+            (bytes_to_token_ids(b"say wo"), None),
+            (
+                bytes_to_token_ids(b"rld"),
+                Some(EngineCoreFinishReason::Length),
+            ),
+        ],
+        "wor",
+        true,
+    )
+    .await;
+
+    assert_eq!(streamed_completion_text(&text), "say wor");
+    assert_eq!(streamed_finish_reason(&text).as_deref(), Some("stop"));
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
 }

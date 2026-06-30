@@ -314,17 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn frequency_penalty_demotes_recent() {
-        let mut l = base_logits();
-        let p = SamplingParams {
-            frequency_penalty: 2.0,
-            ..Default::default()
-        };
-        let out = apply_sampling(&mut l, &p, &[3, 3, 3], None, None, 0);
-        assert_ne!(out.token, 3);
-    }
-
-    #[test]
     fn min_p_and_logprobs() {
         let mut l = base_logits();
         let p = SamplingParams {
@@ -346,34 +335,264 @@ mod tests {
         assert_eq!(out.token, 3);
     }
 
-    #[test]
-    fn categorical_respects_distribution() {
- // A heavily skewed distribution should overwhelmingly draw the dominant
- // outcome across a range of seeds.
-        let probs = [0.9f32, 0.05, 0.05];
-        let hits = (0..1000u64)
-            .filter(|&s| sample_categorical(&probs, s | 1) == 0)
-            .count();
-        assert!(hits > 800, "dominant outcome under-sampled: {hits}/1000");
+    // ----------------------------------------------------------------------
+    // Masking transforms (min-p / top-k / top-p) prune low-probability tokens.
+    //
+    // With greedy defaults (temperature 0.0 => no temperature scaling, top_p 1.0,
+    // top_k 0, min_p 0.0 all no-op) the ONLY transform that touches the in-place
+    // `logits` slice is the one we enable, so reading the slice back after the
+    // call observes exactly which positions were pruned to NEG_INF. The base
+    // logits [3,2,1,0] have softmax probs ~[0.644, 0.237, 0.087, 0.032]
+    // (descending), which pins the cutoffs below.
+    // ----------------------------------------------------------------------
+
+    fn ramp_logits() -> Vec<f32> {
+        vec![3.0, 2.0, 1.0, 0.0]
     }
 
     #[test]
-    fn categorical_decorrelates_adjacent_seeds() {
- // Adjacent seeds (exactly what seed_from produces as the recent window
- // grows by one token) must not collapse to the same draw under a
- // uniform distribution — a single xorshift step failed this.
-        let probs = [0.2f32; 5];
-        let draws: Vec<u32> = (0..200u64).map(|s| sample_categorical(&probs, s)).collect();
-        let distinct: std::collections::HashSet<u32> = draws.iter().copied().collect();
-        assert_eq!(distinct.len(), 5, "all outcomes should be reachable");
- // No long run of identical consecutive draws (correlation symptom).
-        let max_run = draws
-            .windows(2)
-            .fold((1usize, 1usize), |(cur, best), w| {
-                let cur = if w[0] == w[1] { cur + 1 } else { 1 };
-                (cur, best.max(cur))
-            })
-            .1;
-        assert!(max_run < 10, "adjacent seeds correlated: run length {max_run}");
+    fn min_p_prunes_below_relative_threshold() {
+        // min_p 0.3 => threshold = 0.3 * maxprob(0.644) = 0.193.
+        // token0 (0.644) and token1 (0.237) survive; token2 (0.087) and
+        // token3 (0.032) fall below threshold and are masked to NEG_INF.
+        let mut l = ramp_logits();
+        let p = SamplingParams {
+            min_p: 0.3,
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[], None, None, 0);
+        assert!(l[0].is_finite(), "top token survives min-p");
+        assert!(l[1].is_finite(), "second token survives min-p");
+        assert_eq!(l[2], NEG_INF, "token below min_p*maxp pruned");
+        assert_eq!(l[3], NEG_INF, "token below min_p*maxp pruned");
+    }
+
+    #[test]
+    fn top_k_keeps_only_k_highest_logits() {
+        // top_k = 2 keeps the two highest logits (tokens 0 and 1); the rest
+        // are masked to NEG_INF regardless of how close their probs are.
+        let mut l = ramp_logits();
+        let p = SamplingParams {
+            top_k: 2,
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[], None, None, 0);
+        assert!(l[0].is_finite(), "highest logit kept");
+        assert!(l[1].is_finite(), "second-highest logit kept");
+        assert_eq!(l[2], NEG_INF, "3rd-ranked logit pruned by top_k=2");
+        assert_eq!(l[3], NEG_INF, "4th-ranked logit pruned by top_k=2");
+    }
+
+    #[test]
+    fn top_p_nucleus_keeps_smallest_set_reaching_mass() {
+        // top_p 0.7: descending cumulative prob is 0.644 (rank0), 0.881 (rank1),
+        // 0.968 (rank2). The cumulative first reaches >=0.7 at rank1, so the
+        // nucleus is {token0, token1}; tokens 2 and 3 are pruned to NEG_INF.
+        let mut l = ramp_logits();
+        let p = SamplingParams {
+            top_p: 0.7,
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[], None, None, 0);
+        assert!(l[0].is_finite(), "token0 inside nucleus");
+        assert!(l[1].is_finite(), "token1 completes nucleus mass >=0.7");
+        assert_eq!(l[2], NEG_INF, "token2 outside top-p nucleus pruned");
+        assert_eq!(l[3], NEG_INF, "token3 outside top-p nucleus pruned");
+    }
+
+    #[test]
+    fn masking_excludes_pruned_tokens_from_logprobs() {
+        // The returned top-logprobs list only contains surviving (non-NEG_INF)
+        // tokens: top_k=2 leaves 2 candidates, so requesting 5 logprobs returns
+        // exactly the 2 survivors and never a pruned id.
+        let mut l = ramp_logits();
+        let p = SamplingParams {
+            top_k: 2,
+            ..Default::default()
+        };
+        let out = apply_sampling(&mut l, &p, &[], None, None, 5);
+        assert_eq!(out.top.len(), 2, "only the 2 survivors are reportable");
+        let reported: Vec<u32> = out.top.iter().map(|&(t, _)| t).collect();
+        assert!(!reported.contains(&2), "pruned token 2 excluded from logprobs");
+        assert!(!reported.contains(&3), "pruned token 3 excluded from logprobs");
+    }
+
+    // ----------------------------------------------------------------------
+    // Penalty semantics: frequency (count-scaled additive), presence (flat
+    // additive), repetition (multiplicative, sign-aware) are three distinct
+    // transforms. With greedy defaults the penalty is the only transform applied
+    // to the in-place logits, so reading the slice back reveals the exact math.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn frequency_penalty_scales_with_recent_count() {
+        // Equal base logits; token1 appears twice in `recent`, token2 once.
+        // frequency penalty subtracts penalty*count, so the more-repeated token1
+        // is demoted strictly more than token2, and a non-recent token is
+        // untouched. This count scaling is what distinguishes it from presence.
+        let mut l = vec![3.0f32, 3.0, 3.0, 3.0];
+        let p = SamplingParams {
+            frequency_penalty: 1.0,
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[1, 1, 2], None, None, 0);
+        assert_eq!(l[0], 3.0, "non-recent token untouched");
+        assert_eq!(l[3], 3.0, "non-recent token untouched");
+        assert_eq!(l[2], 2.0, "count 1 => -1.0");
+        assert_eq!(l[1], 1.0, "count 2 => -2.0 (scaled by count)");
+        assert!(l[1] < l[2], "higher count demoted more under frequency");
+    }
+
+    #[test]
+    fn presence_penalty_is_flat_regardless_of_count() {
+        // Same recent window as the frequency test, but presence subtracts a
+        // flat penalty once for any appearance: token1 (count 2) and token2
+        // (count 1) are demoted by the SAME amount, leaving them tied.
+        let mut l = vec![3.0f32, 3.0, 3.0, 3.0];
+        let p = SamplingParams {
+            presence_penalty: 1.0,
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[1, 1, 2], None, None, 0);
+        assert_eq!(l[0], 3.0, "non-recent token untouched");
+        assert_eq!(l[3], 3.0, "non-recent token untouched");
+        assert_eq!(l[1], 2.0, "appeared => flat -1.0");
+        assert_eq!(l[2], 2.0, "appeared => flat -1.0");
+        assert_eq!(l[1], l[2], "presence ignores count: equal demotion");
+    }
+
+    #[test]
+    fn repetition_penalty_is_multiplicative_and_sign_aware() {
+        // token0 has a positive logit, token1 a negative one, both in `recent`.
+        // Repetition penalty divides positive logits and multiplies negative
+        // logits by the penalty (sign-aware), unlike the additive penalties
+        // which would shift both by the same constant.
+        let mut l = vec![4.0f32, -4.0, 0.0];
+        let p = SamplingParams {
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[0, 1], None, None, 0);
+        assert_eq!(l[0], 2.0, "positive logit DIVIDED by penalty (4/2)");
+        assert_eq!(l[1], -8.0, "negative logit MULTIPLIED by penalty (-4*2)");
+        assert_eq!(l[2], 0.0, "non-recent token untouched");
+        // Distinct from additive: the two recent tokens moved by different
+        // deltas (-2 and -4), whereas frequency/presence with count 1 each would
+        // shift both by an identical constant.
+        let delta0 = 4.0 - l[0];
+        let delta1 = -4.0 - l[1];
+        assert_ne!(delta0, delta1, "sign-aware deltas differ, not a flat shift");
+    }
+
+    #[test]
+    fn frequency_and_presence_diverge_on_repeated_token() {
+        // Direct contrast: with the SAME recent window, frequency demotes the
+        // twice-seen token below the once-seen token, while presence leaves them
+        // tied. Asserting both orderings in one place proves the semantics are
+        // genuinely different transforms, not aliases.
+        let recent = [1u32, 1, 2];
+
+        let mut lf = vec![3.0f32, 3.0, 3.0];
+        apply_sampling(
+            &mut lf,
+            &SamplingParams {
+                frequency_penalty: 0.5,
+                ..Default::default()
+            },
+            &recent,
+            None,
+            None,
+            0,
+        );
+        assert!(lf[1] < lf[2], "frequency: count-2 token below count-1 token");
+
+        let mut lp = vec![3.0f32, 3.0, 3.0];
+        apply_sampling(
+            &mut lp,
+            &SamplingParams {
+                presence_penalty: 0.5,
+                ..Default::default()
+            },
+            &recent,
+            None,
+            None,
+            0,
+        );
+        assert_eq!(lp[1], lp[2], "presence: count-2 and count-1 tokens tied");
+    }
+
+    // ----------------------------------------------------------------------
+    // sample_categorical determinism + splitmix64 avalanche, exercised through
+    // the public `apply_sampling` path with temperature > 0 so the categorical
+    // branch (not argmax) runs. Properties are asserted statistically with a
+    // documented tolerance, decoupled from the exact mixing constants.
+    // ----------------------------------------------------------------------
+
+    /// Draw a token through the public sampler for a given integer seed over a
+    /// flat (uniform-target) logits vector of width `v`.
+    fn sample_uniform(seed: u64, v: usize) -> u32 {
+        let mut l = vec![0.0f32; v]; // equal logits => uniform target probs
+        let p = SamplingParams {
+            temperature: 1.0,
+            seed: Some(seed),
+            ..Default::default()
+        };
+        apply_sampling(&mut l, &p, &[], None, None, 0).token
+    }
+
+    #[test]
+    fn sample_categorical_is_deterministic_per_seed() {
+        // Identical seed + params + recent window => identical token, every time.
+        for &seed in &[1u64, 7, 12345, 0xDEAD_BEEF, u64::MAX] {
+            let a = sample_uniform(seed, 16);
+            let b = sample_uniform(seed, 16);
+            assert_eq!(a, b, "seed {seed} must reproduce the same draw");
+        }
+    }
+
+    #[test]
+    fn sample_categorical_distribution_is_roughly_uniform() {
+        // Over a seed corpus with a flat target, splitmix64's avalanche should
+        // spread draws across all buckets. Tolerance is generous (max relative
+        // deviation < 0.30 over N=2000, V=8; observed ~0.11) so the test tracks
+        // the *property* of good mixing, not the specific mixing function.
+        const N: u64 = 2000;
+        const V: usize = 8;
+        let mut counts = [0u64; V];
+        for seed in 0..N {
+            counts[sample_uniform(seed, V) as usize] += 1;
+        }
+        let expected = N as f64 / V as f64;
+        for (bucket, &c) in counts.iter().enumerate() {
+            let rel_dev = (c as f64 - expected).abs() / expected;
+            assert!(
+                rel_dev < 0.30,
+                "bucket {bucket} count {c} deviates {rel_dev:.3} (>0.30) from uniform {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_low_bit_seeds_decorrelate() {
+        // splitmix64 avalanche means seeds differing only in low bits map to
+        // well-separated draws. Over consecutive odd seeds (the minimal distinct
+        // step, since `seed_from` ORs in the low bit) draws differ far more often
+        // than a mixer that preserved low-bit correlation would allow.
+        const V: usize = 8;
+        const PAIRS: u64 = 2000;
+        let mut distinct = 0u64;
+        for k in (1..(1 + 2 * PAIRS)).step_by(2) {
+            if sample_uniform(k, V) != sample_uniform(k + 2, V) {
+                distinct += 1;
+            }
+        }
+        let frac = distinct as f64 / PAIRS as f64;
+        // A perfect uniform mapping over V=8 gives ~7/8=0.875 distinct; require
+        // well above 0.6 (observed ~0.87). A degenerate low-bit-preserving mixer
+        // would collapse neighbors to identical buckets, scoring near 0.
+        assert!(
+            frac > 0.6,
+            "adjacent-seed distinct fraction {frac:.3} too low; low bits not avalanched"
+        );
     }
 }

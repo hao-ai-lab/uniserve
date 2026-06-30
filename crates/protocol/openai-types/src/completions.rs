@@ -249,3 +249,144 @@ pub enum CompletionSseChunk {
  /// Final usage chunk emitted before `[DONE]` when `include_usage=true`.
     Usage(CompletionStreamResponse),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+ /// Unknown top-level fields are preserved in the `other` catch-all rather
+ /// than dropped, mirroring the `ChatCompletionRequest::other` behavior.
+    #[test]
+    fn unknown_fields_are_captured_in_other() {
+        let json = serde_json::json!({
+            "model": "test-model",
+            "prompt": "hello",
+            "temperature": 0.5,
+            "some_future_field": 42,
+            "vendor_extension": {"nested": true},
+        });
+
+        let req: CompletionRequest = serde_json::from_value(json).unwrap();
+
+ // Known fields still deserialize normally.
+        assert_eq!(req.model, "test-model");
+        assert_eq!(req.temperature, Some(0.5));
+        assert_eq!(req.prompt, Prompt::Text("hello".to_string()));
+
+ // Unknown fields land in the catch-all, not silently discarded.
+        assert_eq!(req.other.get("some_future_field"), Some(&Value::from(42)));
+        assert_eq!(
+            req.other.get("vendor_extension"),
+            Some(&serde_json::json!({"nested": true}))
+        );
+ // Known fields are not duplicated into the catch-all.
+        assert!(!req.other.contains_key("model"));
+        assert!(!req.other.contains_key("temperature"));
+    }
+
+ /// A minimal request relies on serde defaults: `max_tokens` defaults to 16
+ /// and the `default_true` flags default to true.
+    #[test]
+    fn minimal_request_applies_serde_defaults() {
+        let json = serde_json::json!({
+            "model": "m",
+            "prompt": "p",
+        });
+
+        let req: CompletionRequest = serde_json::from_value(json).unwrap();
+
+        assert_eq!(req.max_tokens, Some(16));
+        assert!(!req.echo);
+        assert!(!req.stream);
+        assert!(req.skip_special_tokens);
+        assert!(req.spaces_between_special_tokens);
+        assert!(req.add_special_tokens);
+        assert!(req.other.is_empty());
+    }
+
+ /// A token-id prompt deserializes into `Prompt::TokenIds` and round-trips
+ /// back to the same JSON array.
+    #[test]
+    fn token_id_prompt_round_trips_through_serde() {
+        let json = serde_json::json!({
+            "model": "m",
+            "prompt": [1, 2, 3],
+        });
+
+        let req: CompletionRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.prompt, Prompt::TokenIds(vec![1, 2, 3]));
+
+        let reserialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(reserialized["prompt"], serde_json::json!([1, 2, 3]));
+    }
+
+ /// `skip_serializing_none` drops absent optional fields from the serialized
+ /// request, so e.g. `seed` and `top_k` do not appear when unset.
+    #[test]
+    fn unset_optional_fields_are_omitted_on_serialize() {
+        let json = serde_json::json!({
+            "model": "m",
+            "prompt": "p",
+        });
+        let req: CompletionRequest = serde_json::from_value(json).unwrap();
+
+        let value = serde_json::to_value(&req).unwrap();
+        let map = value.as_object().unwrap();
+        assert!(!map.contains_key("seed"));
+        assert!(!map.contains_key("top_k"));
+        assert!(!map.contains_key("logprobs"));
+ // Present-with-default scalar fields are still serialized.
+        assert_eq!(map.get("max_tokens"), Some(&Value::from(16)));
+    }
+
+ /// A populated response serializes with the choice fields it carries and
+ /// omits unset optional envelope fields (`skip_serializing_none`).
+    #[test]
+    fn response_serializes_choice_and_omits_unset_fields() {
+        let response = CompletionResponse {
+            id: "cmpl-1".to_string(),
+            object: "text_completion".to_string(),
+            created: 99,
+            model: "m".to_string(),
+            choices: vec![CompletionChoice {
+                index: 0,
+                text: "world".to_string(),
+                logprobs: None,
+                finish_reason: Some("stop".to_string()),
+                stop_reason: None,
+                prompt_logprobs: None,
+                token_ids: None,
+                prompt_token_ids: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            kv_transfer_params: None,
+        };
+
+        let value = serde_json::to_value(&response).unwrap();
+        let map = value.as_object().unwrap();
+        assert_eq!(map.get("id"), Some(&Value::from("cmpl-1")));
+        assert_eq!(value["choices"][0]["text"], Value::from("world"));
+        assert_eq!(value["choices"][0]["finish_reason"], Value::from("stop"));
+ // Unset response-envelope optionals are omitted.
+        assert!(!map.contains_key("usage"));
+        assert!(!map.contains_key("system_fingerprint"));
+ // Unset choice optionals are omitted too.
+        let choice = value["choices"][0].as_object().unwrap();
+        assert!(!choice.contains_key("logprobs"));
+        assert!(!choice.contains_key("token_ids"));
+    }
+
+ /// `CompletionStreamResponse::new` pre-fills the standard envelope.
+    #[test]
+    fn stream_response_new_prefills_envelope() {
+        let stream = CompletionStreamResponse::new("id-1", "model-x", 7);
+
+        assert_eq!(stream.id, "id-1");
+        assert_eq!(stream.object, "text_completion");
+        assert_eq!(stream.model, "model-x");
+        assert_eq!(stream.created, 7);
+        assert!(stream.choices.is_empty());
+        assert!(stream.usage.is_none());
+    }
+}

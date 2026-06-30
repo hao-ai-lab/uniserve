@@ -58,6 +58,56 @@ fn factory_rejects_unknown_parser_names() {
 }
 
 #[test]
+fn unknown_tool_parser_error_names_rejected_parser_and_lists_available() {
+ // The populated registry rejects an unknown explicit name with an error
+ // that both names the rejected parser and surfaces the available parsers,
+ // so an operator who mistyped `--tool-call-parser` can self-correct. We
+ // assert the variant carries the rejected name and a couple of stable
+ // built-in parser names, rather than snapshotting the full registry list
+ // (which churns as parsers are added).
+    let factory = ToolParserFactory::new();
+    let error = match factory.create("nope-not-a-parser", &[]) {
+        Ok(_) => panic!("expected parser lookup to fail"),
+        Err(error) => error,
+    };
+
+    let Error::ParserUnavailableByName {
+        kind,
+        name,
+        available_names,
+    } = &error
+    else {
+        panic!("expected ParserUnavailableByName, got {error:?}");
+    };
+    assert_eq!(*kind, "tool");
+    assert_eq!(name, "nope-not-a-parser");
+    assert!(
+        available_names.iter().any(|n| n == names::HERMES),
+        "available_names should include the hermes parser: {available_names:?}",
+    );
+    assert!(
+        available_names.iter().any(|n| n == names::QWEN3_XML),
+        "available_names should include the qwen3_xml parser: {available_names:?}",
+    );
+
+ // The user-facing message names the rejected parser and includes the
+ // "choose from" hint with at least one stable parser name.
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("nope-not-a-parser"),
+        "error message should name the rejected parser: {rendered}",
+    );
+    assert!(
+        rendered.contains("choose from"),
+        "error message should list available parsers: {rendered}",
+    );
+    assert!(
+        rendered.contains(names::HERMES),
+        "error message should mention a stable available parser: {rendered}",
+    );
+}
+
+#[test]
 fn factory_rejects_unknown_models() {
     let factory = ToolParserFactory::default();
     let error = match factory.create_for_model("definitely-unknown-model", &[]) {

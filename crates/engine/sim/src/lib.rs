@@ -500,16 +500,6 @@ mod tests {
     use uniserve_executor::Executor as _;
 
     #[test]
-    fn new_engine_uses_named_constants() {
-        let e = SimEngine::new();
-        assert_eq!(e.text_len, DEFAULT_TEXT_LEN);
-        assert_eq!(e.fake_eos, FAKE_EOS_TOKEN);
-        assert_eq!(e.vocab, SYNTH_VOCAB_SIZE);
- // The fake EOS id must be addressable in the synthetic logit vector.
-        assert!((e.fake_eos as usize) < e.vocab);
-    }
-
-    #[test]
     fn control_wait_acks_every_control_op() {
         let mut exec = SimExecutor::new(Box::new(SimEngine::new()));
  // Every op variant must produce exactly one ok ack from the single

@@ -101,161 +101,125 @@ impl EngineCoreOutputs {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
     use crate::EngineCoreOutput;
+    use crate::utility::{UtilityOutput, UtilityResultEnvelope};
 
+ /// A message carrying per-request outputs (and nothing else) classifies as a
+ /// `RequestBatch`, preserving the engine index and the contained outputs.
     #[test]
-    fn engine_outputs_classify_request_batch() {
+    fn classifies_pure_request_batch() {
         let outputs = EngineCoreOutputs {
+            engine_index: 5,
             outputs: vec![EngineCoreOutput {
                 request_id: "req-1".to_string(),
                 new_token_ids: vec![7],
                 ..Default::default()
             }],
-            finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
             ..Default::default()
         };
 
-        expect_test::expect![[r#"
-            RequestBatch(
-                RequestBatchOutputs {
-                    engine_index: 0,
-                    outputs: [
-                        EngineCoreOutput {
-                            request_id: "req-1",
-                            new_token_ids: [
-                                7,
-                            ],
-                            new_logprobs: None,
-                            new_prompt_logprobs_tensors: None,
-                            pooling_output: None,
-                            finish_reason: None,
-                            stop_reason: None,
-                            events: None,
-                            kv_transfer_params: None,
-                            trace_headers: None,
-                            prefill_stats: None,
-                            routed_experts: None,
-                            num_nans_in_logits: 0,
-                            native: None,
-                        },
-                    ],
-                    scheduler_stats: None,
-                    timestamp: 0.0,
-                    finished_requests: Some(
-                        {
-                            "req-1",
-                        },
-                    ),
-                },
-            )
-        "#]]
-        .assert_debug_eq(&outputs.classify());
+        let batch = outputs.classify().into_request_batch().unwrap();
+        assert_eq!(batch.engine_index, 5);
+        assert_eq!(batch.outputs.len(), 1);
+        assert_eq!(batch.outputs[0].request_id, "req-1");
     }
 
+ /// `finished_requests` alone (no token outputs) still counts as a request
+ /// payload and classifies as `RequestBatch`.
     #[test]
-    fn engine_outputs_classify_utility() {
+    fn classifies_finished_requests_only_as_request_batch() {
         let outputs = EngineCoreOutputs {
+            engine_index: 1,
+            finished_requests: Some(BTreeSet::from(["done".to_string()])),
+            ..Default::default()
+        };
+
+        let batch = outputs.classify().into_request_batch().unwrap();
+        assert_eq!(batch.engine_index, 1);
+        assert_eq!(
+            batch.finished_requests,
+            Some(BTreeSet::from(["done".to_string()]))
+        );
+    }
+
+ /// A message carrying only a `utility_output` classifies as `Utility` with
+ /// the same call id surfaced.
+    #[test]
+    fn classifies_pure_utility_result() {
+        let outputs = EngineCoreOutputs {
+            engine_index: 2,
             utility_output: Some(UtilityOutput {
                 call_id: 42_u64.into(),
                 failure_message: None,
-                result: None,
+                result: Some(UtilityResultEnvelope::without_type_info(rmpv::Value::Nil)),
             }),
             ..Default::default()
         };
 
-        expect_test::expect![[r#"
-            Utility(
-                UtilityCallOutput {
-                    engine_index: 0,
-                    timestamp: 0.0,
-                    output: UtilityOutput {
-                        call_id: 42,
-                        failure_message: None,
-                        result: None,
-                    },
-                },
-            )
-        "#]]
-        .assert_debug_eq(&outputs.classify());
+        let utility = outputs.classify().into_utility().unwrap();
+        assert_eq!(utility.engine_index, 2);
+        assert_eq!(utility.output.call_id, 42_u64);
     }
 
+ /// A message carrying only `start_wave` classifies as a DP-control
+ /// `StartWave` message with the wave number preserved.
     #[test]
-    fn engine_outputs_classify_control() {
+    fn classifies_start_wave_as_dp_control() {
         let outputs = EngineCoreOutputs {
-            start_wave: Some(3),
+            engine_index: 3,
+            start_wave: Some(11),
             ..Default::default()
         };
 
-        expect_test::expect![[r#"
-            DpControl {
-                engine_index: 0,
-                timestamp: 0.0,
-                control: StartWave(
-                    3,
-                ),
+        match outputs.classify() {
+            ClassifiedEngineCoreOutputs::DpControl {
+                engine_index,
+                control,
+                ..
+            } => {
+                assert_eq!(engine_index, 3);
+                assert_eq!(control, DpControlMessage::StartWave(11));
             }
-        "#]]
-        .assert_debug_eq(&outputs.classify());
+            other => panic!("expected DpControl/StartWave, got {other:?}"),
+        }
     }
 
+ /// A message carrying only `wave_complete` classifies as a DP-control
+ /// `WaveComplete` message.
     #[test]
-    fn engine_outputs_classify_mixed_shape_as_raw() {
+    fn classifies_wave_complete_as_dp_control() {
         let outputs = EngineCoreOutputs {
+            engine_index: 4,
+            wave_complete: Some(9),
+            ..Default::default()
+        };
+
+        match outputs.classify() {
+            ClassifiedEngineCoreOutputs::DpControl { control, .. } => {
+                assert_eq!(control, DpControlMessage::WaveComplete(9));
+            }
+            other => panic!("expected DpControl/WaveComplete, got {other:?}"),
+        }
+    }
+
+ /// A message mixing a request payload with a control signal does not fit any
+ /// clean family and falls through to `Other`, preserving the raw message.
+    #[test]
+    fn classifies_mixed_payload_as_other() {
+        let outputs = EngineCoreOutputs {
+            engine_index: 6,
             outputs: vec![EngineCoreOutput {
-                request_id: "req-1".to_string(),
-                new_token_ids: vec![7],
+                request_id: "req-mix".to_string(),
                 ..Default::default()
             }],
-            utility_output: Some(UtilityOutput {
-                call_id: 1_u64.into(),
-                failure_message: None,
-                result: None,
-            }),
+            start_wave: Some(2),
             ..Default::default()
         };
 
-        expect_test::expect![[r#"
-            Other(
-                EngineCoreOutputs {
-                    engine_index: 0,
-                    outputs: [
-                        EngineCoreOutput {
-                            request_id: "req-1",
-                            new_token_ids: [
-                                7,
-                            ],
-                            new_logprobs: None,
-                            new_prompt_logprobs_tensors: None,
-                            pooling_output: None,
-                            finish_reason: None,
-                            stop_reason: None,
-                            events: None,
-                            kv_transfer_params: None,
-                            trace_headers: None,
-                            prefill_stats: None,
-                            routed_experts: None,
-                            num_nans_in_logits: 0,
-                            native: None,
-                        },
-                    ],
-                    scheduler_stats: None,
-                    timestamp: 0.0,
-                    utility_output: Some(
-                        UtilityOutput {
-                            call_id: 1,
-                            failure_message: None,
-                            result: None,
-                        },
-                    ),
-                    finished_requests: None,
-                    wave_complete: None,
-                    start_wave: None,
-                },
-            )
-        "#]]
-        .assert_debug_eq(&outputs.classify());
+        let raw = outputs.classify().into_other().unwrap();
+        assert_eq!(raw.engine_index, 6);
+        assert_eq!(raw.outputs.len(), 1);
+        assert_eq!(raw.start_wave, Some(2));
     }
 }
