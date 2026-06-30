@@ -18,8 +18,8 @@ import signal
 import sys
 
 from .backends.attention import init_attention_backends
-from .foundation.env import env_flag, env_str
 from .foundation.errors import invalid_descriptor
+from .foundation.runtime_config import set_worker_config, worker_config_from_args
 from .foundation.sizing import DEFAULT_BLOCK_SIZE
 from .nn.mesh import set_current_mesh
 from .server.app import WorkerRuntime
@@ -64,7 +64,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--device", default="cuda")
     ap.add_argument(
         "--mesh",
-        default=env_str("UNISERVE_MESH", default=""),
+        default="",
         help=(
             "parallelism mesh spec: comma-separated key=value entries. Supported "
             "keys: 'tower=text:<dev>;gen:<dev>' places the image-generation tower "
@@ -75,7 +75,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--transfer-backend",
-        default=env_str("UNISERVE_TRANSFER_BACKEND", default="inproc"),
+        default="inproc",
         help=(
             "data-plane Tier-2 backend for this worker's tensor handoffs: inproc "
             "(default) / shm / cuda_ipc / mooncake"
@@ -84,7 +84,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--defer-sampling",
         action="store_true",
-        default=env_flag("UNISERVE_DEFER_SAMPLING"),
+        default=False,
         help=(
             "Deferred sampling: publish decode logits to the data plane and return "
             "handles instead of sampling inline; a separate Sampler worker samples. "
@@ -94,6 +94,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--attention-backend", default="auto")
     ap.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
     ap.add_argument("--kv-token-capacity", type=int, default=None)
+    ap.add_argument("--kv-cache-dtype", default=None)
+    ap.add_argument("--kv-memory-fraction", type=float, default=0.70)
+    ap.add_argument("--model-dtype", default="bfloat16")
+    ap.add_argument("--transformers-trust-remote-code", action="store_true", default=False)
+    ap.add_argument("--transformers-attn-implementation", default="uniserve")
+    ap.add_argument("--disable-model-arch", action="append", default=[])
+    ap.add_argument("--strict-model-imports", action="store_true", default=False)
     ap.add_argument("--tp-rank", type=int, default=0, help="tensor-parallel rank")
     ap.add_argument(
         "--tp-size",
@@ -101,7 +108,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=1,
         help="tensor-parallel world size for ranked workers and model collectives",
     )
+    ap.add_argument("--tp-backend", default=None)
+    ap.add_argument("--tp-init-method", default=None)
+    ap.add_argument("--mooncake-device", default="")
+    ap.add_argument("--mooncake-protocol", default="rdma")
+    ap.add_argument("--torch-compile", action="store_true", default=False)
+    ap.add_argument("--torch-compile-backend", default="inductor")
+    ap.add_argument("--torch-compile-mode", default=None)
+    ap.add_argument("--torch-compile-fullgraph", action="store_true", default=False)
+    ap.add_argument("--torch-compile-dynamic", default=None)
+    ap.add_argument("--cuda-graph", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--cuda-graph-warmup", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--cuda-graph-warmup-batches", default=None)
+    ap.add_argument("--prefill-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--prefill-cuda-graph-warmup", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--prefill-cuda-graph-warmup-tokens", default=None)
+    ap.add_argument("--mixed-text-max-tokens", type=int, default=8192)
+    ap.add_argument("--varlen-prefill", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--forward-max-memory-bound-tokens", type=int, default=281)
+    ap.add_argument("--green-contexts", action="store_true", default=False)
+    ap.add_argument("--logits-processor-chunk-size", type=int, default=0)
+    ap.add_argument("--flashinfer-workspace-size", type=int, default=512 * 1024 * 1024)
+    ap.add_argument("--flashinfer-use-tensor-core", default=None)
+    ap.add_argument("--flashinfer-decode-backend", default="fa2")
+    ap.add_argument("--flashinfer-prefill-backend", default="auto")
+    ap.add_argument("--flashinfer-decode-split-tile-size", type=int, default=None)
+    ap.add_argument("--flashinfer-prefill-split-tile-size", type=int, default=None)
+    ap.add_argument("--flashinfer-disable-split-kv", action="store_true", default=False)
+    ap.add_argument("--flashinfer-fast-decode-plan", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--no-model", action="store_true")
+    ap.add_argument("--allow-stub", action="store_true", default=False)
     return ap
 
 
@@ -180,6 +216,8 @@ def build_driver(args: argparse.Namespace):
         device=args.device,
         tower_devices=tower_devices,
         tower_primary=0,
+        tp_backend=args.tp_backend,
+        tp_init_method=args.tp_init_method,
     )
     set_current_mesh(mesh)
     if args.no_model:
@@ -197,8 +235,8 @@ def build_driver(args: argparse.Namespace):
 def _build_stub_driver(args: argparse.Namespace) -> RunnerDriver:
     logger.warning(
         "STUB MODEL ENABLED: serving the GPU-free StubUniModel echo engine, "
-        "not a real model; outputs are synthetic. Unset --no-model / "
-        "UNISERVE_WORKER_STUB for production serving.",
+        "not a real model; outputs are synthetic. Unset --no-model for "
+        "production serving.",
         extra={"service": args.service_name},
     )
     return RunnerDriver(StubUniModel(), block_size=args.block_size)
@@ -238,6 +276,7 @@ def main():
     _install_fault_dump_handlers()
     args = build_arg_parser().parse_args()
     validate_worker_args(args)
+    set_worker_config(worker_config_from_args(args))
 
     # Deferred import: opening IPC pulls native transport dependencies only for
     # the actual worker entrypoint, not for CLI/unit-test imports.
@@ -296,11 +335,15 @@ def validate_worker_args(args: argparse.Namespace) -> None:
         fail("--tp-rank must satisfy 0 <= rank < tp-size")
     if not args.no_model and not args.model:
         fail("--model is required unless --no-model is set")
-    if args.no_model and not env_flag("UNISERVE_WORKER_STUB"):
+    if args.no_model and not args.allow_stub:
         fail(
             "--no-model loads the GPU-free StubUniModel echo engine and must not be "
-            "used for production serving; set UNISERVE_WORKER_STUB=1 to opt in explicitly"
+            "used for production serving; pass --allow-stub to opt in explicitly"
         )
+    try:
+        worker_config_from_args(args)
+    except ValueError as exc:
+        fail(str(exc))
 
 
 def _install_fault_dump_handlers() -> None:

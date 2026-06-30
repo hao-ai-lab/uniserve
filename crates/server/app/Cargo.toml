@@ -25,6 +25,7 @@ uniserve-openai-api.workspace = true
 uniserve-scheduler.workspace = true
 uniserve-sim.workspace = true
 uniserve-text.workspace = true
+uniserve-worker-ipc.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

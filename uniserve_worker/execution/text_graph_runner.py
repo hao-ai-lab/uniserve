@@ -6,8 +6,7 @@ graph-unaware model is captured/replayed around: the runner builds a static
 the same thin ``model.forward(input_ids, positions, forward_batch)`` the eager path
 uses, so the model never knows it is being graphed.
 
-Env knobs are model-neutral: ``UNISERVE_CUDA_GRAPH`` (decode, default on) and
-``UNISERVE_PREFILL_CUDA_GRAPH`` (prefill, default off).
+Graph settings are model-neutral and come from the worker runtime config.
 """
 from __future__ import annotations
 
@@ -16,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..contracts.forward_batch import ForwardBatch
 from ..contracts.forward_mode import ForwardMode
+from ..foundation.runtime_config import get_worker_config
 from ..runtime.paged_text_cache import BatchedPagedRequestCache
 from .decode_cuda_graph import (
     DecodeCudaGraphRunner,
@@ -33,14 +33,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["TextGraphRunner"]
 
-_DECODE_ENABLED_ENV = "UNISERVE_CUDA_GRAPH"
-_DECODE_WARMUP_ENV = "UNISERVE_CUDA_GRAPH_WARMUP"
-_DECODE_WARMUP_BATCHES_ENV = "UNISERVE_CUDA_GRAPH_WARMUP_BATCHES"
-_PREFILL_ENABLED_ENV = "UNISERVE_PREFILL_CUDA_GRAPH"
-_PREFILL_WARMUP_ENV = "UNISERVE_PREFILL_CUDA_GRAPH_WARMUP"
-_PREFILL_WARMUP_TOKENS_ENV = "UNISERVE_PREFILL_CUDA_GRAPH_WARMUP_TOKENS"
-
-
 class TextGraphRunner:
     """Owns the decode + initial-prefill text CUDA graphs, keyed on the system pool."""
 
@@ -56,21 +48,20 @@ class TextGraphRunner:
         self.num_blocks = int(num_blocks)
         self.block_size = int(block_size)
         self.device = device
+        runtime = get_worker_config()
         self._decode = DecodeCudaGraphRunner(
             name="text",
-            enabled_env=_DECODE_ENABLED_ENV,
-            warmup_env=_DECODE_WARMUP_ENV,
-            warmup_batches_env=_DECODE_WARMUP_BATCHES_ENV,
+            default_enabled=runtime.cuda_graph,
+            default_warmup=runtime.cuda_graph_warmup,
+            default_warmup_batch_sizes=runtime.cuda_graph_warmup_batches,
             metric_prefix="text_",
             logger=logger,
         )
         self._prefill = PrefillCudaGraphRunner(
             name="text",
-            enabled_env=_PREFILL_ENABLED_ENV,
-            warmup_env=_PREFILL_WARMUP_ENV,
-            warmup_tokens_env=_PREFILL_WARMUP_TOKENS_ENV,
-            default_enabled=False,
-            default_warmup=False,
+            default_enabled=runtime.prefill_cuda_graph,
+            default_warmup=runtime.prefill_cuda_graph_warmup,
+            default_warmup_token_buckets=runtime.prefill_cuda_graph_warmup_tokens,
             metric_prefix="text_",
             logger=logger,
         )

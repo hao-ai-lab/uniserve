@@ -1929,8 +1929,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             config_cls=NeoChatConfig,
             model_cls=NEOChatModel,
             tokenizer_cls=AutoTokenizer,
-            attention_env="UNISERVE_SENSENOVA_ATTN",
-            dtype_env="UNISERVE_SENSENOVA_DTYPE",
             config_patch=patch_sensenova_config,
             compatibility_check=check_checkpoint_compatibility,
             stacked_params_mapping=(
@@ -2082,7 +2080,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def _maybe_compile_piecewise(self) -> None:
         if self._torch_compile_applied:
             return
-        cfg = TorchCompileConfig.from_env()
+        cfg = TorchCompileConfig.from_runtime_config()
         if not cfg.enabled:
             return
         report = compile_model_pieces(self, config=cfg)

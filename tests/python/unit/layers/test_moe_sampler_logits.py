@@ -1,10 +1,13 @@
 """Conformance for shared MoE, sampler, and logits helpers."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn as nn
 
+import uniserve_worker.foundation.runtime_config as runtime_config
 import uniserve_worker.nn.activation as activation_mod
 import uniserve_worker.nn.sampler as sampler_mod
 from uniserve_worker.foundation.triton_compat import triton_device_supported
@@ -28,6 +31,14 @@ from uniserve_worker.nn.sampler import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def _set_worker_runtime(monkeypatch, **kwargs):
+    monkeypatch.setattr(
+        runtime_config,
+        "_CURRENT_CONFIG",
+        replace(runtime_config.get_worker_config(), **kwargs),
+    )
 
 
 def _tp_group_mesh(group, *, rank: int = 1, size: int = 2) -> DeviceMesh:
@@ -114,11 +125,10 @@ def test_fused_moe_can_match_unnormalized_topk_routing():
     )
 
 
-def test_triton_qk_rms_norm_matches_reference_on_qkv_views(monkeypatch):
+def test_triton_qk_rms_norm_matches_reference_on_qkv_views():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Triton QK RMSNorm kernel")
     _skip_if_triton_sm100_unsupported()
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(8)
     tokens, q_heads, k_heads, head_dim = 7, 4, 2, 128
     q_size = q_heads * head_dim
@@ -141,11 +151,10 @@ def test_triton_qk_rms_norm_matches_reference_on_qkv_views(monkeypatch):
     assert got_k.is_contiguous()
 
 
-def test_triton_qk_rms_norm_rope_matches_reference_on_qkv_views(monkeypatch):
+def test_triton_qk_rms_norm_rope_matches_reference_on_qkv_views():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Triton QK RMSNorm+RoPE kernel")
     _skip_if_triton_sm100_unsupported()
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(9)
     tokens, q_heads, k_heads, head_dim = 5, 4, 2, 128
     q_size = q_heads * head_dim
@@ -185,13 +194,12 @@ def test_triton_qk_rms_norm_rope_matches_reference_on_qkv_views(monkeypatch):
 @pytest.mark.parametrize("tokens", [1, 5, 17, 257])
 @pytest.mark.parametrize("q_heads,k_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_qk_norm_rope_full_dim_auto_matches_eager_exact(monkeypatch, tokens, q_heads, k_heads, head_dim):
+def test_qk_norm_rope_full_dim_auto_matches_eager_exact(tokens, q_heads, k_heads, head_dim):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for optimized provider parity")
     _skip_if_triton_sm100_unsupported()
     import uniserve_worker.ops as ops
 
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(9100 + tokens + q_heads + k_heads + head_dim)
     q = torch.randn(tokens, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(tokens, k_heads, head_dim, device="cuda", dtype=torch.bfloat16)
@@ -210,7 +218,7 @@ def test_qk_norm_rope_full_dim_auto_matches_eager_exact(monkeypatch, tokens, q_h
 
 @pytest.mark.parametrize("batch,seq_len", [(1, 17), (2, 17), (4, 257)])
 @pytest.mark.parametrize("axis_dims", [(64, 32, 32), (128, 64, 64)])
-def test_qk_norm_rope_multi_axis_auto_matches_eager_exact(monkeypatch, batch, seq_len, axis_dims):
+def test_qk_norm_rope_multi_axis_auto_matches_eager_exact(batch, seq_len, axis_dims):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for optimized provider parity")
     _skip_if_triton_sm100_unsupported()
@@ -218,7 +226,6 @@ def test_qk_norm_rope_multi_axis_auto_matches_eager_exact(monkeypatch, batch, se
     from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
     from uniserve_worker.contracts.forward_stats import ForwardStats
 
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(9200 + batch + seq_len + sum(axis_dims))
     q_heads, k_heads = 4, 2
     q = torch.randn(batch, q_heads, seq_len, sum(axis_dims), device="cuda", dtype=torch.bfloat16)
@@ -271,7 +278,7 @@ def test_qk_norm_rope_multi_axis_auto_matches_eager_exact(monkeypatch, batch, se
     assert stats.operators.counts == {"qk_norm_rope:triton": 1}
 
 
-def test_qk_norm_multi_axis_sensenova_auto_uses_triton_provider(monkeypatch):
+def test_qk_norm_multi_axis_sensenova_auto_uses_triton_provider():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for optimized provider parity")
     _skip_if_triton_sm100_unsupported()
@@ -279,7 +286,6 @@ def test_qk_norm_multi_axis_sensenova_auto_uses_triton_provider(monkeypatch):
     from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
     from uniserve_worker.contracts.forward_stats import ForwardStats
 
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(9300)
     batch, seq_len = 2, 17
     axis_dims = (64, 32, 32)
@@ -585,10 +591,9 @@ def test_sampler_top_p_filters_only_finite_candidates_after_top_k():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_triton_rmsnorm_matches_eager_reference_cuda(monkeypatch):
+def test_triton_rmsnorm_matches_eager_reference_cuda():
     pytest.importorskip("triton")
     _skip_if_triton_sm100_unsupported()
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(11)
     norm = RMSNorm(16).cuda().to(dtype=torch.bfloat16)
     x = torch.randn(5, 16, device="cuda", dtype=torch.bfloat16)
@@ -622,10 +627,9 @@ def test_rmsnorm_matches_reference_for_noncontiguous_cuda_input():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_triton_add_rmsnorm_matches_eager_reference_cuda(monkeypatch):
+def test_triton_add_rmsnorm_matches_eager_reference_cuda():
     pytest.importorskip("triton")
     _skip_if_triton_sm100_unsupported()
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(12)
     norm = RMSNorm(32).cuda().to(dtype=torch.bfloat16)
     x = torch.randn(3, 32, device="cuda", dtype=torch.bfloat16)
@@ -659,7 +663,6 @@ def test_triton_silu_and_mul_matches_eager_reference_cuda(monkeypatch):
     pytest.importorskip("triton")
     _skip_if_triton_sm100_unsupported()
     monkeypatch.setenv("UNISERVE_SILU_AND_MUL_PROVIDER", "triton")
-    monkeypatch.setenv("UNISERVE_TRITON_FUSED_LAYERS", "1")
     torch.manual_seed(13)
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
     with torch.inference_mode():
@@ -691,7 +694,7 @@ def test_logits_processor_can_chunk_large_lm_head_projection(monkeypatch):
             self.sizes.append(int(hidden.shape[0]))
             return self.proj(hidden)
 
-    monkeypatch.setenv("UNISERVE_LOGITS_PROCESSOR_CHUNK_SIZE", "2")
+    _set_worker_runtime(monkeypatch, logits_processor_chunk_size=2)
     hidden = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     lm_head = RecordingHead()
 

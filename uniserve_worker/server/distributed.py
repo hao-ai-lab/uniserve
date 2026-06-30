@@ -20,12 +20,12 @@ that is byte-identical to a single-rank worker.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Sequence
 from typing import Any
 
 import torch
 
-from ..foundation.env import env_str
 from ..foundation.errors import distributed_setup_error
 from ..nn.mesh import (
     CollectiveTransport,
@@ -53,6 +53,8 @@ def build_device_mesh(
     tower_size: int | None = None,
     tower_data_plane: Any | None = None,
     tower_gate: Any | None = None,
+    tp_backend: str | None = None,
+    tp_init_method: str | None = None,
 ) -> DeviceMesh:
     """Construct this worker's :class:`DeviceMesh`.
 
@@ -76,7 +78,15 @@ def build_device_mesh(
 
     axes: list[MeshAxis] = []
     if tp_size > 1:
-        axes.append(_build_tp_axis(tp_rank, tp_size, local_device))
+        axes.append(
+            _build_tp_axis(
+                tp_rank,
+                tp_size,
+                local_device,
+                backend_override=tp_backend,
+                init_method_override=tp_init_method,
+            )
+        )
     if tower_coord is not None:
         tower_axis = _build_cross_process_tower_axis(
             tower_coord, tower_size, tower_data_plane, tower_gate
@@ -99,12 +109,19 @@ def _resolve_local_device(device: str, tp_rank: int, tp_size: int) -> torch.devi
     return dev
 
 
-def _build_tp_axis(tp_rank: int, tp_size: int, device: torch.device) -> MeshAxis:
+def _build_tp_axis(
+    tp_rank: int,
+    tp_size: int,
+    device: torch.device,
+    *,
+    backend_override: str | None = None,
+    init_method_override: str | None = None,
+) -> MeshAxis:
     if not torch.distributed.is_available():
         raise distributed_setup_error("torch.distributed is required for tp_size > 1")
-    backend = _distributed_backend(device)
+    backend = _distributed_backend(device, backend_override=backend_override)
     if not torch.distributed.is_initialized():
-        init_method = _init_method()
+        init_method = _init_method(init_method_override)
         logger.info(
             "initializing tensor-parallel process group",
             extra={
@@ -192,21 +209,21 @@ def _set_cuda_device(device: torch.device, tp_rank: int) -> None:
     torch.cuda.set_device(index)
 
 
-def _distributed_backend(device: torch.device) -> str:
-    override = env_str("UNISERVE_TP_BACKEND", default="")
+def _distributed_backend(device: torch.device, *, backend_override: str | None = None) -> str:
+    override = (backend_override or "").strip()
     if override:
         return override
     return "nccl" if device.type == "cuda" else "gloo"
 
 
-def _init_method() -> str:
-    value = env_str("UNISERVE_TP_INIT_METHOD", default="")
+def _init_method(init_method_override: str | None = None) -> str:
+    value = (init_method_override or "").strip()
     if value:
         return value
-    addr = env_str("MASTER_ADDR", default="127.0.0.1")
-    port = env_str("MASTER_PORT", default="")
+    addr = (os.environ.get("MASTER_ADDR") or "127.0.0.1").strip() or "127.0.0.1"
+    port = (os.environ.get("MASTER_PORT") or "").strip()
     if not port:
         raise distributed_setup_error(
-            "MASTER_PORT or UNISERVE_TP_INIT_METHOD is required for tp_size > 1"
+            "MASTER_PORT or --tp-init-method is required for tp_size > 1"
         )
     return f"tcp://{addr}:{port}"

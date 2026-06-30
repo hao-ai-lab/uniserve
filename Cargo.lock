@@ -5693,6 +5693,7 @@ dependencies = [
  "uniserve-managed-engine",
  "uniserve-server-app",
  "uniserve-server-http",
+ "uniserve-worker-ipc",
 ]
 
 [[package]]
@@ -6039,6 +6040,7 @@ dependencies = [
  "uniserve-scheduler",
  "uniserve-sim",
  "uniserve-text",
+ "uniserve-worker-ipc",
 ]
 
 [[package]]
@@ -6215,6 +6217,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
+ "serde",
  "tracing",
  "uniserve-core",
  "uniserve-executor",

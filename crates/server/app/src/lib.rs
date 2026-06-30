@@ -33,7 +33,7 @@ use uniserve_native_api::resolve_native_profile;
 /// Build the shared application state for one configured model and one engine
 /// client.
 pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
- // Load both backends from the same model metadata so they stay in sync.
+    // Load both backends from the same model metadata so they stay in sync.
     let loaded = load_model_backends(
         &config.model,
         LoadModelBackendsOptions {
@@ -52,10 +52,10 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     let text_backend = loaded.text_backend;
     let chat_backend = loaded.chat_backend;
 
- // Resolve the effective context length: an explicit `--max-model-len`
- // override wins; otherwise derive the model's real context length
- // (`max_position_embeddings`) from the loaded backend so we don't silently
- // truncate long-context models to the 8192 default.
+    // Resolve the effective context length: an explicit `--max-model-len`
+    // override wins; otherwise derive the model's real context length
+    // (`max_position_embeddings`) from the loaded backend so we don't silently
+    // truncate long-context models to the 8192 default.
     let model_max_model_len = text_backend
         .sampling_hints()
         .ok()
@@ -66,16 +66,16 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .or(model_max_model_len)
         .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
 
- // Resolve the model's image/interleave control tokens once from the
- // tokenizer; they drive both the scheduler's image FSM and native-surface
- // prompt ingest.
+    // Resolve the model's image/interleave control tokens once from the
+    // tokenizer; they drive both the scheduler's image FSM and native-surface
+    // prompt ingest.
     let native_profile = resolve_native_profile(&*text_backend.tokenizer());
     let native_controls = &native_profile.controls;
 
- // UniServe owns the engine + scheduler in Rust; Python (or the sim) only
- // runs the model forward pass. The engine runs either on a thread inside
- // this process (the zero-hop default) or as one or more headless
- // `uniserve engine` processes behind the wire protocol.
+    // UniServe owns the engine + scheduler in Rust; Python (or the sim) only
+    // runs the model forward pass. The engine runs either on a thread inside
+    // this process (the zero-hop default) or as one or more headless
+    // `uniserve engine` processes behind the wire protocol.
     let (backend, eos) = match config.engine.backend {
         EngineBackendKind::Sim => (EngineBackend::Sim, vec![151645]),
         EngineBackendKind::Worker => (
@@ -114,11 +114,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 worker_ranks: config.engine.worker_ranks,
                 workers: config.engine.workers.clone(),
                 transfer: config.engine.transfer.clone(),
+                worker_launch: config.engine.worker_launch.clone(),
                 req_slot_cap: 1 << 20,
                 resp_slot_cap: config.engine.resp_slot_cap,
- // Text generation terminates model EOS via scheduler control
- // tokens; explicit request stop tokens stay per request. The
- // sim backend gets its fabricated EOS so it terminates too.
+                // Text generation terminates model EOS via scheduler control
+                // tokens; explicit request stop tokens stay per request. The
+                // sim backend gets its fabricated EOS so it terminates too.
                 bos: native_controls.bos,
                 eos,
                 start_of_image: native_controls.start_of_image,
@@ -137,9 +138,9 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             EngineCoreClient::from_in_process(runtime_client)
         }
         connection => {
- // Socket modes: ship the tokenizer-resolved control tokens to the
- // engines over the handshake INIT extension; sim engines keep
- // their fabricated EOS (see EngineCoreConfig::apply_native_controls).
+            // Socket modes: ship the tokenizer-resolved control tokens to the
+            // engines over the handshake INIT extension; sim engines keep
+            // their fabricated EOS (see EngineCoreConfig::apply_native_controls).
             let controls = NativeControlTokens {
                 bos: native_controls.bos,
                 eos,
@@ -207,8 +208,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .with_tool_call_parser(config.tool_call_parser.clone())
         .with_reasoning_parser(config.uniserve_reasoning_parser.clone());
 
- // If no served names are specified, expose a local checkpoint's directory
- // name as the public ID while still accepting the full path.
+    // If no served names are specified, expose a local checkpoint's directory
+    // name as the public ID while still accepting the full path.
     let served_model_names = if config.served_model_name.is_empty() {
         default_served_model_names(&config.model)
     } else {

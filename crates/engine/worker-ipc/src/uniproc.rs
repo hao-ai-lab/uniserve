@@ -9,9 +9,12 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use serde::Serialize;
 use uniserve_core::CommandWaker;
 use uniserve_executor::{ControlAck, ControlOp, Executor, WorkerExecError};
-use uniserve_worker_ipc_core::{ClientEndpoint, Frame, Pending, event_driven_enabled, service_name};
+use uniserve_worker_ipc_core::{
+    ClientEndpoint, Frame, Pending, event_driven_enabled, service_name,
+};
 use uniserve_worker_wire::{
     EngineCaps, ForwardBatch, ForwardResult, WorkerRequest, WorkerResponse,
 };
@@ -33,6 +36,187 @@ const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const WORKER_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Explicit Python worker launch configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerLaunchConfig {
+    pub stub: bool,
+    pub model_dtype: String,
+    pub kv_cache_dtype: Option<String>,
+    pub kv_memory_fraction: String,
+    pub transformers_trust_remote_code: bool,
+    pub transformers_attn_implementation: String,
+    pub disable_model_arch: Vec<String>,
+    pub strict_model_imports: bool,
+    pub tp_backend: Option<String>,
+    pub mooncake_device: String,
+    pub mooncake_protocol: String,
+    pub torch_compile: bool,
+    pub torch_compile_backend: String,
+    pub torch_compile_mode: Option<String>,
+    pub torch_compile_fullgraph: bool,
+    pub torch_compile_dynamic: Option<String>,
+    pub cuda_graph: bool,
+    pub cuda_graph_warmup: bool,
+    pub cuda_graph_warmup_batches: Option<String>,
+    pub prefill_cuda_graph: bool,
+    pub prefill_cuda_graph_warmup: bool,
+    pub prefill_cuda_graph_warmup_tokens: Option<String>,
+    pub mixed_text_max_tokens: u32,
+    pub varlen_prefill: bool,
+    pub forward_max_memory_bound_tokens: u32,
+    pub green_contexts: bool,
+    pub logits_processor_chunk_size: u32,
+    pub flashinfer_workspace_size: u64,
+    pub flashinfer_use_tensor_core: Option<String>,
+    pub flashinfer_decode_backend: String,
+    pub flashinfer_prefill_backend: String,
+    pub flashinfer_decode_split_tile_size: Option<u32>,
+    pub flashinfer_prefill_split_tile_size: Option<u32>,
+    pub flashinfer_disable_split_kv: bool,
+    pub flashinfer_fast_decode_plan: bool,
+}
+
+impl Default for WorkerLaunchConfig {
+    fn default() -> Self {
+        Self {
+            stub: false,
+            model_dtype: "bfloat16".to_string(),
+            kv_cache_dtype: None,
+            kv_memory_fraction: "0.70".to_string(),
+            transformers_trust_remote_code: false,
+            transformers_attn_implementation: "uniserve".to_string(),
+            disable_model_arch: Vec::new(),
+            strict_model_imports: false,
+            tp_backend: None,
+            mooncake_device: String::new(),
+            mooncake_protocol: "rdma".to_string(),
+            torch_compile: false,
+            torch_compile_backend: "inductor".to_string(),
+            torch_compile_mode: None,
+            torch_compile_fullgraph: false,
+            torch_compile_dynamic: None,
+            cuda_graph: true,
+            cuda_graph_warmup: true,
+            cuda_graph_warmup_batches: None,
+            prefill_cuda_graph: false,
+            prefill_cuda_graph_warmup: false,
+            prefill_cuda_graph_warmup_tokens: None,
+            mixed_text_max_tokens: 8192,
+            varlen_prefill: true,
+            forward_max_memory_bound_tokens: 281,
+            green_contexts: false,
+            logits_processor_chunk_size: 0,
+            flashinfer_workspace_size: 512 * 1024 * 1024,
+            flashinfer_use_tensor_core: None,
+            flashinfer_decode_backend: "fa2".to_string(),
+            flashinfer_prefill_backend: "auto".to_string(),
+            flashinfer_decode_split_tile_size: None,
+            flashinfer_prefill_split_tile_size: None,
+            flashinfer_disable_split_kv: false,
+            flashinfer_fast_decode_plan: true,
+        }
+    }
+}
+
+impl WorkerLaunchConfig {
+    fn append_worker_args(&self, cmd: &mut Command) {
+        if self.stub {
+            cmd.arg("--no-model").arg("--allow-stub");
+        }
+        cmd.arg("--model-dtype").arg(&self.model_dtype);
+        if let Some(value) = &self.kv_cache_dtype {
+            cmd.arg("--kv-cache-dtype").arg(value);
+        }
+        cmd.arg("--kv-memory-fraction")
+            .arg(&self.kv_memory_fraction);
+        if self.transformers_trust_remote_code {
+            cmd.arg("--transformers-trust-remote-code");
+        }
+        cmd.arg("--transformers-attn-implementation")
+            .arg(&self.transformers_attn_implementation);
+        for arch in &self.disable_model_arch {
+            cmd.arg("--disable-model-arch").arg(arch);
+        }
+        if self.strict_model_imports {
+            cmd.arg("--strict-model-imports");
+        }
+        if let Some(value) = &self.tp_backend {
+            cmd.arg("--tp-backend").arg(value);
+        }
+        if !self.mooncake_device.is_empty() {
+            cmd.arg("--mooncake-device").arg(&self.mooncake_device);
+        }
+        cmd.arg("--mooncake-protocol").arg(&self.mooncake_protocol);
+        if self.torch_compile {
+            cmd.arg("--torch-compile");
+        }
+        cmd.arg("--torch-compile-backend")
+            .arg(&self.torch_compile_backend);
+        if let Some(value) = &self.torch_compile_mode {
+            cmd.arg("--torch-compile-mode").arg(value);
+        }
+        if self.torch_compile_fullgraph {
+            cmd.arg("--torch-compile-fullgraph");
+        }
+        if let Some(value) = &self.torch_compile_dynamic {
+            cmd.arg("--torch-compile-dynamic").arg(value);
+        }
+        if !self.cuda_graph {
+            cmd.arg("--no-cuda-graph");
+        }
+        if !self.cuda_graph_warmup {
+            cmd.arg("--no-cuda-graph-warmup");
+        }
+        if let Some(value) = &self.cuda_graph_warmup_batches {
+            cmd.arg("--cuda-graph-warmup-batches").arg(value);
+        }
+        if self.prefill_cuda_graph {
+            cmd.arg("--prefill-cuda-graph");
+        }
+        if self.prefill_cuda_graph_warmup {
+            cmd.arg("--prefill-cuda-graph-warmup");
+        }
+        if let Some(value) = &self.prefill_cuda_graph_warmup_tokens {
+            cmd.arg("--prefill-cuda-graph-warmup-tokens").arg(value);
+        }
+        cmd.arg("--mixed-text-max-tokens")
+            .arg(self.mixed_text_max_tokens.to_string());
+        if !self.varlen_prefill {
+            cmd.arg("--no-varlen-prefill");
+        }
+        cmd.arg("--forward-max-memory-bound-tokens")
+            .arg(self.forward_max_memory_bound_tokens.to_string());
+        if self.green_contexts {
+            cmd.arg("--green-contexts");
+        }
+        cmd.arg("--logits-processor-chunk-size")
+            .arg(self.logits_processor_chunk_size.to_string());
+        cmd.arg("--flashinfer-workspace-size")
+            .arg(self.flashinfer_workspace_size.to_string());
+        if let Some(value) = &self.flashinfer_use_tensor_core {
+            cmd.arg("--flashinfer-use-tensor-core").arg(value);
+        }
+        cmd.arg("--flashinfer-decode-backend")
+            .arg(&self.flashinfer_decode_backend);
+        cmd.arg("--flashinfer-prefill-backend")
+            .arg(&self.flashinfer_prefill_backend);
+        if let Some(value) = self.flashinfer_decode_split_tile_size {
+            cmd.arg("--flashinfer-decode-split-tile-size")
+                .arg(value.to_string());
+        }
+        if let Some(value) = self.flashinfer_prefill_split_tile_size {
+            cmd.arg("--flashinfer-prefill-split-tile-size")
+                .arg(value.to_string());
+        }
+        if self.flashinfer_disable_split_kv {
+            cmd.arg("--flashinfer-disable-split-kv");
+        }
+        if !self.flashinfer_fast_decode_plan {
+            cmd.arg("--no-flashinfer-fast-decode-plan");
+        }
+    }
+}
 
 /// Single-process worker executor over iceoryx2 IPC.
 pub struct UniprocExecutor {
@@ -77,7 +261,34 @@ impl UniprocExecutor {
         block_size: u32,
         attention_backend: &str,
     ) -> anyhow::Result<Self> {
-        Self::spawn_ranked(
+        Self::spawn_with_config(
+            python,
+            model_dir,
+            device,
+            pipeline_depth,
+            req_slot_cap,
+            resp_slot_cap,
+            kv_token_capacity,
+            block_size,
+            attention_backend,
+            &WorkerLaunchConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_config(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+        worker_config: &WorkerLaunchConfig,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_ranked_with_config(
             python,
             model_dir,
             device,
@@ -90,6 +301,7 @@ impl UniprocExecutor {
             0,
             1,
             None,
+            worker_config,
         )
     }
 
@@ -108,7 +320,40 @@ impl UniprocExecutor {
         tp_size: u32,
         tp_init_method: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let mut me = Self::spawn_ranked_deferred(
+        Self::spawn_ranked_with_config(
+            python,
+            model_dir,
+            device,
+            pipeline_depth,
+            req_slot_cap,
+            resp_slot_cap,
+            kv_token_capacity,
+            block_size,
+            attention_backend,
+            tp_rank,
+            tp_size,
+            tp_init_method,
+            &WorkerLaunchConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_ranked_with_config(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+        tp_rank: u32,
+        tp_size: u32,
+        tp_init_method: Option<&str>,
+        worker_config: &WorkerLaunchConfig,
+    ) -> anyhow::Result<Self> {
+        let mut me = Self::spawn_ranked_deferred_with_config(
             python,
             model_dir,
             device,
@@ -124,13 +369,14 @@ impl UniprocExecutor {
             None,
             None,
             false,
+            worker_config,
         )?;
         me.finish_startup()?;
         Ok(me)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_ranked_deferred(
+    pub(crate) fn spawn_ranked_deferred_with_config(
         python: &str,
         model_dir: &str,
         device: &str,
@@ -146,13 +392,14 @@ impl UniprocExecutor {
         worker_kind: Option<&str>,
         transfer_backend: Option<&str>,
         defer_sampling: bool,
+        worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
         let depth = pipeline_depth.max(1);
         let max_payload = req_slot_cap.max(resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
- // The host is authoritative for the boundary mode: resolve it once and
- // force the worker to match (env var on the child) so the two ends never
- // disagree on whether to run event-driven or polled.
+        // The host is authoritative for the boundary mode: resolve it once and
+        // force the worker to match (env var on the child) so the two ends never
+        // disagree on whether to run event-driven or polled.
         let event_driven = event_driven_enabled();
 
         let mut cmd = Command::new(python);
@@ -199,36 +446,31 @@ impl UniprocExecutor {
             .env("WORLD_SIZE", tp_size.to_string())
             .env("LOCAL_RANK", tp_rank.to_string())
             .env("LOCAL_WORLD_SIZE", tp_size.to_string())
-            .env("UNISERVE_TP_RANK", tp_rank.to_string())
-            .env("UNISERVE_TP_SIZE", tp_size.to_string())
             .env(
                 uniserve_worker_ipc_core::EVENT_DRIVEN_ENV,
                 if event_driven { "1" } else { "0" },
             );
         if tp_size > 1 {
             if let Some(init_method) = tp_init_method {
-                cmd.env("UNISERVE_TP_INIT_METHOD", init_method);
+                cmd.arg("--tp-init-method").arg(init_method);
             }
         }
         if let Some(c) = kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
         }
-        if std::env::var("UNISERVE_WORKER_STUB").is_ok() {
-            cmd.arg("--no-model");
-        }
+        worker_config.append_worker_args(&mut cmd);
         if let Ok(cwd) = std::env::current_dir() {
             let pp = std::env::var("PYTHONPATH").unwrap_or_default();
             cmd.env("PYTHONPATH", format!("{}:{}", cwd.display(), pp));
-            cmd.env("UNISERVE_REPO_ROOT", cwd);
         }
         let child = cmd.spawn().context("spawning python worker")?;
 
         let client = ClientEndpoint::connect_with(&service, max_payload, depth, event_driven)
             .context("connecting to worker IPC service")?;
- // Wire the edge-triggered death watcher onto the park's death wake. Only
- // meaningful on the event-driven path (the wake feeds the park
- // listener); on the polling path the scheduler probes liveness on its
- // own timer.
+        // Wire the edge-triggered death watcher onto the park's death wake. Only
+        // meaningful on the event-driven path (the wake feeds the park
+        // listener); on the polling path the scheduler probes liveness on its
+        // own timer.
         let death_watcher = client
             .death_wake()
             .and_then(|wake| DeathWatcher::spawn(child.id(), wake));
@@ -272,10 +514,10 @@ impl UniprocExecutor {
             ),
             k => bail!("unexpected caps response kind: {k}"),
         };
- // The host is authoritative for pipeline depth and TP topology: it spawned the
- // worker with these values on the command line, so we overwrite the worker-echoed
- // caps with the host's own view. If the worker reports something different it
- // indicates a launch/version mismatch worth surfacing, but the host value wins.
+        // The host is authoritative for pipeline depth and TP topology: it spawned the
+        // worker with these values on the command line, so we overwrite the worker-echoed
+        // caps with the host's own view. If the worker reports something different it
+        // indicates a launch/version mismatch worth surfacing, but the host value wins.
         let host_depth = self.depth as u32;
         if caps.pipeline_depth != 0 && caps.pipeline_depth != host_depth {
             tracing::warn!(
@@ -483,17 +725,17 @@ impl UniprocExecutor {
 
     fn submit_control_request(&mut self, req: &WorkerRequest, call_id: u64) -> anyhow::Result<()> {
         if self.shutdown_sent {
- // The worker is being torn down; drop the control op rather than send onto a
- // closing IPC channel. Log so this is observable instead of a silent no-op.
+            // The worker is being torn down; drop the control op rather than send onto a
+            // closing IPC channel. Log so this is observable instead of a silent no-op.
             tracing::debug!(
                 call_id,
                 "dropping control request: executor already shutting down"
             );
             return Ok(());
         }
- // Control ops deliberately share the pipeline-depth slot budget with batches: the
- // worker is launched with --ipc-max-inflight = depth, so total outstanding requests
- // (batch + control) must not exceed `depth` or we would overflow the IPC ring.
+        // Control ops deliberately share the pipeline-depth slot budget with batches: the
+        // worker is launched with --ipc-max-inflight = depth, so total outstanding requests
+        // (batch + control) must not exceed `depth` or we would overflow the IPC ring.
         self.ensure_slot()?;
         let pending = self.send_request_checked(req, "control request")?;
         self.pending.insert(
@@ -543,10 +785,10 @@ impl Executor for UniprocExecutor {
     }
 
     fn park_for_event(&mut self, timeout: Duration) -> anyhow::Result<()> {
- // Park over {result, command, death} without consuming anything: the
- // scheduler drains results, drains commands, and probes liveness after
- // we return, so a spurious wake is harmless. The wait carries its own
- // safety-net slice, so a missed notification degrades to poll latency.
+        // Park over {result, command, death} without consuming anything: the
+        // scheduler drains results, drains commands, and probes liveness after
+        // we return, so a spurious wake is harmless. The wait carries its own
+        // safety-net slice, so a missed notification degrades to poll latency.
         self.client.wait_wake(timeout)?;
         Ok(())
     }
@@ -602,7 +844,8 @@ impl Executor for UniprocExecutor {
             }
             // Event-driven wake on EVT_RESULT; bounded by the remaining deadline
             // so the timeout contract is preserved.
-            self.client.wait_wake((deadline - now).min(RESPONSE_POLL_INTERVAL))?;
+            self.client
+                .wait_wake((deadline - now).min(RESPONSE_POLL_INTERVAL))?;
         }
     }
 
@@ -619,12 +862,12 @@ impl Executor for UniprocExecutor {
         }
     }
 
- /// Fire-and-forget control op. The returned `u64` MUST be treated as opaque: callers
- /// should discard it and use [`Executor::control_wait`] when they need to correlate an
- /// ack. In this single-worker transport the value happens to be the genuine wire
- /// call_id the worker echoes, but the multiproc/disagg transports return a private
- /// counter that matches no worker request, so no caller may assume these semantics.
- /// `0` is returned for no-op ops (empty CopyBlocks/FreeEncoder) that are never sent.
+    /// Fire-and-forget control op. The returned `u64` MUST be treated as opaque: callers
+    /// should discard it and use [`Executor::control_wait`] when they need to correlate an
+    /// ack. In this single-worker transport the value happens to be the genuine wire
+    /// call_id the worker echoes, but the multiproc/disagg transports return a private
+    /// counter that matches no worker request, so no caller may assume these semantics.
+    /// `0` is returned for no-op ops (empty CopyBlocks/FreeEncoder) that are never sent.
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
         match &op {
             ControlOp::CopyBlocks(c) if c.is_empty() => return Ok(0),
@@ -659,14 +902,14 @@ impl Executor for UniprocExecutor {
             return;
         }
         self.shutdown_sent = true;
- // Stop the death watcher before we intentionally tear the worker down,
- // so its exit does not fire a spurious death wake during shutdown.
+        // Stop the death watcher before we intentionally tear the worker down,
+        // so its exit does not fire a spurious death wake during shutdown.
         let _ = self.death_watcher.take();
         let exited = matches!(self.child.try_wait(), Ok(Some(_)));
         if !exited {
- // Drain in-flight responses, but do NOT block indefinitely on a worker that is
- // alive yet hung: bound the drain with a deadline so we always fall through to
- // the graceful shutdown request and, ultimately, the kill fallback below.
+            // Drain in-flight responses, but do NOT block indefinitely on a worker that is
+            // alive yet hung: bound the drain with a deadline so we always fall through to
+            // the graceful shutdown request and, ultimately, the kill fallback below.
             let drain_deadline = Instant::now() + WORKER_DRAIN_TIMEOUT;
             while !self.pending.is_empty() {
                 if Instant::now() >= drain_deadline {
@@ -724,13 +967,13 @@ impl Drop for UniprocExecutor {
 fn nano_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
- // Build an id from a wall-clock timestamp in the high bits plus a process-wide
- // monotonic counter in the low 16 bits. subsec_nanos alone wraps every second and
- // would collide for workers spawned within the same wall-clock second; the counter
- // makes ids produced within any 65536-call window distinct regardless of clock
- // resolution or non-monotonicity, while the timestamp separates ids across windows.
- // The full service name also includes pid + tp_rank, so any residual aliasing in the
- // shifted timestamp bits cannot produce a real cross-worker collision.
+    // Build an id from a wall-clock timestamp in the high bits plus a process-wide
+    // monotonic counter in the low 16 bits. subsec_nanos alone wraps every second and
+    // would collide for workers spawned within the same wall-clock second; the counter
+    // makes ids produced within any 65536-call window distinct regardless of clock
+    // resolution or non-monotonicity, while the timestamp separates ids across windows.
+    // The full service name also includes pid + tp_rank, so any residual aliasing in the
+    // shifted timestamp bits cannot produce a real cross-worker collision.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -747,10 +990,14 @@ mod tests {
 
     #[test]
     fn nano_id_is_unique_within_a_tight_loop() {
- // subsec_nanos alone would collide here because the loop runs faster than a
- // second; the monotonic counter must make every id distinct.
+        // subsec_nanos alone would collide here because the loop runs faster than a
+        // second; the monotonic counter must make every id distinct.
         let n = 10_000;
         let ids: HashSet<u64> = (0..n).map(|_| nano_id()).collect();
-        assert_eq!(ids.len(), n, "nano_id produced a collision within a tight loop");
+        assert_eq!(
+            ids.len(),
+            n,
+            "nano_id produced a collision within a tight loop"
+        );
     }
 }

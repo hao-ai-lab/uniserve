@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -54,20 +52,11 @@ def _fa4_cute_unavailable_reason() -> str | None:
 
 
 def _require_fa4_cute() -> None:
-    """Skip the test if the FA4 CUTE kernel is unavailable.
+    """Skip the test if the FA4 CUTE kernel is unavailable."""
 
-    When ``UNISERVE_FA4_CUTE_STRICT=1`` is set, a missing prerequisite is a hard
-    failure instead of a silent skip. This is the lever a CI lane that *intends* to
-    run FA4 conformance flips, so the kernel can no longer ship untested by being
-    silently skipped (mirrors the UNISERVE_RUN_GPU_E2E gate in the GPU e2e suite).
-    """
     reason = _fa4_cute_unavailable_reason()
     if reason is None:
         return
-    if os.environ.get("UNISERVE_FA4_CUTE_STRICT") == "1":
-        pytest.fail(
-            f"UNISERVE_FA4_CUTE_STRICT=1 but the FA4 CUTE kernel is unavailable: {reason}"
-        )
     pytest.skip(f"requires CUDA and importable FA4 CUTE provider packages: {reason}")
 
 

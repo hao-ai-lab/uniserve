@@ -15,18 +15,18 @@ use uniserve_scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, SchedStats, Scheduler, SchedulingPolicy,
 };
-use uniserve_worker_ipc::{MultiprocExecutor, StageRouter, UniprocExecutor};
+use uniserve_worker_ipc::{MultiprocExecutor, StageRouter, UniprocExecutor, WorkerLaunchConfig};
 use uniserve_worker_wire::EngineCaps;
 
 /// Which forward-only worker the engine drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineBackend {
- /// GPU-free CPU simulation engine (`sim`): no Python, no GPU. Used for
- /// fast, deterministic end-to-end tests of the full serving stack.
+    /// GPU-free CPU simulation engine (`sim`): no Python, no GPU. Used for
+    /// fast, deterministic end-to-end tests of the full serving stack.
     Sim,
- /// The real GPU path: spawn the Python forward-only worker
- /// (`python -m uniserve_worker.main`) and drive it over the shared-memory
- /// descriptor ring.
+    /// The real GPU path: spawn the Python forward-only worker
+    /// (`python -m uniserve_worker.main`) and drive it over the shared-memory
+    /// descriptor ring.
     Worker,
 }
 
@@ -47,52 +47,54 @@ fn assign_pool_device(device: &str, gpu: usize) -> String {
 /// Configuration for one engine core (in-process or headless).
 #[derive(Debug, Clone)]
 pub struct EngineCoreConfig {
- /// Model directory / identifier passed to the worker and used for metrics.
+    /// Model directory / identifier passed to the worker and used for metrics.
     pub model: String,
- /// Compute device for the worker (e.g. `cuda`, `cpu`).
+    /// Compute device for the worker (e.g. `cuda`, `cpu`).
     pub device: String,
- /// Which forward-only worker to drive.
+    /// Which forward-only worker to drive.
     pub backend: EngineBackend,
- /// KV block size in tokens (the page size).
+    /// KV block size in tokens (the page size).
     pub block_size: u32,
- /// How many op-batches the scheduler keeps in flight against the worker.
+    /// How many op-batches the scheduler keeps in flight against the worker.
     pub pipeline_depth: usize,
- /// Maximum number of ops assembled into a single forward batch.
+    /// Maximum number of ops assembled into a single forward batch.
     pub max_batch: usize,
- /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
+    /// Per-step scheduling token budget (vLLM's `max_num_batched_tokens`).
     pub max_num_batched_tokens: usize,
- /// Maximum concurrently running requests (vLLM's `max_num_seqs`).
+    /// Maximum concurrently running requests (vLLM's `max_num_seqs`).
     pub max_num_seqs: usize,
- /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
+    /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
     pub long_prefill_threshold: usize,
- /// Waiting queue policy for admitting/scheduling requests.
+    /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
- /// Maximum model context length reported to the frontend.
+    /// Maximum model context length reported to the frontend.
     pub max_model_len: u32,
- /// Optional explicit KV token capacity override for the worker.
+    /// Optional explicit KV token capacity override for the worker.
     pub kv_token_capacity: Option<u64>,
- /// Attention backend preference forwarded to the Python worker.
+    /// Attention backend preference forwarded to the Python worker.
     pub attention_backend: String,
     /// Python interpreter used to launch the worker.
     pub worker_python: String,
- /// Number of worker rank processes (1 = UniprocExecutor; >1 spawns a
- /// MultiprocExecutor with one ring per rank). Used as the tp size of the
- /// single Full pool when `workers` is unset (the non-disaggregated default).
+    /// Number of worker rank processes (1 = UniprocExecutor; >1 spawns a
+    /// MultiprocExecutor with one ring per rank). Used as the tp size of the
+    /// single Full pool when `workers` is unset (the non-disaggregated default).
     pub worker_ranks: usize,
- /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
- /// `None` (or `full:1`) is the non-disaggregated default: a single Full pool
- /// driven directly, with no `StageRouter`. A multi-stage spec composes pools
- /// behind a `StageRouter`.
+    /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
+    /// `None` (or `full:1`) is the non-disaggregated default: a single Full pool
+    /// driven directly, with no `StageRouter`. A multi-stage spec composes pools
+    /// behind a `StageRouter`.
     pub workers: Option<String>,
- /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
- /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake`. Passed through to the
- /// `TensorMover`; unconfigured edges use the in-process backend.
+    /// Per-edge data-plane transfer backend selection (`--transfer`), e.g.
+    /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake`. Passed through to the
+    /// `TensorMover`; unconfigured edges use the in-process backend.
     pub transfer: Option<String>,
- /// Request-ring slot capacity in bytes.
+    /// Explicit Python worker launch/runtime configuration.
+    pub worker_launch: WorkerLaunchConfig,
+    /// Request-ring slot capacity in bytes.
     pub req_slot_cap: usize,
- /// Response-ring slot capacity in bytes.
+    /// Response-ring slot capacity in bytes.
     pub resp_slot_cap: usize,
- /// Control-token ids resolved from the tokenizer (drive EOS / image FSM).
+    /// Control-token ids resolved from the tokenizer (drive EOS / image FSM).
     pub bos: u32,
     pub eos: Vec<u32>,
     pub start_of_image: u32,
@@ -101,10 +103,10 @@ pub struct EngineCoreConfig {
 }
 
 impl EngineCoreConfig {
- /// A minimal config for the GPU-free sim backend (used by tests).
+    /// A minimal config for the GPU-free sim backend (used by tests).
 
- /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
- /// build a `Sim` backend because it has no spawnable worker process.
+    /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
+    /// build a `Sim` backend because it has no spawnable worker process.
     pub fn sim(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
@@ -124,10 +126,11 @@ impl EngineCoreConfig {
             worker_ranks: default_worker_ranks(),
             workers: None,
             transfer: None,
+            worker_launch: WorkerLaunchConfig::default(),
             req_slot_cap: 1 << 20,
             resp_slot_cap: 8 << 20,
- // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
- // scheduler must recognize it to finish a sim request.
+            // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
+            // scheduler must recognize it to finish a sim request.
             bos: 0,
             eos: vec![151645],
             start_of_image: 0,
@@ -168,17 +171,17 @@ pub struct EngineCore {
 }
 
 impl EngineCore {
- /// Build the scheduler, spawn the forward-only worker, and start the
- /// scheduler owner thread.
+    /// Build the scheduler, spawn the forward-only worker, and start the
+    /// scheduler owner thread.
 
- /// Blocks until the worker has loaded the model and answered the
- /// `get_caps` handshake — for the real worker this can take minutes.
+    /// Blocks until the worker has loaded the model and answered the
+    /// `get_caps` handshake — for the real worker this can take minutes.
 
- /// Only [`EngineBackend::Worker`] is constructible here: the `Sim` backend
- /// has no spawnable process, so a `Sim` config must instead supply its
- /// `SimEngine` executor through [`EngineCore::with_executor`] (which is
- /// backend-agnostic). Passing a `Sim` config to `new` is rejected rather
- /// than silently producing a half-built engine.
+    /// Only [`EngineBackend::Worker`] is constructible here: the `Sim` backend
+    /// has no spawnable process, so a `Sim` config must instead supply its
+    /// `SimEngine` executor through [`EngineCore::with_executor`] (which is
+    /// backend-agnostic). Passing a `Sim` config to `new` is rejected rather
+    /// than silently producing a half-built engine.
     pub fn new(config: EngineCoreConfig) -> anyhow::Result<Self> {
         EngineCoreBuilder::new()
             .config(config)
@@ -192,7 +195,7 @@ impl EngineCore {
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
         let kv_token_capacity = config.effective_kv_token_capacity();
         if tp > 1 {
-            let workers = MultiprocExecutor::spawn(
+            let workers = MultiprocExecutor::spawn_with_config(
                 &config.worker_python,
                 &config.model,
                 &config.device,
@@ -203,11 +206,12 @@ impl EngineCore {
                 kv_token_capacity,
                 config.block_size,
                 &config.attention_backend,
+                &config.worker_launch,
             )
             .context("failed to spawn forward-only worker ranks")?;
             Ok(Box::new(workers))
         } else {
-            let worker = UniprocExecutor::spawn(
+            let worker = UniprocExecutor::spawn_with_config(
                 &config.worker_python,
                 &config.model,
                 &config.device,
@@ -217,6 +221,7 @@ impl EngineCore {
                 kv_token_capacity,
                 config.block_size,
                 &config.attention_backend,
+                &config.worker_launch,
             )
             .context("failed to spawn forward-only worker")?;
             Ok(Box::new(worker))
@@ -262,7 +267,8 @@ impl EngineCore {
             .iter()
             .any(|p| matches!(p.kind, WorkerKind::Und | WorkerKind::Gen));
         let mut next_gpu = 0usize;
-        let mut pools: Vec<(WorkerKind, Box<dyn Executor>)> = Vec::with_capacity(workers.total_pools());
+        let mut pools: Vec<(WorkerKind, Box<dyn Executor>)> =
+            Vec::with_capacity(workers.total_pools());
         for pool in &workers.pools {
             // The decode↔sampler edge is inter-process, so it needs a real
             // cross-process transport; default to same-node shm when the topology
@@ -280,7 +286,7 @@ impl EngineCore {
                     config.device.clone()
                 };
                 next_gpu += pool.tp.max(1);
-                let exec = MultiprocExecutor::spawn_staged(
+                let exec = MultiprocExecutor::spawn_staged_with_config(
                     &config.worker_python,
                     &config.model,
                     &pool_device,
@@ -294,6 +300,7 @@ impl EngineCore {
                     pool.kind.as_str(),
                     backend.as_deref(),
                     defer_sampling,
+                    &config.worker_launch,
                 )
                 .with_context(|| {
                     format!(
@@ -308,10 +315,10 @@ impl EngineCore {
         Ok(Box::new(StageRouter::new(pools)))
     }
 
- /// Build the engine core from an executor supplied by a higher composition
- /// layer. This is the backend-agnostic entry point and the only way to
- /// construct an [`EngineBackend::Sim`] core (whose `SimEngine` executor is
- /// caller-supplied rather than spawned).
+    /// Build the engine core from an executor supplied by a higher composition
+    /// layer. This is the backend-agnostic entry point and the only way to
+    /// construct an [`EngineBackend::Sim`] core (whose `SimEngine` executor is
+    /// caller-supplied rather than spawned).
     pub fn with_executor(
         config: EngineCoreConfig,
         executor: Box<dyn Executor>,
@@ -324,9 +331,9 @@ impl EngineCore {
 
     fn assemble(config: EngineCoreConfig, executor: Box<dyn Executor>) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
- // Capture the command waker before the executor moves into the
- // scheduler: when the executor is event-driven this fires its park's
- // command notifier; otherwise it is the no-op waker.
+        // Capture the command waker before the executor moves into the
+        // scheduler: when the executor is event-driven this fires its park's
+        // command notifier; otherwise it is the no-op waker.
         let waker = executor.command_waker();
         let sched = Scheduler::with_config(
             executor,
@@ -372,17 +379,17 @@ impl EngineCore {
         })
     }
 
- /// Cloneable command-channel front door over the scheduler.
+    /// Cloneable command-channel front door over the scheduler.
     pub fn handle(&self) -> EngineHandle {
         self.handle.clone()
     }
 
- /// Worker-reported capabilities (the post-load truth).
+    /// Worker-reported capabilities (the post-load truth).
     pub fn caps(&self) -> &EngineCaps {
         &self.caps
     }
 
- /// Live scheduler stats, shared with the scheduler thread.
+    /// Live scheduler stats, shared with the scheduler thread.
     pub fn stats(&self) -> &Arc<SchedStats> {
         &self.stats
     }
@@ -395,17 +402,17 @@ impl EngineCore {
         self.max_model_len
     }
 
- /// Allocate the next internal scheduler request id.
+    /// Allocate the next internal scheduler request id.
     pub fn next_request_id(&self) -> RequestId {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
- /// Whether the engine died (worker/executor failure). Sticky.
+    /// Whether the engine died (worker/executor failure). Sticky.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
     }
 
- /// Submit one translated request to the scheduler.
+    /// Submit one translated request to the scheduler.
     pub fn submit(&self, req: GenerateRequest) -> anyhow::Result<()> {
         if self.is_dead() {
             anyhow::bail!("engine core is dead (worker failure)");
@@ -415,7 +422,7 @@ impl EngineCore {
             .map_err(|message| anyhow::anyhow!(message))
     }
 
- // ---- control surface (the utility-call implementations) ----
+    // ---- control surface (the utility-call implementations) ----
 
     pub fn reset_prefix_cache(&self) -> bool {
         self.handle.reset_prefix_cache();
@@ -456,8 +463,8 @@ impl EngineCore {
         self.handle.collective_rpc(method)
     }
 
- /// Shut down the scheduler (which tears down the executor/worker) and join
- /// its thread. Idempotent.
+    /// Shut down the scheduler (which tears down the executor/worker) and join
+    /// its thread. Idempotent.
     pub fn shutdown(&self) {
         self.handle.shutdown();
         let thread = match self.sched_thread.lock() {

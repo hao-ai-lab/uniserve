@@ -11,4 +11,4 @@ pub use multiproc::MultiprocExecutor;
 // is the Understanding/Generation 2-pool constructor. `TensorMover` is the
 // data-plane Tier 1.
 pub use stage_router::{StageRouter, TensorMover};
-pub use uniproc::UniprocExecutor;
+pub use uniproc::{UniprocExecutor, WorkerLaunchConfig};

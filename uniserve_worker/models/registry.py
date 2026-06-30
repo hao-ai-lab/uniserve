@@ -10,9 +10,9 @@ from typing import Type
 
 from ..contracts.forward_mode import ForwardMode, mode_for_op
 from ..contracts.model_protocols import UniModel
-from ..foundation.env import env_flag, env_str
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
 from ..foundation.plugins import discover_package_plugins
+from ..foundation.runtime_config import get_worker_config
 
 __all__ = [
     'ModelRegistry',
@@ -47,7 +47,7 @@ class ModelRegistry:
             self._classes[key] = model_cls
 
     def resolve(self, architectures: list[str] | tuple[str, ...]) -> Type[UniModel]:
-        disabled = set(filter(None, env_str("UNISERVE_DISABLED_MODEL_ARCHS", default="").split(",")))
+        disabled = set(get_worker_config().disabled_model_archs)
         for arch in architectures:
             if arch in disabled:
                 continue
@@ -103,7 +103,7 @@ def _register_module_models(module: ModuleType, *, strict: bool) -> None:
 @lru_cache(maxsize=1)
 def import_model_classes(strict: bool | None = None) -> None:
     if strict is None:
-        strict = env_flag("UNISERVE_STRICT_MODEL_IMPORTS")
+        strict = get_worker_config().strict_model_imports
     discover_package_plugins(
         importlib.import_module(__package__ or "uniserve_worker.models"),
         strict=bool(strict),

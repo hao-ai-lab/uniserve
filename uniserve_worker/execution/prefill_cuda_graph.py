@@ -1,7 +1,6 @@
 """CUDA graph plumbing for text initial prefill."""
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
@@ -52,9 +51,6 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         self,
         *,
         name: str,
-        enabled_env: str,
-        warmup_env: str,
-        warmup_tokens_env: str,
         default_enabled: bool = False,
         default_warmup: bool = False,
         default_warmup_token_buckets: tuple[int, ...] = _DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
@@ -63,9 +59,6 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         logger: Any = None,
     ) -> None:
         self.name = str(name)
-        self.enabled_env = enabled_env
-        self.warmup_env = warmup_env
-        self.warmup_tokens_env = warmup_tokens_env
         self.default_enabled = bool(default_enabled)
         self.default_warmup = bool(default_warmup)
         self.default_warmup_token_buckets = tuple(
@@ -80,17 +73,6 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
 
     def warmup_token_buckets(self) -> tuple[int, ...]:
-        raw = os.environ.get(self.warmup_tokens_env)
-        if raw:
-            raw = raw.strip()
-        if raw:
-            if self.token_bucket_parser is not None:
-                parsed = _normalize_token_buckets(self.token_bucket_parser(raw))
-                if parsed:
-                    return parsed
-            sizes = _parse_positive_int_csv(raw)
-            if sizes:
-                return sizes
         return self.default_warmup_token_buckets
 
     def warmup_capture_token_buckets(self) -> tuple[int, ...]:

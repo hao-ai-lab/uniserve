@@ -7,6 +7,8 @@ use uniserve_core::CommandWaker;
 use uniserve_executor::{ControlAck, ControlOp, Executor};
 use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult};
 
+use crate::WorkerLaunchConfig;
+
 /// How long a single rank may go without producing output, while batches are in
 /// flight, before `next_result` treats it as dead and bails. Generous so a
 /// healthy-but-slow forward is never falsely failed; short enough that a hung
@@ -61,6 +63,35 @@ impl MultiprocExecutor {
         block_size: u32,
         attention_backend: &str,
     ) -> anyhow::Result<Self> {
+        Self::spawn_with_config(
+            python,
+            model_dir,
+            device,
+            world_size,
+            pipeline_depth,
+            req_slot_cap,
+            resp_slot_cap,
+            kv_token_capacity,
+            block_size,
+            attention_backend,
+            &WorkerLaunchConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_config(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        world_size: usize,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+        worker_config: &WorkerLaunchConfig,
+    ) -> anyhow::Result<Self> {
         Self::spawn_inner(
             python,
             model_dir,
@@ -75,6 +106,7 @@ impl MultiprocExecutor {
             None,
             None,
             false,
+            worker_config,
         )
     }
 
@@ -98,6 +130,41 @@ impl MultiprocExecutor {
         transfer_backend: Option<&str>,
         defer_sampling: bool,
     ) -> anyhow::Result<Self> {
+        Self::spawn_staged_with_config(
+            python,
+            model_dir,
+            device,
+            world_size,
+            pipeline_depth,
+            req_slot_cap,
+            resp_slot_cap,
+            kv_token_capacity,
+            block_size,
+            attention_backend,
+            worker_kind,
+            transfer_backend,
+            defer_sampling,
+            &WorkerLaunchConfig::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_staged_with_config(
+        python: &str,
+        model_dir: &str,
+        device: &str,
+        world_size: usize,
+        pipeline_depth: usize,
+        req_slot_cap: usize,
+        resp_slot_cap: usize,
+        kv_token_capacity: Option<u64>,
+        block_size: u32,
+        attention_backend: &str,
+        worker_kind: &str,
+        transfer_backend: Option<&str>,
+        defer_sampling: bool,
+        worker_config: &WorkerLaunchConfig,
+    ) -> anyhow::Result<Self> {
         Self::spawn_inner(
             python,
             model_dir,
@@ -112,6 +179,7 @@ impl MultiprocExecutor {
             Some(worker_kind),
             transfer_backend,
             defer_sampling,
+            worker_config,
         )
     }
 
@@ -130,6 +198,7 @@ impl MultiprocExecutor {
         worker_kind: Option<&str>,
         transfer_backend: Option<&str>,
         defer_sampling: bool,
+        worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
         let world_size = world_size.max(1);
         let tp_init_method = if world_size > 1 {
@@ -140,7 +209,7 @@ impl MultiprocExecutor {
         let mut launched = Vec::with_capacity(world_size);
         for rank in 0..world_size {
             let rank_device = device_for_rank(device, rank, world_size);
-            let worker = crate::UniprocExecutor::spawn_ranked_deferred(
+            let worker = crate::UniprocExecutor::spawn_ranked_deferred_with_config(
                 python,
                 model_dir,
                 &rank_device,
@@ -156,6 +225,7 @@ impl MultiprocExecutor {
                 worker_kind,
                 transfer_backend,
                 defer_sampling,
+                worker_config,
             )?;
             launched.push(worker);
         }
@@ -300,12 +370,12 @@ impl Executor for MultiprocExecutor {
     }
 
     fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
- // `inflight` is bumped only after every rank has accepted the batch, so
- // a partial submit failure never corrupts the in-flight count. It does
- // leave the batch fanned out to ranks 0..rank while later ranks never
- // received it; the scheduler treats any submit error as fatal and tears
- // the engine down, so we surface which rank failed rather than attempt a
- // cross-rank rollback here.
+        // `inflight` is bumped only after every rank has accepted the batch, so
+        // a partial submit failure never corrupts the in-flight count. It does
+        // leave the batch fanned out to ranks 0..rank while later ranks never
+        // received it; the scheduler treats any submit error as fatal and tears
+        // the engine down, so we surface which rank failed rather than attempt a
+        // cross-rank rollback here.
         for (rank, worker) in self.workers.iter_mut().enumerate() {
             worker
                 .submit(batch.clone())
@@ -321,8 +391,8 @@ impl Executor for MultiprocExecutor {
     }
 
     fn check_liveness(&mut self) -> anyhow::Result<()> {
- // any dead rank means the engine is dead. Probe every rank so an
- // idle-time exit of a single worker surfaces as a fatal liveness error.
+        // any dead rank means the engine is dead. Probe every rank so an
+        // idle-time exit of a single worker surfaces as a fatal liveness error.
         for (rank, worker) in self.workers.iter_mut().enumerate() {
             worker
                 .check_liveness()
@@ -385,19 +455,19 @@ impl Executor for MultiprocExecutor {
         if self.inflight == 0 {
             anyhow::bail!("next_result called with no in-flight batches");
         }
- // Bound the wait so a single dead/hung rank surfaces as an executor
- // error instead of wedging the scheduler loop forever. The deadline is
- // reset whenever any rank makes progress, so a healthy-but-slow batch is
- // never falsely failed.
+        // Bound the wait so a single dead/hung rank surfaces as an executor
+        // error instead of wedging the scheduler loop forever. The deadline is
+        // reset whenever any rank makes progress, so a healthy-but-slow batch is
+        // never falsely failed.
         let mut deadline = Instant::now() + NEXT_RESULT_DEADLINE;
         loop {
             self.pump()?;
             if let Some(result) = self.try_join()? {
                 return Ok(result);
             }
- // Wait for fresh output on whichever rank is currently behind. Using
- // the per-worker bounded wait (rather than the unbounded
- // next_result) keeps a hung rank from blocking indefinitely.
+            // Wait for fresh output on whichever rank is currently behind. Using
+            // the per-worker bounded wait (rather than the unbounded
+            // next_result) keeps a hung rank from blocking indefinitely.
             let idx = self
                 .buffers
                 .iter()
@@ -417,12 +487,12 @@ impl Executor for MultiprocExecutor {
     }
 
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
- // NOTE: the returned id is a local fire-and-forget token, NOT a wire
- // call_id. Each per-rank worker.control allocates its own real
- // call_id internally; this counter correlates to none of them. Callers
- // must not use this value to match a later worker ack — use
- // control_wait (which fans out and collects per-rank acks) for any
- // call that needs correlation.
+        // NOTE: the returned id is a local fire-and-forget token, NOT a wire
+        // call_id. Each per-rank worker.control allocates its own real
+        // call_id internally; this counter correlates to none of them. Callers
+        // must not use this value to match a later worker ack — use
+        // control_wait (which fans out and collects per-rank acks) for any
+        // call that needs correlation.
         let call_id = self.next_call_id;
         self.next_call_id += 1;
         for worker in self.workers.iter_mut() {

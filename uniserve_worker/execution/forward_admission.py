@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Mapping, Sequence
 
 from ..contracts.forward_mode import ForwardMode, mode_for_op
-from ..foundation.env import env_int
+from ..foundation.runtime_config import get_worker_config
 
 __all__ = [
     'Route',
@@ -31,13 +31,11 @@ class Route(str, Enum):
     def __str__(self) -> str:
         return self.value
 
-_MAX_MEMORY_BOUND_TOKENS_ENV = "UNISERVE_FORWARD_MAX_MEMORY_BOUND_TOKENS"
-
 # Default memory-bound window for the decode+denoise route. Below this token
 # count the batch stays memory-bound (the forward kernel's precondition); above
 # it the batch tips compute-bound and is rejected. Hardware-tunable via
-# ``_MAX_MEMORY_BOUND_TOKENS_ENV``. The authoritative admission budget lives in
-# the Rust scheduler — this is only the worker-side narrowing gate.
+# worker runtime config. The authoritative admission budget lives in the Rust
+# scheduler — this is only the worker-side narrowing gate.
 _DEFAULT_MAX_MEMORY_BOUND_TOKENS = 281
 
 
@@ -58,15 +56,13 @@ class ForwardAdmissionDecision:
 
 @dataclass(frozen=True)
 class ForwardAdmissionConfig:
-    """Env-derived admission tunables, resolved once at the composition root."""
+    """Runtime-config-derived admission tunables."""
 
     max_memory_bound_decode_tokens: int = _DEFAULT_MAX_MEMORY_BOUND_TOKENS
 
     @classmethod
-    def from_env(cls) -> "ForwardAdmissionConfig":
-        max_memory_bound = env_int(
-            _MAX_MEMORY_BOUND_TOKENS_ENV, default=_DEFAULT_MAX_MEMORY_BOUND_TOKENS
-        )
+    def from_runtime_config(cls) -> "ForwardAdmissionConfig":
+        max_memory_bound = get_worker_config().forward_max_memory_bound_tokens
         # A non-positive crossover would admit nothing; fall back to the default.
         if max_memory_bound <= 0:
             max_memory_bound = _DEFAULT_MAX_MEMORY_BOUND_TOKENS
@@ -82,8 +78,8 @@ class ForwardAdmissionRouter:
         return self.config.max_memory_bound_decode_tokens
 
     @classmethod
-    def from_env(cls) -> "ForwardAdmissionRouter":
-        return cls(config=ForwardAdmissionConfig.from_env())
+    def from_runtime_config(cls) -> "ForwardAdmissionRouter":
+        return cls(config=ForwardAdmissionConfig.from_runtime_config())
 
     def decide(self, ops: Sequence[Mapping[str, object]]) -> ForwardAdmissionDecision:
         modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)

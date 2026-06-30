@@ -3,7 +3,7 @@
 //! the scheduler loop exits, the engine proc emits ENGINE_CORE_DEAD, and the
 //! frontend client fails the in-flight stream and latches unhealthy.
 //!
-//! Run with: UNISERVE_WORKER_STUB=1 UNISERVE_STUB_DIE_AFTER=3 \
+//! Run with: UNISERVE_STUB_DIE_AFTER=3 \
 //! cargo run -p uniserve-engine-process --example worker_death_smoke
 
 use std::time::Duration;
@@ -21,15 +21,15 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
     assert!(
-        std::env::var("UNISERVE_WORKER_STUB").is_ok()
-            && std::env::var("UNISERVE_STUB_DIE_AFTER").is_ok(),
-        "run with UNISERVE_WORKER_STUB=1 UNISERVE_STUB_DIE_AFTER=3"
+        std::env::var("UNISERVE_STUB_DIE_AFTER").is_ok(),
+        "run with UNISERVE_STUB_DIE_AFTER=3"
     );
 
     let handshake = format!("ipc:///tmp/uniserve-death-{}.sock", std::process::id());
     let shutdown = CancellationToken::new();
     let mut core = EngineCoreConfig::sim("stub-model");
     core.backend = EngineBackend::Worker; // the real ring + stub python worker
+    core.worker_launch.stub = true;
     let proc_task = tokio::spawn(run_engine_proc(
         EngineProcConfig {
             handshake_address: handshake.clone(),
@@ -68,9 +68,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let mut stream = client.call(request).await?;
 
- // The in-flight request fails either as a terminal Error output (the
- // request-level path) or as a stream error once the dead sentinel closes
- // the registries — both are acceptable failure shapes.
+    // The in-flight request fails either as a terminal Error output (the
+    // request-level path) or as a stream error once the dead sentinel closes
+    // the registries — both are acceptable failure shapes.
     let mut saw_error = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         "in-flight request must fail when the worker dies"
     );
 
- // The ENGINE_CORE_DEAD sentinel arrives asynchronously; poll the latch.
+    // The ENGINE_CORE_DEAD sentinel arrives asynchronously; poll the latch.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while client.is_healthy() {
         assert!(
@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         client.health_error().map(|e| e.to_string())
     );
 
- // The engine proc itself exits with an error (managed mode would reap it).
+    // The engine proc itself exits with an error (managed mode would reap it).
     let proc_result = proc_task.await?;
     assert!(
         proc_result.is_err(),

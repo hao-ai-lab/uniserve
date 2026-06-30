@@ -6,14 +6,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...foundation.env import (
-    DEFAULT_ATTENTION_BACKEND,
-    env_flag,
-    env_int,
-    env_optional_flag,
-    env_optional_int,
-    env_str,
-)
+from ...foundation.runtime_config import get_worker_config
 from .flashinfer_plan import (
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
@@ -22,13 +15,6 @@ from .flashinfer_plan import (
 )
 
 _DEFAULT_WORKSPACE_SIZE = 512 * 1024 * 1024
-_WORKSPACE_SIZE_ENV = "UNISERVE_FLASHINFER_WORKSPACE_SIZE"
-_USE_TENSOR_CORE_ENV = "UNISERVE_FLASHINFER_USE_TENSOR_CORE"
-_DECODE_BACKEND_ENV = "UNISERVE_FLASHINFER_DECODE_BACKEND"
-_PREFILL_BACKEND_ENV = "UNISERVE_FLASHINFER_PREFILL_BACKEND"
-_DECODE_SPLIT_TILE_ENV = "UNISERVE_FLASHINFER_DECODE_SPLIT_TILE_SIZE"
-_DISABLE_SPLIT_KV_ENV = "UNISERVE_FLASHINFER_DISABLE_SPLIT_KV"
-_FAST_DECODE_PLAN_ENV = "UNISERVE_FLASHINFER_FAST_DECODE_PLAN"
 
 
 class WrapperKey(NamedTuple):
@@ -91,7 +77,7 @@ class _WrapperPool:
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = env_str(_DECODE_BACKEND_ENV, default="fa2")
+        backend = get_worker_config().flashinfer.decode_backend
         use_tensor_cores = _should_use_tensor_cores(
             kv_dtype=kv_dtype,
             num_q_heads=int(num_q_heads),
@@ -123,7 +109,7 @@ class _WrapperPool:
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = env_str(_DECODE_BACKEND_ENV, default="fa2")
+        backend = get_worker_config().flashinfer.decode_backend
         use_tensor_cores = _should_use_tensor_cores(
             kv_dtype=kv_dtype,
             num_q_heads=int(num_q_heads),
@@ -161,7 +147,7 @@ class _WrapperPool:
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = env_str(_PREFILL_BACKEND_ENV, default=DEFAULT_ATTENTION_BACKEND)
+        backend = get_worker_config().flashinfer.prefill_backend
         key = WrapperKey("prefill", device_key, backend)
         wrapper = self._prefill_wrappers.get(key)
         if wrapper is None:
@@ -325,8 +311,8 @@ class _WrapperPool:
             kv_data_type=kv_data_type,
         )
         return _DecodePlanOptions(
-            fixed_split_size=env_optional_int(_DECODE_SPLIT_TILE_ENV),
-            disable_split_kv=env_flag(_DISABLE_SPLIT_KV_ENV),
+            fixed_split_size=get_worker_config().flashinfer.decode_split_tile_size,
+            disable_split_kv=get_worker_config().flashinfer.disable_split_kv,
             signature=signature,
         )
 
@@ -565,12 +551,12 @@ def _device_key(device: torch.device | str) -> str:
 
 
 def _workspace_size() -> int:
-    size = env_int(_WORKSPACE_SIZE_ENV, default=_DEFAULT_WORKSPACE_SIZE, strict=True)
+    size = get_worker_config().flashinfer.workspace_size
     return max(1, size)
 
 
 def _fast_decode_plan_enabled() -> bool:
-    return env_flag(_FAST_DECODE_PLAN_ENV, default=True)
+    return get_worker_config().flashinfer.fast_decode_plan
 
 
 def _should_use_tensor_cores(
@@ -579,7 +565,7 @@ def _should_use_tensor_cores(
     num_q_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    override = env_optional_flag(_USE_TENSOR_CORE_ENV)
+    override = get_worker_config().flashinfer.use_tensor_core
     if override is not None:
         return override
     try:

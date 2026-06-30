@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from ..foundation.env import env_int
+from ..foundation.runtime_config import get_worker_config
 
 __all__ = [
     'LogitsProcessor',
@@ -12,7 +12,7 @@ __all__ = [
 
 
 def _logits_chunk_size() -> int:
-    return max(0, env_int("UNISERVE_LOGITS_PROCESSOR_CHUNK_SIZE", default=0))
+    return get_worker_config().logits_processor_chunk_size
 
 
 class LogitsProcessor(nn.Module):
