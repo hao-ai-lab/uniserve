@@ -64,7 +64,7 @@ mod tests {
         assert!(is_safe_request_id(&HeaderValue::from_static(
             "req-123_abc.def"
         )));
- // A freshly generated id must itself pass validation.
+        // A freshly generated id must itself pass validation.
         assert!(is_safe_request_id(&generate_request_id()));
     }
 
@@ -73,14 +73,16 @@ mod tests {
         assert!(!is_safe_request_id(&HeaderValue::from_static("")));
 
         let too_long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
-        assert!(!is_safe_request_id(&HeaderValue::from_str(&too_long).unwrap()));
+        assert!(!is_safe_request_id(
+            &HeaderValue::from_str(&too_long).unwrap()
+        ));
 
- // Spaces and other visible-but-unsafe chars are rejected.
+        // Spaces and other visible-but-unsafe chars are rejected.
         assert!(!is_safe_request_id(&HeaderValue::from_static("has space")));
         assert!(!is_safe_request_id(&HeaderValue::from_static("a/b")));
         assert!(!is_safe_request_id(&HeaderValue::from_static("<script>")));
 
- // Opaque non-visible bytes a HeaderValue may legally hold are rejected.
+        // Opaque non-visible bytes a HeaderValue may legally hold are rejected.
         assert!(!is_safe_request_id(
             &HeaderValue::from_bytes(&[0x80, 0x81]).unwrap()
         ));

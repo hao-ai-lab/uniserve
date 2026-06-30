@@ -179,7 +179,7 @@ pub struct Function {
     pub name: String,
     pub description: Option<String>,
     pub parameters: Value,
- /// Whether to enable strict schema adherence (OpenAI structured outputs).
+    /// Whether to enable strict schema adherence (OpenAI structured outputs).
     pub strict: Option<bool>,
 }
 
@@ -280,7 +280,7 @@ pub enum ToolReference {
 }
 
 impl ToolReference {
- /// Get a unique identifier for this tool reference.
+    /// Get a unique identifier for this tool reference.
     pub fn identifier(&self) -> String {
         match self {
             ToolReference::Function { name } => format!("function:{name}"),
@@ -324,7 +324,7 @@ pub enum ChatMessage {
         content: Option<MessageContent>,
         name: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
- /// Reasoning content for reasoning-capable models.
+        /// Reasoning content for reasoning-capable models.
         #[serde(alias = "reasoning_content")]
         #[serde(alias = "thinking")]
         reasoning: Option<String>,
@@ -367,13 +367,13 @@ pub struct Usage {
 }
 
 impl Usage {
- /// Create a Usage from prompt and completion token counts.
+    /// Create a Usage from prompt and completion token counts.
     pub fn from_counts(prompt_tokens: u32, completion_tokens: u32) -> Self {
         Self {
             prompt_tokens,
- // `prompt_tokens + completion_tokens` can exceed u32::MAX, which would
- // panic in debug builds and silently wrap in release; saturate instead so
- // total_tokens stays a monotone, non-wrapping value.
+            // `prompt_tokens + completion_tokens` can exceed u32::MAX, which would
+            // panic in debug builds and silently wrap in release; saturate instead so
+            // total_tokens stays a monotone, non-wrapping value.
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
             completion_tokens: Some(completion_tokens),
             prompt_tokens_details: None,
@@ -479,8 +479,8 @@ pub struct ListModelsResponse {
 
 /// Trait for request types that need post-deserialization normalization.
 pub trait Normalizable {
- /// Normalize the request by applying defaults and transformations.
+    /// Normalize the request by applying defaults and transformations.
     fn normalize(&mut self) {
- // Default: no-op
+        // Default: no-op
     }
 }

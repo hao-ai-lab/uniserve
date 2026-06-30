@@ -67,11 +67,11 @@ fn factory_rejects_unknown_parser_names() {
 
 #[test]
 fn unknown_reasoning_parser_error_names_rejected_parser_and_lists_available() {
- // Mirrors the tool-side contract: rejecting an unknown explicit reasoning
- // parser name yields a ParserUnavailableByName error tagged with the
- // "reasoning" kind, carrying the rejected name and the available parser
- // names. We assert the variant plus a couple of stable built-in names
- // instead of snapshotting the whole registry list.
+    // Mirrors the tool-side contract: rejecting an unknown explicit reasoning
+    // parser name yields a ParserUnavailableByName error tagged with the
+    // "reasoning" kind, carrying the rejected name and the available parser
+    // names. We assert the variant plus a couple of stable built-in names
+    // instead of snapshotting the whole registry list.
     let tokenizer = Arc::new(FakeTokenizer);
     let factory = ReasoningParserFactory::new();
     let error = match factory.create("nope-not-a-parser", tokenizer) {

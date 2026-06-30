@@ -22,7 +22,7 @@ pub struct CollectedAssistantMessage {
     pub token_ids: Vec<u32>,
     pub output_token_count: usize,
     pub finish_reason: FinishReason,
- /// Connector-specific KV transfer parameters for disaggregated serving.
+    /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
 }
 
@@ -43,13 +43,13 @@ impl ChatEventStream {
         }
     }
 
- /// Return the request ID associated with this stream.
+    /// Return the request ID associated with this stream.
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
 
- /// Collect the stream to completion and return the final assembled
- /// assistant message.
+    /// Collect the stream to completion and return the final assembled
+    /// assistant message.
     pub async fn collect_message(mut self) -> Result<CollectedAssistantMessage> {
         use futures::StreamExt as _;
 
@@ -108,11 +108,11 @@ impl ChatEventStream {
             }
         }
 
- // The stream ended without a terminal `ChatEvent::Done`. In normal operation the
- // underlying stream surfaces its own error on unexpected close, so reaching here
- // means the terminal event was dropped (or the stream was constructed without one,
- // as the unit tests exercise). Rather than silently succeeding with a partial
- // message, report it explicitly so the dropped terminal output is not masked.
+        // The stream ended without a terminal `ChatEvent::Done`. In normal operation the
+        // underlying stream surfaces its own error on unexpected close, so reaching here
+        // means the terminal event was dropped (or the stream was constructed without one,
+        // as the unit tests exercise). Rather than silently succeeding with a partial
+        // message, report it explicitly so the dropped terminal output is not masked.
         Err(Error::StreamClosedBeforeTerminalOutput {
             request_id: self.request_id,
         })

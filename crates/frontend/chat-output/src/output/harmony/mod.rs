@@ -56,22 +56,22 @@ struct OpenHarmonyToolCall {
 }
 
 struct HarmonyState {
- /// Incremental Harmony parser over assistant token IDs.
+    /// Incremental Harmony parser over assistant token IDs.
     parser: StreamableParser,
- /// Whether tool-call content should surface as structured tool events.
+    /// Whether tool-call content should surface as structured tool events.
     tool_calls_enabled: bool,
- /// Count of completed visible assistant messages for newline insertion.
+    /// Count of completed visible assistant messages for newline insertion.
     completed_visible_messages: usize,
- /// Count of completed reasoning messages for newline insertion.
+    /// Count of completed reasoning messages for newline insertion.
     completed_reasoning_messages: usize,
- /// The current visible text/reasoning group, if any.
+    /// The current visible text/reasoning group, if any.
     current_text_group: Option<HarmonyGroupKey>,
- /// The currently open Harmony tool recipient, if any.
+    /// The currently open Harmony tool recipient, if any.
     open_tool_call: Option<OpenHarmonyToolCall>,
 }
 
 impl HarmonyChatOutputProcessor {
- /// Build one request-scoped Harmony processor after backend policy checks.
+    /// Build one request-scoped Harmony processor after backend policy checks.
     pub fn new(request: &ChatRequest) -> ChatResult<Self> {
         Ok(Self {
             encoding: harmony_encoding()?,
@@ -115,7 +115,7 @@ impl ChatOutputProcessor for HarmonyChatOutputProcessor {
 }
 
 impl HarmonyState {
- /// Create one fresh Harmony streaming state for a new assistant response.
+    /// Create one fresh Harmony streaming state for a new assistant response.
     fn new(encoding: HarmonyEncoding, tool_calls_enabled: bool) -> Result<Self> {
         Ok(Self {
             parser: StreamableParser::new(encoding, Some(Role::Assistant))
@@ -188,8 +188,8 @@ impl HarmonyState {
         Ok(events)
     }
 
- /// Flush Harmony parser state at EOS and emit any newly finalized assistant
- /// events.
+    /// Flush Harmony parser state at EOS and emit any newly finalized assistant
+    /// events.
     fn process_eos(&mut self) -> Result<Vec<AssistantEvent>> {
         let completed_before = self.parser.messages().len();
         let pending_key = HarmonyGroupKey {
@@ -244,8 +244,8 @@ impl HarmonyState {
         Ok(events)
     }
 
- /// Flush one coalesced Harmony content group into internal assistant
- /// events.
+    /// Flush one coalesced Harmony content group into internal assistant
+    /// events.
     fn emit_group(&mut self, group: HarmonyGroup, events: &mut Vec<AssistantEvent>) {
         let channel = group.key.channel.as_deref();
         let recipient = group.key.recipient.as_deref();
@@ -308,7 +308,7 @@ impl HarmonyState {
         }
     }
 
- /// Update newline and open-tool state after one Harmony message completes.
+    /// Update newline and open-tool state after one Harmony message completes.
     fn handle_completed_message(&mut self, key: HarmonyGroupKey) {
         if self.current_text_group.as_ref() == Some(&key) {
             self.current_text_group = None;

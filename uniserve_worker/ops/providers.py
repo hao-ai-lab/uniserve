@@ -273,7 +273,7 @@ class _TritonQKNormProvider:
 
     def can_run(self, req: QKNormReq) -> bool:
         if req.axis_dims is not None:
-            return self._can_run_sensenova_3d(req)
+            return False
         if isinstance(req.q_weight, tuple) or isinstance(req.k_weight, tuple):
             return False
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
@@ -282,10 +282,7 @@ class _TritonQKNormProvider:
 
     def run(self, req: QKNormReq):
         if req.axis_dims is not None:
-            out = self._try_run_sensenova_3d(req)
-            if out is None:
-                raise RuntimeError("triton SenseNova qk_norm became ineligible")
-            return out
+            raise RuntimeError("triton qk_norm only handles single-axis requests without axis_dims")
         if isinstance(req.q_weight, tuple) or isinstance(req.k_weight, tuple):
             raise RuntimeError("triton qk_norm only handles single-axis requests without axis_dims")
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
@@ -304,71 +301,6 @@ class _TritonQKNormProvider:
         if q.ndim == 4:
             return int(q.shape[0]) == int(k.shape[0]) and int(q.shape[2]) == int(k.shape[2])
         return False
-
-    def _sensenova_3d_inputs(self, req: QKNormReq):
-        if req.axis_dims is None or req.q.ndim not in (3, 4) or req.k.ndim not in (3, 4):
-            return None
-        if not self._same_token_layout(req.q, req.k):
-            return None
-        dim = int(req.q.shape[-1])
-        if int(req.k.shape[-1]) != dim:
-            return None
-        if tuple(req.axis_dims) != (dim // 2, dim // 4, dim // 4):
-            return None
-        if not (
-            isinstance(req.q_weight, tuple)
-            and isinstance(req.k_weight, tuple)
-            and len(req.q_weight) == len(req.k_weight) == 3
-        ):
-            return None
-        if req.q_weight[1] is not req.q_weight[2] or req.k_weight[1] is not req.k_weight[2]:
-            return None
-        q_flat, q_shape, q_was_flattened = _TritonQKNormRopeProvider._flatten_heads(req.q)
-        k_flat, k_shape, k_was_flattened = _TritonQKNormRopeProvider._flatten_heads(req.k)
-        if int(q_flat.shape[0]) != int(k_flat.shape[0]):
-            return None
-        return q_flat, k_flat, q_shape, k_shape, q_was_flattened, k_was_flattened
-
-    def _can_run_sensenova_3d(self, req: QKNormReq) -> bool:
-        inputs = self._sensenova_3d_inputs(req)
-        if inputs is None:
-            return False
-        q_flat, k_flat, _q_shape, _k_shape, _q_flattened, _k_flattened = inputs
-        can_run = import_module("uniserve_worker.nn.norm").can_run_triton_sensenova_qk_rms_norm_3d
-        return bool(
-            can_run(
-                q_flat,
-                k_flat,
-                req.q_weight[0],
-                req.q_weight[1],
-                req.k_weight[0],
-                req.k_weight[1],
-            )
-        )
-
-    def _try_run_sensenova_3d(self, req: QKNormReq):
-        inputs = self._sensenova_3d_inputs(req)
-        if inputs is None:
-            return None
-        q_flat, k_flat, q_shape, k_shape, q_was_flattened, k_was_flattened = inputs
-        try_triton_sensenova = import_module("uniserve_worker.nn.norm").try_triton_sensenova_qk_rms_norm_3d
-        out = try_triton_sensenova(
-            q_flat,
-            k_flat,
-            req.q_weight[0],
-            req.q_weight[1],
-            req.k_weight[0],
-            req.k_weight[1],
-            req.eps,
-            req.eps,
-        )
-        if out is None:
-            return None
-        q_out, k_out = out
-        return (
-            _TritonQKNormRopeProvider._unflatten_heads(q_out, q_shape, q_was_flattened),
-            _TritonQKNormRopeProvider._unflatten_heads(k_out, k_shape, k_was_flattened),
-        )
 
 
 class _EagerQKNormProvider:
@@ -430,7 +362,7 @@ class _TritonQKNormRopeProvider:
 
     def can_run(self, req: QKNormRopeReq) -> bool:
         if req.axis_dims is not None:
-            return self._can_run_multi_axis(req)
+            return False
         if isinstance(req.q_weight, tuple) or isinstance(req.cos, tuple):
             return False
         if req.position_ids is not None or req.unsqueeze_dim != 1:
@@ -441,7 +373,7 @@ class _TritonQKNormRopeProvider:
 
     def run(self, req: QKNormRopeReq):
         if req.axis_dims is not None:
-            return self._run_multi_axis(req)
+            raise RuntimeError("triton qk_norm_rope only handles single-axis requests without axis_dims")
         if isinstance(req.q_weight, tuple) or isinstance(req.cos, tuple):
             raise RuntimeError("triton qk_norm_rope only handles single-axis requests without axis_dims")
         try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
@@ -457,8 +389,9 @@ class _TritonQKNormRopeProvider:
             return x, tuple(x.shape), False
         if x.ndim != 4:
             raise RuntimeError("triton multi-axis qk_norm_rope requires 3D or 4D q/k tensors")
-        # SenseNova passes [batch, heads, seq, dim]. Existing Triton norm/RoPE
-        # kernels operate on [tokens, heads, dim], so flatten batch*seq tokens.
+        # Multi-axis callers may pass [batch, heads, seq, dim]. Existing Triton
+        # norm/RoPE kernels operate on [tokens, heads, dim], so flatten
+        # batch*seq tokens.
         flat = x.permute(0, 2, 1, 3).contiguous().reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3])
         return flat, tuple(x.shape), True
 
@@ -497,8 +430,6 @@ class _TritonQKNormRopeProvider:
             return False
         if not (req.q.is_cuda and req.k.is_cuda):
             return False
-        if self._can_run_sensenova_3d(req):
-            return True
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
         try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
         packed_rope = import_module("uniserve_worker.nn.rope")._TritonPackedRope()
@@ -550,96 +481,7 @@ class _TritonQKNormRopeProvider:
             axis = group_end
         return True
 
-    def _sensenova_3d_inputs(self, req: QKNormRopeReq):
-        if req.axis_dims is None or tuple(req.axis_dims) != (
-            int(req.q.shape[-1]) // 2,
-            int(req.q.shape[-1]) // 4,
-            int(req.q.shape[-1]) // 4,
-        ):
-            return None
-        if not (
-            isinstance(req.q_weight, tuple)
-            and isinstance(req.k_weight, tuple)
-            and isinstance(req.cos, tuple)
-            and isinstance(req.sin, tuple)
-            and len(req.q_weight) == len(req.k_weight) == len(req.cos) == len(req.sin) == 3
-        ):
-            return None
-        if req.q_weight[1] is not req.q_weight[2] or req.k_weight[1] is not req.k_weight[2]:
-            return None
-        q_flat, q_shape, q_was_flattened = self._flatten_heads(req.q)
-        k_flat, k_shape, k_was_flattened = self._flatten_heads(req.k)
-        tokens = int(q_flat.shape[0])
-        if int(k_flat.shape[0]) != tokens:
-            return None
-        try:
-            cos = tuple(self._align_rope_table(table, tokens) for table in req.cos)
-            sin = tuple(self._align_rope_table(table, tokens) for table in req.sin)
-        except RuntimeError:
-            return None
-        return q_flat, k_flat, q_shape, k_shape, q_was_flattened, k_was_flattened, cos, sin
-
-    def _can_run_sensenova_3d(self, req: QKNormRopeReq) -> bool:
-        inputs = self._sensenova_3d_inputs(req)
-        if inputs is None:
-            return False
-        q_flat, k_flat, _q_shape, _k_shape, _q_flattened, _k_flattened, cos, sin = inputs
-        can_run = import_module(
-            "uniserve_worker.nn.rope"
-        ).can_run_triton_sensenova_qk_rms_norm_rope_3d
-        return bool(
-            can_run(
-                q_flat,
-                k_flat,
-                req.q_weight[0],
-                req.q_weight[1],
-                req.k_weight[0],
-                req.k_weight[1],
-                cos[0],
-                sin[0],
-                cos[1],
-                sin[1],
-                cos[2],
-                sin[2],
-            )
-        )
-
-    def _try_run_sensenova_3d(self, req: QKNormRopeReq):
-        inputs = self._sensenova_3d_inputs(req)
-        if inputs is None:
-            return None
-        q_flat, k_flat, q_shape, k_shape, q_was_flattened, k_was_flattened, cos, sin = inputs
-        try_triton_sensenova = import_module(
-            "uniserve_worker.nn.rope"
-        ).try_triton_sensenova_qk_rms_norm_rope_3d
-        out = try_triton_sensenova(
-            q_flat,
-            k_flat,
-            req.q_weight[0],
-            req.q_weight[1],
-            req.k_weight[0],
-            req.k_weight[1],
-            cos[0],
-            sin[0],
-            cos[1],
-            sin[1],
-            cos[2],
-            sin[2],
-            req.eps,
-            req.eps,
-        )
-        if out is None:
-            return None
-        q_out, k_out = out
-        return (
-            self._unflatten_heads(q_out, q_shape, q_was_flattened),
-            self._unflatten_heads(k_out, k_shape, k_was_flattened),
-        )
-
     def _run_multi_axis(self, req: QKNormRopeReq):
-        sensenova_3d = self._try_run_sensenova_3d(req)
-        if sensenova_3d is not None:
-            return sensenova_3d
         q_parts = req.q.split(req.axis_dims, dim=-1)
         k_parts = req.k.split(req.axis_dims, dim=-1)
         out_q = []
@@ -693,9 +535,11 @@ class _TritonQKNormRopeProvider:
                     sin_flat = self._align_rope_table(sin, int(q_normed_part.shape[0]))
                     q_rot = packed_rope.run(q_normed_part, cos_flat, sin_flat)
                     k_rot = packed_rope.run(k_normed_part, cos_flat, sin_flat)
-                    part_shape = (*q_shape[:-1], int(req.axis_dims[axis + local]))
-                    out_q.append(self._unflatten_heads(q_rot, part_shape, q_was_flattened))
-                    out_k.append(self._unflatten_heads(k_rot, part_shape, k_was_flattened))
+                    axis_dim = int(req.axis_dims[axis + local])
+                    q_part_shape = (*q_shape[:-1], axis_dim)
+                    k_part_shape = (*k_shape[:-1], axis_dim)
+                    out_q.append(self._unflatten_heads(q_rot, q_part_shape, q_was_flattened))
+                    out_k.append(self._unflatten_heads(k_rot, k_part_shape, k_was_flattened))
             axis = group_end
         return torch.cat(out_q, dim=-1), torch.cat(out_k, dim=-1)
 
@@ -738,7 +582,7 @@ class _EagerQKNormRopeProvider:
         return group_end if group_dim == int(q_weight.shape[-1]) else start + 1
 
     @staticmethod
-    def _apply_axis_rope(q_normed, k_normed, cos, sin, *, apply_rotary_pos_emb, apply_rotary_emb, unsqueeze_dim):
+    def _apply_rope_axis(q_normed, k_normed, cos, sin, *, apply_rotary_pos_emb, apply_rotary_emb, unsqueeze_dim):
         if q_normed.ndim == 4 and cos.ndim == 2:
             dim = int(q_normed.shape[-1])
             if dim % 2:
@@ -801,7 +645,7 @@ class _EagerQKNormRopeProvider:
             q_normed_parts = q_normed_group.split(req.axis_dims[axis:group_end], dim=-1)
             k_normed_parts = k_normed_group.split(req.axis_dims[axis:group_end], dim=-1)
             for local, (q_normed, k_normed) in enumerate(zip(q_normed_parts, k_normed_parts, strict=True)):
-                q_rot, k_rot = self._apply_axis_rope(
+                q_rot, k_rot = self._apply_rope_axis(
                     q_normed,
                     k_normed,
                     req.cos[axis + local],

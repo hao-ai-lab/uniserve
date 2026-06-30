@@ -47,9 +47,9 @@ pub struct HfChatRenderer {
     fast_template: Option<FastChatTemplate>,
     special_tokens: Option<HfSpecialTokens>,
     multimodal: Option<MultimodalRenderInfo>,
- /// Cache of compiled per-request `chat_template` overrides, keyed by the
- /// raw override string, so repeated requests carrying the same override do
- /// not re-parse the Jinja template on every call.
+    /// Cache of compiled per-request `chat_template` overrides, keyed by the
+    /// raw override string, so repeated requests carrying the same override do
+    /// not re-parse the Jinja template on every call.
     override_cache: Mutex<HashMap<String, Arc<CompiledChatTemplate>>>,
 }
 
@@ -61,7 +61,7 @@ pub struct HfChatRenderer {
 const OVERRIDE_CACHE_CAPACITY: usize = 32;
 
 impl HfChatRenderer {
- /// Create a renderer from the given template string.
+    /// Create a renderer from the given template string.
     pub fn new(
         template: Option<String>,
         default_template_kwargs: HashMap<String, JsonValue>,
@@ -94,7 +94,7 @@ impl HfChatRenderer {
         self
     }
 
- /// Create a renderer from the given model files and loading options.
+    /// Create a renderer from the given model files and loading options.
     pub fn load(
         files: &ResolvedModelFiles,
         options: ChatTemplateLoadOptions,
@@ -115,8 +115,8 @@ impl HfChatRenderer {
             );
             info!("using configured chat template override");
         } else if let Some(chat_template_path) = files.chat_template_path.as_deref() {
- // If independent chat template file(s) exist and contain non-empty content,
- // they take priority over template entries in the tokenizer config
+            // If independent chat template file(s) exist and contain non-empty content,
+            // they take priority over template entries in the tokenizer config
             let file_template = load_chat_template(chat_template_path)
                 .map_err(|error| Error::ChatTemplate(error.to_report_string()))?;
 
@@ -143,12 +143,12 @@ impl HfChatRenderer {
         .with_multimodal(multimodal))
     }
 
- /// Apply the chat template to one chat request, rendering the prompt string
- /// to be tokenized and submitted to the model.
+    /// Apply the chat template to one chat request, rendering the prompt string
+    /// to be tokenized and submitted to the model.
 
- /// If the request carries a per-request `chat_template` override, a
- /// temporary template is compiled from that string and used instead of
- /// the model's default.
+    /// If the request carries a per-request `chat_template` override, a
+    /// temporary template is compiled from that string and used instead of
+    /// the model's default.
     fn apply_chat_template(&self, request: &ChatRequest) -> Result<RenderedPrompt> {
         let override_template = request
             .chat_options
@@ -174,10 +174,10 @@ impl HfChatRenderer {
         self.apply_chat_template_inner(template, request)
     }
 
- /// Compile a per-request `chat_template` override, reusing a cached compiled
- /// template when the same override string has been seen before. Compiling a
- /// Jinja template is a full parse, so without this cache a client repeatedly
- /// sending the same override would re-parse it on every request.
+    /// Compile a per-request `chat_template` override, reusing a cached compiled
+    /// template when the same override string has been seen before. Compiling a
+    /// Jinja template is a full parse, so without this cache a client repeatedly
+    /// sending the same override would re-parse it on every request.
     fn compiled_override(&self, template: &str) -> Result<Arc<CompiledChatTemplate>> {
         let mut cache = self
             .override_cache
@@ -190,8 +190,8 @@ impl HfChatRenderer {
             CompiledChatTemplate::new(template.to_owned(), self.content_format)
                 .map_err(|error| Error::ChatTemplate(error.to_report_string()))?,
         );
- // Keep memory bounded: drop the whole cache once it is full rather than
- // tracking per-entry recency.
+        // Keep memory bounded: drop the whole cache once it is full rather than
+        // tracking per-entry recency.
         if cache.len() >= OVERRIDE_CACHE_CAPACITY {
             cache.clear();
         }
@@ -350,17 +350,17 @@ impl ChatRenderer for HfChatRenderer {
 struct TemplateMessage {
     role: &'static str,
     content: TemplateContent,
- // Developer-role messages may provide message-local tools in the same shape
- // as top-level request tools.
+    // Developer-role messages may provide message-local tools in the same shape
+    // as top-level request tools.
     tools: Option<Vec<TemplateTool>>,
- // Reasoning-capable HF templates are inconsistent on the exact field name,
- // so expose both variants for compatibility.
+    // Reasoning-capable HF templates are inconsistent on the exact field name,
+    // so expose both variants for compatibility.
     reasoning: Option<String>,
     reasoning_content: Option<String>,
- // Function-call-capable templates commonly expect assistant tool calls
- // under this OpenAI-compatible field name.
+    // Function-call-capable templates commonly expect assistant tool calls
+    // under this OpenAI-compatible field name.
     tool_calls: Option<Vec<TemplateToolCall>>,
- // Tool-role messages refer back to the assistant call they are answering.
+    // Tool-role messages refer back to the assistant call they are answering.
     tool_call_id: Option<String>,
 }
 
@@ -538,7 +538,7 @@ fn to_template_openai_content(
                 ChatContentPart::Text { text } => {
                     Ok(TemplateContentPart::Text { text: text.clone() })
                 }
- // All multimodal contents are normalized to `{ "type": <modality> }`.
+                // All multimodal contents are normalized to `{ "type": <modality> }`.
                 ChatContentPart::ImageUrl { .. } => {
                     multimodal.ok_or(Error::UnsupportedMultimodalContent("image_url"))?;
                     Ok(TemplateContentPart::Image)
@@ -786,11 +786,11 @@ mod tests {
     fn chat_template_per_request_override() {
         let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
- // Default template renders one way.
+        // Default template renders one way.
         let default_rendered = render(Some("{{ messages[0].content }}"), &request).unwrap();
         assert_eq!(default_rendered, "hello");
 
- // Per-request override replaces the default template entirely.
+        // Per-request override replaces the default template entirely.
         request.chat_options.chat_template = Some("override:{{ messages[0].content }}".to_string());
         let overridden = render(Some("{{ messages[0].content }}"), &request).unwrap();
         assert_eq!(overridden, "override:hello");
@@ -808,14 +808,14 @@ mod tests {
         let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
         request.chat_options.chat_template = Some("override:{{ messages[0].content }}".to_string());
 
- // The same override string is compiled once and reused across renders.
+        // The same override string is compiled once and reused across renders.
         for _ in 0..3 {
             let rendered = renderer.render(&request).unwrap().prompt;
             assert_eq!(rendered, Prompt::Text("override:hello".to_string()));
         }
         assert_eq!(renderer.override_cache.lock().unwrap().len(), 1);
 
- // A distinct override string adds a separate cache entry.
+        // A distinct override string adds a separate cache entry.
         request.chat_options.chat_template = Some("other:{{ messages[0].content }}".to_string());
         let rendered = renderer.render(&request).unwrap().prompt;
         assert_eq!(rendered, Prompt::Text("other:hello".to_string()));
@@ -833,11 +833,12 @@ mod tests {
 
         let mut request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
         for i in 0..(super::OVERRIDE_CACHE_CAPACITY + 1) {
-            request.chat_options.chat_template = Some(format!("o{i}:{{{{ messages[0].content }}}}"));
+            request.chat_options.chat_template =
+                Some(format!("o{i}:{{{{ messages[0].content }}}}"));
             renderer.render(&request).unwrap();
         }
 
- // The cache never exceeds its capacity bound.
+        // The cache never exceeds its capacity bound.
         assert!(renderer.override_cache.lock().unwrap().len() <= super::OVERRIDE_CACHE_CAPACITY);
     }
 

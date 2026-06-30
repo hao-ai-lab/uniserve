@@ -15,12 +15,12 @@ pub use stream::{EngineCoreOutputStream, EngineCoreStreamOutput};
 /// dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AbortCause {
- /// The consumer dropped the stream before the request reached a terminal
- /// engine output.
+    /// The consumer dropped the stream before the request reached a terminal
+    /// engine output.
     #[default]
     DroppedStream,
- /// The frontend matched a stop string locally and intentionally stopped
- /// consuming the stream.
+    /// The frontend matched a stop string locally and intentionally stopped
+    /// consuming the stream.
     StopStringMatched,
 }
 
@@ -29,13 +29,13 @@ task_local::task_local! {
 }
 
 impl AbortCause {
- /// Return the abort cause currently associated with this task, or
- /// [`AbortCause::DroppedStream`] by default.
+    /// Return the abort cause currently associated with this task, or
+    /// [`AbortCause::DroppedStream`] by default.
     pub fn current() -> Self {
         ABORT_CAUSE.try_get().unwrap_or_default()
     }
 
- /// Drop one value while marking the drop as happening for this abort cause.
+    /// Drop one value while marking the drop as happening for this abort cause.
     pub fn drop_as<T>(self, value: T) {
         ABORT_CAUSE.sync_scope(self, move || drop(value));
     }
@@ -99,25 +99,25 @@ pub enum EngineCoreClient {
 }
 
 impl EngineCoreClient {
- /// Wrap a server-owned in-process runtime backend.
+    /// Wrap a server-owned in-process runtime backend.
     pub fn from_in_process(client: impl InProcessEngineClient + 'static) -> Self {
         Self::InProcess(Box::new(client))
     }
 
- /// Connect to out-of-process engine cores over the ZMQ transport.
+    /// Connect to out-of-process engine cores over the ZMQ transport.
     pub async fn connect_zmq(config: crate::zmq::ZmqClientConfig) -> Result<Self> {
         Ok(Self::Zmq(Box::new(
             crate::zmq::ZmqEngineCoreClient::connect(config).await?,
         )))
     }
 
- /// Build a mock-backed client plus its scripting handle (test infrastructure).
+    /// Build a mock-backed client plus its scripting handle (test infrastructure).
     pub fn connect_mock(model_name: impl Into<String>) -> (Self, crate::mock::MockEngine) {
         let (client, engine) = crate::mock::connect_mock(model_name);
         (Self::Mock(client), engine)
     }
 
- /// Add a request and return its per-request raw output stream.
+    /// Add a request and return its per-request raw output stream.
     pub async fn call(&self, req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
         match self {
             Self::InProcess(c) => c.call(req),
@@ -126,8 +126,8 @@ impl EngineCoreClient {
         }
     }
 
- /// Submit a native image/interleave-capable request and return its typed
- /// text+image event stream.
+    /// Submit a native image/interleave-capable request and return its typed
+    /// text+image event stream.
     pub async fn generate_native(&self, req: NativeGenerateRequest) -> Result<NativeEventStream> {
         match self {
             Self::InProcess(c) => c.generate_native(req),
@@ -139,7 +139,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Abort in-flight requests by request id.
+    /// Abort in-flight requests by request id.
     pub async fn abort(&self, ids: &[String]) -> Result<()> {
         match self {
             Self::InProcess(c) => c.abort(ids),
@@ -151,7 +151,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Number of engines backing this client.
+    /// Number of engines backing this client.
     pub fn engine_count(&self) -> usize {
         match self {
             Self::InProcess(c) => c.engine_count(),
@@ -160,7 +160,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Engine routing identities (empty for the in-process engines).
+    /// Engine routing identities (empty for the in-process engines).
     pub fn engine_identities(&self) -> Vec<&[u8]> {
         match self {
             Self::Zmq(c) => c.engine_identities(),
@@ -168,7 +168,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Engine ready responses (empty for the in-process engines).
+    /// Engine ready responses (empty for the in-process engines).
     pub fn ready_responses(&self) -> Vec<&EngineCoreReadyResponse> {
         match self {
             Self::Zmq(c) => c.ready_responses(),
@@ -176,7 +176,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Effective model dtype.
+    /// Effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         match self {
             Self::InProcess(c) => c.model_dtype(),
@@ -185,7 +185,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Engine version string for `/version`.
+    /// Engine version string for `/version`.
     pub fn uniserve_version(&self) -> &str {
         match self {
             Self::InProcess(c) => c.uniserve_version(),
@@ -194,7 +194,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Total number of GPU KV blocks across engines.
+    /// Total number of GPU KV blocks across engines.
     pub fn total_num_gpu_blocks(&self) -> u64 {
         match self {
             Self::InProcess(c) => c.total_num_gpu_blocks(),
@@ -203,7 +203,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Minimum effective `max_model_len`.
+    /// Minimum effective `max_model_len`.
     pub fn max_model_len(&self) -> u32 {
         match self {
             Self::InProcess(c) => c.max_model_len(),
@@ -212,7 +212,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Model name used for metrics labeling.
+    /// Model name used for metrics labeling.
     pub fn model_name(&self) -> &str {
         match self {
             Self::InProcess(c) => c.model_name(),
@@ -221,7 +221,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Whether the client still considers the engine healthy.
+    /// Whether the client still considers the engine healthy.
     pub fn is_healthy(&self) -> bool {
         match self {
             Self::InProcess(c) => c.is_healthy(),
@@ -230,7 +230,7 @@ impl EngineCoreClient {
         }
     }
 
- /// First persistent health error, if any.
+    /// First persistent health error, if any.
     pub fn health_error(&self) -> Option<Arc<Error>> {
         match self {
             Self::InProcess(c) => c.health_error(),
@@ -239,7 +239,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Run `collective_rpc` across engines and their worker ranks.
+    /// Run `collective_rpc` across engines and their worker ranks.
     pub async fn collective_rpc<A, K>(
         &self,
         method: &str,
@@ -258,7 +258,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Whether the engine is currently sleeping.
+    /// Whether the engine is currently sleeping.
     pub async fn is_sleeping(&self) -> Result<bool> {
         match self {
             Self::InProcess(c) => c.is_sleeping(),
@@ -267,7 +267,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Reset the multimodal cache.
+    /// Reset the multimodal cache.
     pub async fn reset_mm_cache(&self) -> Result<()> {
         match self {
             Self::InProcess(c) => c.reset_mm_cache(),
@@ -276,7 +276,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Reset the encoder cache.
+    /// Reset the encoder cache.
     pub async fn reset_encoder_cache(&self) -> Result<()> {
         match self {
             Self::InProcess(c) => c.reset_encoder_cache(),
@@ -285,7 +285,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Reset the prefix cache.
+    /// Reset the prefix cache.
     pub async fn reset_prefix_cache(
         &self,
         _reset_running_requests: bool,
@@ -298,7 +298,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Load or refresh one LoRA adapter.
+    /// Load or refresh one LoRA adapter.
     pub async fn add_lora(&self, lora_request: &LoraRequest) -> Result<bool> {
         match self {
             Self::InProcess(c) => c.add_lora(lora_request),
@@ -307,7 +307,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Remove one LoRA adapter.
+    /// Remove one LoRA adapter.
     pub async fn remove_lora(&self, lora_id: u64) -> Result<bool> {
         match self {
             Self::InProcess(c) => c.remove_lora(lora_id),
@@ -316,7 +316,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Put the engine to sleep.
+    /// Put the engine to sleep.
     pub async fn sleep(&self, level: u32, mode: &str) -> Result<()> {
         match self {
             Self::InProcess(c) => c.sleep(level, mode),
@@ -325,7 +325,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Wake the engine from sleep.
+    /// Wake the engine from sleep.
     pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()> {
         match self {
             Self::InProcess(c) => c.wake_up(tags),
@@ -334,7 +334,7 @@ impl EngineCoreClient {
         }
     }
 
- /// Shut down the client and its engine.
+    /// Shut down the client and its engine.
     pub async fn shutdown(self) -> Result<()> {
         match self {
             Self::InProcess(c) => c.shutdown(),

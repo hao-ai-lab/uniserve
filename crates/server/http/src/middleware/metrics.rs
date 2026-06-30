@@ -18,7 +18,7 @@ const EXCLUDED_HANDLERS: &[&str] = &[
     "/ping",
     "/version",
     "/server_info",
- // Rust frontend extra:
+    // Rust frontend extra:
     "/reset_prefix_cache",
     "/reset_mm_cache",
     "/reset_encoder_cache",
@@ -31,8 +31,8 @@ const EXCLUDED_HANDLERS: &[&str] = &[
 /// Record API-server HTTP metrics with Python-compatible
 /// (`PrometheusFastApiInstrumentator` style) family names and labels.
 pub(crate) async fn track_http_metrics(req: Request, next: Next) -> Response {
- // Resolve the handler from a borrowed `&str` first so excluded requests
- // (the bypass path) never allocate the method/handler strings.
+    // Resolve the handler from a borrowed `&str` first so excluded requests
+    // (the bypass path) never allocate the method/handler strings.
     let handler = req
         .extensions()
         .get::<MatchedPath>()
@@ -42,16 +42,16 @@ pub(crate) async fn track_http_metrics(req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
 
- // Only allocate the owned label strings for tracked requests. They are
- // moved into the body guard so they outlive the handler return.
+    // Only allocate the owned label strings for tracked requests. They are
+    // moved into the body guard so they outlive the handler return.
     let method = req.method().as_str().to_string();
     let handler = handler.to_string();
     let started_at = Instant::now();
 
     let response = next.run(req).await;
 
- // Status is available as soon as the handler returns the response head;
- // duration, however, must be measured at body completion (see below).
+    // Status is available as soon as the handler returns the response head;
+    // duration, however, must be measured at body completion (see below).
     let status = status_group(response.status().as_u16());
     let guard = MetricsGuard {
         started_at,
@@ -60,11 +60,11 @@ pub(crate) async fn track_http_metrics(req: Request, next: Next) -> Response {
         status,
     };
 
- // Wrap the body so the guard's `Drop` fires when the response body is
- // fully sent. For streaming (SSE) responses the handler returns the body
- // immediately, so observing at handler-return would record a near-zero
- // duration; deferring to body-end captures the true request duration.
- // Mirrors the `LoadTrackedBody` pattern in `load.rs`.
+    // Wrap the body so the guard's `Drop` fires when the response body is
+    // fully sent. For streaming (SSE) responses the handler returns the body
+    // immediately, so observing at handler-return would record a near-zero
+    // duration; deferring to body-end captures the true request duration.
+    // Mirrors the `LoadTrackedBody` pattern in `load.rs`.
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,

@@ -12,7 +12,7 @@ use crate::request::ChatRequest;
 pub struct DeepSeekV32ChatRenderer;
 
 impl DeepSeekV32ChatRenderer {
- /// Create the dedicated DeepSeek V3.2 renderer.
+    /// Create the dedicated DeepSeek V3.2 renderer.
     pub fn new() -> Self {
         Self
     }

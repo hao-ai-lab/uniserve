@@ -19,6 +19,8 @@ Backends (one chosen per worker via :func:`make_transport`):
 """
 from __future__ import annotations
 
+import base64
+import json
 import os
 import pickle
 import socket
@@ -83,6 +85,46 @@ class Locator:
         if not isinstance(loc, Locator):
             raise invalid_descriptor("decoded object is not a Locator")
         return loc
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "transport": self.transport,
+            "session": self.session,
+            "nbytes": self.nbytes,
+            "dtype": self.dtype,
+            "shape": list(self.shape),
+            "device": self.device,
+            "addr": self.addr,
+            "handle_b64": base64.b64encode(self.handle).decode("ascii"),
+            "meta": self.meta,
+        }
+
+    @staticmethod
+    def from_wire(raw: dict[str, Any]) -> "Locator":
+        if int(raw.get("version", 1)) != 1:
+            raise invalid_descriptor("unsupported locator wire version")
+        return Locator(
+            transport=str(raw["transport"]),
+            session=str(raw["session"]),
+            nbytes=int(raw["nbytes"]),
+            dtype=str(raw["dtype"]),
+            shape=tuple(int(v) for v in raw["shape"]),
+            device=str(raw["device"]),
+            addr=int(raw.get("addr", 0)),
+            handle=base64.b64decode(str(raw.get("handle_b64", "")).encode("ascii")),
+            meta=dict(raw.get("meta") or {}),
+        )
+
+    def to_wire_json(self) -> str:
+        return json.dumps(self.to_wire(), separators=(",", ":"), sort_keys=True)
+
+    @staticmethod
+    def from_wire_json(raw: str) -> "Locator":
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise invalid_descriptor("locator wire value must be a JSON object")
+        return Locator.from_wire(value)
 
 
 def _dtype_to_str(dtype: "torch.dtype") -> str:

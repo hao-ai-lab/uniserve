@@ -40,8 +40,8 @@ pub fn convert_from_response_format(
             ..Default::default()
         })),
         ResponseFormat::StructuralTag { .. } => {
- // The engine expects the complete response_format object,
- // including the `type` field, as the structural-tag payload.
+            // The engine expects the complete response_format object,
+            // including the `type` field, as the structural-tag payload.
             let tag_json = serde_json::to_string(fmt).map_err(|e| {
                 ApiError::invalid_request(
                     format!("failed to serialize structural_tag: {e}"),
@@ -73,7 +73,7 @@ pub fn convert_from_response_format_value(
         return Ok(None);
     };
 
- // Deserialize into our typed enum and delegate.
+    // Deserialize into our typed enum and delegate.
     let fmt: ResponseFormat = serde_json::from_value(raw.clone()).map_err(|e| {
         ApiError::invalid_request(
             format!("invalid response_format: {e}"),

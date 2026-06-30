@@ -41,9 +41,9 @@ pub(crate) fn init_tracing() {
         )
         .try_init()
     {
- // The tracing subscriber itself failed to install, so we cannot log
- // through `tracing`. Surface the failure directly on stderr rather than
- // swallowing it, since it means subsequent log output may be missing.
+        // The tracing subscriber itself failed to install, so we cannot log
+        // through `tracing`. Surface the failure directly on stderr rather than
+        // swallowing it, since it means subsequent log output may be missing.
         eprintln!("failed to install tracing subscriber: {err}");
     }
 }
@@ -219,9 +219,9 @@ where
         writer.write_char(' ')?;
         self.write_timestamp(&mut writer, ansi)?;
         writer.write_char(' ')?;
- // Use the full file path only when DEBUG (or more verbose) is enabled anywhere,
- // independent of the level of this particular event. Filenames alone are often
- // ambiguous, but full paths are too noisy for normal INFO-level operation.
+        // Use the full file path only when DEBUG (or more verbose) is enabled anywhere,
+        // independent of the level of this particular event. Filenames alone are often
+        // ambiguous, but full paths are too noisy for normal INFO-level operation.
         let full_path = LevelFilter::current() >= LevelFilter::DEBUG;
         self.write_location(&mut writer, meta.file(), meta.line(), full_path, ansi)?;
         writer.write_char(' ')?;

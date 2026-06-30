@@ -220,7 +220,7 @@ async fn grpc_test_server(
     let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
     let svc = GenerateServer::new(GenerateServiceImpl::new(state));
 
- // Bind to an OS-assigned port.
+    // Bind to an OS-assigned port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind grpc listener");
@@ -235,7 +235,7 @@ async fn grpc_test_server(
             .expect("grpc server");
     });
 
- // Connect the client.
+    // Connect the client.
     let grpc_client = GenerateClient::connect(format!("http://{addr}"))
         .await
         .expect("connect grpc client");
@@ -324,7 +324,7 @@ async fn unary_generate_returns_collected_text() {
         .expect("unary generate")
         .into_inner();
 
- // Unary collects all tokens into one response.
+    // Unary collects all tokens into one response.
     let outputs = response.outputs.expect("outputs present");
     assert_eq!(outputs.text, "hi");
 
@@ -466,14 +466,14 @@ async fn streaming_generate_yields_incremental_responses() {
     let responses: Vec<pb::GenerateResponse> =
         stream.map(|r| r.expect("stream item")).collect().await;
 
- // First response carries prompt info, subsequent ones carry output deltas.
+    // First response carries prompt info, subsequent ones carry output deltas.
     assert!(
         responses.len() >= 2,
         "expected at least 2 streamed responses, got {}",
         responses.len()
     );
 
- // First message should have prompt info.
+    // First message should have prompt info.
     let first = &responses[0];
     let prompt_info = first
         .prompt_info
@@ -481,7 +481,7 @@ async fn streaming_generate_yields_incremental_responses() {
         .expect("first response has prompt_info");
     assert_eq!(prompt_info.num_prompt_tokens, 5); // "hello"
 
- // Collect all text deltas.
+    // Collect all text deltas.
     let full_text: String = responses
         .iter()
         .filter_map(|r| r.outputs.as_ref())
@@ -489,7 +489,7 @@ async fn streaming_generate_yields_incremental_responses() {
         .collect();
     assert_eq!(full_text, "hi");
 
- // Last output response should have finish info.
+    // Last output response should have finish info.
     let last_output = responses
         .iter()
         .rev()
@@ -587,7 +587,7 @@ async fn unary_generate_accepts_empty_model() {
     let (mut client, server_task, engine_task) =
         grpc_test_server(default_stream_output_specs()).await;
 
- // Empty `model` (proto3 default) is treated as "unset" and should be accepted.
+    // Empty `model` (proto3 default) is treated as "unset" and should be accepted.
     let response = client
         .generate(pb::GenerateRequest {
             request_id: "test-empty-model".to_string(),
@@ -616,7 +616,7 @@ async fn unary_generate_output_text_defaults_to_true() {
     let (mut client, server_task, engine_task) =
         grpc_test_server(default_stream_output_specs()).await;
 
- // No response options at all — output_text should default to true.
+    // No response options at all — output_text should default to true.
     let response = client
         .generate(pb::GenerateRequest {
             request_id: "test-default-text".to_string(),

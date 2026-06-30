@@ -17,9 +17,10 @@ from ...execution.interleaved_text_stepper import (
 )
 from ...foundation.errors import invalid_descriptor, model_execution_error
 from ...nn.diffusion import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain, init_latent
-from ...nn.diffusion.cfg import Branch, CfgRecipe
+from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
+from ...runtime.masks import build_commit_attention_mask
 from ...nn.vision import build_abs_positions_from_grid_hw, patchify_batch, unpatchify_batch
-from ...runtime.image_defaults import image_height, image_width
+from ...runtime.image_params import required_image_height, required_image_width
 from ...runtime.image_utils import tensor_to_png_b64
 from ...runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
@@ -42,10 +43,6 @@ if TYPE_CHECKING:
 # ImageNet channel statistics for re-normalizing a generated image before ViT re-encoding.
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
-_DEFAULT_IMAGE_STEPS = 50
-_DEFAULT_CFG_TEXT_SCALE = 4.0
-_DEFAULT_CFG_IMG_SCALE = 1.0
-_DEFAULT_TIMESTEP_SHIFT = 3.0
 
 # Resolution-aware noise scaling raises the per-token sequence-length ratio to
 # this power (a square root: noise std scales with sqrt of the token count
@@ -138,6 +135,18 @@ class _ImageParams:
     timestep_shift: float
     retain_images: bool
     seed: int | None
+
+
+def _image_param(ip: dict, key: str, default: Any) -> Any:
+    value = ip.get(key, default)
+    return default if value is None else value
+
+
+def _required_image_param(ip: dict, key: str) -> Any:
+    value = ip.get(key)
+    if value is None:
+        raise invalid_descriptor(f"image.{key} is required")
+    return value
 
 
 @dataclass
@@ -309,17 +318,23 @@ class TextImageDenoiseOps:
         return image_state
 
     def _parse_image_params(self: TextImageDenoiseOwner, ip: dict) -> _ImageParams:
+        steps = int(_required_image_param(ip, "steps"))
+        if steps <= 0:
+            raise invalid_descriptor("image.steps must be positive")
+        cfg_interval = tuple(_required_image_param(ip, "cfg_interval"))
+        if len(cfg_interval) != 2:
+            raise invalid_descriptor("image.cfg_interval must contain exactly two values")
         return _ImageParams(
-            width=image_width(ip),
-            height=image_height(ip),
-            steps=int(ip.get("steps") or _DEFAULT_IMAGE_STEPS),
-            cfg_text=float(ip.get("cfg_text_scale") or _DEFAULT_CFG_TEXT_SCALE),
-            cfg_img=float(ip.get("cfg_img_scale") or _DEFAULT_CFG_IMG_SCALE),
-            cfg_interval=tuple(ip.get("cfg_interval") or (0.0, 1.0)),
-            cfg_norm=str(ip.get("cfg_renorm_type") or "none"),
-            cfg_renorm_min=float(ip.get("cfg_renorm_min") or 0.0),
-            timestep_shift=float(ip.get("timestep_shift") or _DEFAULT_TIMESTEP_SHIFT),
-            retain_images=bool(ip.get("retain_images", True)),
+            width=required_image_width(ip),
+            height=required_image_height(ip),
+            steps=steps,
+            cfg_text=float(_required_image_param(ip, "cfg_text_scale")),
+            cfg_img=float(_required_image_param(ip, "cfg_img_scale")),
+            cfg_interval=(float(cfg_interval[0]), float(cfg_interval[1])),
+            cfg_norm=str(_required_image_param(ip, "cfg_renorm_type")),
+            cfg_renorm_min=float(_required_image_param(ip, "cfg_renorm_min")),
+            timestep_shift=float(_required_image_param(ip, "timestep_shift")),
+            retain_images=bool(_image_param(ip, "retain_images", True)),
             seed=ip.get("seed"),
         )
 
@@ -351,19 +366,27 @@ class TextImageDenoiseOps:
             cond = self._prefix_from_query(query)
         elif not params.retain_images:
             self._ensure_img_start(st.cond)
-        need_tu = params.cfg_text > 1.0 or (
-            params.cfg_img > 1.0 and params.cfg_text != params.cfg_img
+        cfg_plan = build_text_image_cfg_plan(
+            cfg_text_scale=params.cfg_text,
+            cfg_img_scale=params.cfg_img,
+            recipe=CfgRecipe.ADDITIVE_DELTAS,
+            renorm=params.cfg_norm,
+            renorm_min=params.cfg_renorm_min,
         )
-        if need_tu and st.tu.past is None:
+        needs_text_uncond = Branch.TEXT_UNCOND in cfg_plan.branches
+        if needs_text_uncond and st.tu.past is None:
             if getattr(self, "_dataplane_handoff", None) is not None:
                 raise invalid_descriptor("Mode A denoise is missing pre-staged text-unconditional CFG KV")
             st.tu = self._empty_img_start_prefix()
-        elif need_tu:
+        elif needs_text_uncond:
             self._ensure_img_start(st.tu)
-        if params.cfg_img > 1.0 and st.iu.past is None:
+        needs_img_uncond = Branch.IMG_UNCOND in cfg_plan.branches
+        if needs_img_uncond and st.iu.past is None:
             if getattr(self, "_dataplane_handoff", None) is not None:
                 raise invalid_descriptor("Mode A denoise is missing pre-staged image-unconditional CFG KV")
             st.iu = self._empty_img_start_prefix()
+        elif needs_img_uncond:
+            self._ensure_img_start(st.iu)
         return cond
 
     def _build_indexes(
@@ -459,7 +482,7 @@ class TextImageDenoiseOps:
                 1, img.token_h * img.token_w, -1
             )
         image_embeds = image_embeds + timestep_embeddings
-        total = int(st.image.get("steps") or _DEFAULT_IMAGE_STEPS)
+        total = int(img.schedule.num_steps)
         return TextImageDenoiseStep(
             req_id=int(req_id),
             state=state,
@@ -721,8 +744,11 @@ class GeneratedImageCommitDriver:
         h_indexes[:num_image_tokens] = abs_h
         w_indexes[:num_image_tokens] = abs_w
         indexes = torch.stack([t_indexes, h_indexes, w_indexes], dim=0)
-        mask = torch.zeros(1, 1, target_len, past_len + target_len, device=self.owner.device)
-        mask[0, 0, :num_image_tokens, past_len + num_image_tokens] = float("-inf")
+        mask = build_commit_attention_mask(
+            num_image_tokens=num_image_tokens,
+            past_len=past_len,
+            device=self.owner.device,
+        )
         outputs = self.owner.model.language_model(
             inputs_embeds=embeds,
             indexes=indexes,

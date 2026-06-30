@@ -69,13 +69,13 @@ impl MultimodalModelContext {
         self.tokenizer.0.as_ref()
     }
 
- /// Resolve a static model processor spec for one loaded model.
+    /// Resolve a static model processor spec for one loaded model.
     fn resolve_model_spec(&self) -> Option<&'static dyn ModelProcessorSpec> {
         static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(ModelRegistry::new);
         REGISTRY.lookup(&self.metadata())
     }
 
- /// Resolve a static image preprocessor for one loaded model.
+    /// Resolve a static image preprocessor for one loaded model.
     fn resolve_image_processor(&self) -> Option<&'static dyn ImagePreProcessor> {
         static REGISTRY: LazyLock<ImageProcessorRegistry> =
             LazyLock::new(ImageProcessorRegistry::with_defaults);
@@ -100,10 +100,10 @@ impl ResolvedMultimodalSpec {
         let placeholder_token = raw
             .placeholder_token(&metadata)
             .map_err(|error| multimodal!("{error}"))?;
- // This is the rendered prompt marker, so resolve it from the token
- // string itself. Do not use `ModelProcessorSpec::placeholder_token_id`:
- // for some specs that ID is the replacement vision/patch token,
- // not necessarily the token ID of `placeholder_token`.
+        // This is the rendered prompt marker, so resolve it from the token
+        // string itself. Do not use `ModelProcessorSpec::placeholder_token_id`:
+        // for some specs that ID is the replacement vision/patch token,
+        // not necessarily the token ID of `placeholder_token`.
         let placeholder_marker_token_id = context
             .tokenizer()
             .token_to_id(&placeholder_token)
@@ -179,11 +179,11 @@ fn build_media_client() -> Result<reqwest::Client> {
 }
 
 impl MultimodalModelInfo {
- /// Load and resolve multimodal support from model files.
+    /// Load and resolve multimodal support from model files.
 
- /// Returns `Ok(Some(_))` only when both the model spec and image processor
- /// are registered. File read/parse failures are real errors; unsupported
- /// model families are logged and returned as `Ok(None)`.
+    /// Returns `Ok(Some(_))` only when both the model spec and image processor
+    /// are registered. File read/parse failures are real errors; unsupported
+    /// model families are logged and returned as `Ok(None)`.
     pub fn from_paths(
         model_id: String,
         model_type: Option<String>,
@@ -254,10 +254,10 @@ impl MultimodalModelInfo {
         }))
     }
 
- /// Return the template-visible placeholder token for this model.
+    /// Return the template-visible placeholder token for this model.
 
- /// The HF renderer uses this token while flattening image content in string
- /// content format.
+    /// The HF renderer uses this token while flattening image content in string
+    /// content format.
     pub(crate) fn placeholder_token(&self) -> &str {
         &self.spec.placeholder_token
     }
@@ -331,12 +331,12 @@ fn extract_media_parts(request: &ChatRequest) -> Result<Vec<MediaContentPart>> {
 }
 
 impl MultimodalModelInfo {
- /// Run media fetch, image preprocessing, prompt expansion, and feature
- /// build.
+    /// Run media fetch, image preprocessing, prompt expansion, and feature
+    /// build.
 
- /// `prompt_token_ids` is mutated in place because placeholder expansion
- /// changes both the final prompt and the offsets recorded in
- /// `PlaceholderRange`.
+    /// `prompt_token_ids` is mutated in place because placeholder expansion
+    /// changes both the final prompt and the offsets recorded in
+    /// `PlaceholderRange`.
     async fn prepare_multimodal(
         &self,
         media_parts: Vec<MediaContentPart>,
@@ -366,7 +366,7 @@ impl MultimodalModelInfo {
         Ok(features)
     }
 
- /// Fetch all image parts and preserve their request-order UUID metadata.
+    /// Fetch all image parts and preserve their request-order UUID metadata.
     async fn fetch_images(&self, media_parts: Vec<MediaContentPart>) -> Result<FetchedImageMedia> {
         let mut tracker = AsyncMultiModalTracker::new(Arc::clone(&self.media_connector));
         for part in media_parts {
@@ -401,12 +401,12 @@ impl MultimodalModelInfo {
         Ok(FetchedImageMedia { frames, uuids })
     }
 
- /// Preprocess fetched image frames with the model's resolved image
- /// processor.
+    /// Preprocess fetched image frames with the model's resolved image
+    /// processor.
 
- /// The processor work is CPU-heavy relative to request wiring, so it runs
- /// in a blocking task and returns owned tensors ready for wire
- /// conversion.
+    /// The processor work is CPU-heavy relative to request wiring, so it runs
+    /// in a blocking task and returns owned tensors ready for wire
+    /// conversion.
     async fn preprocess_images(
         &self,
         image_frames: &[Arc<llm_multimodal::ImageFrame>],
@@ -427,11 +427,11 @@ impl MultimodalModelInfo {
         .map_err(|error| multimodal!("image preprocessing task failed: {error}"))?
     }
 
- /// Replace rendered placeholder markers with model-specific replacement
- /// tokens.
+    /// Replace rendered placeholder markers with model-specific replacement
+    /// tokens.
 
- /// Replacements are consumed in order, matching the original media-part
- /// order. The returned ranges point into the already-expanded prompt.
+    /// Replacements are consumed in order, matching the original media-part
+    /// order. The returned ranges point into the already-expanded prompt.
     fn expand_prompt_tokens(
         &self,
         prompt_token_ids: &mut Vec<u32>,
@@ -446,10 +446,10 @@ impl MultimodalModelInfo {
         )
     }
 
- /// Convert preprocessed image tensors into engine multimodal features.
+    /// Convert preprocessed image tensors into engine multimodal features.
 
- /// One `MmFeatureSpec` is produced per image. Tensor fields are
- /// sliced according to the model spec's field layout declarations.
+    /// One `MmFeatureSpec` is produced per image. Tensor fields are
+    /// sliced according to the model spec's field layout declarations.
     fn build_features(
         &self,
         preprocessed: PreprocessedImages,
@@ -460,11 +460,11 @@ impl MultimodalModelInfo {
         let len = images.frames.len();
         let tensors = tensor::collect_tensors(preprocessed, model_dtype)?;
 
- // Shared (no field-layout) fields are identical for every image, so
- // convert each to its wire value exactly once here instead of cloning
- // and re-converting the full tensor inside the per-image loop. The
- // per-image cost then drops to a single clone of the already-converted
- // value rather than `O(images x tensor_bytes)` repeated conversions.
+        // Shared (no field-layout) fields are identical for every image, so
+        // convert each to its wire value exactly once here instead of cloning
+        // and re-converting the full tensor inside the per-image loop. The
+        // per-image cost then drops to a single clone of the already-converted
+        // value rather than `O(images x tensor_bytes)` repeated conversions.
         let mut shared_values: HashMap<String, MmKwargValue> = HashMap::new();
         for (key, tensor) in &tensors {
             if self.spec.field_layouts.get(key).is_none() {
@@ -522,13 +522,13 @@ impl MultimodalModelInfo {
                 );
             }
 
- // `frame.hash` is the Blake3 hex-digest of the decoded media bytes
- // (see `llm_multimodal::ImageFrame::hash`). This is the canonical
- // hex-string representation carried by the chat / `MmFeatureSpec`
- // ingress path. It is deliberately a different convention from the
- // native (`ForwardOp`) `u64` path; see the `MmFeatureSpec::mm_hash`
- // contract note. The two paths are disjoint, so this value never has
- // to interoperate with a worker-wire `u64` hash for the same request.
+            // `frame.hash` is the Blake3 hex-digest of the decoded media bytes
+            // (see `llm_multimodal::ImageFrame::hash`). This is the canonical
+            // hex-string representation carried by the chat / `MmFeatureSpec`
+            // ingress path. It is deliberately a different convention from the
+            // native (`ForwardOp`) `u64` path; see the `MmFeatureSpec::mm_hash`
+            // contract note. The two paths are disjoint, so this value never has
+            // to interoperate with a worker-wire `u64` hash for the same request.
             let hash = frame.hash.clone();
             features.push(MmFeatureSpec {
                 data: Some(data),
@@ -788,10 +788,10 @@ mod tests {
 
     #[test]
     fn build_media_client_applies_hardening() {
- // The hardened builder must succeed; a failure would silently fall back
- // to no image fetching at model load. Construction also exercises the
- // redirect/connect-timeout settings so a future incompatible reqwest
- // change is caught here rather than at request time.
+        // The hardened builder must succeed; a failure would silently fall back
+        // to no image fetching at model load. Construction also exercises the
+        // redirect/connect-timeout settings so a future incompatible reqwest
+        // change is caught here rather than at request time.
         assert!(build_media_client().is_ok());
     }
 

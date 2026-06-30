@@ -45,11 +45,11 @@ async fn managed_sim_engine_serves_and_shuts_down() {
     .await
     .expect("connect to managed engine");
 
- // The subprocess engine answered the handshake with post-load truth.
+    // The subprocess engine answered the handshake with post-load truth.
     assert_eq!(client.engine_count(), 1);
     assert!(client.total_num_gpu_blocks() > 0);
 
- // One text generation through the real subprocess.
+    // One text generation through the real subprocess.
     let request = EngineCoreRequest {
         request_id: "req-managed".to_string(),
         prompt_token_ids: Some(vec![1, 2, 3, 4]),
@@ -76,7 +76,7 @@ async fn managed_sim_engine_serves_and_shuts_down() {
 
     client.shutdown().await.expect("shutdown client");
 
- // Supervised teardown: SIGTERM the engine's process group and reap it.
+    // Supervised teardown: SIGTERM the engine's process group and reap it.
     engine
         .shutdown(Duration::from_secs(10))
         .await

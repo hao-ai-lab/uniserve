@@ -19,25 +19,25 @@ use crate::utils::{ResolvedRequestContext, convert_logit_bias, merge_kv_transfer
 /// chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedRequest {
- /// Stable OpenAI-style request ID, reused as the external chat request ID.
+    /// Stable OpenAI-style request ID, reused as the external chat request ID.
     pub request_id: String,
- /// Public model ID echoed back to the client.
+    /// Public model ID echoed back to the client.
     pub response_model: String,
- /// Whether the caller asked for the final streamed usage chunk.
+    /// Whether the caller asked for the final streamed usage chunk.
     pub include_usage: bool,
- /// Whether the caller requested output logprobs on chat choices.
+    /// Whether the caller requested output logprobs on chat choices.
     pub requested_logprobs: bool,
- /// Whether the caller requested top-level prompt logprobs.
+    /// Whether the caller requested top-level prompt logprobs.
     pub include_prompt_logprobs: bool,
- /// Whether to include reasoning content in OpenAI responses.
+    /// Whether to include reasoning content in OpenAI responses.
     pub include_reasoning: bool,
- /// Lowered chat request for `chat`.
+    /// Lowered chat request for `chat`.
     pub chat_request: ChatRequest,
- /// Last assistant-role message content to echo back when `echo=true`.
+    /// Last assistant-role message content to echo back when `echo=true`.
     pub echo: Option<String>,
- /// Whether to include token IDs alongside generated text.
+    /// Whether to include token IDs alongside generated text.
     pub return_token_ids: bool,
- /// Whether to format logprob tokens as `token_id:{id}`.
+    /// Whether to format logprob tokens as `token_id:{id}`.
     pub return_tokens_as_token_ids: bool,
 }
 
@@ -88,8 +88,8 @@ pub fn prepare_chat_request(
         .unwrap_or(false);
     let requested_logprobs = request.logprobs;
 
- // Auto-enable prompt logprobs for non-streaming echo, matching the reference's
- // behavior.
+    // Auto-enable prompt logprobs for non-streaming echo, matching the reference's
+    // behavior.
     let top_logprobs = request.top_logprobs.unwrap_or(0);
     let prompt_logprobs = request
         .prompt_logprobs

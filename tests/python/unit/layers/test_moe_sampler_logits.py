@@ -447,6 +447,66 @@ def test_ops_qk_norm_rope_batched_multi_axis_preserves_batch_tables():
     torch.testing.assert_close(got_k, ref_k)
 
 
+def test_triton_qk_norm_rope_override_declines_multi_axis_gqa():
+    import uniserve_worker.ops as ops
+    from uniserve_worker.ops.providers import _TritonQKNormRopeProvider
+    from uniserve_worker.ops.requests import QKNormRopeReq
+
+    torch.manual_seed(126)
+    batch, seq_len, q_heads, k_heads = 1, 3, 4, 2
+    axis_dims = (4, 2, 2)
+    q = torch.randn(batch, q_heads, seq_len, sum(axis_dims), dtype=torch.float32)
+    k = torch.randn(batch, k_heads, seq_len, sum(axis_dims), dtype=torch.float32)
+    q_t = torch.randn(axis_dims[0])
+    k_t = torch.randn(axis_dims[0])
+    q_hw = torch.randn(axis_dims[1] + axis_dims[2])
+    k_hw = torch.randn(axis_dims[1] + axis_dims[2])
+    q_weights = (q_t, q_hw, q_hw)
+    k_weights = (k_t, k_hw, k_hw)
+    table_positions = torch.arange(batch * seq_len, dtype=torch.float32)
+    cos = (
+        torch.stack([torch.cos(table_positions), torch.cos(table_positions + 0.25)], dim=-1),
+        torch.cos(table_positions[:, None] + 0.5),
+        torch.cos(table_positions[:, None] + 1.0),
+    )
+    sin = (
+        torch.stack([torch.sin(table_positions), torch.sin(table_positions + 0.25)], dim=-1),
+        torch.sin(table_positions[:, None] + 0.5),
+        torch.sin(table_positions[:, None] + 1.0),
+    )
+    req = QKNormRopeReq(q, k, q_weights, k_weights, cos, sin, 1e-6, axis_dims=axis_dims)
+
+    provider = _TritonQKNormRopeProvider()
+    assert not provider.can_run(req)
+    with pytest.raises(RuntimeError, match="axis_dims"):
+        provider.run(req)
+
+    got_q, got_k = ops.qk_norm_rope(
+        q,
+        k,
+        q_weights,
+        k_weights,
+        cos,
+        sin,
+        1e-6,
+        axis_dims=axis_dims,
+        override="triton",
+    )
+    ref_q, ref_k = ops.qk_norm_rope(
+        q,
+        k,
+        q_weights,
+        k_weights,
+        cos,
+        sin,
+        1e-6,
+        axis_dims=axis_dims,
+        override="eager",
+    )
+    torch.testing.assert_close(got_q, ref_q)
+    torch.testing.assert_close(got_k, ref_k)
+
+
 def test_ops_qk_norm_grouped_multi_axis_matches_reference():
     import uniserve_worker.ops as ops
 

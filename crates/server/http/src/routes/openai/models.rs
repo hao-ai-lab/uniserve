@@ -11,8 +11,8 @@ use crate::utils::unix_timestamp;
 /// Return all configured served model names in OpenAI `list models` format.
 pub(crate) async fn list_models(State(state): State<Arc<AppState>>) -> Json<ListModelsResponse> {
     let model_names = state.served_model_names_with_loras().await;
- // OpenAI clients expect `created` to be a real Unix timestamp; report when
- // this listing was produced rather than the epoch.
+    // OpenAI clients expect `created` to be a real Unix timestamp; report when
+    // this listing was produced rather than the epoch.
     let created = unix_timestamp() as i64;
     Json(ListModelsResponse {
         object: "list".to_string(),

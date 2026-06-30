@@ -14,15 +14,15 @@ use uniserve_core::RequestId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceClass {
- /// Logical KV-cache blocks (paged or model-native).
+    /// Logical KV-cache blocks (paged or model-native).
     KvBlock,
- /// Cached encoder outputs (ViT/VAE embeddings), referenced by handle.
+    /// Cached encoder outputs (ViT/VAE embeddings), referenced by handle.
     EncoderOutput,
- /// Denoise image latents resident during generation.
+    /// Denoise image latents resident during generation.
     ImageLatent,
- /// Transient denoise/CFG scratch.
+    /// Transient denoise/CFG scratch.
     Scratch,
- /// Resident LoRA adapter weights.
+    /// Resident LoRA adapter weights.
     Adapter,
 }
 
@@ -37,26 +37,26 @@ impl ResourceClass {
         }
     }
 
- /// the single authoritative accounting **unit** for each class.
- /// Both sides MUST account this class in this unit: the host
- /// [`ResourceLease::capacity`] it issues and the worker's
- /// `ResourceRuntime` used/total it reports for the same class must be the
+    /// the single authoritative accounting **unit** for each class.
+    /// Both sides MUST account this class in this unit: the host
+    /// [`ResourceLease::capacity`] it issues and the worker's
+    /// `ResourceRuntime` used/total it reports for the same class must be the
     /// same magnitude. KvBlock leases and reports blocks; Scratch leases and
     /// reports CFG branch slots against the same unit on both sides.
     pub fn unit(&self) -> &'static str {
         match self {
- // Logical KV-cache blocks (pages), not tokens.
+            // Logical KV-cache blocks (pages), not tokens.
             ResourceClass::KvBlock => "blocks",
- // Cached encoder outputs, referenced by handle.
+            // Cached encoder outputs, referenced by handle.
             ResourceClass::EncoderOutput => "handles",
- // Image latent residency, counted in latent tokens.
+            // Image latent residency, counted in latent tokens.
             ResourceClass::ImageLatent => "latent_tokens",
- // Transient denoise/CFG scratch, counted in CFG branch slots (one
- // per active CFG branch). The physical scratch pool is sized in
- // latent tokens worker-side, but the cross-side *ledger* accounts
- // branch slots on both halves.
+            // Transient denoise/CFG scratch, counted in CFG branch slots (one
+            // per active CFG branch). The physical scratch pool is sized in
+            // latent tokens worker-side, but the cross-side *ledger* accounts
+            // branch slots on both halves.
             ResourceClass::Scratch => "branch_slots",
- // Resident LoRA adapter slots.
+            // Resident LoRA adapter slots.
             ResourceClass::Adapter => "adapters",
         }
     }
@@ -75,13 +75,13 @@ pub struct ResourceHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeasePolicy {
- /// Released when the owning request completes or is dropped (default).
+    /// Released when the owning request completes or is dropped (default).
     #[default]
     PerRequest,
- /// Eligible for eviction/reuse under pressure (e.g. prefix-cache blocks).
+    /// Eligible for eviction/reuse under pressure (e.g. prefix-cache blocks).
     Evictable,
- /// Pinned until explicitly released (e.g. an in-flight denoise latent —
- /// evicting it discards expensive diffusion work).
+    /// Pinned until explicitly released (e.g. an in-flight denoise latent —
+    /// evicting it discards expensive diffusion work).
     Pinned,
 }
 
@@ -92,11 +92,11 @@ pub enum LeasePolicy {
 pub struct ResourceLease {
     pub handle: ResourceHandle,
     pub owner_request: RequestId,
- /// Capacity in the class's authoritative unit ([`ResourceClass::unit`]).
- /// KvBlock = blocks, EncoderOutput = handles, ImageLatent = latent
- /// tokens, Scratch = CFG branch slots, Adapter = adapter slots. The host
- /// issues this and the worker's pressure for the same class must report the
- /// same magnitude — see [`ResourceClass::unit`] for the full contract.
+    /// Capacity in the class's authoritative unit ([`ResourceClass::unit`]).
+    /// KvBlock = blocks, EncoderOutput = handles, ImageLatent = latent
+    /// tokens, Scratch = CFG branch slots, Adapter = adapter slots. The host
+    /// issues this and the worker's pressure for the same class must report the
+    /// same magnitude — see [`ResourceClass::unit`] for the full contract.
     pub capacity: u64,
     pub policy: LeasePolicy,
 }
@@ -143,24 +143,24 @@ mod tests {
             ResourceClass::Scratch,
             ResourceClass::Adapter,
         ] {
- // snake_case serde matches as_str (the worker-declared wire form).
+            // snake_case serde matches as_str (the worker-declared wire form).
             let json = serde_json::to_string(&c).unwrap();
             assert_eq!(json.trim_matches('"'), c.as_str());
         }
     }
 
- /// pin the authoritative accounting unit per class so a future
- /// change can't silently re-introduce a host/worker unit divergence (e.g.
- /// leasing KvBlock in tokens again, or Scratch in branch slots). This is the
- /// single source the host lease and the worker `ResourceRuntime` both follow.
+    /// pin the authoritative accounting unit per class so a future
+    /// change can't silently re-introduce a host/worker unit divergence (e.g.
+    /// leasing KvBlock in tokens again, or Scratch in branch slots). This is the
+    /// single source the host lease and the worker `ResourceRuntime` both follow.
     #[test]
     fn resource_class_units_are_pinned() {
         assert_eq!(ResourceClass::KvBlock.unit(), "blocks");
         assert_eq!(ResourceClass::EncoderOutput.unit(), "handles");
         assert_eq!(ResourceClass::ImageLatent.unit(), "latent_tokens");
- // Scratch is the observe-only ledger's CFG branch-slot count (the host
- // lease and the worker `_scratch_units` both use branch slots), distinct
- // from the physical token-sized scratch pool.
+        // Scratch is the observe-only ledger's CFG branch-slot count (the host
+        // lease and the worker `_scratch_units` both use branch slots), distinct
+        // from the physical token-sized scratch pool.
         assert_eq!(ResourceClass::Scratch.unit(), "branch_slots");
         assert_eq!(ResourceClass::Adapter.unit(), "adapters");
     }

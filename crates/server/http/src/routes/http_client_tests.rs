@@ -285,7 +285,7 @@ async fn non_streaming_chat_via_http_client() {
     assert_eq!(response.model, "test-model");
     assert_eq!(response.choices.len(), 1);
     let choice = &response.choices[0];
- // The stop token `!` is suppressed from text.
+    // The stop token `!` is suppressed from text.
     assert_eq!(choice.message.content.as_deref(), Some("hi"));
     assert_eq!(
         choice.finish_reason,

@@ -24,9 +24,9 @@ pub(crate) fn resolve_request_context(
     headers: &HeaderMap,
     request_id: Option<&str>,
 ) -> ResolvedRequestContext {
- // `None` when the header is absent. A present-but-unparseable value is
- // logged at WARN (rather than silently swallowed) before falling back to
- // `None` so an operator can spot a misconfigured client.
+    // `None` when the header is absent. A present-but-unparseable value is
+    // logged at WARN (rather than silently swallowed) before falling back to
+    // `None` so an operator can spot a misconfigured client.
     let data_parallel_rank = headers
         .get("X-data-parallel-rank")
         .and_then(|v| v.to_str().ok())
@@ -44,7 +44,7 @@ pub(crate) fn resolve_request_context(
             }
         });
 
- // Extract request id from header.
+    // Extract request id from header.
     let request_id_header = headers
         .get("X-Request-Id")
         .and_then(|value| value.to_str().ok());
@@ -87,9 +87,7 @@ pub(crate) fn resolve_base_request_id(
 fn is_acceptable_request_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_REQUEST_ID_LEN
-        && id
-            .chars()
-            .all(|c| !c.is_control() && !c.is_whitespace())
+        && id.chars().all(|c| !c.is_control() && !c.is_whitespace())
 }
 
 /// Generate a fresh server-side request ID. Uses a full (untruncated) UUIDv4 so
@@ -108,12 +106,12 @@ mod tests {
             resolve_base_request_id(Some("req-abc123"), None),
             "req-abc123"
         );
- // Header takes precedence over the body-supplied id.
+        // Header takes precedence over the body-supplied id.
         assert_eq!(
             resolve_base_request_id(Some("from-header"), Some("from-body")),
             "from-header"
         );
- // Falls back to the body-supplied id when the header is absent.
+        // Falls back to the body-supplied id when the header is absent.
         assert_eq!(
             resolve_base_request_id(None, Some("from-body")),
             "from-body"
@@ -122,14 +120,14 @@ mod tests {
 
     #[test]
     fn rejects_empty_overlong_and_control_chars() {
- // Empty supplied id -> generated fallback (not the empty string).
+        // Empty supplied id -> generated fallback (not the empty string).
         assert!(!resolve_base_request_id(Some(""), None).is_empty());
         assert!(is_acceptable_request_id("ok-id"));
         assert!(!is_acceptable_request_id(""));
- // Control characters (newline) would otherwise enable log injection.
+        // Control characters (newline) would otherwise enable log injection.
         assert!(!is_acceptable_request_id("inject\nme"));
         assert!(!is_acceptable_request_id("space here"));
- // Over-long ids are rejected.
+        // Over-long ids are rejected.
         let too_long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
         assert!(!is_acceptable_request_id(&too_long));
         assert!(is_acceptable_request_id(&"a".repeat(MAX_REQUEST_ID_LEN)));
@@ -138,8 +136,8 @@ mod tests {
     #[test]
     fn generated_id_is_full_uuid_not_truncated() {
         let id = generate_request_id();
- // A simple UUIDv4 renders as 32 hex characters; the previous 8-char
- // truncation is what this guards against (collision risk at scale).
+        // A simple UUIDv4 renders as 32 hex characters; the previous 8-char
+        // truncation is what this guards against (collision risk at scale).
         assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }

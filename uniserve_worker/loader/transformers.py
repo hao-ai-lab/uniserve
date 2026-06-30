@@ -34,6 +34,8 @@ __all__ = [
     'NativeTransformersLoader',
 ]
 
+ParamFilterFromModel = Callable[[nn.Module, str | None], Callable[[str], bool] | None]
+
 
 def dtype_from_name(name: str) -> torch.dtype:
     normalized = str(name).lower()
@@ -99,6 +101,8 @@ def load_native_transformers_checkpoint(
     config_patch: Callable[[Any], None] | None = None,
     compatibility_check: Callable[[Any], None] | None = None,
     param_filter: Callable[[str], bool] | None = None,
+    param_filter_from_model: ParamFilterFromModel | None = None,
+    tower_role: str | None = None,
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = (),
 ) -> tuple[nn.Module, Any, str]:
     """Instantiate a native ``nn.Module`` model and stream HF-format weights.
@@ -138,6 +142,13 @@ def load_native_transformers_checkpoint(
     with use_quantization_config(quant_config):
         with init_empty_weights():
             model = model_cls(config)
+    if param_filter_from_model is not None:
+        derived_filter = param_filter_from_model(model, tower_role)
+        if param_filter is not None and derived_filter is not None:
+            base_filter = param_filter
+            param_filter = lambda name: base_filter(name) and derived_filter(name)
+        elif derived_filter is not None:
+            param_filter = derived_filter
     _stream_checkpoint_weights(
         model,
         model_dir,
@@ -426,6 +437,7 @@ class NativeLoadSpec:
     compatibility_check: Callable[[Any], None] | None = None
     use_fast: bool = False
     extra_special_tokens: dict[str, Any] | None = None
+    param_filter_from_model: ParamFilterFromModel | None = None
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = ()
 
 
@@ -473,6 +485,8 @@ class NativeTransformersLoader(BaseModelLoader):
             config_patch=spec.config_patch,
             compatibility_check=spec.compatibility_check,
             param_filter=param_filter,
+            param_filter_from_model=spec.param_filter_from_model,
+            tower_role=tower_role,
             stacked_params_mapping=spec.stacked_params_mapping,
         )
         model = model_cls.from_native(inner, tokenizer=tokenizer, device=real_device, **kwargs)

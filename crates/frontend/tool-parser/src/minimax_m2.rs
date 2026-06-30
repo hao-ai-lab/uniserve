@@ -60,7 +60,7 @@ pub struct MinimaxM2ToolParser {
 }
 
 impl MinimaxM2ToolParser {
- /// Create a MiniMax M2 tool parser.
+    /// Create a MiniMax M2 tool parser.
     fn new(tools: &[Tool]) -> Self {
         Self {
             buffer: String::new(),
@@ -70,7 +70,7 @@ impl MinimaxM2ToolParser {
         }
     }
 
- /// Apply one parsed MiniMax M2 event to parser state and output.
+    /// Apply one parsed MiniMax M2 event to parser state and output.
     fn apply_event(&mut self, event: MinimaxM2Event, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             MinimaxM2Event::Text { len: consumed_len } => {

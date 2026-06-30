@@ -16,7 +16,7 @@ use crate::SamplingParams;
 pub struct SampleOutput {
     pub token: u32,
     pub logprob: f32,
- /// Top `(token_id, logprob)` pairs (length == requested n_logprobs).
+    /// Top `(token_id, logprob)` pairs (length == requested n_logprobs).
     pub top: Vec<(u32, f32)>,
 }
 
@@ -35,7 +35,7 @@ pub fn apply_sampling(
 ) -> SampleOutput {
     let v = logits.len();
 
- // 1. allowed-token whitelist: mask everything else.
+    // 1. allowed-token whitelist: mask everything else.
     if let Some(allow) = allowed {
         let mut keep = vec![false; v];
         for &t in allow {
@@ -49,7 +49,7 @@ pub fn apply_sampling(
             }
         }
     }
- // 2. suppress (bad-words completion / min-tokens EOS floor).
+    // 2. suppress (bad-words completion / min-tokens EOS floor).
     if let Some(sup) = suppress {
         for &t in sup {
             if (t as usize) < v {
@@ -57,15 +57,15 @@ pub fn apply_sampling(
             }
         }
     }
- // 3. logit bias.
+    // 3. logit bias.
     for &(t, b) in &p.logit_bias {
         if (t as usize) < v && logits[t as usize] != NEG_INF {
             logits[t as usize] += b;
         }
     }
- // 4. penalties over the recent output window.
+    // 4. penalties over the recent output window.
     if p.repetition_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0 {
- // counts of each recent token
+        // counts of each recent token
         let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
         for &t in recent {
             *counts.entry(t).or_insert(0.0) += 1.0;
@@ -75,7 +75,7 @@ pub fn apply_sampling(
             if i >= v || logits[i] == NEG_INF {
                 continue;
             }
- // repetition penalty (multiplicative, sign-aware — reference semantics)
+            // repetition penalty (multiplicative, sign-aware — reference semantics)
             if p.repetition_penalty != 1.0 {
                 logits[i] = if logits[i] > 0.0 {
                     logits[i] / p.repetition_penalty
@@ -83,12 +83,12 @@ pub fn apply_sampling(
                     logits[i] * p.repetition_penalty
                 };
             }
- // frequency (scaled by count) + presence (flat, once-appeared)
+            // frequency (scaled by count) + presence (flat, once-appeared)
             logits[i] -= p.frequency_penalty * c;
             logits[i] -= p.presence_penalty;
         }
     }
- // 5. temperature (0 == greedy; applied at sample time).
+    // 5. temperature (0 == greedy; applied at sample time).
     let greedy = p.temperature <= 0.0;
     if !greedy {
         for l in logits.iter_mut() {
@@ -97,7 +97,7 @@ pub fn apply_sampling(
             }
         }
     }
- // 6. min-p: drop tokens below `min_p * max_prob`.
+    // 6. min-p: drop tokens below `min_p * max_prob`.
     if p.min_p > 0.0 {
         let probs = softmax(logits);
         let maxp = probs.iter().cloned().fold(0.0f32, f32::max);
@@ -108,7 +108,7 @@ pub fn apply_sampling(
             }
         }
     }
- // 7. top-k.
+    // 7. top-k.
     if p.top_k > 0 && (p.top_k as usize) < v {
         let mut idx: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
         idx.sort_by(|&a, &b| {
@@ -120,7 +120,7 @@ pub fn apply_sampling(
             logits[i] = NEG_INF;
         }
     }
- // 8. top-p (nucleus).
+    // 8. top-p (nucleus).
     if p.top_p < 1.0 && p.top_p > 0.0 {
         let probs = softmax(logits);
         let mut order: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
@@ -143,7 +143,7 @@ pub fn apply_sampling(
         }
     }
 
- // 9. sample.
+    // 9. sample.
     let token = if greedy {
         argmax(logits)
     } else {
@@ -151,7 +151,7 @@ pub fn apply_sampling(
         sample_categorical(&probs, seed_from(p, recent))
     };
 
- // 10. gather logprobs (softmax of the final, masked logits).
+    // 10. gather logprobs (softmax of the final, masked logits).
     let logprobs = log_softmax(logits);
     let sampled_lp = logprobs.get(token as usize).copied().unwrap_or(NEG_INF);
     let mut top: Vec<(u32, f32)> = Vec::new();
@@ -220,10 +220,10 @@ fn log_softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 fn sample_categorical(probs: &[f32], rng: u64) -> u32 {
- // splitmix64 finalizer for a deterministic, dependency-free draw. A single
- // xorshift step leaves nearby seeds (which `seed_from` readily produces —
- // consecutive `recent.len` or adjacent last-token ids) strongly
- // correlated; splitmix64's avalanche mixes those into well-separated draws.
+    // splitmix64 finalizer for a deterministic, dependency-free draw. A single
+    // xorshift step leaves nearby seeds (which `seed_from` readily produces —
+    // consecutive `recent.len` or adjacent last-token ids) strongly
+    // correlated; splitmix64's avalanche mixes those into well-separated draws.
     let r = ((splitmix64(rng) >> 11) as f64 / (1u64 << 53) as f64) as f32;
     let mut cum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn repetition_penalty_demotes_recent() {
- // token 3 is argmax; penalize it heavily via repetition over recent.
+        // token 3 is argmax; penalize it heavily via repetition over recent.
         let mut l = base_logits();
         let p = SamplingParams {
             repetition_penalty: 100.0,
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn defaults_are_noop_argmax() {
- // Every transform unset => plain argmax, deterministic.
+        // Every transform unset => plain argmax, deterministic.
         let mut l = base_logits();
         let out = apply_sampling(&mut l, &SamplingParams::default(), &[1, 2], None, None, 0);
         assert_eq!(out.token, 3);
@@ -413,8 +413,14 @@ mod tests {
         let out = apply_sampling(&mut l, &p, &[], None, None, 5);
         assert_eq!(out.top.len(), 2, "only the 2 survivors are reportable");
         let reported: Vec<u32> = out.top.iter().map(|&(t, _)| t).collect();
-        assert!(!reported.contains(&2), "pruned token 2 excluded from logprobs");
-        assert!(!reported.contains(&3), "pruned token 3 excluded from logprobs");
+        assert!(
+            !reported.contains(&2),
+            "pruned token 2 excluded from logprobs"
+        );
+        assert!(
+            !reported.contains(&3),
+            "pruned token 3 excluded from logprobs"
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -504,7 +510,10 @@ mod tests {
             None,
             0,
         );
-        assert!(lf[1] < lf[2], "frequency: count-2 token below count-1 token");
+        assert!(
+            lf[1] < lf[2],
+            "frequency: count-2 token below count-1 token"
+        );
 
         let mut lp = vec![3.0f32, 3.0, 3.0];
         apply_sampling(

@@ -109,17 +109,17 @@ pub fn validate_parser_overrides(
 pub struct ChatLlm {
     text: TextLlm,
     backend: DynChatBackend,
- /// Effective model dtype reported by the engine.
+    /// Effective model dtype reported by the engine.
     model_dtype: ModelDtype,
- /// Tool-call parser selection.
+    /// Tool-call parser selection.
     tool_call_parser: ParserSelection,
- /// Reasoning parser selection.
+    /// Reasoning parser selection.
     uniserve_reasoning_parser: ParserSelection,
 }
 
 impl ChatLlm {
- /// Create a new chat facade from a text-generation facade plus a chat
- /// backend.
+    /// Create a new chat facade from a text-generation facade plus a chat
+    /// backend.
     pub fn new(text: TextLlm, backend: DynChatBackend) -> Self {
         let model_dtype = text.uniserve_engine_client().model_dtype();
 
@@ -132,8 +132,8 @@ impl ChatLlm {
         }
     }
 
- /// Convenience constructor for one shared backend object that implements
- /// both text and chat responsibilities.
+    /// Convenience constructor for one shared backend object that implements
+    /// both text and chat responsibilities.
     #[allow(
         clippy::clone_on_ref_ptr,
         reason = "clone performs an Arc trait-object upcast from ChatTextBackend to TextBackend"
@@ -144,42 +144,42 @@ impl ChatLlm {
         Self::new(text, backend)
     }
 
- /// Set tool-call parser selection.
+    /// Set tool-call parser selection.
     pub fn with_tool_call_parser(mut self, selection: ParserSelection) -> Self {
         self.tool_call_parser = selection;
         self
     }
 
- /// Set reasoning parser selection.
+    /// Set reasoning parser selection.
     pub fn with_reasoning_parser(mut self, selection: ParserSelection) -> Self {
         self.uniserve_reasoning_parser = selection;
         self
     }
 
- /// Override the effective model dtype used for multimodal tensor encoding.
+    /// Override the effective model dtype used for multimodal tensor encoding.
     pub fn with_model_dtype(mut self, model_dtype: ModelDtype) -> Self {
         self.model_dtype = model_dtype;
         self
     }
 
- /// Expose the underlying text facade for raw text-generation routes such as
- /// `/v1/completions`.
+    /// Expose the underlying text facade for raw text-generation routes such as
+    /// `/v1/completions`.
     pub fn text(&self) -> &TextLlm {
         &self.text
     }
 
- /// Return the model ID reported by the underlying text backend.
+    /// Return the model ID reported by the underlying text backend.
     pub fn model_id(&self) -> &str {
         self.text.model_id()
     }
 
- /// Expose the underlying engine client for low-level utility/admin
- /// calls.
+    /// Expose the underlying engine client for low-level utility/admin
+    /// calls.
     pub fn uniserve_engine_client(&self) -> &EngineCoreClient {
         self.text.uniserve_engine_client()
     }
 
- /// Render, tokenize, and submit one chat request.
+    /// Render, tokenize, and submit one chat request.
     pub async fn chat(&self, mut request: ChatRequest) -> Result<ChatEventStream> {
         request.validate()?;
 
@@ -190,10 +190,10 @@ impl ChatLlm {
                 uniserve_reasoning_parser: &self.uniserve_reasoning_parser,
             },
         )?;
- // Chat-template rendering is CPU-bound and can be expensive for large
- // conversations, so run it on the blocking pool rather than stalling the
- // async executor. The request is moved in and handed back so downstream
- // lowering can keep using it without an extra clone.
+        // Chat-template rendering is CPU-bound and can be expensive for large
+        // conversations, so run it on the blocking pool rather than stalling the
+        // async executor. The request is moved in and handed back so downstream
+        // lowering can keep using it without an extra clone.
         let chat_renderer = self.backend.chat_renderer();
         let (request, rendered) =
             tokio::task::spawn_blocking(move || -> Result<(ChatRequest, RenderedPrompt)> {
@@ -236,7 +236,7 @@ impl ChatLlm {
         Ok(ChatEventStream::new(request.request_id, structured_stream))
     }
 
- /// Shut down the underlying LLM client and its background tasks.
+    /// Shut down the underlying LLM client and its background tasks.
     pub async fn shutdown(self) -> Result<()> {
         self.text.shutdown().await?;
         Ok(())

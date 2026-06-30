@@ -20,14 +20,14 @@ use crate::parser::reasoning::{ReasoningDelta, ReasoningParser};
 
 /// Per-stream reasoning parsing state.
 struct ReasoningState {
- /// Reasoning parser for the current model family.
+    /// Reasoning parser for the current model family.
     parser: Box<dyn ReasoningParser>,
- /// Whether reasoning parsing has already failed for this stream.
+    /// Whether reasoning parsing has already failed for this stream.
     parser_failed: bool,
 }
 
 impl ReasoningState {
- /// Create one fresh reasoning-adaptation state for a new streamed response.
+    /// Create one fresh reasoning-adaptation state for a new streamed response.
     fn new(parser: Box<dyn ReasoningParser>) -> Self {
         Self {
             parser,
@@ -35,10 +35,10 @@ impl ReasoningState {
         }
     }
 
- /// Convert one decoded text delta into zero or more semantic assistant
- /// deltas.
+    /// Convert one decoded text delta into zero or more semantic assistant
+    /// deltas.
     fn process_delta(&mut self, delta: String) -> Vec<ContentEvent> {
- // If the parser has already failed, skip parsing and return plain text deltas.
+        // If the parser has already failed, skip parsing and return plain text deltas.
         if self.parser_failed {
             return vec![ContentEvent::TextDelta {
                 kind: AssistantBlockKind::Text,
@@ -67,7 +67,7 @@ impl ReasoningState {
         events
     }
 
- /// Initialize parser state once prompt token IDs are available.
+    /// Initialize parser state once prompt token IDs are available.
     fn initialize(&mut self, prompt_token_ids: &[u32]) {
         if self.parser_failed {
             return;
@@ -85,7 +85,7 @@ impl ReasoningState {
         }
     }
 
- /// Flush any parser-held partial delimiter state at end of stream.
+    /// Flush any parser-held partial delimiter state at end of stream.
     fn finish(&mut self) -> Vec<ContentEvent> {
         if self.parser_failed {
             return Vec::new();
@@ -132,7 +132,7 @@ pub async fn reasoning_event_stream(
 ) -> Result<()> {
     pin_mut!(decoded_stream);
 
- // Without a parser, pass through as plain text deltas.
+    // Without a parser, pass through as plain text deltas.
     let Some(uniserve_reasoning_parser) = uniserve_reasoning_parser else {
         while let Some(event) = decoded_stream.next().await.transpose()? {
             for next in ContentEvent::from_decoded_plain_text(event) {

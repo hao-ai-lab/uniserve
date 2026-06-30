@@ -59,12 +59,12 @@ fn factory_rejects_unknown_parser_names() {
 
 #[test]
 fn unknown_tool_parser_error_names_rejected_parser_and_lists_available() {
- // The populated registry rejects an unknown explicit name with an error
- // that both names the rejected parser and surfaces the available parsers,
- // so an operator who mistyped `--tool-call-parser` can self-correct. We
- // assert the variant carries the rejected name and a couple of stable
- // built-in parser names, rather than snapshotting the full registry list
- // (which churns as parsers are added).
+    // The populated registry rejects an unknown explicit name with an error
+    // that both names the rejected parser and surfaces the available parsers,
+    // so an operator who mistyped `--tool-call-parser` can self-correct. We
+    // assert the variant carries the rejected name and a couple of stable
+    // built-in parser names, rather than snapshotting the full registry list
+    // (which churns as parsers are added).
     let factory = ToolParserFactory::new();
     let error = match factory.create("nope-not-a-parser", &[]) {
         Ok(_) => panic!("expected parser lookup to fail"),
@@ -90,8 +90,8 @@ fn unknown_tool_parser_error_names_rejected_parser_and_lists_available() {
         "available_names should include the qwen3_xml parser: {available_names:?}",
     );
 
- // The user-facing message names the rejected parser and includes the
- // "choose from" hint with at least one stable parser name.
+    // The user-facing message names the rejected parser and includes the
+    // "choose from" hint with at least one stable parser name.
     let rendered = error.to_string();
     assert!(
         rendered.contains("nope-not-a-parser"),
@@ -212,7 +212,7 @@ fn factory_new_resolves_default_patterns() {
         Some(names::MINIMAX_M2)
     );
 
- // InternLM2 positive: both dashed and underscored versioned names route.
+    // InternLM2 positive: both dashed and underscored versioned names route.
     assert_eq!(
         factory.resolve_name_for_model("internlm/internlm2-chat-7b"),
         Some(names::INTERNLM)
@@ -222,11 +222,11 @@ fn factory_new_resolves_default_patterns() {
         Some(names::INTERNLM)
     );
 
- // Negative: other internlm-org models do NOT route to the InternLM2 parser,
- // since they use unrelated prompt formats.
- // - InternLM v1 (`internlm-chat-7b`) routes to Llama
- // - InternLM3 (`internlm3-8b-instruct`) routes to Llama
- // - Intern-S1 / Intern-S1-Pro have their own parser (Python PR #40115)
+    // Negative: other internlm-org models do NOT route to the InternLM2 parser,
+    // since they use unrelated prompt formats.
+    // - InternLM v1 (`internlm-chat-7b`) routes to Llama
+    // - InternLM3 (`internlm3-8b-instruct`) routes to Llama
+    // - Intern-S1 / Intern-S1-Pro have their own parser (Python PR #40115)
     assert_eq!(
         factory.resolve_name_for_model("internlm/internlm-chat-7b"),
         None
@@ -244,9 +244,9 @@ fn factory_new_resolves_default_patterns() {
 
 #[test]
 fn factory_new_registers_phi4_mini_json_by_name() {
- // phi-4-mini is registered by explicit name only (matching Python's
- // `--tool-call-parser phi4_mini_json`); it is intentionally not mapped to
- // any model-name pattern.
+    // phi-4-mini is registered by explicit name only (matching Python's
+    // `--tool-call-parser phi4_mini_json`); it is intentionally not mapped to
+    // any model-name pattern.
     let factory = ToolParserFactory::new();
 
     assert!(factory.contains(names::PHI4_MINI_JSON));

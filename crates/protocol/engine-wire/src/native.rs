@@ -20,13 +20,13 @@ use uniserve_core::{GenMode, ImageParams};
 /// model *input*; no embedding ever returns to the host.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WireMmItem {
- /// Content hash (encoder-cache key).
+    /// Content hash (encoder-cache key).
     pub hash: u64,
- /// Start position of this item's span within the flattened prompt ids.
+    /// Start position of this item's span within the flattened prompt ids.
     pub position: u32,
- /// Number of AR positions the encoder output occupies (0 = worker decides).
+    /// Number of AR positions the encoder output occupies (0 = worker decides).
     pub num_tokens: u32,
- /// Input-image bytes (base64 PNG/JPEG).
+    /// Input-image bytes (base64 PNG/JPEG).
     #[serde(default)]
     pub b64: String,
 }
@@ -36,14 +36,14 @@ pub struct WireMmItem {
 /// express. Present iff the request runs one of the image-capable modes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeRequestExt {
- /// Generation mode (text / image / auto-interleave / understanding).
+    /// Generation mode (text / image / auto-interleave / understanding).
     pub mode: GenMode,
- /// Image diffusion parameters.
+    /// Image diffusion parameters.
     pub image: ImageParams,
- /// CFG text-unconditional / image precontext prompt (may be empty).
+    /// CFG text-unconditional / image precontext prompt (may be empty).
     #[serde(default)]
     pub neg_prompt_ids: Vec<u32>,
- /// Staged multimodal input items (encoded before prefill).
+    /// Staged multimodal input items (encoded before prefill).
     #[serde(default)]
     pub mm_items: Vec<WireMmItem>,
 }
@@ -58,19 +58,19 @@ pub struct NativeRequestExt {
 /// translators in `translate.rs`, which match on the variants directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WireImageEvent {
- /// Diffusion for image `image_id` started.
+    /// Diffusion for image `image_id` started.
     Begin {
         image_id: u32,
         height: u32,
         width: u32,
         steps: u16,
     },
- /// One denoise step completed.
+    /// One denoise step completed.
     Step { image_id: u32, step: u16 },
- /// The image finished and committed; `png_b64` carries the encoded pixels
- /// (a small *result*, not KV). Dimensions, byte count, and
- /// checksum describe the encoded PNG bytes, not merely the requested
- /// control-plane size.
+    /// The image finished and committed; `png_b64` carries the encoded pixels
+    /// (a small *result*, not KV). Dimensions, byte count, and
+    /// checksum describe the encoded PNG bytes, not merely the requested
+    /// control-plane size.
     Done {
         image_id: u32,
         #[serde(default)]
@@ -90,8 +90,8 @@ pub enum WireImageEvent {
 /// `Finished` event without engine-side state.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NativeFinishExt {
- /// Native finish reason (`eos`, `max_tokens`, `stop`, `image_done`,
- /// `cancelled`, `aborted`, `error`).
+    /// Native finish reason (`eos`, `max_tokens`, `stop`, `image_done`,
+    /// `cancelled`, `aborted`, `error`).
     pub reason: String,
     #[serde(default)]
     pub prompt_tokens: u64,
@@ -99,7 +99,7 @@ pub struct NativeFinishExt {
     pub completion_tokens: u64,
     #[serde(default)]
     pub images: u64,
- /// Human-readable detail for `rejected` / `error` terminations.
+    /// Human-readable detail for `rejected` / `error` terminations.
     #[serde(default)]
     pub message: Option<String>,
 }
@@ -107,10 +107,10 @@ pub struct NativeFinishExt {
 /// UniServe extension to [`crate::EngineCoreOutput`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NativeOutputExt {
- /// A typed image event, when this output carries one.
+    /// A typed image event, when this output carries one.
     #[serde(default)]
     pub image: Option<WireImageEvent>,
- /// Native finish statistics, set on the terminal output.
+    /// Native finish statistics, set on the terminal output.
     #[serde(default)]
     pub finish: Option<NativeFinishExt>,
 }
@@ -121,16 +121,16 @@ pub struct NativeOutputExt {
 /// tokenizer lives with the frontend.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeControlTokens {
- /// Turn-open token (`<|im_start|>` in the BAGEL/ThinkMorph convention).
+    /// Turn-open token (`<|im_start|>` in the BAGEL/ThinkMorph convention).
     pub bos: u32,
- /// EOS / turn-close token ids.
+    /// EOS / turn-close token ids.
     pub eos: Vec<u32>,
- /// Image span start (`<|vision_start|>`).
+    /// Image span start (`<|vision_start|>`).
     pub start_of_image: u32,
- /// Image span end (`<|vision_end|>`).
+    /// Image span end (`<|vision_end|>`).
     pub end_of_image: u32,
- /// Token-id subsequence of the literal `<image_start>` visual-thinking
- /// trigger (ThinkMorph). Empty disables the literal trigger.
+    /// Token-id subsequence of the literal `<image_start>` visual-thinking
+    /// trigger (ThinkMorph). Empty disables the literal trigger.
     #[serde(default)]
     pub image_start_ids: Vec<u32>,
 }
@@ -140,9 +140,9 @@ mod tests {
     use super::*;
     use crate::{decode_msgpack, decode_value, encode_msgpack};
 
- /// Guards the externally-tagged wire shape: each `WireImageEvent` must encode
- /// as a single-entry map keyed by its variant name, with no stringly-typed
- /// internal `kind` tag riding on the hot output wire.
+    /// Guards the externally-tagged wire shape: each `WireImageEvent` must encode
+    /// as a single-entry map keyed by its variant name, with no stringly-typed
+    /// internal `kind` tag riding on the hot output wire.
     #[test]
     fn image_event_externally_tagged() {
         let cases = [
@@ -155,7 +155,13 @@ mod tests {
                     steps: 50,
                 },
             ),
-            ("Step", WireImageEvent::Step { image_id: 1, step: 7 }),
+            (
+                "Step",
+                WireImageEvent::Step {
+                    image_id: 1,
+                    step: 7,
+                },
+            ),
             (
                 "Done",
                 WireImageEvent::Done {
@@ -174,9 +180,16 @@ mod tests {
             let map = value
                 .as_map()
                 .unwrap_or_else(|| panic!("{variant} should encode as a map, got {value}"));
-            assert_eq!(map.len(), 1, "{variant} should be a single-entry tagged map");
+            assert_eq!(
+                map.len(),
+                1,
+                "{variant} should be a single-entry tagged map"
+            );
             let key = map[0].0.as_str().expect("variant key must be a string");
-            assert_eq!(key, variant, "variant must be the map key, not an inner field");
+            assert_eq!(
+                key, variant,
+                "variant must be the map key, not an inner field"
+            );
             assert_ne!(key, "kind", "no internal `kind` tag on the wire");
         }
     }

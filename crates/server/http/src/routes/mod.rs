@@ -156,9 +156,7 @@ const AUTH_EXEMPT_PATHS: &[&str] = &["/health", "/metrics"];
 /// does not carry the configured key with `401 Unauthorized`, except for the
 /// unauthenticated operational endpoints in [`AUTH_EXEMPT_PATHS`].
 async fn require_api_key(api_key: Arc<String>, req: Request, next: Next) -> Response {
-    if AUTH_EXEMPT_PATHS.contains(&req.uri().path())
-        || authorize(req.headers(), api_key.as_str())
-    {
+    if AUTH_EXEMPT_PATHS.contains(&req.uri().path()) || authorize(req.headers(), api_key.as_str()) {
         next.run(req).await
     } else {
         unauthorized_response()
@@ -203,18 +201,18 @@ fn build_router_with_options(
     runtime_lora_updating_enabled: bool,
 ) -> Router {
     let mut router = Router::new()
- // Health & monitoring
+        // Health & monitoring
         .route("/health", get(health::health))
         .route("/metrics", get(metrics::scrape))
         .route("/load", get(load::load))
         .route("/version", get(version::version))
- // OpenAI-compatible endpoints
+        // OpenAI-compatible endpoints
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))
- // inference endpoints
+        // inference endpoints
         .route("/inference/v1/generate", post(inference::generate))
- // UniServe native image / interleaved-generation surface (no OpenAI analog)
+        // UniServe native image / interleaved-generation surface (no OpenAI analog)
         .route("/generate", post(native::generate))
         .route("/v1/images/generations", post(native::images_generations));
 
@@ -225,7 +223,7 @@ fn build_router_with_options(
     }
 
     if dev_mode_enabled {
- // Development-only
+        // Development-only
         router = router
             .route("/reset_prefix_cache", post(cache::reset_prefix_cache))
             .route("/reset_mm_cache", post(cache::reset_mm_cache))
@@ -240,9 +238,9 @@ fn build_router_with_options(
     let enable_request_id_headers = state.enable_request_id_headers();
     let mut router = router.with_state(Arc::clone(&state));
 
- // Per-request wall-clock timeout (opt-in). Applied closest to the route
- // handlers so it bounds the actual work, not the surrounding bookkeeping
- // layers. Unset/zero leaves requests unbounded, preserving prior behavior.
+    // Per-request wall-clock timeout (opt-in). Applied closest to the route
+    // handlers so it bounds the actual work, not the surrounding bookkeeping
+    // layers. Unset/zero leaves requests unbounded, preserving prior behavior.
     if let Some(timeout) = parse_request_timeout(std::env::var(REQUEST_TIMEOUT_SECONDS_ENV).ok()) {
         router = router.layer(from_fn(move |req: Request, next: Next| {
             enforce_timeout(timeout, req, next)
@@ -253,18 +251,18 @@ fn build_router_with_options(
         .layer(from_fn_with_state(state, middleware::track_server_load))
         .layer(from_fn(middleware::track_http_metrics))
         .layer(TraceLayer::new_for_http())
- // Native image-understanding requests carry base64 photos in the body;
- // raise the default 2 MB cap so real images fit.
+        // Native image-understanding requests carry base64 photos in the body;
+        // raise the default 2 MB cap so real images fit.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
 
     if enable_request_id_headers {
         router = router.layer(from_fn(middleware::set_request_id_header));
     }
 
- // Bearer-token auth (opt-in). Applied as the outermost layer so an
- // unauthenticated request is rejected before any handler, body read, load
- // tracking, or dev/admin route is reached. Unset/empty leaves the surface
- // fully open for trusted-mesh deployments fronted by a TLS+auth gateway.
+    // Bearer-token auth (opt-in). Applied as the outermost layer so an
+    // unauthenticated request is rejected before any handler, body read, load
+    // tracking, or dev/admin route is reached. Unset/empty leaves the surface
+    // fully open for trusted-mesh deployments fronted by a TLS+auth gateway.
     if let Some(api_key) = configured_api_key() {
         let api_key = Arc::new(api_key);
         router = router.layer(from_fn(move |req: Request, next: Next| {
@@ -328,7 +326,7 @@ mod middleware_config_tests {
     #[test]
     fn authorize_accepts_matching_bearer_token() {
         assert!(authorize(&headers_with_auth("Bearer s3cr3t"), "s3cr3t"));
- // Scheme is case-insensitive; surrounding whitespace is trimmed.
+        // Scheme is case-insensitive; surrounding whitespace is trimmed.
         assert!(authorize(&headers_with_auth("bearer s3cr3t"), "s3cr3t"));
         assert!(authorize(&headers_with_auth("Bearer  s3cr3t "), "s3cr3t"));
     }

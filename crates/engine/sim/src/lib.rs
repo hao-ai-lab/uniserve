@@ -87,17 +87,17 @@ impl SimExecutor {
         }
     }
 
- /// Apply a control op against the in-process engine.
+    /// Apply a control op against the in-process engine.
 
- /// Only [`ControlOp::DropRequest`] has observable engine state in the sim:
- /// it forwards a [`Job::Drop`] so the worker thread evicts the request's
- /// records (mirroring the real worker's stateful-diff contract). The
- /// remaining ops address resources the CPU sim does not model — there is no
- /// real KV pool to copy blocks within, no GPU encoder cache to free, no
- /// LoRA registry, no prefix cache, and no device to sleep/wake — so they are
- /// intentional no-ops. The exhaustive match (rather than a single `if let`)
- /// is deliberate: a newly added `ControlOp` variant fails to compile here,
- /// forcing a conscious decision instead of silently dropping the op.
+    /// Only [`ControlOp::DropRequest`] has observable engine state in the sim:
+    /// it forwards a [`Job::Drop`] so the worker thread evicts the request's
+    /// records (mirroring the real worker's stateful-diff contract). The
+    /// remaining ops address resources the CPU sim does not model — there is no
+    /// real KV pool to copy blocks within, no GPU encoder cache to free, no
+    /// LoRA registry, no prefix cache, and no device to sleep/wake — so they are
+    /// intentional no-ops. The exhaustive match (rather than a single `if let`)
+    /// is deliberate: a newly added `ControlOp` variant fails to compile here,
+    /// forcing a conscious decision instead of silently dropping the op.
     fn apply_control(&mut self, op: &ControlOp) {
         match op {
             ControlOp::DropRequest(id) => {
@@ -182,10 +182,10 @@ impl Executor for SimExecutor {
         op: ControlOp,
         _targets: Option<&[u32]>,
     ) -> anyhow::Result<Vec<ControlAck>> {
- // The sim is a single synchronous in-process rank: `apply_control`
- // runs the op (or no-ops it; see `apply_control`) to completion before
- // returning, so the rank-0 ack is genuinely satisfied here rather than
- // optimistically fabricated. `_targets` is meaningless for one rank.
+        // The sim is a single synchronous in-process rank: `apply_control`
+        // runs the op (or no-ops it; see `apply_control`) to completion before
+        // returning, so the rank-0 ack is genuinely satisfied here rather than
+        // optimistically fabricated. `_targets` is meaningless for one rank.
         self.apply_control(&op);
         Ok(vec![ControlAck {
             rank: 0,
@@ -230,11 +230,11 @@ pub struct SimEngine {
 }
 
 impl SimEngine {
- /// Synthetic logit distribution for request `r` at generation index `n`.
- /// The "natural" next token (matching the deterministic fake sampler) gets the
- /// top logit, two alternatives get descending logits, and EOS dominates once
- /// `n >= text_len`. The host-side sampling pipeline (bias, penalties, masks,
- /// min-p/top-k/p) can change the chosen token from the natural argmax.
+    /// Synthetic logit distribution for request `r` at generation index `n`.
+    /// The "natural" next token (matching the deterministic fake sampler) gets the
+    /// top logit, two alternatives get descending logits, and EOS dominates once
+    /// `n >= text_len`. The host-side sampling pipeline (bias, penalties, masks,
+    /// min-p/top-k/p) can change the chosen token from the natural argmax.
     fn synth_logits(&self, r: RequestId, n: usize) -> Vec<f32> {
         let mut v = vec![0.0f32; self.vocab];
         let nat = if n >= self.text_len {
@@ -304,32 +304,32 @@ fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
 }
 
 impl SimEngine {
- /// Advertise a batch-queue depth so the executor keeps that many op-batches
- /// in flight.
+    /// Advertise a batch-queue depth so the executor keeps that many op-batches
+    /// in flight.
     pub fn set_pipeline_depth(&mut self, depth: u32) {
         self.caps.pipeline_depth = depth.max(1);
     }
- /// Number of fabricated text tokens before a synthetic EOS (test knob).
+    /// Number of fabricated text tokens before a synthetic EOS (test knob).
     pub fn set_text_len(&mut self, n: usize) {
         self.text_len = n;
     }
- /// Synthetic sampled token to return from commit_gen (test knob).
+    /// Synthetic sampled token to return from commit_gen (test knob).
     pub fn set_commit_token(&mut self, token: Option<u32>) {
         self.commit_token = token;
     }
- /// Advertise hybrid KV-cache groups at the handshake (test knob).
+    /// Advertise hybrid KV-cache groups at the handshake (test knob).
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroupSpec>) {
         self.caps.groups = groups;
     }
- /// Shrink the KV pool to force admission/preemption pressure (test knob).
+    /// Shrink the KV pool to force admission/preemption pressure (test knob).
     pub fn set_num_blocks(&mut self, n: u32) {
         self.caps.num_blocks = n;
     }
- /// Shrink the block size so growth pressure happens sooner (test knob).
+    /// Shrink the block size so growth pressure happens sooner (test knob).
     pub fn set_block_size(&mut self, n: u32) {
         self.caps.block_size = n;
     }
- /// Test hook for scheduler/worker capability negotiation.
+    /// Test hook for scheduler/worker capability negotiation.
     pub fn mut_caps_for_test(&mut self) -> &mut EngineCaps {
         &mut self.caps
     }
@@ -347,8 +347,8 @@ impl ModelEngine for SimEngine {
     }
 
     fn execute(&mut self, batch: ForwardBatch) -> anyhow::Result<ForwardResult> {
- // Seed per-request control records before running ops (the worker's
- // half of the stateful-diff contract).
+        // Seed per-request control records before running ops (the worker's
+        // half of the stateful-diff contract).
         for nr in &batch.new_reqs {
             self.records.insert(
                 nr.req_id,
@@ -361,14 +361,14 @@ impl ModelEngine for SimEngine {
         let mut per_seq = Vec::new();
         for op in batch.ops {
             let r = op.req_id;
- // Echo the op's op_id on its result, exactly as the GPU worker does,
- // so the host's op_id-correlated completion path is exercised here.
+            // Echo the op's op_id on its result, exactly as the GPU worker does,
+            // so the host's op_id-correlated completion path is exercised here.
             let op_id = op.op_id;
             match op.kind {
                 OpKind::PrefillUnd | OpKind::DecodeUnd => {
                     let n = *self.emitted.get(&r).unwrap_or(&0);
- // Run the host-side sampling pipeline over synthetic logits so
- // the op's params and masks can change the chosen token.
+                    // Run the host-side sampling pipeline over synthetic logits so
+                    // the op's params and masks can change the chosen token.
                     let sampling = self.records.get(&r).and_then(|rec| rec.sampling.clone());
                     let out: SampleOutput = match &sampling {
                         Some(sp) => {
@@ -395,9 +395,9 @@ impl ModelEngine for SimEngine {
                             }
                         }
                     };
- // Only decode advances the generation counter — intermediate
- // (chunked) prefill ops produce no kept token, matching a real
- // model where prefill yields logits only for the last position.
+                    // Only decode advances the generation counter — intermediate
+                    // (chunked) prefill ops produce no kept token, matching a real
+                    // model where prefill yields logits only for the last position.
                     if op.kind == OpKind::DecodeUnd {
                         self.emitted.insert(r, n + 1);
                     }
@@ -433,8 +433,8 @@ impl ModelEngine for SimEngine {
                 }
                 OpKind::CommitGen => {
                     self.steps.remove(&r);
- // After committing an image, reset the text counter so a
- // round-trip (text → image → text …) generates fresh text.
+                    // After committing an image, reset the text counter so a
+                    // round-trip (text → image → text …) generates fresh text.
                     self.emitted.insert(r, 0);
                     let hw = self
                         .records
@@ -454,8 +454,8 @@ impl ModelEngine for SimEngine {
                     });
                 }
                 OpKind::VitEncode | OpKind::VaeEncode => {
- // Fabricate a deterministic worker-side encoder handle from the
- // image content hash. The embedding stays on the worker side.
+                    // Fabricate a deterministic worker-side encoder handle from the
+                    // image content hash. The embedding stays on the worker side.
                     let handle = op.mm_hash.unwrap_or(0).wrapping_mul(0x9E3779B1) | 1;
                     let image_hw = self
                         .records
@@ -502,8 +502,8 @@ mod tests {
     #[test]
     fn control_wait_acks_every_control_op() {
         let mut exec = SimExecutor::new(Box::new(SimEngine::new()));
- // Every op variant must produce exactly one ok ack from the single
- // simulated rank — none may be silently dropped.
+        // Every op variant must produce exactly one ok ack from the single
+        // simulated rank — none may be silently dropped.
         for op in [
             ControlOp::DropRequest(RequestId(1)),
             ControlOp::CopyBlocks(Vec::new()),

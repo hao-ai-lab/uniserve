@@ -239,7 +239,7 @@ async fn completion_chunk_stream(
                     }
                     y.yield_ok(CompletionSseChunk::Chunk(chunk)).await;
                 } else if return_token_ids {
- // Emit a chunk with prompt_token_ids in the first streaming response
+                    // Emit a chunk with prompt_token_ids in the first streaming response
                     let mut chunk =
                         delta_chunk(&request_id, &response_model, created, String::new(), None);
                     if let Some(choice) = chunk.choices.first_mut() {

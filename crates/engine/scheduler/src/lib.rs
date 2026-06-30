@@ -18,12 +18,12 @@ pub use logits::{LogitsProcessor, MaskContribution, ProcCtx};
 pub use policy::{DecisionLog, LatencyHistory, PolicyDecision, PolicyReason, PolicySnapshot};
 pub use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 pub use resources::{LedgerStats, ResourceLedger};
-pub use stats_report::SchedStatsReporter;
 pub use scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, HealthSnapshot,
     MAX_SPEC_DECODE_POS_STATS, SchedStats, Scheduler, SchedulerConfig, SchedulingPolicy,
 };
+pub use stats_report::SchedStatsReporter;
 pub use trace::{RequestTrace, TraceEvent, TraceEventKind};
 pub use uniserve_executor::{ControlAck, ControlOp, Executor};
 pub use uniserve_program::{

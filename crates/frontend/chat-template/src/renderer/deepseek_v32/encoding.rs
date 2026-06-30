@@ -3,12 +3,12 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{Error, Result};
-use crate::request::{ChatContent, ChatMessage, ChatRequest, ChatRole, ChatTool};
 use crate::renderer::deepseek_dsml::{
     BOS_TOKEN, DsmlWrapper, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN, ThinkingMode,
     render_tool_calls, render_tool_schema, tool_response_block_bounds, write_assistant_reasoning,
     write_assistant_text, write_chat_content,
 };
+use crate::request::{ChatContent, ChatMessage, ChatRequest, ChatRole, ChatTool};
 use crate::{AssistantContentBlock, AssistantMessageExt};
 
 /// Human-readable model label used in this renderer's error messages.
@@ -134,8 +134,8 @@ fn render_message(
                 thinking_mode,
                 drop_thinking,
             ),
- // DeepSeek prefix-style final-assistant continuation is not enabled
- // in this renderer.
+            // DeepSeek prefix-style final-assistant continuation is not enabled
+            // in this renderer.
             false,
         ),
         ChatMessage::ToolResponse { content, .. } => render_tool_message(

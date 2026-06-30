@@ -99,7 +99,7 @@ mod tests {
     use serde::Deserialize;
     use tempfile::tempdir;
 
-    use super::{read_json_file, ConfigError};
+    use super::{ConfigError, read_json_file};
 
     #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct Fixture {
@@ -142,9 +142,9 @@ mod tests {
 
     #[test]
     fn read_json_file_does_not_validate_semantics() {
- // `read_json_file` only enforces `T`'s structure; out-of-range values
- // (e.g. a negative count for a field a caller treats as a positive
- // limit) deserialize fine. Semantic validation is the caller's job.
+        // `read_json_file` only enforces `T`'s structure; out-of-range values
+        // (e.g. a negative count for a field a caller treats as a positive
+        // limit) deserialize fine. Semantic validation is the caller's job.
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.json");
         fs::write(&path, r#"{"value":0}"#).unwrap();

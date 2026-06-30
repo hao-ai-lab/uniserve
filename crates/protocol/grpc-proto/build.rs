@@ -3,8 +3,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_dir = format!("{manifest_dir}/../../proto");
     let proto_file = format!("{proto_dir}/uniserve_grpc.proto");
 
- // Fail fast with an actionable message if the proto layout has moved,
- // rather than surfacing an opaque protoc error.
+    // Fail fast with an actionable message if the proto layout has moved,
+    // rather than surfacing an opaque protoc error.
     if !std::path::Path::new(&proto_file).exists() {
         return Err(format!(
             "proto file not found at {proto_file} (proto_dir={proto_dir}); \
@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
- // Re-run the build script when the proto source or its directory changes.
+    // Re-run the build script when the proto source or its directory changes.
     println!("cargo:rerun-if-changed={proto_file}");
     println!("cargo:rerun-if-changed={proto_dir}");
 

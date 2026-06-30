@@ -18,26 +18,26 @@ pub struct SamplingHints {
     pub default_min_p: Option<f32>,
     pub default_repetition_penalty: Option<f32>,
     pub default_max_tokens: Option<u32>,
- /// Model context window size (`max_position_embeddings` from
- /// `config.json`).
+    /// Model context window size (`max_position_embeddings` from
+    /// `config.json`).
     pub max_model_len: Option<u32>,
 }
 
 /// Minimal text-processing backend needed by `text`.
 pub trait TextBackend: Send + Sync {
- /// Return the tokenizer used by this backend.
+    /// Return the tokenizer used by this backend.
     fn tokenizer(&self) -> DynTokenizer;
 
- /// Return whether the loaded model is a mixture-of-experts model.
+    /// Return whether the loaded model is a mixture-of-experts model.
     fn is_moe(&self) -> bool {
         false
     }
 
- /// Return the backend model ID.
+    /// Return the backend model ID.
     fn model_id(&self) -> &str;
 
- /// Return tokenizer/model-derived hints used to enrich southbound sampling
- /// parameters.
+    /// Return tokenizer/model-derived hints used to enrich southbound sampling
+    /// parameters.
     fn sampling_hints(&self) -> Result<SamplingHints> {
         Ok(SamplingHints::default())
     }

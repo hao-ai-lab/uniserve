@@ -12,16 +12,16 @@ const HF_TOKEN_ENV: &str = "HF_TOKEN";
 /// The tokenizer source selected for a model.
 #[derive(Debug, Clone)]
 pub enum TokenizerSource {
- /// Path to `tokenizer.json` in HuggingFace format.
+    /// Path to `tokenizer.json` in HuggingFace format.
     HuggingFace(PathBuf),
- /// Path to `tiktoken.model` or `*.tiktoken` file for tiktoken-based models.
+    /// Path to `tiktoken.model` or `*.tiktoken` file for tiktoken-based models.
     Tiktoken(PathBuf),
- /// Path to `tekken.json` when present (Mistral native tokenizer format).
+    /// Path to `tekken.json` when present (Mistral native tokenizer format).
 
- /// When set, the Tekken tokenizer should be preferred over the Hugging Face
- /// tokenizer because the HuggingFace `tokenizer.json` for Mistral
- /// models has a known regex bug that produces incorrect token IDs for
- /// some inputs.
+    /// When set, the Tekken tokenizer should be preferred over the Hugging Face
+    /// tokenizer because the HuggingFace `tokenizer.json` for Mistral
+    /// models has a known regex bug that produces incorrect token IDs for
+    /// some inputs.
     Tekken(PathBuf),
 }
 
@@ -36,7 +36,7 @@ impl TokenizerSource {
 /// Concrete tokenizer/config file locations resolved for one HF model id.
 #[derive(Debug, Clone)]
 pub struct ResolvedModelFiles {
- /// The selected tokenizer source for this model.
+    /// The selected tokenizer source for this model.
     pub tokenizer: TokenizerSource,
     pub tokenizer_config_path: Option<PathBuf>,
     pub generation_config_path: Option<PathBuf>,
@@ -46,9 +46,9 @@ pub struct ResolvedModelFiles {
 }
 
 impl ResolvedModelFiles {
- /// Resolve tokenizer/config files from a local model directory first when
- /// `model_id` points to one, otherwise consult the local HF cache and
- /// finally the Hub.
+    /// Resolve tokenizer/config files from a local model directory first when
+    /// `model_id` points to one, otherwise consult the local HF cache and
+    /// finally the Hub.
     pub async fn new(model_id: &str) -> Result<Self> {
         if Path::new(model_id).is_dir() {
             return resolve_local_model_files(Path::new(model_id));
@@ -195,9 +195,9 @@ fn resolve_cached_tokenizer_source(
     }
 
     let Some(tokenizer_path) = cache_repo.get("tokenizer.json").or_else(|| {
- // tiktoken.model is the most common name, try it first.
+        // tiktoken.model is the most common name, try it first.
         cache_repo.get("tiktoken.model").or_else(|| {
- // Scan for any *.tiktoken file in the cache snapshot directory.
+            // Scan for any *.tiktoken file in the cache snapshot directory.
             let snapshot_dir = cache_repo.get("config.json")?.parent()?.to_path_buf();
             discover_tiktoken_in_dir(&snapshot_dir)
         })
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn chat_template_wildcard_fallback_ignores_nested_jinja() {
- // A nested/auxiliary template must not be selected when no canonical file exists.
+        // A nested/auxiliary template must not be selected when no canonical file exists.
         assert_eq!(
             select_chat_template_sibling(&siblings(&[
                 "additional_chat_templates/tool_use.jinja",
@@ -459,7 +459,7 @@ mod tests {
             ])),
             None
         );
- // A top-level wildcard `.jinja` is accepted as a last resort.
+        // A top-level wildcard `.jinja` is accepted as a last resort.
         assert_eq!(
             select_chat_template_sibling(&siblings(&["custom.jinja", "tokenizer.json"])),
             Some("custom.jinja")

@@ -24,9 +24,9 @@ pub struct TraceEvent {
     pub op_id: Option<u64>,
     pub op_kind: Option<&'static str>,
     pub step_id: u64,
- /// Host-observed submit→resolve round-trip (ring + worker), microseconds.
+    /// Host-observed submit→resolve round-trip (ring + worker), microseconds.
     pub roundtrip_us: u64,
- /// Worker-reported compute time for the op's batch, microseconds.
+    /// Worker-reported compute time for the op's batch, microseconds.
     pub worker_us: u64,
     pub finish_reason: Option<&'static str>,
 }
@@ -70,7 +70,7 @@ impl RequestTrace {
         }
     }
 
- /// Count of resolved ops (one lifecycle "step" completed).
+    /// Count of resolved ops (one lifecycle "step" completed).
     pub fn resolved_ops(&self) -> usize {
         self.events
             .iter()
@@ -115,7 +115,7 @@ mod tests {
 
         assert!(t.was_admitted() && t.is_finished());
         assert_eq!(t.resolved_ops(), 1);
- // ids are present for correlation.
+        // ids are present for correlation.
         assert_eq!(t.program_id, ProgramId(7));
         let submitted = t
             .events

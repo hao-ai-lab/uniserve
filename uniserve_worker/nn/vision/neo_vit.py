@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from ..rope import RotaryEmbedding
+from ..rope import RotaryEmbedding, apply_rotary_emb
 from .patching import build_abs_positions_from_grid_hw
 
 __all__ = [
@@ -23,22 +23,6 @@ class NeoVitConfig:
     patch_size: int = 16
     num_channels: int = 3
     rope_theta_vision: float = 10000.0
-
-
-def _axis_rope(x: torch.Tensor, positions: torch.Tensor, rope: RotaryEmbedding) -> torch.Tensor:
-    # NEO-ViT uses the interleaved even/odd rotation convention required by the
-    # checkpoint weights, distinct from the shared rotate_half (NeoX) layout in
-    # ``apply_rotary_emb``.  The rotary-frequency construction (cos/sin) is reused
-    # from the shared ``RotaryEmbedding`` so the inv_freq formula lives in one place.
-    cos, sin = rope.cos_sin_1d(positions)
-    cos = cos.to(device=x.device, dtype=x.dtype)
-    sin = sin.to(device=x.device, dtype=x.dtype)
-    even = x[..., 0::2]
-    odd = x[..., 1::2]
-    out = torch.empty_like(x)
-    out[..., 0::2] = even * cos - odd * sin
-    out[..., 1::2] = even * sin + odd * cos
-    return out
 
 
 class NeoVitEncoder(nn.Module):
@@ -68,7 +52,8 @@ class NeoVitEncoder(nn.Module):
             stride=self.downsample_factor,
         )
         self.gelu = nn.GELU()
-        # Per-axis rotary frequencies (interleaved rotation applied in ``_axis_rope``).
+        # Per-axis rotary frequencies; the rotation convention is passed as data
+        # to the shared RoPE helper.
         # Reuse the shared RotaryEmbedding so the inv_freq / cos-sin construction has a
         # single owner; dim is hidden//2 because the head is split into x/y halves.
         self.rope = RotaryEmbedding(dim=hidden // 2, theta=theta)
@@ -92,8 +77,20 @@ class NeoVitEncoder(nn.Module):
     def _apply_2d_rope(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
         abs_x, abs_y = build_abs_positions_from_grid_hw(grid_hw, device=patch_embeds.device)
         half = patch_embeds.shape[-1] // 2
-        x_part = _axis_rope(patch_embeds[..., :half], abs_x, self.rope)
-        y_part = _axis_rope(patch_embeds[..., half:], abs_y, self.rope)
+        x_cos, x_sin = self.rope.cos_sin_1d(abs_x)
+        y_cos, y_sin = self.rope.cos_sin_1d(abs_y)
+        x_part = apply_rotary_emb(
+            patch_embeds[..., :half],
+            x_cos,
+            x_sin,
+            rotation="interleaved",
+        )
+        y_part = apply_rotary_emb(
+            patch_embeds[..., half:],
+            y_cos,
+            y_sin,
+            rotation="interleaved",
+        )
         return torch.cat([x_part, y_part], dim=-1)
 
     def _dense_downsample(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:

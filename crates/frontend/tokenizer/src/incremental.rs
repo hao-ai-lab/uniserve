@@ -4,20 +4,20 @@ use crate::{Result, Tokenizer};
 
 /// Stateful incremental decoder that emits text chunks one token at a time.
 pub trait IncrementalDecoder: Send {
- /// Push one generated token and return how many new string bytes were
- /// added.
+    /// Push one generated token and return how many new string bytes were
+    /// added.
     fn push_token(&mut self, token_id: u32) -> Result<usize>;
 
- /// Consume any text which is currently ready.
+    /// Consume any text which is currently ready.
     fn next_chunk(&mut self) -> Option<String>;
 
- /// Flush any remaining buffered text that has not yet been emitted.
+    /// Flush any remaining buffered text that has not yet been emitted.
 
- /// Called after the final generated token to force out buffered/incomplete
- /// fragments.
+    /// Called after the final generated token to force out buffered/incomplete
+    /// fragments.
     fn flush(&mut self, truncate_output_to: Option<usize>) -> Result<(Option<String>, String)>;
 
- /// Return cumulative decoded text so far.
+    /// Return cumulative decoded text so far.
     fn output(&self) -> &str;
 }
 
@@ -28,20 +28,20 @@ pub(crate) struct DecodeStream<'a, T: Tokenizer + ?Sized> {
     tokenizer: &'a T,
     skip_special_tokens: bool,
     min_bytes_to_buffer: usize,
- // mutated state
+    // mutated state
     ids: Vec<u32>,
     prefix: String,
     prefix_index: usize,
     cumulative_output: String,
     output_index: usize,
- /// Whether the one-shot prompt seed has run. Tracked explicitly (rather than
- /// inferring it from `prefix.is_empty`) so a prompt whose decode ends in
- /// U+FFFD — leaving `prefix` empty — does not re-trigger seeding on every
- /// push and re-emit the prompt.
+    /// Whether the one-shot prompt seed has run. Tracked explicitly (rather than
+    /// inferring it from `prefix.is_empty`) so a prompt whose decode ends in
+    /// U+FFFD — leaving `prefix` empty — does not re-trigger seeding on every
+    /// push and re-emit the prompt.
     prompt_seeded: bool,
- /// Consecutive `push_token` calls that produced no emitted bytes (decode
- /// shrank or still ends in U+FFFD). Bounds the buffered window: see
- /// [`MAX_PENDING_TOKENS`].
+    /// Consecutive `push_token` calls that produced no emitted bytes (decode
+    /// shrank or still ends in U+FFFD). Bounds the buffered window: see
+    /// [`MAX_PENDING_TOKENS`].
     pending_since_emit: usize,
 }
 
@@ -83,10 +83,10 @@ const SAFE_SUFFIX_MAX: usize = 6;
 const MAX_PENDING_TOKENS: usize = 32;
 
 impl<T: Tokenizer + ?Sized> DecodeStream<'_, T> {
- /// Seed `self.prefix` from the shortest trailing suffix whose decoded text
- /// has no U+FFFD — a clean decode means the suffix starts and ends at
- /// valid UTF-8/token boundaries, so priming from it is equivalent to
- /// priming from the full prompt.
+    /// Seed `self.prefix` from the shortest trailing suffix whose decoded text
+    /// has no U+FFFD — a clean decode means the suffix starts and ends at
+    /// valid UTF-8/token boundaries, so priming from it is equivalent to
+    /// priming from the full prompt.
     fn seed_prefix(&mut self) -> Result<()> {
         let prompt_len = self.ids.len();
         if prompt_len > SAFE_SUFFIX_MIN {
@@ -106,12 +106,12 @@ impl<T: Tokenizer + ?Sized> DecodeStream<'_, T> {
         }
         let decoded = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
         if decoded.ends_with('\u{FFFD}') {
- // The prompt tail is an incomplete UTF-8 scalar. Strip the trailing
- // replacement char(s) so `prefix.len` does not include them — a
- // same-byte-length completing scalar would otherwise be masked by the
- // `string.len <= prefix_len` guard in `push_token` and never emitted
- //. Keep every prompt id in the window (`prefix_index = 0`) so
- // the incomplete tail can still combine with the generated tokens.
+            // The prompt tail is an incomplete UTF-8 scalar. Strip the trailing
+            // replacement char(s) so `prefix.len` does not include them — a
+            // same-byte-length completing scalar would otherwise be masked by the
+            // `string.len <= prefix_len` guard in `push_token` and never emitted
+            //. Keep every prompt id in the window (`prefix_index = 0`) so
+            // the incomplete tail can still combine with the generated tokens.
             self.prefix = decoded.trim_end_matches('\u{FFFD}').to_string();
             self.prefix_index = 0;
         } else {
@@ -134,17 +134,17 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
         self.ids.push(token_id);
         let string = self.tokenizer.decode(&self.ids, self.skip_special_tokens)?;
         let prefix_len = self.prefix.len();
- // Normally hold back a decode that shrank or still ends in an incomplete
- // U+FFFD. But once `MAX_PENDING_TOKENS` non-emitting pushes have piled up,
- // force the emit so the window stays bounded and a genuine trailing
- // U+FFFD surfaces incrementally rather than only at flush.
+        // Normally hold back a decode that shrank or still ends in an incomplete
+        // U+FFFD. But once `MAX_PENDING_TOKENS` non-emitting pushes have piled up,
+        // force the emit so the window stays bounded and a genuine trailing
+        // U+FFFD surfaces incrementally rather than only at flush.
         let force = self.pending_since_emit >= MAX_PENDING_TOKENS;
         if !force && (string.len() <= prefix_len || string.ends_with('\u{FFFD}')) {
             self.pending_since_emit += 1;
             return Ok(0);
         }
- // Ensure we split at a utf-8 char boundary (clamps to string.len when
- // prefix_len exceeds it, i.e. a forced emit on a shrunk decode).
+        // Ensure we split at a utf-8 char boundary (clamps to string.len when
+        // prefix_len exceeds it, i.e. a forced emit on a shrunk decode).
         let new_chunk = &string[string.floor_char_boundary(prefix_len)..];
         self.cumulative_output.push_str(new_chunk);
         self.ids.drain(..self.prefix_index);
@@ -159,7 +159,7 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
             .cumulative_output
             .len()
             .saturating_sub(self.min_bytes_to_buffer);
- // Ensure we split at a utf-8 char boundary.
+        // Ensure we split at a utf-8 char boundary.
         let cutoff = self.cumulative_output.floor_char_boundary(cutoff);
         (cutoff > self.output_index).then(|| {
             let chunk = self.cumulative_output[self.output_index..cutoff].to_string();
@@ -176,7 +176,7 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
             self.prefix.clear();
             self.prefix_index = 0;
             self.pending_since_emit = 0;
- // Ensure we split at a utf-8 char boundary.
+            // Ensure we split at a utf-8 char boundary.
             self.cumulative_output
                 .push_str(&string[string.floor_char_boundary(prefix_len)..]);
         }
@@ -198,7 +198,7 @@ impl<T: Tokenizer + ?Sized> IncrementalDecoder for DecodeStream<'_, T> {
 mod tests {
     use super::*;
 
- /// Backend that treats each token ID as a raw byte, producing lossy UTF-8.
+    /// Backend that treats each token ID as a raw byte, producing lossy UTF-8.
     #[derive(Debug)]
     struct Utf8Backend;
 
@@ -222,7 +222,7 @@ mod tests {
         let backend = Utf8Backend;
         let mut decoder = backend.create_decode_stream(&[], false, 0);
 
- // 你 = U+4F60 = 0xE4 0xBD 0xA0
+        // 你 = U+4F60 = 0xE4 0xBD 0xA0
         assert_eq!(decoder.push_token(0xe4).unwrap(), 0);
         assert_eq!(decoder.push_token(0xbd).unwrap(), 0);
         assert_eq!(decoder.push_token(0xa0).unwrap(), 3); // "你" is 3 bytes
@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(decoder.next_chunk().as_deref(), Some("o"));
         assert_eq!(decoder.push_token(b'k' as u32).unwrap(), 1);
         assert_eq!(decoder.next_chunk().as_deref(), Some("k"));
- // All text already consumed via next_chunk
+        // All text already consumed via next_chunk
         let (last_chunk, full_text) = decoder.flush(None).unwrap();
         assert_eq!(last_chunk, None);
         assert_eq!(full_text, "ok");
@@ -259,16 +259,16 @@ mod tests {
         let backend = Utf8Backend;
         let mut decoder = backend.create_decode_stream(&[], false, 0);
 
- // Push incomplete multi-byte sequence — step returns 0 bytes.
+        // Push incomplete multi-byte sequence — step returns 0 bytes.
         assert_eq!(decoder.push_token(0xe4).unwrap(), 0);
         assert_eq!(decoder.push_token(0xbd).unwrap(), 0);
 
- // Flush forces out whatever the decoder can produce (lossy replacement).
+        // Flush forces out whatever the decoder can produce (lossy replacement).
         let (last_chunk, _full_text) = decoder.flush(None).unwrap();
         assert!(last_chunk.is_some());
     }
 
- /// Backend where token 0 is a special token.
+    /// Backend where token 0 is a special token.
     #[derive(Debug)]
     struct SpecialTokenBackend;
 
@@ -312,7 +312,7 @@ mod tests {
         let prompt = &[b'H' as u32, b'i' as u32];
         let mut decoder = backend.create_decode_stream(prompt, false, 0);
 
- // First generated token should not re-emit "Hi".
+        // First generated token should not re-emit "Hi".
         let added = decoder.push_token(b'!' as u32).unwrap();
         assert_eq!(added, 1);
         assert_eq!(decoder.output(), "!");
@@ -337,10 +337,10 @@ mod tests {
         assert_eq!(full_text, "Hello, world!");
     }
 
- /// Backend simulating non-monotonic decode where adding a token changes how
- /// earlier tokens decode (context-dependent normalization), causing
- /// prefix_len to land mid-UTF-8. Reproduces a class of
- /// incremental-detokenization bug.
+    /// Backend simulating non-monotonic decode where adding a token changes how
+    /// earlier tokens decode (context-dependent normalization), causing
+    /// prefix_len to land mid-UTF-8. Reproduces a class of
+    /// incremental-detokenization bug.
     #[derive(Debug)]
     struct NonMonotonicBackend;
 
@@ -353,8 +353,8 @@ mod tests {
             match token_ids {
                 [1] => Ok("abc".into()),
                 [1, 2] => Ok("ab".into()),
- // Token 3 triggers a normalization change: "ab" becomes emoji + "d".
- // prefix_len=3 ("abc") lands inside the 4-byte emoji 🎉.
+                // Token 3 triggers a normalization change: "ab" becomes emoji + "d".
+                // prefix_len=3 ("abc") lands inside the 4-byte emoji 🎉.
                 [1, 2, 3] => Ok("🎉d".into()), // 🎉 is 4 bytes + d = 5 bytes
                 [2, 3] => Ok("🎉d".into()),    // prefix recompute after drain
                 [3] => Ok("d".into()),         // after drain
@@ -367,23 +367,23 @@ mod tests {
         }
     }
 
- /// Without the char-boundary fix, this panics slicing mid-emoji.
+    /// Without the char-boundary fix, this panics slicing mid-emoji.
     #[test]
     fn non_monotonic_decode_does_not_panic() {
         let backend = NonMonotonicBackend;
         let mut decoder = backend.create_decode_stream(&[], false, 0);
 
- // Token 1: "abc", prefix="abc"
+        // Token 1: "abc", prefix="abc"
         assert_eq!(decoder.push_token(1).unwrap(), 3);
- // Token 2: "ab" (shorter), no emit
+        // Token 2: "ab" (shorter), no emit
         assert_eq!(decoder.push_token(2).unwrap(), 0);
- // Token 3: "🎉d" — prefix_len=3 is mid-emoji. Without fix this panics.
+        // Token 3: "🎉d" — prefix_len=3 is mid-emoji. Without fix this panics.
         let added = decoder.push_token(3).unwrap();
         assert!(added > 0);
     }
 
- /// Backend whose decode always ends in U+FFFD and never resolves, growing by
- /// one 'a' per token. Models a pathological / replacement-char-emitting stream.
+    /// Backend whose decode always ends in U+FFFD and never resolves, growing by
+    /// one 'a' per token. Models a pathological / replacement-char-emitting stream.
     #[derive(Debug)]
     struct GrowingFffdBackend;
 
@@ -399,9 +399,9 @@ mod tests {
         }
     }
 
- /// a stream that never resolves its trailing U+FFFD must not grow
- /// the decode window without bound, and must surface bytes incrementally
- /// rather than withholding everything until flush.
+    /// a stream that never resolves its trailing U+FFFD must not grow
+    /// the decode window without bound, and must surface bytes incrementally
+    /// rather than withholding everything until flush.
     #[test]
     fn unresolved_fffd_stream_is_bounded_and_emits() {
         let backend = GrowingFffdBackend;
@@ -409,39 +409,42 @@ mod tests {
         let mut total_added = 0usize;
         for t in 0..200u32 {
             total_added += d.push_token(t).unwrap();
- // Window stays bounded (~2*MAX_PENDING_TOKENS) instead of growing to 200.
+            // Window stays bounded (~2*MAX_PENDING_TOKENS) instead of growing to 200.
             assert!(
                 d.ids.len() <= 2 * MAX_PENDING_TOKENS + 4,
                 "decode window grew unbounded: {}",
                 d.ids.len()
             );
         }
- // Force-emit fired at least once, so a never-resolving U+FFFD is surfaced
- // incrementally rather than only at flush.
-        assert!(total_added > 0, "nothing was ever emitted (held until flush)");
+        // Force-emit fired at least once, so a never-resolving U+FFFD is surfaced
+        // incrementally rather than only at flush.
+        assert!(
+            total_added > 0,
+            "nothing was ever emitted (held until flush)"
+        );
     }
 
- /// a prompt whose decode ends in U+FFFD (incomplete trailing scalar)
- /// must not re-emit the prompt, and a generated token that completes the
- /// scalar must still be emitted (not masked by a same-length prefix).
+    /// a prompt whose decode ends in U+FFFD (incomplete trailing scalar)
+    /// must not re-emit the prompt, and a generated token that completes the
+    /// scalar must still be emitted (not masked by a same-length prefix).
     #[test]
     fn fffd_terminated_prompt_completes_without_re_emitting_prompt() {
         let backend = Utf8Backend;
- // Prompt "Hi" + the first byte of 你 (0xe4): decodes to "Hi\u{FFFD}".
+        // Prompt "Hi" + the first byte of 你 (0xe4): decodes to "Hi\u{FFFD}".
         let prompt = &[b'H' as u32, b'i' as u32, 0xe4];
         let mut decoder = backend.create_decode_stream(prompt, false, 0);
 
         assert_eq!(decoder.push_token(0xbd).unwrap(), 0); // still incomplete
         let added = decoder.push_token(0xa0).unwrap(); // completes 你
         assert!(added > 0, "completing scalar was suppressed");
- // Only the completed scalar is output; "Hi" stays prompt context.
+        // Only the completed scalar is output; "Hi" stays prompt context.
         assert_eq!(decoder.output(), "你");
     }
 
     #[test]
     fn next_chunk_with_hold_back() {
         let backend = Utf8Backend;
- // hold_back_bytes: 3 means we buffer the last 3 bytes
+        // hold_back_bytes: 3 means we buffer the last 3 bytes
         let mut decoder = backend.create_decode_stream(&[], false, 3);
 
         let input = b"Hello!";
@@ -452,9 +455,9 @@ mod tests {
                 chunks.push_str(&chunk);
             }
         }
- // With hold_back_bytes=3, last 3 bytes ("lo!") are held back
+        // With hold_back_bytes=3, last 3 bytes ("lo!") are held back
         assert_eq!(chunks, "Hel");
- // Flush returns the rest
+        // Flush returns the rest
         let (last_chunk, full_text) = decoder.flush(None).unwrap();
         assert_eq!(last_chunk.as_deref(), Some("lo!"));
         assert_eq!(full_text, "Hello!");
@@ -462,10 +465,10 @@ mod tests {
 
     #[test]
     fn next_chunk_cutoff_respects_char_boundary() {
- // Regression: next_chunk's cutoff (len - min_bytes_to_buffer) must be
- // aligned to a UTF-8 char boundary like push_token/flush; otherwise
- // streaming multi-byte output (CJK/emoji) with a hold-back buffer (set
- // by a stop string) panics slicing cumulative_output mid-character.
+        // Regression: next_chunk's cutoff (len - min_bytes_to_buffer) must be
+        // aligned to a UTF-8 char boundary like push_token/flush; otherwise
+        // streaming multi-byte output (CJK/emoji) with a hold-back buffer (set
+        // by a stop string) panics slicing cumulative_output mid-character.
         let backend = Utf8Backend;
         let mut decoder = backend.create_decode_stream(&[], false, 2);
         let mut out = String::new();

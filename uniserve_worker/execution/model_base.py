@@ -100,4 +100,9 @@ class UniModelBase(ModelHooks):
             attention_backend=descriptor.attention_backend,
             kv_dtype=descriptor.kv_dtype,
             encoder_cache_budget=descriptor.encoder_cache_budget,
+            max_vae_grid_tokens=descriptor.max_vae_grid_tokens or descriptor.max_latent_size,
+            max_vit_grid_tokens=descriptor.max_vit_grid_tokens,
+            commit_marker_tokens=descriptor.commit_marker_tokens,
+            gen_rope_advance=descriptor.gen_rope_advance,
+            max_cfg_branches=descriptor.max_cfg_branches,
         )

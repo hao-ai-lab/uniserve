@@ -26,7 +26,7 @@ use crate::{Result, Tool, ToolParser, ToolParserOutput};
 pub struct DeepSeekV32ToolParser(DeepSeekDsmlToolParser);
 
 impl DeepSeekV32ToolParser {
- /// Create a DeepSeek V3.2 tool parser.
+    /// Create a DeepSeek V3.2 tool parser.
     pub(super) fn new(tools: &[Tool]) -> Self {
         Self(DeepSeekDsmlToolParser::new(tools, DsmlTokens::V32))
     }

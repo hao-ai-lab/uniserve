@@ -207,10 +207,11 @@ class InterleavedTextCacheDriver:
         cache.last_token_id = int(tokens[-1])
 
     def append_one(self, cache: TextCache, token_id: int) -> None:
-        self.owner.model.language_model.model.current_index = cache.t_index
         ids = torch.tensor([token_id], dtype=torch.long, device=self.owner.device)
+        indexes = self.text_indexes(cache.t_index + 1, 1)
         outputs = self.owner.model.language_model(
             input_ids=ids.unsqueeze(0),
+            indexes=indexes,
             past_key_values=cache.past,
             use_cache=True,
         )

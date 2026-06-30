@@ -25,25 +25,25 @@ pub struct HfTextBackend {
     model_id: String,
     files: ResolvedModelFiles,
     tokenizer: DynTokenizer,
- /// Primary EOS handled by the engine's dedicated EOS path.
+    /// Primary EOS handled by the engine's dedicated EOS path.
     primary_eos_token_id: Option<u32>,
- /// Additional EOS ids that should flow through stop-token handling.
+    /// Additional EOS ids that should flow through stop-token handling.
     extra_eos_token_ids: BTreeSet<u32>,
- /// Generation-config for sampling defaults that may be inherited when the
- /// user does not explicitly override them.
+    /// Generation-config for sampling defaults that may be inherited when the
+    /// user does not explicitly override them.
     generation_config: GenerationConfig,
- /// Model config (`config.json`).
+    /// Model config (`config.json`).
     model_config: ModelConfig,
 }
 
 impl HfTextBackend {
- /// Load the text backend with the given model id.
+    /// Load the text backend with the given model id.
     pub async fn from_model(model_id: &str) -> Result<Self> {
         let files = ResolvedModelFiles::new(model_id).await?;
         Self::from_resolved_model_files(files, model_id.to_string())
     }
 
- /// Load the text backend from resolved Hugging Face model files.
+    /// Load the text backend from resolved Hugging Face model files.
     pub fn from_resolved_model_files(files: ResolvedModelFiles, model_id: String) -> Result<Self> {
         let tokenizer_config = load_tokenizer_config(files.tokenizer_config_path.as_deref())?;
         let tokenizer = load_tokenizer(&files.tokenizer)?;
@@ -80,8 +80,8 @@ impl HfTextBackend {
         })
     }
 
- /// Expose the resolved model files for use by the chat backend to load the
- /// chat template.
+    /// Expose the resolved model files for use by the chat backend to load the
+    /// chat template.
     pub fn resolved_model_files(&self) -> &ResolvedModelFiles {
         &self.files
     }

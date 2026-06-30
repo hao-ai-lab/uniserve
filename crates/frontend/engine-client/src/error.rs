@@ -52,7 +52,7 @@ pub enum Error {
     #[error("utility call `{method}` returned inconsistent results across engines: {values}")]
     InconsistentUtilityResults { method: String, values: String },
 
- /// A special variant to allow cloning the same error.
+    /// A special variant to allow cloning the same error.
     #[error(transparent)]
     Shared(Arc<Self>),
 }

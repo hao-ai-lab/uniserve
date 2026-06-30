@@ -14,21 +14,21 @@ use uniserve_core::RequestId;
 /// The facts the scheduler weighs each admission pass.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PolicySnapshot {
- // queue depths
+    // queue depths
     pub waiting: usize,
     pub running: usize,
     pub skipped_waiting: usize,
     pub in_flight: usize,
- // resource pressure
+    // resource pressure
     pub free_blocks: usize,
     pub total_blocks: usize,
     pub reserved_blocks: usize,
     pub active_leases: usize,
- // cache facts
+    // cache facts
     pub cached_blocks: usize,
     pub prefix_hit_rate: f32,
     pub mm_cache_hit_rate: f32,
- // latency history: per-op-kind round-trip EWMA, microseconds.
+    // latency history: per-op-kind round-trip EWMA, microseconds.
     pub op_latency_us: Vec<(String, u64)>,
 }
 
@@ -86,7 +86,7 @@ impl LatencyHistory {
         Self::default()
     }
 
- /// Fold one observed round-trip latency for `kind` into its EWMA.
+    /// Fold one observed round-trip latency for `kind` into its EWMA.
     pub fn observe(&mut self, kind: &'static str, us: u64) {
         let e = self.ewma_us.entry(kind).or_insert(us as f64);
         *e = self.alpha * us as f64 + (1.0 - self.alpha) * *e;

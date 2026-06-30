@@ -115,8 +115,7 @@ fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
             continue;
         }
         metric_attr_seen = true;
-        let metas =
-            attr.parse_args_with(Punctuated::<MetricArg, Token![,]>::parse_terminated)?;
+        let metas = attr.parse_args_with(Punctuated::<MetricArg, Token![,]>::parse_terminated)?;
         for meta in metas {
             match meta {
                 MetricArg::Name(value) => {

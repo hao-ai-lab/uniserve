@@ -4,7 +4,7 @@ use uniserve_engine_client::{
 use uniserve_text::tokenizer::DynTokenizer;
 
 use super::defaults;
-use super::profiles::{IU_SYSTEM_PROMPT, NativeModelProfile};
+use super::profiles::NativeModelProfile;
 use super::resolution::resolve_resolution;
 use super::schema::NativeGenerateBody;
 
@@ -32,17 +32,17 @@ impl BuildError {
 /// (`NativeModelProfile::image_defaults`). Naming them here keeps the values
 /// discoverable and prevents silent drift between call sites.
 mod understanding_defaults {
- /// Text-guidance CFG scale for understanding-mode visual reasoning.
+    /// Text-guidance CFG scale for understanding-mode visual reasoning.
     pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
- /// Image-guidance CFG scale for understanding-mode visual reasoning.
+    /// Image-guidance CFG scale for understanding-mode visual reasoning.
     pub(super) const CFG_IMG_SCALE: f32 = 2.0;
- /// CFG renorm strategy for understanding-mode visual reasoning.
+    /// CFG renorm strategy for understanding-mode visual reasoning.
     pub(super) const CFG_RENORM_TYPE: &str = "text_channel";
- /// CFG renorm floor for understanding-mode visual reasoning.
+    /// CFG renorm floor for understanding-mode visual reasoning.
     pub(super) const CFG_RENORM_MIN: f32 = 0.0;
- /// CFG interval (lo, hi) for understanding-mode visual reasoning.
+    /// CFG interval (lo, hi) for understanding-mode visual reasoning.
     pub(super) const CFG_INTERVAL: (f32, f32) = (0.0, 1.0);
- /// Square latent resolution used for understanding-mode thinking images.
+    /// Square latent resolution used for understanding-mode thinking images.
     pub(super) const RESOLUTION: u32 = 512;
 }
 
@@ -101,7 +101,10 @@ impl<'a> NativeRequestBuilder<'a> {
         let first_image = input_images
             .first()
             .ok_or_else(|| BuildError::new("understand mode requires an input image"))?;
-        let system = body.system_prompt.as_deref().unwrap_or(IU_SYSTEM_PROMPT);
+        let system = body
+            .system_prompt
+            .as_deref()
+            .unwrap_or_else(|| self.profile.understanding_system_prompt());
         let mut sys_ids = self
             .profile
             .wrap_understanding_text(&self.tokenizer, system);
@@ -159,11 +162,11 @@ impl<'a> NativeRequestBuilder<'a> {
         let image_body = body.image();
         let defaults = &self.profile.image_defaults;
         let resolution = resolve_resolution(
-            self.profile.resolution_policy,
+            &self.profile.resolution_policy,
             image_body
                 .resolution
                 .as_deref()
-                .or(Some(defaults.resolution)),
+                .or(Some(defaults.resolution.as_str())),
             image_body.width,
             image_body.height,
         )
@@ -194,7 +197,7 @@ impl<'a> NativeRequestBuilder<'a> {
             cfg_renorm_type: image_body
                 .cfg_renorm_type
                 .clone()
-                .unwrap_or_else(|| defaults.cfg_renorm_type.into()),
+                .unwrap_or_else(|| defaults.cfg_renorm_type.clone()),
             cfg_renorm_min: finite_or(
                 image_body.cfg_renorm_min.unwrap_or(defaults.cfg_renorm_min),
                 "image.cfg_renorm_min",
@@ -322,7 +325,7 @@ mod tests {
     use uniserve_text::tokenizer::{DynTokenizer, Tokenizer};
 
     use super::*;
-    use crate::profiles::{NativeModelFamily, resolve_native_profile};
+    use crate::profiles::resolve_native_profile_for_model;
 
     #[derive(Debug)]
     struct SenseNovaTokenizer;
@@ -351,7 +354,6 @@ mod tests {
             match token {
                 "<img>" => Some(151670),
                 "</img>" => Some(151671),
-                "<IMG_CONTEXT>" => Some(151672),
                 "<|im_start|>" => Some(151644),
                 "<|im_end|>" => Some(151645),
                 _ => None,
@@ -362,8 +364,8 @@ mod tests {
     #[test]
     fn sensenova_defaults_match_official_path() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
-        let profile = resolve_native_profile(&*tok);
-        assert_eq!(profile.family, NativeModelFamily::SenseNovaU1);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
+        assert_eq!(profile.id, "sensenova-u1");
         let body = NativeGenerateBody {
             prompt: "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate."
                 .into(),
@@ -389,7 +391,7 @@ mod tests {
     #[test]
     fn unsupported_sensenova_preview_resolution_is_rejected() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
-        let profile = resolve_native_profile(&*tok);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
             mode: Some("image".into()),
@@ -409,7 +411,7 @@ mod tests {
     #[test]
     fn client_image_values_override_profile_defaults() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
-        let profile = resolve_native_profile(&*tok);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
             mode: Some("image".into()),
@@ -438,7 +440,7 @@ mod tests {
     #[test]
     fn explicit_image_prompts_are_preserved() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
-        let profile = resolve_native_profile(&*tok);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "Generate a travel guide".into(),
             mode: Some("interleave".into()),
@@ -458,7 +460,7 @@ mod tests {
     #[test]
     fn invalid_interval_is_rejected() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
-        let profile = resolve_native_profile(&*tok);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
             mode: Some("image".into()),

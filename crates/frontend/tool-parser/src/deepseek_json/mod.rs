@@ -29,7 +29,7 @@ enum DeepSeekJsonFormat {
 }
 
 impl DeepSeekJsonFormat {
- /// Return the parser name used in diagnostics.
+    /// Return the parser name used in diagnostics.
     const fn parser_name(self) -> &'static str {
         match self {
             Self::V3 => "DeepSeek V3",
@@ -37,7 +37,7 @@ impl DeepSeekJsonFormat {
         }
     }
 
- /// Return the marker that closes the raw JSON arguments payload.
+    /// Return the marker that closes the raw JSON arguments payload.
     const fn argument_end_marker(self) -> &'static str {
         match self {
             Self::V3 => V3_ARGUMENT_END,
@@ -77,7 +77,7 @@ struct DeepSeekJsonToolParser {
 }
 
 impl DeepSeekJsonToolParser {
- /// Create a parser for one DeepSeek JSON-argument format.
+    /// Create a parser for one DeepSeek JSON-argument format.
     fn new(format: DeepSeekJsonFormat) -> Self {
         Self {
             buffer: String::new(),
@@ -88,7 +88,7 @@ impl DeepSeekJsonToolParser {
         }
     }
 
- /// Apply one parsed DeepSeek JSON event to parser state and output.
+    /// Apply one parsed DeepSeek JSON event to parser state and output.
     fn apply_event(
         &mut self,
         event: DeepSeekJsonEvent,

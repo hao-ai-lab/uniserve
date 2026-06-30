@@ -404,7 +404,7 @@ async fn chat_streams_text_events() {
         Box::pin(async move {
             let request = mock.recv_request().await;
             assert_eq!(request.request_id, "chat-1");
- // more fields here in the future
+            // more fields here in the future
             assert_eq!(
                 String::from_utf8(
                     request

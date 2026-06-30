@@ -50,19 +50,19 @@ use uniserve_sim::{SimEngine, SimExecutor};
 /// Configuration for one headless engine process.
 #[derive(Debug, Clone)]
 pub struct EngineProcConfig {
- /// Frontend handshake endpoint this engine dials (`tcp://…` / `ipc://…`).
+    /// Frontend handshake endpoint this engine dials (`tcp://…` / `ipc://…`).
     pub handshake_address: String,
- /// Engine index; becomes the 2-byte little-endian socket identity.
+    /// Engine index; becomes the 2-byte little-endian socket identity.
     pub engine_index: u32,
- /// Maximum time to wait for the frontend's INIT after HELLO.
+    /// Maximum time to wait for the frontend's INIT after HELLO.
     pub init_timeout: Duration,
- /// Engine runtime construction (worker spawn, model, scheduler).
+    /// Engine runtime construction (worker spawn, model, scheduler).
     pub core: EngineCoreConfig,
 }
 
 fn now_secs() -> f64 {
- // single shared epoch helper so this matches the frontend's and
- // scheduler's wall-clock timestamps.
+    // single shared epoch helper so this matches the frontend's and
+    // scheduler's wall-clock timestamps.
     uniserve_core::now_unix_secs()
 }
 
@@ -92,7 +92,7 @@ fn apply_native_controls(config: &mut EngineCoreConfig, ctrl: &NativeControlToke
 }
 
 fn model_dtype(core: &EngineCore) -> ModelDtype {
- // shared kv_dtype-alias parser (see `ModelDtype::from_kv_str`).
+    // shared kv_dtype-alias parser (see `ModelDtype::from_kv_str`).
     ModelDtype::from_kv_str(core.caps().kv_dtype.as_str())
 }
 
@@ -110,7 +110,7 @@ fn ready_response(core: &EngineCore) -> EngineCoreReadyResponse {
 enum OutMsg {
     Output(Box<EngineCoreOutput>),
     Utility(UtilityOutput),
- /// The engine died: emit the ENGINE_CORE_DEAD sentinel and stop.
+    /// The engine died: emit the ENGINE_CORE_DEAD sentinel and stop.
     Dead,
 }
 
@@ -151,8 +151,8 @@ async fn dial_handshake(
                 .await?;
 
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
- // Bound each wait so a HELLO sent into the void (endpoint bound by
- // nobody, or bound after our connect raced it) re-dials.
+            // Bound each wait so a HELLO sent into the void (endpoint bound by
+            // nobody, or bound after our connect raced it) re-dials.
             let wait = remaining
                 .min(Duration::from_secs(5))
                 .max(Duration::from_millis(100));
@@ -192,12 +192,12 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
     let mut core_cfg = cfg.core.clone();
     let identity = engine_identity(cfg.engine_index)?;
 
- // ---- 1+2. HELLO → INIT on the handshake socket. ----
+    // ---- 1+2. HELLO → INIT on the handshake socket. ----
 
- // In managed mode the supervisor spawns this process *before* the frontend
- // binds the handshake endpoint (the frontend binds it inside its engine
- // connect), so the dial retries with backoff until INIT arrives or the
- // init timeout elapses.
+    // In managed mode the supervisor spawns this process *before* the frontend
+    // binds the handshake endpoint (the frontend binds it inside its engine
+    // connect), so the dial retries with backoff until INIT arrives or the
+    // init timeout elapses.
     let (mut handshake, init) = tokio::select! {
         r = dial_handshake(&cfg.handshake_address, identity.clone(), cfg.init_timeout) => r?,
         _ = shutdown.cancelled() => return Ok(()),
@@ -218,8 +218,8 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
         apply_native_controls(&mut core_cfg, ctrl);
     }
 
- // ---- 3. Build the runtime: spawns the worker/sim and waits on the
- // worker's get_caps (model load can take minutes for the real worker). ----
+    // ---- 3. Build the runtime: spawns the worker/sim and waits on the
+    // worker's get_caps (model load can take minutes for the real worker). ----
     info!(model = %core_cfg.model, "building engine core (worker handshake / model load)");
     let core = tokio::task::spawn_blocking(move || {
         if core_cfg.backend == uniserve_engine_runtime::EngineBackend::Sim {
@@ -235,8 +235,8 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
     .context("engine runtime build task panicked")??;
     let core = Arc::new(core);
 
- // ---- 4. Register on the data plane: input DEALER (identity + ready
- // response payload) and output PUSH. ----
+    // ---- 4. Register on the data plane: input DEALER (identity + ready
+    // response payload) and output PUSH. ----
     let mut input_options = SocketOptions::default();
     input_options.peer_identity(identity);
     let mut input = DealerSocket::with_options(input_options);
@@ -254,13 +254,13 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
         .await
         .with_context(|| format!("connecting output {output_address}"))?;
 
- // ---- 5. READY: post-load truth has been registered; open the gate. ----
+    // ---- 5. READY: post-load truth has been registered; open the gate. ----
     handshake
         .send(ZmqMessage::from(encode_msgpack(&status_message("READY"))?))
         .await?;
     info!(engine_index = cfg.engine_index, "engine ready");
 
- // ---- 6. Serve. ----
+    // ---- 6. Serve. ----
     let (out_tx, out_rx) = mpsc::unbounded_channel::<OutMsg>();
     let output_task = tokio::spawn(run_output_loop(
         cfg.engine_index,
@@ -270,10 +270,10 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
         core.caps().block_size,
     ));
 
- // Engine-dead monitor: when the scheduler loop dies (worker failure), push
- // the ENGINE_CORE_DEAD sentinel so the frontend fails fast, then bring this
- // process down (the managed-mode supervisor
- // observes the exit).
+    // Engine-dead monitor: when the scheduler loop dies (worker failure), push
+    // the ENGINE_CORE_DEAD sentinel so the frontend fails fast, then bring this
+    // process down (the managed-mode supervisor
+    // observes the exit).
     let dead_watch = {
         let core = Arc::clone(&core);
         let out_tx = out_tx.clone();
@@ -283,7 +283,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
                 if core.is_dead() {
                     warn!("engine core died; emitting ENGINE_CORE_DEAD");
                     let _ = out_tx.send(OutMsg::Dead);
- // Give the output loop a beat to flush the sentinel.
+                    // Give the output loop a beat to flush the sentinel.
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     return;
                 }
@@ -301,7 +301,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
         _ = dead_watch => Err(anyhow::anyhow!("engine core died (worker failure)")),
     };
 
- // Tear down: stop accepting, stop the engine, flush the output task.
+    // Tear down: stop accepting, stop the engine, flush the output task.
     drop(out_tx);
     let _ = output_task.await;
     let core = Arc::try_unwrap(core);
@@ -310,7 +310,7 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
             .await
             .context("engine shutdown task panicked")?,
         Err(core_arc) => {
- // Adapter tasks still hold clones; shut down through the shared ref.
+            // Adapter tasks still hold clones; shut down through the shared ref.
             core_arc.shutdown();
         }
     }
@@ -339,20 +339,18 @@ async fn run_input_loop(
             );
             continue;
         }
-        let request = match EngineCoreControlRequest::decode_frames(
-            frames[0].as_ref(),
-            frames[1].as_ref(),
-        ) {
-            None => {
-                warn!(type_frame = ?frames[0].as_ref(), "unknown request type (ignored)");
-                continue;
-            }
-            Some(Err(e)) => {
-                warn!(error = %e, "failed to decode request (ignored)");
-                continue;
-            }
-            Some(Ok(request)) => request,
-        };
+        let request =
+            match EngineCoreControlRequest::decode_frames(frames[0].as_ref(), frames[1].as_ref()) {
+                None => {
+                    warn!(type_frame = ?frames[0].as_ref(), "unknown request type (ignored)");
+                    continue;
+                }
+                Some(Err(e)) => {
+                    warn!(error = %e, "failed to decode request (ignored)");
+                    continue;
+                }
+                Some(Ok(request)) => request,
+            };
 
         match request {
             EngineCoreControlRequest::Add(req) => handle_add(core, active, out_tx, *req),
@@ -370,7 +368,7 @@ async fn run_input_loop(
                 let _ = out_tx.send(OutMsg::Utility(output));
             }
             EngineCoreControlRequest::StartDpWave => {
- // Reserved: wave coordination for engines sharing collective forward passes.
+                // Reserved: wave coordination for engines sharing collective forward passes.
                 debug!("ignoring START_DP_WAVE (no coordinator)");
             }
         }
@@ -453,8 +451,8 @@ fn execute_utility(core: &Arc<EngineCore>, req: EngineCoreUtilityRequest) -> Uti
                 Value::Boolean(core.remove_lora(lora_id as u32))
             }
             "collective_rpc" => {
- // args = (method, timeout, args, kwargs) — only payload-free descriptor
- // methods are supported; no arbitrary code or tensors cross the seam.
+                // args = (method, timeout, args, kwargs) — only payload-free descriptor
+                // methods are supported; no arbitrary code or tensors cross the seam.
                 let method = req
                     .args
                     .as_array()
@@ -545,8 +543,8 @@ async fn run_output_loop(
                 Some(EngineCoreOutputs {
                     engine_index,
                     outputs,
- // Live scheduler load rides every request batch: it feeds the frontend's
- // routing score and Prometheus metrics.
+                    // Live scheduler load rides every request batch: it feeds the frontend's
+                    // routing score and Prometheus metrics.
                     scheduler_stats: Some(Box::new(reporter.snapshot(&stats, block_size))),
                     timestamp: now_secs(),
                     ..Default::default()

@@ -54,11 +54,11 @@ pub fn to_uniserve_sampling(sp: Option<&EngineCoreSamplingParams>) -> USampling 
             .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
             .unwrap_or_default(),
         min_tokens: sp.min_tokens as usize,
- // `logprobs` is `None` (disabled), a positive count, or `-1` (the full
- // vocabulary). `n_logprobs` is a `u32` count with no "all" sentinel, and
- // the worker clamps it with `min(n_logprobs, vocab_size)`, so map the
- // full-vocab request to `u32::MAX` (clamped to vocab downstream) rather
- // than silently collapsing it to `0` (== logprobs disabled).
+        // `logprobs` is `None` (disabled), a positive count, or `-1` (the full
+        // vocabulary). `n_logprobs` is a `u32` count with no "all" sentinel, and
+        // the worker clamps it with `min(n_logprobs, vocab_size)`, so map the
+        // full-vocab request to `u32::MAX` (clamped to vocab downstream) rather
+        // than silently collapsing it to `0` (== logprobs disabled).
         n_logprobs: match sp.logprobs {
             Some(n) if n < 0 => u32::MAX,
             Some(n) => n as u32,
@@ -122,20 +122,20 @@ pub fn to_generate_request(
     generate.neg_prompt_ids = neg_prompt_ids;
     generate.mm_items = mm_items;
     generate.priority = req.priority;
- // `lora_int_id` is u64 on the reference-shaped wire struct, but the
- // registry guarantees it fits u32 at allocation (LoraManager id-space guard),
- // so this narrowing is lossless.
+    // `lora_int_id` is u64 on the reference-shaped wire struct, but the
+    // registry guarantees it fits u32 at allocation (LoraManager id-space guard),
+    // so this narrowing is lossless.
     generate.lora_id = req.lora_request.as_ref().map(|l| l.lora_int_id as u32);
- // Structured outputs: the frontend tokenized the guided choices; the engine
- // compiles them into a per-step token-mask grammar.
+    // Structured outputs: the frontend tokenized the guided choices; the engine
+    // compiles them into a per-step token-mask grammar.
     generate.grammar = req
         .sampling_params
         .as_ref()
         .and_then(|s| s.choice_token_ids.clone())
         .filter(|c| !c.is_empty())
         .map(uniserve_engine_api::GrammarSpec::Choice);
- // honor the per-request prefix-cache read opt-out (
- // field the engine silently dropped) so `bypass_prefix_cache` is real.
+    // honor the per-request prefix-cache read opt-out (
+    // field the engine silently dropped) so `bypass_prefix_cache` is real.
     generate.skip_reading_prefix_cache = req
         .sampling_params
         .as_ref()
@@ -196,11 +196,11 @@ pub fn build_logprobs(
     top: Option<Vec<(u32, f32)>>,
 ) -> Option<MaybeWireLogprobs> {
     let sampled = sampled?;
- // The sampler returns the sampled token's logprob but not its true vocab
- // rank (it does not count how many masked logits outrank it), so emit rank
- // `0` ("rank unknown") rather than fabricating `1`. A fabricated `1` would
- // both lie about the sampled token's position and collide with the first
- // top-k alternative's rank, which is the genuine 1-based candidate rank.
+    // The sampler returns the sampled token's logprob but not its true vocab
+    // rank (it does not count how many masked logits outrank it), so emit rank
+    // `0` ("rank unknown") rather than fabricating `1`. A fabricated `1` would
+    // both lie about the sampled token's position and collide with the first
+    // top-k alternative's rank, which is the genuine 1-based candidate rank.
     let mut entries = vec![TokenLogprob {
         token_id,
         logprob: sampled,
@@ -224,11 +224,11 @@ pub fn build_logprobs(
 #[derive(Debug, Clone)]
 pub struct AdapterParams {
     pub request_id: String,
- /// Emit per-token logprobs (`sampling_params.logprobs > 0`).
+    /// Emit per-token logprobs (`sampling_params.logprobs > 0`).
     pub want_logprobs: bool,
- /// The request is a native image/interleave request: image events and
- /// finish statistics ride the wire `native` extension, and `Scheduled`
- /// timestamps are surfaced as `EngineCoreEvent`s.
+    /// The request is a native image/interleave request: image events and
+    /// finish statistics ride the wire `native` extension, and `Scheduled`
+    /// timestamps are surfaced as `EngineCoreEvent`s.
     pub native: bool,
 }
 
@@ -247,13 +247,13 @@ pub async fn run_event_adapter(
         native,
     } = params;
 
- // A `TextToken` is held until its `TokenLogprobs` arrives so the sampled
- // token and its top-k alternatives land in one wire output. This coalescing
- // is ONLY needed when logprobs were requested: the scheduler emits
- // `TokenLogprobs` iff `want_logprobs`, and it does so in the same step right
- // after the `TextToken`. When logprobs are NOT requested, holding the token
- // would delay it until the *next* token (a full decode step, ~25ms),
- // inflating streaming TTFT; so in that case we emit immediately.
+    // A `TextToken` is held until its `TokenLogprobs` arrives so the sampled
+    // token and its top-k alternatives land in one wire output. This coalescing
+    // is ONLY needed when logprobs were requested: the scheduler emits
+    // `TokenLogprobs` iff `want_logprobs`, and it does so in the same step right
+    // after the `TextToken`. When logprobs are NOT requested, holding the token
+    // would delay it until the *next* token (a full decode step, ~25ms),
+    // inflating streaming TTFT; so in that case we emit immediately.
     let mut pending: Option<(u32, Option<f32>)> = None;
 
     let token_output = |id: u32, lp: Option<f32>, top: Option<Vec<(u32, f32)>>| EngineCoreOutput {
@@ -281,7 +281,7 @@ pub async fn run_event_adapter(
             GenEvent::TextToken { id, logprob } => {
                 flush_pending!();
                 if want_logprobs {
- // Coalesce with the TokenLogprobs emitted in this same step.
+                    // Coalesce with the TokenLogprobs emitted in this same step.
                     pending = Some((id, logprob));
                 } else if !emit(token_output(id, logprob, None)) {
                     break;
@@ -322,8 +322,8 @@ pub async fn run_event_adapter(
                 width,
                 steps,
             } if native => {
- // Flush the held text token first: image events must not
- // overtake the text that preceded them in interleaved streams.
+                // Flush the held text token first: image events must not
+                // overtake the text that preceded them in interleaved streams.
                 flush_pending!();
                 let output = native_image_output(
                     &request_id,
@@ -415,8 +415,8 @@ pub async fn run_event_adapter(
                 });
                 break;
             }
- // Non-native requests have no wire shape for these; drop them, as
- // the in-process text path always has.
+            // Non-native requests have no wire shape for these; drop them, as
+            // the in-process text path always has.
             GenEvent::Scheduled { .. }
             | GenEvent::ImageBegin { .. }
             | GenEvent::ImageStep { .. }
@@ -533,8 +533,8 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
                 images: f.images as usize,
             }),
             None => {
- // A native stream should always carry the finish extension;
- // fall back to a coarse mapping if it is missing.
+                // A native stream should always carry the finish extension;
+                // fall back to a coarse mapping if it is missing.
                 let reason = match finish_reason {
                     EngineCoreFinishReason::Stop => FinishReason::Eos,
                     EngineCoreFinishReason::Length => FinishReason::MaxTokens,
@@ -564,9 +564,9 @@ mod tests {
 
     #[test]
     fn build_logprobs_sampled_entry_has_no_fabricated_rank() {
- // The sampled token's true vocab rank is unknown to the sampler, so it
- // is emitted as `0` ("unknown") and must not collide with the first
- // top-k alternative's genuine 1-based rank.
+        // The sampled token's true vocab rank is unknown to the sampler, so it
+        // is emitted as `0` ("unknown") and must not collide with the first
+        // top-k alternative's genuine 1-based rank.
         let lp = build_logprobs(7, Some(-0.5), Some(vec![(7, -0.5), (9, -1.2)]))
             .expect("sampled logprob present");
         let positions = match lp {
@@ -576,9 +576,9 @@ mod tests {
         assert_eq!(positions.len(), 1);
         let entries = &positions[0].entries;
         assert_eq!(entries.len(), 3);
- // Sampled token first, rank unknown.
+        // Sampled token first, rank unknown.
         assert_eq!((entries[0].token_id, entries[0].rank), (7, 0));
- // Alternatives carry 1-based candidate ranks.
+        // Alternatives carry 1-based candidate ranks.
         assert_eq!(entries[1].rank, 1);
         assert_eq!(entries[2].rank, 2);
     }
@@ -588,8 +588,8 @@ mod tests {
         let mut sp = EngineCoreSamplingParams::for_test();
         sp.logprobs = Some(-1);
         let u = to_uniserve_sampling(Some(&sp));
- // `-1` (full vocabulary) must not collapse to `0` (disabled); it maps to
- // the max count, which the worker clamps to the vocab size.
+        // `-1` (full vocabulary) must not collapse to `0` (disabled); it maps to
+        // the max count, which the worker clamps to the vocab size.
         assert_eq!(u.n_logprobs, u32::MAX);
 
         sp.logprobs = Some(5);
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn skip_reading_prefix_cache_is_plumbed_to_generate_request() {
- // the wire opt-out is honored at this boundary.
+        // the wire opt-out is honored at this boundary.
         let mut sp = EngineCoreSamplingParams::for_test();
         sp.skip_reading_prefix_cache = Some(true);
         let req = EngineCoreRequest {
@@ -634,7 +634,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         assert!(to_generate_request(&req, RequestId(7), tx).skip_reading_prefix_cache);
 
- // Absent / false defaults to reading the cache (the common case).
+        // Absent / false defaults to reading the cache (the common case).
         let mut sp = EngineCoreSamplingParams::for_test();
         sp.skip_reading_prefix_cache = None;
         let req = EngineCoreRequest {
@@ -691,8 +691,8 @@ mod tests {
         assert_eq!(g.neg_prompt_ids, vec![9]);
     }
 
- /// GenEvents adapted onto the wire and back arrive intact (the socket-mode
- /// native stream roundtrip).
+    /// GenEvents adapted onto the wire and back arrive intact (the socket-mode
+    /// native stream roundtrip).
     #[tokio::test]
     async fn native_event_wire_roundtrip() {
         let (tx, rx) = mpsc::unbounded_channel();

@@ -11,10 +11,10 @@ use crate::request::{SamplingParams, TextRequest};
 /// One text request after it has been lowered into the raw generate boundary.
 #[derive(Debug)]
 pub struct PreparedTextRequest {
- /// The original high-level request, preserved for response-side metadata
- /// and decoding options.
+    /// The original high-level request, preserved for response-side metadata
+    /// and decoding options.
     pub text_request: TextRequest,
- /// The southbound request ready to be sent to `llm`.
+    /// The southbound request ready to be sent to `llm`.
     pub generate_request: GenerateRequest,
 }
 
@@ -41,7 +41,7 @@ pub fn lower_text_request(
         priority: request.priority,
         data_parallel_rank: request.data_parallel_rank,
         lora_request: request.lora_request.clone(),
- // Fields below are currently placeholders.
+        // Fields below are currently placeholders.
         arrival_time: None,
         trace_headers: None,
         reasoning_ended: None,
@@ -95,10 +95,10 @@ pub fn lower_sampling_params(
         uniserve_xargs,
     } = sampling_params;
 
- // Mirrors the model-generation-config inheritance used by the reference OpenAI chat
- // If neither the caller nor the model provides a value, fall back to 1.0 — the
- // default used by the the reference OpenAI-compatible API (via
- // `_DEFAULT_SAMPLING_PARAMS`).
+    // Mirrors the model-generation-config inheritance used by the reference OpenAI chat
+    // If neither the caller nor the model provides a value, fall back to 1.0 — the
+    // default used by the the reference OpenAI-compatible API (via
+    // `_DEFAULT_SAMPLING_PARAMS`).
     let temperature = temperature.or(default_temperature).unwrap_or(1.0);
     let top_p = top_p.or(default_top_p).unwrap_or(1.0);
     let top_k = top_k.or(default_top_k).unwrap_or(0);
@@ -188,21 +188,20 @@ fn tokenize_bad_words(
     let mut all_token_ids = Vec::new();
 
     for bad_word in bad_words.into_iter().flatten() {
- // Without a leading space we always keep the encoding.
- // With a leading space we only keep it when the prefix-space variant produces a
- // distinct first token but the same sequence length *relative to this word's
- // no-space variant* — this mirrors the Python dedup condition that avoids
- // redundant entries. Comparing against this word's own `without_space` (rather
- // than `all_token_ids.last`) keeps the dedup correct even when `without_space`
- // was empty (and thus not pushed) or when the previous entry belongs to a
- // different bad word.
+        // Without a leading space we always keep the encoding.
+        // With a leading space we only keep it when the prefix-space variant produces a
+        // distinct first token but the same sequence length *relative to this word's
+        // no-space variant* — this mirrors the Python dedup condition that avoids
+        // redundant entries. Comparing against this word's own `without_space` (rather
+        // than `all_token_ids.last`) keeps the dedup correct even when `without_space`
+        // was empty (and thus not pushed) or when the previous entry belongs to a
+        // different bad word.
         let without_space = tokenizer.encode(bad_word, false)?;
         let with_space = tokenizer.encode(&format!(" {}", bad_word.trim_start()), false)?;
 
         let keep_with_space = !with_space.is_empty()
             && (without_space.is_empty()
-                || (with_space[0] != without_space[0]
-                    && with_space.len() == without_space.len()));
+                || (with_space[0] != without_space[0] && with_space.len() == without_space.len()));
 
         if !without_space.is_empty() {
             all_token_ids.push(without_space);
@@ -251,8 +250,8 @@ fn merge_unique_token_ids(
     stop_token_ids: &mut Vec<u32>,
     extra_token_ids: impl Iterator<Item = u32>,
 ) {
- // Keep user-provided ordering stable while still folding in backend-derived EOS
- // aliases.
+    // Keep user-provided ordering stable while still folding in backend-derived EOS
+    // aliases.
     for token_id in extra_token_ids {
         if !stop_token_ids.contains(&token_id) {
             stop_token_ids.push(token_id);
@@ -268,8 +267,8 @@ mod tests {
     use crate::backend::SamplingHints;
     use crate::request::{Prompt, TextRequest};
 
- /// Stub tokenizer that returns empty token IDs — sufficient for tests that
- /// don't exercise bad-words tokenization.
+    /// Stub tokenizer that returns empty token IDs — sufficient for tests that
+    /// don't exercise bad-words tokenization.
     struct StubTokenizer;
 
     impl Tokenizer for StubTokenizer {
@@ -625,8 +624,8 @@ mod tests {
         .assert_debug_eq(&params);
     }
 
- /// Tokenizer that maps exact input strings to canned token-id sequences,
- /// used to exercise the bad-words prefix-space dedup logic.
+    /// Tokenizer that maps exact input strings to canned token-id sequences,
+    /// used to exercise the bad-words prefix-space dedup logic.
     struct MapTokenizer {
         map: std::collections::HashMap<String, Vec<u32>>,
     }
@@ -655,11 +654,11 @@ mod tests {
 
     #[test]
     fn tokenize_bad_words_dedup_uses_same_word_no_space_variant() {
- // Two bad words. For "alpha" the prefix-space variant differs in its first
- // token but has the same length, so it must be kept. For "beta" the
- // prefix-space variant matches the no-space variant's first token, so it
- // must be dropped. The dropped "beta" prefix variant must NOT be compared
- // against the prior-pushed "alpha" entry.
+        // Two bad words. For "alpha" the prefix-space variant differs in its first
+        // token but has the same length, so it must be kept. For "beta" the
+        // prefix-space variant matches the no-space variant's first token, so it
+        // must be dropped. The dropped "beta" prefix variant must NOT be compared
+        // against the prior-pushed "alpha" entry.
         let mut map = std::collections::HashMap::new();
         map.insert("alpha".to_string(), vec![10, 11]);
         map.insert(" alpha".to_string(), vec![20, 11]);
@@ -670,36 +669,30 @@ mod tests {
         let words = vec!["alpha".to_string(), "beta".to_string()];
         let result = tokenize_bad_words(Some(&words), &tokenizer).unwrap();
 
-        assert_eq!(
-            result,
-            Some(vec![vec![10, 11], vec![20, 11], vec![30, 31]])
-        );
+        assert_eq!(result, Some(vec![vec![10, 11], vec![20, 11], vec![30, 31]]));
     }
 
     #[test]
     fn tokenize_bad_words_keeps_prefix_variant_when_no_space_variant_empty() {
- // If the no-space variant tokenizes to nothing, the dedup must not compare
- // against an unrelated previous word's entry (the original bug, where
- // `all_token_ids.last` pointed at "alpha"). The prefix-space variant is
- // kept on its own merits.
+        // If the no-space variant tokenizes to nothing, the dedup must not compare
+        // against an unrelated previous word's entry (the original bug, where
+        // `all_token_ids.last` pointed at "alpha"). The prefix-space variant is
+        // kept on its own merits.
         let mut map = std::collections::HashMap::new();
         map.insert("alpha".to_string(), vec![10, 11]);
         map.insert(" alpha".to_string(), vec![20, 11]);
- // "gamma" has no no-space entry (maps to empty); its prefix variant happens
- // to equal alpha's prefix entry [20, 11]. The OLD code compared against
- // `all_token_ids.last` == [20, 11] and (20 == 20) DROPPED it. The correct
- // behaviour keeps it, because there is no same-word no-space variant for it
- // to be redundant against.
+        // "gamma" has no no-space entry (maps to empty); its prefix variant happens
+        // to equal alpha's prefix entry [20, 11]. The OLD code compared against
+        // `all_token_ids.last` == [20, 11] and (20 == 20) DROPPED it. The correct
+        // behaviour keeps it, because there is no same-word no-space variant for it
+        // to be redundant against.
         map.insert(" gamma".to_string(), vec![20, 11]);
         let tokenizer = MapTokenizer { map };
 
         let words = vec!["alpha".to_string(), "gamma".to_string()];
         let result = tokenize_bad_words(Some(&words), &tokenizer).unwrap();
 
-        assert_eq!(
-            result,
-            Some(vec![vec![10, 11], vec![20, 11], vec![20, 11]])
-        );
+        assert_eq!(result, Some(vec![vec![10, 11], vec![20, 11], vec![20, 11]]));
     }
 
     #[test]

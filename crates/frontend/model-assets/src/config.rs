@@ -13,10 +13,10 @@ pub struct HfTokenizerConfig {
     #[serde(flatten)]
     pub special_tokens: HfSpecialTokens,
     pub chat_template: Option<String>,
- /// The `tokenizer_class` field from HuggingFace tokenizer configs. Some
- /// tiktoken-based models (e.g. DeepSeek, Kimi K2) set this to a value
- /// containing "Tiktoken" which can be used as a hint for backend
- /// selection.
+    /// The `tokenizer_class` field from HuggingFace tokenizer configs. Some
+    /// tiktoken-based models (e.g. DeepSeek, Kimi K2) set this to a value
+    /// containing "Tiktoken" which can be used as a hint for backend
+    /// selection.
     pub tokenizer_class: Option<String>,
 }
 
@@ -68,7 +68,7 @@ pub struct HfSpecialTokens {
 }
 
 impl HfSpecialTokens {
- /// Returns true if we don't discover any special tokens in the config.
+    /// Returns true if we don't discover any special tokens in the config.
     pub fn is_empty(&self) -> bool {
         self.bos_token.is_none()
             && self.eos_token.is_none()
@@ -143,8 +143,8 @@ impl OneOrManyExpertCount {
     fn first_value(&self) -> u32 {
         match self {
             Self::One(value) => *value,
- // Python currently takes the first value for list[int] expert
- // counts in remote-code configs.
+            // Python currently takes the first value for list[int] expert
+            // counts in remote-code configs.
             Self::Many(values) => values.first().copied().unwrap_or(0),
         }
     }
@@ -160,31 +160,31 @@ pub struct BlockConfig {
 }
 
 impl ModelConfig {
- /// Return the config that the Rust frontend treats as the text/LLM config.
+    /// Return the config that the Rust frontend treats as the text/LLM config.
 
- /// This is deliberately narrower than Python/transformers: we only support
- /// either the top-level config itself or a single nested `text_config`.
+    /// This is deliberately narrower than Python/transformers: we only support
+    /// either the top-level config itself or a single nested `text_config`.
     fn effective_text_config(&self) -> &Self {
         self.text_config.as_deref().unwrap_or(self)
     }
 
- /// Return the effective Hugging Face `model_type` used by the Rust
- /// frontend.
+    /// Return the effective Hugging Face `model_type` used by the Rust
+    /// frontend.
 
- /// This follows the same simplified text-config selection as the rest of
- /// this type: the top-level config wins, otherwise a single nested
- /// `text_config` may provide the value.
+    /// This follows the same simplified text-config selection as the rest of
+    /// this type: the top-level config wins, otherwise a single nested
+    /// `text_config` may provide the value.
     pub fn model_type(&self) -> Option<&str> {
         self.model_type
             .as_deref()
             .or_else(|| self.text_config.as_deref()?.model_type())
     }
 
- /// Reject partially nested `text_config` payloads that are unlikely to be
- /// valid LLM configs for our current use.
+    /// Reject partially nested `text_config` payloads that are unlikely to be
+    /// valid LLM configs for our current use.
 
- /// This keeps the simplified Rust-side parsing honest: if a model declares
- /// `text_config`, it must at least look like a real text model config.
+    /// This keeps the simplified Rust-side parsing honest: if a model declares
+    /// `text_config`, it must at least look like a real text model config.
     fn validate_text_config_selection(&self) -> Result<()> {
         if let Some(text_config) = self.text_config.as_deref()
             && text_config.num_attention_heads.is_none()
@@ -198,12 +198,12 @@ impl ModelConfig {
         Ok(())
     }
 
- /// Match Python's current expert-count priority on the selected text
- /// config.
+    /// Match Python's current expert-count priority on the selected text
+    /// config.
 
- /// The only intentional simplification here is how we pick the text config:
- /// Rust only looks at the top level or `text_config`, not the broader
- /// transformers composite-config surface.
+    /// The only intentional simplification here is how we pick the text config:
+    /// Rust only looks at the top level or `text_config`, not the broader
+    /// transformers composite-config surface.
     fn num_experts_from_block_configs(&self) -> u32 {
         self.effective_text_config()
             .block_configs

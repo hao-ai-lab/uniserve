@@ -161,7 +161,11 @@ fn sse_json_chunks(text: &str) -> Vec<serde_json::Value> {
 fn streamed_chat_content(text: &str) -> String {
     sse_json_chunks(text)
         .iter()
-        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str().map(str::to_owned))
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
         .collect()
 }
 
@@ -175,9 +179,11 @@ fn streamed_completion_text(text: &str) -> String {
 
 /// Find the single finish_reason emitted across the streamed SSE chunks.
 fn streamed_finish_reason(text: &str) -> Option<String> {
-    sse_json_chunks(text)
-        .iter()
-        .find_map(|chunk| chunk["choices"][0]["finish_reason"].as_str().map(str::to_owned))
+    sse_json_chunks(text).iter().find_map(|chunk| {
+        chunk["choices"][0]["finish_reason"]
+            .as_str()
+            .map(str::to_owned)
+    })
 }
 
 type TestFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
@@ -1046,9 +1052,9 @@ async fn server_info_endpoint_is_dev_mode_only() {
 async fn load_lora_adapter_registers_model_and_forwards_lora_request() {
     let (mut app, engine_task) = test_admin_app_with_engine_script(|mut mock| {
         boxed_test_future(async move {
- // `add_lora`/`remove_lora` are answered in-process by the mock client;
- // only the three generate requests reach the mock engine. Each must
- // carry the resolved `adapter-a` LoRA request.
+            // `add_lora`/`remove_lora` are answered in-process by the mock client;
+            // only the three generate requests reach the mock engine. Each must
+            // carry the resolved `adapter-a` LoRA request.
             let request = mock.recv_request().await;
             assert_adapter_a_lora_request(&request);
             mock.send_outputs(engine_outputs_for_request(
@@ -1249,8 +1255,8 @@ async fn server_info_endpoint_returns_not_found_without_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn unload_lora_adapter_rejects_mismatched_lora_int_id() {
- // `add_lora` is answered in-process by the mock client; the unload mismatch is
- // rejected app-side, so the engine never sees a generate request.
+    // `add_lora` is answered in-process by the mock client; the unload mismatch is
+    // rejected app-side, so the engine never sees a generate request.
     let (mut app, engine_task) =
         test_admin_app_with_engine_script(|_mock| boxed_test_future(async move {})).await;
 
@@ -1359,9 +1365,9 @@ async fn http_metrics_record_list_models_requests() {
 
     assert_eq!(response.status(), StatusCode::OK);
 
- // HTTP metrics are recorded when the response body is fully sent (the
- // body-end guard in `track_http_metrics`), so drive the body to completion
- // before reading the post-request snapshot.
+    // HTTP metrics are recorded when the response body is fully sent (the
+    // body-end guard in `track_http_metrics`), so drive the body to completion
+    // before reading the post-request snapshot.
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("drain body");
@@ -1793,7 +1799,7 @@ async fn http_metrics_group_error_statuses() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
- // Metrics are recorded at body completion; drain the body before snapshot.
+    // Metrics are recorded at body completion; drain the body before snapshot.
     let _ = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("drain body");
@@ -3414,7 +3420,7 @@ async fn streaming_chat_prompt_logprobs_are_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn reset_prefix_cache_route_sends_expected_utility_call() {
- // `reset_prefix_cache` is answered in-process by the mock client.
+    // `reset_prefix_cache` is answered in-process by the mock client.
     let (app, engine_task) =
         test_admin_app_with_engine_script(|_mock| boxed_test_future(async move {})).await;
 
@@ -3442,7 +3448,7 @@ async fn reset_prefix_cache_route_sends_expected_utility_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn reset_mm_cache_route_sends_expected_utility_call() {
- // `reset_mm_cache` is answered in-process by the mock client.
+    // `reset_mm_cache` is answered in-process by the mock client.
     let (app, engine_task) =
         test_admin_app_with_engine_script(|_mock| boxed_test_future(async move {})).await;
 
@@ -3470,7 +3476,7 @@ async fn reset_mm_cache_route_sends_expected_utility_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn reset_encoder_cache_route_sends_expected_utility_call() {
- // `reset_encoder_cache` is answered in-process by the mock client.
+    // `reset_encoder_cache` is answered in-process by the mock client.
     let (app, engine_task) =
         test_admin_app_with_engine_script(|_mock| boxed_test_future(async move {})).await;
 
@@ -3498,7 +3504,7 @@ async fn reset_encoder_cache_route_sends_expected_utility_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn sleep_route_uses_python_compatible_default_query_values() {
- // `sleep` is answered in-process by the mock client.
+    // `sleep` is answered in-process by the mock client.
     let (app, engine_task) =
         test_admin_app_with_engine_script(|_mock| boxed_test_future(async move {})).await;
 
@@ -3526,7 +3532,7 @@ async fn sleep_route_uses_python_compatible_default_query_values() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn wake_up_route_without_tags_sends_none() {
- // `wake_up` is answered in-process by the mock client.
+    // `wake_up` is answered in-process by the mock client.
     let (app, engine_task) =
         test_admin_app_with_engine_script(|_mock| boxed_test_future(async move {})).await;
 
@@ -3703,8 +3709,8 @@ async fn chat_request_sampling_fields_are_mapped_into_engine_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn non_stream_completions_stop_string_excluded_from_output() {
- // Engine generates "say world" but stop string "wor" truncates output to "say
- // ".
+    // Engine generates "say world" but stop string "wor" truncates output to "say
+    // ".
     let output_specs = vec![
         (bytes_to_token_ids(b"say"), None),
         (
@@ -3751,8 +3757,8 @@ async fn non_stream_completions_stop_string_excluded_from_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn non_stream_completions_stop_string_included_in_output() {
- // Same tokens but include_stop_str_in_output=true includes the stop string in
- // the output.
+    // Same tokens but include_stop_str_in_output=true includes the stop string in
+    // the output.
     let output_specs = vec![
         (bytes_to_token_ids(b"say"), None),
         (
@@ -3800,8 +3806,8 @@ async fn non_stream_completions_stop_string_included_in_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn non_stream_completions_no_stop_string_match_preserves_original_finish_reason() {
- // Stop string "xyz" does not appear in "hi!" so the original finish reason is
- // preserved.
+    // Stop string "xyz" does not appear in "hi!" so the original finish reason is
+    // preserved.
     let (app, engine_task) = test_app_with_engine_handle().await;
 
     let response = app
@@ -3833,18 +3839,18 @@ async fn non_stream_completions_no_stop_string_match_preserves_original_finish_r
     engine_task.await.expect("mock engine task");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
 
- // Default output is "hi" (stop token '!' suppressed), finish_reason remains
- // "stop" from EOS.
+    // Default output is "hi" (stop token '!' suppressed), finish_reason remains
+    // "stop" from EOS.
     assert_eq!(json["choices"][0]["text"], "hi");
     assert_eq!(json["choices"][0]["finish_reason"], "stop");
- // No text stop string matched — stop_reason should be absent.
+    // No text stop string matched — stop_reason should be absent.
     assert!(json["choices"][0]["stop_reason"].is_null());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn non_stream_completions_stop_string_array_matches_first_occurrence() {
- // Multiple stop strings: "rl" appears in "world" but " wo" appears earlier.
+    // Multiple stop strings: "rl" appears in "world" but " wo" appears earlier.
     let output_specs = vec![(
         bytes_to_token_ids(b"say world"),
         Some(EngineCoreFinishReason::Length),
@@ -3880,7 +3886,7 @@ async fn non_stream_completions_stop_string_array_matches_first_occurrence() {
     engine_task.await.expect("mock engine task");
     let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
 
- // " wo" is detected first (at byte 3), so output is truncated to "say".
+    // " wo" is detected first (at byte 3), so output is truncated to "say".
     assert_eq!(json["choices"][0]["text"], "say");
     assert_eq!(json["choices"][0]["finish_reason"], "stop");
     assert_eq!(json["choices"][0]["stop_reason"], " wo");

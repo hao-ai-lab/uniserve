@@ -138,7 +138,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
     }
 
     fn model_dtype(&self) -> ModelDtype {
- // shared kv_dtype-alias parser (see `ModelDtype::from_kv_str`).
+        // shared kv_dtype-alias parser (see `ModelDtype::from_kv_str`).
         ModelDtype::from_kv_str(self.core.caps().kv_dtype.as_str())
     }
 

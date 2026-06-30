@@ -22,15 +22,15 @@ pub struct ProcCtx<'a> {
 /// What a processor contributes to the op's masks.
 #[derive(Default)]
 pub struct MaskContribution {
- /// Restrict sampling to these ids (intersected across processors).
+    /// Restrict sampling to these ids (intersected across processors).
     pub allowed: Option<Vec<u32>>,
- /// Forbid sampling these ids (unioned across processors).
+    /// Forbid sampling these ids (unioned across processors).
     pub suppress: Vec<u32>,
 }
 
 pub trait LogitsProcessor: Send {
     fn name(&self) -> &'static str;
- /// the reference `is_argmax_invariant`: whether the processor can change the argmax.
+    /// the reference `is_argmax_invariant`: whether the processor can change the argmax.
     fn is_argmax_invariant(&self) -> bool;
     fn contribute(&self, ctx: &ProcCtx) -> MaskContribution;
 }
@@ -158,7 +158,7 @@ mod tests {
         };
         let (_a, sup) = run_pipeline(&pipe, &ctx(2, &[151645, 151643], &[], &sp));
         assert_eq!(sup, Some(vec![151643, 151645]));
- // at/after the floor, EOS is allowed again
+        // at/after the floor, EOS is allowed again
         let (_a, sup) = run_pipeline(&pipe, &ctx(5, &[151645, 151643], &[], &sp));
         assert_eq!(sup, None);
     }
@@ -170,10 +170,10 @@ mod tests {
             bad_words_ids: vec![vec![7, 8, 9]],
             ..Default::default()
         };
- // recent ends in [7, 8] -> emitting 9 would complete the bad word.
+        // recent ends in [7, 8] -> emitting 9 would complete the bad word.
         let (_a, sup) = run_pipeline(&pipe, &ctx(2, &[0], &[1, 7, 8], &sp));
         assert_eq!(sup, Some(vec![9]));
- // recent does not match the prefix -> no suppression.
+        // recent does not match the prefix -> no suppression.
         let (_a, sup) = run_pipeline(&pipe, &ctx(2, &[0], &[1, 2, 3], &sp));
         assert_eq!(sup, None);
     }
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(allow, Some(vec![3, 4]));
     }
 
- /// Adding a processor needs no scheduler edit — just push onto the pipeline.
+    /// Adding a processor needs no scheduler edit — just push onto the pipeline.
     #[test]
     fn custom_processor_composes() {
         struct BanZero;

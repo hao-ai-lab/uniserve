@@ -67,7 +67,7 @@ pub struct HyV3ToolParser {
 }
 
 impl HyV3ToolParser {
- /// Create a HY3 tool parser.
+    /// Create a HY3 tool parser.
     fn new(tools: &[Tool]) -> Self {
         Self {
             buffer: String::new(),
@@ -77,7 +77,7 @@ impl HyV3ToolParser {
         }
     }
 
- /// Apply one parsed HY3 event to parser state and output.
+    /// Apply one parsed HY3 event to parser state and output.
     fn apply_event(&mut self, event: HyV3Event, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             HyV3Event::Text { len: consumed_len } => {

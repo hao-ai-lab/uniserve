@@ -22,10 +22,10 @@ type Routing = Arc<Mutex<HashMap<String, OutputSender>>>;
 /// A message the client sends to the mock engine.
 #[derive(Debug)]
 pub enum MockClientMessage {
- /// A new generate request.
+    /// A new generate request.
     Add(Box<EngineCoreRequest>),
- /// One or more request ids to abort (from an explicit abort or a dropped
- /// output stream).
+    /// One or more request ids to abort (from an explicit abort or a dropped
+    /// output stream).
     Abort(Vec<String>),
 }
 
@@ -71,16 +71,16 @@ pub struct MockEngine {
 }
 
 impl MockEngine {
- /// Receive the next message from the client (`Add` or `Abort`).
+    /// Receive the next message from the client (`Add` or `Abort`).
     pub async fn recv(&mut self) -> Option<MockClientMessage> {
         self.inbound_rx.recv().await
     }
 
- /// Receive the next `Add` request, skipping any aborts.
+    /// Receive the next `Add` request, skipping any aborts.
 
- /// # Panics
+    /// # Panics
 
- /// Panics if the client disconnects before sending a request.
+    /// Panics if the client disconnects before sending a request.
     pub async fn recv_request(&mut self) -> EngineCoreRequest {
         loop {
             match self.inbound_rx.recv().await {
@@ -91,13 +91,13 @@ impl MockEngine {
         }
     }
 
- /// Route scripted outputs to the matching per-request output streams.
+    /// Route scripted outputs to the matching per-request output streams.
 
- /// An output whose `finish_reason` is set detaches its stream after
- /// delivery. Request ids in `finished_requests` are also detached: if no
- /// terminal output was delivered for them, dropping the sender closes the
- /// stream, which the consumer observes as an unexpected close — matching the
- /// engine's "finished without a final output" semantics.
+    /// An output whose `finish_reason` is set detaches its stream after
+    /// delivery. Request ids in `finished_requests` are also detached: if no
+    /// terminal output was delivered for them, dropping the sender closes the
+    /// stream, which the consumer observes as an unexpected close — matching the
+    /// engine's "finished without a final output" semantics.
     pub fn send_outputs(&self, outputs: EngineCoreOutputs) {
         let engine_index = outputs.engine_index;
         let timestamp = outputs.timestamp;
@@ -130,8 +130,8 @@ pub fn connect_mock(model_name: impl Into<String>) -> (MockEngineClient, MockEng
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
     let (abort_tx, mut abort_rx) = mpsc::unbounded_channel::<AbortRequest>();
 
- // A dropped output stream surfaces to the mock as an abort, so tests can
- // observe client-driven cancellation just as they did over ZMQ.
+    // A dropped output stream surfaces to the mock as an abort, so tests can
+    // observe client-driven cancellation just as they did over ZMQ.
     {
         let inbound_tx = inbound_tx.clone();
         tokio::spawn(async move {

@@ -165,14 +165,12 @@ where
                 .max_concurrent_streams(GRPC_MAX_CONCURRENT_STREAMS)
                 .http2_keepalive_interval(Some(GRPC_HTTP2_KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(GRPC_HTTP2_KEEPALIVE_TIMEOUT))
-                .http2_max_pending_accept_reset_streams(Some(
-                    GRPC_MAX_PENDING_ACCEPT_RESET_STREAMS,
-                ))
+                .http2_max_pending_accept_reset_streams(Some(GRPC_MAX_PENDING_ACCEPT_RESET_STREAMS))
                 .max_frame_size(GRPC_MAX_FRAME_SIZE)
- // Note: tonic's TCP-level knobs (tcp_keepalive, tcp_nodelay) are
- // documented as ignored under `serve_with_incoming*`, so they are
- // omitted here; only the HTTP/2-level and concurrency/timeout limits
- // above take effect on this path.
+                // Note: tonic's TCP-level knobs (tcp_keepalive, tcp_nodelay) are
+                // documented as ignored under `serve_with_incoming*`, so they are
+                // omitted here; only the HTTP/2-level and concurrency/timeout limits
+                // above take effect on this path.
                 .add_service(svc)
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(grpc_listener),

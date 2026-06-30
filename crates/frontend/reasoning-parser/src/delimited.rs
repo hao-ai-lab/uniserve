@@ -13,7 +13,7 @@ use super::{ReasoningDelta, ReasoningError, Result};
 /// hardcoding model-family conventions. That means families with the same
 /// delimiters can often reuse this implementation even if their chat templates
 /// prefill different prompts.
-pub(crate) struct DelimitedReasoningParser {
+pub struct DelimitedReasoningParser {
     tokenizer: DynTokenizer,
     current_in_reasoning: bool,
     buffer: String,
@@ -25,44 +25,46 @@ pub(crate) struct DelimitedReasoningParser {
 }
 
 impl DelimitedReasoningParser {
- /// Create one delimited parser state machine.
+    /// Create one delimited parser state machine.
 
- /// `default_in_reasoning` is only used when prompt initialization sees no
- /// reasoning boundary token at all. If the prompt contains either the
- /// start or end delimiter, that prompt boundary always wins.
-    pub(crate) fn new(
+    /// `default_in_reasoning` is only used when prompt initialization sees no
+    /// reasoning boundary token at all. If the prompt contains either the
+    /// start or end delimiter, that prompt boundary always wins.
+    pub fn new(
         tokenizer: DynTokenizer,
-        start_token: &'static str,
-        end_token: &'static str,
+        start_token: impl Into<String>,
+        end_token: impl Into<String>,
         default_in_reasoning: bool,
     ) -> Result<Self> {
+        let start_token = start_token.into();
+        let end_token = end_token.into();
         let start_token_id =
             tokenizer
-                .token_to_id(start_token)
+                .token_to_id(&start_token)
                 .ok_or_else(|| ReasoningError::MissingToken {
-                    token: start_token.to_string(),
+                    token: start_token.clone(),
                 })?;
         let end_token_id =
             tokenizer
-                .token_to_id(end_token)
+                .token_to_id(&end_token)
                 .ok_or_else(|| ReasoningError::MissingToken {
-                    token: end_token.to_string(),
+                    token: end_token.clone(),
                 })?;
 
         Ok(Self {
             tokenizer,
             current_in_reasoning: default_in_reasoning,
             buffer: String::new(),
-            start_token: start_token.to_string(),
-            end_token: end_token.to_string(),
+            start_token,
+            end_token,
             start_token_id,
             end_token_id,
             default_in_reasoning,
         })
     }
 
- /// Initialize the starting state from prompt token IDs.
-    pub(crate) fn initialize(&mut self, prompt_token_ids: &[u32]) {
+    /// Initialize the starting state from prompt token IDs.
+    pub fn initialize(&mut self, prompt_token_ids: &[u32]) {
         self.current_in_reasoning = last_reasoning_boundary(
             prompt_token_ids,
             self.start_token_id,
@@ -72,8 +74,8 @@ impl DelimitedReasoningParser {
         .unwrap_or(self.default_in_reasoning);
     }
 
- /// Parse one decoded text delta and return its reasoning/content split.
-    pub(crate) fn push(&mut self, delta: &str) -> ReasoningDelta {
+    /// Parse one decoded text delta and return its reasoning/content split.
+    pub fn push(&mut self, delta: &str) -> ReasoningDelta {
         self.buffer.push_str(delta);
 
         let partial_suffix_len = self.partial_suffix_len(&self.buffer);
@@ -84,13 +86,13 @@ impl DelimitedReasoningParser {
         self.parse_stable_text(&stable_text)
     }
 
- /// Flush any buffered partial delimiter suffix at end of stream.
-    pub(crate) fn finish(&mut self) -> ReasoningDelta {
+    /// Flush any buffered partial delimiter suffix at end of stream.
+    pub fn finish(&mut self) -> ReasoningDelta {
         let stable_text = std::mem::take(&mut self.buffer);
         self.parse_stable_text(&stable_text)
     }
 
- /// Parse text that is known not to end with a partial delimiter suffix.
+    /// Parse text that is known not to end with a partial delimiter suffix.
     fn parse_stable_text(&mut self, mut stable: &str) -> ReasoningDelta {
         let mut delta = ReasoningDelta::default();
 
@@ -117,20 +119,20 @@ impl DelimitedReasoningParser {
         delta
     }
 
- /// Return the longest trailing suffix that could still complete a
- /// delimiter.
+    /// Return the longest trailing suffix that could still complete a
+    /// delimiter.
 
- /// A trailing suffix can only be a *strict* prefix of a delimiter when it
- /// is shorter than that delimiter, so only the final
- /// `max(start_token, end_token)` bytes of `text` can ever match. We scan
- /// just that trailing window instead of every char boundary in `text`,
- /// keeping the cost per delta bounded by the delimiter length rather than
- /// the accumulated buffer length.
+    /// A trailing suffix can only be a *strict* prefix of a delimiter when it
+    /// is shorter than that delimiter, so only the final
+    /// `max(start_token, end_token)` bytes of `text` can ever match. We scan
+    /// just that trailing window instead of every char boundary in `text`,
+    /// keeping the cost per delta bounded by the delimiter length rather than
+    /// the accumulated buffer length.
     fn partial_suffix_len(&self, text: &str) -> usize {
         let max_token_len = self.start_token.len().max(self.end_token.len());
- // Suffixes at least `max_token_len` bytes long cannot be a strict
- // prefix of either delimiter, so start scanning from there. Clamp to a
- // char boundary so the slice below is always valid.
+        // Suffixes at least `max_token_len` bytes long cannot be a strict
+        // prefix of either delimiter, so start scanning from there. Clamp to a
+        // char boundary so the slice below is always valid.
         let mut window_start = text.len().saturating_sub(max_token_len);
         while window_start < text.len() && !text.is_char_boundary(window_start) {
             window_start += 1;
@@ -212,8 +214,8 @@ mod partial_suffix_tests {
         }
     }
 
- /// Reference implementation: scan every char boundary, used to confirm the
- /// windowed scan in `partial_suffix_len` is behavior-preserving.
+    /// Reference implementation: scan every char boundary, used to confirm the
+    /// windowed scan in `partial_suffix_len` is behavior-preserving.
     fn reference_partial_suffix_len(start: &str, end: &str, text: &str) -> usize {
         let mut best = 0;
         for (idx, _) in text.char_indices() {
@@ -235,15 +237,15 @@ mod partial_suffix_tests {
     #[test]
     fn ascii_delimiter_cases() {
         let p = parser("<think>", "</think>");
- // No trailing delimiter prefix.
+        // No trailing delimiter prefix.
         assert_eq!(p.partial_suffix_len("plain content"), 0);
- // A complete delimiter is not a *partial* suffix.
+        // A complete delimiter is not a *partial* suffix.
         assert_eq!(p.partial_suffix_len("<think>"), 0);
- // Trailing partial start delimiter.
+        // Trailing partial start delimiter.
         assert_eq!(p.partial_suffix_len("abc<thi"), 4);
- // Trailing partial end delimiter.
+        // Trailing partial end delimiter.
         assert_eq!(p.partial_suffix_len("reason</thi"), 5);
- // The whole short text is a strict prefix.
+        // The whole short text is a strict prefix.
         assert_eq!(p.partial_suffix_len("<th"), 3);
         assert_eq!(p.partial_suffix_len(""), 0);
     }

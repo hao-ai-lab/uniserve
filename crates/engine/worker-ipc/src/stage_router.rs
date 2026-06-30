@@ -247,28 +247,32 @@ impl StageRouter {
         // split directly, so the generic `new` router produces exactly this
         // routing — no manual override. A `--workers und:1,gen:1` topology
         // composes the same thing through `spawn_staged`.
-        Self::new(vec![
-            (WorkerKind::Und, und),
-            (WorkerKind::Gen, gen_worker),
-        ])
+        Self::new(vec![(WorkerKind::Und, und), (WorkerKind::Gen, gen_worker)])
     }
 
     fn merge_caps(pools: &[PoolEntry]) -> EngineCaps {
         // Fold the secondary pools' caps into the first pool's (which seeds the
         // non-merged fields). Op/control/class unions are order-preserving and
         // O(n)-deduped via a HashSet of the already-seen values.
-        pools[1..].iter().fold(pools[0].exec.caps(), |mut acc, pool| {
-            let other = pool.exec.caps();
-            extend_unique(&mut acc.supported_ops, other.supported_ops);
-            extend_unique(&mut acc.supported_controls, other.supported_controls);
-            extend_unique(&mut acc.resource_classes, other.resource_classes);
-            acc.max_latent_size = acc.max_latent_size.max(other.max_latent_size);
-            acc.scratch_capacity_tokens = acc
-                .scratch_capacity_tokens
-                .saturating_add(other.scratch_capacity_tokens);
-            acc.pipeline_depth = acc.pipeline_depth.min(other.pipeline_depth).max(1);
-            acc
-        })
+        pools[1..]
+            .iter()
+            .fold(pools[0].exec.caps(), |mut acc, pool| {
+                let other = pool.exec.caps();
+                extend_unique(&mut acc.supported_ops, other.supported_ops);
+                extend_unique(&mut acc.supported_controls, other.supported_controls);
+                extend_unique(&mut acc.resource_classes, other.resource_classes);
+                acc.max_latent_size = acc.max_latent_size.max(other.max_latent_size);
+                acc.max_vae_grid_tokens = acc.max_vae_grid_tokens.max(other.max_vae_grid_tokens);
+                acc.max_vit_grid_tokens = acc.max_vit_grid_tokens.max(other.max_vit_grid_tokens);
+                acc.commit_marker_tokens = acc.commit_marker_tokens.max(other.commit_marker_tokens);
+                acc.gen_rope_advance = acc.gen_rope_advance.max(other.gen_rope_advance);
+                acc.max_cfg_branches = acc.max_cfg_branches.max(other.max_cfg_branches);
+                acc.scratch_capacity_tokens = acc
+                    .scratch_capacity_tokens
+                    .saturating_add(other.scratch_capacity_tokens);
+                acc.pipeline_depth = acc.pipeline_depth.min(other.pipeline_depth).max(1);
+                acc
+            })
     }
 
     fn route_for(&self, op: &ForwardOp) -> anyhow::Result<usize> {
@@ -294,7 +298,11 @@ impl StageRouter {
         if ops.is_empty() {
             return Ok(false);
         }
-        exec.submit(ForwardBatch { step_id, new_reqs, ops })?;
+        exec.submit(ForwardBatch {
+            step_id,
+            new_reqs,
+            ops,
+        })?;
         Ok(true)
     }
 
@@ -329,7 +337,9 @@ impl StageRouter {
                 anyhow::bail!("stage pool returned unknown step_id {step_id}");
             };
             if step.expected & bit == 0 {
-                anyhow::bail!("duplicate or unexpected pool {pool_idx} result for step_id {step_id}");
+                anyhow::bail!(
+                    "duplicate or unexpected pool {pool_idx} result for step_id {step_id}"
+                );
             }
             let slots: Vec<usize> = step
                 .outputs
@@ -400,7 +410,12 @@ impl StageRouter {
             .ok_or_else(|| anyhow::anyhow!("synthesize_sample with no sampler pool"))?;
         let op_id = self.next_sample_op_id;
         self.next_sample_op_id = self.next_sample_op_id.wrapping_add(1);
-        let new_reqs: Vec<NewRequestData> = self.req_sampling.get(&req_id).cloned().into_iter().collect();
+        let new_reqs: Vec<NewRequestData> = self
+            .req_sampling
+            .get(&req_id)
+            .cloned()
+            .into_iter()
+            .collect();
         let op = ForwardOp {
             req_id,
             kind: OpKind::Sample,
@@ -509,7 +524,8 @@ impl Executor for StageRouter {
         }
         let gen_pool = self.tower_edge.map(|(_, g)| g);
         let commit_und_pool = self.commit_edge.map(|(_, u)| u);
-        let mut partitions: Vec<Vec<ForwardOp>> = (0..self.pools.len()).map(|_| Vec::new()).collect();
+        let mut partitions: Vec<Vec<ForwardOp>> =
+            (0..self.pools.len()).map(|_| Vec::new()).collect();
         let mut routes = Vec::with_capacity(batch.ops.len());
         // new_reqs to replay to the gen pool: the admission descriptor for each
         // request whose first denoise op we thread below.
@@ -533,7 +549,10 @@ impl Executor for StageRouter {
                     }
                 }
             }
-            if Some(idx) == commit_und_pool && op.kind == OpKind::CommitWriteback && op.locator.is_none() {
+            if Some(idx) == commit_und_pool
+                && op.kind == OpKind::CommitWriteback
+                && op.locator.is_none()
+            {
                 if let Some(locator) = self.mover.take_commit_latent(op.req_id) {
                     op.locator = Some(locator);
                 }
@@ -797,7 +816,10 @@ mod tests {
 
     impl RoleExec {
         fn new(role: &'static str) -> Self {
-            Self { role, queued: VecDeque::new() }
+            Self {
+                role,
+                queued: VecDeque::new(),
+            }
         }
     }
 
@@ -808,7 +830,10 @@ mod tests {
 
     impl CommitEdgeExec {
         fn new(role: &'static str) -> Self {
-            Self { role, queued: VecDeque::new() }
+            Self {
+                role,
+                queued: VecDeque::new(),
+            }
         }
     }
 
@@ -818,28 +843,39 @@ mod tests {
             c.pipeline_depth = 4;
             c
         }
-        fn pipeline_depth(&self) -> usize { 4 }
-        fn in_flight(&self) -> usize { self.queued.len() }
+        fn pipeline_depth(&self) -> usize {
+            4
+        }
+        fn in_flight(&self) -> usize {
+            self.queued.len()
+        }
         fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
-            let per_seq = batch.ops.iter().map(|op| {
-                if self.role == "gen" && op.kind == OpKind::CommitGen {
-                    SeqResult {
-                        req_id: op.req_id,
-                        locator: Some("latent-locator".into()),
-                        image_png_b64: Some("png".into()),
-                        ..Default::default()
+            let per_seq = batch
+                .ops
+                .iter()
+                .map(|op| {
+                    if self.role == "gen" && op.kind == OpKind::CommitGen {
+                        SeqResult {
+                            req_id: op.req_id,
+                            locator: Some("latent-locator".into()),
+                            image_png_b64: Some("png".into()),
+                            ..Default::default()
+                        }
+                    } else if self.role == "und" && op.kind == OpKind::CommitWriteback {
+                        SeqResult {
+                            req_id: op.req_id,
+                            locator: op.locator.clone(),
+                            sampled_token_id: Some(1234),
+                            ..Default::default()
+                        }
+                    } else {
+                        SeqResult {
+                            req_id: op.req_id,
+                            ..Default::default()
+                        }
                     }
-                } else if self.role == "und" && op.kind == OpKind::CommitWriteback {
-                    SeqResult {
-                        req_id: op.req_id,
-                        locator: op.locator.clone(),
-                        sampled_token_id: Some(1234),
-                        ..Default::default()
-                    }
-                } else {
-                    SeqResult { req_id: op.req_id, ..Default::default() }
-                }
-            }).collect();
+                })
+                .collect();
             self.queued.push_back(ForwardResult {
                 step_id: batch.step_id,
                 per_seq,
@@ -848,13 +884,27 @@ mod tests {
             });
             Ok(())
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> { Ok(self.queued.pop_front()) }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
-            self.queued.pop_front().ok_or_else(|| anyhow::anyhow!("no queued result"))
+        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+            Ok(self.queued.pop_front())
         }
-        fn control(&mut self, _op: ControlOp) -> anyhow::Result<u64> { Ok(1) }
-        fn control_wait(&mut self, _op: ControlOp, _targets: Option<&[u32]>) -> anyhow::Result<Vec<ControlAck>> {
-            Ok(vec![ControlAck { rank: 0, ok: true, message: None }])
+        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+            self.queued
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no queued result"))
+        }
+        fn control(&mut self, _op: ControlOp) -> anyhow::Result<u64> {
+            Ok(1)
+        }
+        fn control_wait(
+            &mut self,
+            _op: ControlOp,
+            _targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            Ok(vec![ControlAck {
+                rank: 0,
+                ok: true,
+                message: None,
+            }])
         }
     }
 
@@ -908,7 +958,9 @@ mod tests {
             Ok(self.queued.pop_front())
         }
         fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
-            self.queued.pop_front().ok_or_else(|| anyhow::anyhow!("no queued result"))
+            self.queued
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no queued result"))
         }
         fn control(&mut self, _op: ControlOp) -> anyhow::Result<u64> {
             Ok(1)
@@ -918,7 +970,11 @@ mod tests {
             _op: ControlOp,
             _targets: Option<&[u32]>,
         ) -> anyhow::Result<Vec<ControlAck>> {
-            Ok(vec![ControlAck { rank: 0, ok: true, message: None }])
+            Ok(vec![ControlAck {
+                rank: 0,
+                ok: true,
+                message: None,
+            }])
         }
     }
 
@@ -959,7 +1015,10 @@ mod tests {
     fn no_sampler_pool_leaves_decode_result_untouched() {
         // Without a Sampler pool, a decode result (even with a logits handle) is
         // finalized as-is — the 2-phase path is inert.
-        let mut router = StageRouter::new(vec![(WorkerKind::Decode, Box::new(RoleExec::new("decode")))]);
+        let mut router = StageRouter::new(vec![(
+            WorkerKind::Decode,
+            Box::new(RoleExec::new("decode")),
+        )]);
         router
             .submit(ForwardBatch {
                 step_id: 3,
@@ -1101,7 +1160,9 @@ mod tests {
     fn control_wait_acks_have_distinct_ranks() {
         let mut router =
             StageRouter::two_role(Box::new(PoolExec::new()), Box::new(PoolExec::new()));
-        let acks = router.control_wait(ControlOp::ResetPrefixCache, None).unwrap();
+        let acks = router
+            .control_wait(ControlOp::ResetPrefixCache, None)
+            .unwrap();
         assert_eq!(acks.len(), 2);
         assert_eq!(acks.iter().map(|a| a.rank).collect::<Vec<_>>(), vec![0, 1]);
     }
@@ -1119,7 +1180,11 @@ mod tests {
             recorded: std::sync::Arc<std::sync::Mutex<Vec<ForwardOp>>>,
             emit_locator: Option<String>,
         ) -> Self {
-            Self { recorded, emit_locator, queued: VecDeque::new() }
+            Self {
+                recorded,
+                emit_locator,
+                queued: VecDeque::new(),
+            }
         }
     }
 
@@ -1146,7 +1211,10 @@ mod tests {
                     ..Default::default()
                 })
                 .collect();
-            self.recorded.lock().unwrap().extend(batch.ops.iter().cloned());
+            self.recorded
+                .lock()
+                .unwrap()
+                .extend(batch.ops.iter().cloned());
             self.queued.push_back(ForwardResult {
                 step_id: batch.step_id,
                 per_seq,
@@ -1171,7 +1239,11 @@ mod tests {
             _op: ControlOp,
             _targets: Option<&[u32]>,
         ) -> anyhow::Result<Vec<ControlAck>> {
-            Ok(vec![ControlAck { rank: 0, ok: true, message: None }])
+            Ok(vec![ControlAck {
+                rank: 0,
+                ok: true,
+                message: None,
+            }])
         }
     }
 
@@ -1237,7 +1309,10 @@ mod tests {
         assert!(mover.request_ready(RequestId(7)));
         assert!(mover.request_ready(RequestId(8)));
         // Threading the locator into the denoise op hands it off exactly once.
-        assert_eq!(mover.take_conditioning(RequestId(7)).as_deref(), Some("loc-7"));
+        assert_eq!(
+            mover.take_conditioning(RequestId(7)).as_deref(),
+            Some("loc-7")
+        );
         assert_eq!(mover.take_conditioning(RequestId(7)), None);
     }
 }

@@ -27,16 +27,16 @@ pub struct ReadyMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreReadyResponse {
- /// Engine-reported maximum model context length (auto-fitted after
- /// KV cache profiling and may differ from the original config value).
+    /// Engine-reported maximum model context length (auto-fitted after
+    /// KV cache profiling and may differ from the original config value).
     pub max_model_len: u64,
- /// Number of GPU blocks available for KV cache on this engine.
+    /// Number of GPU blocks available for KV cache on this engine.
     pub num_gpu_blocks: u64,
- /// DP coordinator stats publish address, if applicable.
+    /// DP coordinator stats publish address, if applicable.
     pub dp_stats_address: Option<String>,
- /// Effective model dtype after the reference resolves `--dtype`.
+    /// Effective model dtype after the reference resolves `--dtype`.
     pub dtype: ModelDtype,
- /// the reference version reported by the engine process.
+    /// the reference version reported by the engine process.
     pub uniserve_version: String,
 }
 
@@ -59,9 +59,9 @@ pub struct HandshakeAddresses {
 pub struct HandshakeInitMessage {
     pub addresses: HandshakeAddresses,
     pub parallel_config: BTreeMap<String, OpaqueValue>,
- /// UniServe extension: model control-token ids resolved by the frontend's
- /// tokenizer (the engine process has no tokenizer but its scheduler FSM
- /// needs them). Absent on the upstream wire.
+    /// UniServe extension: model control-token ids resolved by the frontend's
+    /// tokenizer (the engine process has no tokenizer but its scheduler FSM
+    /// needs them). Absent on the upstream wire.
     #[serde(default)]
     pub native_controls: Option<crate::native::NativeControlTokens>,
 }

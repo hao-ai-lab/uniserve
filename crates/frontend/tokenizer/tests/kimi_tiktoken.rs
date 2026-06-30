@@ -238,7 +238,9 @@ fn missing_model_type_uses_cl100k_pattern_for_space_before_han() {
 fn kimi_flavored_text_round_trips_through_encode_decode() {
     let text = "<think>\u{4F60}\u{597D}</think><|tool_calls_section_begin|>";
     for (name, backend) in kimi_backends() {
-        let ids = backend.encode(text, false).expect("encode kimi-flavored text");
+        let ids = backend
+            .encode(text, false)
+            .expect("encode kimi-flavored text");
 
         let decoded_keep = backend.decode(&ids, false).expect("decode keep-special");
         assert_eq!(decoded_keep, text, "{name}: keep-special round-trip");
@@ -262,7 +264,9 @@ fn kimi_markers_encode_to_single_special_ids() {
             "{name}: <think> encodes to its id"
         );
         assert_eq!(
-            backend.encode("<|tool_calls_section_begin|>", false).unwrap(),
+            backend
+                .encode("<|tool_calls_section_begin|>", false)
+                .unwrap(),
             vec![260],
             "{name}: tool-calls-section-begin encodes to its id"
         );

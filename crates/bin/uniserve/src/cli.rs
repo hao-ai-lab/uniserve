@@ -976,16 +976,41 @@ mod tests {
         // (serve_flag, serve_value, engine_flag, expected_forwarded_value)
         vec![
             ("--device", "cpu", "--device", "cpu"),
-            ("--worker-python", "/usr/bin/py", "--worker-python", "/usr/bin/py"),
+            (
+                "--worker-python",
+                "/usr/bin/py",
+                "--worker-python",
+                "/usr/bin/py",
+            ),
             ("--worker-ranks", "4", "--worker-ranks", "4"),
-            ("--attention-backend", "flashinfer", "--attention-backend", "flashinfer"),
+            (
+                "--attention-backend",
+                "flashinfer",
+                "--attention-backend",
+                "flashinfer",
+            ),
             ("--block-size", "512", "--block-size", "512"),
             ("--pipeline-depth", "3", "--pipeline-depth", "3"),
             ("--max-batch", "7", "--max-batch", "7"),
-            ("--max-num-batched-tokens", "4096", "--max-num-batched-tokens", "4096"),
+            (
+                "--max-num-batched-tokens",
+                "4096",
+                "--max-num-batched-tokens",
+                "4096",
+            ),
             ("--max-num-seqs", "33", "--max-num-seqs", "33"),
-            ("--long-prefill-threshold", "1234", "--long-prefill-threshold", "1234"),
-            ("--scheduler-policy", "priority", "--scheduler-policy", "priority"),
+            (
+                "--long-prefill-threshold",
+                "1234",
+                "--long-prefill-threshold",
+                "1234",
+            ),
+            (
+                "--scheduler-policy",
+                "priority",
+                "--scheduler-policy",
+                "priority",
+            ),
             ("--resp-slot-cap", "1048576", "--resp-slot-cap", "1048576"),
         ]
     }
@@ -1055,7 +1080,10 @@ mod tests {
         .expect("engine must accept forwarded scheduler-policy spelling");
         match engine.command {
             Command::Engine(args) => {
-                assert!(matches!(args.scheduler_policy, SchedulerPolicyArg::Priority));
+                assert!(matches!(
+                    args.scheduler_policy,
+                    SchedulerPolicyArg::Priority
+                ));
             }
             Command::Serve(_) => panic!("expected engine command"),
         }

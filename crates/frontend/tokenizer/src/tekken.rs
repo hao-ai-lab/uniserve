@@ -11,7 +11,7 @@ pub struct TekkenTokenizer {
 }
 
 impl TekkenTokenizer {
- /// Load a Mistral Tekken tokenizer from a `tekken.json` file.
+    /// Load a Mistral Tekken tokenizer from a `tekken.json` file.
     pub fn new(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with Mistral Tekken");
 
@@ -44,20 +44,24 @@ impl Tokenizer for TekkenTokenizer {
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
- // tekken-rs exposes `get_control_token` for special tokens, a direct map
- // lookup. Try that first, then fall back to encoding the literal.
+        // tekken-rs exposes `get_control_token` for special tokens, a direct map
+        // lookup. Try that first, then fall back to encoding the literal.
         self.inner.get_control_token(token).ok().or_else(|| {
- // Encode without special tokens; a vocabulary token must encode to a
- // single piece. A multi-token result means `token` is not a single
- // vocabulary entry, so report it as unknown rather than returning the
- // first sub-token (which would misclassify the string).
+            // Encode without special tokens; a vocabulary token must encode to a
+            // single piece. A multi-token result means `token` is not a single
+            // vocabulary entry, so report it as unknown rather than returning the
+            // first sub-token (which would misclassify the string).
             let ids = self.inner.encode(token, false, false).ok()?;
             let [id] = ids[..] else { return None };
- // Confirm the candidate id round-trips back to the exact requested
- // string. Without this check a string that merely BPE-collapses to one
- // token (e.g. differing whitespace/normalization) could resolve to an
- // id whose piece is not `token`.
-            if self.inner.id_to_piece(id).is_ok_and(|piece| piece.as_str() == token) {
+            // Confirm the candidate id round-trips back to the exact requested
+            // string. Without this check a string that merely BPE-collapses to one
+            // token (e.g. differing whitespace/normalization) could resolve to an
+            // id whose piece is not `token`.
+            if self
+                .inner
+                .id_to_piece(id)
+                .is_ok_and(|piece| piece.as_str() == token)
+            {
                 Some(id)
             } else {
                 None

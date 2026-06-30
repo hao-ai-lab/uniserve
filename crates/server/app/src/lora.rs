@@ -8,24 +8,30 @@ pub use uniserve_openai_api::LoraModelResolution;
 
 /// Runtime registry for dynamically loaded LoRA adapters.
 pub(crate) struct LoraManager {
- /// Dynamically loaded LoRA adapters keyed by public model name.
+    /// Dynamically loaded LoRA adapters keyed by public model name.
     requests: RwLock<BTreeMap<String, LoraRequest>>,
- /// Monotonic adapter id allocator. LoRA ids are one-indexed.
+    /// Monotonic adapter id allocator. LoRA ids are one-indexed.
     id_counter: AtomicU64,
- /// Serialize dynamic LoRA registry updates around engine utility calls.
+    /// Serialize dynamic LoRA registry updates around engine utility calls.
     update_lock: Mutex<()>,
 }
 
 #[derive(Debug)]
 pub enum LoadLoraError {
-    AlreadyLoaded { lora_name: String },
-    BaseModelName { lora_name: String },
+    AlreadyLoaded {
+        lora_name: String,
+    },
+    BaseModelName {
+        lora_name: String,
+    },
     Engine(uniserve_engine_client::Error),
-    NotLoaded { lora_name: String },
- /// the engine/worker LoRA contract carries `lora_id` as `u32`
- /// (worker-wire `WorkerRequest::lora_id`, FB `lora_id:uint`). The registry
- /// allocates ids from a `u64` counter, so guard the single allocation site
- /// rather than silently truncating with `as u32` at each engine boundary.
+    NotLoaded {
+        lora_name: String,
+    },
+    /// the engine/worker LoRA contract carries `lora_id` as `u32`
+    /// (worker-wire `WorkerRequest::lora_id`, FB `lora_id:uint`). The registry
+    /// allocates ids from a `u64` counter, so guard the single allocation site
+    /// rather than silently truncating with `as u32` at each engine boundary.
     IdSpaceExhausted,
 }
 
@@ -55,16 +61,16 @@ impl LoraManager {
         }
     }
 
- /// Return base served model names plus dynamically loaded LoRA adapter
- /// names.
+    /// Return base served model names plus dynamically loaded LoRA adapter
+    /// names.
     pub(crate) async fn served_model_names(&self, base_model_names: &[String]) -> Vec<String> {
         let mut names = base_model_names.to_vec();
         names.extend(self.requests.read().await.keys().cloned());
         names
     }
 
- /// Resolve the requested model against one consistent LoRA registry
- /// snapshot.
+    /// Resolve the requested model against one consistent LoRA registry
+    /// snapshot.
     pub(crate) async fn resolve_model(
         &self,
         base_model_names: &[String],
@@ -81,7 +87,7 @@ impl LoraManager {
         }
     }
 
- /// Load one dynamic LoRA adapter and register it as a public model name.
+    /// Load one dynamic LoRA adapter and register it as a public model name.
     pub(crate) async fn load_lora(
         &self,
         uniserve_engine_client: &EngineCoreClient,
@@ -100,14 +106,12 @@ impl LoraManager {
             return Err(LoadLoraError::AlreadyLoaded { lora_name });
         }
 
- // The worker merges one adapter into the weights on load and rejects an
- // `add_lora` over an already-resident adapter (the `load_inplace` flag
- // is not threaded to the worker). To honor an in-place reload, evict the
- // resident adapter from the engine first so the subsequent `add_lora`
- // sees no resident deltas.
-        if load_inplace
-            && let Some(resident) = resident.as_ref()
-        {
+        // The worker merges one adapter into the weights on load and rejects an
+        // `add_lora` over an already-resident adapter (the `load_inplace` flag
+        // is not threaded to the worker). To honor an in-place reload, evict the
+        // resident adapter from the engine first so the subsequent `add_lora`
+        // sees no resident deltas.
+        if load_inplace && let Some(resident) = resident.as_ref() {
             uniserve_engine_client
                 .remove_lora(resident.lora_int_id)
                 .await
@@ -118,8 +122,8 @@ impl LoraManager {
             .as_ref()
             .map(|request| request.lora_int_id)
             .unwrap_or_else(|| self.id_counter.fetch_add(1, Ordering::Relaxed) + 1);
- // the engine/worker contract is u32; refuse to allocate an id
- // the wire cannot represent instead of silently truncating downstream.
+        // the engine/worker contract is u32; refuse to allocate an id
+        // the wire cannot represent instead of silently truncating downstream.
         if lora_int_id > u64::from(u32::MAX) {
             return Err(LoadLoraError::IdSpaceExhausted);
         }
@@ -145,8 +149,8 @@ impl LoraManager {
         Ok(lora_request)
     }
 
- /// Remove one dynamic LoRA adapter from the engine and public model
- /// registry.
+    /// Remove one dynamic LoRA adapter from the engine and public model
+    /// registry.
     pub(crate) async fn unload_lora(
         &self,
         uniserve_engine_client: &EngineCoreClient,

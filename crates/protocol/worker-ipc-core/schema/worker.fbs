@@ -156,6 +156,11 @@ table EngineCaps {
   max_latent_size:uint;
   latent_downsample:uint;
   bytes_per_token:ulong;
+  max_vae_grid_tokens:uint;
+  max_vit_grid_tokens:uint;
+  commit_marker_tokens:uint;
+  gen_rope_advance:uint;
+  max_cfg_branches:uint;
   groups:[KvGroupSpec];
   kv_dtype:string;
   attention_backend:string;
