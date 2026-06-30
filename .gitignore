@@ -40,7 +40,6 @@ results/
 benchmark-results/
 benchmarks/results/
 artifacts/
-e2e-artifacts/
 
 target/
 refs/
