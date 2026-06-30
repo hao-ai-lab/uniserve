@@ -7,7 +7,8 @@ from typing import Any, Callable
 import torch
 from torch import nn
 
-from ..foundation.env import DEFAULT_ATTENTION_BACKEND, env_str
+from ..foundation.env import DEFAULT_ATTENTION_BACKEND
+from ..foundation.runtime_config import get_worker_config
 from ..nn.quant import QuantizationConfig, use_quantization_config
 from ..nn.quant.base import process_quantized_modules
 from ..nn.quant.load_state import (
@@ -93,8 +94,6 @@ def load_native_transformers_checkpoint(
     model_cls: Any,
     tokenizer_cls: Any,
     attention_backend: str | None = None,
-    attention_env: str | None = None,
-    dtype_env: str | None = None,
     use_fast: bool = False,
     extra_special_tokens: dict[str, Any] | None = None,
     config_patch: Callable[[Any], None] | None = None,
@@ -118,12 +117,9 @@ def load_native_transformers_checkpoint(
             "native checkpoint loading requires accelerate; install it in the worker environment"
         ) from exc
 
-    attn_backend = attention_backend or (
-        env_str(attention_env, default=DEFAULT_ATTENTION_BACKEND)
-        if attention_env
-        else DEFAULT_ATTENTION_BACKEND
-    )
-    dtype = dtype_from_name(env_str(dtype_env or "UNISERVE_TRANSFORMERS_DTYPE", default="bfloat16"))
+    runtime = get_worker_config()
+    attn_backend = attention_backend or DEFAULT_ATTENTION_BACKEND
+    dtype = dtype_from_name(runtime.model_dtype)
 
     config = config_cls.from_pretrained(model_dir)
     config.uniserve_attention_backend = attn_backend
@@ -426,8 +422,6 @@ class NativeLoadSpec:
     config_cls: Any
     model_cls: Any
     tokenizer_cls: Any
-    attention_env: str | None = None
-    dtype_env: str | None = None
     config_patch: Callable[[Any], None] | None = None
     compatibility_check: Callable[[Any], None] | None = None
     use_fast: bool = False
@@ -474,8 +468,6 @@ class NativeTransformersLoader(BaseModelLoader):
             model_cls=spec.model_cls,
             tokenizer_cls=spec.tokenizer_cls,
             attention_backend=kwargs.get("attention_backend"),
-            attention_env=spec.attention_env,
-            dtype_env=spec.dtype_env,
             use_fast=spec.use_fast,
             extra_special_tokens=spec.extra_special_tokens,
             config_patch=spec.config_patch,

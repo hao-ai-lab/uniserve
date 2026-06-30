@@ -13,7 +13,6 @@ the sampler) owns all of that. The model only *declares* its KV geometry via
 from __future__ import annotations
 
 import logging
-import os
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -36,7 +35,7 @@ import torch.nn as nn
 
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
 from ..execution.model_base import UniModelBase
-from ..foundation.env import env_optional_str
+from ..foundation.runtime_config import get_worker_config
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -71,10 +70,6 @@ from ..runtime.residency import KvCacheSpec
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_KV_FREE_FRACTION = 0.70
-_KV_FREE_FRACTION_ENV = "UNISERVE_QWEN3_KV_CACHE_FREE_FRACTION"
-
-
 def _cfg(config: Any | None) -> SimpleNamespace:
     if isinstance(config, SimpleNamespace):
         cfg = config
@@ -105,12 +100,10 @@ def _cfg(config: Any | None) -> SimpleNamespace:
 
 
 def _requested_kv_cache_dtype(config: Any | None) -> str | None:
-    if "UNISERVE_KV_CACHE_DTYPE" not in os.environ:
-        return get_current_kv_cache_dtype(config)
-    value = env_optional_str("UNISERVE_KV_CACHE_DTYPE")
+    value = get_worker_config().kv_cache_dtype
     if value is not None and value.lower() not in KV_CACHE_NO_OVERRIDE_SENTINELS | {"null"}:
         return value
-    return None
+    return get_current_kv_cache_dtype(config)
 
 
 def _expert_cfg(cfg: SimpleNamespace, intermediate_size: int | None = None) -> SimpleNamespace:
@@ -576,7 +569,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
     def _maybe_compile_piecewise(self) -> None:
         if self._torch_compile_applied:
             return
-        cfg = TorchCompileConfig.from_env()
+        cfg = TorchCompileConfig.from_runtime_config()
         if not cfg.enabled:
             return
         report = compile_model_pieces(self, config=cfg)
@@ -640,7 +633,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         except Exception:
             return None
         bytes_per_token = max(1, self._kv_bytes_per_token(compute_dtype))
-        fraction = _bounded_float_env(_KV_FREE_FRACTION_ENV, _DEFAULT_KV_FREE_FRACTION)
+        fraction = get_worker_config().kv_memory_fraction
         usable_bytes = max(0, int(float(free_bytes) * fraction))
         token_capacity = usable_bytes // bytes_per_token
         blocks = max(1, int(token_capacity) // block)
@@ -677,21 +670,3 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
 
 
 EntryClass = Qwen3ForCausalLM
-
-
-def _bounded_float_env(name: str, default: float) -> float:
-    raw = os.environ.get(name, "")
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except ValueError:
-        logger.warning("ignoring invalid float environment override", extra={"name": name, "value": raw})
-        return default
-    if value <= 0.0 or value >= 1.0:
-        logger.warning(
-            "ignoring out-of-range float environment override",
-            extra={"name": name, "value": raw},
-        )
-        return default
-    return value

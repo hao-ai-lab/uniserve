@@ -9,8 +9,11 @@ from typing import Any, Callable
 import torch
 
 from ..contracts.forward_mode import ForwardMode
-from ..foundation.env import env_flag
 from ..foundation.errors import classify
+from ..foundation.runtime_config import (
+    DEFAULT_DECODE_GRAPH_BATCH_SIZES,
+    DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
+)
 
 # Module-level buffer pool for ``_share_decode_graph_input_buffer`` (contract tests).
 _DECODE_GRAPH_INPUT_BUFFER_POOL: dict[tuple[str, str, str], torch.Tensor] = {}
@@ -91,61 +94,8 @@ def record_graph_stats(
     stats.cuda_graph_padded_tokens += max(0, padded_tokens - unpadded_tokens)
     stats.record_runtime_graph_mode(mode.value)
 
-# Capture bucket ladders; tunable via warmup env overrides, not correctness constants.
-_DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
-    1,
-    2,
-    4,
-    8,
-    12,
-    16,
-    24,
-    32,
-    40,
-    48,
-    56,
-    64,
-    80,
-    96,
-    112,
-    128,
-)
-_DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
-    4,
-    8,
-    12,
-    16,
-    20,
-    24,
-    28,
-    32,
-    48,
-    64,
-    80,
-    96,
-    112,
-    128,
-    160,
-    192,
-    224,
-    256,
-    288,
-    320,
-    352,
-    384,
-    416,
-    448,
-    480,
-    512,
-    576,
-    640,
-    704,
-    768,
-    832,
-    896,
-    960,
-    1024,
-)
+_DEFAULT_DECODE_GRAPH_BATCH_SIZES = DEFAULT_DECODE_GRAPH_BATCH_SIZES
+_DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
 
 
 def _parse_positive_int_csv(raw: str) -> tuple[int, ...]:
@@ -220,8 +170,6 @@ class _GraphRunnerBase:
     """Shared enable/warmup/capture-pool scaffolding for the graph runners."""
 
     name: str
-    enabled_env: str
-    warmup_env: str
     default_enabled: bool
     default_warmup: bool
     metric_prefix: str
@@ -232,10 +180,10 @@ class _GraphRunnerBase:
     _graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor]
 
     def enabled(self) -> bool:
-        return env_flag(self.enabled_env, default=self.default_enabled)
+        return self.default_enabled
 
     def warmup_enabled(self) -> bool:
-        return env_flag(self.warmup_env, default=self.default_warmup)
+        return self.default_warmup
 
     def capture_pool(self) -> Any:
         if self._capture_pool is not None:

@@ -28,6 +28,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uniserve-engine-runtime.workspace = true
 uniserve-engine-process.workspace = true
+uniserve-worker-ipc.workspace = true
 uniserve-managed-engine.workspace = true
 uniserve-server-app.workspace = true
 uniserve-server-http.workspace = true

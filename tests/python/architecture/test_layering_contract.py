@@ -368,7 +368,7 @@ def test_backend_provider_pack_imports_do_not_mutate_sys_path_or_use_env_paths()
             text = path.read_text(encoding="utf-8")
             if "sys.path" in text:
                 offenders.append(f"{path.relative_to(ROOT).as_posix()}: sys.path mutation/reference")
-            if "UNISERVE_FA4_CUTE_PATH" in text:
+            if re.search(r"os\.environ(?:\.get)?\([^)]*FA4[^)]*PATH", text):
                 offenders.append(f"{path.relative_to(ROOT).as_posix()}: legacy FA4 env path")
     assert offenders == []
 
@@ -487,15 +487,13 @@ def test_sensenova_qk_norm_rope_has_no_model_local_legacy_path():
     spec_source = (ROOT / "specs" / "backend_ops.md").read_text(encoding="utf-8")
 
     assert "_qk_norm_rope_3d_legacy" not in model_source
-    assert "UNISERVE_SENSENOVA_FUSED_QK_NORM_ROPE" not in model_source
+    assert "SENSENOVA_FUSED" not in model_source
     assert 'env_override="UNISERVE_QK_NORM_ROPE_PROVIDER"' in provider_source
     assert not (ROOT / "benchmarks" / "serving" / "sensenova_fusion_matrix.py").exists()
     assert not (ROOT / "benchmarks" / "kernels" / "sensenova_projection_microbench.py").exists()
     for source in (config_source, spec_source):
-        assert "UNISERVE_FUSED_QK_NORM_ROPE" not in source
-        assert "UNISERVE_SENSENOVA_FUSED_QK_NORM_ROPE" not in source
-        assert "UNISERVE_SENSENOVA_FUSED_QKV_PROJ" not in source
-        assert "UNISERVE_SENSENOVA_FUSED_GATE_UP" not in source
+        assert "FUSED_QK_NORM_ROPE" not in source
+        assert "SENSENOVA_FUSED" not in source
     for needle in ("_fused_qkv_proj", "_fused_gate_up", "self.q_proj", "self.gate_proj"):
         assert needle not in model_source
 

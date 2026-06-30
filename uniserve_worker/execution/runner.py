@@ -26,6 +26,7 @@ from ..contracts.resource_plan import LatentTokens, ResourcePlan
 from ..foundation.env import env_flag
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.profiling import profile_range
+from ..foundation.runtime_config import get_worker_config
 from ..runtime.forward_batch_builder import ForwardBatchBuilder
 from ..runtime.request_state import RequestStateTable
 from ..runtime.resources import ResourceRuntime
@@ -173,8 +174,8 @@ class ModelRunner:
         self._init_capability_flags(model)
         self._mode_strategies = self._build_mode_strategies()
         self._init_resource_accounting(resource_runtime, residency)
-        # CUDA Green Context SM partitioning. ``None`` unless UNISERVE_GREEN_CONTEXTS
-        # is set and the model runs on a CUDA device.
+        # CUDA Green Context SM partitioning. ``None`` unless runtime config
+        # enables it and the model runs on a CUDA device.
         self.stream_manager = self._maybe_build_stream_manager()
 
     def _init_text_execution(
@@ -336,7 +337,7 @@ class ModelRunner:
         return model.kv_cache_spec()
 
     def _maybe_build_stream_manager(self):
-        if not env_flag("UNISERVE_GREEN_CONTEXTS"):
+        if not get_worker_config().green_contexts:
             return None
         import torch
 
@@ -662,7 +663,7 @@ class ModelRunner:
         splits per-mode.
         """
         if self.batch_policy.supports_mixed_modes:
-            decision = ForwardAdmissionRouter.from_env().decide(ops)
+            decision = ForwardAdmissionRouter.from_runtime_config().decide(ops)
             if decision.use_forward and self._accepts_forward_batch(ops, decision):
                 return [list(enumerate(ops))]
             self._log_text_mixed_split(ops, decision)

@@ -13,8 +13,8 @@ import torch
 
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
 from ..execution.model_base import UniModelBase
-from ..foundation.env import env_flag, env_str
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_lease_violation
+from ..foundation.runtime_config import get_worker_config
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..loader.transformers import dtype_from_name, infer_input_device
 from ..nn import RadixAttention
@@ -28,14 +28,11 @@ _ATTN_IMPL = "uniserve"
 
 
 def _trust_remote_code() -> bool:
-    # Default OFF (I7): executing arbitrary checkpoint-shipped code is opt-in and
-    # must be explicitly enabled, matching the native loader's hardcoded
-    # trust_remote_code=False. Enable via UNISERVE_TRANSFORMERS_TRUST_REMOTE_CODE.
-    return env_flag("UNISERVE_TRANSFORMERS_TRUST_REMOTE_CODE", default=False)
+    return get_worker_config().transformers_trust_remote_code
 
 
 def _attention_implementation() -> str:
-    return env_str("UNISERVE_TRANSFORMERS_ATTN_IMPLEMENTATION", default=_ATTN_IMPL)
+    return get_worker_config().transformers_attn_implementation
 
 
 def _uniserve_attention_forward(
@@ -220,7 +217,7 @@ class TransformersForCausalLM(UniModelBase):
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         trust_remote_code = _trust_remote_code()
-        dtype = dtype_from_name(env_str("UNISERVE_TRANSFORMERS_DTYPE", default="bfloat16"))
+        dtype = dtype_from_name(get_worker_config().model_dtype)
         attn_impl = _attention_implementation()
         if attn_impl == _ATTN_IMPL:
             _register_uniserve_attention()
