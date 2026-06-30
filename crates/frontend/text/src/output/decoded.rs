@@ -20,9 +20,9 @@ pub struct TextDecodeOptions {
     pub skip_special_tokens: bool,
     pub include_stop_str_in_output: bool,
     pub stop_strings: Option<Vec<String>>,
- /// Minimum number of tokens to generate before stop-string checking kicks
- /// in. Stop strings found within the first `min_tokens` tokens are
- /// ignored.
+    /// Minimum number of tokens to generate before stop-string checking kicks
+    /// in. Stop strings found within the first `min_tokens` tokens are
+    /// ignored.
     pub min_tokens: u32,
 }
 
@@ -43,7 +43,7 @@ pub struct Finished {
     pub prompt_token_count: usize,
     pub output_token_count: usize,
     pub finish_reason: FinishReason,
- /// Connector-specific KV transfer parameters for disaggregated serving.
+    /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
 }
 
@@ -51,32 +51,32 @@ pub struct Finished {
 /// adaptation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedTextEvent {
- /// The request has reached the point where prompt-scoped decoding metadata
- /// is ready.
+    /// The request has reached the point where prompt-scoped decoding metadata
+    /// is ready.
     Start {
- /// The actual prompt token IDs for this request.
+        /// The actual prompt token IDs for this request.
         prompt_token_ids: Arc<[u32]>,
- /// Once-only prompt logprobs metadata, when requested.
+        /// Once-only prompt logprobs metadata, when requested.
 
- /// The first prompt token is carried separately because it has no left
- /// context to score against; `scored_positions` covers the
- /// remaining prompt positions.
+        /// The first prompt token is carried separately because it has no left
+        /// context to score against; `scored_positions` covers the
+        /// remaining prompt positions.
         prompt_logprobs: Option<DecodedPromptLogprobs>,
     },
- /// A delta of text has been decoded, optionally alongside token-position
- /// logprobs.
+    /// A delta of text has been decoded, optionally alongside token-position
+    /// logprobs.
 
- /// `delta` is the newly visible decoded text fragment for this update.
+    /// `delta` is the newly visible decoded text fragment for this update.
 
- /// `logprobs` covers the newly generated token positions from the same
- /// update, but is not guaranteed to align with `delta` by character
- /// span. One update may carry token logprobs but no newly visible text
- /// yet, and one visible text fragment may reflect multiple token
- /// positions becoming decodable together.
+    /// `logprobs` covers the newly generated token positions from the same
+    /// update, but is not guaranteed to align with `delta` by character
+    /// span. One update may carry token logprobs but no newly visible text
+    /// yet, and one visible text fragment may reflect multiple token
+    /// positions becoming decodable together.
 
- /// Upper-level may further parse `delta` as reasoning or tool calls.
+    /// Upper-level may further parse `delta` as reasoning or tool calls.
 
- /// When `finished` is `Some`, this is the terminal event for the request.
+    /// When `finished` is `Some`, this is the terminal event for the request.
     TextDelta {
         delta: String,
         token_ids: Vec<u32>,
@@ -105,7 +105,7 @@ pub async fn decoded_text_event_stream(
     while let Some(next) = raw_stream.next().await {
         let output = next?;
 
- // If it's the first output, init states and yield `Start` event.
+        // If it's the first output, init states and yield `Start` event.
         if decoder.is_none() {
             let Some(prompt_token_ids) = output.prompt_token_ids() else {
                 return Err(Error::MalformedOutput {
@@ -118,9 +118,9 @@ pub async fn decoded_text_event_stream(
             let dec = tokenizer.create_decode_stream(
                 prompt_token_ids,
                 decode_options.skip_special_tokens,
- // If we are excluding stop strings from output, we need to buffer
- // the output so that we don't return the beginning of a stop string
- // when streaming the outputs.
+                // If we are excluding stop strings from output, we need to buffer
+                // the output so that we don't return the beginning of a stop string
+                // when streaming the outputs.
                 match decode_options.include_stop_str_in_output {
                     true => 0,
                     false => {
@@ -165,8 +165,8 @@ pub async fn decoded_text_event_stream(
         let suppress_terminal_stop_token = finish_reason.as_ref().is_some_and(|r| r.is_stop())
             && !decode_options.include_stop_str_in_output;
         let decodable_token_ids = if suppress_terminal_stop_token {
- // Match Python V1 token-stop detokenization by keeping the stop token
- // in metadata while excluding it from user-visible text.
+            // Match Python V1 token-stop detokenization by keeping the stop token
+            // in metadata while excluding it from user-visible text.
             output
                 .token_ids
                 .split_last()
@@ -209,7 +209,7 @@ pub async fn decoded_text_event_stream(
         let mut new_token_ids = output.token_ids;
         let mut new_logprobs = output.logprobs;
 
- // Trim tokens and logprobs if we matched stop string.
+        // Trim tokens and logprobs if we matched stop string.
         if let Some(num_tokens) = truncate_tokens_to {
             new_token_ids.truncate(num_tokens);
             if let Some(logprobs) = &mut new_logprobs {
@@ -241,7 +241,7 @@ pub async fn decoded_text_event_stream(
         }
 
         if let Some(reason) = finish_reason {
- // Flush any remaining buffered text.
+            // Flush any remaining buffered text.
             let (last_chunk, mut text) = decoder.flush(truncate_output_to)?;
             let text_len = text.len();
             let full_text = tracing::enabled!(Level::TRACE).then(|| text.clone());
@@ -269,9 +269,9 @@ pub async fn decoded_text_event_stream(
                 trace!(full_text, "request finished with terminal decoded text");
             }
 
- // Intentionally drop the stream with explicit cause, so that the engine core
- // can distinguish between such normal completion vs an unexpected
- // early drop.
+            // Intentionally drop the stream with explicit cause, so that the engine core
+            // can distinguish between such normal completion vs an unexpected
+            // early drop.
             if stop_str_matched {
                 AbortCause::StopStringMatched.drop_as(raw_stream);
             }
@@ -309,7 +309,7 @@ pub async fn decoded_text_event_stream(
 /// (index into stop string vec, byte index of first byte of stop string in
 /// output)
 fn matches_stop_string(stops: &[String], output: &str, new_bytes: usize) -> Option<(usize, usize)> {
- // We compare byte subslices to avoid utf8 boundary problem
+    // We compare byte subslices to avoid utf8 boundary problem
     let output = output.as_bytes();
     let next_off = (output.len() + 1) - new_bytes;
     stops
@@ -338,7 +338,7 @@ mod tests {
     use super::*;
     use crate::output::TextOutputStreamExt as _;
 
- /// Backend that treats each token ID as a raw byte, producing lossy UTF-8.
+    /// Backend that treats each token ID as a raw byte, producing lossy UTF-8.
     struct ByteTokenizer;
 
     impl Tokenizer for ByteTokenizer {
@@ -364,8 +364,8 @@ mod tests {
         }
     }
 
- /// Helper: run `decoded_text_event_stream` to completion and return the
- /// collected output.
+    /// Helper: run `decoded_text_event_stream` to completion and return the
+    /// collected output.
     async fn run_to_completion(
         token_ids: Vec<u32>,
         decode_options: TextDecodeOptions,
@@ -383,7 +383,7 @@ mod tests {
             .unwrap()
     }
 
- /// Convert ASCII string to token IDs (one byte per token).
+    /// Convert ASCII string to token IDs (one byte per token).
     fn ascii_tokens(s: &str) -> Vec<u32> {
         s.bytes().map(u32::from).collect()
     }
@@ -415,7 +415,7 @@ mod tests {
         }
     }
 
- // --- stop string stream tests ---
+    // --- stop string stream tests ---
 
     #[tokio::test]
     async fn stream_stop_string_sets_task_local_abort_cause_on_raw_stream_drop() {
@@ -487,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_stop_string_first_of_multiple_wins() {
- // Both "ll" and "lo" are present; "ll" appears first in the output.
+        // Both "ll" and "lo" are present; "ll" appears first in the output.
         let output = run_to_completion(ascii_tokens("hello"), opts(&["ll", "lo"], 0)).await;
         assert_eq!(output.text, "he");
         assert!(output.finish_reason.is_stop());
@@ -508,12 +508,12 @@ mod tests {
         assert!(output.finish_reason.is_stop());
     }
 
- // --- min_tokens + stop string interaction ---
+    // --- min_tokens + stop string interaction ---
 
     #[tokio::test]
     async fn min_tokens_suppresses_early_stop_string() {
- // stop="e", min_tokens=3: the 'e' at token 2 is within the first 3 tokens,
- // so it should be skipped. No later 'e' exists, so output runs to completion.
+        // stop="e", min_tokens=3: the 'e' at token 2 is within the first 3 tokens,
+        // so it should be skipped. No later 'e' exists, so output runs to completion.
         let output = run_to_completion(ascii_tokens("hello"), opts(&["e"], 3)).await;
         assert_eq!(output.text, "hello");
         assert_eq!(output.finish_reason, FinishReason::Length);
@@ -521,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn min_tokens_allows_stop_string_after_threshold() {
- // stop="e", min_tokens=2: the first 'e' at token 3 is past the threshold.
+        // stop="e", min_tokens=2: the first 'e' at token 3 is past the threshold.
         let output = run_to_completion(ascii_tokens("greet"), opts(&["e"], 2)).await;
         assert_eq!(output.text, "gr");
         assert!(output.finish_reason.is_stop());
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn stop_string_matches_at_end() {
         let stops = vec!["wor".to_string()];
- // Output: "say wor", last byte 'r' was just added (new_bytes=1)
+        // Output: "say wor", last byte 'r' was just added (new_bytes=1)
         let result = matches_stop_string(&stops, "say wor", 1);
         assert_eq!(result, Some((0, 4)));
     }
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn stop_string_matches_first_of_multiple() {
         let stops = vec!["wor".to_string(), "say".to_string()];
- // "say" appears earlier but "wor" is checked first (index 0)
+        // "say" appears earlier but "wor" is checked first (index 0)
         let result = matches_stop_string(&stops, "say wor", 1);
         assert_eq!(result, Some((0, 4)));
     }
@@ -567,7 +567,7 @@ mod tests {
     #[test]
     fn stop_string_matches_with_multiple_new_bytes() {
         let stops = vec!["wor".to_string()];
- // "say wor" where last 3 bytes "wor" were added at once
+        // "say wor" where last 3 bytes "wor" were added at once
         let result = matches_stop_string(&stops, "say wor", 3);
         assert_eq!(result, Some((0, 4)));
     }
@@ -596,9 +596,9 @@ mod tests {
     #[test]
     fn stop_string_not_in_new_bytes_region() {
         let stops = vec!["say".to_string()];
- // "say" is in the output but before the new byte region.
- // new_bytes=1 means only 'r' was added; "say" ended at byte 3,
- // but the search window starts at next_off - stop_len = 7+1-1 - 3 = 4.
+        // "say" is in the output but before the new byte region.
+        // new_bytes=1 means only 'r' was added; "say" ended at byte 3,
+        // but the search window starts at next_off - stop_len = 7+1-1 - 3 = 4.
         let result = matches_stop_string(&stops, "say wor", 1);
         assert_eq!(result, None);
     }
@@ -613,8 +613,8 @@ mod tests {
     #[test]
     fn stop_string_multibyte_utf8() {
         let stops = vec!["世界".to_string()];
- // "你好世界" is 12 bytes: 你(3) + 好(3) + 世(3) + 界(3)
- // "世界" starts at byte 6
+        // "你好世界" is 12 bytes: 你(3) + 好(3) + 世(3) + 界(3)
+        // "世界" starts at byte 6
         let result = matches_stop_string(&stops, "你好世界", 3);
         assert_eq!(result, Some((0, 6)));
     }

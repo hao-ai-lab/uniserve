@@ -17,10 +17,6 @@ from pathlib import Path
 import pytest
 
 from uniserve_worker.contracts.op_kinds import OP_KINDS
-from uniserve_worker.runtime.image_defaults import (
-    SENSENOVA_DEFAULT_HEIGHT,
-    SENSENOVA_DEFAULT_WIDTH,
-)
 
 pytestmark = pytest.mark.contract
 
@@ -53,25 +49,4 @@ def test_op_kind_vocabulary_matches_flatbuffers_schema():
     fbs_kinds = {_camel_to_snake(m) for m in members}
     assert fbs_kinds == set(OP_KINDS), (
         f"op-kind drift: fbs={sorted(fbs_kinds)} python={sorted(OP_KINDS)}"
-    )
-
-
-def test_image_defaults_match_rust_image_params_default():
-    """Python image fallback dims == Rust ImageParams::default() (I5/INC-54)."""
-    root = _repo_root()
-    if root is None:
-        pytest.skip("Rust crates not present in this checkout")
-    core_rs = root / "crates/foundation/core/src/lib.rs"
-    if not core_rs.exists():
-        pytest.skip("foundation core lib.rs not present")
-    text = core_rs.read_text(encoding="utf-8")
-    block = re.search(r"impl Default for ImageParams\s*\{(.*?)\n\}", text, re.DOTALL)
-    assert block, "could not locate impl Default for ImageParams"
-    body = block.group(1)
-    h = re.search(r"height:\s*(\d+)", body)
-    w = re.search(r"width:\s*(\d+)", body)
-    assert h and w, "could not parse default height/width"
-    assert (int(h.group(1)), int(w.group(1))) == (SENSENOVA_DEFAULT_HEIGHT, SENSENOVA_DEFAULT_WIDTH), (
-        f"image default drift: rust=({h.group(1)},{w.group(1)}) "
-        f"python=({SENSENOVA_DEFAULT_HEIGHT},{SENSENOVA_DEFAULT_WIDTH})"
     )

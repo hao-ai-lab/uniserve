@@ -40,7 +40,7 @@ fn main() {
     std::fs::write(&path, &bytes).unwrap();
     println!("wrote {} bytes to {}", bytes.len(), path);
 
- // also round-trip a response
+    // also round-trip a response
     let resp = WorkerResponse {
         kind: "caps".into(),
         call_id: None,
@@ -64,7 +64,7 @@ fn main() {
     )
     .unwrap();
 
- // self round-trip check
+    // self round-trip check
     let back = flat::decode_request(&bytes).unwrap();
     println!(
         "rust round-trip ok: {:?}",

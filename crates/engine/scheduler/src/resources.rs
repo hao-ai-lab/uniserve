@@ -19,7 +19,7 @@ use uniserve_worker_wire::{
 pub struct LedgerStats {
     pub issued: u64,
     pub released: u64,
- /// Leases still active when a request left `running` (released defensively).
+    /// Leases still active when a request left `running` (released defensively).
     pub leaked: u64,
     pub invariant_violations: u64,
 }
@@ -68,7 +68,7 @@ impl ResourceLedger {
         });
     }
 
- /// Issue a lease for `capacity` units of `class` to `req`; returns the handle.
+    /// Issue a lease for `capacity` units of `class` to `req`; returns the handle.
     pub fn issue(
         &mut self,
         req: RequestId,
@@ -92,8 +92,8 @@ impl ResourceLedger {
         handle
     }
 
- /// Release every lease of one class held by `req` (e.g. image latents +
- /// scratch when a generated image commits). Returns the count released.
+    /// Release every lease of one class held by `req` (e.g. image latents +
+    /// scratch when a generated image commits). Returns the count released.
     pub fn release_class(&mut self, req: RequestId, class: ResourceClass) -> usize {
         let Some(leases) = self.active.get_mut(&req) else {
             return 0;
@@ -117,9 +117,9 @@ impl ResourceLedger {
         released
     }
 
- /// Release every lease held by `req` (completion / drop / preemption).
- /// Returns the count released; counts any still-held lease as a soft leak so
- /// missing intermediate releases are visible without masking the invariant.
+    /// Release every lease held by `req` (completion / drop / preemption).
+    /// Returns the count released; counts any still-held lease as a soft leak so
+    /// missing intermediate releases are visible without masking the invariant.
     pub fn release_request(&mut self, req: RequestId) -> usize {
         let Some(leases) = self.active.remove(&req) else {
             return 0;
@@ -132,18 +132,18 @@ impl ResourceLedger {
         n
     }
 
- /// Active lease count for a request (0 == fully released).
+    /// Active lease count for a request (0 == fully released).
     pub fn active_for(&self, req: RequestId) -> usize {
         self.active.get(&req).map(|v| v.len()).unwrap_or(0)
     }
 
- /// Total active leases across all requests (0 when the engine is idle).
+    /// Total active leases across all requests (0 when the engine is idle).
     pub fn total_active(&self) -> usize {
         self.active.values().map(|v| v.len()).sum()
     }
 
- /// Assert `req` holds no leases (call AFTER `release_request`). A violation is
- /// counted + logged, never panicked, so the live serving loop is unaffected.
+    /// Assert `req` holds no leases (call AFTER `release_request`). A violation is
+    /// counted + logged, never panicked, so the live serving loop is unaffected.
     pub fn assert_released(&mut self, req: RequestId) -> bool {
         let held = self.active_for(req);
         if held != 0 {
@@ -184,11 +184,11 @@ mod tests {
         l.issue(r, ResourceClass::Scratch, 64, LeasePolicy::PerRequest);
         assert_eq!(l.active_for(r), 3);
         assert_eq!(l.total_active(), 3);
- // commit releases image leases; KV persists.
+        // commit releases image leases; KV persists.
         assert_eq!(l.release_class(r, ResourceClass::ImageLatent), 1);
         assert_eq!(l.release_class(r, ResourceClass::Scratch), 1);
         assert_eq!(l.active_for(r), 1);
- // finish releases the rest.
+        // finish releases the rest.
         assert_eq!(l.release_request(r), 1);
         assert_eq!(l.active_for(r), 0);
         assert!(l.assert_released(r));

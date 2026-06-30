@@ -21,153 +21,153 @@ fn default_completion_max_tokens() -> Option<u32> {
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct CompletionRequest {
- // -------- Standard OpenAI API Parameters --------
- /// ID of the model to use
+    // -------- Standard OpenAI API Parameters --------
+    /// ID of the model to use
     pub model: String,
 
- /// The prompt(s) to generate completions for.
+    /// The prompt(s) to generate completions for.
 
- /// Token-ID input bypasses tokenizer work after conversion to the text
- /// facade.
+    /// Token-ID input bypasses tokenizer work after conversion to the text
+    /// facade.
     pub prompt: Prompt,
 
- /// Echo back the prompt in addition to the completion
+    /// Echo back the prompt in addition to the completion
     #[serde(default)]
     pub echo: bool,
 
- /// Number between -2.0 and 2.0. Positive values penalize new tokens based
- /// on their existing frequency in the text so far
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based
+    /// on their existing frequency in the text so far
     pub frequency_penalty: Option<f32>,
 
- /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion
     pub logit_bias: Option<HashMap<String, f32>>,
 
- /// Include the log probabilities on the logprobs most likely tokens
+    /// Include the log probabilities on the logprobs most likely tokens
     pub logprobs: Option<u32>,
 
- /// The maximum number of tokens to generate (defaults to 16 when absent,
- /// matching the reference / OpenAI API convention)
+    /// The maximum number of tokens to generate (defaults to 16 when absent,
+    /// matching the reference / OpenAI API convention)
     #[serde(default = "default_completion_max_tokens")]
     pub max_tokens: Option<u32>,
 
- /// How many completions to generate for each prompt
+    /// How many completions to generate for each prompt
     pub n: Option<u32>,
 
- /// Number between -2.0 and 2.0. Positive values penalize new tokens based
- /// on whether they appear in the text so far
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based
+    /// on whether they appear in the text so far
     pub presence_penalty: Option<f32>,
 
- /// If specified, our system will make a best effort to sample
- /// deterministically
+    /// If specified, our system will make a best effort to sample
+    /// deterministically
     pub seed: Option<i64>,
 
- /// Up to 4 sequences where the API will stop generating further tokens
+    /// Up to 4 sequences where the API will stop generating further tokens
     #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
- /// Whether to stream back partial progress
+    /// Whether to stream back partial progress
     #[serde(default)]
     pub stream: bool,
 
- /// The suffix that comes after a completion of inserted text
+    /// The suffix that comes after a completion of inserted text
     pub suffix: Option<String>,
 
- /// What sampling temperature to use, between 0 and 2
+    /// What sampling temperature to use, between 0 and 2
     pub temperature: Option<f32>,
 
- /// An alternative to sampling with temperature (nucleus sampling)
+    /// An alternative to sampling with temperature (nucleus sampling)
     pub top_p: Option<f32>,
 
- /// A unique identifier representing your end-user
+    /// A unique identifier representing your end-user
     pub user: Option<String>,
 
- // -------- Sampling Parameters --------
- /// Options for streaming response
+    // -------- Sampling Parameters --------
+    /// Options for streaming response
     pub stream_options: Option<StreamOptions>,
 
- /// Use beam search instead of sampling
+    /// Use beam search instead of sampling
     #[serde(default)]
     pub use_beam_search: bool,
 
- /// Top-k sampling parameter
+    /// Top-k sampling parameter
     pub top_k: Option<u32>,
 
- /// Min-p nucleus sampling parameter
+    /// Min-p nucleus sampling parameter
     pub min_p: Option<f32>,
 
- /// Repetition penalty for reducing repetitive text
+    /// Repetition penalty for reducing repetitive text
     pub repetition_penalty: Option<f32>,
 
- /// Length penalty for beam search
+    /// Length penalty for beam search
     pub length_penalty: Option<f32>,
 
- /// Specific token IDs to use as stop conditions
+    /// Specific token IDs to use as stop conditions
     pub stop_token_ids: Option<Vec<u32>>,
 
- /// Include stop string in output
+    /// Include stop string in output
     #[serde(default)]
     pub include_stop_str_in_output: bool,
 
- /// Ignore end-of-sequence tokens during generation
+    /// Ignore end-of-sequence tokens during generation
     #[serde(default)]
     pub ignore_eos: bool,
 
- /// Minimum number of tokens to generate
+    /// Minimum number of tokens to generate
     pub min_tokens: Option<u32>,
 
- /// Skip special tokens during detokenization
+    /// Skip special tokens during detokenization
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
- /// Add spaces between special tokens during detokenization
+    /// Add spaces between special tokens during detokenization
     #[serde(default = "default_true")]
     pub spaces_between_special_tokens: bool,
 
- /// Truncate prompt tokens to this length
+    /// Truncate prompt tokens to this length
     pub truncate_prompt_tokens: Option<i64>,
 
- /// Restrict output to these token IDs only
+    /// Restrict output to these token IDs only
     pub allowed_token_ids: Option<Vec<u32>>,
 
- /// Number of prompt logprobs to return
+    /// Number of prompt logprobs to return
     pub prompt_logprobs: Option<i32>,
 
- // -------- Extra Parameters --------
- /// Whether to add special tokens (e.g. BOS) to the prompt
+    // -------- Extra Parameters --------
+    /// Whether to add special tokens (e.g. BOS) to the prompt
     #[serde(default = "default_true")]
     pub add_special_tokens: bool,
 
- /// Format specification for structured output (JSON mode, JSON schema,
- /// etc.)
+    /// Format specification for structured output (JSON mode, JSON schema,
+    /// etc.)
     pub response_format: Option<Value>,
 
- /// Additional kwargs for structured outputs
+    /// Additional kwargs for structured outputs
     pub structured_outputs: Option<Value>,
 
- /// Request scheduling priority (lower means earlier; default 0)
+    /// Request scheduling priority (lower means earlier; default 0)
     pub priority: Option<i32>,
 
- /// External request ID used for response correlation.
+    /// External request ID used for response correlation.
     pub request_id: Option<String>,
 
- /// Tokens represented as strings of the form 'token_id:{token_id}' in
- /// logprobs
+    /// Tokens represented as strings of the form 'token_id:{token_id}' in
+    /// logprobs
     pub return_tokens_as_token_ids: Option<bool>,
 
- /// Include token IDs alongside generated text
+    /// Include token IDs alongside generated text
     pub return_token_ids: Option<bool>,
 
- /// Salt for prefix cache isolation in multi-user environments
+    /// Salt for prefix cache isolation in multi-user environments
     pub cache_salt: Option<String>,
 
- /// KV transfer parameters for disaggregated serving
+    /// KV transfer parameters for disaggregated serving
     pub kv_transfer_params: Option<HashMap<String, Value>>,
 
- /// Additional request parameters with string or numeric values for custom
- /// extensions
+    /// Additional request parameters with string or numeric values for custom
+    /// extensions
     pub uniserve_xargs: Option<HashMap<String, Value>>,
 
- /// Additional fields
+    /// Additional fields
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -215,7 +215,7 @@ pub struct CompletionStreamResponse {
 }
 
 impl CompletionStreamResponse {
- /// Create a stream response with the standard envelope fields pre-filled.
+    /// Create a stream response with the standard envelope fields pre-filled.
     pub fn new(id: &str, model: &str, created: u64) -> Self {
         Self {
             id: id.to_string(),
@@ -244,9 +244,9 @@ pub struct CompletionStreamChoice {
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum CompletionSseChunk {
- /// Ordinary OpenAI completions delta/final chunk.
+    /// Ordinary OpenAI completions delta/final chunk.
     Chunk(CompletionStreamResponse),
- /// Final usage chunk emitted before `[DONE]` when `include_usage=true`.
+    /// Final usage chunk emitted before `[DONE]` when `include_usage=true`.
     Usage(CompletionStreamResponse),
 }
 
@@ -254,8 +254,8 @@ pub enum CompletionSseChunk {
 mod tests {
     use super::*;
 
- /// Unknown top-level fields are preserved in the `other` catch-all rather
- /// than dropped, mirroring the `ChatCompletionRequest::other` behavior.
+    /// Unknown top-level fields are preserved in the `other` catch-all rather
+    /// than dropped, mirroring the `ChatCompletionRequest::other` behavior.
     #[test]
     fn unknown_fields_are_captured_in_other() {
         let json = serde_json::json!({
@@ -268,24 +268,24 @@ mod tests {
 
         let req: CompletionRequest = serde_json::from_value(json).unwrap();
 
- // Known fields still deserialize normally.
+        // Known fields still deserialize normally.
         assert_eq!(req.model, "test-model");
         assert_eq!(req.temperature, Some(0.5));
         assert_eq!(req.prompt, Prompt::Text("hello".to_string()));
 
- // Unknown fields land in the catch-all, not silently discarded.
+        // Unknown fields land in the catch-all, not silently discarded.
         assert_eq!(req.other.get("some_future_field"), Some(&Value::from(42)));
         assert_eq!(
             req.other.get("vendor_extension"),
             Some(&serde_json::json!({"nested": true}))
         );
- // Known fields are not duplicated into the catch-all.
+        // Known fields are not duplicated into the catch-all.
         assert!(!req.other.contains_key("model"));
         assert!(!req.other.contains_key("temperature"));
     }
 
- /// A minimal request relies on serde defaults: `max_tokens` defaults to 16
- /// and the `default_true` flags default to true.
+    /// A minimal request relies on serde defaults: `max_tokens` defaults to 16
+    /// and the `default_true` flags default to true.
     #[test]
     fn minimal_request_applies_serde_defaults() {
         let json = serde_json::json!({
@@ -304,8 +304,8 @@ mod tests {
         assert!(req.other.is_empty());
     }
 
- /// A token-id prompt deserializes into `Prompt::TokenIds` and round-trips
- /// back to the same JSON array.
+    /// A token-id prompt deserializes into `Prompt::TokenIds` and round-trips
+    /// back to the same JSON array.
     #[test]
     fn token_id_prompt_round_trips_through_serde() {
         let json = serde_json::json!({
@@ -320,8 +320,8 @@ mod tests {
         assert_eq!(reserialized["prompt"], serde_json::json!([1, 2, 3]));
     }
 
- /// `skip_serializing_none` drops absent optional fields from the serialized
- /// request, so e.g. `seed` and `top_k` do not appear when unset.
+    /// `skip_serializing_none` drops absent optional fields from the serialized
+    /// request, so e.g. `seed` and `top_k` do not appear when unset.
     #[test]
     fn unset_optional_fields_are_omitted_on_serialize() {
         let json = serde_json::json!({
@@ -335,12 +335,12 @@ mod tests {
         assert!(!map.contains_key("seed"));
         assert!(!map.contains_key("top_k"));
         assert!(!map.contains_key("logprobs"));
- // Present-with-default scalar fields are still serialized.
+        // Present-with-default scalar fields are still serialized.
         assert_eq!(map.get("max_tokens"), Some(&Value::from(16)));
     }
 
- /// A populated response serializes with the choice fields it carries and
- /// omits unset optional envelope fields (`skip_serializing_none`).
+    /// A populated response serializes with the choice fields it carries and
+    /// omits unset optional envelope fields (`skip_serializing_none`).
     #[test]
     fn response_serializes_choice_and_omits_unset_fields() {
         let response = CompletionResponse {
@@ -368,16 +368,16 @@ mod tests {
         assert_eq!(map.get("id"), Some(&Value::from("cmpl-1")));
         assert_eq!(value["choices"][0]["text"], Value::from("world"));
         assert_eq!(value["choices"][0]["finish_reason"], Value::from("stop"));
- // Unset response-envelope optionals are omitted.
+        // Unset response-envelope optionals are omitted.
         assert!(!map.contains_key("usage"));
         assert!(!map.contains_key("system_fingerprint"));
- // Unset choice optionals are omitted too.
+        // Unset choice optionals are omitted too.
         let choice = value["choices"][0].as_object().unwrap();
         assert!(!choice.contains_key("logprobs"));
         assert!(!choice.contains_key("token_ids"));
     }
 
- /// `CompletionStreamResponse::new` pre-fills the standard envelope.
+    /// `CompletionStreamResponse::new` pre-fills the standard envelope.
     #[test]
     fn stream_response_new_prefills_envelope() {
         let stream = CompletionStreamResponse::new("id-1", "model-x", 7);

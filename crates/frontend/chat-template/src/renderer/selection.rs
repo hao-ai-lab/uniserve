@@ -6,14 +6,14 @@ use serde_with::{DeserializeFromStr, SerializeDisplay};
 /// Specify which chat renderer implementation to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
 pub enum RendererSelection {
- /// Use model-based auto-detection.
+    /// Use model-based auto-detection.
     #[default]
     Auto,
- /// Force the generic Hugging Face chat-template renderer.
+    /// Force the generic Hugging Face chat-template renderer.
     Hf,
- /// Force the DeepSeek V3.2 renderer.
+    /// Force the DeepSeek V3.2 renderer.
     DeepSeekV32,
- /// Force the DeepSeek V4 renderer.
+    /// Force the DeepSeek V4 renderer.
     DeepSeekV4,
 }
 
@@ -23,13 +23,13 @@ impl RendererSelection {
     pub const DEEPSEEK_V4_LITERAL: &str = "deepseek_v4";
     pub const HF_LITERAL: &str = "hf";
 
- /// Resolve the renderer selection using the given model type string, if
- /// it's `Auto`.
+    /// Resolve the renderer selection using the given model type string, if
+    /// it's `Auto`.
 
- /// Matching is case-insensitive so that the renderer auto-detection aligns
- /// with the sibling tool/reasoning parser selectors, which also match
- /// case-insensitively (see `chat-output`'s `ParserFactory`). A model whose
- /// `model_type` differs only in case should resolve to the same renderer.
+    /// Matching is case-insensitive so that the renderer auto-detection aligns
+    /// with the sibling tool/reasoning parser selectors, which also match
+    /// case-insensitively (see `chat-output`'s `ParserFactory`). A model whose
+    /// `model_type` differs only in case should resolve to the same renderer.
     pub fn resolve(self, model_type: &str) -> Self {
         match self {
             Self::Auto => {
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn renderer_selection_resolve_auto_detects_case_insensitively() {
- // Auto detection maps known model types to their renderers.
+        // Auto detection maps known model types to their renderers.
         assert_eq!(
             RendererSelection::Auto.resolve("deepseek_v32"),
             RendererSelection::DeepSeekV32
@@ -112,7 +112,7 @@ mod tests {
             RendererSelection::Auto.resolve("deepseek_v4"),
             RendererSelection::DeepSeekV4
         );
- // Matching is case-insensitive, mirroring the parser selectors.
+        // Matching is case-insensitive, mirroring the parser selectors.
         assert_eq!(
             RendererSelection::Auto.resolve("DeepSeek_V32"),
             RendererSelection::DeepSeekV32
@@ -121,7 +121,7 @@ mod tests {
             RendererSelection::Auto.resolve("DEEPSEEK_V4"),
             RendererSelection::DeepSeekV4
         );
- // Unknown model types fall back to the generic HF renderer.
+        // Unknown model types fall back to the generic HF renderer.
         assert_eq!(
             RendererSelection::Auto.resolve("llama"),
             RendererSelection::Hf
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn renderer_selection_resolve_keeps_explicit_choice() {
- // A non-Auto selection ignores the model type and is returned as-is.
+        // A non-Auto selection ignores the model type and is returned as-is.
         for selection in [
             RendererSelection::Hf,
             RendererSelection::DeepSeekV32,

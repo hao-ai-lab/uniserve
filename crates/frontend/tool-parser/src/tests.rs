@@ -338,7 +338,9 @@ mod streaming_invariants {
                     shape(&streamed),
                     shape(&whole_output),
                     "{}: calls diverged for split at {:?}|{:?}",
-                    case.label, head, tail
+                    case.label,
+                    head,
+                    tail
                 );
             }
 
@@ -400,11 +402,9 @@ mod streaming_invariants {
                 .unwrap();
 
             let arguments = format!(r#"{{"text":"literal {sentinel} inside"}}"#);
-            let whole = case.whole.replacen(
-                r#"{"location":"Tokyo","days":"3"}"#,
-                &arguments,
-                1,
-            );
+            let whole = case
+                .whole
+                .replacen(r#"{"location":"Tokyo","days":"3"}"#, &arguments, 1);
 
             // Whole parse keeps the sentinel inside the single call's arguments.
             let mut parser = (case.build)(&tools);
@@ -425,7 +425,9 @@ mod streaming_invariants {
                     shape(&streamed),
                     vec![call("get_weather", &arguments)],
                     "{}: sentinel-in-string diverged for split {:?}|{:?}",
-                    case.label, head, tail
+                    case.label,
+                    head,
+                    tail
                 );
             }
         }
@@ -684,9 +686,7 @@ mod streaming_invariants {
             (
                 "qwen_coder",
                 qwen_coder as fn(&[Tool]) -> Box<dyn ToolParser>,
-                format!(
-                    "<tool_call>\n<function=get_weather>\n<parameter=location>{leak_probe}"
-                ),
+                format!("<tool_call>\n<function=get_weather>\n<parameter=location>{leak_probe}"),
             ),
         ];
 

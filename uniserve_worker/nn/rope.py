@@ -20,8 +20,6 @@ __all__ = [
     'rotate_half',
     'apply_rotary_emb',
     'try_triton_qk_rms_norm_rope',
-    'can_run_triton_sensenova_qk_rms_norm_rope_3d',
-    'try_triton_sensenova_qk_rms_norm_rope_3d',
     'apply_rotary_pos_emb',
     'RotaryEmbedding',
     'HFRotaryEmbedding',
@@ -49,120 +47,6 @@ _TRITON_ROPE_BLOCK = 256
 
 
 if triton is not None:
-
-    @triton.jit
-    def _sensenova_square_pair(ptr, base, stride: tl.constexpr, start: tl.constexpr, active, offset: tl.constexpr):
-        x0 = tl.load(ptr + base + (start + offset) * stride, mask=active, other=0.0).to(tl.float32)
-        x1 = tl.load(ptr + base + (start + 32 + offset) * stride, mask=active, other=0.0).to(tl.float32)
-        return ((x0 * x0).to(tl.float32) + (x1 * x1).to(tl.float32)).to(tl.float32)
-
-    @triton.jit
-    def _sensenova_add_rn(a, b):
-        return tl.inline_asm_elementwise(
-            "add.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            [a, b],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-
-    @triton.jit
-    def _sensenova_sub_rn(a, b):
-        return tl.inline_asm_elementwise(
-            "sub.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            [a, b],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-
-    @triton.jit
-    def _sensenova_mul_rn(a, b):
-        return tl.inline_asm_elementwise(
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            [a, b],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-
-    @triton.jit
-    def _sensenova_mean_square_64(ptr, base, stride: tl.constexpr, start: tl.constexpr, active):
-        p0 = _sensenova_square_pair(ptr, base, stride, start, active, 0)
-        p1 = _sensenova_square_pair(ptr, base, stride, start, active, 1)
-        p2 = _sensenova_square_pair(ptr, base, stride, start, active, 2)
-        p3 = _sensenova_square_pair(ptr, base, stride, start, active, 3)
-        p4 = _sensenova_square_pair(ptr, base, stride, start, active, 4)
-        p5 = _sensenova_square_pair(ptr, base, stride, start, active, 5)
-        p6 = _sensenova_square_pair(ptr, base, stride, start, active, 6)
-        p7 = _sensenova_square_pair(ptr, base, stride, start, active, 7)
-        p8 = _sensenova_square_pair(ptr, base, stride, start, active, 8)
-        p9 = _sensenova_square_pair(ptr, base, stride, start, active, 9)
-        p10 = _sensenova_square_pair(ptr, base, stride, start, active, 10)
-        p11 = _sensenova_square_pair(ptr, base, stride, start, active, 11)
-        p12 = _sensenova_square_pair(ptr, base, stride, start, active, 12)
-        p13 = _sensenova_square_pair(ptr, base, stride, start, active, 13)
-        p14 = _sensenova_square_pair(ptr, base, stride, start, active, 14)
-        p15 = _sensenova_square_pair(ptr, base, stride, start, active, 15)
-        p16 = _sensenova_square_pair(ptr, base, stride, start, active, 16)
-        p17 = _sensenova_square_pair(ptr, base, stride, start, active, 17)
-        p18 = _sensenova_square_pair(ptr, base, stride, start, active, 18)
-        p19 = _sensenova_square_pair(ptr, base, stride, start, active, 19)
-        p20 = _sensenova_square_pair(ptr, base, stride, start, active, 20)
-        p21 = _sensenova_square_pair(ptr, base, stride, start, active, 21)
-        p22 = _sensenova_square_pair(ptr, base, stride, start, active, 22)
-        p23 = _sensenova_square_pair(ptr, base, stride, start, active, 23)
-        p24 = _sensenova_square_pair(ptr, base, stride, start, active, 24)
-        p25 = _sensenova_square_pair(ptr, base, stride, start, active, 25)
-        p26 = _sensenova_square_pair(ptr, base, stride, start, active, 26)
-        p27 = _sensenova_square_pair(ptr, base, stride, start, active, 27)
-        p28 = _sensenova_square_pair(ptr, base, stride, start, active, 28)
-        p29 = _sensenova_square_pair(ptr, base, stride, start, active, 29)
-        p30 = _sensenova_square_pair(ptr, base, stride, start, active, 30)
-        p31 = _sensenova_square_pair(ptr, base, stride, start, active, 31)
-        s0 = _sensenova_add_rn(p0, p1)
-        s1 = _sensenova_add_rn(p2, p3)
-        s2 = _sensenova_add_rn(p4, p5)
-        s3 = _sensenova_add_rn(p6, p7)
-        s4 = _sensenova_add_rn(p8, p9)
-        s5 = _sensenova_add_rn(p10, p11)
-        s6 = _sensenova_add_rn(p12, p13)
-        s7 = _sensenova_add_rn(p14, p15)
-        s8 = _sensenova_add_rn(p16, p17)
-        s9 = _sensenova_add_rn(p18, p19)
-        s10 = _sensenova_add_rn(p20, p21)
-        s11 = _sensenova_add_rn(p22, p23)
-        s12 = _sensenova_add_rn(p24, p25)
-        s13 = _sensenova_add_rn(p26, p27)
-        s14 = _sensenova_add_rn(p28, p29)
-        s15 = _sensenova_add_rn(p30, p31)
-        t0 = _sensenova_add_rn(s0, s1)
-        t1 = _sensenova_add_rn(s2, s3)
-        t2 = _sensenova_add_rn(s4, s5)
-        t3 = _sensenova_add_rn(s6, s7)
-        t4 = _sensenova_add_rn(s8, s9)
-        t5 = _sensenova_add_rn(s10, s11)
-        t6 = _sensenova_add_rn(s12, s13)
-        t7 = _sensenova_add_rn(s14, s15)
-        u0 = _sensenova_add_rn(t0, t1)
-        u1 = _sensenova_add_rn(t2, t3)
-        u2 = _sensenova_add_rn(t4, t5)
-        u3 = _sensenova_add_rn(t6, t7)
-        v0 = _sensenova_add_rn(u0, u1)
-        v1 = _sensenova_add_rn(u2, u3)
-        return _sensenova_add_rn(v0, v1) / 64.0
-
-    @triton.jit
-    def _sensenova_mean_square(ptr, base, stride: tl.constexpr, start: tl.constexpr, active, n_cols: tl.constexpr, block: tl.constexpr):
-        if n_cols == 64:
-            return _sensenova_mean_square_64(ptr, base, stride, start, active)
-        offs = tl.arange(0, block)
-        mask = active & (offs < n_cols)
-        x = tl.load(ptr + base + (start + offs) * stride, mask=mask, other=0.0).to(tl.float32)
-        return tl.sum(x * x, axis=0) / n_cols
 
     @triton.jit
     def _packed_rope_kernel(
@@ -270,176 +154,6 @@ if triton is not None:
         k_rot = tl.where(first_half, k1_norm * k_cos - k2_norm * k_sin, k2_norm * k_cos + k1_norm * k_sin)
         tl.store(k_out_ptr + k_pid * dim + offs, k_rot, mask=k_mask)
 
-    @triton.jit
-    def _sensenova_qk_rms_norm_rope_3d_kernel(
-        q_ptr,
-        k_ptr,
-        qw_t_ptr,
-        qw_hw_ptr,
-        kw_t_ptr,
-        kw_hw_ptr,
-        cos_t_ptr,
-        sin_t_ptr,
-        cos_h_ptr,
-        sin_h_ptr,
-        cos_w_ptr,
-        sin_w_ptr,
-        q_out_ptr,
-        k_out_ptr,
-        q_rows: tl.constexpr,
-        k_rows: tl.constexpr,
-        q_heads: tl.constexpr,
-        k_heads: tl.constexpr,
-        q_stride_0: tl.constexpr,
-        q_stride_1: tl.constexpr,
-        q_stride_2: tl.constexpr,
-        k_stride_0: tl.constexpr,
-        k_stride_1: tl.constexpr,
-        k_stride_2: tl.constexpr,
-        dim: tl.constexpr,
-        t_dim: tl.constexpr,
-        t_half: tl.constexpr,
-        hw_dim: tl.constexpr,
-        hw_half: tl.constexpr,
-        q_eps: tl.constexpr,
-        k_eps: tl.constexpr,
-        block: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        offs = tl.arange(0, block)
-        t_col = offs < t_dim
-        t_first = offs < t_half
-        t_pair = offs % t_half
-        t_second = t_half + t_pair
-        hw_col = offs < hw_dim
-        hw_first = offs < hw_half
-        hw_pair = offs % hw_half
-        hw_second = hw_half + hw_pair
-
-        q_active = pid < q_rows
-        q_token = pid // q_heads
-        q_head = pid - q_token * q_heads
-        q_base = q_token * q_stride_0 + q_head * q_stride_1
-
-        q_t_var = _sensenova_mean_square(q_ptr, q_base, q_stride_2, 0, q_active, t_dim, block)
-        q_t_inv = tl.rsqrt(q_t_var + q_eps)
-        q_t_1 = tl.load(q_ptr + q_base + t_pair * q_stride_2, mask=q_active & t_col, other=0.0).to(tl.float32)
-        q_t_2 = tl.load(q_ptr + q_base + t_second * q_stride_2, mask=q_active & t_col, other=0.0).to(tl.float32)
-        qw_t_1 = tl.load(qw_t_ptr + t_pair, mask=t_col, other=0.0).to(tl.float32)
-        qw_t_2 = tl.load(qw_t_ptr + t_second, mask=t_col, other=0.0).to(tl.float32)
-        q_cos_t = tl.load(cos_t_ptr + q_token * t_half + t_pair, mask=q_active & t_col, other=0.0).to(tl.float32)
-        q_sin_t = tl.load(sin_t_ptr + q_token * t_half + t_pair, mask=q_active & t_col, other=0.0).to(tl.float32)
-        q_t_1 = (q_t_1 * q_t_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_t_2 = (q_t_2 * q_t_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_t_1 = (q_t_1 * qw_t_1).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_t_2 = (q_t_2 * qw_t_2).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_t_left = _sensenova_mul_rn(q_t_1, q_cos_t)
-        q_t_right = _sensenova_mul_rn(q_t_2, q_sin_t)
-        q_t_second_left = _sensenova_mul_rn(q_t_2, q_cos_t)
-        q_t_second_right = _sensenova_mul_rn(q_t_1, q_sin_t)
-        q_t_rot = tl.where(t_first, _sensenova_sub_rn(q_t_left, q_t_right), _sensenova_add_rn(q_t_second_left, q_t_second_right))
-        q_t_rot = q_t_rot.to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        tl.store(q_out_ptr + pid * dim + offs, q_t_rot, mask=q_active & t_col)
-
-        q_hw_var = _sensenova_mean_square(q_ptr, q_base, q_stride_2, t_dim, q_active, t_dim, block)
-        q_hw_inv = tl.rsqrt(q_hw_var + q_eps)
-        q_h_1 = tl.load(q_ptr + q_base + (t_dim + hw_pair) * q_stride_2, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_h_2 = tl.load(q_ptr + q_base + (t_dim + hw_second) * q_stride_2, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_w_1 = tl.load(q_ptr + q_base + (t_dim + hw_dim + hw_pair) * q_stride_2, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_w_2 = tl.load(q_ptr + q_base + (t_dim + hw_dim + hw_second) * q_stride_2, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        qw_h_1 = tl.load(qw_hw_ptr + hw_pair, mask=hw_col, other=0.0).to(tl.float32)
-        qw_h_2 = tl.load(qw_hw_ptr + hw_second, mask=hw_col, other=0.0).to(tl.float32)
-        qw_w_1 = tl.load(qw_hw_ptr + hw_dim + hw_pair, mask=hw_col, other=0.0).to(tl.float32)
-        qw_w_2 = tl.load(qw_hw_ptr + hw_dim + hw_second, mask=hw_col, other=0.0).to(tl.float32)
-        q_cos_h = tl.load(cos_h_ptr + q_token * hw_half + hw_pair, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_sin_h = tl.load(sin_h_ptr + q_token * hw_half + hw_pair, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_cos_w = tl.load(cos_w_ptr + q_token * hw_half + hw_pair, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_sin_w = tl.load(sin_w_ptr + q_token * hw_half + hw_pair, mask=q_active & hw_col, other=0.0).to(tl.float32)
-        q_h_1 = (q_h_1 * q_hw_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_h_2 = (q_h_2 * q_hw_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_w_1 = (q_w_1 * q_hw_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_w_2 = (q_w_2 * q_hw_inv).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_h_1 = (q_h_1 * qw_h_1).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_h_2 = (q_h_2 * qw_h_2).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_w_1 = (q_w_1 * qw_w_1).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_w_2 = (q_w_2 * qw_w_2).to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_h_left = _sensenova_mul_rn(q_h_1, q_cos_h)
-        q_h_right = _sensenova_mul_rn(q_h_2, q_sin_h)
-        q_h_second_left = _sensenova_mul_rn(q_h_2, q_cos_h)
-        q_h_second_right = _sensenova_mul_rn(q_h_1, q_sin_h)
-        q_w_left = _sensenova_mul_rn(q_w_1, q_cos_w)
-        q_w_right = _sensenova_mul_rn(q_w_2, q_sin_w)
-        q_w_second_left = _sensenova_mul_rn(q_w_2, q_cos_w)
-        q_w_second_right = _sensenova_mul_rn(q_w_1, q_sin_w)
-        q_h_rot = tl.where(hw_first, _sensenova_sub_rn(q_h_left, q_h_right), _sensenova_add_rn(q_h_second_left, q_h_second_right))
-        q_w_rot = tl.where(hw_first, _sensenova_sub_rn(q_w_left, q_w_right), _sensenova_add_rn(q_w_second_left, q_w_second_right))
-        q_h_rot = q_h_rot.to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        q_w_rot = q_w_rot.to(q_out_ptr.dtype.element_ty).to(tl.float32)
-        tl.store(q_out_ptr + pid * dim + t_dim + offs, q_h_rot, mask=q_active & hw_col)
-        tl.store(q_out_ptr + pid * dim + t_dim + hw_dim + offs, q_w_rot, mask=q_active & hw_col)
-
-        k_pid = pid - q_rows
-        k_active = (k_pid >= 0) & (k_pid < k_rows)
-        k_token = k_pid // k_heads
-        k_head = k_pid - k_token * k_heads
-        k_base = k_token * k_stride_0 + k_head * k_stride_1
-
-        k_t_var = _sensenova_mean_square(k_ptr, k_base, k_stride_2, 0, k_active, t_dim, block)
-        k_t_inv = tl.rsqrt(k_t_var + k_eps)
-        k_t_1 = tl.load(k_ptr + k_base + t_pair * k_stride_2, mask=k_active & t_col, other=0.0).to(tl.float32)
-        k_t_2 = tl.load(k_ptr + k_base + t_second * k_stride_2, mask=k_active & t_col, other=0.0).to(tl.float32)
-        kw_t_1 = tl.load(kw_t_ptr + t_pair, mask=t_col, other=0.0).to(tl.float32)
-        kw_t_2 = tl.load(kw_t_ptr + t_second, mask=t_col, other=0.0).to(tl.float32)
-        k_cos_t = tl.load(cos_t_ptr + k_token * t_half + t_pair, mask=k_active & t_col, other=0.0).to(tl.float32)
-        k_sin_t = tl.load(sin_t_ptr + k_token * t_half + t_pair, mask=k_active & t_col, other=0.0).to(tl.float32)
-        k_t_1 = (k_t_1 * k_t_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_t_2 = (k_t_2 * k_t_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_t_1 = (k_t_1 * kw_t_1).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_t_2 = (k_t_2 * kw_t_2).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_t_left = _sensenova_mul_rn(k_t_1, k_cos_t)
-        k_t_right = _sensenova_mul_rn(k_t_2, k_sin_t)
-        k_t_second_left = _sensenova_mul_rn(k_t_2, k_cos_t)
-        k_t_second_right = _sensenova_mul_rn(k_t_1, k_sin_t)
-        k_t_rot = tl.where(t_first, _sensenova_sub_rn(k_t_left, k_t_right), _sensenova_add_rn(k_t_second_left, k_t_second_right))
-        k_t_rot = k_t_rot.to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        tl.store(k_out_ptr + k_pid * dim + offs, k_t_rot, mask=k_active & t_col)
-
-        k_hw_var = _sensenova_mean_square(k_ptr, k_base, k_stride_2, t_dim, k_active, t_dim, block)
-        k_hw_inv = tl.rsqrt(k_hw_var + k_eps)
-        k_h_1 = tl.load(k_ptr + k_base + (t_dim + hw_pair) * k_stride_2, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_h_2 = tl.load(k_ptr + k_base + (t_dim + hw_second) * k_stride_2, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_w_1 = tl.load(k_ptr + k_base + (t_dim + hw_dim + hw_pair) * k_stride_2, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_w_2 = tl.load(k_ptr + k_base + (t_dim + hw_dim + hw_second) * k_stride_2, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        kw_h_1 = tl.load(kw_hw_ptr + hw_pair, mask=hw_col, other=0.0).to(tl.float32)
-        kw_h_2 = tl.load(kw_hw_ptr + hw_second, mask=hw_col, other=0.0).to(tl.float32)
-        kw_w_1 = tl.load(kw_hw_ptr + hw_dim + hw_pair, mask=hw_col, other=0.0).to(tl.float32)
-        kw_w_2 = tl.load(kw_hw_ptr + hw_dim + hw_second, mask=hw_col, other=0.0).to(tl.float32)
-        k_cos_h = tl.load(cos_h_ptr + k_token * hw_half + hw_pair, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_sin_h = tl.load(sin_h_ptr + k_token * hw_half + hw_pair, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_cos_w = tl.load(cos_w_ptr + k_token * hw_half + hw_pair, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_sin_w = tl.load(sin_w_ptr + k_token * hw_half + hw_pair, mask=k_active & hw_col, other=0.0).to(tl.float32)
-        k_h_1 = (k_h_1 * k_hw_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_h_2 = (k_h_2 * k_hw_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_w_1 = (k_w_1 * k_hw_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_w_2 = (k_w_2 * k_hw_inv).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_h_1 = (k_h_1 * kw_h_1).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_h_2 = (k_h_2 * kw_h_2).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_w_1 = (k_w_1 * kw_w_1).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_w_2 = (k_w_2 * kw_w_2).to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_h_left = _sensenova_mul_rn(k_h_1, k_cos_h)
-        k_h_right = _sensenova_mul_rn(k_h_2, k_sin_h)
-        k_h_second_left = _sensenova_mul_rn(k_h_2, k_cos_h)
-        k_h_second_right = _sensenova_mul_rn(k_h_1, k_sin_h)
-        k_w_left = _sensenova_mul_rn(k_w_1, k_cos_w)
-        k_w_right = _sensenova_mul_rn(k_w_2, k_sin_w)
-        k_w_second_left = _sensenova_mul_rn(k_w_2, k_cos_w)
-        k_w_second_right = _sensenova_mul_rn(k_w_1, k_sin_w)
-        k_h_rot = tl.where(hw_first, _sensenova_sub_rn(k_h_left, k_h_right), _sensenova_add_rn(k_h_second_left, k_h_second_right))
-        k_w_rot = tl.where(hw_first, _sensenova_sub_rn(k_w_left, k_w_right), _sensenova_add_rn(k_w_second_left, k_w_second_right))
-        k_h_rot = k_h_rot.to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        k_w_rot = k_w_rot.to(k_out_ptr.dtype.element_ty).to(tl.float32)
-        tl.store(k_out_ptr + k_pid * dim + t_dim + offs, k_h_rot, mask=k_active & hw_col)
-        tl.store(k_out_ptr + k_pid * dim + t_dim + hw_dim + offs, k_w_rot, mask=k_active & hw_col)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -448,11 +162,29 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+def apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    rotation: str = "neox",
+) -> torch.Tensor:
     """Packed GPT-NeoX style RoPE.
 
     ``x`` is ``[seq, heads, dim]`` and ``cos``/``sin`` are ``[seq, dim/2]``.
     """
+
+    if rotation == "interleaved":
+        cos = cos.to(device=x.device, dtype=x.dtype)
+        sin = sin.to(device=x.device, dtype=x.dtype)
+        even = x[..., 0::2]
+        odd = x[..., 1::2]
+        out = torch.empty_like(x)
+        out[..., 0::2] = even * cos - odd * sin
+        out[..., 1::2] = even * sin + odd * cos
+        return out
+    if rotation != "neox":
+        raise ValueError(f"unknown RoPE rotation convention {rotation!r}")
 
     from uniserve_worker import ops
 
@@ -508,116 +240,6 @@ def try_triton_qk_rms_norm_rope(
     return q_out, k_out
 
 
-def try_triton_sensenova_qk_rms_norm_rope_3d(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight_t: torch.Tensor,
-    q_weight_hw: torch.Tensor,
-    k_weight_t: torch.Tensor,
-    k_weight_hw: torch.Tensor,
-    cos_t: torch.Tensor,
-    sin_t: torch.Tensor,
-    cos_h: torch.Tensor,
-    sin_h: torch.Tensor,
-    cos_w: torch.Tensor,
-    sin_w: torch.Tensor,
-    q_eps: float,
-    k_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not _sensenova_qk_rms_norm_rope_3d_is_eligible(
-        q,
-        k,
-        q_weight_t,
-        q_weight_hw,
-        k_weight_t,
-        k_weight_hw,
-        cos_t,
-        sin_t,
-        cos_h,
-        sin_h,
-        cos_w,
-        sin_w,
-    ):
-        return None
-    q_tokens = int(q.shape[0])
-    k_tokens = int(k.shape[0])
-    q_heads = int(q.shape[1])
-    k_heads = int(k.shape[1])
-    dim = int(q.shape[-1])
-    t_dim = dim // 2
-    hw_dim = dim // 4
-    q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
-    q_rows = q_tokens * q_heads
-    k_rows = k_tokens * k_heads
-    _sensenova_qk_rms_norm_rope_3d_kernel[(q_rows + k_rows,)](
-        q,
-        k,
-        q_weight_t,
-        q_weight_hw,
-        k_weight_t,
-        k_weight_hw,
-        cos_t,
-        sin_t,
-        cos_h,
-        sin_h,
-        cos_w,
-        sin_w,
-        q_out,
-        k_out,
-        q_rows,
-        k_rows,
-        q_heads,
-        k_heads,
-        int(q.stride(0)),
-        int(q.stride(1)),
-        int(q.stride(2)),
-        int(k.stride(0)),
-        int(k.stride(1)),
-        int(k.stride(2)),
-        dim,
-        t_dim,
-        t_dim // 2,
-        hw_dim,
-        hw_dim // 2,
-        float(q_eps),
-        float(k_eps),
-        triton.next_power_of_2(t_dim),
-        num_warps=4,
-    )
-    return q_out, k_out
-
-
-def can_run_triton_sensenova_qk_rms_norm_rope_3d(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight_t: torch.Tensor,
-    q_weight_hw: torch.Tensor,
-    k_weight_t: torch.Tensor,
-    k_weight_hw: torch.Tensor,
-    cos_t: torch.Tensor,
-    sin_t: torch.Tensor,
-    cos_h: torch.Tensor,
-    sin_h: torch.Tensor,
-    cos_w: torch.Tensor,
-    sin_w: torch.Tensor,
-) -> bool:
-    return _sensenova_qk_rms_norm_rope_3d_is_eligible(
-        q,
-        k,
-        q_weight_t,
-        q_weight_hw,
-        k_weight_t,
-        k_weight_hw,
-        cos_t,
-        sin_t,
-        cos_h,
-        sin_h,
-        cos_w,
-        sin_w,
-    )
-
-
 def _qk_rms_norm_rope_is_eligible(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -631,70 +253,6 @@ def _qk_rms_norm_rope_is_eligible(
     if not _qk_rms_norm_rope_tensors_on_supported_device(q, k, q_weight, k_weight, cos, sin):
         return False
     return _qk_rms_norm_rope_shapes_match(q, k, q_weight, k_weight, cos, sin)
-
-
-def _sensenova_qk_rms_norm_rope_3d_is_eligible(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_weight_t: torch.Tensor,
-    q_weight_hw: torch.Tensor,
-    k_weight_t: torch.Tensor,
-    k_weight_hw: torch.Tensor,
-    cos_t: torch.Tensor,
-    sin_t: torch.Tensor,
-    cos_h: torch.Tensor,
-    sin_h: torch.Tensor,
-    cos_w: torch.Tensor,
-    sin_w: torch.Tensor,
-) -> bool:
-    tensors = (
-        q,
-        k,
-        q_weight_t,
-        q_weight_hw,
-        k_weight_t,
-        k_weight_hw,
-        cos_t,
-        sin_t,
-        cos_h,
-        sin_h,
-        cos_w,
-        sin_w,
-    )
-    if triton is None or not triton_fused_layers_enabled() or torch.is_grad_enabled():
-        return False
-    if not all(t.is_cuda and t.device == q.device for t in tensors):
-        return False
-    if not triton_device_supported(q.device):
-        return False
-    if q.dtype != k.dtype or q.ndim != 3 or k.ndim != 3:
-        return False
-    if int(q.stride(-1)) != 1 or int(k.stride(-1)) != 1:
-        return False
-    if not all(t.is_contiguous() for t in tensors[2:]):
-        return False
-    if int(q.shape[0]) <= 0 or int(k.shape[0]) <= 0 or int(q.shape[1]) <= 0 or int(k.shape[1]) <= 0:
-        return False
-    if int(q.shape[0]) != int(k.shape[0]) or int(q.shape[-1]) != int(k.shape[-1]):
-        return False
-    dim = int(q.shape[-1])
-    if dim <= 0 or dim % 8 != 0 or dim > 1024:
-        return False
-    t_dim = dim // 2
-    hw_dim = dim // 4
-    hw_half = hw_dim // 2
-    return (
-        q_weight_t.shape == (t_dim,)
-        and k_weight_t.shape == (t_dim,)
-        and q_weight_hw.shape == (t_dim,)
-        and k_weight_hw.shape == (t_dim,)
-        and cos_t.shape == (int(q.shape[0]), t_dim // 2)
-        and sin_t.shape == cos_t.shape
-        and cos_h.shape == (int(q.shape[0]), hw_half)
-        and sin_h.shape == cos_h.shape
-        and cos_w.shape == (int(q.shape[0]), hw_half)
-        and sin_w.shape == cos_w.shape
-    )
 
 
 def _qk_rms_norm_rope_tensors_on_supported_device(

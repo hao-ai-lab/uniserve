@@ -21,11 +21,11 @@ pub mod event_type {
     pub const IMAGE_BEGIN: &str = "image_begin";
     pub const IMAGE_STEP: &str = "image_step";
     pub const IMAGE_DONE: &str = "image_done";
- /// Success terminal.
+    /// Success terminal.
     pub const FINISHED: &str = "finished";
- /// Failure terminal (contract rejected before generation).
+    /// Failure terminal (contract rejected before generation).
     pub const REJECTED: &str = "rejected";
- /// Failure terminal (engine/model error).
+    /// Failure terminal (engine/model error).
     pub const ERROR: &str = "error";
 }
 
@@ -42,13 +42,13 @@ pub struct NativeEventSummary {
 }
 
 impl NativeEventSummary {
- /// A native stream passes the contract iff it reaches exactly one success
- /// terminal (`finished`) and emits no failure terminals (`rejected` /
- /// `error`). `finished == 1` (not `>= 1`) is intentional: the production
- /// emitter sends exactly one terminal event per stream, so a duplicate
- /// `finished` is a protocol violation. This matches the Python classifier
- /// `classify_native_events` in
- /// `benchmarks/serving/uniserve_bench/response_classifier.py`.
+    /// A native stream passes the contract iff it reaches exactly one success
+    /// terminal (`finished`) and emits no failure terminals (`rejected` /
+    /// `error`). `finished == 1` (not `>= 1`) is intentional: the production
+    /// emitter sends exactly one terminal event per stream, so a duplicate
+    /// `finished` is a protocol violation. This matches the Python classifier
+    /// `classify_native_events` in
+    /// `benchmarks/serving/uniserve_bench/response_classifier.py`.
     pub fn passed_contract(&self) -> bool {
         self.finished == 1 && self.rejected == 0 && self.errors == 0
     }
@@ -123,8 +123,8 @@ mod tests {
 
     #[test]
     fn duplicate_finished_fails_contract() {
- // Production emits exactly one terminal; two `finished` events is a
- // protocol violation and must fail, matching the Python classifier.
+        // Production emits exactly one terminal; two `finished` events is a
+        // protocol violation and must fail, matching the Python classifier.
         let summary = summarize_events(&[json!({"type":"finished"}), json!({"type":"finished"})]);
         assert_eq!(summary.finished, 2);
         assert!(!summary.passed_contract());
@@ -132,12 +132,12 @@ mod tests {
 
     #[test]
     fn vocabulary_matches_native_api() {
- // Pins the canonical event-type strings. These MUST stay in lockstep
- // with `event_json` / `is_terminal` in
- // `crates/frontend/native-api/src/events.rs` and the Python mirror in
- // `benchmarks/serving/uniserve_bench/response_classifier.py`. A rename
- // in the production emitter that is not mirrored here will fail this
- // test instead of silently desynchronizing the classifiers.
+        // Pins the canonical event-type strings. These MUST stay in lockstep
+        // with `event_json` / `is_terminal` in
+        // `crates/frontend/native-api/src/events.rs` and the Python mirror in
+        // `benchmarks/serving/uniserve_bench/response_classifier.py`. A rename
+        // in the production emitter that is not mirrored here will fail this
+        // test instead of silently desynchronizing the classifiers.
         let all = [
             event_type::SCHEDULED,
             event_type::TEXT,
@@ -163,8 +163,12 @@ mod tests {
                 "error",
             ]
         );
- // Terminal set mirrors native-api `is_terminal`.
-        let terminals = [event_type::FINISHED, event_type::REJECTED, event_type::ERROR];
+        // Terminal set mirrors native-api `is_terminal`.
+        let terminals = [
+            event_type::FINISHED,
+            event_type::REJECTED,
+            event_type::ERROR,
+        ];
         assert_eq!(terminals, ["finished", "rejected", "error"]);
     }
 }

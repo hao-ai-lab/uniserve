@@ -23,7 +23,7 @@ pub struct ServerInfoSnapshot {
 }
 
 impl ServerInfoSnapshot {
- /// Capture the runtime configuration fields available to the Rust frontend.
+    /// Capture the runtime configuration fields available to the Rust frontend.
     pub fn from_config(config: &Config) -> Self {
         let uniserve_config_json = serde_json::to_value(config).unwrap_or_else(|error| {
             json!({

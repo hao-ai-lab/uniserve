@@ -9,9 +9,9 @@ pub fn validate_request_compat(
     request: &CompletionRequest,
     served_model_names: &[String],
 ) -> Result<(), ApiError> {
- // This path is intentionally scoped to the minimum surface needed for
- // random-workload benchmark compatibility, so unsupported compatibility
- // completions features fail early here.
+    // This path is intentionally scoped to the minimum surface needed for
+    // random-workload benchmark compatibility, so unsupported compatibility
+    // completions features fail early here.
     check_model_served(&request.model, served_model_names)?;
 
     check_stream_options_requires_stream(request.stream_options.is_some(), request.stream)?;
@@ -62,8 +62,8 @@ pub fn validate_request_compat(
         );
     }
 
- // ---- Reject parameters that are accepted for deserialization but not yet
- // implemented ----
+    // ---- Reject parameters that are accepted for deserialization but not yet
+    // implemented ----
 
     if request.length_penalty.is_some() {
         bail_invalid_request!(param = "length_penalty", "length_penalty is not supported.");

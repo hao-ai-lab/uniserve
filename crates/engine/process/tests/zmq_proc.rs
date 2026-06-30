@@ -73,7 +73,7 @@ async fn socket_mode_text_generation() {
         .await
         .expect("connect zmq client");
 
- // The handshake delivered real post-load truth from EngineCaps.
+    // The handshake delivered real post-load truth from EngineCaps.
     assert_eq!(client.engine_count(), 1);
     assert_eq!(client.ready_responses().len(), 1);
     assert!(client.total_num_gpu_blocks() > 0);
@@ -129,8 +129,8 @@ async fn socket_mode_native_image_generation() {
         .await
         .expect("connect zmq client");
 
- // Pure text->image diffusion over the wire: the image events ride the
- // UniServe `native` protocol extension.
+    // Pure text->image diffusion over the wire: the image events ride the
+    // UniServe `native` protocol extension.
     let request = NativeGenerateRequest {
         prompt_ids: vec![1, 2, 3],
         neg_prompt_ids: vec![],
@@ -202,7 +202,7 @@ async fn socket_mode_interleave_generation() {
         .await
         .expect("connect zmq client");
 
- // Interleaved text+image over the wire: text rounds and two images.
+    // Interleaved text+image over the wire: text rounds and two images.
     let request = NativeGenerateRequest {
         prompt_ids: vec![1, 2, 3],
         neg_prompt_ids: vec![],
@@ -299,7 +299,7 @@ async fn socket_mode_two_engines_distribute_and_route() {
         .await
         .expect("connect zmq client to two engines");
     assert_eq!(client.engine_count(), 2);
- // The 2-byte little-endian engine-index identities are both registered.
+    // The 2-byte little-endian engine-index identities are both registered.
     let mut identities = client.engine_identities();
     identities.sort();
     assert_eq!(identities, vec![&[0u8, 0u8][..], &[1u8, 0u8][..]]);
@@ -316,8 +316,8 @@ async fn socket_mode_two_engines_distribute_and_route() {
         ..Default::default()
     };
 
- // Load-balanced distribution: submit 6 concurrent requests; the
- // least-loaded score alternates them across both engines.
+    // Load-balanced distribution: submit 6 concurrent requests; the
+    // least-loaded score alternates them across both engines.
     let mut streams = Vec::new();
     for i in 0..6 {
         streams.push(
@@ -343,7 +343,7 @@ async fn socket_mode_two_engines_distribute_and_route() {
         "expected load balancing to use both engines"
     );
 
- // Explicit data_parallel_rank bypasses load balancing.
+    // Explicit data_parallel_rank bypasses load balancing.
     for rank in [1u32, 0, 1] {
         let mut stream = client
             .call(request(
@@ -398,7 +398,7 @@ async fn engine_dead_sentinel_latches_health() {
 
     let handshake_addr = ipc_endpoint("dead");
 
- // Engine-side peer: handshake, register, accept one request, die.
+    // Engine-side peer: handshake, register, accept one request, die.
     let engine_handshake = handshake_addr.clone();
     let engine_task = tokio::spawn(async move {
         let identity =
@@ -406,7 +406,7 @@ async fn engine_dead_sentinel_latches_health() {
         let mut options = SocketOptions::default();
         options.peer_identity(identity.clone());
         let mut handshake = DealerSocket::with_options(options);
- // The frontend binds after we spawn; retry the dial.
+        // The frontend binds after we spawn; retry the dial.
         for _ in 0..100 {
             if handshake.connect(&engine_handshake).await.is_ok() {
                 break;
@@ -452,13 +452,13 @@ async fn engine_dead_sentinel_latches_health() {
             .await
             .unwrap();
 
- // Accept one Add request, then declare the engine dead.
+        // Accept one Add request, then declare the engine dead.
         let _ = input.recv().await.unwrap();
         output
             .send(ZmqMessage::from(ENGINE_CORE_DEAD_SENTINEL.to_vec()))
             .await
             .unwrap();
- // Keep sockets alive briefly so the sentinel flushes.
+        // Keep sockets alive briefly so the sentinel flushes.
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
 
@@ -478,7 +478,7 @@ async fn engine_dead_sentinel_latches_health() {
     };
     let mut stream = client.call(request).await.expect("submit request");
 
- // The in-flight stream resolves with an error once the sentinel lands.
+    // The in-flight stream resolves with an error once the sentinel lands.
     let mut saw_error = false;
     while let Some(item) = tokio::time::timeout(Duration::from_secs(10), stream.next())
         .await
@@ -491,7 +491,7 @@ async fn engine_dead_sentinel_latches_health() {
     }
     assert!(saw_error, "in-flight stream must fail on engine death");
 
- // The health latch sticks and new work fails fast.
+    // The health latch sticks and new work fails fast.
     assert!(
         !client.is_healthy(),
         "health latch must record engine death"

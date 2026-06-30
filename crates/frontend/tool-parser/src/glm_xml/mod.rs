@@ -33,11 +33,11 @@ enum GlmMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Separator {
- /// GLM-4.5/4.6 format: function name must end at a newline before
- /// arguments.
+    /// GLM-4.5/4.6 format: function name must end at a newline before
+    /// arguments.
     Newline,
- /// GLM-4.7 format: function name may end at whitespace or directly before
- /// `<arg_key>`.
+    /// GLM-4.7 format: function name may end at whitespace or directly before
+    /// `<arg_key>`.
     Flexible,
 }
 
@@ -61,20 +61,20 @@ struct GlmXmlToolParser {
     emitted_tool_count: usize,
     tool_parameters: ToolSchemas,
     separator: Separator,
- /// Number of leading buffer bytes already scanned for [`TOOL_CALL_END`]
- /// while in [`GlmMode::ToolCall`].
+    /// Number of leading buffer bytes already scanned for [`TOOL_CALL_END`]
+    /// while in [`GlmMode::ToolCall`].
 
- /// The buffered tool-call body is re-fed to the parser on every chunk, so
- /// without this watermark each chunk re-scans the whole accumulated body
- /// for the closing marker (`O(n^2)` over a body delivered in `n` chunks).
- /// We instead only search the freshly appended tail, keeping it in `[..)`
- /// of `tool_call_scan_offset`, and reset it whenever the buffer is drained
- /// or the parser is reset.
+    /// The buffered tool-call body is re-fed to the parser on every chunk, so
+    /// without this watermark each chunk re-scans the whole accumulated body
+    /// for the closing marker (`O(n^2)` over a body delivered in `n` chunks).
+    /// We instead only search the freshly appended tail, keeping it in `[..)`
+    /// of `tool_call_scan_offset`, and reset it whenever the buffer is drained
+    /// or the parser is reset.
     tool_call_scan_offset: usize,
 }
 
 impl GlmXmlToolParser {
- /// Create a GLM XML tool parser with a function-name separator.
+    /// Create a GLM XML tool parser with a function-name separator.
     fn new(tools: &[Tool], separator: Separator) -> Self {
         Self {
             buffer: String::new(),
@@ -86,7 +86,7 @@ impl GlmXmlToolParser {
         }
     }
 
- /// Apply one parsed GLM event to parser state and output.
+    /// Apply one parsed GLM event to parser state and output.
     fn apply_event(&mut self, event: GlmEvent, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             GlmEvent::Text { len: consumed_len } => {
@@ -124,10 +124,10 @@ impl GlmXmlToolParser {
         self.buffer.push_str(chunk);
 
         loop {
- // While buffering an incomplete tool-call body, cheaply gate on the
- // closing marker so we only scan the freshly appended tail instead
- // of re-running the body parser over the whole accumulated buffer
- // on every chunk.
+            // While buffering an incomplete tool-call body, cheaply gate on the
+            // closing marker so we only scan the freshly appended tail instead
+            // of re-running the body parser over the whole accumulated buffer
+            // on every chunk.
             if self.mode == GlmMode::ToolCall && !self.tool_call_end_buffered() {
                 break;
             }
@@ -141,24 +141,24 @@ impl GlmXmlToolParser {
 
             self.apply_event(event, output)?;
             self.buffer.drain(..consumed_len);
- // The remaining buffer shifted; restart the closing-marker scan.
+            // The remaining buffer shifted; restart the closing-marker scan.
             self.tool_call_scan_offset = 0;
         }
 
         Ok(())
     }
 
- /// Returns whether the buffered tool-call body already contains the closing
- /// [`TOOL_CALL_END`] marker, advancing the scan watermark over the bytes
- /// that have been confirmed not to contain it.
+    /// Returns whether the buffered tool-call body already contains the closing
+    /// [`TOOL_CALL_END`] marker, advancing the scan watermark over the bytes
+    /// that have been confirmed not to contain it.
 
- /// `tool_call_scan_offset` records how many leading buffer bytes were
- /// already searched on a previous chunk. Only the freshly appended tail is
- /// examined here, re-checking the last `TOOL_CALL_END.len - 1` bytes of
- /// the already-scanned region so a marker straddling the watermark is
- /// not missed.
+    /// `tool_call_scan_offset` records how many leading buffer bytes were
+    /// already searched on a previous chunk. Only the freshly appended tail is
+    /// examined here, re-checking the last `TOOL_CALL_END.len - 1` bytes of
+    /// the already-scanned region so a marker straddling the watermark is
+    /// not missed.
     fn tool_call_end_buffered(&mut self) -> bool {
- // Overlap the search so a marker that straddles the watermark is found.
+        // Overlap the search so a marker that straddles the watermark is found.
         let search_from = self
             .tool_call_scan_offset
             .saturating_sub(TOOL_CALL_END.len() - 1);
@@ -168,7 +168,7 @@ impl GlmXmlToolParser {
             return true;
         }
 
- // No full marker yet: the entire current buffer has now been searched.
+        // No full marker yet: the entire current buffer has now been searched.
         self.tool_call_scan_offset = self.buffer.len();
         false
     }
@@ -500,9 +500,9 @@ mod tests {
 
     #[test]
     fn glm45_streaming_incremental_scan_handles_unicode_split_char_by_char() {
- // Stream a tool-call body one character at a time, including a
- // multi-byte argument value, to exercise the incremental closing-marker
- // scan (and its UTF-8 char-boundary clamping) across many chunks.
+        // Stream a tool-call body one character at a time, including a
+        // multi-byte argument value, to exercise the incremental closing-marker
+        // scan (and its UTF-8 char-boundary clamping) across many chunks.
         let mut parser = Glm45MoeToolParser::new(&test_tools());
         let call = glm45_tool_call("get_weather", &[("city", "北京 — 東京 — 🌧")]);
 

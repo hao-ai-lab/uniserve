@@ -94,6 +94,11 @@ class Caps:
     quantization: str | None = None
     pipeline_depth: int | None = None
     encoder_cache_budget: int | None = None
+    max_vae_grid_tokens: int = 0
+    max_vit_grid_tokens: int = 0
+    commit_marker_tokens: int = 2
+    gen_rope_advance: int = 2
+    max_cfg_branches: int = 3
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -119,6 +124,11 @@ class Caps:
             },
             "pipeline_depth": self.pipeline_depth or 1,
             "encoder_cache_budget": self.encoder_cache_budget or 0,
+            "max_vae_grid_tokens": self.max_vae_grid_tokens,
+            "max_vit_grid_tokens": self.max_vit_grid_tokens,
+            "commit_marker_tokens": self.commit_marker_tokens,
+            "gen_rope_advance": self.gen_rope_advance,
+            "max_cfg_branches": self.max_cfg_branches,
             "supported_controls": list(self.supported_controls),
             "adapter_mode": self.adapter_mode,
             "execution_constraints": {
@@ -174,6 +184,29 @@ def validate_caps(raw: Mapping[str, Any], *, owner: str = "driver") -> Caps:
             wire_int_field(caps["encoder_cache_budget"], f"{owner}.caps.encoder_cache_budget")
             if "encoder_cache_budget" in caps
             else None
+        ),
+        max_vae_grid_tokens=wire_int_field(
+            caps.get("max_vae_grid_tokens", caps.get("max_latent_size", 0)),
+            f"{owner}.caps.max_vae_grid_tokens",
+        ),
+        max_vit_grid_tokens=wire_int_field(
+            caps.get("max_vit_grid_tokens", 0),
+            f"{owner}.caps.max_vit_grid_tokens",
+        ),
+        commit_marker_tokens=wire_int_field(
+            caps.get("commit_marker_tokens", 2),
+            f"{owner}.caps.commit_marker_tokens",
+            minimum=1,
+        ),
+        gen_rope_advance=wire_int_field(
+            caps.get("gen_rope_advance", 2),
+            f"{owner}.caps.gen_rope_advance",
+            minimum=1,
+        ),
+        max_cfg_branches=wire_int_field(
+            caps.get("max_cfg_branches", 3),
+            f"{owner}.caps.max_cfg_branches",
+            minimum=1,
         ),
     )
 

@@ -17,47 +17,47 @@ pub type MmFeatures = Vec<MmFeatureSpec>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MmFeatureSpec {
- /// Represents multimodal data for this feature.
+    /// Represents multimodal data for this feature.
 
- /// Can be `None` if the item is cached, to skip IPC between API server
- /// and engine core processes.
+    /// Can be `None` if the item is cached, to skip IPC between API server
+    /// and engine core processes.
     pub data: Option<MmKwargsItem>,
 
- /// The input modality, e.g., `"image"`, `"audio"`, `"video"`.
+    /// The input modality, e.g., `"image"`, `"audio"`, `"video"`.
     pub modality: String,
 
- /// The hash for caching encoder outputs (with LoRA prefix if applicable).
+    /// The hash for caching encoder outputs (with LoRA prefix if applicable).
     pub identifier: String,
 
- /// The location of the `modality` tokens corresponding to this item
- /// in the prompt, e.g., `PlaceholderRange(offset=2, length=336)`.
+    /// The location of the `modality` tokens corresponding to this item
+    /// in the prompt, e.g., `PlaceholderRange(offset=2, length=336)`.
     pub mm_position: PlaceholderRange,
 
- /// The hash for caching processor outputs (without LoRA prefix).
+    /// The hash for caching processor outputs (without LoRA prefix).
 
- /// # Contract
+    /// # Contract
 
- /// On this (chat / `MmFeatureSpec`) ingress path the value is the
- /// **content digest as a hex string** — concretely the Blake3 hex-digest of
- /// the decoded media bytes, produced upstream in the chat multimodal builder
- /// (see `crates/frontend/chat/src/multimodal.rs`) and threaded through from
- /// `llm_multimodal::ImageFrame::hash`.
+    /// On this (chat / `MmFeatureSpec`) ingress path the value is the
+    /// **content digest as a hex string** — concretely the Blake3 hex-digest of
+    /// the decoded media bytes, produced upstream in the chat multimodal builder
+    /// (see `crates/frontend/chat/src/multimodal.rs`) and threaded through from
+    /// `llm_multimodal::ImageFrame::hash`.
 
- /// This is intentionally a *different representation* from the native
- /// (image-generation / `ForwardOp`) ingress path, where the encoder-cache
- /// key is a `u64` (`worker-wire::ForwardOp::mm_hash`, fed from
- /// `engine-wire::WireMmItem::hash`, which `native-api`'s builder computes as
- /// an fnv1a fold of the base64 bytes). The two ingress paths are disjoint —
- /// there is no `MmFeatures` -> native `WireMmItem` conversion — so a request
- /// only ever carries one of the two conventions, never both, and the
- /// representations are not interchangeable. Do **not** assume a value seen
- /// here is comparable to a worker-wire `mm_hash` `u64`.
+    /// This is intentionally a *different representation* from the native
+    /// (image-generation / `ForwardOp`) ingress path, where the encoder-cache
+    /// key is a `u64` (`worker-wire::ForwardOp::mm_hash`, fed from
+    /// `engine-wire::WireMmItem::hash`, which `native-api`'s builder computes as
+    /// an fnv1a fold of the base64 bytes). The two ingress paths are disjoint —
+    /// there is no `MmFeatures` -> native `WireMmItem` conversion — so a request
+    /// only ever carries one of the two conventions, never both, and the
+    /// representations are not interchangeable. Do **not** assume a value seen
+    /// here is comparable to a worker-wire `mm_hash` `u64`.
 
- /// Unifying the two protocols onto a single width/representation requires a
- /// coordinated change to `worker-wire`, `engine-wire::native`, the
- /// `native-api` hash producer, the scheduler, and the Python worker's
- /// `mm_hash` parsing; it is tracked separately and deliberately not
- /// done piecemeal on only one side.
+    /// Unifying the two protocols onto a single width/representation requires a
+    /// coordinated change to `worker-wire`, `engine-wire::native`, the
+    /// `native-api` hash producer, the scheduler, and the Python worker's
+    /// `mm_hash` parsing; it is tracked separately and deliberately not
+    /// done piecemeal on only one side.
     #[serde(default)]
     pub mm_hash: Option<String>,
 }
@@ -66,15 +66,15 @@ pub struct MmFeatureSpec {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaceholderRange {
- /// The start index of the placeholder in the prompt.
+    /// The start index of the placeholder in the prompt.
     pub offset: usize,
 
- /// The length of the placeholder.
+    /// The length of the placeholder.
     pub length: usize,
 
- /// A boolean mask of shape `(length)` indicating which positions
- /// between `offset` and `offset + length` to assign embeddings to.
- /// `None` means all positions.
+    /// A boolean mask of shape `(length)` indicating which positions
+    /// between `offset` and `offset + length` to assign embeddings to.
+    /// `None` means all positions.
     #[serde(default)]
     pub is_embed: Option<WireTensor>,
 }
@@ -89,15 +89,15 @@ pub type MmKwargsItem = BTreeMap<String, MmFieldElem>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MmFieldElem {
- /// The processed value of this field in `MmKwargsItem`, i.e. the
- /// keyword argument value to be passed to the model.
+    /// The processed value of this field in `MmKwargsItem`, i.e. the
+    /// keyword argument value to be passed to the model.
 
- /// It may be set to `None` if it is determined that the item is cached
- /// in `EngineCore`.
+    /// It may be set to `None` if it is determined that the item is cached
+    /// in `EngineCore`.
     pub data: Option<MmKwargValue>,
 
- /// Defines how to combine this field's processed values with others in
- /// order to batch multi-modal items together for model inference.
+    /// Defines how to combine this field's processed values with others in
+    /// order to batch multi-modal items together for model inference.
     pub field: MmField,
 }
 
@@ -128,8 +128,8 @@ pub enum MmField {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MmBatchedField {
- /// If `True`, then this field is excluded from being moved to the
- /// accelerator when multimodal items are grouped and batched.
+    /// If `True`, then this field is excluded from being moved to the
+    /// accelerator when multimodal items are grouped and batched.
     pub keep_on_cpu: bool,
 }
 
@@ -139,15 +139,15 @@ pub struct MmBatchedField {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MmFlatField {
- /// For each multi-modal item, a slice (`dim=0`) or a tuple of slices
- /// (`dim>0`) that is used to extract the data corresponding to it.
+    /// For each multi-modal item, a slice (`dim=0`) or a tuple of slices
+    /// (`dim>0`) that is used to extract the data corresponding to it.
     pub slices: Vec<MmSlice>,
 
- /// The dimension to extract data, default to 0.
+    /// The dimension to extract data, default to 0.
     pub dim: i32,
 
- /// If `True`, then this field is excluded from being moved to the
- /// accelerator when multimodal items are grouped and batched.
+    /// If `True`, then this field is excluded from being moved to the
+    /// accelerator when multimodal items are grouped and batched.
     pub keep_on_cpu: bool,
 }
 
@@ -158,8 +158,8 @@ pub struct MmFlatField {
 pub struct MmSharedField {
     pub batch_size: usize,
 
- /// If `True`, then this field is excluded from being moved to the
- /// accelerator when multimodal items are grouped and batched.
+    /// If `True`, then this field is excluded from being moved to the
+    /// accelerator when multimodal items are grouped and batched.
     pub keep_on_cpu: bool,
 }
 

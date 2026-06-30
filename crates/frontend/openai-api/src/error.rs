@@ -4,15 +4,15 @@ use uniserve_openai_types::{ErrorDetail, ErrorResponse};
 /// requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
- /// The JSON request is syntactically valid but asks for unsupported or
- /// invalid behavior.
+    /// The JSON request is syntactically valid but asks for unsupported or
+    /// invalid behavior.
     InvalidRequest {
         message: String,
         param: Option<&'static str>,
     },
- /// The requested model name does not match any served model or adapter.
+    /// The requested model name does not match any served model or adapter.
     ModelNotFound { model: String },
- /// An internal conversion invariant failed.
+    /// An internal conversion invariant failed.
     ServerError { message: String },
 }
 
@@ -38,8 +38,8 @@ impl ApiError {
         }
     }
 
- /// Convert this error into the standard OpenAI-compatible JSON error
- /// payload.
+    /// Convert this error into the standard OpenAI-compatible JSON error
+    /// payload.
     pub fn to_error_response(&self) -> ErrorResponse {
         let error = match self {
             Self::InvalidRequest { message, param } => ErrorDetail {

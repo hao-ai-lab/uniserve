@@ -27,25 +27,25 @@ pub enum ChatRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatContentPart {
- /// One plain-text content block.
+    /// One plain-text content block.
     Text { text: String },
- /// One image URL/data URL content block.
+    /// One image URL/data URL content block.
     ImageUrl {
         image_url: String,
         detail: Option<ImageDetail>,
         uuid: Option<String>,
     },
- // ImageData...
- // ImageEmbeds...
+    // ImageData...
+    // ImageEmbeds...
 }
 
 impl ChatContentPart {
- /// Construct one text content part with plain string content.
+    /// Construct one text content part with plain string content.
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text { text: text.into() }
     }
 
- /// Construct one image URL content part with the given URL string.
+    /// Construct one image URL content part with the given URL string.
     pub fn image_url(image_url: impl Into<String>) -> Self {
         Self::ImageUrl {
             image_url: image_url.into(),
@@ -54,8 +54,8 @@ impl ChatContentPart {
         }
     }
 
- /// Return the text content of this part when it's a text block, or an
- /// "unsupported multimodal content" error otherwise.
+    /// Return the text content of this part when it's a text block, or an
+    /// "unsupported multimodal content" error otherwise.
     pub fn as_text(&self) -> Result<&str> {
         match self {
             Self::Text { text } => Ok(text),
@@ -63,12 +63,12 @@ impl ChatContentPart {
         }
     }
 
- /// Return whether this part is a text block with empty content.
+    /// Return whether this part is a text block with empty content.
     pub fn is_empty_text(&self) -> bool {
         matches!(self, Self::Text { text } if text.is_empty())
     }
 
- /// Return whether this part contains any multimodal content.
+    /// Return whether this part contains any multimodal content.
     pub fn is_multimodal(&self) -> bool {
         match self {
             Self::Text { .. } => false,
@@ -83,17 +83,17 @@ impl ChatContentPart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatContent {
- /// Simple text content.
+    /// Simple text content.
     Text(String),
- /// OpenAI-style blocks.
+    /// OpenAI-style blocks.
     Parts(Vec<ChatContentPart>),
 }
 
 impl ChatContent {
- /// Flatten the text content into one plain string without adding
- /// separators.
- // This method becomes meaningfully fallible when more non-text content
- // parts are added.
+    /// Flatten the text content into one plain string without adding
+    /// separators.
+    // This method becomes meaningfully fallible when more non-text content
+    // parts are added.
     pub fn try_flatten_to_text(&self) -> Result<String> {
         Ok(match self {
             Self::Text(text) => text.clone(),
@@ -105,7 +105,7 @@ impl ChatContent {
         })
     }
 
- /// Return whether there's no text content or only empty text blocks.
+    /// Return whether there's no text content or only empty text blocks.
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Text(text) => text.is_empty(),
@@ -113,7 +113,7 @@ impl ChatContent {
         }
     }
 
- /// Return whether this content contains any multimodal parts.
+    /// Return whether this content contains any multimodal parts.
     pub fn has_multimodal(&self) -> bool {
         match self {
             Self::Text(_) => false,
@@ -145,18 +145,18 @@ impl From<Vec<ChatContentPart>> for ChatContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum ChatMessage {
- /// System message content.
+    /// System message content.
     System { content: ChatContent },
- /// Developer message content plus optional message-local tools.
+    /// Developer message content plus optional message-local tools.
     Developer {
         content: ChatContent,
         tools: Option<Vec<ChatTool>>,
     },
- /// User message content.
+    /// User message content.
     User { content: ChatContent },
- /// Assistant history content assembled from structured assistant blocks.
+    /// Assistant history content assembled from structured assistant blocks.
     Assistant { content: Vec<AssistantContentBlock> },
- /// Tool response content associated with one prior assistant tool call.
+    /// Tool response content associated with one prior assistant tool call.
     ToolResponse {
         content: ChatContent,
         tool_call_id: String,
@@ -164,7 +164,7 @@ pub enum ChatMessage {
 }
 
 impl ChatMessage {
- /// Construct one chat message with plain string content.
+    /// Construct one chat message with plain string content.
     pub fn text(role: ChatRole, text: impl Into<String>) -> Self {
         let content: String = text.into();
 
@@ -182,14 +182,14 @@ impl ChatMessage {
         }
     }
 
- /// Construct one chat message with system role.
+    /// Construct one chat message with system role.
     pub fn system(content: impl Into<ChatContent>) -> Self {
         Self::System {
             content: content.into(),
         }
     }
 
- /// Construct one chat message with developer role.
+    /// Construct one chat message with developer role.
     pub fn developer(content: impl Into<ChatContent>, tools: Option<Vec<ChatTool>>) -> Self {
         Self::Developer {
             content: content.into(),
@@ -197,27 +197,27 @@ impl ChatMessage {
         }
     }
 
- /// Construct one chat message with user role.
+    /// Construct one chat message with user role.
     pub fn user(content: impl Into<ChatContent>) -> Self {
         Self::User {
             content: content.into(),
         }
     }
 
- /// Construct one chat message with assistant role and plain string content.
+    /// Construct one chat message with assistant role and plain string content.
     pub fn assistant_text(text: impl Into<String>) -> Self {
         Self::Assistant {
             content: vec![AssistantContentBlock::Text { text: text.into() }],
         }
     }
 
- /// Construct one chat message with assistant role and structured content
- /// blocks.
+    /// Construct one chat message with assistant role and structured content
+    /// blocks.
     pub fn assistant_blocks(content: Vec<AssistantContentBlock>) -> Self {
         Self::Assistant { content }
     }
 
- /// Construct one tool-role message.
+    /// Construct one tool-role message.
     pub fn tool_response(content: impl Into<ChatContent>, tool_call_id: impl Into<String>) -> Self {
         Self::ToolResponse {
             content: content.into(),
@@ -225,7 +225,7 @@ impl ChatMessage {
         }
     }
 
- /// Return the chat role of this message.
+    /// Return the chat role of this message.
     pub fn role(&self) -> ChatRole {
         match self {
             Self::System { .. } => ChatRole::System,
@@ -236,7 +236,7 @@ impl ChatMessage {
         }
     }
 
- /// Concatenate the visible text carried by this message.
+    /// Concatenate the visible text carried by this message.
     pub fn text_content(&self) -> Result<String> {
         match self {
             Self::System { content }
@@ -247,7 +247,7 @@ impl ChatMessage {
         }
     }
 
- /// Concatenate assistant reasoning text when present.
+    /// Concatenate assistant reasoning text when present.
     pub fn reasoning_content(&self) -> Option<String> {
         match self {
             Self::Assistant { content } => content.reasoning(),
@@ -258,7 +258,7 @@ impl ChatMessage {
         }
     }
 
- /// Return whether this message contains any multimodal content.
+    /// Return whether this message contains any multimodal content.
     pub fn has_multimodal(&self) -> bool {
         match self {
             Self::System { content }
@@ -282,22 +282,22 @@ impl From<AssistantMessage> for ChatMessage {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GenerationPromptMode {
- /// Append a generation prompt for a new assistant turn.
+    /// Append a generation prompt for a new assistant turn.
 
- /// Equivalent to `add_generation_prompt = true` and `continue_final_message
- /// = false`.
+    /// Equivalent to `add_generation_prompt = true` and `continue_final_message
+    /// = false`.
     #[default]
     StartNewAssistant,
- /// Leave the final assistant message open so generation continues it.
+    /// Leave the final assistant message open so generation continues it.
 
- /// Equivalent to `add_generation_prompt = false` and
- /// `continue_final_message = true`.
+    /// Equivalent to `add_generation_prompt = false` and
+    /// `continue_final_message = true`.
     ContinueFinalAssistant,
- /// Render the existing chat history without adding any trailing generation
- /// prompt.
+    /// Render the existing chat history without adding any trailing generation
+    /// prompt.
 
- /// Equivalent to `add_generation_prompt = false` and
- /// `continue_final_message = false`.
+    /// Equivalent to `add_generation_prompt = false` and
+    /// `continue_final_message = false`.
     NoGenerationPrompt,
 }
 
@@ -315,19 +315,19 @@ pub use uniserve_openai_types::ReasoningEffort;
 /// rendering in `chat`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatOptions {
- /// Controls whether rendering starts a new assistant turn, continues the
- /// final assistant message, or emits no trailing generation prompt at
- /// all.
+    /// Controls whether rendering starts a new assistant turn, continues the
+    /// final assistant message, or emits no trailing generation prompt at
+    /// all.
     pub generation_prompt_mode: GenerationPromptMode,
 
- /// Per-request Jinja chat template override. When set, this template is
- /// used instead of the model's default chat template.
+    /// Per-request Jinja chat template override. When set, this template is
+    /// used instead of the model's default chat template.
     pub chat_template: Option<String>,
 
- /// Effort level exposed to chat templates for reasoning models.
+    /// Effort level exposed to chat templates for reasoning models.
     pub reasoning_effort: Option<ReasoningEffort>,
 
- /// Additional keyword arguments exposed to the chat template.
+    /// Additional keyword arguments exposed to the chat template.
     pub template_kwargs: HashMap<String, Value>,
 }
 
@@ -343,8 +343,8 @@ impl Default for ChatOptions {
 }
 
 impl ChatOptions {
- /// Whether to add a generation prompt for a new assistant turn after the
- /// existing chat history.
+    /// Whether to add a generation prompt for a new assistant turn after the
+    /// existing chat history.
     pub fn add_generation_prompt(&self) -> bool {
         matches!(
             self.generation_prompt_mode,
@@ -352,8 +352,8 @@ impl ChatOptions {
         )
     }
 
- /// Whether to leave the final assistant message open so generation
- /// continues it.
+    /// Whether to leave the final assistant message open so generation
+    /// continues it.
     pub fn continue_final_message(&self) -> bool {
         matches!(
             self.generation_prompt_mode,
@@ -375,46 +375,46 @@ pub enum ChatToolChoice {
 /// generate request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatRequest {
- /// Stable caller-supplied request ID.
+    /// Stable caller-supplied request ID.
     pub request_id: String,
- /// Ordered chat history to render.
+    /// Ordered chat history to render.
     pub messages: Vec<ChatMessage>,
- /// User-facing sampling parameters accepted by `chat`.
+    /// User-facing sampling parameters accepted by `chat`.
     pub sampling_params: SamplingParams,
- /// Chat-specific rendering options.
+    /// Chat-specific rendering options.
     pub chat_options: ChatOptions,
- /// Function tools made available to the model for this request.
+    /// Function tools made available to the model for this request.
     pub tools: Vec<ChatTool>,
- /// Tool-choice behavior for this request.
+    /// Tool-choice behavior for this request.
     pub tool_choice: ChatToolChoice,
- /// Text decode options for incremental detokenization.
+    /// Text decode options for incremental detokenization.
     pub decode_options: TextDecodeOptions,
- /// Whether to emit intermediate northbound content deltas before the
- /// terminal result.
+    /// Whether to emit intermediate northbound content deltas before the
+    /// terminal result.
 
- /// If `false`, callers only observe the terminal accumulated assistant
- /// output. If `true`, callers may receive zero or more incremental
- /// content events before the final terminal one.
+    /// If `false`, callers only observe the terminal accumulated assistant
+    /// output. If `true`, callers may receive zero or more incremental
+    /// content events before the final terminal one.
     pub intermediate: bool,
- /// Request scheduling priority (lower means earlier handling; default 0).
+    /// Request scheduling priority (lower means earlier handling; default 0).
     pub priority: i32,
- /// Documents for RAG (retrieval-augmented generation), passed to the chat
- /// template.
+    /// Documents for RAG (retrieval-augmented generation), passed to the chat
+    /// template.
     pub documents: Option<Vec<Value>>,
- /// Salt for prefix cache isolation in multi-user environments.
+    /// Salt for prefix cache isolation in multi-user environments.
     pub cache_salt: Option<String>,
- /// Whether to add special tokens (e.g. BOS) during prompt tokenization.
+    /// Whether to add special tokens (e.g. BOS) during prompt tokenization.
     pub add_special_tokens: bool,
- /// Override data parallel rank.
+    /// Override data parallel rank.
     #[serde(default)]
     pub data_parallel_rank: Option<u32>,
- /// LoRA adapter selected for this request.
+    /// LoRA adapter selected for this request.
     #[serde(default)]
     pub lora_request: Option<LoraRequest>,
 }
 
 impl ChatRequest {
- /// Return one minimal valid request fixture for tests.
+    /// Return one minimal valid request fixture for tests.
     pub fn for_test() -> Self {
         Self {
             request_id: "test-request".to_string(),
@@ -434,7 +434,7 @@ impl ChatRequest {
         }
     }
 
- /// Validate basic request invariants before rendering.
+    /// Validate basic request invariants before rendering.
     pub fn validate(&self) -> Result<()> {
         if self.messages.is_empty() {
             return Err(Error::EmptyMessages);
@@ -453,24 +453,24 @@ impl ChatRequest {
         Ok(())
     }
 
- /// Return true if this request contains any multimodal content in its
- /// messages.
+    /// Return true if this request contains any multimodal content in its
+    /// messages.
     pub fn has_multimodal(&self) -> bool {
         self.messages.iter().any(ChatMessage::has_multimodal)
     }
 
- /// Return true if this request should enable tool parsing based on the tool
- /// choice and tool list.
+    /// Return true if this request should enable tool parsing based on the tool
+    /// choice and tool list.
     pub fn tool_parsing_enabled(&self) -> bool {
         matches!(self.tool_choice, ChatToolChoice::Auto) && !self.tools.is_empty()
     }
 
- /// Return the request-level thinking toggle when explicitly requested.
+    /// Return the request-level thinking toggle when explicitly requested.
 
- /// We currently accept the two request kwargs `thinking` and
- /// `enable_thinking`. Both must be booleans when present. If both are
- /// present, they must have the same value. If neither key is provided,
- /// return `None`.
+    /// We currently accept the two request kwargs `thinking` and
+    /// `enable_thinking`. Both must be booleans when present. If both are
+    /// present, they must have the same value. If neither key is provided,
+    /// return `None`.
     pub fn enable_thinking(&self) -> Result<Option<bool>> {
         let thinking = self.parse_template_bool("thinking")?;
         let enable_thinking = self.parse_template_bool("enable_thinking")?;
@@ -500,8 +500,8 @@ impl ChatRequest {
 }
 
 impl ChatRole {
- /// Return the chat-template role string used by the current text-only chat
- /// backend.
+    /// Return the chat-template role string used by the current text-only chat
+    /// backend.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::System => "system",

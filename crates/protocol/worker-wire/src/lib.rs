@@ -40,13 +40,13 @@ pub enum OpKind {
     CommitWriteback,
     VaeEncode,
     VitEncode,
- /// Sampler-stage op: turn a `Logits` handle into a sampled token. Produced by
- /// the StageRouter when a Sampler pool is split off; never emitted by the base
- /// scheduler, which samples inside the decode worker by default.
+    /// Sampler-stage op: turn a `Logits` handle into a sampled token. Produced by
+    /// the StageRouter when a Sampler pool is split off; never emitted by the base
+    /// scheduler, which samples inside the decode worker by default.
     Sample,
- /// PostProcess-stage op: encode one finished image/video frame. Produced by
- /// the StageRouter when a PostProcess pool is split off; never
- /// emitted by the base scheduler.
+    /// PostProcess-stage op: encode one finished image/video frame. Produced by
+    /// the StageRouter when a PostProcess pool is split off; never
+    /// emitted by the base scheduler.
     EncodeFrame,
 }
 
@@ -72,18 +72,18 @@ impl Default for TokenSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRequestData {
     pub req_id: RequestId,
- /// Static sampling parameters (per-step masks stay on the op).
+    /// Static sampling parameters (per-step masks stay on the op).
     pub sampling: Option<SamplingParams>,
- /// Image diffusion parameters (dimensions may be refined worker-side from
- /// its own VAE-resize of an input image).
+    /// Image diffusion parameters (dimensions may be refined worker-side from
+    /// its own VAE-resize of an input image).
     pub image: Option<ImageParams>,
- /// CFG text-unconditional / image precontext prompt.
+    /// CFG text-unconditional / image precontext prompt.
     pub neg_token_ids: Option<Vec<u32>>,
- /// LoRA adapter applied to this request's ops (worker-resident).
+    /// LoRA adapter applied to this request's ops (worker-resident).
     pub lora_id: Option<u32>,
- /// Initial logical KV block allocation.
+    /// Initial logical KV block allocation.
     pub block_ids: Vec<BlockId>,
- /// KV-cache group the block ids live in.
+    /// KV-cache group the block ids live in.
     pub group_id: u32,
 }
 
@@ -110,59 +110,59 @@ pub struct ForwardOp {
     pub req_id: RequestId,
     pub kind: OpKind,
     pub modality: Modality,
- /// Logical KV blocks allocated since the last op for this request (the
- /// worker appends them to its per-request block map).
+    /// Logical KV blocks allocated since the last op for this request (the
+    /// worker appends them to its per-request block map).
     pub new_block_ids: Vec<BlockId>,
     pub pos_range: (u32, u32),
     pub token_ids: Option<Vec<u32>>,
- /// Where text input ids are read from. `Wire` uses `token_ids`; `LastSampled`
- /// tells the worker to feed the last sampled device token for this
- /// request, while `token_ids` still describes the logical one-token shape.
+    /// Where text input ids are read from. `Wire` uses `token_ids`; `LastSampled`
+    /// tells the worker to feed the last sampled device token for this
+    /// request, while `token_ids` still describes the logical one-token shape.
     #[serde(default)]
     pub token_source: TokenSource,
     pub timestep_idx: Option<u16>,
     pub cond_pos: Option<u32>,
- /// Model-neutral classifier-free-guidance descriptor. Geometry such as
- /// branch KV spans is computed worker-side from this plus request state.
+    /// Model-neutral classifier-free-guidance descriptor. Geometry such as
+    /// branch KV spans is computed worker-side from this plus request state.
     pub cfg: Option<CfgParams>,
     pub image_in: Option<u64>, // StagedImageId (Vit/Vae encode handle)
- /// Optional per-image text conditioning prompt for a generated image. This
- /// is a small descriptor string; the worker tokenizes it into a temporary
- /// branch KV cache and does not ship hidden states over the wire.
+    /// Optional per-image text conditioning prompt for a generated image. This
+    /// is a small descriptor string; the worker tokenizes it into a temporary
+    /// branch KV cache and does not ship hidden states over the wire.
     pub image_prompt: Option<String>,
     // ---- image-understanding interleave. All descriptors/small-input. ----
- /// Input-image bytes (base64 PNG/JPEG) for a Vit/Vae encode op. Mirror of the
- /// output `image_png_b64` "small result" — bytes in, not KV.
+    /// Input-image bytes (base64 PNG/JPEG) for a Vit/Vae encode op. Mirror of the
+    /// output `image_png_b64` "small result" — bytes in, not KV.
     pub image_b64: Option<String>,
- // ---- which KV-cache group these block ids live in (0 == the single
- // full-attention group BAGEL uses today). ----
+    // ---- which KV-cache group these block ids live in (0 == the single
+    // full-attention group BAGEL uses today). ----
     pub group_id: u32,
- // ---- logits-processor descriptors. All are small id lists / scalars,
- // never tensors — the worker masks/penalizes with them in the canonical order. ----
- /// Allowed-token whitelist: if `Some`, every other logit is masked to -inf.
+    // ---- logits-processor descriptors. All are small id lists / scalars,
+    // never tensors — the worker masks/penalizes with them in the canonical order. ----
+    /// Allowed-token whitelist: if `Some`, every other logit is masked to -inf.
     pub allowed_tokens: Option<Vec<u32>>,
- /// Tokens to suppress (mask to -inf): EOS while under `min_tokens`,
- /// completed bad-words, etc. — enforced in the control plane, applied by the worker.
+    /// Tokens to suppress (mask to -inf): EOS while under `min_tokens`,
+    /// completed bad-words, etc. — enforced in the control plane, applied by the worker.
     pub suppress_tokens: Option<Vec<u32>>,
- /// Bounded window of recently generated token ids for penalty application
- /// (the host owns generation, so the worker stays stateless — risk 4).
+    /// Bounded window of recently generated token ids for penalty application
+    /// (the host owns generation, so the worker stays stateless — risk 4).
     pub recent_tokens: Option<Vec<u32>>,
- // ---- multimodal encode. ----
- /// Content hash of the staged image this op encodes (encoder-cache key).
+    // ---- multimodal encode. ----
+    /// Content hash of the staged image this op encodes (encoder-cache key).
     pub mm_hash: Option<u64>,
- /// Reserved contract field: draft tokens for worker-side verify-and-accept
- /// speculative decoding. No drafter exists yet — this is the wire seam only.
+    /// Reserved contract field: draft tokens for worker-side verify-and-accept
+    /// speculative decoding. No drafter exists yet — this is the wire seam only.
     pub spec_token_ids: Option<Vec<u32>>,
- // ---- op-lifecycle id so the host correlates this op's result with the
- // submitted op. Scalar, never a tensor. ----
+    // ---- op-lifecycle id so the host correlates this op's result with the
+    // submitted op. Scalar, never a tensor. ----
     pub op_id: Option<u64>,
- /// Sampler stage: handle to the logits a `sample` op consumes. Scalar id routed
- /// by the StageRouter; the data-plane locator (if any) is fetched worker-side
- /// and never crosses this control-plane field as a tensor.
+    /// Sampler stage: handle to the logits a `sample` op consumes. Scalar id routed
+    /// by the StageRouter; the data-plane locator (if any) is fetched worker-side
+    /// and never crosses this control-plane field as a tensor.
     pub logits_handle: Option<u64>,
- /// Data-plane locator the consumer worker resolves to fetch this op's input
- /// tensor. base64 of the opaque `Locator` bytes — a small descriptor
- /// (opaque descriptor bytes), routed verbatim by the host.
+    /// Data-plane locator the consumer worker resolves to fetch this op's input
+    /// tensor. base64 of the opaque `Locator` bytes — a small descriptor
+    /// (opaque descriptor bytes), routed verbatim by the host.
     pub locator: Option<String>,
 }
 
@@ -198,8 +198,8 @@ impl Default for ForwardOp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardBatch {
     pub step_id: u64,
- /// Requests first dispatched in this batch: their static state crosses
- /// here, once; the worker seeds a per-request record before running `ops`.
+    /// Requests first dispatched in this batch: their static state crosses
+    /// here, once; the worker seeds a per-request record before running `ops`.
     pub new_reqs: Vec<NewRequestData>,
     pub ops: Vec<ForwardOp>,
 }
@@ -214,29 +214,29 @@ pub struct SeqResult {
     pub num_steps_done: Option<u16>,
     pub image_png_b64: Option<String>,
     pub image_hw: Option<(u32, u32)>,
- // ---- logprobs (scalars + id-scalar pairs, never logits tensors). ----
- /// Logprob of the sampled token (the `gather_logprobs` analog).
+    // ---- logprobs (scalars + id-scalar pairs, never logits tensors). ----
+    /// Logprob of the sampled token (the `gather_logprobs` analog).
     pub sampled_logprob: Option<f32>,
- /// Top-`n_logprobs` `(token_id, logprob)` pairs for this step.
+    /// Top-`n_logprobs` `(token_id, logprob)` pairs for this step.
     pub top_logprobs: Option<Vec<(u32, f32)>>,
- // ---- opaque worker-side handle to the encoder output produced by a
- // VitEncode/VaeEncode op. The embedding itself never returns to the host. ----
+    // ---- opaque worker-side handle to the encoder output produced by a
+    // VitEncode/VaeEncode op. The embedding itself never returns to the host. ----
     pub encoder_handle: Option<u64>,
     /// Number of KV positions an encode/commit op appended (the host
- /// advances its KV-length mirror by this; the worker is authoritative).
+    /// advances its KV-length mirror by this; the worker is authoritative).
     pub num_tokens: Option<u32>,
- /// Reserved contract field: how many of the op's `spec_token_ids` the worker
- /// accepted. Consumed by scheduler accounting when a drafter is wired in.
+    /// Reserved contract field: how many of the op's `spec_token_ids` the worker
+    /// accepted. Consumed by scheduler accounting when a drafter is wired in.
     pub num_accepted_tokens: Option<u32>,
- /// echo of the op's `op_id` for result↔op
- /// correlation in the lifecycle trace.
+    /// echo of the op's `op_id` for result↔op
+    /// correlation in the lifecycle trace.
     pub op_id: Option<u64>,
- /// Sampler stage: handle to the logits this op produced, when sampling is
- /// peeled into a separate Sampler pool. Scalar id; routing key.
+    /// Sampler stage: handle to the logits this op produced, when sampling is
+    /// peeled into a separate Sampler pool. Scalar id; routing key.
     pub logits_handle: Option<u64>,
- /// Data-plane locator for the tensor this op produced (published logits /
- /// embedding). base64 of the opaque `Locator`
- /// bytes; the host routes it to the consumer op verbatim, never parsing it.
+    /// Data-plane locator for the tensor this op produced (published logits /
+    /// embedding). base64 of the opaque `Locator`
+    /// bytes; the host routes it to the consumer op verbatim, never parsing it.
     pub locator: Option<String>,
 }
 
@@ -244,12 +244,12 @@ pub struct SeqResult {
 pub struct ForwardResult {
     pub step_id: u64,
     pub per_seq: Vec<SeqResult>,
- /// worker compute time for this batch in microseconds (the worker
- /// MetricsService measurement, promoted onto the wire). A scalar — never a
- /// tensor.
+    /// worker compute time for this batch in microseconds (the worker
+    /// MetricsService measurement, promoted onto the wire). A scalar — never a
+    /// tensor.
     pub worker_exec_us: Option<u64>,
- /// Worker-local forward/kernel counters for this batch. These are safe
- /// scalar counters only; tensors and payload data stay worker-resident.
+    /// Worker-local forward/kernel counters for this batch. These are safe
+    /// scalar counters only; tensors and payload data stay worker-resident.
     #[serde(default)]
     pub forward_stats: Option<WorkerForwardStats>,
 }
@@ -327,15 +327,15 @@ pub struct WorkerForwardStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterMode {
- /// No LoRA support (SenseNova today).
+    /// No LoRA support (SenseNova today).
     #[default]
     None,
- /// One merged adapter applies engine-wide; only one resident at a time
- /// (Bagel today: merge-on-load, `lora_id` selects but cannot mix).
+    /// One merged adapter applies engine-wide; only one resident at a time
+    /// (Bagel today: merge-on-load, `lora_id` selects but cannot mix).
     EngineWide,
- /// Per-request adapter routing (reserved; not implemented).
+    /// Per-request adapter routing (reserved; not implemented).
     PerRequest,
- /// Per-batch multi-adapter routing (reserved; not implemented).
+    /// Per-batch multi-adapter routing (reserved; not implemented).
     MultiAdapter,
 }
 
@@ -349,7 +349,7 @@ pub enum AdapterMode {
 /// must process it in one forward.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConstraints {
- /// Max ops the worker accepts in one `ForwardBatch` (0 == host default).
+    /// Max ops the worker accepts in one `ForwardBatch` (0 == host default).
     pub max_batch_ops: u32,
 }
 impl Default for ExecutionConstraints {
@@ -370,34 +370,44 @@ pub struct EngineCaps {
     pub supported_ops: Vec<String>,
     pub max_latent_size: u32,
     pub latent_downsample: u32,
+    #[serde(default)]
+    pub max_vae_grid_tokens: u32,
+    #[serde(default)]
+    pub max_vit_grid_tokens: u32,
+    #[serde(default = "default_commit_marker_tokens")]
+    pub commit_marker_tokens: u32,
+    #[serde(default = "default_gen_rope_advance")]
+    pub gen_rope_advance: u32,
+    #[serde(default = "default_max_cfg_branches")]
+    pub max_cfg_branches: u32,
     pub bytes_per_token: u64,
- // ---- KV-cache groups (hybrid layouts). Empty == one implicit full
- // group spanning [1, num_blocks) — the BAGEL default — so the field is a
- // no-op until a hybrid model reports groups. ----
+    // ---- KV-cache groups (hybrid layouts). Empty == one implicit full
+    // group spanning [1, num_blocks) — the BAGEL default — so the field is a
+    // no-op until a hybrid model reports groups. ----
     pub groups: Vec<KvCacheGroupSpec>,
- // ---- KV dtype / attention backend / quantization the worker chose;
- // the host consumes these to size its logical pool, it selects nothing. ----
+    // ---- KV dtype / attention backend / quantization the worker chose;
+    // the host consumes these to size its logical pool, it selects nothing. ----
     pub kv_dtype: String,
     pub attention_backend: String,
     pub quantization: Option<String>,
     pub rank: RankInfo,
- // ---- how many op-batches the host may keep in flight against this
- // worker (the batch-queue depth). Default 1 == today's synchronous behavior. ----
+    // ---- how many op-batches the host may keep in flight against this
+    // worker (the batch-queue depth). Default 1 == today's synchronous behavior. ----
     pub pipeline_depth: u32,
- // ---- encoder-output cache budget (number of cached encoder handles). ----
+    // ---- encoder-output cache budget (number of cached encoder handles). ----
     pub encoder_cache_budget: u32,
- // ---- scheduler/runtime consume only declared capabilities. ----
- /// Control kinds this worker actually implements (subset of
- /// copy_blocks/load_lora/unload_lora/free_encoder/reset_prefix_cache/sleep/
- /// wake_up). A control absent here is rejected before execution rather than
- /// silently no-op'd.
+    // ---- scheduler/runtime consume only declared capabilities. ----
+    /// Control kinds this worker actually implements (subset of
+    /// copy_blocks/load_lora/unload_lora/free_encoder/reset_prefix_cache/sleep/
+    /// wake_up). A control absent here is rejected before execution rather than
+    /// silently no-op'd.
     pub supported_controls: Vec<String>,
- /// LoRA residency mode.
+    /// LoRA residency mode.
     pub adapter_mode: AdapterMode,
- /// Batching/grouping constraints for execution planning.
+    /// Batching/grouping constraints for execution planning.
     pub execution_constraints: ExecutionConstraints,
- /// Resource classes this worker accounts for — the host
- /// issues leases and asserts invariants only for declared classes.
+    /// Resource classes this worker accounts for — the host
+    /// issues leases and asserts invariants only for declared classes.
     pub resource_classes: Vec<ResourceClass>,
 }
 fn default_kv_dtype() -> String {
@@ -408,6 +418,15 @@ fn default_attention_backend() -> String {
 }
 fn default_pipeline_depth() -> u32 {
     1
+}
+fn default_commit_marker_tokens() -> u32 {
+    2
+}
+fn default_gen_rope_advance() -> u32 {
+    2
+}
+fn default_max_cfg_branches() -> u32 {
+    3
 }
 impl Default for EngineCaps {
     fn default() -> Self {
@@ -424,6 +443,11 @@ impl Default for EngineCaps {
             ],
             max_latent_size: 64,
             latent_downsample: 16,
+            max_vae_grid_tokens: 64,
+            max_vit_grid_tokens: 0,
+            commit_marker_tokens: default_commit_marker_tokens(),
+            gen_rope_advance: default_gen_rope_advance(),
+            max_cfg_branches: default_max_cfg_branches(),
             bytes_per_token: 57344,
             groups: Vec::new(),
             kv_dtype: default_kv_dtype(),
@@ -463,8 +487,8 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
- /// Wire string carried in the `kind` field across the IPC boundary, matching
- /// the serde-snake_case serialization byte-for-byte.
+    /// Wire string carried in the `kind` field across the IPC boundary, matching
+    /// the serde-snake_case serialization byte-for-byte.
     pub fn as_wire_str(self) -> &'static str {
         match self {
             Self::GetCaps => "get_caps",
@@ -483,9 +507,9 @@ impl RequestKind {
         }
     }
 
- /// Parse a wire string back into the discriminant. Used for the
- /// control-method strings on `EngineCaps.supported_controls`, which share the
- /// request-kind vocabulary.
+    /// Parse a wire string back into the discriminant. Used for the
+    /// control-method strings on `EngineCaps.supported_controls`, which share the
+    /// request-kind vocabulary.
     pub fn from_wire_str(name: &str) -> Option<Self> {
         Some(match name {
             "get_caps" => Self::GetCaps,
@@ -512,25 +536,25 @@ impl RequestKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRequest {
     pub kind: RequestKind,
- /// Correlation id for control calls: the worker echoes it on the matching
- /// response so acks route by id (and fan-outs join per rank) instead of by
- /// queue position.
+    /// Correlation id for control calls: the worker echoes it on the matching
+    /// response so acks route by id (and fan-outs join per rank) instead of by
+    /// queue position.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<ForwardBatch>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub req_id: Option<RequestId>,
- /// `(src_block_id, dst_block_id)` pairs for prefix-cache physical reuse.
+    /// `(src_block_id, dst_block_id)` pairs for prefix-cache physical reuse.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub copies: Option<Vec<(BlockId, BlockId)>>,
- /// LoRA adapter id for load/unload control ops.
+    /// LoRA adapter id for load/unload control ops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_id: Option<u32>,
- /// filesystem path / repo id for a LoRA adapter to load.
+    /// filesystem path / repo id for a LoRA adapter to load.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lora_path: Option<String>,
- /// encoder-output handles whose physical storage the worker may reclaim.
+    /// encoder-output handles whose physical storage the worker may reclaim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_handles: Option<Vec<u64>>,
 }
@@ -635,28 +659,28 @@ pub struct WorkerMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResponse {
     pub kind: String, // "caps" | "result" | "ok" | "error" | "metrics" | "pressure"
- /// Echo of the request's `call_id` for control-call correlation.
+    /// Echo of the request's `call_id` for control-call correlation.
     pub call_id: Option<u64>,
     pub caps: Option<EngineCaps>,
     pub result: Option<ForwardResult>,
     pub metrics: Option<WorkerMetrics>,
     pub pressure: Option<Vec<ResourcePressure>>,
     pub message: Option<String>,
- // ---- typed error taxonomy. On an
- // "error" response these classify the failure so the host can decide
- // abort/retry/drop vs tear-down instead of treating every error as fatal.
- // All scalars / short strings — never tensors. ----
- /// Stable error class (see Python `runtime.errors.ErrorCode`).
+    // ---- typed error taxonomy. On an
+    // "error" response these classify the failure so the host can decide
+    // abort/retry/drop vs tear-down instead of treating every error as fatal.
+    // All scalars / short strings — never tensors. ----
+    /// Stable error class (see Python `runtime.errors.ErrorCode`).
     pub code: Option<String>,
- /// Whether retrying the same op could succeed.
+    /// Whether retrying the same op could succeed.
     pub retryable: Option<bool>,
- /// Whether the worker can no longer serve (tear it down) vs a single
- /// request/op failure (drop just that request).
+    /// Whether the worker can no longer serve (tear it down) vs a single
+    /// request/op failure (drop just that request).
     pub fatal: Option<bool>,
 }
 
 impl WorkerResponse {
- /// `true` when an `"error"` response should tear the worker down.
+    /// `true` when an `"error"` response should tear the worker down.
     pub fn is_fatal_error(&self) -> bool {
         self.kind == "error" && self.fatal.unwrap_or(true)
     }
@@ -679,9 +703,9 @@ mod tests {
 
     #[test]
     fn request_kind_serializes_to_unchanged_wire_strings() {
- // The Python worker reads `WorkerRequest.kind` as a plain string via the
- // pythonize/serde path; pin every variant's serialized form so the enum
- // discriminant stays byte-identical to the legacy `kind: String` values.
+        // The Python worker reads `WorkerRequest.kind` as a plain string via the
+        // pythonize/serde path; pin every variant's serialized form so the enum
+        // discriminant stays byte-identical to the legacy `kind: String` values.
         let cases = [
             (RequestKind::GetCaps, "get_caps"),
             (RequestKind::Execute, "execute"),
@@ -706,8 +730,8 @@ mod tests {
                 kind
             );
         }
- // The whole envelope still serializes with a flat top-level `kind` string,
- // exactly as the Python worker dispatches on (`req.get("kind")`).
+        // The whole envelope still serializes with a flat top-level `kind` string,
+        // exactly as the Python worker dispatches on (`req.get("kind")`).
         let req = WorkerRequest::execute(ForwardBatch {
             step_id: 1,
             new_reqs: Vec::new(),
@@ -899,25 +923,25 @@ mod tests {
         assert_eq!(result.per_seq[0].locator.as_deref(), Some("c2VxbG9j"));
     }
 
- /// the serde structs and the FlatBuffers schema are two independent
- /// source-of-truth definitions kept in sync only by the hand-written mapping
- /// in `flat.rs`. The compiler catches a *missing* field (the `*T` struct
- /// literals are exhaustive), but it cannot catch a swapped/mis-paired scalar
- /// within a correctly-listed tuple field, because the serde side carries
- /// `(u32, u32)` / `(f32, f32)` tuples while the FB side splits them into
- /// `_lo`/`_hi`, `_w`/`_h` scalar pairs. This test pins the pair *ordering*
- /// by round-tripping deliberately asymmetric values: any `pos_lo<->pos_hi`,
- /// `image_hw_w<->image_hw_h`, `interval_lo<->interval_hi`, or
- /// `cfg_interval_lo<->cfg_interval_hi` transposition in `flat.rs` flips the
- /// observed tuple and fails here instead of silently mis-mapping on the wire.
+    /// the serde structs and the FlatBuffers schema are two independent
+    /// source-of-truth definitions kept in sync only by the hand-written mapping
+    /// in `flat.rs`. The compiler catches a *missing* field (the `*T` struct
+    /// literals are exhaustive), but it cannot catch a swapped/mis-paired scalar
+    /// within a correctly-listed tuple field, because the serde side carries
+    /// `(u32, u32)` / `(f32, f32)` tuples while the FB side splits them into
+    /// `_lo`/`_hi`, `_w`/`_h` scalar pairs. This test pins the pair *ordering*
+    /// by round-tripping deliberately asymmetric values: any `pos_lo<->pos_hi`,
+    /// `image_hw_w<->image_hw_h`, `interval_lo<->interval_hi`, or
+    /// `cfg_interval_lo<->cfg_interval_hi` transposition in `flat.rs` flips the
+    /// observed tuple and fails here instead of silently mis-mapping on the wire.
     #[test]
     fn flatbuffer_scalar_pair_ordering_is_preserved() {
- // Asymmetric values so a `.0`/`.1` swap cannot round-trip equal.
+        // Asymmetric values so a `.0`/`.1` swap cannot round-trip equal.
         let req = WorkerRequest::execute(ForwardBatch {
             step_id: 1,
             new_reqs: vec![NewRequestData {
                 image: Some(ImageParams {
- // `cfg_interval` splits into cfg_interval_lo/cfg_interval_hi.
+                    // `cfg_interval` splits into cfg_interval_lo/cfg_interval_hi.
                     cfg_interval: (0.125, 0.875),
                     width: 100,
                     height: 200,
@@ -927,7 +951,7 @@ mod tests {
             }],
             ops: vec![ForwardOp {
                 req_id: RequestId(1),
- // `pos_range` splits into pos_lo/pos_hi.
+                // `pos_range` splits into pos_lo/pos_hi.
                 pos_range: (3, 7),
                 cfg: Some(CfgParams {
                     branch_count: 1,
@@ -935,7 +959,7 @@ mod tests {
                     img_scale: 1.0,
                     renorm_type: "global".into(),
                     renorm_min: 0.0,
- // `interval` splits into interval_lo/interval_hi.
+                    // `interval` splits into interval_lo/interval_hi.
                     interval: (0.25, 0.75),
                 }),
                 ..ForwardOp::default()
@@ -961,7 +985,7 @@ mod tests {
             "image width/height transposed"
         );
 
- // `SeqResult.image_hw` splits into image_hw_w/image_hw_h on the FB side.
+        // `SeqResult.image_hw` splits into image_hw_w/image_hw_h on the FB side.
         let resp = WorkerResponse {
             kind: "result".into(),
             call_id: None,
@@ -1042,8 +1066,10 @@ mod tests {
             );
         }
 
-        let rust_wire: std::collections::BTreeSet<String> =
-            rust_variants.iter().map(|k| wire_str(*k).to_string()).collect();
+        let rust_wire: std::collections::BTreeSet<String> = rust_variants
+            .iter()
+            .map(|k| wire_str(*k).to_string())
+            .collect();
 
         // `[[op]]` table: wire strings + Rust variant identifiers.
         let ops = schema["op"].as_array().expect("schema [[op]] array");
@@ -1097,7 +1123,8 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         // The order list must cover exactly the same variant set (as Rust idents).
-        let order_set: std::collections::BTreeSet<&str> = order.iter().map(String::as_str).collect();
+        let order_set: std::collections::BTreeSet<&str> =
+            order.iter().map(String::as_str).collect();
         let ident_set: std::collections::BTreeSet<&str> =
             rust_variants.iter().map(|k| variant_ident(*k)).collect();
         assert_eq!(
@@ -1130,31 +1157,31 @@ mod tests {
     /// about whether it may carry tensor data.
     #[test]
     fn wire_payload_fields_are_descriptors_only() {
- // The bindings are intentionally unused; the destructuring itself is the
- // assertion (it must enumerate every field — no `..`).
+        // The bindings are intentionally unused; the destructuring itself is the
+        // assertion (it must enumerate every field — no `..`).
         let ForwardOp {
             req_id: _,
             kind: _,
             modality: _,
-            new_block_ids: _,    // logical block ids (scalars), never KV bytes
-            pos_range: _,        // (u32, u32) descriptor
-            token_ids: _,        // input token ids — small id list, not logits
-            token_source: _,     // enum selector
-            timestep_idx: _,     // scalar
-            cond_pos: _,         // scalar
-            cfg: _,              // CfgParams descriptor (scalars only)
-            image_in: _,         // StagedImageId handle (scalar)
-            image_prompt: _,     // short prompt string descriptor
-            image_b64: _,        // input image bytes (b64), output-style small result
-            group_id: _,         // scalar
-            allowed_tokens: _,   // id list
-            suppress_tokens: _,  // id list
-            recent_tokens: _,    // bounded id list
-            mm_hash: _,          // content hash (scalar)
-            spec_token_ids: _,   // draft token ids (scalars)
-            op_id: _,            // lifecycle id (scalar)
-            logits_handle: _,    // opaque logits handle (scalar); logits stay off-wire
-            locator: _,          // base64 data-plane locator (small descriptor); tensor stays off-wire
+            new_block_ids: _,   // logical block ids (scalars), never KV bytes
+            pos_range: _,       // (u32, u32) descriptor
+            token_ids: _,       // input token ids — small id list, not logits
+            token_source: _,    // enum selector
+            timestep_idx: _,    // scalar
+            cond_pos: _,        // scalar
+            cfg: _,             // CfgParams descriptor (scalars only)
+            image_in: _,        // StagedImageId handle (scalar)
+            image_prompt: _,    // short prompt string descriptor
+            image_b64: _,       // input image bytes (b64), output-style small result
+            group_id: _,        // scalar
+            allowed_tokens: _,  // id list
+            suppress_tokens: _, // id list
+            recent_tokens: _,   // bounded id list
+            mm_hash: _,         // content hash (scalar)
+            spec_token_ids: _,  // draft token ids (scalars)
+            op_id: _,           // lifecycle id (scalar)
+            logits_handle: _,   // opaque logits handle (scalar); logits stay off-wire
+            locator: _, // base64 data-plane locator (small descriptor); tensor stays off-wire
         } = ForwardOp::default();
 
         let SeqResult {
@@ -1171,7 +1198,7 @@ mod tests {
             num_accepted_tokens: _, // scalar
             op_id: _,               // lifecycle id (scalar)
             logits_handle: _,       // opaque logits handle (scalar); logits stay off-wire
-            locator: _,             // base64 data-plane locator (small descriptor); tensor stays off-wire
+            locator: _, // base64 data-plane locator (small descriptor); tensor stays off-wire
         } = SeqResult::default();
 
         let NewRequestData {

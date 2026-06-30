@@ -123,16 +123,12 @@ async fn render_after_request(
             for mut batch in batches {
                 // Rewrite each output's request_id to the engine-assigned id and
                 // ensure the finished set references it once terminal.
-                let is_terminal = batch
-                    .outputs
-                    .iter()
-                    .any(|o| o.finish_reason.is_some());
+                let is_terminal = batch.outputs.iter().any(|o| o.finish_reason.is_some());
                 for output in &mut batch.outputs {
                     output.request_id = request.request_id.clone();
                 }
                 if is_terminal {
-                    batch.finished_requests =
-                        Some(BTreeSet::from([request.request_id.clone()]));
+                    batch.finished_requests = Some(BTreeSet::from([request.request_id.clone()]));
                 }
                 mock.send_outputs(batch);
             }
@@ -140,7 +136,10 @@ async fn render_after_request(
     });
 
     let llm = Llm::new(client);
-    let mut stream = llm.generate(generate_request(request_id, max_tokens)).await.unwrap();
+    let mut stream = llm
+        .generate(generate_request(request_id, max_tokens))
+        .await
+        .unwrap();
     while stream.next().await.transpose().unwrap().is_some() {}
 
     let _ = shutdown_tx.send(());

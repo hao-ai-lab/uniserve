@@ -179,11 +179,6 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use uniserve_executor::{ControlOp, Executor, WorkerExecError};
 
-/// Per-image KV upper bounds for worst-case reservation (exact counts
-/// come back from the worker's encode ops). VAE: 64x64 latent grid; ViT: 70x70
-/// patch grid (the 980/14 max), each + start/end markers.
-const IU_VAE_MAX: usize = 64 * 64;
-const IU_VIT_MAX: usize = 70 * 70;
 /// default per-step multimodal encode budget when the worker caps do not pin it.
 const DEFAULT_MM_ENCODE_BUDGET: usize = 4;
 /// default encoder-output cache capacity when the worker reports no
@@ -626,8 +621,8 @@ impl Scheduler {
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
-    // build from the worker's reported KV-cache groups (hybrid layouts);
-    // empty == the single full-attention group BAGEL uses today.
+        // build from the worker's reported KV-cache groups (hybrid layouts);
+        // empty == the single full-attention group BAGEL uses today.
         let bm = if caps.groups.is_empty() {
             BlockManager::new(
                 caps.num_blocks as usize,
@@ -680,6 +675,11 @@ impl Scheduler {
                     "pipeline_depth": caps.pipeline_depth,
                     "max_latent_size": caps.max_latent_size,
                     "latent_downsample": caps.latent_downsample,
+                    "max_vae_grid_tokens": caps.max_vae_grid_tokens,
+                    "max_vit_grid_tokens": caps.max_vit_grid_tokens,
+                    "commit_marker_tokens": caps.commit_marker_tokens,
+                    "gen_rope_advance": caps.gen_rope_advance,
+                    "max_cfg_branches": caps.max_cfg_branches,
                     "resource_classes": &caps.resource_classes,
                 },
             }));
@@ -850,9 +850,17 @@ impl Scheduler {
             active_leases: self.ledger.total_active(),
             resource_invariant_violations: self.ledger.stats.invariant_violations,
             completed_traces: self.completed_traces.len(),
-            last_worker_exec_us: self.stats.timing.last_worker_exec_us.load(Ordering::Relaxed),
+            last_worker_exec_us: self
+                .stats
+                .timing
+                .last_worker_exec_us
+                .load(Ordering::Relaxed),
             queue_wait_count: self.stats.timing.queue_wait_count.load(Ordering::Relaxed),
-            queue_wait_us_total: self.stats.timing.queue_wait_us_total.load(Ordering::Relaxed),
+            queue_wait_us_total: self
+                .stats
+                .timing
+                .queue_wait_us_total
+                .load(Ordering::Relaxed),
             queue_wait_us_max: self.stats.timing.queue_wait_us_max.load(Ordering::Relaxed),
             fatal: self.fatal,
             supported_ops: self.caps.supported_ops.clone(),
@@ -864,16 +872,16 @@ impl Scheduler {
     /// spin the schedule-ahead loop. Returns `true` if the engine died
     /// (executor/worker failure) rather than shutting down gracefully.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
-    // Event-driven executors (the iceoryx2 worker) park on a single wait
-    // over {result, command, worker-death} instead of the fixed-interval
-    // poll; the command ingress fires the executor's command waker, so a
-    // freshly enqueued command interrupts the park (no missed-command
-    // window). Polling executors (sim/local, which wake natively on their
-    // result channel) keep the crossbeam select below
-    // Event-driven executors park on {result, command, death}.
+        // Event-driven executors (the iceoryx2 worker) park on a single wait
+        // over {result, command, worker-death} instead of the fixed-interval
+        // poll; the command ingress fires the executor's command waker, so a
+        // freshly enqueued command interrupts the park (no missed-command
+        // window). Polling executors (sim/local, which wake natively on their
+        // result channel) keep the crossbeam select below
+        // Event-driven executors park on {result, command, death}.
         let event_driven = self.executor.event_driven();
         loop {
-    // drain pending commands (non-blocking)
+            // drain pending commands (non-blocking)
             let mut shutdown = false;
             loop {
                 match rx.try_recv() {
@@ -903,9 +911,9 @@ impl Scheduler {
             }
 
             if event_driven {
-    // One park point. On wake, loop back to drain commands + step.
-    // The park itself never observes shutdown — commands are drained
-    // at the loop head — so it only needs to surface fatal death.
+                // One park point. On wake, loop back to drain commands + step.
+                // The park itself never observes shutdown — commands are drained
+                // at the loop head — so it only needs to surface fatal death.
                 if !progressed {
                     self.park_event_driven();
                     if self.fatal {
@@ -940,12 +948,12 @@ impl Scheduler {
                 && self.pending.is_empty()
                 && self.executor.in_flight() == 0
             {
-    // even fully idle, wake periodically to probe worker
-    // liveness so a worker that dies with nothing in flight is
-    // detected promptly (the engine latches fatal and the frontend
-    // stops routing here) instead of only being noticed when the
-    // next request arrives. When gated on grammar compilation we use
-    // the shorter slice so the compiler is polled responsively.
+                // even fully idle, wake periodically to probe worker
+                // liveness so a worker that dies with nothing in flight is
+                // detected promptly (the engine latches fatal and the frontend
+                // stops routing here) instead of only being noticed when the
+                // next request arrives. When gated on grammar compilation we use
+                // the shorter slice so the compiler is polled responsively.
                 let wait = if self.skipped_waiting.is_empty() {
                     IDLE_LIVENESS_POLL
                 } else {
@@ -958,7 +966,7 @@ impl Scheduler {
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-    // No command arrived; verify the worker is still alive.
+                        // No command arrived; verify the worker is still alive.
                         if let Err(e) = self.executor.check_liveness() {
                             self.on_executor_error(e);
                             if self.fatal {
@@ -975,9 +983,9 @@ impl Scheduler {
                 }
             }
         }
-    // Graceful shutdown: report Aborted to everything still queued or
-    // running before tearing the executor down (staged drain happened at
-    // the HTTP layer; nothing in flight should just see a closed channel).
+        // Graceful shutdown: report Aborted to everything still queued or
+        // running before tearing the executor down (staged drain happened at
+        // the HTTP layer; nothing in flight should just see a closed channel).
         self.abort_all_requests();
         self.executor.shutdown();
         false
@@ -1004,9 +1012,9 @@ impl Scheduler {
             self.on_executor_error(e);
             return;
         }
-    // The death watcher wakes the park instantly on child exit; confirm and
-    // latch it here (also the only death signal when fully idle, where no
-    // result drain would otherwise surface it).
+        // The death watcher wakes the park instantly on child exit; confirm and
+        // latch it here (also the only death signal when fully idle, where no
+        // result drain would otherwise surface it).
         if let Err(e) = self.executor.check_liveness() {
             self.on_executor_error(e);
         }
@@ -1108,7 +1116,7 @@ impl Scheduler {
             st.cancelled = true;
             st.aborted = abort;
         }
-    // a request still gated on grammar compilation can be cancelled too
+        // a request still gated on grammar compilation can be cancelled too
         if let Some(st) = self.skipped_waiting.remove(&id) {
             let reason = if abort {
                 FinishReason::Aborted
@@ -1133,7 +1141,7 @@ impl Scheduler {
             });
             return;
         }
-    // also drop from the waiting queue if not yet admitted (reporting the reason)
+        // also drop from the waiting queue if not yet admitted (reporting the reason)
         if let Some(st) = self.pending.remove_request(id) {
             let reason = if abort {
                 FinishReason::Aborted
@@ -1265,10 +1273,10 @@ impl Scheduler {
     }
 
     fn enqueue(&mut self, req: GenerateRequest) {
-    // admission backpressure. Shed load instead of letting the waiting
-    // queues (pending + grammar-gated) grow without bound under overload —
-    // an unbounded burst would otherwise OOM the process and take down every
-    // in-flight request. Reject the new submit with a typed event.
+        // admission backpressure. Shed load instead of letting the waiting
+        // queues (pending + grammar-gated) grow without bound under overload —
+        // an unbounded burst would otherwise OOM the process and take down every
+        // in-flight request. Reject the new submit with a typed event.
         let waiting = self.pending.len() + self.skipped_waiting.len();
         if waiting >= self.config.max_num_waiting {
             self.record_decision(
@@ -1293,28 +1301,28 @@ impl Scheduler {
         }
         let prompt_len = req.prompt_ids.len();
         let worst = self.worstcase(&req, prompt_len);
-    // Image-only and image-understanding requests have predictable KV spans
-    // and/or expensive staged image state, so reserve them up front.
-    // Auto-interleave has unbounded text growth controlled by max_tokens;
-    // reserving prompt + max_tokens + all possible image KV would reject
-    // normal long-budget requests before the model can naturally stop.
+        // Image-only and image-understanding requests have predictable KV spans
+        // and/or expensive staged image state, so reserve them up front.
+        // Auto-interleave has unbounded text growth controlled by max_tokens;
+        // reserving prompt + max_tokens + all possible image KV would reject
+        // normal long-budget requests before the model can naturally stop.
         let reserve_worstcase = matches!(req.mode, GenMode::Image | GenMode::InterleaveUnd);
-    // a request with staged images encodes them before prefill.
+        // a request with staged images encodes them before prefill.
         // Understanding interleave prefills SYS first, then encodes the
-    // image at its in-prompt position, so it starts in Prefill.
+        // image at its in-prompt position, so it starts in Prefill.
         let phase0 = if req.mm_items.is_empty() || req.mode == GenMode::InterleaveUnd {
             Phase::Prefill
         } else {
             Phase::Encode
         };
-    // compile the request into its typed program (host-internal
-    // IR). The FSM stays authoritative; the program rides along for typed
-    // representation, lifecycle tracking, and policy hints.
+        // compile the request into its typed program (host-internal
+        // IR). The FSM stays authoritative; the program rides along for typed
+        // representation, lifecycle tracking, and policy hints.
         let mut program = uniserve_program::compile(&req);
         let program_id = uniserve_core::ProgramId(self.next_program_id);
         self.next_program_id += 1;
         program.program_id = program_id;
-    // a lifecycle trace keyed by trace/program/request ids.
+        // a lifecycle trace keyed by trace/program/request ids.
         let trace = crate::trace::RequestTrace::new(
             req.request_id,
             uniserve_core::TraceId(req.request_id.0),
@@ -1358,9 +1366,9 @@ impl Scheduler {
             worker_image_latent_units: 0,
             req,
         };
-    // Structured-output gate: a request with a grammar
-    // waits in skipped_waiting until its compilation finishes; admission
-    // collects ready grammars each pass.
+        // Structured-output gate: a request with a grammar
+        // waits in skipped_waiting until its compilation finishes; admission
+        // collects ready grammars each pass.
         if let Some(spec) = st.req.grammar.clone() {
             let id = st.req.request_id;
             self.grammar_compiler.submit(id, spec);
@@ -1375,6 +1383,26 @@ impl Scheduler {
     fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
         let dl = self.caps.latent_downsample as u64;
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
+    }
+
+    fn cap_max_vae_grid_tokens(&self) -> usize {
+        self.caps.max_vae_grid_tokens.max(self.caps.max_latent_size) as usize
+    }
+
+    fn cap_max_vit_grid_tokens(&self) -> usize {
+        self.caps.max_vit_grid_tokens as usize
+    }
+
+    fn cap_commit_marker_tokens(&self) -> usize {
+        self.caps.commit_marker_tokens.max(1) as usize
+    }
+
+    fn cap_gen_rope_advance(&self) -> u32 {
+        self.caps.gen_rope_advance.max(1)
+    }
+
+    fn cap_max_cfg_branches(&self) -> u64 {
+        self.caps.max_cfg_branches.max(1) as u64
     }
 
     fn worker_tracks_image_latent(&self) -> bool {
@@ -1446,7 +1474,7 @@ impl Scheduler {
 
     fn generated_image_span(&self, ip: &uniserve_core::ImageParams) -> usize {
         if ip.retain_images {
-            self.num_vae(ip) as usize + 2
+            self.num_vae(ip) as usize + self.cap_commit_marker_tokens()
         } else {
             0
         }
@@ -1464,12 +1492,13 @@ impl Scheduler {
                     + req.max_tokens
                     + self.generated_image_span(&req.image) * req.image.max_images as usize
             }
-        // Exact image token counts come back from the worker's encode
-    // ops; reserve generously up front for the input image + each generated
-    // reasoning image, both dual-encoded (VAE clean ⊕ ViT). The per-image
-    // upper bounds are the max VAE (64x64) and ViT (70x70) grids + markers.
+            // Exact image token counts come back from the worker's encode ops;
+            // reserve generously up front for the input image + each generated
+            // reasoning image, both dual-encoded (VAE clean + ViT).
             GenMode::InterleaveUnd => {
-                let per_image = IU_VAE_MAX + IU_VIT_MAX + 4;
+                let per_image = self.cap_max_vae_grid_tokens()
+                    + self.cap_max_vit_grid_tokens()
+                    + 2 * self.cap_commit_marker_tokens();
                 prompt_len + req.max_tokens + per_image * (1 + req.image.max_images as usize)
             }
         };
@@ -1516,13 +1545,13 @@ impl Scheduler {
     /// slots, but leaves any blocking result wait to `run`.
     fn step_nonblocking(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
-    // 1. resolve any completed batches (non-blocking).
+        // 1. resolve any completed batches (non-blocking).
         let mut progressed = self.drain_results();
 
-    // 2. reap cancellations before assembling.
+        // 2. reap cancellations before assembling.
         self.reap_cancellations();
 
-    // 3. submit as many batches as pipeline capacity allows.
+        // 3. submit as many batches as pipeline capacity allows.
         while self.executor.can_submit() {
             self.admit();
             let (new_reqs, ops) = self.assemble();
@@ -1563,8 +1592,8 @@ impl Scheduler {
             .general
             .in_flight
             .store(self.executor.in_flight(), Ordering::Relaxed);
-    // drain the manager's event ring so it doesn't grow unbounded; the
-    // counters below already aggregate it, but draining keeps memory bounded.
+        // drain the manager's event ring so it doesn't grow unbounded; the
+        // counters below already aggregate it, but draining keeps memory bounded.
         let _ = self.bm.drain_events();
         self.stats
             .kv_cache
@@ -1590,8 +1619,8 @@ impl Scheduler {
             .encoder
             .cached
             .store(self.enc_cache.len(), Ordering::Relaxed);
-    // resource-plane observability — active leases (0 when idle) and
-    // any retained-after-release invariant violations.
+        // resource-plane observability — active leases (0 when idle) and
+        // any retained-after-release invariant violations.
         self.stats
             .resources
             .active
@@ -1656,12 +1685,15 @@ impl Scheduler {
     }
 
     fn register_inflight(&mut self, op: &ForwardOp, started: Instant) {
-        self.inflight_ops.entry(op.req_id).or_default().push_back(InflightOp {
-            kind: op.kind,
-            op_id: op.op_id,
-            spec_tokens: op.spec_token_ids.clone().unwrap_or_default(),
-            started,
-        });
+        self.inflight_ops
+            .entry(op.req_id)
+            .or_default()
+            .push_back(InflightOp {
+                kind: op.kind,
+                op_id: op.op_id,
+                spec_tokens: op.spec_token_ids.clone().unwrap_or_default(),
+                started,
+            });
     }
 
     /// Resolve one in-flight op for `id`, matching the worker's echoed `op_id`
@@ -1700,23 +1732,27 @@ impl Scheduler {
         let worker_fatal = exec.map(|w| w.fatal).unwrap_or(true);
         let code = exec.and_then(|w| w.code.as_deref());
         let retryable = exec.map(|w| w.retryable).unwrap_or(false);
-    // Host-bug classes are latched fatal regardless of the worker's bit:
-    // continuing to schedule against a violated invariant is unsafe.
+        // Host-bug classes are latched fatal regardless of the worker's bit:
+        // continuing to schedule against a violated invariant is unsafe.
         let host_escalates_fatal =
             matches!(code, Some("SchedulerBug") | Some("InvariantViolation"));
         let fatal = worker_fatal || host_escalates_fatal;
         if fatal {
-            tracing::error!(?code, retryable, "fatal executor error (engine will stop): {e}");
+            tracing::error!(
+                ?code,
+                retryable,
+                "fatal executor error (engine will stop): {e}"
+            );
             self.fatal = true;
         } else if matches!(code, Some("UserInputError")) {
-    // A malformed request is the client's fault, not a worker problem:
-    // fail just that request at info level instead of warn-spam.
+            // A malformed request is the client's fault, not a worker problem:
+            // fail just that request at info level instead of warn-spam.
             tracing::info!(?code, "request rejected by worker (failing in-flight): {e}");
         } else {
-    // Non-fatal worker errors keep the worker up. `retryable` is
-    // surfaced so a recoverable class (OOM/transient) is visible to
-    // operators; an automatic requeue path lands with the drafter/retry
-    // budget work and is intentionally not attempted here.
+            // Non-fatal worker errors keep the worker up. `retryable` is
+            // surfaced so a recoverable class (OOM/transient) is visible to
+            // operators; an automatic requeue path lands with the drafter/retry
+            // budget work and is intentionally not attempted here.
             tracing::warn!(
                 ?code,
                 retryable,
@@ -1727,7 +1763,7 @@ impl Scheduler {
     }
 
     fn apply_result(&mut self, result: ForwardResult) {
-    // worker-reported batch compute time (one value per batch).
+        // worker-reported batch compute time (one value per batch).
         let result_step_id = result.step_id;
         let batch_roundtrip_us = self
             .batch_started
@@ -1741,9 +1777,9 @@ impl Scheduler {
                 .last_worker_exec_us
                 .store(w, Ordering::Relaxed);
         }
-    // fold the per-batch worker compute time and host round-trip
-    // latency into cumulative counters so they surface in the structured
-    // wire stats / Prometheus, mirroring what the JSON trace already records.
+        // fold the per-batch worker compute time and host round-trip
+        // latency into cumulative counters so they surface in the structured
+        // wire stats / Prometheus, mirroring what the JSON trace already records.
         self.stats
             .timing
             .worker_exec_us_total
@@ -1760,19 +1796,19 @@ impl Scheduler {
         let mut resolved_ops = Vec::with_capacity(result.per_seq.len());
         for sr in result.per_seq {
             let id = sr.req_id;
-    // op_id-correlated completion: resolve the exact op the
-    // worker echoed, not merely the FIFO-oldest one.
+            // op_id-correlated completion: resolve the exact op the
+            // worker echoed, not merely the FIFO-oldest one.
             let (kind, draft_token_ids, started) = self.pop_inflight(id, sr.op_id);
             let draft_tokens = draft_token_ids.len();
-    // fold this op's host-side round-trip latency into the history.
+            // fold this op's host-side round-trip latency into the history.
             let roundtrip_us = started
                 .map(|start| start.elapsed().as_micros() as u64)
                 .unwrap_or(0);
             if let Some(k) = kind {
                 self.latency.observe(opkind_str(k), roundtrip_us);
             }
-    // record the op-resolved lifecycle event (op_id echoed by the
-    // worker, host round-trip + worker compute time).
+            // record the op-resolved lifecycle event (op_id echoed by the
+            // worker, host round-trip + worker compute time).
             let op_id = sr.op_id;
             resolved_ops.push(json!({
                 "request_id": id.0,
@@ -1829,7 +1865,7 @@ impl Scheduler {
         add_worker_forward_map(&self.stats.worker.forward_mode_tokens, &stats.mode_tokens);
         add_worker_forward_map(&self.stats.worker.forward_mode_us, &stats.mode_us);
         add_worker_forward_map(&self.stats.worker.forward_component_us, &stats.component_us);
-           // Fold worker forward stats maps into scheduler stats.
+        // Fold worker forward stats maps into scheduler stats.
         add_worker_forward_map(
             &self.stats.worker.attention_backend_counts,
             &stats.attention_backend_counts,
@@ -1946,9 +1982,9 @@ impl Scheduler {
     fn fail_all_inflight(&mut self, msg: &str) {
         let ids: Vec<RequestId> = self.inflight_ops.keys().copied().collect();
         self.inflight_ops.clear();
-    // the submitted batches whose results will now never return are
-    // failed here, so drop their pending submit-timestamps too — otherwise
-    // `batch_started` accumulates orphaned entries for every failed batch.
+        // the submitted batches whose results will now never return are
+        // failed here, so drop their pending submit-timestamps too — otherwise
+        // `batch_started` accumulates orphaned entries for every failed batch.
         self.batch_started.clear();
         for id in ids {
             if self.running.contains_key(&id) {
@@ -1964,14 +2000,14 @@ impl Scheduler {
     }
 
     fn reap_cancellations(&mut self) {
-    // never release a cancelled request's KV while one of its ops is
-    // still executing on the worker. `finish` frees the physical blocks
-    // immediately (and DropRequest is fire-and-forget), so reaping an
-    // in-flight request would let the blocks be re-allocated to another
-    // request before the cancelled forward completes — corrupting that
-    // request's KV cache on a pipelined worker. Defer to a later step: once
-    // the op resolves, `inflight_kinds` drains and the next reap finishes it.
-    // This mirrors the `!has_inflight` guard preemption already uses.
+        // never release a cancelled request's KV while one of its ops is
+        // still executing on the worker. `finish` frees the physical blocks
+        // immediately (and DropRequest is fire-and-forget), so reaping an
+        // in-flight request would let the blocks be re-allocated to another
+        // request before the cancelled forward completes — corrupting that
+        // request's KV cache on a pipelined worker. Defer to a later step: once
+        // the op resolves, `inflight_kinds` drains and the next reap finishes it.
+        // This mirrors the `!has_inflight` guard preemption already uses.
         let cancelled: Vec<(RequestId, bool)> = self
             .running
             .iter()
@@ -1996,7 +2032,7 @@ impl Scheduler {
         if self.sleeping {
             return;
         }
-    // Open the structured-output gate for grammars that finished compiling.
+        // Open the structured-output gate for grammars that finished compiling.
         for (id, compiled) in self.grammar_compiler.drain_ready() {
             if let Some(mut st) = self.skipped_waiting.remove(&id) {
                 st.grammar = Some(GrammarMatcher::new(compiled));
@@ -2015,18 +2051,12 @@ impl Scheduler {
             if head.reserve_worstcase {
                 let need = head.worstcase_blocks;
                 let scratch_ok = match head.req.mode {
-                    GenMode::Image | GenMode::AutoInterleave => {
-                        let branches = if head.req.image.cfg_text_scale > 1.0 {
-                            2
-                        } else {
-                            1
-                        };
-                        self.bm
-                            .can_reserve_scratch(self.num_vae(&head.req.image) * branches)
-                    }
-        // The cfg branches are a truncated paged view + a
-    // worker-internal cache, so only the main latent uses scratch.
-                    GenMode::InterleaveUnd => self.bm.can_reserve_scratch(IU_VAE_MAX as u64),
+                    GenMode::Image | GenMode::AutoInterleave => self.bm.can_reserve_scratch(
+                        self.num_vae(&head.req.image) * self.cap_max_cfg_branches(),
+                    ),
+                    GenMode::InterleaveUnd => self
+                        .bm
+                        .can_reserve_scratch(self.cap_max_vae_grid_tokens() as u64),
                     GenMode::Text => true,
                 };
                 if need > self.usable_blocks {
@@ -2055,8 +2085,8 @@ impl Scheduler {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
-    // Physically allocate the worst case now: nothing can take
-    // these blocks, so this request can never fail mid-flight.
+                    // Physically allocate the worst case now: nothing can take
+                    // these blocks, so this request can never fail mid-flight.
                     self.bm.ensure_capacity(id, need * bs);
                     self.reserved_blocks += need;
                     self.record_decision(id, crate::policy::PolicyReason::Admitted, need);
@@ -2118,10 +2148,10 @@ impl Scheduler {
                 }
             }
 
-    // No room now. Under Priority, a higher-priority arrival preempts a
-    // lower-priority budgeted running request to be admitted; retry if
-    // a victim was freed, else stop (the queue is ordered, so later
-    // entries can't fit either).
+            // No room now. Under Priority, a higher-priority arrival preempts a
+            // lower-priority budgeted running request to be admitted; retry if
+            // a victim was freed, else stop (the queue is ordered, so later
+            // entries can't fit either).
             let head_priority = self.pending.peek_request().map(|s| s.req.priority);
             if let Some(prio) = head_priority
                 && self.preempt_for_admission(prio)
@@ -2149,10 +2179,10 @@ impl Scheduler {
             .timing
             .queue_wait_us_max
             .fetch_max(queue_wait_us, Ordering::Relaxed);
-    // lease KvBlock capacity in BLOCKS, the same unit the worker's
-    // ResourceRuntime accounts (`len(new_blocks)` against `num_blocks`).
-    // Capacity is counted in blocks, not tokens multiplied by `block_size`.
-    // `resources.rs` (ResourceLease::capacity) is the unit authority: KvBlock is blocks.
+        // lease KvBlock capacity in BLOCKS, the same unit the worker's
+        // ResourceRuntime accounts (`len(new_blocks)` against `num_blocks`).
+        // Capacity is counted in blocks, not tokens multiplied by `block_size`.
+        // `resources.rs` (ResourceLease::capacity) is the unit authority: KvBlock is blocks.
         let kv_capacity = st.worstcase_blocks as u64;
         let mode = mode_str(st.req.mode);
         let phase = phase_str(st.phase);
@@ -2191,7 +2221,7 @@ impl Scheduler {
             "free_blocks": self.bm.free_blocks(),
             "reserved_blocks": self.reserved_blocks,
         }));
-    // lease this request's KV residency (released at finish/drop/preempt).
+        // lease this request's KV residency (released at finish/drop/preempt).
         self.ledger.issue(
             id,
             uniserve_worker_wire::ResourceClass::KvBlock,
@@ -2200,8 +2230,7 @@ impl Scheduler {
         );
         let bs = self.caps.block_size as usize;
         if let Some(st) = self.running.get_mut(&id) {
-            self.prefix_cache
-                .lookup(st, &mut self.bm, &self.stats, bs);
+            self.prefix_cache.lookup(st, &mut self.bm, &self.stats, bs);
         }
     }
 
@@ -2211,10 +2240,10 @@ impl Scheduler {
     fn assemble(&mut self) -> (Vec<NewRequestData>, Vec<ForwardOp>) {
         let mut new_reqs: Vec<NewRequestData> = Vec::new();
         let mut ops: Vec<ForwardOp> = Vec::new();
-    // vLLM's per-step token budget with the clip rule: the budget, not the
-    // chunk threshold, is the binding constraint.
+        // vLLM's per-step token budget with the clip rule: the budget, not the
+        // chunk threshold, is the binding constraint.
         let mut budget: usize = self.config.max_num_batched_tokens;
-    // per-step multimodal encode budget.
+        // per-step multimodal encode budget.
         let mut encodes_left = self.mm_encode_budget;
         let ids = self.assembly_order();
         for id in ids {
@@ -2232,20 +2261,20 @@ impl Scheduler {
                 continue;
             }
             let next_kind = self.peek_next_kind(id);
-    // und/gen mixed-batch single-forward is a non-negotiable invariant: the
-    // scheduler mixes op kinds unconditionally. There is no
-    // `supports_mixed_op_kinds` gate — any worker that receives a mixed
-    // batch processes it in one forward.
+            // und/gen mixed-batch single-forward is a non-negotiable invariant: the
+            // scheduler mixes op kinds unconditionally. There is no
+            // `supports_mixed_op_kinds` gate — any worker that receives a mixed
+            // batch processes it in one forward.
             if next_kind == Some(OpKind::DenoiseGen) && !self.can_schedule_denoise(id) {
                 continue;
             }
-    // Build an op; on a block-budget miss, preempt a budgeted victim
-    // and retry — else skip this request for the step.
+            // Build an op; on a block-budget miss, preempt a budgeted victim
+            // and retry — else skip this request for the step.
             let mut tries = 0usize;
             loop {
                 match self.next_op(id, budget) {
                     Some(mut op) => {
-    // bound encode work per step; defer if over budget.
+                        // bound encode work per step; defer if over budget.
                         if op.kind == OpKind::VitEncode || op.kind == OpKind::VaeEncode {
                             if encodes_left == 0 {
                                 break;
@@ -2253,9 +2282,9 @@ impl Scheduler {
                             encodes_left -= 1;
                         }
                         budget = budget.saturating_sub(op_token_cost(&op));
-    // Stateful-diff contract: a request's static state and
-    // initial block allocation cross once, ahead of its
-    // first op; the op then carries only deltas.
+                        // Stateful-diff contract: a request's static state and
+                        // initial block allocation cross once, ahead of its
+                        // first op; the op then carries only deltas.
                         if let Some(st) = self.running.get_mut(&id)
                             && !st.worker_registered
                         {
@@ -2300,10 +2329,15 @@ impl Scheduler {
     fn assembly_priority(&self, id: RequestId) -> u8 {
         match self.peek_next_kind(id) {
             Some(OpKind::VitEncode | OpKind::VaeEncode | OpKind::PrefillUnd) => 0,
-            Some(OpKind::DecodeUnd | OpKind::TargetVerifyUnd | OpKind::CommitGen | OpKind::CommitWriteback) => 1,
+            Some(
+                OpKind::DecodeUnd
+                | OpKind::TargetVerifyUnd
+                | OpKind::CommitGen
+                | OpKind::CommitWriteback,
+            ) => 1,
             Some(OpKind::DenoiseGen) => 2,
-    // Sample/EncodeFrame are StageRouter-injected stage ops, never produced
-    // by this scheduler's per-request FSM; group them with "no op".
+            // Sample/EncodeFrame are StageRouter-injected stage ops, never produced
+            // by this scheduler's per-request FSM; group them with "no op".
             Some(OpKind::Sample | OpKind::EncodeFrame) | None => 3,
         }
     }
@@ -2361,16 +2395,15 @@ impl Scheduler {
             if st.reserve_worstcase {
                 return false;
             }
-    // never preempt an AutoInterleave request mid-image
-    // (DenoiseGen/CommitGen) nor one that has already committed an
-    // image. Preemption resumes by recomputing KV over `prompt ++
-    // generated_ids`, but generated_ids holds only text tokens — the
-    // committed image latents are not in it, so replaying the diff
-    // would drop the image KV/positions and corrupt the resumed
-    // request. Make this an explicit guard, not an implicit invariant.
+            // never preempt an AutoInterleave request mid-image
+            // (DenoiseGen/CommitGen) nor one that has already committed an
+            // image. Preemption resumes by recomputing KV over `prompt ++
+            // generated_ids`, but generated_ids holds only text tokens — the
+            // committed image latents are not in it, so replaying the diff
+            // would drop the image KV/positions and corrupt the resumed
+            // request. Make this an explicit guard, not an implicit invariant.
             if st.req.mode == GenMode::AutoInterleave
-                && (matches!(st.phase, Phase::DenoiseGen | Phase::CommitGen)
-                    || st.images_done > 0)
+                && (matches!(st.phase, Phase::DenoiseGen | Phase::CommitGen) || st.images_done > 0)
             {
                 return false;
             }
@@ -2452,8 +2485,8 @@ impl Scheduler {
         );
         self.order.retain(|x| *x != victim);
         self.bm.release(victim);
-    // a preempted request is re-queued and re-admitted (which re-issues
-    // its lease), so release its current leases now to avoid a stale double.
+        // a preempted request is re-queued and re-admitted (which re-issues
+        // its lease), so release its current leases now to avoid a stale double.
         self.ledger.release_request(victim);
         let _ = self.executor.control(ControlOp::DropRequest(victim));
         let mut st = st;
@@ -2500,8 +2533,8 @@ impl Scheduler {
         let _span = tracing::trace_span!("scheduler.submit_batch", ops = ops.len()).entered();
         self.step_id += 1;
         let step = self.step_id;
-    // /10: stamp each op's submit time (round-trip latency) + assign its
-    // op_id (lifecycle correlation), and record an OpSubmitted trace event.
+        // /10: stamp each op's submit time (round-trip latency) + assign its
+        // op_id (lifecycle correlation), and record an OpSubmitted trace event.
         let submit_at = Instant::now();
         for op in &mut ops {
             let oid = self.next_op_id;
@@ -2510,11 +2543,11 @@ impl Scheduler {
             self.register_inflight(op, submit_at);
             let opk = opkind_str(op.kind);
             if let Some(st) = self.running.get_mut(&op.req_id) {
-    // the FSM may only emit op kinds
-    // the request's typed program declares (proven across the sim suite).
-    // A violation indicates a program/FSM drift bug; surface it in all
-    // builds (release included) rather than silently no-op'ing, while
-    // still failing hard under test via the debug_assert.
+                // the FSM may only emit op kinds
+                // the request's typed program declares (proven across the sim suite).
+                // A violation indicates a program/FSM drift bug; surface it in all
+                // builds (release included) rather than silently no-op'ing, while
+                // still failing hard under test via the debug_assert.
                 if !st.program.wire_kinds().contains(opk) {
                     tracing::warn!(
                         "program/FSM drift: FSM emitted op {opk} not declared by the \
@@ -2711,10 +2744,10 @@ impl Scheduler {
         let phase = self.running.get(&id)?.phase;
         match phase {
             Phase::Encode => {
-    // skip any images already in the encoder cache (pinning them),
-    // then emit a VitEncode for the first uncached image. The embedding
-    // never crosses the wire — the op carries the content hash + a
-    // staged-image handle, the result returns an encoder handle.
+                // skip any images already in the encoder cache (pinning them),
+                // then emit a VitEncode for the first uncached image. The embedding
+                // never crosses the wire — the op carries the content hash + a
+                // staged-image handle, the result returns an encoder handle.
                 let (mm_items, mut cursor) = {
                     let st = self.running.get(&id)?;
                     (st.req.mm_items.clone(), st.mm_cursor)
@@ -2756,8 +2789,8 @@ impl Scheduler {
                 let prompt = Self::effective_prompt(st).to_vec();
                 let n = prompt.len();
                 let cursor = st.prompt_cursor as usize;
-    // Chunked prefill with the clip rule: the chunk is bounded by
-    // the remaining step budget and the long-prefill threshold.
+                // Chunked prefill with the clip rule: the chunk is bounded by
+                // the remaining step budget and the long-prefill threshold.
                 let chunk_cap = (n - cursor)
                     .min(self.config.long_prefill_threshold)
                     .min(budget.max(1));
@@ -2768,9 +2801,9 @@ impl Scheduler {
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-    // Advance the cursor at build time: a request with an op in flight
-    // is never re-scheduled, so this is the authoritative chunk end and
-    // `resolve` simply checks cursor vs prompt length (no re-derivation).
+                // Advance the cursor at build time: a request with an op in flight
+                // is never re-scheduled, so this is the authoritative chunk end and
+                // `resolve` simply checks cursor vs prompt length (no re-derivation).
                 if let Some(st) = self.running.get_mut(&id) {
                     st.prompt_cursor = end as u32;
                     st.pos = end as u32;
@@ -2801,8 +2834,12 @@ impl Scheduler {
                 let (allowed, suppress) = self.token_masks(id);
                 let spec_token_ids = if !use_last_sampled && budget > 1 {
                     self.running.get(&id).and_then(|st| {
-                        self.spec_decode
-                            .draft_tokens(st, tok, allowed.as_deref(), suppress.as_deref())
+                        self.spec_decode.draft_tokens(
+                            st,
+                            tok,
+                            allowed.as_deref(),
+                            suppress.as_deref(),
+                        )
                     })
                 } else {
                     None
@@ -2835,12 +2872,15 @@ impl Scheduler {
                 let cond_pos = st.cond_pos;
                 let nvae = self.num_vae(&st.req.image) as usize;
                 if st.req.image.retain_images
-                    && !self.bm.ensure_capacity(id, cond_pos as usize + nvae + 2)
+                    && !self.bm.ensure_capacity(
+                        id,
+                        cond_pos as usize + nvae + self.cap_commit_marker_tokens(),
+                    )
                 {
                     return None;
                 }
                 let timestep = st.steps_done;
-    // pure text->image path runs single-branch CFG.
+                // pure text->image path runs single-branch CFG.
                 let cfg = cfg_params(&st.req.image, 1);
                 let image_prompt = Self::image_prompt_for(st);
                 Some(ForwardOp {
@@ -2924,7 +2964,7 @@ impl Scheduler {
                     .mm_items
                     .get(st.mm_cursor)
                     .map(|m| m.position as usize);
-    // at an unencoded image position -> switch to Encode
+                // at an unencoded image position -> switch to Encode
                 if next_img == Some(cursor) {
                     if let Some(s) = self.running.get_mut(&id) {
                         s.phase = Phase::Encode;
@@ -2932,7 +2972,7 @@ impl Scheduler {
                     }
                     return self.next_op_iu(id, budget);
                 }
-    // chunk to the next image boundary, clipped by the step budget.
+                // chunk to the next image boundary, clipped by the step budget.
                 let boundary = match next_img {
                     Some(p) if p > cursor => p,
                     _ => n,
@@ -3006,9 +3046,10 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let cond_pos = st.cond_pos;
                 let timestep = st.steps_done;
-    // image-understanding interleave path runs up to
-    // 3-branch CFG for the reasoning image.
-                let cfg = cfg_params(&st.req.image, 3);
+                let cfg = cfg_params(
+                    &st.req.image,
+                    self.caps.max_cfg_branches.max(1).min(u8::MAX as u32) as u8,
+                );
                 Some(ForwardOp {
                     req_id: id,
                     kind: OpKind::DenoiseGen,
@@ -3059,14 +3100,14 @@ impl Scheduler {
                     (st.prompt_cursor as usize, st.req.prompt_ids.len())
                 };
                 if cursor >= n {
-    // prompt fully prefilled -> open the assistant turn with <bos>.
+                    // prompt fully prefilled -> open the assistant turn with <bos>.
                     if let Some(st) = self.running.get_mut(&id) {
                         st.next_token = self.ctrl.bos;
                         st.round_tokens.clear();
                         st.phase = Phase::DecodeUnd;
                     }
                 }
-    // else: more prefill (the next op continues, or switches to Encode).
+                // else: more prefill (the next op continues, or switches to Encode).
             }
             OpKind::VaeEncode | OpKind::VitEncode => {
                 let added = sr.num_tokens.unwrap_or(0);
@@ -3092,7 +3133,7 @@ impl Scheduler {
                 let tok = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
                 let closing = self.running.get(&id).map(|s| s.iu_closing).unwrap_or(false);
                 if closing {
-    // the <|im_end|> is now committed; decide image vs finish.
+                    // the <|im_end|> is now committed; decide image vs finish.
                     let (triggered, images_done, max_images, n_gen, max_tokens) = {
                         let st = self.running.get(&id).unwrap();
                         (
@@ -3119,7 +3160,7 @@ impl Scheduler {
                     );
                 }
                 if self.ctrl.eos.contains(&tok) {
-    // close the round: feed <|im_end|> into KV, transition on its resolve.
+                    // close the round: feed <|im_end|> into KV, transition on its resolve.
                     if let Some(s) = self.running.get_mut(&id) {
                         s.next_token = self.ctrl.eos[0];
                         s.iu_closing = true;
@@ -3178,8 +3219,8 @@ impl Scheduler {
                 }
                 self.bm.activate(id);
                 self.bm.release_scratch(id);
-    // the image committed — release its latent + scratch leases
-    // (the request continues; its KV lease persists until finish).
+                // the image committed — release its latent + scratch leases
+                // (the request continues; its KV lease persists until finish).
                 self.ledger
                     .release_class(id, uniserve_worker_wire::ResourceClass::ImageLatent);
                 self.ledger
@@ -3192,12 +3233,13 @@ impl Scheduler {
                     self.emit(id, image_done_event(image_id, b64));
                 }
                 let added = sr.num_tokens.unwrap_or(0);
+                let gen_rope_advance = self.cap_gen_rope_advance();
                 if let Some(st) = self.running.get_mut(&id) {
                     st.worker_image_latent_units = 0;
                     st.kvlen += added;
-                    st.pos = cond_pos + 2; // VAE + ViT blocks = 2 rope slots
+                    st.pos = cond_pos + gen_rope_advance;
                     st.images_done += 1;
-    // resume text: a fresh assistant turn (<bos>), like native gen_text.
+                    // resume text: a fresh assistant turn (<bos>), like native gen_text.
                     st.next_token = self.ctrl.bos;
                     st.round_tokens.clear();
                     st.phase = Phase::DecodeUnd;
@@ -3213,15 +3255,10 @@ impl Scheduler {
             self.num_vae_hw(st.gen_h, st.gen_w)
         };
         self.bm.reserve_scratch(id, nvae);
-    // physical scratch reserved in latent tokens above; the
-    // observe-only ledger Scratch lease is in CFG BRANCH SLOTS to match the
-    // worker's `_scratch_units`. The image-understanding interleave path runs
-    // up to 3-branch CFG.
-        let scratch_branches = {
-            let st = self.running.get(&id).unwrap();
-            cfg_params(&st.req.image, 3).branch_count as u64
-        };
-    // lease the reasoning-image latent + scratch (released at commit).
+        // physical scratch reserved in latent tokens above; the observe-only
+        // ledger Scratch lease is in CFG branch slots to match the worker.
+        let scratch_branches = self.cap_max_cfg_branches();
+        // lease the reasoning-image latent + scratch (released at commit).
         self.ledger.issue(
             id,
             uniserve_worker_wire::ResourceClass::ImageLatent,
@@ -3273,12 +3310,12 @@ impl Scheduler {
             sampling: &st.req.sampling,
         };
         let (mut allowed, mut suppress) = crate::logits::run_pipeline(&self.logits_pipeline, &ctx);
-    // Image-budget enforcement (host-side mask): once an interleave
-    // request has drawn its max_images, the image-start token is
-    // suppressed, so an eager or positively-biased model must return to
-    // text/EOS instead of emitting un-actionable image triggers into its
-    // own context forever. Suppression beats logit bias (bias skips
-    // -inf'd logits on the worker).
+        // Image-budget enforcement (host-side mask): once an interleave
+        // request has drawn its max_images, the image-start token is
+        // suppressed, so an eager or positively-biased model must return to
+        // text/EOS instead of emitting un-actionable image triggers into its
+        // own context forever. Suppression beats logit bias (bias skips
+        // -inf'd logits on the worker).
         if st.req.mode == GenMode::AutoInterleave
             && st.images_done >= st.req.image.max_images as usize
             && self.ctrl.start_of_image != 0
@@ -3290,9 +3327,9 @@ impl Scheduler {
         // If the model's text turn is naturally complete while image budget
         // remains, resolve treats EOS as a clean image boundary instead of
         // making the model invent filler text.
-    // Structured outputs: the grammar's per-step mask intersects whatever
-    // the pipeline allows. A completed grammar restricts to the stop set so
-    // the request terminates on the next step.
+        // Structured outputs: the grammar's per-step mask intersects whatever
+        // the pipeline allows. A completed grammar restricts to the stop set so
+        // the request terminates on the next step.
         if let Some(matcher) = &st.grammar {
             let g_allowed = if matcher.is_complete() {
                 let mut stops = self.ctrl.eos.clone();
@@ -3394,11 +3431,11 @@ impl Scheduler {
         match kind {
             OpKind::PrefillUnd | OpKind::DecodeUnd => {
                 self.bm.activate(id);
-    // chunked prefill: a prefill op may only have consumed part of
-    // the prompt; if so, advance the cursor and stay in Prefill.
+                // chunked prefill: a prefill op may only have consumed part of
+                // the prompt; if so, advance the cursor and stay in Prefill.
                 if kind == OpKind::PrefillUnd {
-    // The cursor was advanced to the chunk end at build time; if it
-    // hasn't reached the (effective) prompt end, more chunks remain.
+                    // The cursor was advanced to the chunk end at build time; if it
+                    // hasn't reached the (effective) prompt end, more chunks remain.
                     let (cursor, prompt_len) = {
                         let st = self.running.get(&id).unwrap();
                         (st.prompt_cursor as usize, Self::effective_prompt(st).len())
@@ -3410,10 +3447,10 @@ impl Scheduler {
                 let (mode, max_tokens, ignore_eos, min_tokens) = {
                     let st = self.running.get_mut(&id).unwrap();
                     if kind == OpKind::PrefillUnd {
-    // prompt (possibly prompt++generated on recompute) is done.
+                        // prompt (possibly prompt++generated on recompute) is done.
                         st.pos = Self::effective_prompt(st).len() as u32;
                         st.prompt_cursor = st.pos;
-    // recompute finished: future growth is plain decode again.
+                        // recompute finished: future growth is plain decode again.
                         st.recompute_ids = None;
                     } else {
                         st.pos += 1;
@@ -3426,23 +3463,23 @@ impl Scheduler {
                         st.req.sampling.min_tokens,
                     )
                 };
-    // the prompt is fully prefilled now — publish its full
-    // blocks to the prefix cache for later requests to reuse.
+                // the prompt is fully prefilled now — publish its full
+                // blocks to the prefix cache for later requests to reuse.
                 if kind == OpKind::PrefillUnd {
                     let bs = self.caps.block_size as usize;
                     if let Some(st) = self.running.get_mut(&id) {
                         self.prefix_cache.cache_blocks(st, &mut self.bm, bs);
                     }
                 }
-    // Native callers may deliberately force the first image by
-    // ending an assistant prefix with the model's image-start
-    // control token. Treat that prefilled boundary the same as a
-    // sampled boundary so AutoInterleave is not left to sampling
-    // luck after an explicit prefix.
+                // Native callers may deliberately force the first image by
+                // ending an assistant prefix with the model's image-start
+                // control token. Treat that prefilled boundary the same as a
+                // sampled boundary so AutoInterleave is not left to sampling
+                // luck after an explicit prefix.
                 if kind == OpKind::PrefillUnd && self.prefilled_auto_image_start(id) {
                     return self.begin_image(id);
                 }
-    // pure t2i: ignore the sampled token, jump straight to denoise
+                // pure t2i: ignore the sampled token, jump straight to denoise
                 if mode == GenMode::Image && kind == OpKind::PrefillUnd {
                     return self.begin_image(id);
                 }
@@ -3452,8 +3489,8 @@ impl Scheduler {
                     let st = self.running.get(&id).unwrap();
                     (st.images_done, st.req.image.max_images as usize)
                 };
-    // the model requested an image inline; honor it while the
-    // request is still under its image budget.
+                // the model requested an image inline; honor it while the
+                // request is still under its image budget.
                 if tok == self.ctrl.start_of_image
                     && mode == GenMode::AutoInterleave
                     && images_done < max_images
@@ -3461,9 +3498,9 @@ impl Scheduler {
                     return self.begin_image(id);
                 }
                 let n_gen = self.running.get(&id).map(|s| s.n_generated).unwrap_or(0);
-    // min_tokens floor: suppress EOS/stop termination until met.
+                // min_tokens floor: suppress EOS/stop termination until met.
                 let under_floor = n_gen < min_tokens;
-    // explicit stop-token termination (distinct from model EOS).
+                // explicit stop-token termination (distinct from model EOS).
                 let stop_tok_hit = !under_floor
                     && self
                         .running
@@ -3501,12 +3538,12 @@ impl Scheduler {
                         matcher.advance(tok);
                     }
                 }
-    // ThinkMorph's literal visual-thinking trigger in generation
-    // mode: the fine-tune may signal the next image with the
-    // literal "<image_start>" text instead of BAGEL's
-    // <|vision_start|> token. Honor it the moment the trigger core
-    // completes (the understanding FSM matches the same ids at
-    // round close).
+                // ThinkMorph's literal visual-thinking trigger in generation
+                // mode: the fine-tune may signal the next image with the
+                // literal "<image_start>" text instead of BAGEL's
+                // <|vision_start|> token. Honor it the moment the trigger core
+                // completes (the understanding FSM matches the same ids at
+                // round close).
                 if mode == GenMode::AutoInterleave
                     && images_done < max_images
                     && !self.ctrl.image_start_ids.is_empty()
@@ -3567,8 +3604,8 @@ impl Scheduler {
                 }
                 self.bm.activate(id);
                 self.bm.release_scratch(id);
-    // the image committed — release its latent + scratch leases
-    // (the request continues; its KV lease persists until finish).
+                // the image committed — release its latent + scratch leases
+                // (the request continues; its KV lease persists until finish).
                 self.ledger
                     .release_class(id, uniserve_worker_wire::ResourceClass::ImageLatent);
                 self.ledger
@@ -3580,8 +3617,8 @@ impl Scheduler {
                 if let Some(b64) = sr.image_png_b64 {
                     self.emit(id, image_done_event(image_id, b64));
                 }
-    // Advance past the committed image's latent span (num_vae + the two
-    // boundary tokens), matching the worst-case footprint sizing.
+                // Advance past the committed image's latent span (num_vae + the two
+                // boundary tokens), matching the worst-case footprint sizing.
                 let span = self
                     .running
                     .get(&id)
@@ -3593,10 +3630,10 @@ impl Scheduler {
                     st.text_since_image = 0;
                     st.pos = cond_pos + span;
                 }
-    // pure t2i finishes after one image; AutoInterleave round-trips
-    // back to text (text → image → text → image …). Termination then
-    // happens in DecodeUnd on a genuine terminal condition (EOS or
-    // max_tokens) or from a commit-side EOS reported by the worker.
+                // pure t2i finishes after one image; AutoInterleave round-trips
+                // back to text (text → image → text → image …). Termination then
+                // happens in DecodeUnd on a genuine terminal condition (EOS or
+                // max_tokens) or from a commit-side EOS reported by the worker.
                 if mode == GenMode::AutoInterleave {
                     if let Some(tok) = sr.sampled_token_id {
                         let (images_done, max_images, n_gen, max_tokens, hit_eos, start_image) = {
@@ -3636,8 +3673,8 @@ impl Scheduler {
                 }
             }
             OpKind::VitEncode | OpKind::VaeEncode => {
-    // store the worker-side encoder handle in the cache, pin it
-    // for this request, and advance to the next image (or prefill).
+                // store the worker-side encoder handle in the cache, pin it
+                // for this request, and advance to the next image (or prefill).
                 let handle = sr.encoder_handle.unwrap_or(0);
                 let (hash, total) = {
                     let st = self.running.get(&id).unwrap();
@@ -3666,25 +3703,20 @@ impl Scheduler {
     fn begin_image(&mut self, id: RequestId) {
         let nvae = {
             let st = self.running.get(&id).unwrap();
-            self.num_vae(&st.req.image)
-                * if st.req.image.cfg_text_scale > 1.0 {
-                    2
-                } else {
-                    1
-                }
+            self.num_vae(&st.req.image) * self.cap_max_cfg_branches()
         };
         self.bm.reserve_scratch(id, nvae);
-    // the physical scratch pool is reserved in latent tokens above
-    // (`reserve_scratch`), but the observe-only *ledger* Scratch lease is in
-    // CFG BRANCH SLOTS — the same unit the worker's ResourceRuntime accounts
-    // (`_scratch_units`) — so the host lease magnitude and worker `used`
-    // agree. The pure text->image path runs single-branch CFG (max 1).
+        // the physical scratch pool is reserved in latent tokens above
+        // (`reserve_scratch`), but the observe-only *ledger* Scratch lease is in
+        // CFG BRANCH SLOTS — the same unit the worker's ResourceRuntime accounts
+        // (`_scratch_units`) — so the host lease magnitude and worker `used`
+        // agree.
         let scratch_branches = {
             let st = self.running.get(&id).unwrap();
             cfg_params(&st.req.image, 1).branch_count as u64
         };
-    // lease the denoise latent (pinned — evicting discards diffusion
-    // work) + the CFG scratch; both released when the image commits.
+        // lease the denoise latent (pinned — evicting discards diffusion
+        // work) + the CFG scratch; both released when the image commits.
         self.ledger.issue(
             id,
             uniserve_worker_wire::ResourceClass::ImageLatent,
@@ -3738,11 +3770,11 @@ impl Scheduler {
             if st.reserve_worstcase {
                 self.reserved_blocks = self.reserved_blocks.saturating_sub(st.worstcase_blocks);
             }
-    // release this request's encoder-cache references (evictable now).
+            // release this request's encoder-cache references (evictable now).
             for h in &st.mm_acquired {
                 self.enc_cache.release(*h);
             }
-    // close + archive the lifecycle trace (reconstructable post-finish).
+            // close + archive the lifecycle trace (reconstructable post-finish).
             let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::Finished);
             ev.finish_reason = Some(finish_reason_str(&reason));
             st.trace.push(ev);
@@ -3768,7 +3800,7 @@ impl Scheduler {
             });
         }
         self.bm.release(id);
-    // release every lease this request held and assert it leaked none.
+        // release every lease this request held and assert it leaked none.
         self.ledger.release_request(id);
         self.ledger.assert_released(id);
         let _ = self.executor.control(ControlOp::DropRequest(id));
@@ -3844,28 +3876,13 @@ fn decode_lookahead_from_env() -> bool {
 }
 
 /// Build the wire [`CfgParams`] for a denoise op.
-
-/// `branch_count` is the **number of CFG branches the worker's denoise
-/// loop actually runs** for this op (`denoise_driver` iterates
-/// `range(cfg.branch_count)`), *not* a free-floating logical count and *not*
-/// the physical scratch reservation. `max_branches` caps it to the per-path
-/// policy: the pure text->image path runs single-branch CFG (`max_branches=1`),
-/// while the image-understanding interleave path runs up to 3-branch CFG
-/// (`max_branches=3`). Because the worker's compute, the worker's throughput
-/// metric (`runner._op_token_count`), and this field all derive from the same
-/// value, they stay consistent — the cross-side scratch *accounting* unit is
-/// kept separate and aligned, so this is a deliberate per-path
-/// behavioral difference, not a leak.
-fn cfg_params(image: &uniserve_core::ImageParams, max_branches: u8) -> CfgParams {
-    let mut branches = 1;
-    if image.cfg_text_scale > 1.0 {
-        branches += 1;
-    }
-    if image.cfg_img_scale > 1.0 {
-        branches += 1;
-    }
+///
+/// The exact text/image CFG branch set is derived by the worker-side CFG plan.
+/// The scheduler only carries the per-path branch bound needed by generic
+/// denoise accounting.
+fn cfg_params(image: &uniserve_core::ImageParams, branch_count: u8) -> CfgParams {
     CfgParams {
-        branch_count: branches.min(max_branches).max(1),
+        branch_count: branch_count.max(1),
         text_scale: image.cfg_text_scale,
         img_scale: image.cfg_img_scale,
         renorm_type: image.cfg_renorm_type.clone(),
@@ -3897,15 +3914,21 @@ mod tests {
             inflight(OpKind::DecodeUnd, Some(11)),
             inflight(OpKind::DecodeUnd, Some(12)),
         ]);
-    // Resolve the middle op first (out of order): it must be removed, not the
-    // FIFO front.
+        // Resolve the middle op first (out of order): it must be removed, not the
+        // FIFO front.
         let got = take_inflight_by_op_id(&mut q, Some(11)).expect("op 11 present");
         assert_eq!(got.op_id, Some(11));
         assert_eq!(q.len(), 2);
         assert_eq!(q.front().unwrap().op_id, Some(10));
-    // Then the last, then the first — order is driven by op_id, not position.
-        assert_eq!(take_inflight_by_op_id(&mut q, Some(12)).unwrap().op_id, Some(12));
-        assert_eq!(take_inflight_by_op_id(&mut q, Some(10)).unwrap().op_id, Some(10));
+        // Then the last, then the first — order is driven by op_id, not position.
+        assert_eq!(
+            take_inflight_by_op_id(&mut q, Some(12)).unwrap().op_id,
+            Some(12)
+        );
+        assert_eq!(
+            take_inflight_by_op_id(&mut q, Some(10)).unwrap().op_id,
+            Some(10)
+        );
         assert!(q.is_empty());
     }
 
@@ -3915,11 +3938,14 @@ mod tests {
             inflight(OpKind::DecodeUnd, Some(1)),
             inflight(OpKind::DecodeUnd, Some(2)),
         ]);
-    // No echoed op_id (sim-style transport before stamping, or a drift):
-    // resolve in FIFO order.
+        // No echoed op_id (sim-style transport before stamping, or a drift):
+        // resolve in FIFO order.
         assert_eq!(take_inflight_by_op_id(&mut q, None).unwrap().op_id, Some(1));
-    // An unknown op_id also degrades to FIFO rather than dropping the result.
-        assert_eq!(take_inflight_by_op_id(&mut q, Some(999)).unwrap().op_id, Some(2));
+        // An unknown op_id also degrades to FIFO rather than dropping the result.
+        assert_eq!(
+            take_inflight_by_op_id(&mut q, Some(999)).unwrap().op_id,
+            Some(2)
+        );
         assert!(take_inflight_by_op_id(&mut q, None).is_none());
     }
 
@@ -3960,22 +3986,19 @@ mod tests {
         assert_eq!(ngram_draft_one(&seq, 4, None, Some(&[7])), None);
     }
 
-    // cfg_params caps the wire branch_count at `max_branches` while
-    // still deriving the true branch count from the active CFG scales.
     #[test]
-    fn cfg_params_clamps_branch_count_to_max_branches() {
+    fn cfg_params_uses_declared_branch_count() {
         let mut img = uniserve_core::ImageParams {
             cfg_text_scale: 4.0,
             cfg_img_scale: 4.0,
             ..Default::default()
         };
-    // Both scales active -> 3 logical branches, capped by max_branches.
         assert_eq!(cfg_params(&img, 1).branch_count, 1);
         assert_eq!(cfg_params(&img, 3).branch_count, 3);
-    // No CFG scales -> always at least one branch.
+        assert_eq!(cfg_params(&img, 0).branch_count, 1);
         img.cfg_text_scale = 1.0;
         img.cfg_img_scale = 1.0;
-        assert_eq!(cfg_params(&img, 3).branch_count, 1);
+        assert_eq!(cfg_params(&img, 3).branch_count, 3);
     }
 
     /// A no-op executor: every submit succeeds, no result ever returns, and
@@ -4045,16 +4068,20 @@ mod tests {
     fn enqueue_rejects_when_waiting_queue_is_full() {
         let mut sched = test_scheduler();
         sched.set_max_num_waiting(2);
-    // The first two fit the waiting queue (admission is not run here).
+        // The first two fit the waiting queue (admission is not run here).
         sched.submit_for_test(test_request(1, 4));
         sched.submit_for_test(test_request(2, 4));
         assert_eq!(sched.pending.len(), 2);
-    // The third overflows and must be rejected (not queued).
+        // The third overflows and must be rejected (not queued).
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut over = test_request(3, 4);
         over.event_tx = tx;
         sched.submit_for_test(over);
-        assert_eq!(sched.pending.len(), 2, "overflow request must not be queued");
+        assert_eq!(
+            sched.pending.len(),
+            2,
+            "overflow request must not be queued"
+        );
         match rx.try_recv() {
             Ok(GenEvent::Rejected { .. }) => {}
             other => panic!("expected Rejected event, got {other:?}"),
@@ -4070,7 +4097,7 @@ mod tests {
         sched.admit();
         let id = RequestId(1);
         assert!(sched.running.contains_key(&id));
-    // Simulate an op in flight for this request.
+        // Simulate an op in flight for this request.
         let op = ForwardOp {
             req_id: id,
             kind: OpKind::PrefillUnd,
@@ -4078,14 +4105,14 @@ mod tests {
         };
         sched.register_inflight(&op, Instant::now());
         assert!(sched.has_inflight(id));
-    // Cancel, then reap: the request must survive while its op is in flight.
+        // Cancel, then reap: the request must survive while its op is in flight.
         sched.mark_cancelled(id, false);
         sched.reap_cancellations();
         assert!(
             sched.running.contains_key(&id),
             "cancelled request with an in-flight op must not be reaped yet"
         );
-    // Once the op drains, the next reap finishes it.
+        // Once the op drains, the next reap finishes it.
         let _ = sched.pop_inflight(id, None);
         assert!(!sched.has_inflight(id));
         sched.reap_cancellations();
@@ -4105,9 +4132,9 @@ mod tests {
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);
-    // Fresh AutoInterleave (no images yet, text phase) is preemptible.
+        // Fresh AutoInterleave (no images yet, text phase) is preemptible.
         assert!(sched.preemptible(id));
-    // After committing an image, it must become preemption-exempt.
+        // After committing an image, it must become preemption-exempt.
         if let Some(st) = sched.running.get_mut(&id) {
             st.images_done = 1;
         }

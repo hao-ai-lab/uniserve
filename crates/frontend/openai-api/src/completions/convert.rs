@@ -11,20 +11,20 @@ use crate::utils::{ResolvedRequestContext, convert_logit_bias, merge_kv_transfer
 /// every SSE chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedRequest {
- /// Stable OpenAI-style request ID, reused as the external text request ID.
+    /// Stable OpenAI-style request ID, reused as the external text request ID.
     pub request_id: String,
- /// Public model ID echoed back to the client.
+    /// Public model ID echoed back to the client.
     pub response_model: String,
- /// Whether the caller asked for the final streamed usage chunk.
+    /// Whether the caller asked for the final streamed usage chunk.
     pub include_usage: bool,
- /// Lowered text request for the shared `text` facade.
+    /// Lowered text request for the shared `text` facade.
     pub text_request: TextRequest,
- /// Original text prompt that should be echoed back northbound when
- /// `echo=true`.
+    /// Original text prompt that should be echoed back northbound when
+    /// `echo=true`.
     pub echo: Option<String>,
- /// Whether to include token IDs alongside generated text.
+    /// Whether to include token IDs alongside generated text.
     pub return_token_ids: bool,
- /// Whether to format logprob tokens as `token_id:{id}`.
+    /// Whether to format logprob tokens as `token_id:{id}`.
     pub return_tokens_as_token_ids: bool,
 }
 

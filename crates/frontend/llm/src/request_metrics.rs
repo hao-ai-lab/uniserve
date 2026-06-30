@@ -20,7 +20,6 @@ const PROMPT_TOKEN_SOURCE_EXTERNAL_KV_TRANSFER: &str = "external_kv_transfer";
 /// bookkeeping, centered on `RequestStateStats` and the per-output/per-finished
 /// update flow.
 
-
 #[derive(Debug, Clone)]
 pub(crate) struct RequestMetricsTracker {
     model_name: String,
@@ -40,8 +39,8 @@ pub(crate) struct RequestMetricsTracker {
 }
 
 impl RequestMetricsTracker {
- /// Create the per-request tracker from the normalized `llm`-layer request
- /// context.
+    /// Create the per-request tracker from the normalized `llm`-layer request
+    /// context.
     pub(crate) fn new(
         model_name: String,
         arrival_time: f64,
@@ -67,7 +66,7 @@ impl RequestMetricsTracker {
         }
     }
 
- /// Update request-lifecycle state from one engine output item.
+    /// Update request-lifecycle state from one engine output item.
 
     pub(crate) fn observe_output(
         &mut self,
@@ -113,8 +112,8 @@ impl RequestMetricsTracker {
         self.last_token_ts = batch_timestamp;
     }
 
- /// Emit the terminal request metrics once a finished output has been
- /// observed.
+    /// Emit the terminal request metrics once a finished output has been
+    /// observed.
 
     pub(crate) fn record_finished(&self, received_at: f64, finish_reason: FinishReason) {
         let labels = engine_labels(&self.model_name, self.last_seen_engine_index);
@@ -306,7 +305,7 @@ fn diff_or_zero(end: f64, start: f64) -> f64 {
 /// timestamps rather than the engine's monotonic scheduler timestamps.
 
 pub(crate) fn current_unix_timestamp_secs() -> f64 {
- // delegate to the single shared epoch helper so the frontend's
- // wall-clock timestamps (TTFT/E2E) match every other component's.
+    // delegate to the single shared epoch helper so the frontend's
+    // wall-clock timestamps (TTFT/E2E) match every other component's.
     uniserve_core::now_unix_secs()
 }

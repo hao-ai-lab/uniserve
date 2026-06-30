@@ -19,13 +19,13 @@ use crate::error::{Error, Result};
 pub struct UtilityCallId(rmpv::Integer);
 
 impl UtilityCallId {
- /// Returns the integer represented as `u64` if possible, or else `None`.
- /// This is the typical case for utility calls.
+    /// Returns the integer represented as `u64` if possible, or else `None`.
+    /// This is the typical case for utility calls.
     pub fn as_u64(self) -> Option<u64> {
         self.0.as_u64()
     }
 
- /// Returns the integer represented as `i64` if possible, or else `None`.
+    /// Returns the integer represented as `i64` if possible, or else `None`.
     pub fn as_i64(self) -> Option<i64> {
         self.0.as_i64()
     }
@@ -111,8 +111,8 @@ pub struct EngineCoreUtilityRequest {
 }
 
 impl EngineCoreUtilityRequest {
- /// Create a new utility request with the given strongly typed arguments,
- /// encoding them into the expected msgpack value format.
+    /// Create a new utility request with the given strongly typed arguments,
+    /// encoding them into the expected msgpack value format.
     pub fn new<T>(
         client_index: u32,
         call_id: u64,
@@ -148,7 +148,7 @@ impl EngineCoreUtilityRequest {
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct UtilityOutput {
     pub call_id: UtilityCallId,
- /// Non-`None` implies the call failed and `result` should be ignored.
+    /// Non-`None` implies the call failed and `result` should be ignored.
     #[serde(default)]
     pub failure_message: Option<String>,
     #[serde(default)]
@@ -159,18 +159,18 @@ pub struct UtilityOutput {
 
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct UtilityResultEnvelope {
- /// Recursive type information encoded on Python side, serving as the hint
- /// for deserialization. We don't care it here as in Rust frontend all
- /// utility calls are strongly-typed.
+    /// Recursive type information encoded on Python side, serving as the hint
+    /// for deserialization. We don't care it here as in Rust frontend all
+    /// utility calls are strongly-typed.
     #[serde(default)]
     type_info: Option<OpaqueValue>,
- /// The actual utility result.
+    /// The actual utility result.
     #[serde(default = "default_opaque_value_nil")]
     result: OpaqueValue,
 }
 
 impl UtilityResultEnvelope {
- /// Create a utility result envelope without type information.
+    /// Create a utility result envelope without type information.
     pub fn without_type_info(result: OpaqueValue) -> Self {
         Self {
             type_info: None,
@@ -180,7 +180,7 @@ impl UtilityResultEnvelope {
 }
 
 impl UtilityOutput {
- /// Decode the typed result of a utility call.
+    /// Decode the typed result of a utility call.
     pub fn into_typed_result<T>(self, method: &str) -> Result<T>
     where
         T: serde::de::DeserializeOwned,

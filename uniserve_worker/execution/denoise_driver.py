@@ -20,7 +20,7 @@ from ..nn.diffusion import (
     x_pred_to_velocity,
 )
 from ..nn.diffusion.cfg import CfgPlan, CfgRecipe, build_text_image_cfg_plan
-from ..runtime.image_defaults import image_height, image_width
+from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.request_state import RequestState
 
 if TYPE_CHECKING:
@@ -215,8 +215,8 @@ class DenoiseDriver:
             return state.latent.to(device=self.device, dtype=self.dtype)
         shape = op.get("latent_shape") or image.get("latent_shape")
         if shape is None:
-            h = image_height(image)
-            w = image_width(image)
+            h = required_image_height(image)
+            w = required_image_width(image)
             downsample = int(image.get("latent_downsample", _DEFAULT_LATENT_DOWNSAMPLE) or _DEFAULT_LATENT_DOWNSAMPLE)
             channels = int(image.get("latent_channels", _DEFAULT_LATENT_CHANNELS) or _DEFAULT_LATENT_CHANNELS)
             shape = (channels, max(1, h // downsample), max(1, w // downsample))

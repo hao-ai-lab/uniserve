@@ -13,13 +13,13 @@ const LOG_STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// underlying `Arc<Atomic*>` as the prometheus `Family` entry, so reads go
 /// straight to the atomic with no lock.
 struct EngineMetrics {
- // Counters for throughput deltas.
+    // Counters for throughput deltas.
     prompt_tokens_computed: U64Counter,
     generation_tokens: U64Counter,
     prefix_cache_queries: U64Counter,
     prefix_cache_hits: U64Counter,
 
- // Gauges for instantaneous scheduler state.
+    // Gauges for instantaneous scheduler state.
     scheduler_running: U64Gauge,
     scheduler_waiting: U64Gauge,
     kv_cache_usage: F64Gauge,
@@ -45,7 +45,7 @@ pub(crate) struct StatsLogger {
 }
 
 impl StatsLogger {
- /// Start the background stats logging task.
+    /// Start the background stats logging task.
     pub(crate) fn start(model_name: String, engine_count: usize) -> Self {
         let task = AbortOnDropHandle::new(tokio::spawn(async move {
             run_stats_logger(model_name, engine_count).await;
@@ -69,9 +69,9 @@ fn resolve_engine_metrics(model_name: &str, engine_count: usize) -> Vec<EngineMe
                 source: "local_compute",
             };
             EngineMetrics {
- // Use "local_compute" source for prompt throughput (excludes
- // cached/transferred tokens), matching Python's
- // `iteration_stats.prompt_token_stats.computed`.
+                // Use "local_compute" source for prompt throughput (excludes
+                // cached/transferred tokens), matching Python's
+                // `iteration_stats.prompt_token_stats.computed`.
                 prompt_tokens_computed: m.request.prompt_tokens_by_source.get_or_create_owned(&pt),
                 generation_tokens: m.request.generation_tokens.get_or_create_owned(&el),
                 prefix_cache_queries: m.scheduler.prefix_cache_queries.get_or_create_owned(&el),
@@ -89,8 +89,8 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
 
     let mut interval = tokio::time::interval(LOG_STATS_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
- // The first tick fires immediately; skip it so the first log is after one full
- // interval.
+    // The first tick fires immediately; skip it so the first log is after one full
+    // interval.
     interval.tick().await;
 
     let mut prev = read_counters(&engines);
@@ -115,16 +115,16 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
         let generation_throughput =
             curr.generation_tokens.wrapping_sub(prev.generation_tokens) as f64 / elapsed;
 
- // Idle = both current and previous throughputs are zero.
+        // Idle = both current and previous throughputs are zero.
         let is_idle = prompt_throughput == 0.0
             && generation_throughput == 0.0
             && last_prompt_throughput == 0.0
             && last_generation_throughput == 0.0;
 
- // Read scheduler gauges (aggregate across engines).
+        // Read scheduler gauges (aggregate across engines).
         let (num_running, num_waiting, kv_cache_usage) = read_scheduler_gauges(&engines);
 
- // Compute prefix cache hit rate over this interval.
+        // Compute prefix cache hit rate over this interval.
         let delta_queries = curr
             .prefix_cache_queries
             .wrapping_sub(prev.prefix_cache_queries);
@@ -135,7 +135,7 @@ async fn run_stats_logger(model_name: String, engine_count: usize) {
             0.0
         };
 
- // Build the log line.
+        // Build the log line.
         msg.clear();
         if write!(
             msg,

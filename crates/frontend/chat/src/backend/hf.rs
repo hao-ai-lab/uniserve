@@ -31,7 +31,7 @@ pub struct HfChatBackend {
 }
 
 impl HfChatBackend {
- /// Load the chat backend from resolved Hugging Face model files.
+    /// Load the chat backend from resolved Hugging Face model files.
     pub fn from_resolved_model_files(
         files: ResolvedModelFiles,
         model_id: String,

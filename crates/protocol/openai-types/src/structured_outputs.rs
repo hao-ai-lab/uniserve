@@ -10,7 +10,7 @@ pub struct JsonSchemaFormat {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
- /// The actual JSON schema object.
+    /// The actual JSON schema object.
     #[serde(alias = "json_schema")]
     pub schema: Value,
     #[serde(default)]
@@ -30,18 +30,18 @@ pub enum ResponseFormat {
     JsonSchema {
         json_schema: JsonSchemaFormat,
     },
- /// Structural-tag format. Conversion layers serialize the entire object,
- /// including the `type` field, into the engine structured-output payload.
+    /// Structural-tag format. Conversion layers serialize the entire object,
+    /// including the `type` field, into the engine structured-output payload.
 
- /// The payload is captured as a catch-all map so compatible structural-tag
- /// shapes are preserved without needing separate typed structs for each
- /// external dialect.
+    /// The payload is captured as a catch-all map so compatible structural-tag
+    /// shapes are preserved without needing separate typed structs for each
+    /// external dialect.
 
- /// Note: this is intentionally an opaque pass-through. Schema validation of
- /// the structural-tag grammar is deferred to the engine, which compiles the
- /// serialized payload into a constraint; validating dialect-specific shapes
- /// here would require typed structs per dialect and is out of scope for this
- /// protocol DTO.
+    /// Note: this is intentionally an opaque pass-through. Schema validation of
+    /// the structural-tag grammar is deferred to the engine, which compiles the
+    /// serialized payload into a constraint; validating dialect-specific shapes
+    /// here would require typed structs per dialect and is out of scope for this
+    /// protocol DTO.
     StructuralTag {
         #[serde(flatten)]
         extra: serde_json::Map<String, Value>,
@@ -52,8 +52,8 @@ pub enum ResponseFormat {
 mod tests {
     use super::*;
 
- /// `{"type": "text"}` deserializes into the unit `Text` variant and
- /// round-trips back to the same tagged JSON.
+    /// `{"type": "text"}` deserializes into the unit `Text` variant and
+    /// round-trips back to the same tagged JSON.
     #[test]
     fn text_format_round_trips() {
         let json = serde_json::json!({"type": "text"});
@@ -63,7 +63,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&format).unwrap(), json);
     }
 
- /// `json_object` uses snake_case tag renaming.
+    /// `json_object` uses snake_case tag renaming.
     #[test]
     fn json_object_format_round_trips() {
         let json = serde_json::json!({"type": "json_object"});
@@ -73,8 +73,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&format).unwrap(), json);
     }
 
- /// A `json_schema` format carries the nested `JsonSchemaFormat` and
- /// round-trips through serde preserving name/strict/schema.
+    /// A `json_schema` format carries the nested `JsonSchemaFormat` and
+    /// round-trips through serde preserving name/strict/schema.
     #[test]
     fn json_schema_format_round_trips() {
         let json = serde_json::json!({
@@ -99,8 +99,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&format).unwrap(), json);
     }
 
- /// `JsonSchemaFormat::schema` accepts the `json_schema` alias as an
- /// alternative key for the inner schema object.
+    /// `JsonSchemaFormat::schema` accepts the `json_schema` alias as an
+    /// alternative key for the inner schema object.
     #[test]
     fn json_schema_format_accepts_schema_alias() {
         let json = serde_json::json!({
@@ -115,8 +115,8 @@ mod tests {
         assert_eq!(format.strict, None);
     }
 
- /// The `structural_tag` variant captures the entire payload (including the
- /// `type` tag) in its catch-all `extra` map and re-serializes it intact.
+    /// The `structural_tag` variant captures the entire payload (including the
+    /// `type` tag) in its catch-all `extra` map and re-serializes it intact.
     #[test]
     fn structural_tag_captures_extra_payload_in_catch_all() {
         let json = serde_json::json!({
@@ -128,20 +128,17 @@ mod tests {
         let format: ResponseFormat = serde_json::from_value(json.clone()).unwrap();
         match &format {
             ResponseFormat::StructuralTag { extra } => {
- // Dialect-specific fields are preserved opaquely in the catch-all.
+                // Dialect-specific fields are preserved opaquely in the catch-all.
                 assert_eq!(
                     extra.get("structures"),
                     Some(&serde_json::json!([{"begin": "<a>", "end": "</a>"}]))
                 );
-                assert_eq!(
-                    extra.get("triggers"),
-                    Some(&serde_json::json!(["<a>"]))
-                );
+                assert_eq!(extra.get("triggers"), Some(&serde_json::json!(["<a>"])));
             }
             other => panic!("expected StructuralTag, got {other:?}"),
         }
 
- // The whole payload, including the type tag, round-trips unchanged.
+        // The whole payload, including the type tag, round-trips unchanged.
         assert_eq!(serde_json::to_value(&format).unwrap(), json);
     }
 }

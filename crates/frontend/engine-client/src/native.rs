@@ -50,7 +50,7 @@ impl NativeEventStream {
         }
     }
 
- /// Await the next event, or `None` once the stream is exhausted.
+    /// Await the next event, or `None` once the stream is exhausted.
     pub async fn next(&mut self) -> Option<GenEvent> {
         let ev = self.rx.recv().await?;
         if matches!(
@@ -73,4 +73,3 @@ impl Drop for NativeEventStream {
         }
     }
 }
-

@@ -50,8 +50,8 @@ pub(super) struct TemplateContext<'a> {
     pub(super) special_tokens: Option<&'a HfSpecialTokens>,
     #[serde(flatten)]
     pub(super) template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
- // By putting top-level `reasoning_effort` after `template_kwargs`, this overrides any
- // `reasoning_effort` value that might be present there.
+    // By putting top-level `reasoning_effort` after `template_kwargs`, this overrides any
+    // `reasoning_effort` value that might be present there.
     pub(super) reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -100,13 +100,13 @@ pub fn resolve_chat_template(chat_template: &str) -> Result<String> {
 /// One compiled chat template with its Jinja environment and detected content
 /// format.
 pub(super) struct CompiledChatTemplate {
- /// Cached, fully-configured environment for one compiled template.
+    /// Cached, fully-configured environment for one compiled template.
     env: Environment<'static>,
     content_format: ChatTemplateContentFormat,
 }
 
 impl CompiledChatTemplate {
- /// Compile the given chat template string into a [`CompiledChatTemplate`].
+    /// Compile the given chat template string into a [`CompiledChatTemplate`].
     pub(super) fn new(
         template: String,
         content_format: ChatTemplateContentFormatOption,
@@ -123,8 +123,8 @@ impl CompiledChatTemplate {
         })
     }
 
- /// Apply the compiled template to the given context and return the rendered
- /// prompt.
+    /// Apply the compiled template to the given context and return the rendered
+    /// prompt.
     pub(super) fn apply(&self, ctx: TemplateContext<'_>) -> Result<String> {
         let tmpl = self.env.get_template("chat")?;
         tmpl.render(ctx).map_err(TemplateError::from)

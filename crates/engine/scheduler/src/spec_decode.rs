@@ -91,10 +91,10 @@ impl SpecDecodeAccounting {
 
     pub(crate) fn ngram_enabled_for(&self, st: &ReqState) -> bool {
         let sp = &st.req.sampling;
-    // Worker target verification samples with temperature/top-k/top-p/min-p,
-    // penalties, logit bias, and static allowed-token masks. Keep drafts off
-    // for controls whose legal set can change inside the drafted prefix or
-    // whose per-token response semantics are not yet represented.
+        // Worker target verification samples with temperature/top-k/top-p/min-p,
+        // penalties, logit bias, and static allowed-token masks. Keep drafts off
+        // for controls whose legal set can change inside the drafted prefix or
+        // whose per-token response semantics are not yet represented.
         st.req.mode == GenMode::Text
             && st.grammar.is_none()
             && st.n_generated >= sp.min_tokens

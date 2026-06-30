@@ -25,7 +25,7 @@ pub fn record_scheduler_stats(
         engine,
     };
 
- // Scheduler state gauges.
+    // Scheduler state gauges.
     metrics
         .scheduler_running
         .get_or_create(&labels)
@@ -67,7 +67,7 @@ pub fn record_scheduler_stats(
         .get_or_create(&labels)
         .set(stats.max_queue_wait_us);
 
- // Prefix-cache counters, including the connector-backed external cache path.
+    // Prefix-cache counters, including the connector-backed external cache path.
     metrics
         .prefix_cache_queries
         .get_or_create(&labels)
@@ -88,7 +88,7 @@ pub fn record_scheduler_stats(
             .inc_by(connector_prefix_cache_stats.base.hits);
     }
 
- // Speculative decoding counters.
+    // Speculative decoding counters.
     if let Some(spec_decoding_stats) = &stats.spec_decoding_stats {
         metrics
             .spec_decode_num_drafts
@@ -120,7 +120,7 @@ pub fn record_scheduler_stats(
         }
     }
 
- // Worker-local forward/kernel counters.
+    // Worker-local forward/kernel counters.
     if let Some(worker_stats) = &stats.worker_forward_stats {
         for (mode, count) in &worker_stats.mode_counts {
             metrics
@@ -162,8 +162,8 @@ pub fn record_scheduler_stats(
                 })
                 .inc_by(*us);
         }
- // the two maps the scheduler folds all
- // the way through to Prometheus.
+        // the two maps the scheduler folds all
+        // the way through to Prometheus.
         for (backend, count) in &worker_stats.attention_backend_counts {
             metrics
                 .worker_attention_backend_counts
@@ -288,16 +288,16 @@ pub fn record_scheduler_stats(
         }
     }
 
- // directly-measured batch latency (worker compute + host
- // round-trip), now surfaced to Prometheus instead of the JSON trace only.
+    // directly-measured batch latency (worker compute + host
+    // round-trip), now surfaced to Prometheus instead of the JSON trace only.
 
- // the worker/scheduler latency counters use cumulative *microseconds*
- // (the `_us` suffix is the unit contract carried on the wire), deliberately
- // distinct from the per-request second-valued histograms in
- // `uniserve_observability::request`. They are not a competing unit system:
- // a dashboard reconciles them as `seconds = <_us counter> / 1e6`. The
- // microsecond integer counter is kept (rather than a lossy us->s cast at
- // ingest) so sub-microsecond cumulative precision is preserved.
+    // the worker/scheduler latency counters use cumulative *microseconds*
+    // (the `_us` suffix is the unit contract carried on the wire), deliberately
+    // distinct from the per-request second-valued histograms in
+    // `uniserve_observability::request`. They are not a competing unit system:
+    // a dashboard reconciles them as `seconds = <_us counter> / 1e6`. The
+    // microsecond integer counter is kept (rather than a lossy us->s cast at
+    // ingest) so sub-microsecond cumulative precision is preserved.
     metrics
         .worker_exec_us
         .get_or_create(&labels)
@@ -311,7 +311,7 @@ pub fn record_scheduler_stats(
         .get_or_create(&labels)
         .inc_by(stats.batch_count);
 
- // Per-engine performance / MFU counters.
+    // Per-engine performance / MFU counters.
     if let Some(perf_stats) = &stats.perf_stats
         && (perf_stats.num_flops_per_gpu != 0
             || perf_stats.num_read_bytes_per_gpu != 0
@@ -331,7 +331,7 @@ pub fn record_scheduler_stats(
             .inc_by(perf_stats.num_write_bytes_per_gpu);
     }
 
- // Sampled KV-cache residency histograms.
+    // Sampled KV-cache residency histograms.
     if !stats.kv_cache_eviction_events.is_empty() {
         let kv_block_lifetime_seconds = metrics.kv_block_lifetime_seconds.get_or_create(&labels);
         let kv_block_idle_before_evict_seconds = metrics

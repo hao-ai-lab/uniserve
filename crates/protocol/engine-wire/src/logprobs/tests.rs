@@ -267,8 +267,8 @@ fn rejects_non_none_cu_num_generated_tokens() {
         ],
     );
     let ranks = Value::Ext(3, vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
- // The 4th tuple slot is `cu_num_generated_tokens`; set it to a non-empty
- // integer array instead of the required `Value::Nil`.
+    // The 4th tuple slot is `cu_num_generated_tokens`; set it to a non-empty
+    // integer array instead of the required `Value::Nil`.
     let wire_logprobs = Value::Array(vec![
         ndarray_value("<i8", &[2, 3], ids),
         ndarray_value("<f4", &[2, 3], probs),

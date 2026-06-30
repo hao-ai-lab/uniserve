@@ -22,12 +22,14 @@ same-device copy.
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from ..foundation.errors import invalid_descriptor
 from ..ops.core import Capabilities, Handoff
+from .transfer import Locator
 from .tower_kv import reshard_kv_snapshot, wait_kv_snapshot_ready
 
 __all__ = [
@@ -240,9 +242,8 @@ class ConditioningSnapshot:
     index for the image RoPE and the img-start guard) without a second crossing.
 
     ``to_wire``/``from_wire`` is the ``str`` form for the ``SeqResult.locator``
-    wire field: base64 of the pickled snapshot, the same opaque-locator encoding
-    the control plane already uses for the decode→sampler edge (every ``Locator``
-    is pickle-clean, incl. the ``cuda_ipc`` IPC-handle reduction)."""
+    wire field. It is JSON with typed locator records, so the host can carry the
+    payload opaquely without relying on Python pickle at this boundary."""
 
     locators: tuple[Any, ...]
     length: int
@@ -259,20 +260,61 @@ class ConditioningSnapshot:
     iu_last_token_id: int | None = None
 
     def to_wire(self) -> str:
-        import base64
-        import pickle
-
-        return base64.b64encode(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")
+        payload = {
+            "version": 1,
+            "locators": [_locator_to_wire(locator) for locator in self.locators],
+            "length": int(self.length),
+            "num_layers": int(self.num_layers),
+            "t_index": int(self.t_index),
+            "last_token_id": self.last_token_id,
+            "tu_locators": [_locator_to_wire(locator) for locator in self.tu_locators],
+            "tu_length": int(self.tu_length),
+            "tu_t_index": int(self.tu_t_index),
+            "tu_last_token_id": self.tu_last_token_id,
+            "iu_locators": [_locator_to_wire(locator) for locator in self.iu_locators],
+            "iu_length": int(self.iu_length),
+            "iu_t_index": int(self.iu_t_index),
+            "iu_last_token_id": self.iu_last_token_id,
+        }
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
     @staticmethod
     def from_wire(s: str) -> "ConditioningSnapshot":
-        import base64
-        import pickle
+        try:
+            raw = json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise invalid_descriptor("conditioning snapshot locator is not valid JSON") from exc
+        if not isinstance(raw, dict):
+            raise invalid_descriptor("conditioning snapshot wire value must be a JSON object")
+        if int(raw.get("version", 1)) != 1:
+            raise invalid_descriptor("unsupported conditioning snapshot wire version")
+        return ConditioningSnapshot(
+            locators=tuple(_locator_from_wire(value) for value in raw.get("locators", [])),
+            length=int(raw.get("length", 0)),
+            num_layers=int(raw.get("num_layers", 0)),
+            t_index=int(raw.get("t_index", -1)),
+            last_token_id=raw.get("last_token_id"),
+            tu_locators=tuple(_locator_from_wire(value) for value in raw.get("tu_locators", [])),
+            tu_length=int(raw.get("tu_length", 0)),
+            tu_t_index=int(raw.get("tu_t_index", -1)),
+            tu_last_token_id=raw.get("tu_last_token_id"),
+            iu_locators=tuple(_locator_from_wire(value) for value in raw.get("iu_locators", [])),
+            iu_length=int(raw.get("iu_length", 0)),
+            iu_t_index=int(raw.get("iu_t_index", -1)),
+            iu_last_token_id=raw.get("iu_last_token_id"),
+        )
 
-        obj = pickle.loads(base64.b64decode(s.encode("ascii")))
-        if not isinstance(obj, ConditioningSnapshot):
-            raise invalid_descriptor("decoded object is not a ConditioningSnapshot")
-        return obj
+
+def _locator_to_wire(locator: Any) -> dict[str, Any]:
+    if not isinstance(locator, Locator):
+        raise invalid_descriptor(f"conditioning snapshot expected Locator, got {type(locator).__name__}")
+    return locator.to_wire()
+
+
+def _locator_from_wire(value: Any) -> Locator:
+    if not isinstance(value, dict):
+        raise invalid_descriptor("conditioning snapshot locator entry must be a JSON object")
+    return Locator.from_wire(value)
 
 
 @dataclass

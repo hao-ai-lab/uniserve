@@ -24,8 +24,8 @@ pub mod names {
     pub const GEMMA4: &str = "gemma4";
     pub const HERMES: &str = "hermes";
     pub const HY_V3: &str = "hy_v3";
- // Matches the Python CLI name `--tool-call-parser internlm`, which Python
- // also routes to `Internlm2ToolParser` despite the version-agnostic name.
+    // Matches the Python CLI name `--tool-call-parser internlm`, which Python
+    // also routes to `Internlm2ToolParser` despite the version-agnostic name.
     pub const INTERNLM: &str = "internlm";
     pub const KIMI_K2: &str = "kimi_k2";
     pub const LLAMA3_JSON: &str = "llama3_json";
@@ -44,15 +44,15 @@ type ToolParserCreator = fn(&[ChatTool]) -> uniserve_tool_parser::Result<Box<dyn
 pub type ToolParserFactory = ParserFactory<ToolParserCreator>;
 
 impl ToolParserFactory {
- /// Get the global tool parser factory with built-in registrations and model
- /// mappings.
+    /// Get the global tool parser factory with built-in registrations and model
+    /// mappings.
     pub fn global() -> &'static Self {
         static INSTANCE: LazyLock<ToolParserFactory> = LazyLock::new(ToolParserFactory::new);
         &INSTANCE
     }
 
- /// Create the default registry with built-in parser names and model
- /// mappings.
+    /// Create the default registry with built-in parser names and model
+    /// mappings.
     pub fn new() -> Self {
         let mut factory = Self::default();
 
@@ -86,10 +86,10 @@ impl ToolParserFactory {
             .register_pattern("hermes", names::HERMES)
             .register_pattern("hy3", names::HY_V3)
             .register_pattern("hy_v3", names::HY_V3)
- // Narrow to `internlm2` substring so it matches `internlm2-chat-7b`
- // and `internlm2_5-7b-chat` but NOT `internlm-chat-7b` (InternLM v1,
- // routes to Llama), `internlm3-*` (also Llama-architecture), or `Intern-S1` /
- // `Intern-S1-Pro` (separate intern-s1 parser, see PR #40115).
+            // Narrow to `internlm2` substring so it matches `internlm2-chat-7b`
+            // and `internlm2_5-7b-chat` but NOT `internlm-chat-7b` (InternLM v1,
+            // routes to Llama), `internlm3-*` (also Llama-architecture), or `Intern-S1` /
+            // `Intern-S1-Pro` (separate intern-s1 parser, see PR #40115).
             .register_pattern("internlm2", names::INTERNLM)
             .register_pattern("llama-4", names::LLAMA4_JSON)
             .register_pattern("llama-3.2", names::LLAMA3_JSON)
@@ -113,7 +113,7 @@ impl ToolParserFactory {
         factory
     }
 
- /// Register one parser type that exposes a static `create` constructor.
+    /// Register one parser type that exposes a static `create` constructor.
     pub fn register_parser<T>(&mut self, name: &str) -> &mut Self
     where
         T: ToolParser + 'static,
@@ -121,7 +121,7 @@ impl ToolParserFactory {
         self.register_creator(name, T::create)
     }
 
- /// Construct a parser from an exact name.
+    /// Construct a parser from an exact name.
     pub fn create(&self, name: &str, tools: &[ChatTool]) -> crate::Result<Box<dyn ToolParser>> {
         let creator = self
             .creator(name)
@@ -138,7 +138,7 @@ impl ToolParserFactory {
         })
     }
 
- /// Resolve a parser from model ID and then construct it.
+    /// Resolve a parser from model ID and then construct it.
     pub fn create_for_model(
         &self,
         model_id: &str,
@@ -167,21 +167,21 @@ mod cross_registry_tests {
 
     #[test]
     fn glm_tool_vs_reasoning_routing_divergence_is_pinned() {
- // The tool and reasoning factories each carry their own hand-maintained
- // (model-substring -> parser-name) table, so GLM routing can drift
- // between them. The divergence below is *intentional and forced*: a
- // dedicated GLM47 tool parser exists (Separator::Flexible) distinct from
- // GLM45 (Separator::Newline), but there is no GLM47 reasoning parser, so
- // every GLM variant shares the one GLM45 reasoning impl (an alias to the
- // Qwen3 reasoning parser).
+        // The tool and reasoning factories each carry their own hand-maintained
+        // (model-substring -> parser-name) table, so GLM routing can drift
+        // between them. The divergence below is *intentional and forced*: a
+        // dedicated GLM47 tool parser exists (Separator::Flexible) distinct from
+        // GLM45 (Separator::Newline), but there is no GLM47 reasoning parser, so
+        // every GLM variant shares the one GLM45 reasoning impl (an alias to the
+        // Qwen3 reasoning parser).
 
- // This pins both sides so a future reordering of either pattern table —
- // or adding a GLM47-specific reasoning parser without updating both
- // registries — surfaces here instead of silently mis-routing one side.
+        // This pins both sides so a future reordering of either pattern table —
+        // or adding a GLM47-specific reasoning parser without updating both
+        // registries — surfaces here instead of silently mis-routing one side.
         let tool = ToolParserFactory::new();
         let reasoning = ReasoningParserFactory::new();
 
- // Newest GLM family: dedicated GLM47 tool parser, shared GLM45 reasoning.
+        // Newest GLM family: dedicated GLM47 tool parser, shared GLM45 reasoning.
         for model_id in ["zai-org/GLM-5-32B-Chat", "glm-4.7"] {
             assert_eq!(
                 tool.resolve_name_for_model(model_id),
@@ -195,7 +195,7 @@ mod cross_registry_tests {
             );
         }
 
- // Older GLM variants resolve to GLM45 on both sides.
+        // Older GLM variants resolve to GLM45 on both sides.
         for model_id in ["glm-4.6", "glm-4.5"] {
             assert_eq!(
                 tool.resolve_name_for_model(model_id),
@@ -212,17 +212,17 @@ mod cross_registry_tests {
 
     #[test]
     fn deepseek_tool_vs_reasoning_routing_divergence_is_pinned() {
- // DeepSeek routing is intentionally divergent between the two
- // hand-maintained tables. The tool table carries dedicated
- // `deepseek-v3.1`/`deepseek-v3.2` parsers and routes `deepseek-r1` to the
- // V3 *tool* parser, while the reasoning table keeps a distinct
- // `deepseek_r1` reasoning parser and has no V3.1/V3.2 specialization (both
- // collapse onto the shared `deepseek_v3` reasoning parser). Pin both sides
- // so reordering or specializing one table without the other surfaces here.
+        // DeepSeek routing is intentionally divergent between the two
+        // hand-maintained tables. The tool table carries dedicated
+        // `deepseek-v3.1`/`deepseek-v3.2` parsers and routes `deepseek-r1` to the
+        // V3 *tool* parser, while the reasoning table keeps a distinct
+        // `deepseek_r1` reasoning parser and has no V3.1/V3.2 specialization (both
+        // collapse onto the shared `deepseek_v3` reasoning parser). Pin both sides
+        // so reordering or specializing one table without the other surfaces here.
         let tool = ToolParserFactory::new();
         let reasoning = ReasoningParserFactory::new();
 
- // R1 diverges: tool routes to the V3 tool parser, reasoning to its own R1.
+        // R1 diverges: tool routes to the V3 tool parser, reasoning to its own R1.
         assert_eq!(
             tool.resolve_name_for_model("deepseek-ai/DeepSeek-R1-0528"),
             Some(names::DEEPSEEK_V3),
@@ -234,7 +234,7 @@ mod cross_registry_tests {
             "deepseek-r1 reasoning routing changed",
         );
 
- // V3.1 / V3.2 diverge: tool has dedicated parsers, reasoning collapses to V3.
+        // V3.1 / V3.2 diverge: tool has dedicated parsers, reasoning collapses to V3.
         assert_eq!(
             tool.resolve_name_for_model("deepseek-ai/DeepSeek-V3.1"),
             Some(names::DEEPSEEK_V31),
@@ -256,7 +256,7 @@ mod cross_registry_tests {
             "deepseek-v3.2 reasoning routing changed",
         );
 
- // V4 stays in sync: both tables route to their own deepseek_v4 entry.
+        // V4 stays in sync: both tables route to their own deepseek_v4 entry.
         assert_eq!(
             tool.resolve_name_for_model("deepseek-ai/DeepSeek-V4"),
             Some(names::DEEPSEEK_V4),
@@ -271,11 +271,11 @@ mod cross_registry_tests {
 
     #[test]
     fn internlm_tool_routing_has_no_reasoning_counterpart() {
- // InternLM2 has a dedicated tool parser pattern but the reasoning table
- // carries no InternLM pattern at all, so a versioned InternLM2 model that
- // resolves on the tool side resolves to nothing on the reasoning side.
- // Pin this asymmetry so adding/removing an InternLM reasoning pattern is a
- // deliberate, visible change.
+        // InternLM2 has a dedicated tool parser pattern but the reasoning table
+        // carries no InternLM pattern at all, so a versioned InternLM2 model that
+        // resolves on the tool side resolves to nothing on the reasoning side.
+        // Pin this asymmetry so adding/removing an InternLM reasoning pattern is a
+        // deliberate, visible change.
         let tool = ToolParserFactory::new();
         let reasoning = ReasoningParserFactory::new();
 

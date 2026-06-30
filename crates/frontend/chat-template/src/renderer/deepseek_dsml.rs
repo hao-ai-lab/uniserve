@@ -50,19 +50,19 @@ pub(super) enum ThinkingMode {
 /// `<｜DSML｜function_calls>` while V4 uses `<｜DSML｜tool_calls>`.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DsmlWrapper {
- /// Opening tool-calls block marker, e.g. `<｜DSML｜function_calls>`.
+    /// Opening tool-calls block marker, e.g. `<｜DSML｜function_calls>`.
     start: &'static str,
- /// Closing tool-calls block marker, e.g. `</｜DSML｜function_calls>`.
+    /// Closing tool-calls block marker, e.g. `</｜DSML｜function_calls>`.
     end: &'static str,
 }
 
 impl DsmlWrapper {
- /// DeepSeek V3.2 wraps tool calls in `function_calls`.
+    /// DeepSeek V3.2 wraps tool calls in `function_calls`.
     pub(super) const V32: Self = Self {
         start: "<｜DSML｜function_calls>",
         end: "</｜DSML｜function_calls>",
     };
- /// DeepSeek V4 wraps tool calls in `tool_calls`.
+    /// DeepSeek V4 wraps tool calls in `tool_calls`.
     pub(super) const V4: Self = Self {
         start: "<｜DSML｜tool_calls>",
         end: "</｜DSML｜tool_calls>",
@@ -257,6 +257,8 @@ fn json_dumps<T: Serialize>(model_label: &str, value: &T) -> Result<String> {
         .ascii(false)
         .format_to_string(value)
         .map_err(|error| {
-            Error::ChatTemplate(format!("failed to serialize {model_label} JSON payload: {error}"))
+            Error::ChatTemplate(format!(
+                "failed to serialize {model_label} JSON payload: {error}"
+            ))
         })
 }

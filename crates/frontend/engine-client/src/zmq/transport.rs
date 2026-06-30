@@ -33,26 +33,26 @@ pub struct EngineId(Bytes);
 
 impl Debug for EngineId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
- // Display the engine id as a hex string for easier debugging.
+        // Display the engine id as a hex string for easier debugging.
         write!(f, "EngineId({})", hex::encode(&self.0))
     }
 }
 
 impl EngineId {
- /// Convert the engine id into a ZMQ frame for sending.
+    /// Convert the engine id into a ZMQ frame for sending.
     pub fn to_frame(&self) -> Bytes {
         self.0.clone()
     }
 
- /// Convert the engine id into a ZMQ frame for sending.
+    /// Convert the engine id into a ZMQ frame for sending.
     pub fn into_frame(self) -> Bytes {
         self.0
     }
 
- /// Parse the engine index encoded in the routing identity.
+    /// Parse the engine index encoded in the routing identity.
 
- /// Engine-core processes use a two-byte little-endian engine index as
- /// their ROUTER/DEALER identity (the vLLM convention).
+    /// Engine-core processes use a two-byte little-endian engine index as
+    /// their ROUTER/DEALER identity (the vLLM convention).
     pub fn engine_index(&self) -> Option<u32> {
         if self.len() != 2 {
             return None;
@@ -60,8 +60,8 @@ impl EngineId {
         Some(u16::from_le_bytes([self[0], self[1]]) as u32)
     }
 
- /// Construct an engine id from the engine index encoding (two-byte
- /// little-endian).
+    /// Construct an engine id from the engine index encoding (two-byte
+    /// little-endian).
     pub fn from_engine_index(value: u32) -> Self {
         Self(Bytes::copy_from_slice(&(value as u16).to_le_bytes()))
     }
@@ -99,28 +99,28 @@ impl TryFrom<EngineId> for PeerIdentity {
 /// transport.
 #[derive(Clone, Debug)]
 pub struct ConnectedEngine {
- /// The identity of the connected engine.
+    /// The identity of the connected engine.
     pub engine_id: EngineId,
- /// Post-initialization configuration received from the engine on the input
- /// socket registration message.
+    /// Post-initialization configuration received from the engine on the input
+    /// socket registration message.
     pub ready_response: EngineCoreReadyResponse,
 }
 
 /// Represents the connected shared transport plus all registered engines after
 /// a successful multi-engine startup handshake.
 pub(crate) struct ConnectedTransport {
- /// The local address of the shared input socket that all engines connect to
- /// for receiving requests.
+    /// The local address of the shared input socket that all engines connect to
+    /// for receiving requests.
     pub input_address: String,
- /// The local address of the shared output socket that all engines connect
- /// to for sending responses.
+    /// The local address of the shared output socket that all engines connect
+    /// to for sending responses.
     pub output_address: String,
- /// All engines connected through the startup handshake.
+    /// All engines connected through the startup handshake.
     pub engines: Vec<ConnectedEngine>,
 
- /// The sending half of the shared input socket.
+    /// The sending half of the shared input socket.
     pub input_send: RouterSendHalf,
- /// The shared output socket for receiving responses from all engines.
+    /// The shared output socket for receiving responses from all engines.
     pub output_socket: PullSocket,
 }
 
@@ -156,20 +156,20 @@ pub(crate) async fn connect_handshake(
         handshake_address, "waiting for engines to connect"
     );
 
- // 1. Bind shared local input/output sockets first so every engine receives the same data-plane
- // addresses during handshake.
+    // 1. Bind shared local input/output sockets first so every engine receives the same data-plane
+    // addresses during handshake.
     let (input_address, mut input_socket, output_address, output_socket) =
         bind_local_sockets(local_host, local_input_address, local_output_address).await?;
     info!(%input_address, %output_address, "bound local transport sockets");
 
- // 2. Bind the shared handshake socket once. All engines connect to this socket with their own
- // identities, and startup order does not matter.
+    // 2. Bind the shared handshake socket once. All engines connect to this socket with their own
+    // identities, and startup order does not matter.
     let mut handshake_socket = RouterSocket::new();
     handshake_socket.bind(handshake_address).await?;
 
     let mut engines = BTreeMap::new();
 
- // 3. Receive HELLO from every engine and send a matching INIT.
+    // 3. Receive HELLO from every engine and send a matching INIT.
     while engines.len() < engine_count {
         debug!(
             handshake_address,
@@ -227,7 +227,7 @@ pub(crate) async fn connect_handshake(
         }
     }
 
- // 4. Every engine may now send READY (after its model load completes).
+    // 4. Every engine may now send READY (after its model load completes).
     while engines.values().any(|state| !state.is_ready_received()) {
         debug!(
             handshake_address,
@@ -270,7 +270,7 @@ pub(crate) async fn connect_handshake(
         }
     }
 
- // 5. Wait for every engine to connect to the shared input socket and register itself.
+    // 5. Wait for every engine to connect to the shared input socket and register itself.
     let engines =
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), ready_timeout).await?;
     info!(engine_count = engines.len(), "engines connected");
@@ -496,21 +496,21 @@ pub(crate) async fn run_output_loop(
     loop {
         let message = match output_socket.recv().await {
             Ok(message) => message,
- // `NoMessage` means the underlying fair queue has no remaining peers
- // to drain: the socket is closed/drained and recv would keep
- // returning this immediately, so retrying would busy-spin. Treat it
- // as terminal: notify the client and shut down the output loop.
+            // `NoMessage` means the underlying fair queue has no remaining peers
+            // to drain: the socket is closed/drained and recv would keep
+            // returning this immediately, so retrying would busy-spin. Treat it
+            // as terminal: notify the client and shut down the output loop.
             Err(error @ ZmqError::NoMessage) => {
                 error!(error = %error.as_report(), "output socket closed; shutting down output loop");
                 let _ = tx.send(Err(Error::Transport(error))).await;
                 return;
             }
             Err(error) => {
- // A transient or per-peer recv error (e.g. one engine's frame
- // failed to decode, or one peer disconnected). The PULL socket
- // has already dropped the offending peer, so do not let a single
- // recv error permanently kill outputs from the other healthy
- // engines: log it and keep the loop running.
+                // A transient or per-peer recv error (e.g. one engine's frame
+                // failed to decode, or one peer disconnected). The PULL socket
+                // has already dropped the offending peer, so do not let a single
+                // recv error permanently kill outputs from the other healthy
+                // engines: log it and keep the loop running.
                 warn!(error = %error.as_report(), "recoverable error receiving output message; continuing");
                 continue;
             }
@@ -540,8 +540,8 @@ pub(crate) async fn run_output_loop(
                 Ok(decoded)
             }
             Err(error) => {
- // Notify the client but keep the output loop running to
- // continue processing future messages from the engines.
+                // Notify the client but keep the output loop running to
+                // continue processing future messages from the engines.
                 warn!(frame_len, error = %error.as_report(), "failed to decode output message");
                 Err(error.into())
             }

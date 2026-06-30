@@ -10,22 +10,22 @@ use serde_with::{DeserializeFromStr, SerializeDisplay};
 /// Chat template content format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum ChatTemplateContentFormat {
- /// Content is a simple string.
+    /// Content is a simple string.
     #[default]
     String,
- /// Content is a list of structured parts (OpenAI format).
+    /// Content is a list of structured parts (OpenAI format).
     OpenAi,
 }
 
 /// Configurable chat-template content format selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
 pub enum ChatTemplateContentFormatOption {
- /// Detect the format from the template source.
+    /// Detect the format from the template source.
     #[default]
     Auto,
- /// Always flatten content into plain strings before rendering.
+    /// Always flatten content into plain strings before rendering.
     String,
- /// Always pass content through in OpenAI-compatible structured form.
+    /// Always pass content through in OpenAI-compatible structured form.
     OpenAi,
 }
 

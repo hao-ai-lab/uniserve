@@ -17,11 +17,11 @@ use uniserve_worker_wire::flat::{
 use uniserve_worker_wire::{WorkerRequest, WorkerResponse};
 
 mod events;
+use events::{ClientEvents, ServerEvents};
 pub use events::{
     EVENT_DRIVEN_ENV, EVENT_WAIT_SAFETY_NET, EVT_COMMAND, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
     WakeEvents, WakeSender, event_driven_enabled,
 };
-use events::{ClientEvents, ServerEvents};
 
 pub mod transfer_agent;
 pub use transfer_agent::{
@@ -147,7 +147,7 @@ pub struct ClientEndpoint {
     _node: Node<IxService>,
     client: IxClient,
     connect_timeout: Duration,
- /// Companion event ports for the event-driven boundary (None when polling).
+    /// Companion event ports for the event-driven boundary (None when polling).
     events: Option<ClientEvents>,
 }
 
@@ -165,8 +165,8 @@ impl ClientEndpoint {
         )
     }
 
- /// As [`Self::connect`], but with an explicit event-driven choice (the host
- /// is authoritative: it spawns the worker with the matching setting).
+    /// As [`Self::connect`], but with an explicit event-driven choice (the host
+    /// is authoritative: it spawns the worker with the matching setting).
     pub fn connect_with(
         service: &str,
         initial_max_slice_len: usize,
@@ -208,14 +208,14 @@ impl ClientEndpoint {
         })
     }
 
- /// Whether the event-driven boundary is active on this endpoint.
+    /// Whether the event-driven boundary is active on this endpoint.
     pub fn is_event_driven(&self) -> bool {
         self.events.is_some()
     }
 
- /// Park for {result, command, death} until a wake fires or `timeout`
- /// elapses. Returns which sources fired. Only valid on an event-driven
- /// endpoint; pollers must use [`Self::try_recv_response`] on a deadline.
+    /// Park for {result, command, death} until a wake fires or `timeout`
+    /// elapses. Returns which sources fired. Only valid on an event-driven
+    /// endpoint; pollers must use [`Self::try_recv_response`] on a deadline.
     pub fn wait_wake(&self, timeout: Duration) -> anyhow::Result<WakeEvents> {
         match &self.events {
             Some(ev) => ev.wait(timeout),
@@ -226,14 +226,14 @@ impl ClientEndpoint {
         }
     }
 
- /// A cloneable wake source the command ingress fires after enqueuing a
- /// command (None when polling).
+    /// A cloneable wake source the command ingress fires after enqueuing a
+    /// command (None when polling).
     pub fn command_wake(&self) -> Option<WakeSender> {
         self.events.as_ref().map(ClientEvents::command_wake)
     }
 
- /// A cloneable wake source the worker-death watcher fires on child exit
- /// (None when polling).
+    /// A cloneable wake source the worker-death watcher fires on child exit
+    /// (None when polling).
     pub fn death_wake(&self) -> Option<WakeSender> {
         self.events.as_ref().map(ClientEvents::death_wake)
     }
@@ -275,8 +275,8 @@ impl ClientEndpoint {
         *request.user_header_mut() = header;
         let request = request.write_from_slice(payload);
         let pending = request.send().context("sending iceoryx2 request")?;
- // Wake the worker the instant the request is queued, so its `recv`
- // returns from the event listener rather than the safety-net poll.
+        // Wake the worker the instant the request is queued, so its `recv`
+        // returns from the event listener rather than the safety-net poll.
         if let Some(events) = &self.events {
             events.notify_request();
         }
@@ -324,7 +324,7 @@ pub struct ServerEndpoint {
     _node: Node<IxService>,
     server: IxServer,
     active: VecDeque<IxActive>,
- /// Companion event ports for the event-driven boundary (None when polling).
+    /// Companion event ports for the event-driven boundary (None when polling).
     events: Option<ServerEvents>,
 }
 
@@ -342,8 +342,8 @@ impl ServerEndpoint {
         )
     }
 
- /// As [`Self::bind`], but with an explicit event-driven choice (so the
- /// worker can be forced to match a host that disabled it).
+    /// As [`Self::bind`], but with an explicit event-driven choice (so the
+    /// worker can be forced to match a host that disabled it).
     pub fn bind_with(
         service: &str,
         initial_max_slice_len: usize,
@@ -385,7 +385,7 @@ impl ServerEndpoint {
         })
     }
 
- /// Whether the event-driven boundary is active on this endpoint.
+    /// Whether the event-driven boundary is active on this endpoint.
     pub fn is_event_driven(&self) -> bool {
         self.events.is_some()
     }
@@ -438,8 +438,8 @@ impl ServerEndpoint {
         *response.user_header_mut() = header;
         let response = response.write_from_slice(payload);
         response.send().context("sending iceoryx2 response")?;
- // Wake the host the instant the response is queued, so its result wait
- // returns from the event listener rather than the safety-net poll.
+        // Wake the host the instant the response is queued, so its result wait
+        // returns from the event listener rather than the safety-net poll.
         if let Some(events) = &self.events {
             events.notify_response();
         }
@@ -463,7 +463,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
     };
     if let Some(batch) = &req.batch {
         h.step_id = batch.step_id;
- // Hint only: first op's id. See the doc comment above.
+        // Hint only: first op's id. See the doc comment above.
         if let Some(op) = batch.ops.first() {
             h.op_id = op.op_id.unwrap_or_default();
         }
@@ -486,7 +486,7 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
     };
     if let Some(result) = &resp.result {
         h.step_id = result.step_id;
- // Hint only: first seq's op id. See the doc comment above.
+        // Hint only: first seq's op id. See the doc comment above.
         if let Some(seq) = result.per_seq.first() {
             h.op_id = seq.op_id.unwrap_or_default();
         }
@@ -570,9 +570,16 @@ mod tests {
         for name in uniserve_worker_wire::flat::request_kind_names() {
             let code = request_kind_code(name);
             assert_ne!(code, 0, "request_kind_code missing for {name:?}");
-            assert!(seen.insert(code), "duplicate request_kind_code for {name:?}");
+            assert!(
+                seen.insert(code),
+                "duplicate request_kind_code for {name:?}"
+            );
         }
-        assert_eq!(request_kind_code("cancel"), 0, "cancel must stay absent from ReqKind");
+        assert_eq!(
+            request_kind_code("cancel"),
+            0,
+            "cancel must stay absent from ReqKind"
+        );
         assert_eq!(request_kind_code("bogus"), 0);
     }
 
@@ -580,8 +587,8 @@ mod tests {
     fn payload_len_u32_rejects_oversized() {
         assert_eq!(payload_len_u32(0).unwrap(), 0);
         assert_eq!(payload_len_u32(u32::MAX as usize).unwrap(), u32::MAX);
- // Lengths that do not fit in u32 must error instead of silently
- // truncating via `as u32`.
+        // Lengths that do not fit in u32 must error instead of silently
+        // truncating via `as u32`.
         if (u32::MAX as usize) < usize::MAX {
             assert!(payload_len_u32(u32::MAX as usize + 1).is_err());
         }
@@ -605,7 +612,7 @@ mod tests {
 
     #[test]
     fn header_is_padding_free() {
- // 3 u64 + 3 u32 + 1 u16 + 2 u8, with no implicit padding.
+        // 3 u64 + 3 u32 + 1 u16 + 2 u8, with no implicit padding.
         assert_eq!(std::mem::size_of::<Header>(), 3 * 8 + 3 * 4 + 2 + 2);
     }
 }

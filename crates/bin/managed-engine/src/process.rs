@@ -26,29 +26,29 @@ pub fn allocate_handshake_port(host: &str) -> Result<u16> {
 /// Spawn configuration for one managed headless `uniserve engine` process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedEngineConfig {
- /// Path to the `uniserve` binary hosting the `engine` subcommand
- /// (normally `std::env::current_exe`).
+    /// Path to the `uniserve` binary hosting the `engine` subcommand
+    /// (normally `std::env::current_exe`).
     pub binary: String,
- /// Model identifier passed to `uniserve engine <model>`.
+    /// Model identifier passed to `uniserve engine <model>`.
     pub model: String,
- /// Host portion of the engine handshake endpoint.
+    /// Host portion of the engine handshake endpoint.
     pub handshake_host: String,
- /// Port portion of the engine handshake endpoint.
+    /// Port portion of the engine handshake endpoint.
     pub handshake_port: u16,
- /// Engine index of this replica within the deployment.
+    /// Engine index of this replica within the deployment.
     pub engine_index: u32,
- /// Extra CLI arguments forwarded verbatim to `uniserve engine`
- /// (`--sim`, `--device`, `--block-size`, …).
+    /// Extra CLI arguments forwarded verbatim to `uniserve engine`
+    /// (`--sim`, `--device`, `--block-size`, …).
     pub engine_args: Vec<String>,
 }
 
 impl ManagedEngineConfig {
- /// Render the handshake address the frontend binds and the engine dials.
+    /// Render the handshake address the frontend binds and the engine dials.
     pub fn handshake_address(&self) -> String {
         format!("tcp://{}:{}", self.handshake_host, self.handshake_port)
     }
 
- /// Build the concrete command line for the managed headless engine.
+    /// Build the concrete command line for the managed headless engine.
     pub fn to_command(&self) -> StdCommand {
         let mut command = StdCommand::new(&self.binary);
         command
@@ -67,16 +67,16 @@ impl ManagedEngineConfig {
 #[derive(Clone)]
 pub struct ManagedEngineHandle {
     child: Arc<Mutex<Child>>,
- /// PID captured at spawn time. Cached so signalling (and shutdown) never
- /// has to lock the `Child`, which lets `wait_for_exit` hold the lock across
- /// an event-driven `Child::wait` await without deadlocking a concurrent
- /// shutdown.
+    /// PID captured at spawn time. Cached so signalling (and shutdown) never
+    /// has to lock the `Child`, which lets `wait_for_exit` hold the lock across
+    /// an event-driven `Child::wait` await without deadlocking a concurrent
+    /// shutdown.
     pid: Option<u32>,
     shutdown_started: Arc<AtomicBool>,
 }
 
 impl ManagedEngineHandle {
- /// Spawn one managed headless engine and return a handle for monitoring it.
+    /// Spawn one managed headless engine and return a handle for monitoring it.
     pub async fn spawn(config: ManagedEngineConfig) -> Result<Self> {
         let command = config.to_command();
         info!(
@@ -104,7 +104,7 @@ impl ManagedEngineHandle {
         })
     }
 
- /// Poll whether the managed engine has exited yet.
+    /// Poll whether the managed engine has exited yet.
     pub async fn try_wait(&self) -> Result<Option<ExitStatus>> {
         let mut child = self.child.lock().await;
         child
@@ -112,12 +112,12 @@ impl ManagedEngineHandle {
             .context("failed to poll the status of managed engine")
     }
 
- /// Wait until the managed engine exits.
+    /// Wait until the managed engine exits.
 
- /// Event-driven: awaits `tokio::process::Child::wait` (which registers for
- /// the child's SIGCHLD) rather than busy-polling `try_wait`. The lock is
- /// held across the await, but signalling reads the cached `pid` instead of
- /// the `Child`, so a concurrent `shutdown` cannot deadlock against it.
+    /// Event-driven: awaits `tokio::process::Child::wait` (which registers for
+    /// the child's SIGCHLD) rather than busy-polling `try_wait`. The lock is
+    /// held across the await, but signalling reads the cached `pid` instead of
+    /// the `Child`, so a concurrent `shutdown` cannot deadlock against it.
     pub async fn wait_for_exit(&self) -> Result<ExitStatus> {
         let mut child = self.child.lock().await;
         child
@@ -126,24 +126,24 @@ impl ManagedEngineHandle {
             .context("failed to wait for managed engine to exit")
     }
 
- /// Terminate the managed engine process group and wait for it to stop.
+    /// Terminate the managed engine process group and wait for it to stop.
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
 
- // Use the PID captured at spawn time so we never lock the `Child` here;
- // `wait_for_exit` may be holding that lock across its event-driven
- // `Child::wait` await.
+        // Use the PID captured at spawn time so we never lock the `Child` here;
+        // `wait_for_exit` may be holding that lock across its event-driven
+        // `Child::wait` await.
         let Some(pid) = self.pid else {
             return Ok(());
         };
 
- // Enforce a minimum shutdown timeout to give the engine process (and
- // its Python worker) enough time to clean up.
+        // Enforce a minimum shutdown timeout to give the engine process (and
+        // its Python worker) enough time to clean up.
         let shutdown_timeout = std::cmp::max(timeout, MIN_SHUTDOWN_TIMEOUT);
 
- // First, try to gracefully terminate.
+        // First, try to gracefully terminate.
         info!(
             pid,
             ?shutdown_timeout,
@@ -151,14 +151,14 @@ impl ManagedEngineHandle {
         );
         process_group::terminate(pid)?;
 
- // Wait for the process to exit on its own.
+        // Wait for the process to exit on its own.
         match tokio::time::timeout(shutdown_timeout, self.wait_for_exit()).await {
             Ok(Ok(_)) => return Ok(()),
             Ok(Err(error)) => return Err(error),
             Err(_) => {}
         }
 
- // If it doesn't exit within the timeout, force kill it.
+        // If it doesn't exit within the timeout, force kill it.
         info!(
             pid,
             "managed engine did not exit within timeout, sending SIGKILL"
@@ -175,9 +175,9 @@ impl ManagedEngineHandle {
 mod process_group {
     use super::*;
 
- /// Place the engine child into its own process group so `serve` can tear
- /// down the whole subtree (engine + its Python worker) rather than just
- /// the immediate process.
+    /// Place the engine child into its own process group so `serve` can tear
+    /// down the whole subtree (engine + its Python worker) rather than just
+    /// the immediate process.
     pub(super) fn configure(command: &mut Command) {
         unsafe {
             command.pre_exec(|| {
@@ -189,17 +189,17 @@ mod process_group {
         }
     }
 
- /// Send SIGTERM to the managed engine process group.
+    /// Send SIGTERM to the managed engine process group.
     pub(super) fn terminate(pid: u32) -> Result<()> {
         signal(pid, libc::SIGTERM)
     }
 
- /// Send SIGKILL to the managed engine process group.
+    /// Send SIGKILL to the managed engine process group.
     pub(super) fn kill(pid: u32) -> Result<()> {
         signal(pid, libc::SIGKILL)
     }
 
- /// Deliver one signal to the managed engine process group.
+    /// Deliver one signal to the managed engine process group.
     fn signal(pid: u32, signal: i32) -> Result<()> {
         let rc = unsafe { libc::kill(-(pid as i32), signal) };
         if rc == 0 {

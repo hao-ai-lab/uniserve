@@ -13,8 +13,8 @@ mod tests {
 
     use crate::pb;
 
- /// A request carrying a text prompt round-trips through protobuf encode and
- /// decode, preserving the `Prompt::Text` oneof and scalar fields.
+    /// A request carrying a text prompt round-trips through protobuf encode and
+    /// decode, preserving the `Prompt::Text` oneof and scalar fields.
     #[test]
     fn generate_request_text_prompt_round_trips() {
         let request = pb::GenerateRequest {
@@ -41,8 +41,8 @@ mod tests {
         );
     }
 
- /// The token-ids prompt oneof preserves the `TokenIds` message through a
- /// protobuf round-trip.
+    /// The token-ids prompt oneof preserves the `TokenIds` message through a
+    /// protobuf round-trip.
     #[test]
     fn generate_request_token_ids_prompt_round_trips() {
         let request = pb::GenerateRequest {
@@ -53,8 +53,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded =
-            pb::GenerateRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        let decoded = pb::GenerateRequest::decode(request.encode_to_vec().as_slice()).unwrap();
 
         match decoded.prompt {
             Some(pb::generate_request::Prompt::TokenIds(token_ids)) => {
@@ -64,8 +63,8 @@ mod tests {
         }
     }
 
- /// The `structured_output` oneof selects the `Choice` variant and preserves
- /// the nested choice strings across a protobuf round-trip.
+    /// The `structured_output` oneof selects the `Choice` variant and preserves
+    /// the nested choice strings across a protobuf round-trip.
     #[test]
     fn decoding_parameters_choice_oneof_round_trips() {
         let decoding = pb::DecodingParameters {
@@ -78,8 +77,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded =
-            pb::DecodingParameters::decode(decoding.encode_to_vec().as_slice()).unwrap();
+        let decoded = pb::DecodingParameters::decode(decoding.encode_to_vec().as_slice()).unwrap();
 
         assert_eq!(decoded.repetition_penalty, 1.1);
         match decoded.structured_output {
@@ -90,9 +88,9 @@ mod tests {
         }
     }
 
- /// A `FinishInfo` carrying a STOP reason round-trips: the enum tag decodes
- /// back to `FinishReason::Stop` and the `stop_reason` oneof preserves the
- /// stop string.
+    /// A `FinishInfo` carrying a STOP reason round-trips: the enum tag decodes
+    /// back to `FinishReason::Stop` and the `stop_reason` oneof preserves the
+    /// stop string.
     #[test]
     fn finish_info_stop_reason_round_trips() {
         let finish = pb::FinishInfo {
@@ -115,21 +113,27 @@ mod tests {
         );
     }
 
- /// The generated `FinishReason` enum maps each variant to its stable
- /// ProtoBuf field name and back.
+    /// The generated `FinishReason` enum maps each variant to its stable
+    /// ProtoBuf field name and back.
     #[test]
     fn finish_reason_str_name_round_trips() {
         use pb::finish_info::FinishReason;
 
         assert_eq!(FinishReason::Stop.as_str_name(), "STOP");
         assert_eq!(FinishReason::Length.as_str_name(), "LENGTH");
-        assert_eq!(FinishReason::from_str_name("ABORTED"), Some(FinishReason::Aborted));
-        assert_eq!(FinishReason::from_str_name("NOT_FINISHED"), Some(FinishReason::NotFinished));
+        assert_eq!(
+            FinishReason::from_str_name("ABORTED"),
+            Some(FinishReason::Aborted)
+        );
+        assert_eq!(
+            FinishReason::from_str_name("NOT_FINISHED"),
+            Some(FinishReason::NotFinished)
+        );
         assert_eq!(FinishReason::from_str_name("unknown"), None);
     }
 
- /// An empty buffer decodes into the message default (all proto3 fields at
- /// their zero values), confirming optional/absent fields stay unset.
+    /// An empty buffer decodes into the message default (all proto3 fields at
+    /// their zero values), confirming optional/absent fields stay unset.
     #[test]
     fn generate_request_decodes_empty_buffer_as_default() {
         let decoded = pb::GenerateRequest::decode(Vec::new().as_slice()).unwrap();

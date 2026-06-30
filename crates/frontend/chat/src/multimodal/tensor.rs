@@ -11,17 +11,17 @@ use crate::error::{Error, Result, bail_multimodal, multimodal};
 /// Representation for multimodal kwarg values for transformation.
 #[derive(Debug, Clone)]
 pub(super) enum KwargValue {
- /// Float tensor with row-major flat data and shape.
+    /// Float tensor with row-major flat data and shape.
     F32Tensor { data: Vec<f32>, shape: Vec<usize> },
- /// Float16 tensor with row-major flat data and shape.
+    /// Float16 tensor with row-major flat data and shape.
     F16Tensor { data: Vec<f16>, shape: Vec<usize> },
- /// BFloat16 tensor with row-major flat data and shape.
+    /// BFloat16 tensor with row-major flat data and shape.
     Bf16Tensor { data: Vec<bf16>, shape: Vec<usize> },
- /// Signed integer tensor with row-major flat data and shape.
+    /// Signed integer tensor with row-major flat data and shape.
     I64Tensor { data: Vec<i64>, shape: Vec<usize> },
- /// Unsigned integer tensor with row-major flat data and shape.
+    /// Unsigned integer tensor with row-major flat data and shape.
     U32Tensor { data: Vec<u32>, shape: Vec<usize> },
- /// Non-tensor kwarg value that is shared or copied as-is.
+    /// Non-tensor kwarg value that is shared or copied as-is.
     Passthrough(ProtocolKwargValue),
 }
 
@@ -84,8 +84,8 @@ impl KwargValue {
         })
     }
 
- /// Convert a float tensor to the target float dtype if needed, keeping the
- /// same shape.
+    /// Convert a float tensor to the target float dtype if needed, keeping the
+    /// same shape.
     fn from_f32_tensor(data: Vec<f32>, shape: Vec<usize>, float_dtype: ModelDtype) -> Result<Self> {
         match float_dtype {
             ModelDtype::Float16 => Ok(Self::F16Tensor {
@@ -127,10 +127,10 @@ impl TryFrom<KwargValue> for ProtocolKwargValue {
 }
 
 impl KwargValue {
- /// Extract one image from a batched tensor field.
+    /// Extract one image from a batched tensor field.
 
- /// Batched fields use their first axis as image index and drop that axis in
- /// the per-feature value, matching the reference batched-field semantics.
+    /// Batched fields use their first axis as image index and drop that axis in
+    /// the per-feature value, matching the reference batched-field semantics.
     pub(super) fn batched_value_at(&self, index: usize) -> Result<Self> {
         match self {
             Self::F32Tensor { data, shape } => {
@@ -157,9 +157,9 @@ impl KwargValue {
         }
     }
 
- /// Extract one image's variable-length range from a flat tensor field.
+    /// Extract one image's variable-length range from a flat tensor field.
 
- /// Flat fields keep the first axis as the sliced length for this image.
+    /// Flat fields keep the first axis as the sliced length for this image.
     pub(super) fn flat_value_range(&self, start: usize, end: usize) -> Result<Self> {
         match self {
             Self::F32Tensor { data, shape } => {

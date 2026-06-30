@@ -63,7 +63,7 @@ pub(super) enum JsonParamType {
 }
 
 impl ToolSchemas {
- /// Normalize OpenAI-style tool parameter JSON schemas for one request.
+    /// Normalize OpenAI-style tool parameter JSON schemas for one request.
     pub(super) fn from_tools(tools: &[Tool]) -> Self {
         let tools = tools
             .iter()
@@ -73,10 +73,10 @@ impl ToolSchemas {
         Self { tools }
     }
 
- /// Convert parameter values for one named tool.
+    /// Convert parameter values for one named tool.
 
- /// Unknown tool names use an empty schema, so all parameters fall back to
- /// strings or object-like JSON for structured inputs.
+    /// Unknown tool names use an empty schema, so all parameters fall back to
+    /// strings or object-like JSON for structured inputs.
     pub(super) fn convert_params_with_schema<P>(
         &self,
         function_name: &str,
@@ -94,7 +94,7 @@ impl ToolSchemas {
         converted
     }
 
- /// Convert one parameter value for one named tool.
+    /// Convert one parameter value for one named tool.
     pub(super) fn convert_param_with_schema<P>(
         &self,
         function_name: &str,
@@ -110,8 +110,8 @@ impl ToolSchemas {
 }
 
 impl ToolSchema {
- /// Return an empty schema with no parameter information, which causes all
- /// parameters to be treated as strings.
+    /// Return an empty schema with no parameter information, which causes all
+    /// parameters to be treated as strings.
     const fn empty() -> &'static Self {
         static EMPTY: ToolSchema = ToolSchema {
             params: BTreeMap::new(),
@@ -119,7 +119,7 @@ impl ToolSchema {
         &EMPTY
     }
 
- /// Normalize an OpenAI-style tool parameters JSON schema.
+    /// Normalize an OpenAI-style tool parameters JSON schema.
     fn from_schema(parameters: &Value) -> Self {
         let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
             return Self::default();
@@ -135,18 +135,18 @@ impl ToolSchema {
         Self { params }
     }
 
- /// Convert one parameter value using its normalized schema type.
+    /// Convert one parameter value using its normalized schema type.
 
- /// If the parameter name is unknown, or we don't have a schema for it, or
- /// the value fails to convert, this falls back to returning the raw
- /// string as a JSON string value, or object-like JSON for structured input.
+    /// If the parameter name is unknown, or we don't have a schema for it, or
+    /// the value fails to convert, this falls back to returning the raw
+    /// string as a JSON string value, or object-like JSON for structured input.
     fn convert(&self, name: &str, input: ParamInput) -> Value {
         convert_with_optional_schema(self.params.get(name), &input)
     }
 }
 
 impl JsonParamType {
- /// Normalize one parameter property schema.
+    /// Normalize one parameter property schema.
     fn from_schema(schema: &Value) -> Option<Self> {
         let schema = schema.as_object()?;
 
@@ -169,8 +169,8 @@ impl JsonParamType {
             return Some(param_type);
         }
 
- // Typically, these types are already handled by checking the "type" field, but
- // we can also infer them from their characteristic fields if "type" is missing.
+        // Typically, these types are already handled by checking the "type" field, but
+        // we can also infer them from their characteristic fields if "type" is missing.
         if schema.contains_key("enum") {
             return Some(Self::String);
         }
@@ -184,7 +184,7 @@ impl JsonParamType {
         None
     }
 
- /// Normalize a JSON schema `type` value.
+    /// Normalize a JSON schema `type` value.
     fn from_type_value(type_value: &Value, schema: &Map<String, Value>) -> Option<Self> {
         match type_value {
             Value::String(kind) => Self::from_type_name(kind, Some(schema)),
@@ -204,7 +204,7 @@ impl JsonParamType {
         }
     }
 
- /// Normalize one JSON schema type name.
+    /// Normalize one JSON schema type name.
     fn from_type_name(kind: &str, schema: Option<&Map<String, Value>>) -> Option<Self> {
         let kind = kind.trim().to_ascii_lowercase();
         match kind.as_str() {
@@ -230,7 +230,7 @@ impl JsonParamType {
         }
     }
 
- /// Normalize object schema fields.
+    /// Normalize object schema fields.
     fn object_from_schema(schema: Option<&Map<String, Value>>) -> Self {
         let properties = schema
             .and_then(|schema| schema.get("properties"))
@@ -261,7 +261,7 @@ impl JsonParamType {
         }
     }
 
- /// Normalize array schema fields.
+    /// Normalize array schema fields.
     fn array_from_schema(schema: Option<&Map<String, Value>>) -> Self {
         let items = schema
             .and_then(|schema| schema.get("items"))
@@ -271,7 +271,7 @@ impl JsonParamType {
         Self::Array { items }
     }
 
- /// Collapse a candidate type list into one normalized type.
+    /// Collapse a candidate type list into one normalized type.
     fn one_of(mut types: Vec<Self>) -> Self {
         if types.len() == 1 {
             types.remove(0)
@@ -283,24 +283,24 @@ impl JsonParamType {
 
 /// Convert one parameter input to a normalized JSON value.
 fn convert_with_optional_schema(param_type: Option<&JsonParamType>, input: &ParamInput) -> Value {
- // For literal `null`, always convert to JSON null value.
+    // For literal `null`, always convert to JSON null value.
     if let ParamInput::Text(value) = input
         && value.eq_ignore_ascii_case("null")
     {
         return Value::Null;
     }
 
- // If we have a schema, try to convert the value using it.
+    // If we have a schema, try to convert the value using it.
     if let Some(param_type) = param_type
         && let Some(value) = try_convert_value(param_type, input)
     {
         return value;
     }
- // We don't have a schema, or conversion failed, use fallback logic.
+    // We don't have a schema, or conversion failed, use fallback logic.
     match input {
         ParamInput::Text(value) => Value::String(value.clone()),
         ParamInput::Elements(elements) => {
- // Convert structured input to object without a schema.
+            // Convert structured input to object without a schema.
             Value::Object(convert_elements_to_object(elements, &BTreeMap::new(), None))
         }
     }
@@ -328,7 +328,7 @@ fn try_convert_text_value(param_type: &JsonParamType, value: &str) -> Option<Val
         JsonParamType::Object { .. } if value.is_empty() => Some(Value::Object(Map::new())),
         JsonParamType::Array { .. } if value.is_empty() => Some(Value::Array(Vec::new())),
         JsonParamType::Object { .. } | JsonParamType::Array { .. } => {
- // For composite types with string input, simply interpret the string as JSON.
+            // For composite types with string input, simply interpret the string as JSON.
             serde_json::from_str(value).ok()
         }
         JsonParamType::Null => value.eq_ignore_ascii_case("null").then_some(Value::Null),
@@ -353,7 +353,7 @@ fn try_convert_elements_value(
             additional_properties.as_deref(),
         ))),
         JsonParamType::Array { items } => Some(Value::Array(
- // Collect all child elements into an array, regardless of their names.
+            // Collect all child elements into an array, regardless of their names.
             elements
                 .iter()
                 .map(|element| convert_with_optional_schema(items.as_deref(), &element.value))
@@ -363,7 +363,7 @@ fn try_convert_elements_value(
             .iter()
             .find_map(|param_type| try_convert_elements_value(param_type, elements)),
 
- // Primitive types can't be converted from structured input.
+        // Primitive types can't be converted from structured input.
         JsonParamType::String
         | JsonParamType::Integer
         | JsonParamType::Number
@@ -391,7 +391,7 @@ fn convert_elements_to_object(
 fn insert_object_value(object: &mut Map<String, Value>, key: String, value: Value) {
     if let Some(existing) = object.get_mut(&key) {
         match existing {
- // Collect values under the same key into an array.
+            // Collect values under the same key into an array.
             Value::Array(values) => values.push(value),
             existing => {
                 let first = std::mem::replace(existing, Value::Null);
@@ -521,17 +521,17 @@ mod tests {
         assert_eq!(converted_number_text(&params, "+1"), "1");
         assert_eq!(converted_number_text(&params, "+1.0"), "1.0");
 
- // We cannot preserve the original number precision by enabling `serde_json`'s
- // `arbitrary_precision` feature, otherwise the test
- // `serialized_json_numbers_do_not_leak_serde_private_representation` will fail.
- // See issue: https://github.com/mitsuhiko/minijinja/issues/641
+        // We cannot preserve the original number precision by enabling `serde_json`'s
+        // `arbitrary_precision` feature, otherwise the test
+        // `serialized_json_numbers_do_not_leak_serde_private_representation` will fail.
+        // See issue: https://github.com/mitsuhiko/minijinja/issues/641
 
- // assert_eq!(converted_number_text(&params, "5.00"), "5.00");
- // assert_eq!(converted_number_text(&params, "1e0"), "1e+0");
- // assert_eq!(
- // converted_number_text(&params, "9223372036854775807.5"),
- // "9223372036854775807.5"
- // );
+        // assert_eq!(converted_number_text(&params, "5.00"), "5.00");
+        // assert_eq!(converted_number_text(&params, "1e0"), "1e+0");
+        // assert_eq!(
+        // converted_number_text(&params, "9223372036854775807.5"),
+        // "9223372036854775807.5"
+        // );
     }
 
     fn converted_number_text(params: &ToolSchema, value: &str) -> String {

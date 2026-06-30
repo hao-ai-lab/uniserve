@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     );
     assert_eq!(executor.caps().rank.tp_size as usize, world);
 
- // The collective_rpc shape: per-rank correlated acks over the real rings.
+    // The collective_rpc shape: per-rank correlated acks over the real rings.
     let acks = executor.control_wait(ControlOp::ResetPrefixCache, None)?;
     println!("control acks: {acks:?}");
     assert_eq!(acks.len(), world);

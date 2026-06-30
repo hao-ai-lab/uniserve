@@ -117,11 +117,11 @@ pub(super) async fn load_lora_adapter(
             None,
         ));
     }
- // `is_3d_lora_weight` is a phantom contract field: it is collected here and
- // carried over the wire, but no backend honors it. The worker's
- // MergeOnLoadLoRA always interprets adapters as 2D A@B deltas, so a request
- // with `is_3d_lora_weight=true` would otherwise produce a silently wrong
- // merge. Reject it loudly instead of accepting a flag we cannot deliver.
+    // `is_3d_lora_weight` is a phantom contract field: it is collected here and
+    // carried over the wire, but no backend honors it. The worker's
+    // MergeOnLoadLoRA always interprets adapters as 2D A@B deltas, so a request
+    // with `is_3d_lora_weight=true` would otherwise produce a silently wrong
+    // merge. Reject it loudly instead of accepting a flag we cannot deliver.
     if request.is_3d_lora_weight {
         return Err(ApiError::invalid_request(
             "'is_3d_lora_weight' is not supported: the LoRA backend only merges 2D adapter weights."

@@ -36,30 +36,30 @@ pub enum AssistantEvent {
         kind: AssistantBlockKind,
         delta: String,
     },
- /// Per-decoded-update sample metadata: logprobs and/or output token IDs.
+    /// Per-decoded-update sample metadata: logprobs and/or output token IDs.
     #[subenum(ContentEvent)]
     LogprobsDelta {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
- /// The start of a new tool call, with its declared name and generated ID.
+    /// The start of a new tool call, with its declared name and generated ID.
     ToolCallStart { id: String, name: String },
- /// A delta for the arguments of the currently open tool call. Must follow a
- /// `ToolCallStart`.
+    /// A delta for the arguments of the currently open tool call. Must follow a
+    /// `ToolCallStart`.
     ToolCallArgumentsDelta { delta: String },
     #[subenum(ContentEvent)]
     Done {
         prompt_token_count: usize,
         output_token_count: usize,
         finish_reason: FinishReason,
- /// Connector-specific KV transfer parameters for disaggregated serving.
+        /// Connector-specific KV transfer parameters for disaggregated serving.
         kv_transfer_params: Option<serde_json::Value>,
     },
 }
 
 impl ContentEvent {
- /// Convert a [`DecodedTextEvent`] into one or more [`ContentEvent`] values
- /// by treating all text as plain (non-reasoning) content.
+    /// Convert a [`DecodedTextEvent`] into one or more [`ContentEvent`] values
+    /// by treating all text as plain (non-reasoning) content.
     fn from_decoded_plain_text(event: DecodedTextEvent) -> Vec<Self> {
         match event {
             DecodedTextEvent::Start {
@@ -110,7 +110,7 @@ pub type DynChatEventStream = Pin<Box<dyn Stream<Item = Result<ChatEvent>> + Sen
 /// Request-scoped output processor from decoded text events into structured
 /// chat events.
 pub trait ChatOutputProcessor: Send {
- /// Consume decoded text stream and return the structured chat-event stream.
+    /// Consume decoded text stream and return the structured chat-event stream.
     fn process(self: Box<Self>, decoded: DynDecodedTextEventStream) -> Result<DynChatEventStream>;
 }
 

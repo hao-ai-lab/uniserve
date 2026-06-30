@@ -55,8 +55,9 @@ const RETRY_AFTER_SECONDS: &str = "1";
 /// Parsed admission limit, resolved once from [`MAX_CONCURRENT_REQUESTS_ENV`].
 
 /// `None` means admission control is disabled.
-static MAX_CONCURRENT_REQUESTS: LazyLock<Option<u64>> =
-    LazyLock::new(|| parse_max_concurrent_requests(std::env::var(MAX_CONCURRENT_REQUESTS_ENV).ok()));
+static MAX_CONCURRENT_REQUESTS: LazyLock<Option<u64>> = LazyLock::new(|| {
+    parse_max_concurrent_requests(std::env::var(MAX_CONCURRENT_REQUESTS_ENV).ok())
+});
 
 /// Parse the configured admission limit from a raw environment value.
 
@@ -125,11 +126,11 @@ pub(crate) async fn track_server_load(
         return next.run(req).await;
     }
 
- // Admission control: shed load before admitting a new request when the
- // configured in-flight limit has been reached. The check-then-increment is
- // intentionally not a single atomic compare-and-set; a brief overshoot of a
- // request or two under contention is acceptable for load shedding and keeps
- // the shared `AppState` counter API unchanged.
+    // Admission control: shed load before admitting a new request when the
+    // configured in-flight limit has been reached. The check-then-increment is
+    // intentionally not a single atomic compare-and-set; a brief overshoot of a
+    // request or two under contention is acceptable for load shedding and keeps
+    // the shared `AppState` counter API unchanged.
     if let Some(limit) = *MAX_CONCURRENT_REQUESTS {
         if state.server_load() >= limit {
             return overloaded_response(limit);

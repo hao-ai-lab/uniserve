@@ -19,23 +19,23 @@ use crate::{FinishReason, Result};
 /// One currently open assistant text-like block being assembled from streamed
 /// deltas.
 struct OpenTextBlock {
- /// Stable position of this block in the final assistant message.
+    /// Stable position of this block in the final assistant message.
     index: usize,
- /// Semantic kind of the block being assembled.
+    /// Semantic kind of the block being assembled.
     kind: AssistantBlockKind,
- /// Accumulated text payload for the block.
+    /// Accumulated text payload for the block.
     text: String,
 }
 
 /// One currently open assistant tool call being assembled from streamed deltas.
 struct OpenToolCall {
- /// Stable ordinal of this tool call in the assistant tool-call list.
+    /// Stable ordinal of this tool call in the assistant tool-call list.
     index: usize,
- /// Stable tool-call ID exposed northbound.
+    /// Stable tool-call ID exposed northbound.
     id: String,
- /// Function name.
+    /// Function name.
     name: String,
- /// Incremental JSON arguments accumulated so far.
+    /// Incremental JSON arguments accumulated so far.
     arguments: String,
 }
 
@@ -45,18 +45,18 @@ struct OpenToolCall {
 /// and appends deltas to them until the semantic kind changes or the stream
 /// terminates.
 struct StructuredEventState {
- /// Final assistant message assembled so far.
+    /// Final assistant message assembled so far.
     message: AssistantMessage,
- /// Currently open text or reasoning block, if any.
+    /// Currently open text or reasoning block, if any.
     open_text_block: Option<OpenTextBlock>,
- /// Currently open tool call, if any.
+    /// Currently open tool call, if any.
     open_tool_call: Option<OpenToolCall>,
- /// Next OpenAI-compatible tool-call ordinal.
+    /// Next OpenAI-compatible tool-call ordinal.
     next_tool_call_index: usize,
 }
 
 impl StructuredEventState {
- /// Create one fresh assembly state for a new streamed response.
+    /// Create one fresh assembly state for a new streamed response.
     fn new() -> Self {
         Self {
             message: AssistantMessage::default(),
@@ -66,7 +66,7 @@ impl StructuredEventState {
         }
     }
 
- /// Convert one parsed text delta into zero or more structured chat events.
+    /// Convert one parsed text delta into zero or more structured chat events.
     fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -78,7 +78,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
- /// Forward per-update sample metadata without attaching it to text blocks.
+    /// Forward per-update sample metadata without attaching it to text blocks.
     fn process_logprobs_delta(
         &mut self,
         logprobs: Option<DecodedLogprobs>,
@@ -90,7 +90,7 @@ impl StructuredEventState {
         }])
     }
 
- /// Start one new tool call, closing any incompatible open block first.
+    /// Start one new tool call, closing any incompatible open block first.
     fn start_tool_call(&mut self, id: String, name: String) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
         self.close_open_text_block(&mut events);
@@ -108,7 +108,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
- /// Append one incremental tool-call arguments delta.
+    /// Append one incremental tool-call arguments delta.
     fn push_tool_call_arguments(&mut self, delta: String) -> Result<Vec<ChatEvent>> {
         let mut events = Vec::new();
         let Some(open_tool_call) = self.open_tool_call.as_mut() else {
@@ -124,7 +124,7 @@ impl StructuredEventState {
         Ok(events)
     }
 
- /// Close any open block and emit the terminal `Done` event.
+    /// Close any open block and emit the terminal `Done` event.
     fn finish(
         &mut self,
         prompt_token_count: usize,
@@ -145,8 +145,8 @@ impl StructuredEventState {
         Ok(events)
     }
 
- /// Append one semantic text delta to the current block, or open a new block
- /// when the semantic kind changes.
+    /// Append one semantic text delta to the current block, or open a new block
+    /// when the semantic kind changes.
     fn push_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -158,7 +158,7 @@ impl StructuredEventState {
         }
 
         match self.open_text_block.as_mut() {
- // If there's a currently open block of the same kind, append to it.
+            // If there's a currently open block of the same kind, append to it.
             Some(open_block) if open_block.kind == kind => {
                 open_block.text.push_str(&delta);
                 events.push(ChatEvent::BlockDelta {
@@ -167,8 +167,8 @@ impl StructuredEventState {
                     delta,
                 });
             }
- // Otherwise, close the currently open block (if any) and start a
- // new one.
+            // Otherwise, close the currently open block (if any) and start a
+            // new one.
             _ => {
                 self.close_open_text_block(events);
                 let index = self.message.content.len();
@@ -183,7 +183,7 @@ impl StructuredEventState {
         }
     }
 
- /// Finalize the currently open text block, if present.
+    /// Finalize the currently open text block, if present.
     fn close_open_text_block(&mut self, events: &mut Vec<ChatEvent>) {
         let Some(open_block) = self.open_text_block.take() else {
             return;
@@ -207,7 +207,7 @@ impl StructuredEventState {
         });
     }
 
- /// Finalize the currently open tool call, if present.
+    /// Finalize the currently open tool call, if present.
     fn close_open_tool_call(&mut self, events: &mut Vec<ChatEvent>) {
         let Some(open_tool_call) = self.open_tool_call.take() else {
             return;

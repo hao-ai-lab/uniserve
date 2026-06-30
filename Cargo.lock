@@ -6106,6 +6106,7 @@ dependencies = [
  "uniserve-observability",
  "uniserve-openai-api",
  "uniserve-openai-types",
+ "uniserve-reasoning-parser",
  "uniserve-server-app",
  "uniserve-server-grpc",
  "uniserve-text",

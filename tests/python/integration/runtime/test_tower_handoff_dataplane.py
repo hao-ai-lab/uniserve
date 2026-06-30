@@ -16,23 +16,11 @@ from uniserve_worker.runtime.tower_handoff import (
     DataPlaneTowerHandoff,
     TowerBinding,
 )
+from uniserve_worker.runtime.transfer import LocalTransport
 
 
-class _FakeDataPlane:
+class _FakeDataPlane(LocalTransport):
     """In-memory stand-in for a register-once Transport (publish/fetch by locator)."""
-
-    def __init__(self) -> None:
-        self._store: dict[int, torch.Tensor] = {}
-        self._next = 0
-
-    def publish(self, tensor: torch.Tensor):
-        loc = self._next
-        self._next += 1
-        self._store[loc] = tensor.clone()
-        return loc
-
-    def fetch(self, locator):
-        return self._store[locator]
 
 
 def _pool() -> PagedKVPool:

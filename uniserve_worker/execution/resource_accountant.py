@@ -13,7 +13,7 @@ from ..contracts.op_kinds import DENOISE_GEN
 from ..contracts.resource_plan import LatentTokens, PerBranch, ResourcePlan
 from ..foundation.errors import WorkerError
 from ..foundation.sizing import ceil_div
-from ..runtime.image_defaults import image_height, image_width
+from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.request_state import RequestStateTable
 from ..runtime.resources import ResourceRuntime
 
@@ -158,8 +158,8 @@ class ResourceAccountant:
             for value in shape:
                 units *= max(1, int(value))
             return units
-        h = image_height(image)
-        w = image_width(image)
+        h = required_image_height(image)
+        w = required_image_width(image)
         downsample = int(image.get("latent_downsample") or rule.downsample or 16)
         return _ceil_div(max(1, h), downsample) * _ceil_div(max(1, w), downsample)
 

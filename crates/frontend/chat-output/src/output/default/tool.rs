@@ -19,19 +19,19 @@ use crate::parser::tool::{ToolCallDelta, ToolParser, ToolParserOutput};
 
 /// Per-stream tool parsing state.
 struct ToolState {
- /// Parser for the current model family.
+    /// Parser for the current model family.
     parser: Box<dyn ToolParser>,
- /// Whether tool parsing has already failed for this stream.
+    /// Whether tool parsing has already failed for this stream.
     parser_failed: bool,
- /// The parser-local index of the currently open tool call, if any.
- // NOTE: We only allow single open tool call at a time right now, since that's what all
- // supported parsers currently emit. Change this to a `BTreeMap` if we need to support multiple
- // interleaved calls in the future.
+    /// The parser-local index of the currently open tool call, if any.
+    // NOTE: We only allow single open tool call at a time right now, since that's what all
+    // supported parsers currently emit. Change this to a `BTreeMap` if we need to support multiple
+    // interleaved calls in the future.
     open_call_index: Option<usize>,
 }
 
 impl ToolState {
- /// Create one fresh tool-parsing state for a new streamed response.
+    /// Create one fresh tool-parsing state for a new streamed response.
     fn new(parser: Box<dyn ToolParser>) -> Self {
         Self {
             parser,
@@ -40,8 +40,8 @@ impl ToolState {
         }
     }
 
- /// Convert one semantic assistant text delta into zero or more tool-aware
- /// internal events.
+    /// Convert one semantic assistant text delta into zero or more tool-aware
+    /// internal events.
     fn process_text_delta(
         &mut self,
         kind: AssistantBlockKind,
@@ -49,8 +49,8 @@ impl ToolState {
     ) -> Result<Vec<AssistantEvent>> {
         let mut events = Vec::new();
 
- // Only normal assistant text is eligible for tool parsing. Reasoning
- // blocks and plain-text fallback should pass through unchanged.
+        // Only normal assistant text is eligible for tool parsing. Reasoning
+        // blocks and plain-text fallback should pass through unchanged.
         if kind != AssistantBlockKind::Text || self.parser_failed {
             self.open_call_index = None;
             events.push(AssistantEvent::TextDelta { kind, delta });
@@ -67,14 +67,14 @@ impl ToolState {
                     error = %error.as_report(),
                     "tool parser failed; falling back to plain text deltas"
                 );
- // Permanently mark this parser as failed.
- // Parsing errors currently terminate the stream to avoid
- // emitting partial tool-call state.
+                // Permanently mark this parser as failed.
+                // Parsing errors currently terminate the stream to avoid
+                // emitting partial tool-call state.
                 self.parser_failed = true;
 
- // On parsing failure, we still apply the partial parser output if any, but we close
- // any open tool calls and emit the remaining buffered text as a plain-text delta to
- // preserve as much of the output as possible.
+                // On parsing failure, we still apply the partial parser output if any, but we close
+                // any open tool calls and emit the remaining buffered text as a plain-text delta to
+                // preserve as much of the output as possible.
                 self.process_parser_output(kind, output, &mut events)?;
                 self.open_call_index = None;
                 push_text_delta(&mut events, kind, self.parser.reset());
@@ -84,22 +84,22 @@ impl ToolState {
         Ok(events)
     }
 
- /// Apply one parsed tool output to the current stream state.
+    /// Apply one parsed tool output to the current stream state.
     fn process_parser_output(
         &mut self,
         kind: AssistantBlockKind,
         output: ToolParserOutput,
         events: &mut Vec<AssistantEvent>,
     ) -> Result<()> {
- // When we are not currently streaming a tool call, preserve plain
- // text first and then surface any new tool call items.
+        // When we are not currently streaming a tool call, preserve plain
+        // text first and then surface any new tool call items.
         if self.open_call_index.is_none() {
             push_text_delta(events, kind, output.normal_text);
             self.process_tool_items(output.calls, events)?;
         } else {
- // Once a tool call is open, prioritize tool deltas first. If the
- // parser emits normal text again, close the tool call and resume
- // plain text output.
+            // Once a tool call is open, prioritize tool deltas first. If the
+            // parser emits normal text again, close the tool call and resume
+            // plain text output.
             self.process_tool_items(output.calls, events)?;
             if !output.normal_text.is_empty() {
                 self.open_call_index = None;
@@ -109,7 +109,7 @@ impl ToolState {
         Ok(())
     }
 
- /// Apply one batch of parsed tool-call deltas emitted by the parser.
+    /// Apply one batch of parsed tool-call deltas emitted by the parser.
     fn process_tool_items(
         &mut self,
         items: Vec<ToolCallDelta>,
@@ -129,7 +129,7 @@ impl ToolState {
             }
 
             if item.arguments.is_empty() {
- // No arguments delta to apply.
+                // No arguments delta to apply.
                 continue;
             }
             let Some(open_call_index) = self.open_call_index else {
@@ -156,7 +156,7 @@ impl ToolState {
         Ok(())
     }
 
- /// Flush parser state at end-of-stream and close any remaining open calls.
+    /// Flush parser state at end-of-stream and close any remaining open calls.
     fn finish(&mut self) -> Result<Vec<AssistantEvent>> {
         let mut events = Vec::new();
 
@@ -197,7 +197,7 @@ pub async fn tool_event_stream(
     parser: Option<Box<dyn ToolParser>>,
     mut y: TryYielder<AssistantEvent, Error>,
 ) -> Result<()> {
- // Without a parser, pass through the input stream unchanged.
+    // Without a parser, pass through the input stream unchanged.
     let Some(parser) = parser else {
         pin_mut!(stream);
         while let Some(event) = stream.next().await.transpose()? {

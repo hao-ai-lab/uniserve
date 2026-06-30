@@ -68,9 +68,12 @@ fn wake_event_name(svc: &str) -> String {
     format!("{svc}/evt_wake")
 }
 
-fn open_event_service(node: &Node<IxService>, name: &str) -> anyhow::Result<EventFactory<IxService>> {
-    let service_name =
-        ServiceName::new(name).map_err(|e| anyhow::anyhow!("event service name {name:?}: {e:?}"))?;
+fn open_event_service(
+    node: &Node<IxService>,
+    name: &str,
+) -> anyhow::Result<EventFactory<IxService>> {
+    let service_name = ServiceName::new(name)
+        .map_err(|e| anyhow::anyhow!("event service name {name:?}: {e:?}"))?;
     node.service_builder(&service_name)
         .event()
         .open_or_create()
@@ -105,12 +108,14 @@ pub struct WakeSender {
 }
 
 impl WakeSender {
- /// Fire the wake. Errors are swallowed: a wake is a best-effort latency
- /// optimization over the parked listener's safety-net timeout, never a
- /// correctness requirement, so a transient notify failure must not surface
- /// as a command/teardown error.
+    /// Fire the wake. Errors are swallowed: a wake is a best-effort latency
+    /// optimization over the parked listener's safety-net timeout, never a
+    /// correctness requirement, so a transient notify failure must not surface
+    /// as a command/teardown error.
     pub fn wake(&self) {
-        let _ = self.notifier.notify_with_custom_event_id(EventId::new(self.event_id));
+        let _ = self
+            .notifier
+            .notify_with_custom_event_id(EventId::new(self.event_id));
     }
 }
 
@@ -120,7 +125,7 @@ pub struct WakeEvents {
     pub result: bool,
     pub command: bool,
     pub death: bool,
- /// A notification with an unrecognized id (forward-compat / spurious wake).
+    /// A notification with an unrecognized id (forward-compat / spurious wake).
     pub other: bool,
 }
 
@@ -152,15 +157,15 @@ impl ClientEvents {
         })
     }
 
- /// Tell the worker a request is waiting in the request-response ring.
+    /// Tell the worker a request is waiting in the request-response ring.
     pub(crate) fn notify_request(&self) {
         let _ = self
             .req_notifier
             .notify_with_custom_event_id(EventId::new(EVT_REQUEST));
     }
 
- /// Park until a wake fires or `timeout` elapses, draining every pending
- /// event id so a backlog cannot cause an immediate re-wake spin.
+    /// Park until a wake fires or `timeout` elapses, draining every pending
+    /// event id so a backlog cannot cause an immediate re-wake spin.
     pub(crate) fn wait(&self, timeout: Duration) -> anyhow::Result<WakeEvents> {
         let mut ev = WakeEvents::default();
         self.wake_listener
@@ -177,9 +182,9 @@ impl ClientEvents {
         Ok(ev)
     }
 
- /// A cloneable wake source the command ingress fires after enqueuing a
- /// command, so the parked host wakes immediately instead of after the
- /// safety-net timeout.
+    /// A cloneable wake source the command ingress fires after enqueuing a
+    /// command, so the parked host wakes immediately instead of after the
+    /// safety-net timeout.
     pub(crate) fn command_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
@@ -187,8 +192,8 @@ impl ClientEvents {
         }
     }
 
- /// A cloneable wake source the worker-death watcher fires on child exit, so
- /// an idle host detects death immediately (no liveness-poll floor).
+    /// A cloneable wake source the worker-death watcher fires on child exit, so
+    /// an idle host detects death immediately (no liveness-poll floor).
     pub(crate) fn death_wake(&self) -> WakeSender {
         WakeSender {
             notifier: Arc::clone(&self.wake_notifier),
@@ -216,8 +221,8 @@ impl ServerEvents {
         })
     }
 
- /// Park until a request notification arrives or `timeout` elapses, draining
- /// every pending id.
+    /// Park until a request notification arrives or `timeout` elapses, draining
+    /// every pending id.
     pub(crate) fn wait_request(&self, timeout: Duration) -> anyhow::Result<()> {
         self.req_listener
             .timed_wait_all(|_id| {}, timeout)
@@ -225,7 +230,7 @@ impl ServerEvents {
         Ok(())
     }
 
- /// Tell the host a response is available in the request-response ring.
+    /// Tell the host a response is available in the request-response ring.
     pub(crate) fn notify_response(&self) {
         let _ = self
             .wake_notifier

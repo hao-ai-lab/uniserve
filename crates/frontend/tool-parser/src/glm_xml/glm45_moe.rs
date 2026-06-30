@@ -16,7 +16,7 @@ use crate::{Result, Tool, ToolParser, ToolParserOutput};
 pub struct Glm45MoeToolParser(GlmXmlToolParser);
 
 impl Glm45MoeToolParser {
- /// Create a GLM-4.5/4.6 MoE tool parser.
+    /// Create a GLM-4.5/4.6 MoE tool parser.
     pub(super) fn new(tools: &[Tool]) -> Self {
         Self(GlmXmlToolParser::new(tools, Separator::Newline))
     }

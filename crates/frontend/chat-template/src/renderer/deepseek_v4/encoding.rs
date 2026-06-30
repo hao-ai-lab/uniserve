@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 
 use crate::error::{Error, Result};
-use crate::request::{ChatContent, ChatMessage, ChatRequest, ChatTool, ReasoningEffort};
 use crate::renderer::deepseek_dsml::{
     BOS_TOKEN, DsmlWrapper, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN, ThinkingMode,
     render_tool_calls, render_tool_schema, tool_response_block_bounds, write_assistant_reasoning,
     write_assistant_text, write_chat_content,
 };
+use crate::request::{ChatContent, ChatMessage, ChatRequest, ChatTool, ReasoningEffort};
 use crate::{AssistantContentBlock, AssistantMessageExt};
 
 /// Human-readable model label used in this renderer's error messages.
@@ -69,10 +69,10 @@ pub(super) fn render_request(request: &ChatRequest) -> Result<String> {
             }
             ChatMessage::User { content } => render_user_message(&mut out, content)?,
             ChatMessage::Assistant { content } => {
- // Mirror Python: thinking block (reasoning + </think>) is
- // emitted whenever thinking is active and reasoning isn't
- // dropped - i.e. drop_thinking is off OR this turn lies
- // strictly after the last user turn.
+                // Mirror Python: thinking block (reasoning + </think>) is
+                // emitted whenever thinking is active and reasoning isn't
+                // dropped - i.e. drop_thinking is off OR this turn lies
+                // strictly after the last user turn.
                 let emit_thinking_block = thinking_mode == ThinkingMode::Thinking
                     && (!drop_thinking || current_render_index > last_user_render_index);
                 let append_eos = !(message_index + 1 == request.messages.len()

@@ -22,9 +22,9 @@ use crate::tensor::{WireArrayData, WireNdArray};
 pub struct TokenLogprob {
     pub token_id: u32,
     pub logprob: f32,
- /// The sampled/selected token uses its actual vocab rank. Remaining entries
- /// use 1-based top-k ranks matching the engine's returned candidate
- /// order.
+    /// The sampled/selected token uses its actual vocab rank. Remaining entries
+    /// use 1-based top-k ranks matching the engine's returned candidate
+    /// order.
     pub rank: u32,
 }
 
@@ -38,15 +38,15 @@ pub struct PositionLogprobs {
 }
 
 impl PositionLogprobs {
- /// Convert one decoded logprobs row into this per-position form by grouping
- /// each token/logprob pair together with the sampled/selected token's
- /// actual vocab rank.
+    /// Convert one decoded logprobs row into this per-position form by grouping
+    /// each token/logprob pair together with the sampled/selected token's
+    /// actual vocab rank.
 
- /// `token_ids` is still in raw signed form: the engine right-pads ragged
- /// top-k rows with a `-1` sentinel (see [`array::TOKEN_ID_PADDING_SENTINEL`])
- /// in the trailing columns. Those padding slots carry no real token and are
- /// skipped here rather than decoded into bogus [`TokenLogprob`] entries. The
- /// sampled/selected token in column 0 is never padded.
+    /// `token_ids` is still in raw signed form: the engine right-pads ragged
+    /// top-k rows with a `-1` sentinel (see [`array::TOKEN_ID_PADDING_SENTINEL`])
+    /// in the trailing columns. Those padding slots carry no real token and are
+    /// skipped here rather than decoded into bogus [`TokenLogprob`] entries. The
+    /// sampled/selected token in column 0 is never padded.
     fn from_decoded_row(token_ids: &[i64], logprobs: &[f32], sampled_rank: u32) -> Result<Self> {
         if token_ids.len() != logprobs.len() {
             bail_ext_value_decode!(
@@ -62,7 +62,7 @@ impl PositionLogprobs {
         let mut entries = Vec::with_capacity(token_ids.len());
         for (index, (&token_id, &logprob)) in token_ids.iter().zip(logprobs.iter()).enumerate() {
             let Some(token_id) = array::token_id_from_i64(token_id, "logprobs row")? else {
- // Padding sentinel: trailing ragged-row slot with no real token.
+                // Padding sentinel: trailing ragged-row slot with no real token.
                 continue;
             };
             let rank = if index == 0 {
@@ -92,18 +92,18 @@ impl PositionLogprobs {
 /// this per-position form to callers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Logprobs {
- /// One decoded logprobs record per scored position in this engine
- /// output.
+    /// One decoded logprobs record per scored position in this engine
+    /// output.
     pub positions: Vec<PositionLogprobs>,
 }
 
 impl Logprobs {
- /// Returns the number of scored positions in this payload.
+    /// Returns the number of scored positions in this payload.
     pub fn len(&self) -> usize {
         self.positions.len()
     }
 
- /// Returns whether the payload contains no scored positions.
+    /// Returns whether the payload contains no scored positions.
     pub fn is_empty(&self) -> bool {
         self.positions.is_empty()
     }
@@ -114,26 +114,26 @@ impl Logprobs {
 /// returned to callers.
 #[derive(Clone, PartialEq, Debug, EnumAsInner)]
 pub enum MaybeWireLogprobs {
- /// The logprobs are still in the wire format and need to be resolved by
- /// looking up aux frames and decoding raw views. Should only be used
- /// internally during deserialization.
+    /// The logprobs are still in the wire format and need to be resolved by
+    /// looking up aux frames and decoding raw views. Should only be used
+    /// internally during deserialization.
     Wire(Box<WireLogprobs>),
- /// The actual decoded logprobs value,
+    /// The actual decoded logprobs value,
     Direct(Logprobs),
 }
 
 impl Deref for MaybeWireLogprobs {
     type Target = Logprobs;
 
- /// Dereferences to the decoded [`Logprobs`].
+    /// Dereferences to the decoded [`Logprobs`].
 
- /// # Panics
+    /// # Panics
 
- /// Panics if the value is still in [`MaybeWireLogprobs::Wire`] form (i.e.
- /// [`resolve`](MaybeWireLogprobs::resolve) has not yet run). The `Deref`
- /// trait cannot signal this fallibly, so callers that may hold an
- /// unresolved value must use the [`as_direct`](Self::as_direct) /
- /// [`into_direct`](Self::into_direct) accessors instead.
+    /// Panics if the value is still in [`MaybeWireLogprobs::Wire`] form (i.e.
+    /// [`resolve`](MaybeWireLogprobs::resolve) has not yet run). The `Deref`
+    /// trait cannot signal this fallibly, so callers that may hold an
+    /// unresolved value must use the [`as_direct`](Self::as_direct) /
+    /// [`into_direct`](Self::into_direct) accessors instead.
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Wire(_) => panic!(
@@ -146,15 +146,15 @@ impl Deref for MaybeWireLogprobs {
 }
 
 impl DerefMut for MaybeWireLogprobs {
- /// Mutably dereferences to the decoded [`Logprobs`].
+    /// Mutably dereferences to the decoded [`Logprobs`].
 
- /// # Panics
+    /// # Panics
 
- /// Panics if the value is still in [`MaybeWireLogprobs::Wire`] form (i.e.
- /// [`resolve`](MaybeWireLogprobs::resolve) has not yet run). The `DerefMut`
- /// trait cannot signal this fallibly, so callers that may hold an
- /// unresolved value must use the [`as_direct_mut`](Self::as_direct_mut)
- /// accessor instead.
+    /// Panics if the value is still in [`MaybeWireLogprobs::Wire`] form (i.e.
+    /// [`resolve`](MaybeWireLogprobs::resolve) has not yet run). The `DerefMut`
+    /// trait cannot signal this fallibly, so callers that may hold an
+    /// unresolved value must use the [`as_direct_mut`](Self::as_direct_mut)
+    /// accessor instead.
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             Self::Wire(_) => panic!(
@@ -171,7 +171,7 @@ impl<'de> Deserialize<'de> for MaybeWireLogprobs {
     where
         D: Deserializer<'de>,
     {
- // When deserializing, it's always in the wire form.
+        // When deserializing, it's always in the wire form.
         WireLogprobs::deserialize(deserializer).map(|v| Self::Wire(Box::new(v)))
     }
 }
@@ -181,7 +181,7 @@ impl Serialize for MaybeWireLogprobs {
     where
         S: serde::Serializer,
     {
- // For testing purposes only. We don't actually serialize it into aux frames.
+        // For testing purposes only. We don't actually serialize it into aux frames.
         match self {
             Self::Wire(value) => value.serialize(serializer),
             Self::Direct(value) => WireLogprobs::from_direct(value)
@@ -192,8 +192,8 @@ impl Serialize for MaybeWireLogprobs {
 }
 
 impl MaybeWireLogprobs {
- /// Resolve the wire representation into decoded logprobs by looking up aux
- /// frames and decoding raw views as needed.
+    /// Resolve the wire representation into decoded logprobs by looking up aux
+    /// frames and decoding raw views as needed.
     fn resolve<Frame>(self, frames: &[Frame], field_prefix: &str) -> Result<Self>
     where
         Frame: AsRef<[u8]>,
@@ -206,8 +206,8 @@ impl MaybeWireLogprobs {
 }
 
 impl EngineCoreOutputs {
- /// Resolve all wire-format fields in-place by looking up aux frames and
- /// decoding raw-view payloads as needed.
+    /// Resolve all wire-format fields in-place by looking up aux frames and
+    /// decoding raw-view payloads as needed.
     fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
     where
         Frame: AsRef<[u8]>,
@@ -220,8 +220,8 @@ impl EngineCoreOutputs {
 }
 
 impl EngineCoreOutput {
- /// Resolve all wire-format fields in-place by looking up aux frames and
- /// decoding raw-view payloads as needed.
+    /// Resolve all wire-format fields in-place by looking up aux frames and
+    /// decoding raw-view payloads as needed.
     fn resolve_in_place<Frame>(&mut self, frames: &[Frame]) -> Result<()>
     where
         Frame: AsRef<[u8]>,
@@ -237,11 +237,11 @@ impl EngineCoreOutput {
 }
 
 impl WireLogprobs {
- /// Convert semantic per-position logprobs into the Python wire tuple shape.
+    /// Convert semantic per-position logprobs into the Python wire tuple shape.
 
- /// This exists mainly so Rust-side tests can inject semantic logprobs into
- /// mocked engine outputs without manually building ndarray
- /// raw-view tuples.
+    /// This exists mainly so Rust-side tests can inject semantic logprobs into
+    /// mocked engine outputs without manually building ndarray
+    /// raw-view tuples.
     fn from_direct(value: &Logprobs) -> std::result::Result<Self, String> {
         let rows = value.positions.len();
         let cols = value
@@ -292,9 +292,9 @@ impl WireLogprobs {
         })
     }
 
- /// Resolve the wire-format logprobs into semantic [`Logprobs`] records by
- /// looking up aux frames, decoding raw views, and grouping each row
- /// into one [`PositionLogprobs`].
+    /// Resolve the wire-format logprobs into semantic [`Logprobs`] records by
+    /// looking up aux frames, decoding raw views, and grouping each row
+    /// into one [`PositionLogprobs`].
     fn resolve<Frame>(self, frames: &[Frame], field_prefix: &str) -> Result<Logprobs>
     where
         Frame: AsRef<[u8]>,

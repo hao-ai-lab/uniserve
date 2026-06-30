@@ -370,8 +370,8 @@ fn seq_result_to_fb(sr: &SeqResult) -> fbs::SeqResultT {
         denoise_done: sr.denoise_done,
         num_steps_done: sr.num_steps_done,
         image_png_b64: sr.image_png_b64.clone(),
- // `SeqResult.image_hw` is canonically `(height, width)`; store each
- // component into the matching schema field so the field names do not lie.
+        // `SeqResult.image_hw` is canonically `(height, width)`; store each
+        // component into the matching schema field so the field names do not lie.
         image_hw_h: sr.image_hw.map(|(h, _)| h),
         image_hw_w: sr.image_hw.map(|(_, w)| w),
         sampled_logprob: sr.sampled_logprob,
@@ -400,7 +400,7 @@ fn seq_result_from_fb(sr: fbs::SeqResultT) -> SeqResult {
         denoise_done: sr.denoise_done,
         num_steps_done: sr.num_steps_done,
         image_png_b64: sr.image_png_b64,
- // Reassemble the canonical `(height, width)` tuple from the matching fields.
+        // Reassemble the canonical `(height, width)` tuple from the matching fields.
         image_hw: match (sr.image_hw_h, sr.image_hw_w) {
             (Some(h), Some(w)) => Some((h, w)),
             _ => None,
@@ -450,6 +450,11 @@ fn caps_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         ),
         max_latent_size: caps.max_latent_size,
         latent_downsample: caps.latent_downsample,
+        max_vae_grid_tokens: caps.max_vae_grid_tokens,
+        max_vit_grid_tokens: caps.max_vit_grid_tokens,
+        commit_marker_tokens: caps.commit_marker_tokens,
+        gen_rope_advance: caps.gen_rope_advance,
+        max_cfg_branches: caps.max_cfg_branches,
         bytes_per_token: caps.bytes_per_token,
         groups: Some(caps.groups.iter().map(kv_group_to_fb).collect()),
         kv_dtype: Some(caps.kv_dtype.clone()),
@@ -496,6 +501,23 @@ fn caps_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
             .collect::<anyhow::Result<_>>()?,
         max_latent_size: caps.max_latent_size,
         latent_downsample: caps.latent_downsample,
+        max_vae_grid_tokens: caps.max_vae_grid_tokens,
+        max_vit_grid_tokens: caps.max_vit_grid_tokens,
+        commit_marker_tokens: if caps.commit_marker_tokens == 0 {
+            2
+        } else {
+            caps.commit_marker_tokens
+        },
+        gen_rope_advance: if caps.gen_rope_advance == 0 {
+            2
+        } else {
+            caps.gen_rope_advance
+        },
+        max_cfg_branches: if caps.max_cfg_branches == 0 {
+            3
+        } else {
+            caps.max_cfg_branches
+        },
         bytes_per_token: caps.bytes_per_token,
         groups: caps
             .groups
@@ -937,7 +959,10 @@ const REQUEST_KINDS: &[(RequestKind, fbs::ReqKind)] = &[
     (RequestKind::LoadLora, fbs::ReqKind::LoadLora),
     (RequestKind::UnloadLora, fbs::ReqKind::UnloadLora),
     (RequestKind::FreeEncoder, fbs::ReqKind::FreeEncoder),
-    (RequestKind::ResetPrefixCache, fbs::ReqKind::ResetPrefixCache),
+    (
+        RequestKind::ResetPrefixCache,
+        fbs::ReqKind::ResetPrefixCache,
+    ),
     (RequestKind::Sleep, fbs::ReqKind::Sleep),
     (RequestKind::WakeUp, fbs::ReqKind::WakeUp),
     (RequestKind::GetMetrics, fbs::ReqKind::GetMetrics),
@@ -1060,8 +1085,8 @@ mod tests {
 
     #[test]
     fn seq_result_image_hw_field_labels_match_height_width() {
- // `SeqResult.image_hw` is canonically `(height, width)`. Use asymmetric
- // dims so a height/width swap in either lambda would be caught.
+        // `SeqResult.image_hw` is canonically `(height, width)`. Use asymmetric
+        // dims so a height/width swap in either lambda would be caught.
         let height = 720u32;
         let width = 1280u32;
         let native = SeqResult {
@@ -1071,8 +1096,8 @@ mod tests {
         };
 
         let fb = seq_result_to_fb(&native);
- // The schema field named `image_hw_h` must carry the height component,
- // and `image_hw_w` the width component.
+        // The schema field named `image_hw_h` must carry the height component,
+        // and `image_hw_w` the width component.
         assert_eq!(fb.image_hw_h, Some(height));
         assert_eq!(fb.image_hw_w, Some(width));
 
@@ -1082,9 +1107,9 @@ mod tests {
 
     #[test]
     fn kind_tables_round_trip_and_reject_dead_cancel() {
- // both directions derive from the single REQUEST_KINDS /
- // RESPONSE_KINDS tables, so a `name -> fb -> name` round-trip over the
- // whole table catches any drift between the two lookups.
+        // both directions derive from the single REQUEST_KINDS /
+        // RESPONSE_KINDS tables, so a `name -> fb -> name` round-trip over the
+        // whole table catches any drift between the two lookups.
         for (kind, fb) in REQUEST_KINDS {
             assert_eq!(req_kind_to_fb(*kind), *fb, "to_fb drift: {kind:?}");
             assert_eq!(
@@ -1101,7 +1126,7 @@ mod tests {
                 "from_fb drift: {name}"
             );
         }
- // the `cancel` request kind is not in the wire vocabulary.
+        // the `cancel` request kind is not in the wire vocabulary.
         assert!(RequestKind::from_wire_str("cancel").is_none());
     }
 
@@ -1126,7 +1151,7 @@ mod tests {
         cfg.interval_hi = f32::NEG_INFINITY;
         assert!(cfg_from_fb(cfg).is_err());
 
- // A fully-finite cfg still decodes.
+        // A fully-finite cfg still decodes.
         let cfg = fbs::CfgParamsT::default();
         assert!(cfg_from_fb(cfg).is_ok());
     }

@@ -23,6 +23,11 @@ def test_caps_error_and_flatbuffers_schema_are_pinned():
         "max_latent_size",
         "latent_downsample",
         "bytes_per_token",
+        "max_vae_grid_tokens",
+        "max_vit_grid_tokens",
+        "commit_marker_tokens",
+        "gen_rope_advance",
+        "max_cfg_branches",
         "groups",
         "kv_dtype",
         "attention_backend",
@@ -59,4 +64,9 @@ def test_caps_error_and_flatbuffers_schema_are_pinned():
     # caught here, where there is otherwise no behavioural IPC test.
     assert "table EngineCaps" in schema
     assert "pipeline_depth:uint;" in schema
+    assert "max_vae_grid_tokens:uint;" in schema
+    assert "max_vit_grid_tokens:uint;" in schema
+    assert "commit_marker_tokens:uint;" in schema
+    assert "gen_rope_advance:uint;" in schema
+    assert "max_cfg_branches:uint;" in schema
     assert "call_id:ulong = null;" in schema

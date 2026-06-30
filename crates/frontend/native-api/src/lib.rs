@@ -9,5 +9,8 @@ pub mod resolution;
 pub mod schema;
 
 pub use builder::NativeRequestBuilder;
-pub use profiles::{NativeModelProfile, resolve_native_profile};
+pub use profiles::{
+    NativeDelimitedText, NativeModelProfile, NativeOutputFilter, resolve_native_profile,
+    resolve_native_profile_for_model,
+};
 pub use schema::{NativeGenerateBody, NativeImageBody};

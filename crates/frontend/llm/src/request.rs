@@ -17,16 +17,16 @@ use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateRequest {
- /// Unique ID of the request.
+    /// Unique ID of the request.
     pub request_id: String,
- /// Token IDs of the prompt.
+    /// Token IDs of the prompt.
     pub prompt_token_ids: Vec<u32>,
- /// Sampling parameters forwarded to the engine.
+    /// Sampling parameters forwarded to the engine.
     pub sampling_params: EngineCoreSamplingParams,
- /// Optional multimodal features already prepared by `chat`.
+    /// Optional multimodal features already prepared by `chat`.
     pub mm_features: Option<MmFeatures>,
 
- // Fields below are currently likely unused by callers.
+    // Fields below are currently likely unused by callers.
     pub arrival_time: Option<f64>,
     pub cache_salt: Option<String>,
     pub trace_headers: Option<BTreeMap<String, String>>,
@@ -42,7 +42,7 @@ pub(crate) struct PreparedGenerateRequest {
 }
 
 impl GenerateRequest {
- /// Validate and lower this request into the raw engine request format.
+    /// Validate and lower this request into the raw engine request format.
     pub(crate) fn prepare(self, randomize_request_id: bool) -> Result<PreparedGenerateRequest> {
         if self.prompt_token_ids.is_empty() {
             return Err(Error::EmptyPromptTokenIds {
@@ -65,10 +65,10 @@ impl GenerateRequest {
 
         let external_request_id = request_id;
         let engine_request_id = if randomize_request_id {
- // Use the full UUID (128 bits) as the suffix rather than truncating
- // to 8 hex chars (32 bits): the truncated form has a non-negligible
- // birthday-bound collision probability among requests sharing the
- // same external request id.
+            // Use the full UUID (128 bits) as the suffix rather than truncating
+            // to 8 hex chars (32 bits): the truncated form has a non-negligible
+            // birthday-bound collision probability among requests sharing the
+            // same external request id.
             let random_suffix = Uuid::new_v4().simple().to_string();
             format!("{external_request_id}-{random_suffix}")
         } else {
@@ -104,7 +104,7 @@ impl GenerateRequest {
 }
 
 impl PreparedGenerateRequest {
- /// Return the original prompt token IDs copied into the raw engine request.
+    /// Return the original prompt token IDs copied into the raw engine request.
     pub(crate) fn prompt_token_ids(&self) -> &[u32] {
         self.engine_request
             .prompt_token_ids
@@ -185,8 +185,8 @@ mod tests {
         let suffix = request_id
             .strip_prefix("req-1-")
             .expect("randomized id keeps the external prefix");
- // A simple-format UUID is 32 hex chars; the previous implementation
- // truncated it to 8, weakening collision resistance.
+        // A simple-format UUID is 32 hex chars; the previous implementation
+        // truncated it to 8, weakening collision resistance.
         assert_eq!(suffix.len(), 32);
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
     }

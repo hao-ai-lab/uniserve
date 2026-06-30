@@ -22,8 +22,8 @@ use uniserve_chat_template::request::{
     GenerationPromptMode,
 };
 use uniserve_chat_template::{
-    AssistantContentBlock, AssistantToolCall, ChatRenderer, DeepSeekV32ChatRenderer,
-    DeepSeekV4ChatRenderer,
+    AssistantContentBlock, AssistantToolCall, ChatRenderer, DeepSeekV4ChatRenderer,
+    DeepSeekV32ChatRenderer,
 };
 
 const QWEN3_TEMPLATE: &str = include_str!("templates/qwen3.jinja");
@@ -45,7 +45,11 @@ fn text_to_prompt(rendered: uniserve_chat_template::RenderedPrompt) -> String {
         .expect("renderer should produce a text prompt")
 }
 
-fn hf_render(template: &str, format: ChatTemplateContentFormatOption, request: &ChatRequest) -> String {
+fn hf_render(
+    template: &str,
+    format: ChatTemplateContentFormatOption,
+    request: &ChatRequest,
+) -> String {
     let rendered = HfChatRenderer::new(Some(template.to_owned()), HashMap::new(), format)
         .expect("template should compile")
         .render(request)
@@ -111,7 +115,11 @@ fn auto_detection_treats_alias_loop_template_as_string() {
     // first, which the detector must NOT treat as a direct content loop.
     let template = "{%- for message in messages -%}{%- set parts = message.content -%}\
 {%- if parts is string -%}STR:{{ parts }}{%- else -%}LIST{%- endif -%}{%- endfor -%}";
-    let rendered = hf_render(template, ChatTemplateContentFormatOption::Auto, &multipart_user());
+    let rendered = hf_render(
+        template,
+        ChatTemplateContentFormatOption::Auto,
+        &multipart_user(),
+    );
     assert_eq!(rendered, "STR:ab");
 }
 
@@ -120,7 +128,11 @@ fn auto_detection_treats_length_and_index_access_template_as_string() {
     // Length / index access on content must not be mistaken for a content loop.
     let template = "{%- for message in messages -%}len={{ message.content|length }};\
 first={{ message.content[0] }}{%- endfor -%}";
-    let rendered = hf_render(template, ChatTemplateContentFormatOption::Auto, &multipart_user());
+    let rendered = hf_render(
+        template,
+        ChatTemplateContentFormatOption::Auto,
+        &multipart_user(),
+    );
     // String content "ab": length 2, index 0 is the character 'a'.
     assert_eq!(rendered, "len=2;first=a");
 }
@@ -129,7 +141,11 @@ first={{ message.content[0] }}{%- endfor -%}";
 fn auto_detection_treats_direct_content_loop_template_as_openai() {
     let template = "{%- for message in messages -%}\
 {%- for part in message.content -%}{{ part.text }}|{%- endfor -%}{%- endfor -%}";
-    let rendered = hf_render(template, ChatTemplateContentFormatOption::Auto, &multipart_user());
+    let rendered = hf_render(
+        template,
+        ChatTemplateContentFormatOption::Auto,
+        &multipart_user(),
+    );
     // Each part surfaces as a structured `{text: ...}` object.
     assert_eq!(rendered, "a|b|");
 }
@@ -164,11 +180,21 @@ fn auto_detection_classifies_hermes_committed_template_as_string() {
     // (`'\n' + message.content`). `Auto` must therefore behave exactly like the
     // explicit String force, and differently from the OpenAI force.
     let request = committed_template_probe_request();
-    let auto = hf_render_outcome(HERMES_STRING_TEMPLATE, ChatTemplateContentFormatOption::Auto, &request);
-    let forced_string =
-        hf_render_outcome(HERMES_STRING_TEMPLATE, ChatTemplateContentFormatOption::String, &request);
-    let forced_openai =
-        hf_render_outcome(HERMES_STRING_TEMPLATE, ChatTemplateContentFormatOption::OpenAi, &request);
+    let auto = hf_render_outcome(
+        HERMES_STRING_TEMPLATE,
+        ChatTemplateContentFormatOption::Auto,
+        &request,
+    );
+    let forced_string = hf_render_outcome(
+        HERMES_STRING_TEMPLATE,
+        ChatTemplateContentFormatOption::String,
+        &request,
+    );
+    let forced_openai = hf_render_outcome(
+        HERMES_STRING_TEMPLATE,
+        ChatTemplateContentFormatOption::OpenAi,
+        &request,
+    );
 
     assert_eq!(
         auto, forced_string,
@@ -190,11 +216,21 @@ fn auto_detection_classifies_gemma4_committed_template_as_openai() {
     // the synthetic direct-content-loop case; here we pin that Auto lands on
     // OpenAI for a real, AST-detected OpenAI template.)
     let request = committed_template_probe_request();
-    let auto = hf_render_outcome(GEMMA4_OPENAI_TEMPLATE, ChatTemplateContentFormatOption::Auto, &request);
-    let forced_openai =
-        hf_render_outcome(GEMMA4_OPENAI_TEMPLATE, ChatTemplateContentFormatOption::OpenAi, &request);
+    let auto = hf_render_outcome(
+        GEMMA4_OPENAI_TEMPLATE,
+        ChatTemplateContentFormatOption::Auto,
+        &request,
+    );
+    let forced_openai = hf_render_outcome(
+        GEMMA4_OPENAI_TEMPLATE,
+        ChatTemplateContentFormatOption::OpenAi,
+        &request,
+    );
 
-    assert!(auto.is_ok(), "Gemma4 render under Auto should succeed, got: {auto:?}");
+    assert!(
+        auto.is_ok(),
+        "Gemma4 render under Auto should succeed, got: {auto:?}"
+    );
     assert_eq!(
         auto, forced_openai,
         "Auto detection for Gemma4 should match the explicit OpenAI rendering"
@@ -204,13 +240,21 @@ fn auto_detection_classifies_gemma4_committed_template_as_openai() {
 #[test]
 fn detector_probe_reports_string_for_string_format() {
     // Sanity anchor for the probe template itself under an explicit String force.
-    let rendered = hf_render(DETECT_PROBE, ChatTemplateContentFormatOption::String, &multipart_user());
+    let rendered = hf_render(
+        DETECT_PROBE,
+        ChatTemplateContentFormatOption::String,
+        &multipart_user(),
+    );
     assert_eq!(rendered, "STR:ab");
 }
 
 #[test]
 fn detector_probe_reports_list_for_openai_format() {
-    let rendered = hf_render(DETECT_PROBE, ChatTemplateContentFormatOption::OpenAi, &multipart_user());
+    let rendered = hf_render(
+        DETECT_PROBE,
+        ChatTemplateContentFormatOption::OpenAi,
+        &multipart_user(),
+    );
     assert_eq!(rendered, "LIST:a:b");
 }
 
@@ -240,13 +284,20 @@ fn qwen_family_render_is_deterministic_across_repeated_renders() {
     let first = text_to_prompt(renderer.render(&request).unwrap());
     let second = text_to_prompt(renderer.render(&request).unwrap());
 
-    assert_eq!(first, second, "repeated Qwen renders must be byte-identical");
+    assert_eq!(
+        first, second,
+        "repeated Qwen renders must be byte-identical"
+    );
 }
 
 #[test]
 fn qwen_family_preserves_historical_assistant_completion_text_byte_identically() {
     let request = qwen_history();
-    let rendered = hf_render(QWEN3_TEMPLATE, ChatTemplateContentFormatOption::Auto, &request);
+    let rendered = hf_render(
+        QWEN3_TEMPLATE,
+        ChatTemplateContentFormatOption::Auto,
+        &request,
+    );
 
     // The historical assistant turn's visible completion text must survive
     // intact inside the rendered prompt, framed by the assistant turn markers.
@@ -293,7 +344,10 @@ fn deepseek_v4_render(messages: Vec<ChatMessage>) -> String {
 fn deepseek_v32_family_render_is_deterministic_across_repeated_renders() {
     let first = deepseek_v32_render(deepseek_history());
     let second = deepseek_v32_render(deepseek_history());
-    assert_eq!(first, second, "repeated DeepSeek V3.2 renders must be byte-identical");
+    assert_eq!(
+        first, second,
+        "repeated DeepSeek V3.2 renders must be byte-identical"
+    );
 }
 
 #[test]
@@ -312,7 +366,10 @@ fn deepseek_v32_family_preserves_historical_assistant_completion_text() {
 fn deepseek_v4_family_render_is_deterministic_across_repeated_renders() {
     let first = deepseek_v4_render(deepseek_history());
     let second = deepseek_v4_render(deepseek_history());
-    assert_eq!(first, second, "repeated DeepSeek V4 renders must be byte-identical");
+    assert_eq!(
+        first, second,
+        "repeated DeepSeek V4 renders must be byte-identical"
+    );
 }
 
 #[test]
@@ -353,42 +410,76 @@ fn deepseek_v32_tool_call_arguments_preserve_key_order_and_number_precision() {
     let rendered = deepseek_v32_render(assistant_tool_call_history(MIXED_ARGS));
 
     // DSML emits one `<parameter>` per argument, in original key order.
-    let zulu = rendered.find("name=\"zulu\"").expect("zulu parameter present");
-    let alpha = rendered.find("name=\"alpha\"").expect("alpha parameter present");
-    let mike = rendered.find("name=\"mike\"").expect("mike parameter present");
-    let delta = rendered.find("name=\"delta\"").expect("delta parameter present");
+    let zulu = rendered
+        .find("name=\"zulu\"")
+        .expect("zulu parameter present");
+    let alpha = rendered
+        .find("name=\"alpha\"")
+        .expect("alpha parameter present");
+    let mike = rendered
+        .find("name=\"mike\"")
+        .expect("mike parameter present");
+    let delta = rendered
+        .find("name=\"delta\"")
+        .expect("delta parameter present");
     assert!(
         zulu < alpha && alpha < mike && mike < delta,
         "DSML parameters must follow the original key order, got:\n{rendered}"
     );
 
     // Integer stays integer; `1.00` normalizes to `1.0`; array preserved.
-    assert!(rendered.contains("string=\"false\">2</"), "integer arg should render as 2");
-    assert!(rendered.contains("string=\"false\">1.0</"), "1.00 should normalize to 1.0");
+    assert!(
+        rendered.contains("string=\"false\">2</"),
+        "integer arg should render as 2"
+    );
+    assert!(
+        rendered.contains("string=\"false\">1.0</"),
+        "1.00 should normalize to 1.0"
+    );
     assert!(
         rendered.contains("string=\"false\">[3, 4]</"),
         "array arg should render with json_dumps spacing, got:\n{rendered}"
     );
     // String value is emitted raw under string="true".
-    assert!(rendered.contains("string=\"true\">hi</"), "string arg should be raw under string=true");
+    assert!(
+        rendered.contains("string=\"true\">hi</"),
+        "string arg should be raw under string=true"
+    );
 }
 
 #[test]
 fn deepseek_v4_tool_call_arguments_preserve_key_order_and_number_precision() {
     let rendered = deepseek_v4_render(assistant_tool_call_history(MIXED_ARGS));
 
-    let zulu = rendered.find("name=\"zulu\"").expect("zulu parameter present");
-    let alpha = rendered.find("name=\"alpha\"").expect("alpha parameter present");
-    let mike = rendered.find("name=\"mike\"").expect("mike parameter present");
-    let delta = rendered.find("name=\"delta\"").expect("delta parameter present");
+    let zulu = rendered
+        .find("name=\"zulu\"")
+        .expect("zulu parameter present");
+    let alpha = rendered
+        .find("name=\"alpha\"")
+        .expect("alpha parameter present");
+    let mike = rendered
+        .find("name=\"mike\"")
+        .expect("mike parameter present");
+    let delta = rendered
+        .find("name=\"delta\"")
+        .expect("delta parameter present");
     assert!(
         zulu < alpha && alpha < mike && mike < delta,
         "DSML parameters must follow the original key order, got:\n{rendered}"
     );
 
-    assert!(rendered.contains("string=\"false\">2</"), "integer arg should render as 2");
-    assert!(rendered.contains("string=\"false\">1.0</"), "1.00 should normalize to 1.0");
-    assert!(rendered.contains("string=\"true\">hi</"), "string arg should be raw under string=true");
+    assert!(
+        rendered.contains("string=\"false\">2</"),
+        "integer arg should render as 2"
+    );
+    assert!(
+        rendered.contains("string=\"false\">1.0</"),
+        "1.00 should normalize to 1.0"
+    );
+    assert!(
+        rendered.contains("string=\"true\">hi</"),
+        "string arg should be raw under string=true"
+    );
 }
 
 #[test]
@@ -414,7 +505,10 @@ fn hf_family_tojson_preserves_key_order_and_number_precision() {
         "{{ messages[1].tool_calls[0].function.arguments|tojson(separators=[',', ':']) }}";
     let rendered = hf_render(template, ChatTemplateContentFormatOption::Auto, &request);
 
-    assert_eq!(rendered, r#"{"zulu":2,"alpha":1.0,"mike":"hi","delta":[3,4]}"#);
+    assert_eq!(
+        rendered,
+        r#"{"zulu":2,"alpha":1.0,"mike":"hi","delta":[3,4]}"#
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -11,8 +11,8 @@ const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
 
 #[easy_ext::ext(ShapeExt)]
 impl [usize] {
- /// Returned the total number of elements implied by this shape, or `None`
- /// if the product of the dimensions overflows `usize`.
+    /// Returned the total number of elements implied by this shape, or `None`
+    /// if the product of the dimensions overflows `usize`.
     pub fn checked_numel(&self) -> Option<usize> {
         self.iter()
             .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
@@ -32,7 +32,7 @@ pub struct WireNdArray {
 }
 
 impl WireNdArray {
- /// Build a float32 tensor/ndarray backed by native-endian raw-view bytes.
+    /// Build a float32 tensor/ndarray backed by native-endian raw-view bytes.
     pub fn from_f32(shape: Vec<usize>, data: Vec<f32>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
@@ -42,7 +42,7 @@ impl WireNdArray {
         })
     }
 
- /// Build a float16 tensor/ndarray backed by native-endian raw-view bytes.
+    /// Build a float16 tensor/ndarray backed by native-endian raw-view bytes.
     pub fn from_f16(shape: Vec<usize>, data: Vec<f16>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
@@ -52,7 +52,7 @@ impl WireNdArray {
         })
     }
 
- /// Build a bfloat16 tensor/ndarray backed by native-endian raw-view bytes.
+    /// Build a bfloat16 tensor/ndarray backed by native-endian raw-view bytes.
     pub fn from_bf16(shape: Vec<usize>, data: Vec<bf16>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
@@ -62,7 +62,7 @@ impl WireNdArray {
         })
     }
 
- /// Build an int64 tensor/ndarray backed by native-endian raw-view bytes.
+    /// Build an int64 tensor/ndarray backed by native-endian raw-view bytes.
     pub fn from_i64(shape: Vec<usize>, data: Vec<i64>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
@@ -72,7 +72,7 @@ impl WireNdArray {
         })
     }
 
- /// Build a uint32 tensor/ndarray backed by native-endian raw-view bytes.
+    /// Build a uint32 tensor/ndarray backed by native-endian raw-view bytes.
     pub fn from_u32(shape: Vec<usize>, data: Vec<u32>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
@@ -82,10 +82,10 @@ impl WireNdArray {
         })
     }
 
- /// Build a bool tensor/ndarray backed by raw-view bytes.
+    /// Build a bool tensor/ndarray backed by raw-view bytes.
 
- /// This matches `torch.bool` storage: one byte per element, not a packed
- /// bitmap. Values are canonicalized as `false -> 0` and `true -> 1`.
+    /// This matches `torch.bool` storage: one byte per element, not a packed
+    /// bitmap. Values are canonicalized as `false -> 0` and `true -> 1`.
     pub fn from_bool(shape: Vec<usize>, data: Vec<bool>) -> Result<Self, String> {
         validate_element_count(&shape, data.len())?;
         Ok(Self {
@@ -95,10 +95,10 @@ impl WireNdArray {
         })
     }
 
- /// Build a tensor/ndarray from already-encoded raw-view bytes.
+    /// Build a tensor/ndarray from already-encoded raw-view bytes.
 
- /// Use this as an escape hatch when the caller already owns bytes that
- /// match the requested `dtype` and `shape`.
+    /// Use this as an escape hatch when the caller already owns bytes that
+    /// match the requested `dtype` and `shape`.
     pub fn from_raw(dtype: impl Into<String>, shape: Vec<usize>, data: Vec<u8>) -> Self {
         Self {
             dtype: dtype.into(),
@@ -136,10 +136,10 @@ pub type WireTensor = WireNdArray;
 
 #[derive(Debug, Clone, PartialEq, EnumAsInner)]
 pub enum WireArrayData {
- /// The index of the aux frame where the raw bytes of this array/tensor are
- /// stored.
+    /// The index of the aux frame where the raw bytes of this array/tensor are
+    /// stored.
     AuxIndex(usize),
- /// The raw bytes of this array/tensor.
+    /// The raw bytes of this array/tensor.
     RawView(Vec<u8>),
 }
 
@@ -172,17 +172,17 @@ impl Serialize for WireArrayData {
     where
         S: Serializer,
     {
- // Outbound serialization (Rust -> Python) only ever produces inline
- // raw-view bytes: every outbound payload — multimodal request tensors
- // and the test-only `MaybeWireLogprobs` serialization — is built via the
- // `RawView` constructors. `AuxIndex` is constructed *only* on the inbound
- // `Deserialize` path (decoding engine outputs) and resolved against the
- // multipart aux frames before reaching callers.
+        // Outbound serialization (Rust -> Python) only ever produces inline
+        // raw-view bytes: every outbound payload — multimodal request tensors
+        // and the test-only `MaybeWireLogprobs` serialization — is built via the
+        // `RawView` constructors. `AuxIndex` is constructed *only* on the inbound
+        // `Deserialize` path (decoding engine outputs) and resolved against the
+        // multipart aux frames before reaching callers.
 
- // There is no transport-level plumbing to emit aux frames outbound, so an
- // `AuxIndex` here cannot be turned into a meaningful wire payload. Rather
- // than silently emit a bare integer that no Python decoder expects, reject
- // it loudly so the bug surfaces at its source.
+        // There is no transport-level plumbing to emit aux frames outbound, so an
+        // `AuxIndex` here cannot be turned into a meaningful wire payload. Rather
+        // than silently emit a bare integer that no Python decoder expects, reject
+        // it loudly so the bug surfaces at its source.
         match self {
             Self::AuxIndex(index) => Err(serde::ser::Error::custom(format!(
                 "cannot serialize WireArrayData::AuxIndex({index}) outbound: aux-frame \
@@ -278,9 +278,9 @@ mod tests {
 
     #[test]
     fn aux_index_serialize_rejected_loudly() {
- // `AuxIndex` is an inbound-only wire form (built during `Deserialize`).
- // It has no outbound transport plumbing, so serializing it must fail
- // loudly rather than silently emit a meaningless integer.
+        // `AuxIndex` is an inbound-only wire form (built during `Deserialize`).
+        // It has no outbound transport plumbing, so serializing it must fail
+        // loudly rather than silently emit a meaningless integer.
         let err = rmpv::ext::to_value(WireArrayData::AuxIndex(7))
             .expect_err("AuxIndex must not serialize outbound");
         let message = err.to_string();
@@ -292,8 +292,8 @@ mod tests {
 
     #[test]
     fn aux_index_still_deserializes_from_integer() {
- // The inbound deserialize contract is unchanged: a bare integer maps to
- // an aux-frame reference.
+        // The inbound deserialize contract is unchanged: a bare integer maps to
+        // an aux-frame reference.
         let value: WireArrayData =
             rmpv::ext::from_value(Value::Integer(7u64.into())).expect("integer -> AuxIndex");
         assert_eq!(value, WireArrayData::AuxIndex(7));

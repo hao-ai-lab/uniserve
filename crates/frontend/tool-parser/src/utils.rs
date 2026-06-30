@@ -29,7 +29,7 @@ pub(super) fn partial_prefix_len(buffer: &str, token: &str) -> usize {
     let buffer_bytes = buffer.as_bytes();
     let token_bytes = token.as_bytes();
 
- // Scan from the longest possible suffix to preserve overlapping prefixes.
+    // Scan from the longest possible suffix to preserve overlapping prefixes.
     for index in tail_start..buffer.len() {
         if buffer_bytes[index] != first_byte {
             continue;
@@ -152,11 +152,11 @@ fn decode_xml_entity(entity: &str) -> Option<char> {
 /// maps silently drifted apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ValueTrim {
- /// Keep the value verbatim (MiniMax M2, HY3, DeepSeek DSML).
+    /// Keep the value verbatim (MiniMax M2, HY3, DeepSeek DSML).
     None,
- /// Trim all leading and trailing ASCII/Unicode whitespace (GLM).
+    /// Trim all leading and trailing ASCII/Unicode whitespace (GLM).
     Whitespace,
- /// Strip a single leading and a single trailing `\n` (Qwen Coder).
+    /// Strip a single leading and a single trailing `\n` (Qwen Coder).
     OneWrappingNewline,
 }
 
@@ -189,8 +189,12 @@ pub(super) fn xml_param_list<P>(
     mut parameter: impl FnMut(&mut &str) -> ModalResult<P>,
 ) -> ModalResult<Vec<P>> {
     let mut input = body;
-    delimited(ws0, repeat(0.., terminated(|i: &mut &str| parameter(i), ws0)), eof)
-        .parse_next(&mut input)
+    delimited(
+        ws0,
+        repeat(0.., terminated(|i: &mut &str| parameter(i), ws0)),
+        eof,
+    )
+    .parse_next(&mut input)
 }
 
 /// Streaming lexical state for a top-level JSON object.
@@ -212,7 +216,7 @@ enum JsonObjectScanPhase {
 }
 
 impl JsonObjectScanState {
- /// Returns whether the top-level JSON object has closed.
+    /// Returns whether the top-level JSON object has closed.
     pub(super) const fn complete(&self) -> bool {
         matches!(self.phase, JsonObjectScanPhase::Complete)
     }
@@ -379,7 +383,7 @@ pub(super) fn parse_buffered_event<E>(
         Ok(event) => event,
         Err(ErrMode::Incomplete(_)) => return Ok(None),
         Err(ErrMode::Backtrack(e) | ErrMode::Cut(e)) => {
- // Keep the context compact here; callers add parser-specific detail.
+            // Keep the context compact here; callers add parser-specific detail.
             return Err(parsing_failed!("{}", e));
         }
     };
@@ -414,7 +418,10 @@ mod tests {
 
     #[test]
     fn normalize_xml_value_trim_policies_are_independent() {
-        assert_eq!(normalize_xml_value("\n a&amp;b \n", ValueTrim::None), "\n a&b \n");
+        assert_eq!(
+            normalize_xml_value("\n a&amp;b \n", ValueTrim::None),
+            "\n a&b \n"
+        );
         assert_eq!(
             normalize_xml_value("\n a&amp;b \n", ValueTrim::Whitespace),
             "a&b"
@@ -440,8 +447,8 @@ mod tests {
             Ok((key.to_string(), value))
         }
 
-        let params = xml_param_list("  <k>a</k><v> 1&amp;2 </v>\n<k>b</k><v>3</v>  ", parameter)
-            .unwrap();
+        let params =
+            xml_param_list("  <k>a</k><v> 1&amp;2 </v>\n<k>b</k><v>3</v>  ", parameter).unwrap();
 
         assert_eq!(
             params,

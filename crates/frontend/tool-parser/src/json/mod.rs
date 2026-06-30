@@ -46,9 +46,9 @@ struct JsonToolCallConfig {
     marker_whitespace: JsonToolCallWhitespace,
     delimiter: Option<&'static str>,
     name_key: &'static str,
- /// Candidate JSON keys naming the arguments payload, tried in order.
- /// Most parsers use a single key like `["arguments"]`, but some accept
- /// multiple (e.g. InternLM2 accepts `parameters` or `arguments`).
+    /// Candidate JSON keys naming the arguments payload, tried in order.
+    /// Most parsers use a single key like `["arguments"]`, but some accept
+    /// multiple (e.g. InternLM2 accepts `parameters` or `arguments`).
     arguments_key: &'static [&'static str],
 }
 
@@ -86,7 +86,7 @@ struct JsonToolCallParser {
 }
 
 impl JsonToolCallParser {
- /// Create a marker-wrapped JSON tool-call parser.
+    /// Create a marker-wrapped JSON tool-call parser.
     fn new(config: JsonToolCallConfig) -> Self {
         Self {
             config,
@@ -108,9 +108,9 @@ impl JsonToolCallParser {
             self.buffer.drain(..consumed_len);
         }
 
- // Any bytes still buffered here belong to an event that has not yet
- // completed. Bound that retention so an unterminated tool call cannot
- // grow the buffer without limit.
+        // Any bytes still buffered here belong to an event that has not yet
+        // completed. Bound that retention so an unterminated tool call cannot
+        // grow the buffer without limit.
         if self.buffer.len() > MAX_BUFFER_BYTES {
             return Err(parsing_failed!(
                 "{} buffer exceeded {} bytes without completing a tool call",
@@ -137,7 +137,7 @@ impl JsonToolCallParser {
         Ok(output)
     }
 
- /// Apply one parsed JSON tool-call event to parser state and output.
+    /// Apply one parsed JSON tool-call event to parser state and output.
     fn apply_event(
         &mut self,
         event: JsonToolCallEvent,
@@ -527,8 +527,8 @@ mod tests {
         let mut parser = JsonToolCallParser::new(DELIMITED_CONFIG);
         let mut output = ToolParserOutput::default();
 
- // Open a tool call whose function-name string never closes, so the
- // header never completes and the buffer would otherwise grow forever.
+        // Open a tool call whose function-name string never closes, so the
+        // header never completes and the buffer would otherwise grow forever.
         parser
             .parse_into(r#"<tool_calls>{"function":""#, &mut output)
             .unwrap();

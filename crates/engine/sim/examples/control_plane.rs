@@ -51,7 +51,7 @@ fn main() {
             .unwrap();
     }
 
- // collect until every request is Finished
+    // collect until every request is Finished
     let mut done = 0usize;
     let total = rxs.len();
     let mut counts: HashMap<RequestId, (String, usize, usize, bool)> = HashMap::new();
