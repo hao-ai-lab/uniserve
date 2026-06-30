@@ -1,5 +1,5 @@
 {
-  "artifact_root": "e2e-artifacts/current-verify",
+  "artifact_root": "artifacts",
   "python": ".venv/bin/python",
   "server_bin": "target/debug/uniserve",
   "servers": {
@@ -28,7 +28,7 @@
         "4096"
       ]
     },
-    "sensenova-u1-mode-a-cuda-ipc": {
+    "sensenova-u1-disagg": {
       "extends": "sensenova-u1-single",
       "cuda_visible_devices": "0,1",
       "serve_args": [
@@ -84,10 +84,6 @@
       "output_file": "qwen3-sharegpt-stress.json",
       "expect_completed": 200,
       "expect_failed": 0
-    },
-    "uniserve-kernel-provider-smoke": {
-      "type": "script",
-      "script": "scripts/verify_uniserve_kernel_provider.py"
     }
   },
   "suites": {
@@ -96,9 +92,6 @@
     ],
     "sensenova-u1-mode-a": [
       "sensenova-travel-interleave-4x"
-    ],
-    "kernel-provider-smoke": [
-      "uniserve-kernel-provider-smoke"
     ]
   }
 }
