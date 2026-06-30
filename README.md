@@ -27,13 +27,11 @@ The tested baseline is the **NVIDIA NGC PyTorch container** (`nvcr.io/nvidia/pyt
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable && . "$HOME/.cargo/env"
 
 # 2. A virtualenv that inherits the system PyTorch.
-python3 -m venv --system-site-packages .venv && source .venv/bin/activate
+uv venv --system-site-packages .venv && source .venv/bin/activate
 
 # 3. Install (builds the `uniserve` binary and the IPC extension via setuptools-rust).
-pip install -e .
+uv pip install -e .
 ```
-
-`--system-site-packages` keeps the container's prebuilt PyTorch visible so pip does not reinstall a different one, and is also required because the system interpreter is "externally managed" (PEP 668). `./scripts/bootstrap.sh` runs exactly these three steps for you, including installing rustup if needed.
 
 ## Quick start
 
@@ -110,42 +108,44 @@ uniserve serve /path/to/big-model --worker-ranks 4
 
 ## Dependencies
 
-- **Runtime** (`pip install -e .`): PyTorch, transformers, safetensors, einops, accelerate, numpy, pillow, sentencepiece, huggingface_hub.
-- `**gpu`** (`pip install -e ".[gpu]"`): optional accelerator kernels (`flashinfer-python`); worker imports are guarded and fall back to a pure-PyTorch attention path when absent.
-- `**dev` / `test` / `bench**`: linting, type-checking, testing, and the serving benchmark harness.
+- **Runtime** (`uv pip install -e .`): PyTorch, transformers, safetensors, einops, accelerate, numpy, pillow, sentencepiece, huggingface_hub.
+- **gpu** (`uv pip install -e ".[gpu]"`): optional accelerator kernels (`flashinfer-python`); worker imports are guarded and fall back to a pure-PyTorch attention path when absent.
+- **dev** / **test** / **bench**: linting, type-checking, testing, and the serving benchmark harness.
 
 ## Development
 
-`make` wraps the common local checks:
+The `justfile` wraps the common local checks (install [just](https://github.com/casey/just) if not already available):
 
 ```bash
-make fmt                       # cargo fmt --check
-make clippy                    # cargo clippy -D warnings
-make test-rust                 # cargo test --workspace
-make lint                      # fmt + clippy + ruff + mypy
-make test-python-fast          # unit / contract / architecture tests
-make test-python-integration   # fake/simulated-backend tests
-make test-python-e2e           # black-box server tests (uses --sim)
+just fmt                       # cargo fmt --check
+just clippy                    # cargo clippy -D warnings
+just test-rust                 # cargo test --workspace
+just lint                      # fmt + clippy + ruff + mypy
+just test-python-fast          # unit / contract / architecture tests
+just test-python-integration   # fake/simulated-backend tests
+just test-python-e2e           # black-box server tests (uses --sim)
+just test-all                  # all of the above in one shot
 ```
 
 GPU/model end-to-end validation is opt-in because it loads real checkpoints:
 
 ```bash
-UNISERVE_RUN_GPU_E2E=1 make test-python-gpu
+UNISERVE_RUN_GPU_E2E=1 just test-python-gpu
 ```
 
 ## Project layout
 
 ```
-crates/
-  foundation/   core types, config, observability
-  protocol/     wire formats, gRPC/OpenAI types, worker IPC (incl. the PyO3 extension)
-  engine/       scheduler, KV, executor, worker-IPC host, process supervisor
-  frontend/     tokenizer, chat templates, OpenAI/native APIs, parsers
-  server/       HTTP + gRPC server apps
-  bin/          the `uniserve` binary
-uniserve_worker/  forward-only Python worker: models, layers, model loaders, runtime
-benchmarks/       OpenAI-compatible serving benchmark harness
+crates/                        Rust workspace (see Cargo.toml for the full crate list)
+  foundation/                  core types, config, observability
+  protocol/                    wire formats, gRPC/OpenAI types, worker IPC (incl. the PyO3 extension)
+  engine/                      scheduler, KV, executor, worker-IPC host, process supervisor
+  frontend/                    tokenizer, chat templates, OpenAI/native APIs, parsers
+  server/                      HTTP + gRPC server apps
+  bin/                         the `uniserve` CLI binary
+uniserve_worker/               forward-only Python worker: models, layers, model loaders, runtime
+benchmarks/                    OpenAI-compatible serving benchmark harness
+justfile                       development & release recipes (replaces Makefile)
 ```
 
 ## License
