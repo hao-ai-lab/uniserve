@@ -8,10 +8,10 @@ Concepts:
 
 Examples:
   scripts/verify list
-  scripts/verify launch sensenova-u1-mode-a-cuda-ipc
+  scripts/verify launch sensenova-u1-disagg
   scripts/verify generate sensenova-travel-interleave-4x
   scripts/verify bench qwen3-sharegpt-stress
-  scripts/verify clean sensenova-u1-mode-a-cuda-ipc
+  scripts/verify clean sensenova-u1-disagg
 """
 
 from __future__ import annotations
