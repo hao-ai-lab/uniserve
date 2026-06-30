@@ -18,7 +18,7 @@ pub struct Gemma4ReasoningParser {
 }
 
 impl Gemma4ReasoningParser {
- /// Create a Gemma4 parser.
+    /// Create a Gemma4 parser.
     pub fn new(tokenizer: DynTokenizer) -> Result<Self> {
         Ok(Self {
             inner: DelimitedReasoningParser::new(tokenizer, "<|channel>", "<channel|>", false)?,
@@ -27,10 +27,10 @@ impl Gemma4ReasoningParser {
         })
     }
 
- /// Apply Gemma4's `thought\n` stripping rule to one reasoning delta.
+    /// Apply Gemma4's `thought\n` stripping rule to one reasoning delta.
 
- /// Early reasoning text is buffered until we can decide whether it begins
- /// with the structural channel label.
+    /// Early reasoning text is buffered until we can decide whether it begins
+    /// with the structural channel label.
     fn strip_thought_prefix(&mut self, reasoning: &str) -> Option<String> {
         if self.prefix_stripped {
             return Some(reasoning.to_string());
@@ -70,7 +70,7 @@ impl Gemma4ReasoningParser {
         Some(std::mem::take(&mut self.reasoning_text))
     }
 
- /// Apply Gemma4-specific reasoning post-processing to one parsed delta.
+    /// Apply Gemma4-specific reasoning post-processing to one parsed delta.
     fn post_process(&mut self, mut result: ReasoningDelta) -> ReasoningDelta {
         if let Some(reasoning) = result.reasoning.take() {
             result.reasoning = self

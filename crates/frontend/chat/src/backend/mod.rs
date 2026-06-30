@@ -21,17 +21,17 @@ pub struct NewChatOutputProcessorOptions<'a> {
 
 /// Minimal prompt-processing backend needed by `chat`.
 pub trait ChatBackend: Send + Sync {
- /// Return the renderer used for chat-prompt construction.
+    /// Return the renderer used for chat-prompt construction.
     fn chat_renderer(&self) -> DynChatRenderer;
 
- /// Return model files/config needed for request-scoped multimodal
- /// preprocessing, if supported.
+    /// Return model files/config needed for request-scoped multimodal
+    /// preprocessing, if supported.
     fn multimodal_model_info(&self) -> Option<&MultimodalModelInfo> {
         None
     }
 
- /// Create a request-scoped output processor after request-level adjustments
- /// are applied.
+    /// Create a request-scoped output processor after request-level adjustments
+    /// are applied.
     fn new_chat_output_processor(
         &self,
         request: &mut ChatRequest,
@@ -58,18 +58,18 @@ pub type DynChatTextBackend = Arc<dyn ChatTextBackend>;
 /// Frontend-side chat backend loading options.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoadModelBackendsOptions {
- /// Which chat renderer implementation to use.
+    /// Which chat renderer implementation to use.
     pub renderer: RendererSelection,
- /// Disable frontend-side multimodal preprocessing and render the model as
- /// language-only.
+    /// Disable frontend-side multimodal preprocessing and render the model as
+    /// language-only.
     pub language_model_only: bool,
- /// How to serialize `message.content` when rendering the chat template.
+    /// How to serialize `message.content` when rendering the chat template.
     pub chat_template_content_format: ChatTemplateContentFormatOption,
- /// Optional server-default chat template override, provided either as an
- /// inline template or as a path to a template file.
+    /// Optional server-default chat template override, provided either as an
+    /// inline template or as a path to a template file.
     pub chat_template: Option<String>,
- /// Optional server-default keyword arguments merged into every
- /// chat-template render before request-level `chat_template_kwargs`.
+    /// Optional server-default keyword arguments merged into every
+    /// chat-template render before request-level `chat_template_kwargs`.
     pub default_chat_template_kwargs: HashMap<String, Value>,
 }
 
@@ -84,6 +84,6 @@ pub async fn load_model_backends(
     model_id: &str,
     options: LoadModelBackendsOptions,
 ) -> Result<LoadedModelBackends> {
- // Currently, we only have HuggingFace backends.
+    // Currently, we only have HuggingFace backends.
     hf::load_model_backends(model_id, options).await
 }

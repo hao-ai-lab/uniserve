@@ -23,8 +23,8 @@ pub struct RenderedPrompt {
 
 /// Minimal chat-prompt renderer used by `chat`.
 pub trait ChatRenderer: Send + Sync {
- /// Render one chat request into the text prompt submitted to the text
- /// backend.
+    /// Render one chat request into the text prompt submitted to the text
+    /// backend.
     fn render(&self, request: &ChatRequest) -> Result<RenderedPrompt>;
 }
 

@@ -44,7 +44,6 @@ enum Gemma4Mode {
 
 /// Tool parser for Google Gemma4 models.
 
-
 /// Handles the Gemma4 function call format:
 
 /// `<|tool_call>call:func_name{key:<|"|>value<|"|>}<tool_call|>`

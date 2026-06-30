@@ -43,13 +43,13 @@ pub enum ClassifiedEngineCoreOutputs {
         timestamp: f64,
         control: DpControlMessage,
     },
- /// Fallback for wire-shape combinations that do not map cleanly onto the
- /// current semantic families.
+    /// Fallback for wire-shape combinations that do not map cleanly onto the
+    /// current semantic families.
     Other(EngineCoreOutputs),
 }
 
 impl EngineCoreOutputs {
- /// Classify the raw wire message into a more semantic Rust enum.
+    /// Classify the raw wire message into a more semantic Rust enum.
     pub fn classify(self) -> ClassifiedEngineCoreOutputs {
         let mut output = self;
         let has_request_payload = !output.outputs.is_empty()
@@ -105,8 +105,8 @@ mod tests {
     use crate::EngineCoreOutput;
     use crate::utility::{UtilityOutput, UtilityResultEnvelope};
 
- /// A message carrying per-request outputs (and nothing else) classifies as a
- /// `RequestBatch`, preserving the engine index and the contained outputs.
+    /// A message carrying per-request outputs (and nothing else) classifies as a
+    /// `RequestBatch`, preserving the engine index and the contained outputs.
     #[test]
     fn classifies_pure_request_batch() {
         let outputs = EngineCoreOutputs {
@@ -125,8 +125,8 @@ mod tests {
         assert_eq!(batch.outputs[0].request_id, "req-1");
     }
 
- /// `finished_requests` alone (no token outputs) still counts as a request
- /// payload and classifies as `RequestBatch`.
+    /// `finished_requests` alone (no token outputs) still counts as a request
+    /// payload and classifies as `RequestBatch`.
     #[test]
     fn classifies_finished_requests_only_as_request_batch() {
         let outputs = EngineCoreOutputs {
@@ -143,8 +143,8 @@ mod tests {
         );
     }
 
- /// A message carrying only a `utility_output` classifies as `Utility` with
- /// the same call id surfaced.
+    /// A message carrying only a `utility_output` classifies as `Utility` with
+    /// the same call id surfaced.
     #[test]
     fn classifies_pure_utility_result() {
         let outputs = EngineCoreOutputs {
@@ -162,8 +162,8 @@ mod tests {
         assert_eq!(utility.output.call_id, 42_u64);
     }
 
- /// A message carrying only `start_wave` classifies as a DP-control
- /// `StartWave` message with the wave number preserved.
+    /// A message carrying only `start_wave` classifies as a DP-control
+    /// `StartWave` message with the wave number preserved.
     #[test]
     fn classifies_start_wave_as_dp_control() {
         let outputs = EngineCoreOutputs {
@@ -185,8 +185,8 @@ mod tests {
         }
     }
 
- /// A message carrying only `wave_complete` classifies as a DP-control
- /// `WaveComplete` message.
+    /// A message carrying only `wave_complete` classifies as a DP-control
+    /// `WaveComplete` message.
     #[test]
     fn classifies_wave_complete_as_dp_control() {
         let outputs = EngineCoreOutputs {
@@ -203,8 +203,8 @@ mod tests {
         }
     }
 
- /// A message mixing a request payload with a control signal does not fit any
- /// clean family and falls through to `Other`, preserving the raw message.
+    /// A message mixing a request payload with a control signal does not fit any
+    /// clean family and falls through to `Other`, preserving the raw message.
     #[test]
     fn classifies_mixed_payload_as_other() {
         let outputs = EngineCoreOutputs {

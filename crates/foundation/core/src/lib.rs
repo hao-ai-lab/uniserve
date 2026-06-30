@@ -489,7 +489,11 @@ mod tests {
         let (frac, whole) = epoch_conversion(clock);
         assert!((frac - 1234.75).abs() < 1e-6, "fractional secs preserved");
         assert_eq!(whole, 1234, "whole secs == floor(fractional)");
-        assert_eq!(whole, frac.floor() as u64, "u64 helper == floor(f64 helper)");
+        assert_eq!(
+            whole,
+            frac.floor() as u64,
+            "u64 helper == floor(f64 helper)"
+        );
     }
 
     #[test]

@@ -10,16 +10,16 @@ use crate::scheduler::ReqState;
 
 /// Ordering policy for waiting requests.
 pub trait RequestQueue: Send {
- /// Append a newly arrived request.
+    /// Append a newly arrived request.
     fn add_request(&mut self, st: ReqState);
- /// Re-queue a preempted request so it restarts promptly: at the front
- /// under FCFS, in priority order (original arrival time) under Priority.
+    /// Re-queue a preempted request so it restarts promptly: at the front
+    /// under FCFS, in priority order (original arrival time) under Priority.
     fn prepend_request(&mut self, st: ReqState);
- /// The next request admission would consider.
+    /// The next request admission would consider.
     fn peek_request(&self) -> Option<&ReqState>;
- /// Remove and return the next request.
+    /// Remove and return the next request.
     fn pop_request(&mut self) -> Option<ReqState>;
- /// Remove a specific waiting request (cancellation before admission).
+    /// Remove a specific waiting request (cancellation before admission).
     fn remove_request(&mut self, id: RequestId) -> Option<ReqState>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -66,14 +66,14 @@ impl RequestQueue for FcfsRequestQueue {
 /// the sorted invariant lets the insertion point be located by binary search.
 #[derive(Default)]
 pub struct PriorityRequestQueue {
- /// Sorted ascending by `(priority, queued_at)`.
+    /// Sorted ascending by `(priority, queued_at)`.
     queue: VecDeque<ReqState>,
 }
 
 impl PriorityRequestQueue {
- /// Index at which `st` should be inserted to preserve the ascending
- /// `(priority, queued_at)` order. `O(log n)` comparisons via binary search
- /// over the sorted queue (binary search; insertion is still `O(n)` shifts).
+    /// Index at which `st` should be inserted to preserve the ascending
+    /// `(priority, queued_at)` order. `O(log n)` comparisons via binary search
+    /// over the sorted queue (binary search; insertion is still `O(n)` shifts).
     fn insertion_index(&self, st: &ReqState) -> usize {
         let key = (st.req.priority, st.queued_at);
         self.queue
@@ -88,8 +88,8 @@ impl RequestQueue for PriorityRequestQueue {
     }
 
     fn prepend_request(&mut self, st: ReqState) {
- // A preempted request keeps its original `queued_at`, so ordered
- // insertion already places it ahead of same-priority later arrivals.
+        // A preempted request keeps its original `queued_at`, so ordered
+        // insertion already places it ahead of same-priority later arrivals.
         self.add_request(st);
     }
 

@@ -41,7 +41,7 @@ impl ProgramOpKind {
             _ => Modality::Und,
         }
     }
- /// The worker op-kind label this lifecycle op lowers to.
+    /// The worker op-kind label this lifecycle op lowers to.
     pub fn wire_kinds(&self) -> &'static [&'static str] {
         match self {
             ProgramOpKind::Encode => &["vit_encode", "vae_encode"],
@@ -59,12 +59,12 @@ impl ProgramOpKind {
 /// loop bounds come from the FSM and `GenerateRequest` (see module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recurrence {
- /// Runs once.
+    /// Runs once.
     Once,
- /// A fixed-count loop (e.g. `denoise` × steps).
+    /// A fixed-count loop (e.g. `denoise` × steps).
     Fixed(u32),
- /// Data-dependent, bounded by a budget (e.g. `decode` until EOS/max_tokens,
- /// or the image sub-graph repeated up to `max_images`).
+    /// Data-dependent, bounded by a budget (e.g. `decode` until EOS/max_tokens,
+    /// or the image sub-graph repeated up to `max_images`).
     Bounded(u32),
 }
 
@@ -113,13 +113,13 @@ pub enum OpState {
 #[derive(Debug, Clone)]
 pub struct InferenceProgram {
     pub request_id: RequestId,
- /// Assigned by the scheduler at enqueue (compile leaves it 0).
+    /// Assigned by the scheduler at enqueue (compile leaves it 0).
     pub program_id: ProgramId,
     pub mode: GenMode,
     pub ops: Vec<ProgramOp>,
- // Policy hints. Forward-looking: compiled from the request but
- // not yet read by the scheduler, which keys admission/preemption off the
- // equivalent `ReqState`/`GenerateRequest` fields (see module docs).
+    // Policy hints. Forward-looking: compiled from the request but
+    // not yet read by the scheduler, which keys admission/preemption off the
+    // equivalent `ReqState`/`GenerateRequest` fields (see module docs).
     pub priority: i32,
     pub latency_class: LatencyClass,
     pub reserving: bool,
@@ -127,14 +127,14 @@ pub struct InferenceProgram {
 }
 
 impl InferenceProgram {
- /// The distinct typed op kinds in this program.
+    /// The distinct typed op kinds in this program.
     pub fn op_kinds(&self) -> Vec<ProgramOpKind> {
         let mut v: Vec<ProgramOpKind> = self.ops.iter().map(|o| o.kind).collect();
         v.dedup();
         v
     }
 
- /// All worker op-kind labels this program may lower to (the consistency set).
+    /// All worker op-kind labels this program may lower to (the consistency set).
     pub fn wire_kinds(&self) -> std::collections::BTreeSet<&'static str> {
         self.ops
             .iter()
@@ -161,8 +161,8 @@ pub fn compile(req: &GenerateRequest) -> InferenceProgram {
     let max_images = req.image.max_images.max(1) as u32;
     let max_tokens = req.max_tokens.max(1) as u32;
 
- // Staged input images are dual-encoded (ViT ⊕ VAE) before prefill, for ANY
- // mode — as is understanding-interleave (its input + reasoning images).
+    // Staged input images are dual-encoded (ViT ⊕ VAE) before prefill, for ANY
+    // mode — as is understanding-interleave (its input + reasoning images).
     let has_encode = !req.mm_items.is_empty() || req.mode == GenMode::InterleaveUnd;
     let mut prefill_deps = Vec::new();
     if has_encode {
@@ -223,8 +223,8 @@ pub fn compile(req: &GenerateRequest) -> InferenceProgram {
                 deps: vec![p],
                 recurrence: Recurrence::Bounded(max_tokens),
             });
- // The image sub-graph, repeated up to max_images, each fed by decode
- // and feeding back into decode (the interleave loop).
+            // The image sub-graph, repeated up to max_images, each fed by decode
+            // and feeding back into decode (the interleave loop).
             let dn = id();
             ops.push(ProgramOp {
                 op_id: dn,
@@ -241,7 +241,7 @@ pub fn compile(req: &GenerateRequest) -> InferenceProgram {
                 deps: vec![dn],
                 recurrence: Recurrence::Bounded(max_images),
             });
- // commit feeds back into a continuation decode.
+            // commit feeds back into a continuation decode.
             let d2 = id();
             ops.push(ProgramOp {
                 op_id: d2,
@@ -318,7 +318,7 @@ mod tests {
             ]
         );
         assert!(p.reserving);
- // denoise recurs `steps` times.
+        // denoise recurs `steps` times.
         let dn = p
             .ops
             .iter()
@@ -335,14 +335,14 @@ mod tests {
         assert!(kinds.contains(&ProgramOpKind::Decode));
         assert!(kinds.contains(&ProgramOpKind::Denoise));
         assert!(kinds.contains(&ProgramOpKind::Commit));
- // the image commit is bounded by max_images.
+        // the image commit is bounded by max_images.
         let c = p
             .ops
             .iter()
             .find(|o| o.kind == ProgramOpKind::Commit)
             .unwrap();
         assert_eq!(c.recurrence, Recurrence::Bounded(2));
- // no encode (that's understanding-interleave only).
+        // no encode (that's understanding-interleave only).
         assert!(!kinds.contains(&ProgramOpKind::Encode));
     }
 
@@ -385,7 +385,7 @@ mod tests {
                 !p.ops.is_empty(),
                 "{mode:?} must compile to a non-empty program"
             );
- // deps reference valid op ids (a well-formed DAG).
+            // deps reference valid op ids (a well-formed DAG).
             let ids: std::collections::BTreeSet<u32> = p.ops.iter().map(|o| o.op_id).collect();
             for op in &p.ops {
                 for d in &op.deps {

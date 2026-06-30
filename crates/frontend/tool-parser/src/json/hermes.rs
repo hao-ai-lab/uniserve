@@ -29,7 +29,7 @@ pub struct HermesToolParser {
 }
 
 impl HermesToolParser {
- /// Create a Hermes tool parser.
+    /// Create a Hermes tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(HERMES_CONFIG),

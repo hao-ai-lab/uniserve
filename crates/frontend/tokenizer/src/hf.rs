@@ -13,8 +13,8 @@ use crate::{Result, Tokenizer};
 enum Backend {
     Hf(Box<HfTokenizer>),
     Fastokens(Box<FastokensTokenizer>),
- /// Fastokens tokenizer whose decoder is pure GPT-2 byte-level, so we can
- /// bypass `Decoder::decode`'s `Vec<String>`/`join("")` assembly.
+    /// Fastokens tokenizer whose decoder is pure GPT-2 byte-level, so we can
+    /// bypass `Decoder::decode`'s `Vec<String>`/`join("")` assembly.
     FastokensByteLevel(Box<FastokensTokenizer>),
 }
 
@@ -109,7 +109,7 @@ impl HuggingFaceTokenizer {
         }
     }
 
- /// Load from `tokenizer.json` with `fastokens`.
+    /// Load from `tokenizer.json` with `fastokens`.
     pub fn new_fastokens(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with fastokens");
         let t = FastokensTokenizer::from_file(path)
@@ -117,7 +117,7 @@ impl HuggingFaceTokenizer {
         Ok(Self::from_fastokens_backend(t))
     }
 
- /// Load from `tokenizer.json` with Hugging Face `tokenizers`.
+    /// Load from `tokenizer.json` with Hugging Face `tokenizers`.
     pub fn new_hf(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with huggingface tokenizers");
         let t = HfTokenizer::from_file(path)
@@ -125,7 +125,7 @@ impl HuggingFaceTokenizer {
         Ok(Self::from_hf_backend(t))
     }
 
- /// Load from `tokenizer.json` via fastokens or HuggingFace tokenizers.
+    /// Load from `tokenizer.json` via fastokens or HuggingFace tokenizers.
     pub fn new(path: &Path) -> Result<Self> {
         match Self::new_fastokens(path) {
             Ok(tokenizer) => Ok(tokenizer),
@@ -262,9 +262,9 @@ mod tests {
         assert!(wrapper.is_special_id(special_id));
     }
 
- /// BPE tokenizer that round-trips through fastokens with a genuine
- /// `ByteLevel` decoder; vocab covers both GPT-2 (Ġ U+0120) and non-GPT-2
- /// (｜ U+FF5C) codepoints.
+    /// BPE tokenizer that round-trips through fastokens with a genuine
+    /// `ByteLevel` decoder; vocab covers both GPT-2 (Ġ U+0120) and non-GPT-2
+    /// (｜ U+FF5C) codepoints.
     fn tiny_byte_level_bpe() -> fastokens::Tokenizer {
         let raw = r#"{
             "version": "1.0",
@@ -325,7 +325,7 @@ mod tests {
         assert!(super::is_byte_level_only(&dec));
     }
 
- /// Fast path must produce byte-identical output to fastokens' own decode.
+    /// Fast path must produce byte-identical output to fastokens' own decode.
     #[test]
     fn fast_byte_level_matches_fastokens_decode() {
         let t = tiny_byte_level_bpe();

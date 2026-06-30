@@ -7,10 +7,10 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
+use crate::{MAX_SPEC_DECODE_POS_STATS, SchedStats};
 use uniserve_engine_wire::stats::{
     BaseCacheStats, PrefixCacheStats, SchedulerStats, SpecDecodingStats, WorkerForwardStats,
 };
-use crate::{MAX_SPEC_DECODE_POS_STATS, SchedStats};
 
 /// Converts the scheduler's cumulative counters into per-update deltas for the
 /// wire shape (whose prefix-cache counters are increments, not totals).
@@ -26,17 +26,17 @@ pub struct SchedStatsReporter {
     last_spec_accepted_tokens: u64,
     last_spec_accepted_tokens_per_pos: [u64; MAX_SPEC_DECODE_POS_STATS],
     last_worker_forward_stats: WorkerForwardStats,
- // cumulative batch-timing counters, delta'd into per-update sums.
+    // cumulative batch-timing counters, delta'd into per-update sums.
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
     last_batch_timing_count: u64,
 }
 
 impl SchedStatsReporter {
- /// Snapshot the live counters into one wire `SchedulerStats` update.
+    /// Snapshot the live counters into one wire `SchedulerStats` update.
 
- /// `block_size` converts block-granular prefix-cache query counts into the
- /// token-granular counts the wire shape documents.
+    /// `block_size` converts block-granular prefix-cache query counts into the
+    /// token-granular counts the wire shape documents.
     pub fn snapshot(&mut self, stats: &SchedStats, block_size: u32) -> SchedulerStats {
         let num_blocks = stats.kv_cache.num_blocks.load(Ordering::Relaxed);
         let free_blocks = stats.kv_cache.free_blocks.load(Ordering::Relaxed);
@@ -70,11 +70,15 @@ impl SchedStatsReporter {
             0
         };
 
- // per-update deltas of the directly-measured batch timing.
+        // per-update deltas of the directly-measured batch timing.
         let worker_exec_us_total = stats.timing.worker_exec_us_total.load(Ordering::Relaxed);
-        let batch_roundtrip_us_total = stats.timing.batch_roundtrip_us_total.load(Ordering::Relaxed);
+        let batch_roundtrip_us_total = stats
+            .timing
+            .batch_roundtrip_us_total
+            .load(Ordering::Relaxed);
         let batch_timing_count = stats.timing.batch_timing_count.load(Ordering::Relaxed);
-        let delta_worker_exec_us = worker_exec_us_total.saturating_sub(self.last_worker_exec_us_total);
+        let delta_worker_exec_us =
+            worker_exec_us_total.saturating_sub(self.last_worker_exec_us_total);
         let delta_batch_roundtrip_us =
             batch_roundtrip_us_total.saturating_sub(self.last_batch_roundtrip_us_total);
         let delta_batch_count = batch_timing_count.saturating_sub(self.last_batch_timing_count);
@@ -100,7 +104,7 @@ impl SchedStatsReporter {
                     queries: delta_queries * block_size as u64,
                     hits: delta_hit_tokens,
                 },
- // Preemption observability on the wire: per-update count of preempted requests.
+                // Preemption observability on the wire: per-update count of preempted requests.
                 preempted_requests: delta_preemptions,
                 ..Default::default()
             },
@@ -192,8 +196,8 @@ fn worker_forward_stats_snapshot(stats: &SchedStats) -> WorkerForwardStats {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
- // surface the two maps the worker computes (attention backend /
- // cuda-graph runtime mode) so they reach the wire stats and Prometheus.
+    // surface the two maps the worker computes (attention backend /
+    // cuda-graph runtime mode) so they reach the wire stats and Prometheus.
     let attention_backend_counts = stats
         .worker
         .attention_backend_counts
@@ -302,7 +306,7 @@ fn delta_worker_forward_stats(
             .attention_launches
             .saturating_sub(previous.attention_launches),
         attention_us: current.attention_us.saturating_sub(previous.attention_us),
- // per-update deltas for the two newly-surfaced maps.
+        // per-update deltas for the two newly-surfaced maps.
         attention_backend_counts: delta_map(
             &current.attention_backend_counts,
             &previous.attention_backend_counts,
@@ -409,8 +413,14 @@ mod tests {
         stats.prefix.queries.store(10, Ordering::Relaxed);
         stats.prefix.hit_tokens.store(512, Ordering::Relaxed);
         stats.timing.queue_wait_count.store(3, Ordering::Relaxed);
-        stats.timing.queue_wait_us_total.store(15_003, Ordering::Relaxed);
-        stats.timing.queue_wait_us_max.store(9_000, Ordering::Relaxed);
+        stats
+            .timing
+            .queue_wait_us_total
+            .store(15_003, Ordering::Relaxed);
+        stats
+            .timing
+            .queue_wait_us_max
+            .store(9_000, Ordering::Relaxed);
         stats
             .worker
             .flashinfer_decode_plan_calls
@@ -459,7 +469,7 @@ mod tests {
             Some(&4)
         );
 
- // Second snapshot with unchanged counters reports zero deltas.
+        // Second snapshot with unchanged counters reports zero deltas.
         let wire2 = reporter.snapshot(&stats, 256);
         assert_eq!(wire2.num_admitted_reqs, 0);
         assert_eq!(wire2.avg_queue_wait_us, 0);
@@ -470,16 +480,19 @@ mod tests {
         assert!(wire2.worker_forward_stats.is_none());
     }
 
- /// the two maps the worker computes (attention backend / cuda-graph
- /// runtime mode) must survive the SchedStats -> wire snapshot/delta instead
- /// of being silently dropped before they can reach Prometheus.
- /// the directly-measured per-batch worker compute time and host
- /// round-trip latency must surface as per-update deltas in the wire stats so
- /// they reach Prometheus.
+    /// the two maps the worker computes (attention backend / cuda-graph
+    /// runtime mode) must survive the SchedStats -> wire snapshot/delta instead
+    /// of being silently dropped before they can reach Prometheus.
+    /// the directly-measured per-batch worker compute time and host
+    /// round-trip latency must surface as per-update deltas in the wire stats so
+    /// they reach Prometheus.
     #[test]
     fn snapshot_surfaces_batch_timing() {
         let stats = SchedStats::default();
-        stats.timing.worker_exec_us_total.store(1_200, Ordering::Relaxed);
+        stats
+            .timing
+            .worker_exec_us_total
+            .store(1_200, Ordering::Relaxed);
         stats
             .timing
             .batch_roundtrip_us_total
@@ -492,7 +505,7 @@ mod tests {
         assert_eq!(wire.batch_roundtrip_us, 1_500);
         assert_eq!(wire.batch_count, 3);
 
- // Counters unchanged -> zero deltas on the next snapshot.
+        // Counters unchanged -> zero deltas on the next snapshot.
         let wire2 = reporter.snapshot(&stats, 256);
         assert_eq!(wire2.worker_exec_us, 0);
         assert_eq!(wire2.batch_roundtrip_us, 0);
@@ -521,8 +534,8 @@ mod tests {
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
         assert_eq!(worker.cuda_graph_runtime_mode_counts.get("graph"), Some(&5));
 
- // Second snapshot with unchanged counters reports zero deltas (so both
- // maps are part of the delta/is_empty bookkeeping, not always-present).
+        // Second snapshot with unchanged counters reports zero deltas (so both
+        // maps are part of the delta/is_empty bookkeeping, not always-present).
         let wire2 = reporter.snapshot(&stats, 256);
         assert!(wire2.worker_forward_stats.is_none());
     }

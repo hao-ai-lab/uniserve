@@ -49,7 +49,7 @@ pub struct Llama3JsonToolParser {
 }
 
 impl Llama3JsonToolParser {
- /// Create a Llama JSON tool parser.
+    /// Create a Llama JSON tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             buffer: String::new(),
@@ -59,7 +59,7 @@ impl Llama3JsonToolParser {
         }
     }
 
- /// Commit the stream to JSON parsing or permanent passthrough.
+    /// Commit the stream to JSON parsing or permanent passthrough.
     fn commit_start(&mut self) -> bool {
         if !matches!(self.mode, LlamaJsonMode::Start) {
             return true;
@@ -77,7 +77,7 @@ impl Llama3JsonToolParser {
         true
     }
 
- /// Apply one parsed Llama JSON event to parser state and output.
+    /// Apply one parsed Llama JSON event to parser state and output.
     fn apply_event(&mut self, event: LlamaJsonEvent, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             LlamaJsonEvent::ToolCallHeader { function_name } => {

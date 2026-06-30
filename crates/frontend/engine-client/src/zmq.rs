@@ -38,38 +38,38 @@ pub use transport::{ConnectedEngine, EngineId};
 /// engine processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportMode {
- /// The frontend owns the startup handshake and allocates or binds the
- /// transport addresses itself before replying to engine `HELLO` messages.
+    /// The frontend owns the startup handshake and allocates or binds the
+    /// transport addresses itself before replying to engine `HELLO` messages.
     HandshakeOwner {
- /// Shared handshake endpoint that engines dial during startup.
+        /// Shared handshake endpoint that engines dial during startup.
         handshake_address: String,
- /// Host/IP that engines should use to connect back to the frontend
- /// transport sockets.
+        /// Host/IP that engines should use to connect back to the frontend
+        /// transport sockets.
         advertised_host: String,
- /// Total number of engines expected to join this transport.
+        /// Total number of engines expected to join this transport.
         engine_count: usize,
- /// Maximum time to wait for each startup phase to complete. Must cover
- /// model load: the engine answers READY only after its worker loaded.
+        /// Maximum time to wait for each startup phase to complete. Must cover
+        /// model load: the engine answers READY only after its worker loaded.
         ready_timeout: Duration,
- /// Optional explicit bind address for the input ROUTER socket.
+        /// Optional explicit bind address for the input ROUTER socket.
         local_input_address: Option<String>,
- /// Optional explicit bind address for the output PULL socket.
+        /// Optional explicit bind address for the output PULL socket.
         local_output_address: Option<String>,
     },
 
- /// An external supervisor has already chosen the transport addresses, and
- /// the frontend only needs to bind them and wait for engine registration
- /// frames.
+    /// An external supervisor has already chosen the transport addresses, and
+    /// the frontend only needs to bind them and wait for engine registration
+    /// frames.
     Bootstrapped {
- /// Input ROUTER socket address that engines will connect to for
- /// requests.
+        /// Input ROUTER socket address that engines will connect to for
+        /// requests.
         input_address: String,
- /// Output PULL socket address that engines will connect to for
- /// responses.
+        /// Output PULL socket address that engines will connect to for
+        /// responses.
         output_address: String,
- /// Total number of engines expected to register on this transport.
+        /// Total number of engines expected to register on this transport.
         engine_count: usize,
- /// Maximum time to wait for all expected engines to register.
+        /// Maximum time to wait for all expected engines to register.
         ready_timeout: Duration,
     },
 }
@@ -78,20 +78,20 @@ pub enum TransportMode {
 /// concurrently starting) engine processes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZmqClientConfig {
- /// Frontend-to-engine transport setup.
+    /// Frontend-to-engine transport setup.
     pub transport_mode: TransportMode,
- /// Model name used for frontend-side metrics labels.
+    /// Model name used for frontend-side metrics labels.
     pub model_name: String,
- /// Frontend client index stamped onto every request.
+    /// Frontend client index stamped onto every request.
     pub client_index: u32,
- /// Control-token ids resolved from the tokenizer, shipped to each engine
- /// in the handshake INIT (UniServe extension).
+    /// Control-token ids resolved from the tokenizer, shipped to each engine
+    /// in the handshake INIT (UniServe extension).
     pub native_controls: Option<NativeControlTokens>,
 }
 
 impl ZmqClientConfig {
- /// Create a config with the given handshake address, expecting a single
- /// engine, and default values for all other fields.
+    /// Create a config with the given handshake address, expecting a single
+    /// engine, and default values for all other fields.
     pub fn new_single(handshake_address: impl Into<String>) -> Self {
         Self {
             transport_mode: TransportMode::HandshakeOwner {
@@ -120,8 +120,8 @@ impl ZmqClientConfig {
 }
 
 fn now_secs() -> f64 {
- // single shared epoch helper (matches the frontend metrics layer's
- // wall-clock timestamps).
+    // single shared epoch helper (matches the frontend metrics layer's
+    // wall-clock timestamps).
     uniserve_core::now_unix_secs()
 }
 
@@ -135,18 +135,18 @@ pub struct ZmqEngineCoreClient {
     abort_tx: mpsc::UnboundedSender<AbortRequest>,
     native_seq: AtomicU64,
 
- // Background tasks
+    // Background tasks
     output_task: AbortOnDropHandle<()>,
     dispatcher_task: AbortOnDropHandle<()>,
     abort_task: AbortOnDropHandle<()>,
 }
 
 impl ZmqEngineCoreClient {
- /// Connect to engine processes using the configured transport mode.
+    /// Connect to engine processes using the configured transport mode.
 
- /// In handshake-owned mode this method drives the full engine startup
- /// handshake. In bootstrapped mode it binds the provided frontend sockets
- /// and waits for the expected engine registration frames.
+    /// In handshake-owned mode this method drives the full engine startup
+    /// handshake. In bootstrapped mode it binds the provided frontend sockets
+    /// and waits for the expected engine registration frames.
     pub async fn connect(config: ZmqClientConfig) -> Result<Self> {
         let connected = match &config.transport_mode {
             TransportMode::HandshakeOwner {
@@ -218,14 +218,14 @@ impl ZmqEngineCoreClient {
         })
     }
 
- /// Return the address of the input socket that the client uses to send
- /// requests to the engines.
+    /// Return the address of the input socket that the client uses to send
+    /// requests to the engines.
     pub fn input_address(&self) -> &str {
         &self.input_address
     }
 
- /// Return the address of the output socket that the client listens on for
- /// engine responses.
+    /// Return the address of the output socket that the client listens on for
+    /// engine responses.
     pub fn output_address(&self) -> &str {
         &self.output_address
     }
@@ -234,7 +234,7 @@ impl ZmqEngineCoreClient {
         self.engines.len()
     }
 
- /// Return the engine routing identities of all connected engines.
+    /// Return the engine routing identities of all connected engines.
     pub fn engine_identities(&self) -> Vec<&[u8]> {
         self.engines
             .iter()
@@ -242,8 +242,8 @@ impl ZmqEngineCoreClient {
             .collect()
     }
 
- /// Return the ready responses received from all engines on the input
- /// socket.
+    /// Return the ready responses received from all engines on the input
+    /// socket.
     pub fn ready_responses(&self) -> Vec<&EngineCoreReadyResponse> {
         self.engines
             .iter()
@@ -251,7 +251,7 @@ impl ZmqEngineCoreClient {
             .collect()
     }
 
- /// Return the engine-reported effective model dtype.
+    /// Return the engine-reported effective model dtype.
     pub fn model_dtype(&self) -> ModelDtype {
         let Some(engine) = self.engines.first() else {
             debug_assert!(false, "engine core client requires at least one engine");
@@ -260,7 +260,7 @@ impl ZmqEngineCoreClient {
         engine.ready_response.dtype
     }
 
- /// Return the engine-reported version string.
+    /// Return the engine-reported version string.
     pub fn engine_version(&self) -> &str {
         let Some(engine) = self.engines.first() else {
             debug_assert!(false, "engine core client requires at least one engine");
@@ -269,8 +269,8 @@ impl ZmqEngineCoreClient {
         engine.ready_response.uniserve_version.as_str()
     }
 
- /// Return the total number of GPU blocks summed across all connected
- /// engines.
+    /// Return the total number of GPU blocks summed across all connected
+    /// engines.
     pub fn total_num_gpu_blocks(&self) -> u64 {
         debug_assert!(
             !self.engines.is_empty(),
@@ -282,7 +282,7 @@ impl ZmqEngineCoreClient {
             .sum()
     }
 
- /// Return the minimum engine-reported `max_model_len` across all engines.
+    /// Return the minimum engine-reported `max_model_len` across all engines.
     pub fn max_model_len(&self) -> u32 {
         debug_assert!(
             !self.engines.is_empty(),
@@ -299,12 +299,12 @@ impl ZmqEngineCoreClient {
         self.inner.model_name()
     }
 
- /// Return whether the client still considers the engines healthy.
+    /// Return whether the client still considers the engines healthy.
     pub fn is_healthy(&self) -> bool {
         self.inner.is_healthy()
     }
 
- /// Return the first persistent health error observed by the client, if any.
+    /// Return the first persistent health error observed by the client, if any.
     pub fn health_error(&self) -> Option<Arc<Error>> {
         self.inner.health_error()
     }
@@ -312,8 +312,8 @@ impl ZmqEngineCoreClient {
 
 // Client API implementation.
 impl ZmqEngineCoreClient {
- /// Add a new request to an engine and return a per-request raw output
- /// stream.
+    /// Add a new request to an engine and return a per-request raw output
+    /// stream.
     pub async fn call(&self, mut req: EngineCoreRequest) -> Result<EngineCoreOutputStream> {
         req.client_index = self.config.client_index;
         req.validate()?;
@@ -340,7 +340,7 @@ impl ZmqEngineCoreClient {
             .send_to_engine(&engine_id, EngineCoreControlRequest::Add(Box::new(req)))
             .await
         {
- // Failed to send the request to the engine, roll back the registration.
+            // Failed to send the request to the engine, roll back the registration.
             self.inner.rollback_request(&request_id);
             return Err(error);
         }
@@ -352,8 +352,8 @@ impl ZmqEngineCoreClient {
         ))
     }
 
- /// Submit a native image/interleave request over the wire and adapt the
- /// per-request output stream back into typed text+image [`GenEvent`]s.
+    /// Submit a native image/interleave request over the wire and adapt the
+    /// per-request output stream back into typed text+image [`GenEvent`]s.
     pub async fn generate_native(&self, req: NativeGenerateRequest) -> Result<NativeEventStream> {
         let seq = self.native_seq.fetch_add(1, Ordering::Relaxed);
         let request_id = format!("native-{}-{}", std::process::id(), seq);
@@ -387,30 +387,30 @@ impl ZmqEngineCoreClient {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
- // Consumer dropped the native stream: drop the wire stream,
- // whose Drop auto-aborts the request upstream.
-                    _ = tx.closed() => return,
-                    item = stream.next() => match item {
-                        Some(Ok(out)) => {
-                            for ev in wire_output_to_gen_events(&out.output) {
-                                if tx.send(ev).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Some(Err(error)) => {
-                            let _ = tx.send(GenEvent::Error { message: error.to_string() });
-                            return;
-                        }
-                        None => return,
-                    },
-                }
+                // Consumer dropped the native stream: drop the wire stream,
+                // whose Drop auto-aborts the request upstream.
+                                   _ = tx.closed() => return,
+                                   item = stream.next() => match item {
+                                       Some(Ok(out)) => {
+                                           for ev in wire_output_to_gen_events(&out.output) {
+                                               if tx.send(ev).is_err() {
+                                                   return;
+                                               }
+                                           }
+                                       }
+                                       Some(Err(error)) => {
+                                           let _ = tx.send(GenEvent::Error { message: error.to_string() });
+                                           return;
+                                       }
+                                       None => return,
+                                   },
+                               }
             }
         });
         Ok(NativeEventStream::new(rx))
     }
 
- /// Abort currently in-flight requests by request ID.
+    /// Abort currently in-flight requests by request ID.
     pub async fn abort(&self, ids: &[String]) -> Result<()> {
         let abortable = self.inner.abortable_request_ids(ids)?;
 
@@ -428,9 +428,9 @@ impl ZmqEngineCoreClient {
         Ok(())
     }
 
- /// Call a typed utility method on all connected engines, returning one
- /// decoded result per connected engine if all calls succeed or an error
- /// if any call fails.
+    /// Call a typed utility method on all connected engines, returning one
+    /// decoded result per connected engine if all calls succeed or an error
+    /// if any call fails.
     pub async fn call_utility<T, A>(&self, method: &str, args: A) -> Result<Vec<T>>
     where
         T: serde::de::DeserializeOwned,
@@ -443,9 +443,9 @@ impl ZmqEngineCoreClient {
             "sending utility request"
         );
 
- // Phase 1: allocate one call id per engine and build the per-engine
- // request payloads up-front. Any failure here must roll back the call
- // ids already allocated so they do not leak until shutdown.
+        // Phase 1: allocate one call id per engine and build the per-engine
+        // request payloads up-front. Any failure here must roll back the call
+        // ids already allocated so they do not leak until shutdown.
         let mut pending_calls = Vec::with_capacity(self.engines.len());
         let mut prepared_sends = Vec::with_capacity(self.engines.len());
         for engine in &self.engines {
@@ -478,8 +478,8 @@ impl ZmqEngineCoreClient {
             prepared_sends.push((&engine.engine_id, request));
         }
 
- // Phase 2: dispatch every utility request concurrently; fail fast on
- // the first transport error and roll back.
+        // Phase 2: dispatch every utility request concurrently; fail fast on
+        // the first transport error and roll back.
         let send_futures = prepared_sends.iter().map(|(engine_id, request)| {
             self.inner.send_to_engine(
                 engine_id,
@@ -492,8 +492,8 @@ impl ZmqEngineCoreClient {
             return Err(err);
         }
 
- // Phase 3: wait for all engines to respond and preserve the per-engine
- // result list.
+        // Phase 3: wait for all engines to respond and preserve the per-engine
+        // result list.
         let futures = pending_calls.into_iter().map(|(call_id, rx)| async move {
             let output = rx.await.map_err(|_| Error::UtilityCallClosed {
                 method: method.to_string(),
@@ -504,8 +504,8 @@ impl ZmqEngineCoreClient {
         try_join_all(futures).await
     }
 
- /// Execute `collective_rpc` on all engines and flatten all engine results
- /// into one list.
+    /// Execute `collective_rpc` on all engines and flatten all engine results
+    /// into one list.
     pub async fn collective_rpc<A, K>(
         &self,
         method: &str,
@@ -524,14 +524,14 @@ impl ZmqEngineCoreClient {
         Ok(results
             .into_iter()
             .flat_map(|result| match result {
- // Each engine's result is itself the worker-level result list.
+                // Each engine's result is itself the worker-level result list.
                 rmpv::Value::Array(results) => results,
                 other => vec![other],
             })
             .collect())
     }
 
- /// Return whether the engine is currently sleeping at any level.
+    /// Return whether the engine is currently sleeping at any level.
     pub async fn is_sleeping(&self) -> Result<bool> {
         let results: Vec<bool> = self.call_utility("is_sleeping", ()).await?;
         let first = *results
@@ -550,21 +550,21 @@ impl ZmqEngineCoreClient {
         }
     }
 
- /// Reset the multi-modal cache.
+    /// Reset the multi-modal cache.
     pub async fn reset_mm_cache(&self) -> Result<()> {
         self.call_utility::<(), _>("reset_mm_cache", ()).await?;
         Ok(())
     }
 
- /// Reset the encoder cache.
+    /// Reset the encoder cache.
     pub async fn reset_encoder_cache(&self) -> Result<()> {
         self.call_utility::<(), _>("reset_encoder_cache", ())
             .await?;
         Ok(())
     }
 
- /// Reset the prefix cache. Returns `true` only when every engine confirms
- /// the reset (AND aggregation).
+    /// Reset the prefix cache. Returns `true` only when every engine confirms
+    /// the reset (AND aggregation).
     pub async fn reset_prefix_cache(&self) -> Result<bool> {
         let results: Vec<bool> = self.call_utility("reset_prefix_cache", ()).await?;
         if results.is_empty() {
@@ -576,7 +576,7 @@ impl ZmqEngineCoreClient {
         Ok(results.into_iter().all(|ok| ok))
     }
 
- /// Load or refresh one LoRA adapter on every connected engine.
+    /// Load or refresh one LoRA adapter on every connected engine.
     pub async fn add_lora(&self, lora_request: &LoraRequest) -> Result<bool> {
         Ok(self
             .call_utility::<bool, _>("add_lora", (lora_request,))
@@ -585,7 +585,7 @@ impl ZmqEngineCoreClient {
             .all(|loaded| loaded))
     }
 
- /// Remove one LoRA adapter from every connected engine.
+    /// Remove one LoRA adapter from every connected engine.
     pub async fn remove_lora(&self, lora_id: u64) -> Result<bool> {
         Ok(self
             .call_utility::<bool, _>("remove_lora", (lora_id,))
@@ -594,19 +594,19 @@ impl ZmqEngineCoreClient {
             .all(|removed| removed))
     }
 
- /// Put the engines to sleep.
+    /// Put the engines to sleep.
     pub async fn sleep(&self, level: u32, mode: &str) -> Result<()> {
         self.call_utility::<(), _>("sleep", (level, mode)).await?;
         Ok(())
     }
 
- /// Wake the engines from sleep.
+    /// Wake the engines from sleep.
     pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()> {
         self.call_utility::<(), _>("wake_up", (tags,)).await?;
         Ok(())
     }
 
- /// Shut down local client tasks and close transport state.
+    /// Shut down local client tasks and close transport state.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
             inner,
@@ -621,7 +621,7 @@ impl ZmqEngineCoreClient {
         inner.shutdown();
         drop(abort_tx);
 
- // Abort all client tasks first, then await them, in dependency order.
+        // Abort all client tasks first, then await them, in dependency order.
         let tasks = vec![abort_task, dispatcher_task, output_task];
         tasks.iter().for_each(|t| t.abort());
         join_all(tasks).await;

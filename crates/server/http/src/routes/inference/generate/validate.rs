@@ -106,7 +106,10 @@ mod tests {
         .expect("parse request");
         let error = validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
             .expect_err("max_tokens == 0 must be rejected");
-        assert_eq!(error.to_error_response().error.param.as_deref(), Some("sampling_params"));
+        assert_eq!(
+            error.to_error_response().error.param.as_deref(),
+            Some("sampling_params")
+        );
     }
 
     #[test]
@@ -132,7 +135,10 @@ mod tests {
         .expect("parse request");
         let error = validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
             .expect_err("prompt_logprobs == -2 must be rejected");
-        assert_eq!(error.to_error_response().error.param.as_deref(), Some("sampling_params"));
+        assert_eq!(
+            error.to_error_response().error.param.as_deref(),
+            Some("sampling_params")
+        );
     }
 
     #[test]

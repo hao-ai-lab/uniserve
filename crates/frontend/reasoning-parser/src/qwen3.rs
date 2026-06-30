@@ -12,7 +12,7 @@ pub struct Qwen3ReasoningParser {
 }
 
 impl Qwen3ReasoningParser {
- /// Create a Qwen3 parser backed by the shared delimited state machine.
+    /// Create a Qwen3 parser backed by the shared delimited state machine.
     pub fn new(tokenizer: DynTokenizer) -> Result<Self> {
         Ok(Self {
             inner: DelimitedReasoningParser::new(tokenizer, "<think>", "</think>", false)?,

@@ -63,7 +63,7 @@ impl EngineCoreOutputStream {
         }
     }
 
- /// Return the engine-wire `request_id` bound to this stream.
+    /// Return the engine-wire `request_id` bound to this stream.
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
@@ -82,9 +82,9 @@ impl Stream for EngineCoreOutputStream {
             Poll::Ready(Some(item)) => {
                 match &item {
                     Ok(output) => {
- // If the output indicates the request is finished, mark the stream as
- // terminated with cleanly-finished state and expect no more outputs to
- // come.
+                        // If the output indicates the request is finished, mark the stream as
+                        // terminated with cleanly-finished state and expect no more outputs to
+                        // come.
                         if output.finished() {
                             if output.finish_reason == Some(EngineCoreFinishReason::Error) {
                                 error!(
@@ -97,8 +97,8 @@ impl Stream for EngineCoreOutputStream {
                         }
                     }
                     Err(error) => {
- // If we get an error from the output stream, mark the stream as terminated
- // with an error.
+                        // If we get an error from the output stream, mark the stream as terminated
+                        // with an error.
                         warn!(self.request_id, error = %error.as_report(), "request encountered an error");
                         self.state = State::ClosedWithError;
                     }
@@ -106,10 +106,10 @@ impl Stream for EngineCoreOutputStream {
                 Poll::Ready(Some(item))
             }
             Poll::Ready(None) => {
- // If we get a `None` without seeing a finished output, this is an unexpected
- // close from the engine side. Mark the stream as terminated
- // with an unexpected close state and send an error down the
- // stream to notify the caller.
+                // If we get a `None` without seeing a finished output, this is an unexpected
+                // close from the engine side. Mark the stream as terminated
+                // with an unexpected close state and send an error down the
+                // stream to notify the caller.
                 warn!(self.request_id, "request stream closed unexpectedly");
                 self.state = State::UnexpectedClose;
 
@@ -130,10 +130,10 @@ impl FusedStream for EngineCoreOutputStream {
 impl Drop for EngineCoreOutputStream {
     fn drop(&mut self) {
         if self.is_terminated() {
- // If it's terminated, it means that the request either finished cleanly, or
- // encountered an error or unexpected close from the engine. In any
- // case, the request stream is already considered inactive and
- // there's no need to abort it on the engine side.
+            // If it's terminated, it means that the request either finished cleanly, or
+            // encountered an error or unexpected close from the engine. In any
+            // case, the request stream is already considered inactive and
+            // there's no need to abort it on the engine side.
             return;
         }
 

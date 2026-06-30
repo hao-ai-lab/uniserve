@@ -29,7 +29,7 @@ use crate::{Result, Tool, ToolParser, ToolParserOutput};
 pub struct DeepSeekV4ToolParser(DeepSeekDsmlToolParser);
 
 impl DeepSeekV4ToolParser {
- /// Create a DeepSeek V4 tool parser.
+    /// Create a DeepSeek V4 tool parser.
     fn new(tools: &[Tool]) -> Self {
         Self(DeepSeekDsmlToolParser::new(tools, DsmlTokens::V4))
     }

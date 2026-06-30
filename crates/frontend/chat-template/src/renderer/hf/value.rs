@@ -25,7 +25,7 @@ pub(super) fn to_template_value(value: JsonValue) -> TemplateValue {
                 .map(|(key, value)| (key, to_template_value(value).0))
                 .collect(),
         )),
- // For primitive values, directly convert them to `minijinja::Value` using `from_serialize`.
+        // For primitive values, directly convert them to `minijinja::Value` using `from_serialize`.
         value => minijinja::Value::from_serialize(value),
     })
 }
@@ -74,8 +74,8 @@ impl Object for TemplateMap {
         _method: &str,
         _args: &[minijinja::Value],
     ) -> std::result::Result<minijinja::Value, TemplateError> {
- // Always return `UnknownMethod` for method calls,
- // so that pycompat can handle dict methods through the unknown-method callback.
+        // Always return `UnknownMethod` for method calls,
+        // so that pycompat can handle dict methods through the unknown-method callback.
         Err(TemplateError::from(TemplateErrorKind::UnknownMethod))
     }
 }

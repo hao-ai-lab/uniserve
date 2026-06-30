@@ -8,44 +8,44 @@ use crate::error::Error;
 /// One decoded token candidate and its logprob metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedTokenLogprob {
- /// Original vocabulary token ID for this candidate.
+    /// Original vocabulary token ID for this candidate.
     pub token_id: u32,
- /// Best-effort decoded token string for this candidate.
+    /// Best-effort decoded token string for this candidate.
     pub token: String,
- /// Log probability of this token candidate.
+    /// Log probability of this token candidate.
     pub logprob: f32,
- /// Vocabulary rank of this token candidate.
+    /// Vocabulary rank of this token candidate.
     pub rank: u32,
 }
 
 /// One position's decoded token candidates and their logprobs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedPositionLogprobs {
- /// Candidate tokens for this position.
+    /// Candidate tokens for this position.
     pub entries: Vec<DecodedTokenLogprob>,
 }
 
 /// Decoded sample logprobs for generated token positions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedLogprobs {
- /// Generated token positions covered by this payload.
+    /// Generated token positions covered by this payload.
     pub positions: Vec<DecodedPositionLogprobs>,
 }
 
 /// Decoded prompt logprobs for prompt token positions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodedPromptLogprobs {
- /// Original vocabulary token ID for the first prompt token.
+    /// Original vocabulary token ID for the first prompt token.
     pub first_token_id: u32,
- /// Best-effort decoded string for the first prompt token.
+    /// Best-effort decoded string for the first prompt token.
 
- /// The first prompt token has no left context to score against, so it is
- /// stored separately instead of appearing in `scored_positions`.
+    /// The first prompt token has no left context to score against, so it is
+    /// stored separately instead of appearing in `scored_positions`.
     pub first_token: String,
- /// Scored prompt positions after the first prompt token.
+    /// Scored prompt positions after the first prompt token.
 
- /// `scored_positions[i]` corresponds to the prompt token at position `i +
- /// 1`.
+    /// `scored_positions[i]` corresponds to the prompt token at position `i +
+    /// 1`.
     pub scored_positions: Vec<DecodedPositionLogprobs>,
 }
 

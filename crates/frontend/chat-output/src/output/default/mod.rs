@@ -40,12 +40,12 @@ pub struct DefaultChatOutputProcessor {
 }
 
 impl DefaultChatOutputProcessor {
- /// Build the default output processor and apply any parser-specific request
- /// adjustments.
+    /// Build the default output processor and apply any parser-specific request
+    /// adjustments.
 
- /// Parser resolution happens here so that request validation, prompt
- /// rendering, and streaming all observe the same parser-adjusted
- /// request state.
+    /// Parser resolution happens here so that request validation, prompt
+    /// rendering, and streaming all observe the same parser-adjusted
+    /// request state.
     pub fn new(
         request: &mut ChatRequest,
         model_id: &str,
@@ -77,11 +77,11 @@ impl DefaultChatOutputProcessor {
         })
     }
 
- /// Build the plain-text-only default output processor.
+    /// Build the plain-text-only default output processor.
 
- /// This keeps the default structured chat-event assembly but disables both
- /// reasoning parsing and tool-call parsing completely, so that all
- /// content is treated as opaque text.
+    /// This keeps the default structured chat-event assembly but disables both
+    /// reasoning parsing and tool-call parsing completely, so that all
+    /// content is treated as opaque text.
     pub fn plain_text_only() -> Self {
         Self {
             uniserve_reasoning_parser: None,
@@ -163,13 +163,13 @@ static REASONING_PARSER_LOG_ONCE: Once = Once::new();
 static AUTO_REASONING_PARSER_FALLBACK_LOG_ONCE: Once = Once::new();
 
 impl ChatOutputProcessor for DefaultChatOutputProcessor {
- /// Transforms a raw generate-output token stream into structured chat
- /// events through three sequential stages once text decoding has
- /// already happened:
+    /// Transforms a raw generate-output token stream into structured chat
+    /// events through three sequential stages once text decoding has
+    /// already happened:
 
- /// 1. [`reasoning_event_stream`] — reasoning/content separation
- /// 2. [`tool_event_stream`] — tool-call parsing
- /// 3. [`structured_chat_event_stream`] — final block assembly
+    /// 1. [`reasoning_event_stream`] — reasoning/content separation
+    /// 2. [`tool_event_stream`] — tool-call parsing
+    /// 3. [`structured_chat_event_stream`] — final block assembly
     fn process(self: Box<Self>, decoded: DynDecodedTextEventStream) -> Result<DynChatEventStream> {
         let reasoning = reasoning_event_stream(decoded, self.uniserve_reasoning_parser);
         let tool = tool_event_stream(reasoning, self.uniserve_tool_parser);

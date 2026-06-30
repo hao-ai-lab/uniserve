@@ -79,7 +79,7 @@ struct DeepSeekDsmlToolParser {
 }
 
 impl DeepSeekDsmlToolParser {
- /// Create a parser with DSML tokens for one DeepSeek format.
+    /// Create a parser with DSML tokens for one DeepSeek format.
     fn new(tools: &[Tool], tokens: DsmlTokens) -> Self {
         Self {
             buffer: String::new(),
@@ -90,7 +90,7 @@ impl DeepSeekDsmlToolParser {
         }
     }
 
- /// Apply one parsed DSML event to parser state and output.
+    /// Apply one parsed DSML event to parser state and output.
     fn apply_event(&mut self, event: DsmlEvent, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             DsmlEvent::Text { len: consumed_len } => {
@@ -134,11 +134,11 @@ impl DeepSeekDsmlToolParser {
     }
 
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
- // Extract tool calls from streaming model output.
+        // Extract tool calls from streaming model output.
 
- // Uses a buffer-until-complete-invoke strategy: text is buffered until
- // a complete invoke block is available, then parsed and emitted in one
- // shot.
+        // Uses a buffer-until-complete-invoke strategy: text is buffered until
+        // a complete invoke block is available, then parsed and emitted in one
+        // shot.
         self.buffer.push_str(chunk);
 
         while let Some((event, consumed_len)) = parse_buffered_event(&self.buffer, |input| {

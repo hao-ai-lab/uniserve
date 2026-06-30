@@ -27,7 +27,7 @@ use uniserve_tokenizer::DynTokenizer;
 
 pub use self::cohere_cmd::CohereCmdReasoningParser;
 pub use self::deepseek_r1::DeepSeekR1ReasoningParser;
-pub(crate) use self::delimited::DelimitedReasoningParser;
+pub use self::delimited::DelimitedReasoningParser;
 pub use self::gemma4::Gemma4ReasoningParser;
 pub use self::kimi::KimiReasoningParser;
 pub use self::qwen3::Qwen3ReasoningParser;
@@ -60,12 +60,12 @@ pub struct ReasoningDelta {
 }
 
 impl ReasoningDelta {
- /// Return true when this delta carries neither reasoning nor content text.
+    /// Return true when this delta carries neither reasoning nor content text.
     pub fn is_empty(&self) -> bool {
         self.reasoning.is_none() && self.content.is_none()
     }
 
- /// Append text to the reasoning portion, creating it on first use.
+    /// Append text to the reasoning portion, creating it on first use.
     pub(crate) fn push_reasoning(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -76,7 +76,7 @@ impl ReasoningDelta {
         }
     }
 
- /// Append text to the visible content portion, creating it on first use.
+    /// Append text to the visible content portion, creating it on first use.
     pub(crate) fn push_content(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -91,29 +91,29 @@ impl ReasoningDelta {
 /// Incremental parser that splits decoded text deltas into reasoning and
 /// content.
 pub trait ReasoningParser: Send {
- /// Construct a boxed parser instance for one request stream.
+    /// Construct a boxed parser instance for one request stream.
     fn create(tokenizer: DynTokenizer) -> Result<Box<dyn ReasoningParser>>
     where
         Self: Sized + 'static;
 
- /// Initialize parser state from prompt token IDs before output deltas
- /// arrive.
+    /// Initialize parser state from prompt token IDs before output deltas
+    /// arrive.
     fn initialize(&mut self, _prompt_token_ids: &[u32]) -> Result<()> {
         Ok(())
     }
 
- /// Return whether decoded output must preserve tokenizer special tokens.
+    /// Return whether decoded output must preserve tokenizer special tokens.
 
- /// Some model families emit reasoning sentinels as special tokens. Those
- /// parsers need `skip_special_tokens = false` while parsing is enabled.
+    /// Some model families emit reasoning sentinels as special tokens. Those
+    /// parsers need `skip_special_tokens = false` while parsing is enabled.
     fn preserve_special_tokens(&self) -> bool {
         false
     }
 
- /// Feed one decoded text delta into the parser.
+    /// Feed one decoded text delta into the parser.
     fn push(&mut self, delta: &str) -> Result<ReasoningDelta>;
 
- /// Flush any buffered partial delimiter state at end of stream.
+    /// Flush any buffered partial delimiter state at end of stream.
     fn finish(&mut self) -> Result<ReasoningDelta> {
         Ok(ReasoningDelta::default())
     }

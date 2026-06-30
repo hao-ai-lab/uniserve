@@ -39,7 +39,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
     type GenerateStreamStream =
         Pin<Box<dyn Stream<Item = Result<pb::GenerateResponse, Status>> + Send>>;
 
- /// Unary generate: collect all output and return a single response.
+    /// Unary generate: collect all output and return a single response.
     async fn generate(
         &self,
         request: Request<pb::GenerateRequest>,
@@ -47,11 +47,11 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
 
- // Resolve the requested model against one dynamic LoRA registry snapshot so
- // gRPC shares the same model+adapter selection contract as the HTTP routes:
- // validate against base names plus loaded adapter names, and attach the
- // resolved adapter as the request's `lora_request`. An empty proto3 model
- // field is treated as "unset" (no adapter), matching `to_text_request`.
+        // Resolve the requested model against one dynamic LoRA registry snapshot so
+        // gRPC shares the same model+adapter selection contract as the HTTP routes:
+        // validate against base names plus loaded adapter names, and attach the
+        // resolved adapter as the request's `lora_request`. An empty proto3 model
+        // field is treated as "unset" (no adapter), matching `to_text_request`.
         let model_name = (!proto_req.model.is_empty()).then(|| proto_req.model.clone());
         let lora_resolution = self
             .state
@@ -72,7 +72,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
             .await
             .map_err(|e| Status::internal(e.to_report_string()))?;
 
- // Build the single aggregated response.
+        // Build the single aggregated response.
         let prompt_info = convert::to_prompt_info(
             &collected.prompt_token_ids,
             collected.prompt_logprobs.as_ref(),
@@ -100,7 +100,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         }))
     }
 
- /// Streaming generate: yield incremental responses as tokens are produced.
+    /// Streaming generate: yield incremental responses as tokens are produced.
     async fn generate_stream(
         &self,
         request: Request<pb::GenerateRequest>,
@@ -108,11 +108,11 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let proto_req = request.into_inner();
         let response_opts = ResponseOpts::from_proto(proto_req.response.as_ref());
 
- // Resolve the requested model against one dynamic LoRA registry snapshot so
- // gRPC shares the same model+adapter selection contract as the HTTP routes:
- // validate against base names plus loaded adapter names, and attach the
- // resolved adapter as the request's `lora_request`. An empty proto3 model
- // field is treated as "unset" (no adapter), matching `to_text_request`.
+        // Resolve the requested model against one dynamic LoRA registry snapshot so
+        // gRPC shares the same model+adapter selection contract as the HTTP routes:
+        // validate against base names plus loaded adapter names, and attach the
+        // resolved adapter as the request's `lora_request`. An empty proto3 model
+        // field is treated as "unset" (no adapter), matching `to_text_request`.
         let model_name = (!proto_req.model.is_empty()).then(|| proto_req.model.clone());
         let lora_resolution = self
             .state
@@ -167,7 +167,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
                 };
 
                 if tx.send(response).await.is_err() {
- // Client disconnected.
+                    // Client disconnected.
                     break;
                 }
             }

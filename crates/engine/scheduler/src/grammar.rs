@@ -18,7 +18,7 @@ use uniserve_engine_api::GrammarSpec;
 /// A compiled grammar: a token trie over the allowed completions.
 #[derive(Debug, Clone)]
 pub struct CompiledGrammar {
- /// The allowed token-id sequences (deduplicated, empty sequences removed).
+    /// The allowed token-id sequences (deduplicated, empty sequences removed).
     sequences: Vec<Vec<u32>>,
 }
 
@@ -40,7 +40,7 @@ impl CompiledGrammar {
 #[derive(Debug, Clone)]
 pub struct GrammarMatcher {
     grammar: CompiledGrammar,
- /// Tokens accepted so far.
+    /// Tokens accepted so far.
     progress: Vec<u32>,
 }
 
@@ -52,14 +52,14 @@ impl GrammarMatcher {
         }
     }
 
- /// Whether one allowed sequence has been fully produced.
+    /// Whether one allowed sequence has been fully produced.
     pub fn is_complete(&self) -> bool {
         self.grammar.sequences.iter().any(|s| s == &self.progress)
     }
 
- /// The token ids allowed at the current position: the next token of every
- /// sequence the progress is a strict prefix of. Empty means no
- /// continuation is allowed (the request must terminate).
+    /// The token ids allowed at the current position: the next token of every
+    /// sequence the progress is a strict prefix of. Empty means no
+    /// continuation is allowed (the request must terminate).
     pub fn allowed_next(&self) -> Vec<u32> {
         let mut allowed: Vec<u32> = self
             .grammar
@@ -73,7 +73,7 @@ impl GrammarMatcher {
         allowed
     }
 
- /// Record one accepted token.
+    /// Record one accepted token.
     pub fn advance(&mut self, token: u32) {
         self.progress.push(token);
     }
@@ -110,15 +110,15 @@ impl GrammarCompiler {
         }
     }
 
- /// Submit one grammar for compilation.
+    /// Submit one grammar for compilation.
 
- /// The send only fails if the background compiler thread has gone away
- /// (panicked, or the receiver was dropped). That is unrecoverable for this
- /// request — its compilation will never land in [`drain_ready`], so the
- /// request would otherwise sit in the `skipped_waiting` gate forever. We
- /// cannot fail the request from here (the gate is the scheduler's, not the
- /// compiler's), so surface the dead-compiler condition loudly instead of
- /// swallowing it silently.
+    /// The send only fails if the background compiler thread has gone away
+    /// (panicked, or the receiver was dropped). That is unrecoverable for this
+    /// request — its compilation will never land in [`drain_ready`], so the
+    /// request would otherwise sit in the `skipped_waiting` gate forever. We
+    /// cannot fail the request from here (the gate is the scheduler's, not the
+    /// compiler's), so surface the dead-compiler condition loudly instead of
+    /// swallowing it silently.
     pub fn submit(&self, id: RequestId, spec: GrammarSpec) {
         if self.tx.send((id, spec)).is_err() {
             tracing::error!(
@@ -128,7 +128,7 @@ impl GrammarCompiler {
         }
     }
 
- /// Collect every compilation finished so far (non-blocking).
+    /// Collect every compilation finished so far (non-blocking).
     pub fn drain_ready(&self) -> Vec<(RequestId, CompiledGrammar)> {
         let mut out = Vec::new();
         while let Ok(item) = self.rx.try_recv() {

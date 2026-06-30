@@ -108,14 +108,14 @@ async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Serve(args) => {
             if args.runtime.engine_count == 0 {
- // The deliberate single-node default: the engine runs
- // on a thread inside the server with no serialized hop.
+                // The deliberate single-node default: the engine runs
+                // on a thread inside the server with no serialized hop.
                 uniserve_server_http::serve(args.to_uniserve_config(), shutdown_signal()).await
             } else {
                 serve_with_engines(*args).await
             }
         }
- // One headless engine process behind the engine wire protocol.
+        // One headless engine process behind the engine wire protocol.
         Command::Engine(args) => {
             uniserve_engine_process::run_engine_proc(args.to_proc_config(), shutdown_signal()).await
         }
@@ -168,8 +168,8 @@ async fn serve_with_engines(args: ServeArgs) -> Result<()> {
         "serving with out-of-process engine cores"
     );
 
- // Spawn the locally managed engines; they dial the handshake (with retry)
- // while the server builds its state and binds the handshake socket.
+    // Spawn the locally managed engines; they dial the handshake (with retry)
+    // while the server builds its state and binds the handshake socket.
     let binary = env::current_exe()
         .context("failed to resolve the uniserve binary path")?
         .display()
@@ -212,80 +212,80 @@ async fn serve_with_engines(args: ServeArgs) -> Result<()> {
         })
     };
 
- // Watch for any managed engine exiting unexpectedly. Each engine is
- // awaited event-driven (no busy-poll): one waiter task per engine reports
- // the first exit over a channel, and we surface whichever fires first.
+    // Watch for any managed engine exiting unexpectedly. Each engine is
+    // awaited event-driven (no busy-poll): one waiter task per engine reports
+    // the first exit over a channel, and we surface whichever fires first.
     let engine_exit = {
         let engines = engines.clone();
         async move {
             if engines.is_empty() {
- // Frontend-only mode: nothing local to watch.
+                // Frontend-only mode: nothing local to watch.
                 return std::future::pending::<anyhow::Result<ExitStatus>>().await;
             }
             let (tx, mut rx) = tokio::sync::mpsc::channel(engines.len());
             for engine in engines {
                 let tx = tx.clone();
                 tokio::spawn(async move {
- // Drop is fine if the receiver already took a result.
+                    // Drop is fine if the receiver already took a result.
                     let _ = tx.send(engine.wait_for_exit().await).await;
                 });
             }
             drop(tx);
- // The first exit (or the first error) wins. The detached waiter
- // tasks for the still-running engines keep awaiting their own
- // exit; each one ends on its own once that engine stops (e.g. when
- // the shutdown path below signals it).
+            // The first exit (or the first error) wins. The detached waiter
+            // tasks for the still-running engines keep awaiting their own
+            // exit; each one ends on its own once that engine stops (e.g. when
+            // the shutdown path below signals it).
             match rx.recv().await {
                 Some(result) => result,
- // Unreachable while at least one engine waiter holds a sender,
- // but stay pending rather than spuriously reporting an exit.
+                // Unreachable while at least one engine waiter holds a sender,
+                // but stay pending rather than spuriously reporting an exit.
                 None => std::future::pending::<anyhow::Result<ExitStatus>>().await,
             }
         }
     };
 
     let shutdown_reason = tokio::select! {
-        biased;
+           biased;
 
- // Received shutdown signal via Ctrl-C or SIGTERM.
-        _ = shutdown.cancelled() => ShutdownReason::Signal,
+    // Received shutdown signal via Ctrl-C or SIGTERM.
+           _ = shutdown.cancelled() => ShutdownReason::Signal,
 
- // A managed engine exited unexpectedly.
-        engine_exit = engine_exit => {
-            match engine_exit {
-                Ok(status) => {
-                    warn!(%status, "managed engine exited, shutting down...");
-                    ShutdownReason::EngineExited(status)
-                }
-                Err(error) => ShutdownReason::Server(error.context("failed to monitor managed engine")),
-            }
-        }
+    // A managed engine exited unexpectedly.
+           engine_exit = engine_exit => {
+               match engine_exit {
+                   Ok(status) => {
+                       warn!(%status, "managed engine exited, shutting down...");
+                       ShutdownReason::EngineExited(status)
+                   }
+                   Err(error) => ShutdownReason::Server(error.context("failed to monitor managed engine")),
+               }
+           }
 
- // Serve task exited unexpectedly.
-        serve_result = &mut serve_task => {
-            let serve_result = serve_result.context("serve task join failed")?;
-            match serve_result {
-                Ok(()) => ShutdownReason::Server(anyhow!(
-                    "OpenAI server shut down unexpectedly without error"
-                )),
-                Err(error) => ShutdownReason::Server(error),
-            }
-        }
-    };
- // Regardless of the shutdown reason, broadcast shutdown so all serving
- // tasks are notified.
+    // Serve task exited unexpectedly.
+           serve_result = &mut serve_task => {
+               let serve_result = serve_result.context("serve task join failed")?;
+               match serve_result {
+                   Ok(()) => ShutdownReason::Server(anyhow!(
+                       "OpenAI server shut down unexpectedly without error"
+                   )),
+                   Err(error) => ShutdownReason::Server(error),
+               }
+           }
+       };
+    // Regardless of the shutdown reason, broadcast shutdown so all serving
+    // tasks are notified.
     shutdown.cancel();
 
- // Shutdown begins. Terminate the managed engines first (SIGTERM →
- // bounded wait → SIGKILL on the whole engine process group).
+    // Shutdown begins. Terminate the managed engines first (SIGTERM →
+    // bounded wait → SIGKILL on the whole engine process group).
     for engine in &engines {
         engine.shutdown(shutdown_timeout).await?;
     }
     if !engines.is_empty() {
         info!("managed engines shut down gracefully");
     }
- // Wait for the API server to shut down gracefully by draining in-flight
- // requests.
+    // Wait for the API server to shut down gracefully by draining in-flight
+    // requests.
     if !matches!(shutdown_reason, ShutdownReason::Server(_)) {
         serve_task.await.context("serve task join failed")??;
     }

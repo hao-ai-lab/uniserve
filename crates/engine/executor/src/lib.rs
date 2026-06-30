@@ -200,9 +200,7 @@ impl WorkersSpec {
     /// Whether this is the trivial single-Full-pool topology (the default, which
     /// composes a plain executor rather than a `StageRouter`).
     pub fn is_single_full(&self) -> bool {
-        self.pools.len() == 1
-            && self.pools[0].kind == WorkerKind::Full
-            && self.pools[0].count == 1
+        self.pools.len() == 1 && self.pools[0].kind == WorkerKind::Full && self.pools[0].count == 1
     }
 
     /// Total pool instances (sum of `count` across entries).
@@ -225,9 +223,9 @@ impl TransferSpec {
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         let mut edges = std::collections::BTreeMap::new();
         for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            let (edge, backend) = entry
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("--transfer entry {entry:?} must be edge=backend"))?;
+            let (edge, backend) = entry.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("--transfer entry {entry:?} must be edge=backend")
+            })?;
             let (src, dst) = edge
                 .split_once("->")
                 .ok_or_else(|| anyhow::anyhow!("--transfer edge {edge:?} must be src->dst"))?;
@@ -329,8 +327,7 @@ impl ControlOp {
             "sleep" => Some(Self::Sleep),
             "wake_up" => Some(Self::WakeUp),
             // Payload-carrying ops require their arguments.
-            "drop_request" | "copy_blocks" | "free_encoder" | "load_lora"
-            | "unload_lora" => None,
+            "drop_request" | "copy_blocks" | "free_encoder" | "load_lora" | "unload_lora" => None,
             _ => None,
         }
     }
@@ -472,10 +469,10 @@ pub trait Executor: Send {
 mod tests {
     use super::*;
 
- /// Whether a variant is reachable via the name-only `collective_rpc`
- /// surface (`from_method`). The exhaustive `match` over `ControlOp` is the
- /// drift guard: adding a variant forces a deliberate classification here,
- /// which keeps `method` and `from_method` in lockstep.
+    /// Whether a variant is reachable via the name-only `collective_rpc`
+    /// surface (`from_method`). The exhaustive `match` over `ControlOp` is the
+    /// drift guard: adding a variant forces a deliberate classification here,
+    /// which keeps `method` and `from_method` in lockstep.
     fn payload_free(op: &ControlOp) -> bool {
         match op {
             ControlOp::ResetPrefixCache | ControlOp::Sleep | ControlOp::WakeUp => true,
@@ -489,8 +486,8 @@ mod tests {
 
     #[test]
     fn from_method_round_trips() {
- // One instance of every variant. The exhaustive match in
- // `payload_free` guarantees this list stays complete.
+        // One instance of every variant. The exhaustive match in
+        // `payload_free` guarantees this list stays complete.
         let variants = [
             ControlOp::DropRequest(RequestId(0)),
             ControlOp::CopyBlocks(vec![(BlockId(0), BlockId(1))]),
@@ -667,9 +664,30 @@ mod tests {
         assert!(WorkersSpec::single_full(4).is_single_full());
         let epd = WorkersSpec::parse("encoder:2,prefill:1:tp=4,decode:1:tp=4,sampler:4").unwrap();
         assert_eq!(epd.pools.len(), 4);
-        assert_eq!(epd.pools[0], PoolSpec { kind: WorkerKind::Encoder, count: 2, tp: 1 });
-        assert_eq!(epd.pools[1], PoolSpec { kind: WorkerKind::Prefill, count: 1, tp: 4 });
-        assert_eq!(epd.pools[3], PoolSpec { kind: WorkerKind::Sampler, count: 4, tp: 1 });
+        assert_eq!(
+            epd.pools[0],
+            PoolSpec {
+                kind: WorkerKind::Encoder,
+                count: 2,
+                tp: 1
+            }
+        );
+        assert_eq!(
+            epd.pools[1],
+            PoolSpec {
+                kind: WorkerKind::Prefill,
+                count: 1,
+                tp: 4
+            }
+        );
+        assert_eq!(
+            epd.pools[3],
+            PoolSpec {
+                kind: WorkerKind::Sampler,
+                count: 4,
+                tp: 1
+            }
+        );
         assert_eq!(epd.total_pools(), 8);
         assert!(!epd.is_single_full());
         assert!(WorkersSpec::parse("full:1").unwrap().is_single_full());
@@ -690,10 +708,19 @@ mod tests {
             "encoder->prefill=cuda_ipc,prefill->decode=mooncake,decode->sampler=shm",
         )
         .unwrap();
-        assert_eq!(t.backend_for(WorkerKind::Encoder, WorkerKind::Prefill), "cuda_ipc");
-        assert_eq!(t.backend_for(WorkerKind::Prefill, WorkerKind::Decode), "mooncake");
+        assert_eq!(
+            t.backend_for(WorkerKind::Encoder, WorkerKind::Prefill),
+            "cuda_ipc"
+        );
+        assert_eq!(
+            t.backend_for(WorkerKind::Prefill, WorkerKind::Decode),
+            "mooncake"
+        );
         // Unconfigured edge falls back to the in-process backend.
-        assert_eq!(t.backend_for(WorkerKind::Sampler, WorkerKind::Full), "inproc");
+        assert_eq!(
+            t.backend_for(WorkerKind::Sampler, WorkerKind::Full),
+            "inproc"
+        );
         assert!(TransferSpec::parse("bad-entry").is_err());
     }
 }

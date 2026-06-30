@@ -34,8 +34,8 @@ pub(crate) struct ClientInner {
 }
 
 impl ClientInner {
- /// Create a new instance with the given input send half after the startup
- /// handshake completes.
+    /// Create a new instance with the given input send half after the startup
+    /// handshake completes.
     pub(crate) fn new(
         input_send: RouterSendHalf,
         model_name: String,
@@ -50,17 +50,17 @@ impl ClientInner {
         }
     }
 
- /// Get the model name associated with this client used for metrics
- /// labeling.
+    /// Get the model name associated with this client used for metrics
+    /// labeling.
     pub(crate) fn model_name(&self) -> &str {
         &self.model_name
     }
 
- /// Register a newly added request. Return the selected engine id and the
- /// per-request output channel bound to its `request_id`.
+    /// Register a newly added request. Return the selected engine id and the
+    /// per-request output channel bound to its `request_id`.
 
- /// When `data_parallel_rank` is provided, the request is routed to that
- /// specific engine rank, bypassing load balancing.
+    /// When `data_parallel_rank` is provided, the request is routed to that
+    /// specific engine rank, bypassing load balancing.
     pub(crate) fn register_request(
         &self,
         request_id: String,
@@ -73,7 +73,7 @@ impl ClientInner {
         registry.register(request_id, data_parallel_rank)
     }
 
- /// Allocate the next utility `call_id` and register its waiting receiver.
+    /// Allocate the next utility `call_id` and register its waiting receiver.
     pub(crate) fn allocate_and_register_utility_call(&self) -> Result<(u64, UtilityReceiver)> {
         let mut registry = self.utility_reg.lock();
         if registry.is_closed() {
@@ -82,21 +82,21 @@ impl ClientInner {
         Ok(registry.allocate_and_register())
     }
 
- /// Undo a batch of utility call allocations when the fan-out send fails
- /// partway through. Silently ignores unknown call ids so callers can pass
- /// the full set without first filtering successful sends.
+    /// Undo a batch of utility call allocations when the fan-out send fails
+    /// partway through. Silently ignores unknown call ids so callers can pass
+    /// the full set without first filtering successful sends.
     pub(crate) fn unregister_utility_calls(&self, call_ids: impl IntoIterator<Item = u64>) {
         self.utility_reg.lock().unregister_many(call_ids);
     }
 
- /// Undo a request registration when `add_request` fails.
+    /// Undo a request registration when `add_request` fails.
     pub(crate) fn rollback_request(&self, request_id: &str) {
         let _ = self.request_reg.lock().remove(request_id);
     }
 
- /// Filter the given request IDs to the subset that are still tracked as
- /// active and can be aborted, grouped by the engine that originally
- /// accepted them.
+    /// Filter the given request IDs to the subset that are still tracked as
+    /// active and can be aborted, grouped by the engine that originally
+    /// accepted them.
     pub(crate) fn abortable_request_ids(
         &self,
         request_ids: &[String],
@@ -108,8 +108,8 @@ impl ClientInner {
         Ok(registry.abortable_request_ids(request_ids))
     }
 
- /// Obtain stream senders for a whole engine output batch with one registry
- /// lock acquisition.
+    /// Obtain stream senders for a whole engine output batch with one registry
+    /// lock acquisition.
     pub(crate) fn take_senders_for_outputs<'a>(
         &self,
         outputs: impl IntoIterator<Item = &'a EngineCoreOutput>,
@@ -117,8 +117,8 @@ impl ClientInner {
         self.request_reg.lock().senders_for_outputs(outputs)
     }
 
- /// Remove a batch of requests that have finished or aborted, returning
- /// their stream senders.
+    /// Remove a batch of requests that have finished or aborted, returning
+    /// their stream senders.
     pub(crate) fn finish_requests<'a>(
         &self,
         request_ids: impl IntoIterator<Item = &'a String>,
@@ -126,23 +126,23 @@ impl ClientInner {
         self.request_reg.lock().finish_many(request_ids)
     }
 
- /// Apply one scheduler stats update for the given engine to the local
- /// routing state. Returns `false` if the engine is unknown to the
- /// client.
+    /// Apply one scheduler stats update for the given engine to the local
+    /// routing state. Returns `false` if the engine is unknown to the
+    /// client.
     pub(crate) fn apply_scheduler_stats(&self, engine_index: u32, stats: &SchedulerStats) -> bool {
         self.request_reg
             .lock()
             .apply_scheduler_stats(engine_index, stats)
     }
 
- /// Close all active request streams and utility calls with the first
- /// persistent health error.
+    /// Close all active request streams and utility calls with the first
+    /// persistent health error.
     pub(crate) fn close_registries(&self, error: Arc<Error>) {
         let persistent_error = self.record_health_error(error);
         let request_senders = self.request_reg.lock().close();
         let utility_senders = self.utility_reg.lock().close();
 
- // Notify all ongoing requests that the client is closed.
+        // Notify all ongoing requests that the client is closed.
         for sender in request_senders {
             let _ = sender.send(Err(Error::Shared(Arc::clone(&persistent_error))));
         }
@@ -151,21 +151,21 @@ impl ClientInner {
         }
     }
 
- /// Return the first persistent health error observed by the client, if any.
+    /// Return the first persistent health error observed by the client, if any.
     pub(crate) fn health_error(&self) -> Option<Arc<Error>> {
         self.health_error.load_full()
     }
 
- /// Return whether the client still considers the engine healthy.
+    /// Return whether the client still considers the engine healthy.
     pub(crate) fn is_healthy(&self) -> bool {
         self.health_error.load().is_none()
     }
 
- /// Resolve one utility output to the waiting caller. Returns `true` if a
- /// waiting caller existed.
+    /// Resolve one utility output to the waiting caller. Returns `true` if a
+    /// waiting caller existed.
     pub(crate) fn resolve_utility_output(&self, output: UtilityOutput) -> bool {
         let Some(call_id) = output.call_id.as_u64() else {
- // All utility calls issued by this client have unsigned call IDs.
+            // All utility calls issued by this client have unsigned call IDs.
             return false;
         };
 
@@ -178,10 +178,10 @@ impl ClientInner {
         }
     }
 
- /// Send one control-path message to the engine. The request type tag is
- /// derived from the variant, so the type frame and payload frame cannot
- /// disagree. Add requests should first be registered via `register_request`
- /// to ensure the request stream is tracked.
+    /// Send one control-path message to the engine. The request type tag is
+    /// derived from the variant, so the type frame and payload frame cannot
+    /// disagree. Add requests should first be registered via `register_request`
+    /// to ensure the request stream is tracked.
     pub(crate) async fn send_to_engine(
         &self,
         engine_id: &EngineId,
@@ -193,7 +193,7 @@ impl ClientInner {
         Ok(())
     }
 
- /// Handle an abort request by sending the abort message to the engine.
+    /// Handle an abort request by sending the abort message to the engine.
     pub(crate) async fn do_abort_requests(
         &self,
         engine_id: &EngineId,
@@ -206,15 +206,15 @@ impl ClientInner {
         .await
     }
 
- /// Shut down by closing all active request streams and utility calls with a
- /// sticky client closed error.
+    /// Shut down by closing all active request streams and utility calls with a
+    /// sticky client closed error.
     pub(crate) fn shutdown(&self) {
         self.close_registries(Arc::new(client_closed!("engine client shut down")));
     }
 
- /// Remove the request from the active registry for auto-abort and return
- /// the engine that the request was originally routed to, if it is still
- /// active.
+    /// Remove the request from the active registry for auto-abort and return
+    /// the engine that the request was originally routed to, if it is still
+    /// active.
     pub(crate) fn take_auto_abort_target(&self, request_id: &str) -> Option<EngineId> {
         let mut registry = self.request_reg.lock();
         let (_, engine_id) = registry.remove(request_id)?;
@@ -224,9 +224,9 @@ impl ClientInner {
         Some(engine_id)
     }
 
- /// Publish the first persistent health error and return the sticky error
- /// recorded for this client. Later failures do not overwrite the first
- /// one so `/health` and post-close callers observe a stable cause.
+    /// Publish the first persistent health error and return the sticky error
+    /// recorded for this client. Later failures do not overwrite the first
+    /// one so `/health` and post-close callers observe a stable cause.
     fn record_health_error(&self, error: Arc<Error>) -> Arc<Error> {
         if let Some(existing) = self.health_error.load_full() {
             return existing;
@@ -240,8 +240,8 @@ impl ClientInner {
         self.health_error.load_full().unwrap_or(error)
     }
 
- /// Assert there is a recorded health error and return a `Shared` variant
- /// wrapping it for error returns when the client is already closed.
+    /// Assert there is a recorded health error and return a `Shared` variant
+    /// wrapping it for error returns when the client is already closed.
     fn closed_error(&self) -> Error {
         self.health_error
             .load_full()
@@ -257,7 +257,7 @@ pub(crate) async fn run_abort_loop(
     inner: Arc<ClientInner>,
     mut abort_rx: mpsc::UnboundedReceiver<AbortRequest>,
 ) {
- // Coalesce bursts of auto-aborts into a single Abort message per engine.
+    // Coalesce bursts of auto-aborts into a single Abort message per engine.
     const MAX_DRAIN: usize = 1024;
     let mut batch: Vec<AbortRequest> = Vec::new();
 
@@ -333,8 +333,8 @@ pub(crate) async fn run_output_dispatcher_loop(
                         }
                     }
 
- // Safety net for requests the engine marked finished
- // without a terminal output.
+                    // Safety net for requests the engine marked finished
+                    // without a terminal output.
                     if let Some(finished_requests) = batch.finished_requests.as_ref() {
                         for request_id in finished_requests {
                             trace!(request_id, "request completed via finished_requests");

@@ -29,7 +29,7 @@ from ..execution.model_base import UniModelBase
 from ..execution.runner import ModelRunner
 from ..foundation.env import env_int
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-from ..runtime.image_defaults import image_height, image_width
+from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.request_state import RequestState
 from .base_driver import BaseWorkerDriver
@@ -130,6 +130,10 @@ class StubUniModel(UniModelBase):
             scratch_capacity_tokens=STUB_SCRATCH_TOKENS,
             max_latent_size=self.max_latent_size,
             latent_downsample=self.latent_downsample,
+            max_vae_grid_tokens=self.max_latent_size,
+            commit_marker_tokens=2,
+            gen_rope_advance=2,
+            max_cfg_branches=3,
             bytes_per_token=self.bytes_per_token,
             max_batch_ops=self.max_batch_ops,
         )
@@ -173,7 +177,7 @@ class StubUniModel(UniModelBase):
         for req_id in batch.as_commit().req_ids:
             self.steps.pop(req_id, None)
             image = self.images.get(req_id) or {}
-            hw = (image_height(image), image_width(image))
+            hw = (required_image_height(image), required_image_width(image))
             png = _synthetic_png_b64(hw[1], hw[0])
             out.append(CommitOutput(req_id=req_id, image_png_b64=png, image_hw=hw))
         return out
@@ -230,6 +234,10 @@ class StubEngine(BaseWorkerDriver):
             supported_ops=tuple(self.supported_ops),
             max_latent_size=STUB_MAX_LATENT_SIZE,
             latent_downsample=STUB_LATENT_DOWNSAMPLE,
+            max_vae_grid_tokens=STUB_MAX_LATENT_SIZE,
+            commit_marker_tokens=2,
+            gen_rope_advance=2,
+            max_cfg_branches=3,
             bytes_per_token=STUB_BYTES_PER_TOKEN,
             supported_controls=tuple(self.supported_controls),
             adapter_mode=self.adapter_mode,

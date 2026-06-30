@@ -95,6 +95,11 @@ class CapsDescriptor:
     latent_downsample: int
     bytes_per_token: int
     max_batch_ops: int
+    max_vae_grid_tokens: int = 0
+    max_vit_grid_tokens: int = 0
+    commit_marker_tokens: int = 2
+    gen_rope_advance: int = 2
+    max_cfg_branches: int = 3
     attention_backend: str | None = None
     kv_dtype: str | None = None
     encoder_cache_budget: int | None = None

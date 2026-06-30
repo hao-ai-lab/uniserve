@@ -17,11 +17,11 @@ use crate::output::TextDecodeOptions;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, EnumAsInner)]
 #[serde(untagged)]
 pub enum Prompt {
- /// Untokenized prompt text that still needs tokenizer work before
- /// generation.
+    /// Untokenized prompt text that still needs tokenizer work before
+    /// generation.
     Text(String),
- /// Pre-tokenized prompt IDs that should be forwarded southbound without
- /// re-encoding.
+    /// Pre-tokenized prompt IDs that should be forwarded southbound without
+    /// re-encoding.
     TokenIds(Vec<u32>),
 }
 
@@ -40,67 +40,67 @@ impl Default for Prompt {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SamplingParams {
- /// Controls randomness. Lower values are more deterministic; zero means
- /// greedy sampling. `None` means no explicit user override.
+    /// Controls randomness. Lower values are more deterministic; zero means
+    /// greedy sampling. `None` means no explicit user override.
     pub temperature: Option<f32>,
- /// Cumulative probability threshold for nucleus sampling.
+    /// Cumulative probability threshold for nucleus sampling.
     pub top_p: Option<f32>,
- /// Maximum number of top tokens to consider. `Some(0)` means all tokens.
+    /// Maximum number of top tokens to consider. `Some(0)` means all tokens.
     pub top_k: Option<u32>,
- /// Random seed used by the sampler when present.
+    /// Random seed used by the sampler when present.
     pub seed: Option<i64>,
- /// Maximum number of tokens to generate. `None` means no explicit user
- /// override.
+    /// Maximum number of tokens to generate. `None` means no explicit user
+    /// override.
     pub max_tokens: Option<u32>,
- /// Minimum number of tokens to generate before EOS or stop-token handling.
+    /// Minimum number of tokens to generate before EOS or stop-token handling.
     pub min_tokens: Option<u32>,
- /// Number of log probabilities to return per generated token.
+    /// Number of log probabilities to return per generated token.
 
- /// `None` disables sample logprobs. `-1` requests the full vocabulary.
+    /// `None` disables sample logprobs. `-1` requests the full vocabulary.
     pub logprobs: Option<i32>,
- /// Number of log probabilities to return per prompt token.
+    /// Number of log probabilities to return per prompt token.
 
- /// `None` disables prompt logprobs. `-1` requests the full vocabulary.
+    /// `None` disables prompt logprobs. `-1` requests the full vocabulary.
     pub prompt_logprobs: Option<i32>,
- /// Minimum probability threshold for token sampling. `None` means no
- /// explicit user override.
+    /// Minimum probability threshold for token sampling. `None` means no
+    /// explicit user override.
     pub min_p: Option<f32>,
- /// Frequency penalty applied by the sampler. `None` means no explicit user
- /// override.
+    /// Frequency penalty applied by the sampler. `None` means no explicit user
+    /// override.
     pub frequency_penalty: Option<f32>,
- /// Presence penalty applied by the sampler. `None` means no explicit user
- /// override.
+    /// Presence penalty applied by the sampler. `None` means no explicit user
+    /// override.
     pub presence_penalty: Option<f32>,
- /// Repetition penalty applied by the sampler. `None` means no explicit user
- /// override.
+    /// Repetition penalty applied by the sampler. `None` means no explicit user
+    /// override.
     pub repetition_penalty: Option<f32>,
- /// Explicit stop token IDs provided by the caller. `None` means no explicit
- /// user override.
+    /// Explicit stop token IDs provided by the caller. `None` means no explicit
+    /// user override.
     pub stop_token_ids: Option<Vec<u32>>,
- /// If true, do not stop on the model's primary EOS token.
+    /// If true, do not stop on the model's primary EOS token.
     pub ignore_eos: bool,
- /// Modify the likelihood of specified tokens appearing in the completion.
- /// Keys are token IDs.
+    /// Modify the likelihood of specified tokens appearing in the completion.
+    /// Keys are token IDs.
     pub logit_bias: Option<HashMap<u32, f32>>,
- /// Restrict output to these token IDs only.
+    /// Restrict output to these token IDs only.
     pub allowed_token_ids: Option<Vec<u32>>,
- /// Words to avoid during generation (tokenized to IDs during lowering).
+    /// Words to avoid during generation (tokenized to IDs during lowering).
     pub bad_words: Option<Vec<String>>,
- /// Specific token IDs for which log probabilities should be returned at
- /// each position.
+    /// Specific token IDs for which log probabilities should be returned at
+    /// each position.
 
- /// When set, the engine returns logprobs for exactly these tokens in
- /// addition to the sampled/scored token. Mutually exclusive with
- /// `logprobs` in practice.
+    /// When set, the engine returns logprobs for exactly these tokens in
+    /// addition to the sampled/scored token. Mutually exclusive with
+    /// `logprobs` in practice.
     pub logprob_token_ids: Option<Vec<u32>>,
- /// Parameters for configuring structured outputs (guided decoding).
+    /// Parameters for configuring structured outputs (guided decoding).
     pub structured_outputs: Option<StructuredOutputsParams>,
- /// If true, bypass reads from the prefix cache for this request (the prompt
- /// will not reuse cached KV blocks from earlier requests, though newly
- /// computed blocks may still populate the cache). `None` defers to
- /// engine defaults.
+    /// If true, bypass reads from the prefix cache for this request (the prompt
+    /// will not reuse cached KV blocks from earlier requests, though newly
+    /// computed blocks may still populate the cache). `None` defers to
+    /// engine defaults.
     pub skip_reading_prefix_cache: Option<bool>,
- /// Additional request parameters for custom extensions.
+    /// Additional request parameters for custom extensions.
     pub uniserve_xargs: Option<HashMap<String, Value>>,
 }
 
@@ -137,41 +137,41 @@ impl Default for SamplingParams {
 /// the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextRequest {
- /// Stable caller-supplied request ID.
+    /// Stable caller-supplied request ID.
     pub request_id: String,
- /// Prompt text or prompt token IDs for this request.
+    /// Prompt text or prompt token IDs for this request.
     pub prompt: Prompt,
- /// Multimodal features prepared by a higher-level frontend. Raw text
- /// requests keep this empty; multimodal chat uses it with pre-tokenized
- /// prompt IDs.
+    /// Multimodal features prepared by a higher-level frontend. Raw text
+    /// requests keep this empty; multimodal chat uses it with pre-tokenized
+    /// prompt IDs.
     pub mm_features: Option<MmFeatures>,
- /// User-facing sampling parameters accepted by `text`.
+    /// User-facing sampling parameters accepted by `text`.
     pub sampling_params: SamplingParams,
- /// Incremental detokenization options for the response path.
+    /// Incremental detokenization options for the response path.
     pub decode_options: TextDecodeOptions,
- /// Whether to emit intermediate northbound deltas before the terminal
- /// result.
+    /// Whether to emit intermediate northbound deltas before the terminal
+    /// result.
 
- /// If `false`, callers only observe the terminal accumulated output. If
- /// `true`, callers may receive zero or more incremental decoded updates
- /// before the final terminal event.
+    /// If `false`, callers only observe the terminal accumulated output. If
+    /// `true`, callers may receive zero or more incremental decoded updates
+    /// before the final terminal event.
     pub intermediate: bool,
- /// Request scheduling priority (lower means earlier handling; default 0).
+    /// Request scheduling priority (lower means earlier handling; default 0).
     pub priority: i32,
- /// Salt for prefix cache isolation in multi-user environments.
+    /// Salt for prefix cache isolation in multi-user environments.
     pub cache_salt: Option<String>,
- /// Whether to add special tokens (e.g. BOS) during prompt tokenization.
+    /// Whether to add special tokens (e.g. BOS) during prompt tokenization.
     pub add_special_tokens: bool,
- /// Override data parallel rank.
+    /// Override data parallel rank.
     #[serde(default)]
     pub data_parallel_rank: Option<u32>,
- /// LoRA adapter selected for this request.
+    /// LoRA adapter selected for this request.
     #[serde(default)]
     pub lora_request: Option<LoraRequest>,
 }
 
 impl TextRequest {
- /// Return one minimal valid request fixture for tests.
+    /// Return one minimal valid request fixture for tests.
     pub fn for_test() -> Self {
         Self {
             request_id: "test-request".to_string(),
@@ -188,7 +188,7 @@ impl TextRequest {
         }
     }
 
- /// Validate the minimum invariants before tokenization or request lowering.
+    /// Validate the minimum invariants before tokenization or request lowering.
     pub fn validate(&self) -> Result<()> {
         if matches!(&self.prompt, Prompt::TokenIds(ids) if ids.is_empty()) {
             return Err(Error::EmptyPromptTokenIds {

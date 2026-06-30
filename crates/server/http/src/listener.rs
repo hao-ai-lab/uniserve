@@ -24,10 +24,10 @@ pub(crate) enum Listener {
 }
 
 impl Listener {
- /// Bind or adopt the listener described by the frontend configuration.
+    /// Bind or adopt the listener described by the frontend configuration.
 
- /// For inherited sockets, the concrete listener kind is detected from the
- /// socket family of the supplied file descriptor.
+    /// For inherited sockets, the concrete listener kind is detected from the
+    /// socket family of the supplied file descriptor.
     pub(crate) async fn bind(mode: &HttpListenerMode) -> Result<Self> {
         match mode {
             HttpListenerMode::BindTcp { host, port } => {
@@ -38,8 +38,8 @@ impl Listener {
         }
     }
 
- /// Return a log-friendly local address string for either TCP or Unix
- /// sockets.
+    /// Return a log-friendly local address string for either TCP or Unix
+    /// sockets.
     pub(crate) fn local_addr(&self) -> Result<String> {
         match self {
             Self::Tcp(listener) => Ok(listener.local_addr()?.to_string()),
@@ -51,11 +51,11 @@ impl Listener {
     }
 
     fn from_inherited_fd(fd: i32) -> Result<Self> {
- // Validate the raw integer before taking ownership of it. `OwnedFd` assumes
- // the fd is open and will `close(2)` it on drop, so handing it a negative or
- // already-closed descriptor is undefined behavior and could close an unrelated
- // fd. A non-negative value plus a successful `fcntl(F_GETFD)` probe confirms the
- // descriptor is open before we adopt it.
+        // Validate the raw integer before taking ownership of it. `OwnedFd` assumes
+        // the fd is open and will `close(2)` it on drop, so handing it a negative or
+        // already-closed descriptor is undefined behavior and could close an unrelated
+        // fd. A non-negative value plus a successful `fcntl(F_GETFD)` probe confirms the
+        // descriptor is open before we adopt it.
         if fd < 0 {
             return Err(std::io::Error::from_raw_os_error(libc::EBADF));
         }
@@ -63,14 +63,14 @@ impl Listener {
             return Err(std::io::Error::last_os_error());
         }
 
- // SAFETY: `fd` was just validated as a non-negative, open descriptor, and we
- // take ownership of it exactly once to create a single listener.
+        // SAFETY: `fd` was just validated as a non-negative, open descriptor, and we
+        // take ownership of it exactly once to create a single listener.
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let socket = Socket::from(owned_fd);
 
- // The Python supervisor pre-binds the socket to reserve the endpoint early, but
- // Rust is responsible for transitioning inherited stream sockets into
- // the listening state before accepting connections.
+        // The Python supervisor pre-binds the socket to reserve the endpoint early, but
+        // Rust is responsible for transitioning inherited stream sockets into
+        // the listening state before accepting connections.
         socket.listen(libc::SOMAXCONN)?;
         socket.set_nonblocking(true)?;
 

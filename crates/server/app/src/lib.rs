@@ -28,7 +28,7 @@ pub use crate::lora::{LoadLoraError, LoraModelResolution, UnloadLoraError};
 use crate::runtime_client::RuntimeEngineClient;
 pub use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 pub use crate::state::AppState;
-use uniserve_native_api::resolve_native_profile;
+use uniserve_native_api::resolve_native_profile_for_model;
 
 /// Build the shared application state for one configured model and one engine
 /// client.
@@ -69,7 +69,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     // Resolve the model's image/interleave control tokens once from the
     // tokenizer; they drive both the scheduler's image FSM and native-surface
     // prompt ingest.
-    let native_profile = resolve_native_profile(&*text_backend.tokenizer());
+    let native_profile =
+        resolve_native_profile_for_model(&config.model, &*text_backend.tokenizer());
     let native_controls = &native_profile.controls;
 
     // UniServe owns the engine + scheduler in Rust; Python (or the sim) only

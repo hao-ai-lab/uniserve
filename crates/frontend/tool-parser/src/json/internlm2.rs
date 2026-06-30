@@ -8,13 +8,13 @@ const INTERNLM2_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     marker_whitespace: JsonToolCallWhitespace::Optional,
     delimiter: None,
     name_key: "name",
- // The Python parser's `get_arguments` accepts either `parameters` or
- // `arguments` and prefers `parameters` when both are present. This Rust
- // parser uses first-encountered semantics because the header parser only
- // permits one args key per tool-call object; if a future model emits
- // both keys in the same object, the Rust port will accept the first one
- // and reject the trailing one as a syntax error rather than silently
- // shadowing it.
+    // The Python parser's `get_arguments` accepts either `parameters` or
+    // `arguments` and prefers `parameters` when both are present. This Rust
+    // parser uses first-encountered semantics because the header parser only
+    // permits one args key per tool-call object; if a future model emits
+    // both keys in the same object, the Rust port will accept the first one
+    // and reject the trailing one as a syntax error rather than silently
+    // shadowing it.
     arguments_key: &["parameters", "arguments"],
 };
 
@@ -77,7 +77,7 @@ pub struct Internlm2ToolParser {
 }
 
 impl Internlm2ToolParser {
- /// Create an InternLM2 tool parser.
+    /// Create an InternLM2 tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(INTERNLM2_CONFIG),
@@ -86,7 +86,7 @@ impl Internlm2ToolParser {
 }
 
 impl ToolParser for Internlm2ToolParser {
- /// Create a boxed InternLM2 tool parser.
+    /// Create a boxed InternLM2 tool parser.
     fn create(tools: &[Tool]) -> Result<Box<dyn ToolParser>>
     where
         Self: Sized + 'static,
@@ -94,24 +94,24 @@ impl ToolParser for Internlm2ToolParser {
         Ok(Box::new(Self::new(tools)))
     }
 
- /// Preserve special-token markers while decoding, since
- /// `<|action_start|>`, `<|plugin|>`, and `<|action_end|>` are tokenizer
- /// special tokens in InternLM2 models.
+    /// Preserve special-token markers while decoding, since
+    /// `<|action_start|>`, `<|plugin|>`, and `<|action_end|>` are tokenizer
+    /// special tokens in InternLM2 models.
     fn preserve_special_tokens(&self) -> bool {
         true
     }
 
- /// Feed one decoded text chunk through the InternLM2 parser.
+    /// Feed one decoded text chunk through the InternLM2 parser.
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.inner.parse_into(chunk, output)
     }
 
- /// Flush any buffered partial state at end of stream.
+    /// Flush any buffered partial state at end of stream.
     fn finish(&mut self) -> Result<ToolParserOutput> {
         self.inner.finish()
     }
 
- /// Clear parser state and return currently uncommitted buffered text.
+    /// Clear parser state and return currently uncommitted buffered text.
     fn reset(&mut self) -> String {
         self.inner.reset()
     }

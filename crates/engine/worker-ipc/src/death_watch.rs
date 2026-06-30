@@ -33,8 +33,9 @@ mod imp {
             // SAFETY: pidfd_open is a thin syscall wrapper; pid is the child we
             // just spawned. A negative return means the kernel lacks the
             // syscall (pre-5.3) — we fall back to the liveness probe.
-            let pidfd =
-                unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint) };
+            let pidfd = unsafe {
+                libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0 as libc::c_uint)
+            };
             if pidfd < 0 {
                 return None;
             }
@@ -146,6 +147,9 @@ mod tests {
         }
         drop(watcher);
         let _ = child.wait();
-        assert!(saw_death, "death watcher did not fire the death wake on child exit");
+        assert!(
+            saw_death,
+            "death watcher did not fire the death wake on child exit"
+        );
     }
 }

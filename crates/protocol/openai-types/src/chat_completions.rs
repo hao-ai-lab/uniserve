@@ -20,219 +20,219 @@ use crate::structured_outputs::ResponseFormat;
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[validate(schema(function = "validate_chat_cross_parameters"))]
 pub struct ChatCompletionRequest {
- // -------- Standard OpenAI API Parameters --------
- /// A list of messages comprising the conversation so far
+    // -------- Standard OpenAI API Parameters --------
+    /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
     pub messages: Vec<ChatMessage>,
 
- /// ID of the model to use
+    /// ID of the model to use
     #[serde(default = "default_model")]
     pub model: String,
 
- /// Number between -2.0 and 2.0. Positive values penalize new tokens based
- /// on their existing frequency in the text so far
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based
+    /// on their existing frequency in the text so far
     #[validate(range(min = -2.0, max = 2.0))]
     pub frequency_penalty: Option<f32>,
 
- /// Modify the likelihood of specified tokens appearing in the completion
+    /// Modify the likelihood of specified tokens appearing in the completion
     pub logit_bias: Option<HashMap<String, f32>>,
 
- /// Whether to return log probabilities of the output tokens
+    /// Whether to return log probabilities of the output tokens
     #[serde(default)]
     pub logprobs: bool,
 
- /// An integer specifying the number of most likely tokens to return
- /// -1 means return all
+    /// An integer specifying the number of most likely tokens to return
+    /// -1 means return all
     #[validate(range(min = -1))]
     pub top_logprobs: Option<i32>,
 
- /// Compatibility alias for `max_completion_tokens`.
+    /// Compatibility alias for `max_completion_tokens`.
     #[validate(range(min = 1))]
     pub max_tokens: Option<u32>,
 
- /// An upper bound for the number of tokens that can be generated for a
- /// completion
+    /// An upper bound for the number of tokens that can be generated for a
+    /// completion
     #[validate(range(min = 1))]
     pub max_completion_tokens: Option<u32>,
 
- /// How many chat completion choices to generate for each input message
+    /// How many chat completion choices to generate for each input message
     #[validate(range(min = 1, max = 10))]
     pub n: Option<u32>,
 
- /// Number between -2.0 and 2.0. Positive values penalize new tokens based
- /// on whether they appear in the text so far
+    /// Number between -2.0 and 2.0. Positive values penalize new tokens based
+    /// on whether they appear in the text so far
     #[validate(range(min = -2.0, max = 2.0))]
     pub presence_penalty: Option<f32>,
 
- /// An object specifying the format that the model must output
+    /// An object specifying the format that the model must output
     pub response_format: Option<ResponseFormat>,
 
- /// If specified, our system will make a best effort to sample
- /// deterministically
+    /// If specified, our system will make a best effort to sample
+    /// deterministically
     pub seed: Option<i64>,
 
- /// Up to 4 sequences where the API will stop generating further tokens
+    /// Up to 4 sequences where the API will stop generating further tokens
     #[validate(custom(function = "validate_stop"))]
     pub stop: Option<StringOrArray>,
 
- /// If set, partial message deltas will be sent
+    /// If set, partial message deltas will be sent
     #[serde(default)]
     pub stream: bool,
 
- /// Options for streaming response
+    /// Options for streaming response
     pub stream_options: Option<StreamOptions>,
 
- /// What sampling temperature to use, between 0 and 2
+    /// What sampling temperature to use, between 0 and 2
     #[validate(range(min = 0.0, max = 2.0))]
     pub temperature: Option<f32>,
 
- /// An alternative to sampling with temperature
+    /// An alternative to sampling with temperature
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
- /// A list of tools the model may call
+    /// A list of tools the model may call
     pub tools: Option<Vec<Tool>>,
 
- /// Controls which (if any) tool is called by the model
+    /// Controls which (if any) tool is called by the model
     pub tool_choice: Option<ToolChoice>,
 
- /// Effort level for reasoning models (none, minimal, low, medium, high,
- /// xhigh, max)
+    /// Effort level for reasoning models (none, minimal, low, medium, high,
+    /// xhigh, max)
     pub reasoning_effort: Option<ReasoningEffort>,
 
- /// Whether to enable parallel function calling during tool use
+    /// Whether to enable parallel function calling during tool use
     pub parallel_tool_calls: Option<bool>,
 
- /// A unique identifier representing your end-user
+    /// A unique identifier representing your end-user
     pub user: Option<String>,
 
- // -------- Sampling Parameters --------
- /// Use beam search instead of sampling
+    // -------- Sampling Parameters --------
+    /// Use beam search instead of sampling
     #[serde(default)]
     pub use_beam_search: bool,
 
- /// Top-k sampling parameter
+    /// Top-k sampling parameter
     pub top_k: Option<u32>,
 
- /// Min-p nucleus sampling parameter
+    /// Min-p nucleus sampling parameter
     #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: Option<f32>,
 
- /// Repetition penalty for reducing repetitive text
+    /// Repetition penalty for reducing repetitive text
     #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: Option<f32>,
 
- /// Length penalty for beam search
+    /// Length penalty for beam search
     pub length_penalty: Option<f32>,
 
- /// Specific token IDs to use as stop conditions
+    /// Specific token IDs to use as stop conditions
     pub stop_token_ids: Option<Vec<u32>>,
 
- /// Include stop string in output
+    /// Include stop string in output
     #[serde(default)]
     pub include_stop_str_in_output: bool,
 
- /// Ignore end-of-sequence tokens during generation
+    /// Ignore end-of-sequence tokens during generation
     #[serde(default)]
     pub ignore_eos: bool,
 
- /// Minimum number of tokens to generate
+    /// Minimum number of tokens to generate
     #[validate(range(min = 1))]
     pub min_tokens: Option<u32>,
 
- /// Skip special tokens during detokenization
+    /// Skip special tokens during detokenization
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 
- /// Add spaces between special tokens during detokenization
+    /// Add spaces between special tokens during detokenization
     #[serde(default = "default_true")]
     pub spaces_between_special_tokens: bool,
 
- /// Truncate prompt tokens to this length
+    /// Truncate prompt tokens to this length
     pub truncate_prompt_tokens: Option<i64>,
 
- /// Number of prompt logprobs to return
+    /// Number of prompt logprobs to return
     pub prompt_logprobs: Option<i32>,
 
- /// Restrict output to these token IDs only
+    /// Restrict output to these token IDs only
     pub allowed_token_ids: Option<Vec<u32>>,
 
- /// List of bad words to avoid during generation
+    /// List of bad words to avoid during generation
     pub bad_words: Option<Vec<String>>,
 
- // -------- Extra Parameters --------
- /// Token budget for reasoning/thinking
+    // -------- Extra Parameters --------
+    /// Token budget for reasoning/thinking
     pub thinking_token_budget: Option<u32>,
 
- /// Whether to include reasoning content in the response
+    /// Whether to include reasoning content in the response
     #[serde(default = "default_true")]
     pub include_reasoning: bool,
 
- /// If true, the new message will be prepended with the last message if they
- /// belong to the same role.
+    /// If true, the new message will be prepended with the last message if they
+    /// belong to the same role.
     #[serde(default)]
     pub echo: bool,
 
- /// Whether to add the generation prompt to the chat template.
+    /// Whether to add the generation prompt to the chat template.
 
- /// When omitted, the request follows the API default behavior, which is
- /// equivalent to `true` unless `continue_final_message=true` selects
- /// final assistant continuation instead.
+    /// When omitted, the request follows the API default behavior, which is
+    /// equivalent to `true` unless `continue_final_message=true` selects
+    /// final assistant continuation instead.
     pub add_generation_prompt: Option<bool>,
 
- /// Continue generating from final assistant message
+    /// Continue generating from final assistant message
     #[serde(default)]
     pub continue_final_message: bool,
 
- /// Whether to add special tokens (e.g. BOS) to the prompt
+    /// Whether to add special tokens (e.g. BOS) to the prompt
     #[serde(default)]
     pub add_special_tokens: bool,
 
- /// Documents for RAG (retrieval-augmented generation)
+    /// Documents for RAG (retrieval-augmented generation)
     pub documents: Option<Vec<Value>>,
 
- /// Jinja chat template override
+    /// Jinja chat template override
     pub chat_template: Option<String>,
 
- /// Additional keyword args passed to the chat template renderer
+    /// Additional keyword args passed to the chat template renderer
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
- /// Additional kwargs for media IO connectors, keyed by modality
+    /// Additional kwargs for media IO connectors, keyed by modality
     pub media_io_kwargs: Option<HashMap<String, Value>>,
 
- /// Additional kwargs for the HF processor
+    /// Additional kwargs for the HF processor
     pub mm_processor_kwargs: Option<HashMap<String, Value>>,
 
- /// Additional kwargs for structured outputs
+    /// Additional kwargs for structured outputs
     pub structured_outputs: Option<Value>,
 
- /// Request scheduling priority (lower means earlier; default 0)
+    /// Request scheduling priority (lower means earlier; default 0)
     pub priority: Option<i32>,
 
- /// External request ID used for response correlation.
+    /// External request ID used for response correlation.
     pub request_id: Option<String>,
 
- /// Tokens represented as strings of the form 'token_id:{token_id}' in
- /// logprobs
+    /// Tokens represented as strings of the form 'token_id:{token_id}' in
+    /// logprobs
     pub return_tokens_as_token_ids: Option<bool>,
 
- /// Include token IDs alongside generated text
+    /// Include token IDs alongside generated text
     pub return_token_ids: Option<bool>,
 
- /// Salt for prefix cache isolation in multi-user environments
+    /// Salt for prefix cache isolation in multi-user environments
     pub cache_salt: Option<String>,
 
- /// KV transfer parameters for disaggregated serving
+    /// KV transfer parameters for disaggregated serving
     pub kv_transfer_params: Option<HashMap<String, Value>>,
 
- /// Additional request parameters with string or numeric values for custom
- /// extensions
+    /// Additional request parameters with string or numeric values for custom
+    /// extensions
     pub uniserve_xargs: Option<HashMap<String, Value>>,
 
- /// Parameters for detecting repetitive N-gram patterns in output tokens
+    /// Parameters for detecting repetitive N-gram patterns in output tokens
     pub repetition_detection: Option<Value>,
 
- /// Additional fields
+    /// Additional fields
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
@@ -303,16 +303,16 @@ impl Default for ChatCompletionRequest {
 }
 
 impl Normalizable for ChatCompletionRequest {
- /// Normalize the request by applying defaults and field updates.
+    /// Normalize the request by applying defaults and field updates.
     fn normalize(&mut self) {
- // Normalize the compatibility alias onto the canonical field.
+        // Normalize the compatibility alias onto the canonical field.
         if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
             self.max_completion_tokens = self.max_tokens;
             self.max_tokens = None;
         }
 
- // Apply tool_choice defaults
- // If tools is None, leave tool_choice as None (don't set it)
+        // Apply tool_choice defaults
+        // If tools is None, leave tool_choice as None (don't set it)
         if self.tool_choice.is_none()
             && let Some(tools) = &self.tools
         {
@@ -390,7 +390,7 @@ pub struct ChatCompletionStreamResponse {
 }
 
 impl ChatCompletionStreamResponse {
- /// Create a stream response with the standard envelope fields pre-filled.
+    /// Create a stream response with the standard envelope fields pre-filled.
     pub fn new(id: &str, model: &str, created: u64) -> Self {
         Self {
             id: id.to_string(),
@@ -461,21 +461,21 @@ fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::Validati
 fn validate_chat_cross_parameters(
     req: &ChatCompletionRequest,
 ) -> Result<(), validator::ValidationError> {
- // 1. Validate logprobs dependency
+    // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
         let mut e = validator::ValidationError::new("top_logprobs_requires_logprobs");
         e.message = Some("top_logprobs is only allowed when logprobs is enabled".into());
         return Err(e);
     }
 
- // 2. Validate stream_options dependency
+    // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
         let mut e = validator::ValidationError::new("stream_options_requires_stream");
         e.message = Some("stream_options can only be used when stream is true".into());
         return Err(e);
     }
 
- // 3. Validate token limits - min <= max
+    // 3. Validate token limits - min <= max
     if let (Some(min_tokens), Some(max_completion_tokens)) =
         (req.min_tokens, req.max_completion_tokens)
         && min_tokens > max_completion_tokens
@@ -493,7 +493,7 @@ fn validate_chat_cross_parameters(
         return Err(e);
     }
 
- // 4. Validate response format JSON schema name
+    // 4. Validate response format JSON schema name
     if let Some(ResponseFormat::JsonSchema { json_schema }) = &req.response_format
         && json_schema.name.is_empty()
     {
@@ -502,11 +502,11 @@ fn validate_chat_cross_parameters(
         return Err(e);
     }
 
- // 5. Validate tool_choice requires tools (except for "none")
+    // 5. Validate tool_choice requires tools (except for "none")
     if let Some(ref tool_choice) = req.tool_choice {
         let has_tools = req.tools.as_ref().is_some_and(|t| !t.is_empty());
 
- // Check if tool_choice is anything other than "none"
+        // Check if tool_choice is anything other than "none"
         let is_some_choice = !matches!(tool_choice, ToolChoice::Value(ToolChoiceValue::None));
 
         if is_some_choice && !has_tools {
@@ -515,11 +515,11 @@ fn validate_chat_cross_parameters(
             return Err(e);
         }
 
- // Additional validation when tools are present
+        // Additional validation when tools are present
         if let Some(tools) = req.tools.as_ref().filter(|t| !t.is_empty()) {
             match tool_choice {
                 ToolChoice::Function { function, .. } => {
- // Validate that the specified function name exists in tools
+                    // Validate that the specified function name exists in tools
                     let function_exists = tools.iter().any(|tool| {
                         tool.tool_type == "function" && tool.function.name == function.name
                     });
@@ -542,7 +542,7 @@ fn validate_chat_cross_parameters(
                     tools: allowed_tools,
                     ..
                 } => {
- // Validate mode is "auto" or "required"
+                    // Validate mode is "auto" or "required"
                     if mode != "auto" && mode != "required" {
                         let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
                         e.message = Some(format!(
@@ -551,12 +551,12 @@ fn validate_chat_cross_parameters(
                         return Err(e);
                     }
 
- // Validate that all ToolReferences are Function type (Chat API only supports
- // function tools)
+                    // Validate that all ToolReferences are Function type (Chat API only supports
+                    // function tools)
                     for tool_ref in allowed_tools {
                         match tool_ref {
                             ToolReference::Function { name } => {
- // Validate that the function exists in tools array
+                                // Validate that the function exists in tools array
                                 let tool_exists = tools.iter().any(|tool| {
                                     tool.tool_type == "function" && tool.function.name == *name
                                 });
@@ -575,7 +575,7 @@ fn validate_chat_cross_parameters(
                                 }
                             }
                             _ => {
- // Chat Completion API only supports function tools in tool_choice
+                                // Chat Completion API only supports function tools in tool_choice
                                 let mut e = validator::ValidationError::new(
                                     "tool_choice_invalid_tool_type",
                                 );
@@ -615,11 +615,11 @@ mod tests {
 
         let req: ChatCompletionRequest = serde_json::from_value(json).unwrap();
 
- // Known fields still deserialize normally.
+        // Known fields still deserialize normally.
         assert_eq!(req.model, "test-model");
         assert_eq!(req.temperature, Some(0.5));
 
- // Unknown fields are preserved in the catch-all rather than silently dropped.
+        // Unknown fields are preserved in the catch-all rather than silently dropped.
         assert_eq!(req.other.get("some_future_field"), Some(&Value::from(42)));
         assert_eq!(
             req.other.get("vendor_extension"),

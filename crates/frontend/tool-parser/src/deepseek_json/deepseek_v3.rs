@@ -18,7 +18,7 @@ use crate::{Result, Tool, ToolParser, ToolParserOutput};
 pub struct DeepSeekV3ToolParser(DeepSeekJsonToolParser);
 
 impl DeepSeekV3ToolParser {
- /// Create a DeepSeek V3 tool parser.
+    /// Create a DeepSeek V3 tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self(DeepSeekJsonToolParser::new(DeepSeekJsonFormat::V3))
     }

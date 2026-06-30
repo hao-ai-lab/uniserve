@@ -55,8 +55,8 @@ fn request_latency_histogram() -> Histogram {
 }
 
 fn request_token_count_histogram() -> Histogram {
- // Histogram upper bound is intentionally static; request-level context
- // limits are enforced before metrics are recorded.
+    // Histogram upper bound is intentionally static; request-level context
+    // limits are enforced before metrics are recorded.
     Histogram::new(build_1_2_5_buckets(131_072))
 }
 
@@ -84,7 +84,7 @@ pub(crate) type PromptTokenSourceCounterFamily = Family<PromptTokenSourceLabels,
 /// Request-lifecycle Prometheus families exported from the `llm` layer.
 #[derive(MetricFamily)]
 pub struct RequestMetrics {
- // Request-derived counters.
+    // Request-derived counters.
     #[metric(
         name = "uniserve:num_preemptions",
         help = "Cumulative number of preemption events."
@@ -111,12 +111,12 @@ pub struct RequestMetrics {
     )]
     pub generation_tokens: Family<EngineLabels, U64Counter>,
 
- // We intentionally don't support iteration-level histograms for now, since it seems to make
- // more sense if the engine maintains these metrics and frontend simply forwards.
+    // We intentionally don't support iteration-level histograms for now, since it seems to make
+    // more sense if the engine maintains these metrics and frontend simply forwards.
 
- // pub iteration_tokens_total: HistogramFamily,
+    // pub iteration_tokens_total: HistogramFamily,
 
- // Request lifecycle counters and histograms.
+    // Request lifecycle counters and histograms.
     #[metric(
         name = "uniserve:request_success",
         help = "Count of successfully processed requests."

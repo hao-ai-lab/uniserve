@@ -31,7 +31,7 @@ pub struct Qwen3XmlToolParser {
 }
 
 impl Qwen3XmlToolParser {
- /// Create a Qwen XML tool parser.
+    /// Create a Qwen XML tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(QWEN_XML_CONFIG),

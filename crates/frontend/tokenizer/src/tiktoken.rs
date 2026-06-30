@@ -44,12 +44,12 @@ const MAX_RESERVED_SPECIAL_TOKENS: u32 = 1 << 20;
 #[derive(Debug, Clone, Deserialize)]
 struct AddedToken {
     content: String,
- /// HuggingFace `added_tokens_decoder` entries can be marked `"special":
- /// true|false`. Special tokens are dropped from output when `decode` is
- /// called with `skip_special_tokens = true`. Defaults to `false` when
- /// the field is omitted, matching HuggingFace's `AddedToken` default —
- /// so only tokens explicitly marked special are stripped during normal
- /// decode (where `skip_special_tokens` itself defaults to true).
+    /// HuggingFace `added_tokens_decoder` entries can be marked `"special":
+    /// true|false`. Special tokens are dropped from output when `decode` is
+    /// called with `skip_special_tokens = true`. Defaults to `false` when
+    /// the field is omitted, matching HuggingFace's `AddedToken` default —
+    /// so only tokens explicitly marked special are stripped during normal
+    /// decode (where `skip_special_tokens` itself defaults to true).
     #[serde(default)]
     special: bool,
 }
@@ -58,9 +58,9 @@ struct AddedToken {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct TiktokenTokenizerConfig {
- /// Format:
- /// `{ "added_tokens_decoder": { "163584": { "content": "[BOS]", "special":
- /// true },... } }`
+    /// Format:
+    /// `{ "added_tokens_decoder": { "163584": { "content": "[BOS]", "special":
+    /// true },... } }`
     #[serde(default)]
     added_tokens_decoder: FxHashMap<u32, AddedToken>,
 }
@@ -75,20 +75,20 @@ struct TiktokenModelConfig {
 }
 
 impl TiktokenModelConfig {
- /// Read `model_type` from a model `config.json` value, falling back to a
- /// single-level nested `text_config.model_type` for composite (e.g.
- /// multimodal) configs that keep text metadata under a `text_config`
- /// object.
+    /// Read `model_type` from a model `config.json` value, falling back to a
+    /// single-level nested `text_config.model_type` for composite (e.g.
+    /// multimodal) configs that keep text metadata under a `text_config`
+    /// object.
     fn effective_model_type(&self) -> Option<&str> {
         self.model_type
             .as_deref()
             .or_else(|| self.text_config.as_deref()?.effective_model_type())
     }
 
- /// Read `vocab_size` from a model `config.json` value, falling back to a
- /// single-level nested `text_config.vocab_size` for composite (e.g.
- /// multimodal) configs that keep text metadata under a `text_config`
- /// object — matching the same shape `ModelConfig` parses.
+    /// Read `vocab_size` from a model `config.json` value, falling back to a
+    /// single-level nested `text_config.vocab_size` for composite (e.g.
+    /// multimodal) configs that keep text metadata under a `text_config`
+    /// object — matching the same shape `ModelConfig` parses.
     fn effective_vocab_size(&self) -> Option<u32> {
         self.vocab_size
             .or_else(|| self.text_config.as_deref()?.effective_vocab_size())
@@ -108,62 +108,62 @@ enum Backend {
 
 struct RiptokenBackend {
     inner: Box<riptoken::CoreBPE>,
- /// Set of special-token strings recognized in input text, precomputed once
- /// at construction so `encode` does not rebuild it on every call.
+    /// Set of special-token strings recognized in input text, precomputed once
+    /// at construction so `encode` does not rebuild it on every call.
 
- /// `riptoken::CoreBPE::encode` requires a borrowed `&HashSet<&str>`. A
- /// `HashSet<&str>` that borrows from an owned field would make this struct
- /// self-referential, so the special-token strings are leaked once into
- /// `&'static str`. The tokenizer is a process-lifetime `Arc` singleton and
- /// the special-token set is small and bounded (a few hundred to a few
- /// thousand entries), so this is a one-time, fixed cost.
+    /// `riptoken::CoreBPE::encode` requires a borrowed `&HashSet<&str>`. A
+    /// `HashSet<&str>` that borrows from an owned field would make this struct
+    /// self-referential, so the special-token strings are leaked once into
+    /// `&'static str`. The tokenizer is a process-lifetime `Arc` singleton and
+    /// the special-token set is small and bounded (a few hundred to a few
+    /// thousand entries), so this is a one-time, fixed cost.
     allowed_special_tokens: HashSet<&'static str>,
 }
 
 struct TiktokenRsBackend {
     inner: Box<tiktoken_rs::CoreBPE>,
- /// Reverse map for special / added token strings populated from the
- /// reserved range. This lets `token_to_id` answer special-token lookups
- /// directly without round-tripping through `tiktoken-rs`'s encoder,
- /// which can panic for unknown special-looking strings.
+    /// Reverse map for special / added token strings populated from the
+    /// reserved range. This lets `token_to_id` answer special-token lookups
+    /// directly without round-tripping through `tiktoken-rs`'s encoder,
+    /// which can panic for unknown special-looking strings.
     special_token_ids_by_text: FxHashMap<String, u32>,
- /// Set of out-of-vocab token IDs we have already warned about. The
- /// reserved-slot population in the constructor should keep this empty
- /// under normal operation; it only fills up if a model emits ids at or
- /// above `vocab_upper_bound` (e.g. an engine sampling bug). We dedupe
- /// so streaming decode (which calls `decode` repeatedly on the same prefix)
- /// does not spam.
+    /// Set of out-of-vocab token IDs we have already warned about. The
+    /// reserved-slot population in the constructor should keep this empty
+    /// under normal operation; it only fills up if a model emits ids at or
+    /// above `vocab_upper_bound` (e.g. an engine sampling bug). We dedupe
+    /// so streaming decode (which calls `decode` repeatedly on the same prefix)
+    /// does not spam.
     warned_unknown_ids: Mutex<FxHashSet<u32>>,
 }
 
 struct TokenMetadata {
- /// Number of regular BPE tokens. Token ids in `[0, num_base_tokens)` are
- /// BPE tokens that always decode to text; ids in `[num_base_tokens,
- /// vocab_upper_bound)` live in the special-token slots and are subject
- /// to `skip_special_tokens` filtering.
+    /// Number of regular BPE tokens. Token ids in `[0, num_base_tokens)` are
+    /// BPE tokens that always decode to text; ids in `[num_base_tokens,
+    /// vocab_upper_bound)` live in the special-token slots and are subject
+    /// to `skip_special_tokens` filtering.
     num_base_tokens: u32,
- /// Exclusive upper bound on token IDs that `inner` is guaranteed to know
- /// how to decode.
+    /// Exclusive upper bound on token IDs that `inner` is guaranteed to know
+    /// how to decode.
 
- /// The constructor registers every id in `[num_base_tokens,
- /// vocab_upper_bound)` with the inner `CoreBPE` as a (named or
- /// `<|reserved_token_{id}|>`) special token, and the BPE
- /// encoder densely covers `[0, num_base_tokens)`. So any id below this
- /// bound is in one of the inner `CoreBPE`'s decoder maps and
- /// `_decode_native_and_split` will not panic on it. `decode` filters
- /// out ids at or above this bound to keep that guarantee.
+    /// The constructor registers every id in `[num_base_tokens,
+    /// vocab_upper_bound)` with the inner `CoreBPE` as a (named or
+    /// `<|reserved_token_{id}|>`) special token, and the BPE
+    /// encoder densely covers `[0, num_base_tokens)`. So any id below this
+    /// bound is in one of the inner `CoreBPE`'s decoder maps and
+    /// `_decode_native_and_split` will not panic on it. `decode` filters
+    /// out ids at or above this bound to keep that guarantee.
     vocab_upper_bound: u32,
- /// Ids in `[num_base_tokens, vocab_upper_bound)` whose
- /// `added_tokens_decoder` entry was explicitly marked `"special":
- /// false` — i.e. tokens that should still appear in output
- /// even when `skip_special_tokens = true`. For Kimi K2 / K2.5 this
- /// typically holds the tool-call markers and `<think>` / `</think>`.
- /// Reserved-slot placeholders are not in this set (they default to
- /// special and get skipped).
+    /// Ids in `[num_base_tokens, vocab_upper_bound)` whose
+    /// `added_tokens_decoder` entry was explicitly marked `"special":
+    /// false` — i.e. tokens that should still appear in output
+    /// even when `skip_special_tokens = true`. For Kimi K2 / K2.5 this
+    /// typically holds the tool-call markers and `<think>` / `</think>`.
+    /// Reserved-slot placeholders are not in this set (they default to
+    /// special and get skipped).
     non_special_added_ids: FxHashSet<u32>,
- /// Raw token string by token id. Base BPE tokens are represented with
- /// lossy UTF-8, matching decode behavior for byte sequences that are not
- /// valid UTF-8 on their own.
+    /// Raw token string by token id. Base BPE tokens are represented with
+    /// lossy UTF-8, matching decode behavior for byte sequences that are not
+    /// valid UTF-8 on their own.
     token_by_id: FxHashMap<u32, String>,
 }
 
@@ -174,9 +174,9 @@ impl TokenMetadata {
                 || id >= self.vocab_upper_bound
                 || self.non_special_added_ids.contains(&id)
         };
- // The common streaming case is a chunk of plain BPE tokens with nothing
- // to strip, so borrow the input instead of allocating a fresh `Vec`
- // unless filtering actually removes at least one id.
+        // The common streaming case is a chunk of plain BPE tokens with nothing
+        // to strip, so borrow the input instead of allocating a fresh `Vec`
+        // unless filtering actually removes at least one id.
         if token_ids.iter().all(|id| keep(id)) {
             Cow::Borrowed(token_ids)
         } else {
@@ -197,15 +197,15 @@ impl TokenMetadata {
 
 impl RiptokenBackend {
     fn encode(&self, text: &str) -> Vec<u32> {
- // `allowed_special_tokens` is a `HashSet<&'static str>` already in the
- // exact shape `riptoken::CoreBPE::encode` wants, so the set is built
- // once at construction rather than on every encode call.
+        // `allowed_special_tokens` is a `HashSet<&'static str>` already in the
+        // exact shape `riptoken::CoreBPE::encode` wants, so the set is built
+        // once at construction rather than on every encode call.
         self.inner.encode(text, &self.allowed_special_tokens)
     }
 
     fn decode(&self, token_ids: &[u32]) -> String {
         let bytes = self.inner.decode_bytes(token_ids);
- // Use the stable lossy UTF-8 conversion path.
+        // Use the stable lossy UTF-8 conversion path.
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -236,7 +236,7 @@ impl TiktokenRsBackend {
             ._decode_native_and_split(safe_ids)
             .flatten()
             .collect();
- // Use the stable lossy UTF-8 conversion path.
+        // Use the stable lossy UTF-8 conversion path.
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -245,23 +245,23 @@ impl TiktokenRsBackend {
             return Some(token_id);
         }
 
- // Fall back to ordinary encoding for regular vocabulary items. This
- // deliberately avoids `encode_with_special_tokens`: older `tiktoken-rs`
- // versions can panic if the input text merely *looks* like a special
- // token but is not registered in `special_tokens_encoder`.
+        // Fall back to ordinary encoding for regular vocabulary items. This
+        // deliberately avoids `encode_with_special_tokens`: older `tiktoken-rs`
+        // versions can panic if the input text merely *looks* like a special
+        // token but is not registered in `special_tokens_encoder`.
         let ids = self.inner.encode_ordinary(token);
         if ids.len() == 1 { Some(ids[0]) } else { None }
     }
 
- /// Log a warning the first time an unknown token id is seen during decode,
- /// deduped across calls so streaming decode does not spam the log for
- /// the same id.
+    /// Log a warning the first time an unknown token id is seen during decode,
+    /// deduped across calls so streaming decode does not spam the log for
+    /// the same id.
     fn warn_unknown_id(&self, token_id: u32) {
- // Recover from a poisoned lock rather than silently swallowing it: the
- // guarded data is a plain dedupe set with no invariant that a panic
- // could have left inconsistent, so the worst case is one duplicate
- // warning. Swallowing the poison instead would silently disable all
- // future unknown-id warnings.
+        // Recover from a poisoned lock rather than silently swallowing it: the
+        // guarded data is a plain dedupe set with no invariant that a panic
+        // could have left inconsistent, so the worst case is one duplicate
+        // warning. Swallowing the poison instead would silently disable all
+        // future unknown-id warnings.
         let mut set = self
             .warned_unknown_ids
             .lock()
@@ -280,16 +280,16 @@ impl TiktokenRsBackend {
 }
 
 impl TiktokenTokenizer {
- /// Load a tiktoken tokenizer from a `.tiktoken` / `tiktoken.model` BPE
- /// file.
+    /// Load a tiktoken tokenizer from a `.tiktoken` / `tiktoken.model` BPE
+    /// file.
 
- /// The BPE file format is one `<base64-token-bytes> <rank>` pair per line,
- /// the same format used by OpenAI's tiktoken and by HuggingFace model
- /// repos that ship tiktoken files (e.g. DeepSeek, Kimi K2).
+    /// The BPE file format is one `<base64-token-bytes> <rank>` pair per line,
+    /// the same format used by OpenAI's tiktoken and by HuggingFace model
+    /// repos that ship tiktoken files (e.g. DeepSeek, Kimi K2).
 
- /// Special / added tokens are read from `tokenizer_config.json` in the same
- /// directory when present. The `cl100k_base` regex pattern is used as a
- /// reasonable default.
+    /// Special / added tokens are read from `tokenizer_config.json` in the same
+    /// directory when present. The `cl100k_base` regex pattern is used as a
+    /// reasonable default.
     pub fn new(path: &Path) -> Result<Self> {
         if std::env::var_os(DISABLE_RIPTOKEN_ENV).is_some() {
             return Self::new_tiktoken_rs(path);
@@ -308,14 +308,14 @@ impl TiktokenTokenizer {
         }
     }
 
- /// Load from `tiktoken.model` / `*.tiktoken` with riptoken.
+    /// Load from `tiktoken.model` / `*.tiktoken` with riptoken.
     pub fn new_riptoken(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with riptoken (BPE file)");
 
         let config = LoadedTiktokenConfig::load(path)?;
- // Leak each special-token string once into `&'static str` so the
- // allowed-special set can be cached on the backend (see
- // `RiptokenBackend::allowed_special_tokens`).
+        // Leak each special-token string once into `&'static str` so the
+        // allowed-special set can be cached on the backend (see
+        // `RiptokenBackend::allowed_special_tokens`).
         let allowed_special_tokens: HashSet<&'static str> = config
             .special_tokens_encoder
             .keys()
@@ -342,7 +342,7 @@ impl TiktokenTokenizer {
         })
     }
 
- /// Load from `tiktoken.model` / `*.tiktoken` with tiktoken-rs.
+    /// Load from `tiktoken.model` / `*.tiktoken` with tiktoken-rs.
     pub fn new_tiktoken_rs(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with tiktoken-rs (BPE file)");
 
@@ -411,8 +411,8 @@ impl LoadedTiktokenConfig {
 
         let parent_dir = path.parent();
 
- // Read added/special tokens (id -> {name, special}) from
- // tokenizer_config.json in the same dir.
+        // Read added/special tokens (id -> {name, special}) from
+        // tokenizer_config.json in the same dir.
         let added_tokens_by_id = parent_dir
             .map(|dir| dir.join("tokenizer_config.json"))
             .filter(|p| p.exists())
@@ -432,13 +432,13 @@ impl LoadedTiktokenConfig {
             });
         let vocab_size_from_config = model_config.as_ref().and_then(|c| c.effective_vocab_size());
 
- // Build the full special-tokens encoder by populating the reserved
- // range that follows the BPE vocabulary. Unknown reserved slots get
- // Python-compatible placeholder names so sampled ids can still decode.
+        // Build the full special-tokens encoder by populating the reserved
+        // range that follows the BPE vocabulary. Unknown reserved slots get
+        // Python-compatible placeholder names so sampled ids can still decode.
 
- // Note: `*.tiktoken` ranks are token ids, and they are not guaranteed
- // to be contiguous. The base-vocab boundary is therefore `max_rank + 1`,
- // not `encoder.len`.
+        // Note: `*.tiktoken` ranks are token ids, and they are not guaranteed
+        // to be contiguous. The base-vocab boundary is therefore `max_rank + 1`,
+        // not `encoder.len`.
         let num_base_tokens = encoder
             .values()
             .copied()
@@ -450,11 +450,11 @@ impl LoadedTiktokenConfig {
             .max(num_base_tokens)
             .max(max_added_id.saturating_add(1));
 
- // Guard against a pathologically large reserved range: the loop below
- // allocates one placeholder string per id in `[num_base_tokens,
- // reserved_end)`, so an outsized `vocab_size` or a sparse high-id
- // `added_tokens_decoder` entry would otherwise iterate (and allocate)
- // millions of slots. Clamp to a sane maximum and warn.
+        // Guard against a pathologically large reserved range: the loop below
+        // allocates one placeholder string per id in `[num_base_tokens,
+        // reserved_end)`, so an outsized `vocab_size` or a sparse high-id
+        // `added_tokens_decoder` entry would otherwise iterate (and allocate)
+        // millions of slots. Clamp to a sane maximum and warn.
         let reserved_end = {
             let cap = num_base_tokens.saturating_add(MAX_RESERVED_SPECIAL_TOKENS);
             if reserved_end > cap {
@@ -522,14 +522,14 @@ impl LoadedTiktokenConfig {
 
 impl Tokenizer for TiktokenTokenizer {
     fn encode(&self, text: &str, _add_special_tokens: bool) -> Result<Vec<u32>> {
- // `add_special_tokens` is intentionally a no-op for tiktoken, and this
- // is a deliberate contract rather than a silent drop. In HuggingFace
- // semantics the flag controls automatic insertion of BOS/EOS (and other
- // template-injected) special tokens; tiktoken-based models do not have
- // such auto-insertion — chat templates embed any special tokens as
- // literal text in `text`, which both backends already recognize and
- // emit as their registered ids regardless of this flag. There is thus
- // nothing for the flag to enable or disable here.
+        // `add_special_tokens` is intentionally a no-op for tiktoken, and this
+        // is a deliberate contract rather than a silent drop. In HuggingFace
+        // semantics the flag controls automatic insertion of BOS/EOS (and other
+        // template-injected) special tokens; tiktoken-based models do not have
+        // such auto-insertion — chat templates embed any special tokens as
+        // literal text in `text`, which both backends already recognize and
+        // emit as their registered ids regardless of this flag. There is thus
+        // nothing for the flag to enable or disable here.
         Ok(match &self.backend {
             Backend::Riptoken(backend) => backend.encode(text),
             Backend::TiktokenRs(backend) => backend.encode(text),
@@ -537,23 +537,23 @@ impl Tokenizer for TiktokenTokenizer {
     }
 
     fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> Result<String> {
- // Filter passes:
+        // Filter passes:
 
- // 1. The constructor registers every id in `[num_base_tokens, vocab_upper_bound)` as a
- // special token (named or `<|reserved_token_{id}|>` placeholder, matching
- // `tokenization_kimi.py`). The tiktoken-rs backend additionally drops ids at or above
- // that bound so `_decode_native_and_split` cannot panic; riptoken's `decode_bytes`
- // already skips unknown ids.
+        // 1. The constructor registers every id in `[num_base_tokens, vocab_upper_bound)` as a
+        // special token (named or `<|reserved_token_{id}|>` placeholder, matching
+        // `tokenization_kimi.py`). The tiktoken-rs backend additionally drops ids at or above
+        // that bound so `_decode_native_and_split` cannot panic; riptoken's `decode_bytes`
+        // already skips unknown ids.
 
- // 2. When `skip_special_tokens = true`, ids in `[num_base_tokens, vocab_upper_bound)` are
- // dropped *unless* they were marked `"special": false` in `added_tokens_decoder`. This
- // matches HuggingFace's tokenizer semantics: tool-call markers and `<think>` /
- // `</think>` (which Kimi K2 / K2.5 declare as non-special) stay in the output, while
- // BOS/EOS/header tokens and reserved-slot placeholders are stripped.
+        // 2. When `skip_special_tokens = true`, ids in `[num_base_tokens, vocab_upper_bound)` are
+        // dropped *unless* they were marked `"special": false` in `added_tokens_decoder`. This
+        // matches HuggingFace's tokenizer semantics: tool-call markers and `<think>` /
+        // `</think>` (which Kimi K2 / K2.5 declare as non-special) stay in the output, while
+        // BOS/EOS/header tokens and reserved-slot placeholders are stripped.
 
- // Lossy UTF-8 decoding (instead of strict `String::from_utf8`) is used so
- // partial multi-byte sequences become `\u{FFFD}`, which `DecodeStream`
- // relies on to detect incomplete characters during streaming.
+        // Lossy UTF-8 decoding (instead of strict `String::from_utf8`) is used so
+        // partial multi-byte sequences become `\u{FFFD}`, which `DecodeStream`
+        // relies on to detect incomplete characters during streaming.
         let ids: Cow<'_, [u32]> = if skip_special_tokens {
             self.metadata.filter_special_tokens(token_ids)
         } else {
@@ -617,10 +617,10 @@ mod tests {
         };
     }
 
- /// Write a minimal `*.tiktoken` BPE file (one token per byte 0..=255) into
- /// `dir` and return its path. The single-byte vocab is enough to
- /// exercise the multi-byte / streaming UTF-8 paths without depending on
- /// any pretrained tokenizer asset.
+    /// Write a minimal `*.tiktoken` BPE file (one token per byte 0..=255) into
+    /// `dir` and return its path. The single-byte vocab is enough to
+    /// exercise the multi-byte / streaming UTF-8 paths without depending on
+    /// any pretrained tokenizer asset.
     fn write_synthetic_bpe_file(dir: &std::path::Path) -> PathBuf {
         let mut content = String::new();
         for byte in 0u8..=255 {
@@ -632,12 +632,12 @@ mod tests {
         path
     }
 
- /// Write a synthetic `*.tiktoken` file whose base-vocab ranks are
- /// sparse/non-contiguous.
+    /// Write a synthetic `*.tiktoken` file whose base-vocab ranks are
+    /// sparse/non-contiguous.
 
- /// This reproduces the important edge case for `num_base_tokens`: it must
- /// be derived from `max_rank + 1`, not `encoder.len`, otherwise
- /// high-rank base tokens get misclassified as reserved/special ids.
+    /// This reproduces the important edge case for `num_base_tokens`: it must
+    /// be derived from `max_rank + 1`, not `encoder.len`, otherwise
+    /// high-rank base tokens get misclassified as reserved/special ids.
     fn write_sparse_rank_bpe_file(dir: &std::path::Path) -> PathBuf {
         let mut content = String::new();
         for byte in 0u8..=255 {
@@ -653,9 +653,9 @@ mod tests {
         path
     }
 
- /// Build a `TiktokenTokenizer` from the synthetic BPE file with no sibling
- /// config files, so the constructor takes the
- /// `FALLBACK_NUM_RESERVED_SPECIAL_TOKENS` (256) path.
+    /// Build a `TiktokenTokenizer` from the synthetic BPE file with no sibling
+    /// config files, so the constructor takes the
+    /// `FALLBACK_NUM_RESERVED_SPECIAL_TOKENS` (256) path.
     fn explicit_backends(path: &Path) -> Vec<TiktokenTokenizer> {
         vec![
             TiktokenTokenizer::new_riptoken(path).expect("load riptoken backend"),
@@ -669,10 +669,10 @@ mod tests {
         (explicit_backends(&path), dir)
     }
 
- /// Verify that tiktoken decode uses lossy UTF-8 (producing `\u{FFFD}`)
- /// rather than returning an error for incomplete multi-byte sequences.
- /// This is critical for streaming decode — `DecodeStream` relies on
- /// `\u{FFFD}` to detect incomplete characters.
+    /// Verify that tiktoken decode uses lossy UTF-8 (producing `\u{FFFD}`)
+    /// rather than returning an error for incomplete multi-byte sequences.
+    /// This is critical for streaming decode — `DecodeStream` relies on
+    /// `\u{FFFD}` to detect incomplete characters.
     #[test]
     fn tiktoken_decode_incomplete_utf8_produces_replacement_char() {
         let (backends, _dir) = tiktoken_backends();
@@ -691,23 +691,23 @@ mod tests {
         }
     }
 
- /// When `config.json` exposes a `vocab_size`, the reserved-token range must
- /// be sized to it rather than to the 256-slot fallback. This is the
- /// general (non-Kimi-specific) path: any tiktoken model whose own
- /// `config.json` says e.g. `vocab_size = 280` should populate
- /// reserved slots for `[num_base_tokens, 280)` and nothing beyond.
+    /// When `config.json` exposes a `vocab_size`, the reserved-token range must
+    /// be sized to it rather than to the 256-slot fallback. This is the
+    /// general (non-Kimi-specific) path: any tiktoken model whose own
+    /// `config.json` says e.g. `vocab_size = 280` should populate
+    /// reserved slots for `[num_base_tokens, 280)` and nothing beyond.
     #[test]
     fn tiktoken_reserved_range_uses_vocab_size_from_config_json() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let bpe_path = write_synthetic_bpe_file(dir.path());
- // num_base_tokens = 256, vocab_size = 280 → reserved range = [256, 280) (24
- // slots, smaller than the 256 fallback so we can prove the config value
- // is honoured).
+        // num_base_tokens = 256, vocab_size = 280 → reserved range = [256, 280) (24
+        // slots, smaller than the 256 fallback so we can prove the config value
+        // is honoured).
         fs::write(dir.path().join("config.json"), r#"{"vocab_size": 280}"#)
             .expect("write config.json");
 
         for backend in explicit_backends(&bpe_path) {
- // Inside the configured range: reserved placeholder, round-trips both ways.
+            // Inside the configured range: reserved placeholder, round-trips both ways.
             let in_range_id: u32 = 270;
             let placeholder = format!("<|reserved_token_{in_range_id}|>");
             assert_eq!(backend.decode(&[in_range_id], false).unwrap(), placeholder);
@@ -720,9 +720,9 @@ mod tests {
                 Some(placeholder.as_str())
             );
 
- // Outside the configured range: not registered as a reserved slot — falls
- // through to the backend's unknown-id behavior. The point is that we *don't*
- // over-populate beyond what the model actually exposes.
+            // Outside the configured range: not registered as a reserved slot — falls
+            // through to the backend's unknown-id behavior. The point is that we *don't*
+            // over-populate beyond what the model actually exposes.
             let out_of_range_id: u32 = 290;
             let out_of_range_placeholder = format!("<|reserved_token_{out_of_range_id}|>");
             assert_eq!(backend.decode(&[out_of_range_id], false).unwrap(), "");
@@ -731,38 +731,41 @@ mod tests {
         }
     }
 
- /// A pathologically large `vocab_size` must not cause the constructor to
- /// iterate/allocate an unbounded reserved range: it is clamped to
- /// `num_base_tokens + MAX_RESERVED_SPECIAL_TOKENS`. Base tokens still decode,
- /// and ids past the cap are treated as unknown rather than registered.
+    /// A pathologically large `vocab_size` must not cause the constructor to
+    /// iterate/allocate an unbounded reserved range: it is clamped to
+    /// `num_base_tokens + MAX_RESERVED_SPECIAL_TOKENS`. Base tokens still decode,
+    /// and ids past the cap are treated as unknown rather than registered.
     #[test]
     fn tiktoken_reserved_range_is_capped_for_pathological_vocab_size() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let bpe_path = write_synthetic_bpe_file(dir.path());
- // num_base_tokens = 256; a 4-billion vocab_size would, uncapped, try to
- // materialize ~4e9 placeholder strings. The cap must bound this.
-        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 4000000000}"#)
-            .expect("write config.json");
+        // num_base_tokens = 256; a 4-billion vocab_size would, uncapped, try to
+        // materialize ~4e9 placeholder strings. The cap must bound this.
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"vocab_size": 4000000000}"#,
+        )
+        .expect("write config.json");
 
         for backend in explicit_backends(&bpe_path) {
- // Base BPE token still decodes normally.
+            // Base BPE token still decodes normally.
             let h = backend.encode("H", false).unwrap()[0];
             assert_eq!(backend.decode(&[h], false).unwrap(), "H");
 
- // An id beyond the cap (num_base_tokens 256 + 2^20) is not a
- // registered reserved slot, so it decodes to nothing / is unknown.
+            // An id beyond the cap (num_base_tokens 256 + 2^20) is not a
+            // registered reserved slot, so it decodes to nothing / is unknown.
             let beyond_cap: u32 = super::MAX_RESERVED_SPECIAL_TOKENS + 256 + 10;
             assert_eq!(backend.decode(&[beyond_cap], false).unwrap(), "");
             assert_eq!(backend.id_to_token(beyond_cap), None);
         }
     }
 
- /// Sparse/non-contiguous BPE ranks must still count as base-vocab ids.
+    /// Sparse/non-contiguous BPE ranks must still count as base-vocab ids.
 
- /// Regression shape:
- /// - base vocabulary contains ids 0..=255 and also a normal BPE token at id 1000
- /// - if `num_base_tokens` were computed as `encoder.len` (257), id 1000 would be
- /// misclassified as special/reserved and disappear under `skip_special_tokens = true`
+    /// Regression shape:
+    /// - base vocabulary contains ids 0..=255 and also a normal BPE token at id 1000
+    /// - if `num_base_tokens` were computed as `encoder.len` (257), id 1000 would be
+    /// misclassified as special/reserved and disappear under `skip_special_tokens = true`
     #[test]
     fn tiktoken_sparse_base_ranks_are_not_misclassified_as_special() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -780,17 +783,17 @@ mod tests {
         }
     }
 
- /// `skip_special_tokens` must:
- /// * keep regular BPE token text unchanged,
- /// * drop ids whose `added_tokens_decoder` entry says `"special": true`,
- /// * drop reserved-slot placeholder ids (which default to special),
- /// * keep ids whose `added_tokens_decoder` entry says `"special": false` — this is how Kimi K2
- /// / K2.5 marks tool-call markers and `<think>` / `</think>`.
+    /// `skip_special_tokens` must:
+    /// * keep regular BPE token text unchanged,
+    /// * drop ids whose `added_tokens_decoder` entry says `"special": true`,
+    /// * drop reserved-slot placeholder ids (which default to special),
+    /// * keep ids whose `added_tokens_decoder` entry says `"special": false` — this is how Kimi K2
+    /// / K2.5 marks tool-call markers and `<think>` / `</think>`.
 
- /// Synthetic backend has `num_base_tokens = 256`. We write a
- /// `tokenizer_config.json` that names ids 257 (special) and 258
- /// (non-special), and a `config.json` with `vocab_size` covering both.
- /// Id 259 stays a default reserved placeholder (special).
+    /// Synthetic backend has `num_base_tokens = 256`. We write a
+    /// `tokenizer_config.json` that names ids 257 (special) and 258
+    /// (non-special), and a `config.json` with `vocab_size` covering both.
+    /// Id 259 stays a default reserved placeholder (special).
     #[test]
     fn tiktoken_skip_special_tokens_filters_special_but_keeps_non_special_added_tokens() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -809,8 +812,8 @@ mod tests {
             .expect("write config.json");
 
         for backend in explicit_backends(&bpe_path) {
- // Resolve the BPE ids for "Hi" so we can interleave them with special-token
- // ids.
+            // Resolve the BPE ids for "Hi" so we can interleave them with special-token
+            // ids.
             let h = backend.encode("H", false).unwrap()[0];
             let i = backend.encode("i", false).unwrap()[0];
 
@@ -820,22 +823,22 @@ mod tests {
 
             let ids = vec![h, special_id, i, non_special_id, reserved_id];
 
- // skip_special_tokens = false: everything is rendered as-is.
+            // skip_special_tokens = false: everything is rendered as-is.
             let kept = backend.decode(&ids, false).unwrap();
             assert_eq!(
                 kept,
                 "H<|im_end|>i<|tool_call_begin|><|reserved_token_259|>"
             );
 
- // skip_special_tokens = true: special token (257) and reserved placeholder
- // (259) are dropped; the non-special added token (258) survives.
+            // skip_special_tokens = true: special token (257) and reserved placeholder
+            // (259) are dropped; the non-special added token (258) survives.
             let stripped = backend.decode(&ids, true).unwrap();
             assert_eq!(stripped, "Hi<|tool_call_begin|>");
         }
     }
 
- /// `vocab_size` may live under `text_config` for composite (e.g.
- /// multimodal) configs.
+    /// `vocab_size` may live under `text_config` for composite (e.g.
+    /// multimodal) configs.
     #[test]
     fn tiktoken_reserved_range_reads_text_config_vocab_size() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -851,7 +854,7 @@ mod tests {
             let placeholder = format!("<|reserved_token_{in_range_id}|>");
             assert_eq!(backend.decode(&[in_range_id], false).unwrap(), placeholder);
 
- // Just outside the nested vocab_size — should not be registered.
+            // Just outside the nested vocab_size — should not be registered.
             assert_eq!(backend.decode(&[270], false).unwrap(), "");
         }
     }
@@ -922,15 +925,15 @@ mod tests {
         );
     }
 
- /// Reserved token ids in `[num_base_tokens, num_base_tokens + 256)` must
- /// decode to their placeholder name (matching `tokenization_kimi.py`'s
- /// `<|reserved_token_{i}|>` format), even when the source
- /// `tokenizer_config.json` does not list them in `added_tokens_decoder`.
+    /// Reserved token ids in `[num_base_tokens, num_base_tokens + 256)` must
+    /// decode to their placeholder name (matching `tokenization_kimi.py`'s
+    /// `<|reserved_token_{i}|>` format), even when the source
+    /// `tokenizer_config.json` does not list them in `added_tokens_decoder`.
 
- /// In our synthetic backend `num_base_tokens = 256` (256 single-byte BPE
- /// tokens), so the reserved range is `[256, 512)`. Picking id 300 —
- /// well inside that range and absent from any `added_tokens_decoder` —
- /// should round-trip both ways.
+    /// In our synthetic backend `num_base_tokens = 256` (256 single-byte BPE
+    /// tokens), so the reserved range is `[256, 512)`. Picking id 300 —
+    /// well inside that range and absent from any `added_tokens_decoder` —
+    /// should round-trip both ways.
     #[test]
     fn tiktoken_reserved_token_round_trip() {
         let (backends, _dir) = tiktoken_backends();
@@ -942,8 +945,8 @@ mod tests {
             let decoded = backend.decode(&[reserved_id], false).unwrap();
             assert_eq!(decoded, placeholder);
 
- // The placeholder name should also encode back to the same single id, since
- // the constructor registers it as a special token with `CoreBPE`.
+            // The placeholder name should also encode back to the same single id, since
+            // the constructor registers it as a special token with `CoreBPE`.
             let encoded = backend.encode(&placeholder, false).unwrap();
             assert_eq!(encoded, vec![reserved_id]);
 
@@ -955,22 +958,22 @@ mod tests {
         }
     }
 
- /// Decoding a token id that is beyond even the reserved range must not
- /// panic — it falls through to the warn-and-skip backstop instead of
- /// crashing the worker thread.
+    /// Decoding a token id that is beyond even the reserved range must not
+    /// panic — it falls through to the warn-and-skip backstop instead of
+    /// crashing the worker thread.
     #[test]
     fn tiktoken_rs_decode_unknown_token_id_does_not_panic() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = write_synthetic_bpe_file(dir.path());
         let backend = TiktokenTokenizer::new_tiktoken_rs(&path).expect("load tiktoken-rs backend");
 
- // ID well above num_base_tokens (256) + reserved (256) = 512 — guaranteed
- // unknown.
+        // ID well above num_base_tokens (256) + reserved (256) = 512 — guaranteed
+        // unknown.
         let unknown_id: u32 = 999_999;
         let result = backend.decode(&[unknown_id], false);
         assert_eq!(result.unwrap(), "");
 
- // Mixed: known bytes for "Hi" surrounding an unknown id should yield just "Hi".
+        // Mixed: known bytes for "Hi" surrounding an unknown id should yield just "Hi".
         let h = backend.encode("H", false).unwrap()[0];
         let i = backend.encode("i", false).unwrap()[0];
         let result = backend.decode(&[h, unknown_id, i], false).unwrap();
@@ -991,9 +994,9 @@ mod tests {
         assert_eq!(backend.decode(&[h, unknown_id, i], false).unwrap(), "Hi");
     }
 
- /// Streaming decode of CJK text through tiktoken should produce the
- /// original text without errors, even though individual tokens may
- /// represent partial UTF-8 byte sequences.
+    /// Streaming decode of CJK text through tiktoken should produce the
+    /// original text without errors, even though individual tokens may
+    /// represent partial UTF-8 byte sequences.
     #[test]
     fn tiktoken_streaming_decode_multibyte() {
         let (backends, _dir) = tiktoken_backends();
@@ -1019,8 +1022,8 @@ mod tests {
         }
     }
 
- /// Mixed ASCII and multi-byte text should stream correctly through
- /// tiktoken.
+    /// Mixed ASCII and multi-byte text should stream correctly through
+    /// tiktoken.
     #[test]
     fn tiktoken_streaming_decode_mixed_ascii_and_multibyte() {
         let (backends, _dir) = tiktoken_backends();

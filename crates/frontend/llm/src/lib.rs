@@ -31,8 +31,8 @@ pub struct Llm {
 }
 
 impl Llm {
- /// Create a new minimal LLM facade from an already connected engine
- /// client.
+    /// Create a new minimal LLM facade from an already connected engine
+    /// client.
     pub fn new(client: EngineCoreClient) -> Self {
         Self {
             client,
@@ -41,7 +41,7 @@ impl Llm {
         }
     }
 
- /// Enable or disable periodic stats logging.
+    /// Enable or disable periodic stats logging.
     pub fn with_log_stats(mut self, enabled: bool) -> Self {
         if enabled {
             let stats_logger = StatsLogger::start(
@@ -55,26 +55,26 @@ impl Llm {
         self
     }
 
- /// Control whether external request ids are randomized before reaching the
- /// engine.
+    /// Control whether external request ids are randomized before reaching the
+    /// engine.
     pub fn with_request_id_randomization(mut self, enabled: bool) -> Self {
         self.randomize_request_id = enabled;
         self
     }
 
- /// Expose the underlying engine client for low-level utility/admin
- /// calls.
+    /// Expose the underlying engine client for low-level utility/admin
+    /// calls.
     pub fn uniserve_engine_client(&self) -> &EngineCoreClient {
         &self.client
     }
 
- /// Submit one tokenized generate request and return a per-request output
- /// stream.
+    /// Submit one tokenized generate request and return a per-request output
+    /// stream.
     pub async fn generate(&self, req: GenerateRequest) -> Result<GenerateOutputStream> {
         let prepared = req.prepare(self.randomize_request_id)?;
         let prompt_token_ids = prepared.prompt_token_ids().into();
 
- // Record internal engine request ID in the current tracing span.
+        // Record internal engine request ID in the current tracing span.
         Span::current().record("engine_request_id", &prepared.engine_request.request_id);
 
         let request_metrics = RequestMetricsTracker::new(
@@ -93,7 +93,7 @@ impl Llm {
         ))
     }
 
- /// Shut down the underlying engine client and its background tasks.
+    /// Shut down the underlying engine client and its background tasks.
     pub async fn shutdown(self) -> Result<()> {
         self.client.shutdown().await?;
         Ok(())

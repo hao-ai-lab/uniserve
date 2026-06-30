@@ -1,0 +1,49 @@
+{
+  "id": "bagel",
+  "control_tokens": {
+    "bos": ["<|im_start|>", "<|begin_of_sentence|>"],
+    "eos": ["<|im_end|>", "<|end_of_sentence|>", "<|endoftext|>"],
+    "start_of_image": ["<|vision_start|>", "<img>"],
+    "end_of_image": ["<|vision_end|>", "</img>"],
+    "image_start_text": "image_start"
+  },
+  "default_mode": "text",
+  "supported_modes": ["text", "image", "interleave", "understand"],
+  "image_defaults": {
+    "resolution": "1:1",
+    "steps": 50,
+    "cfg_text_scale": 4.0,
+    "cfg_img_scale": 1.0,
+    "cfg_renorm_type": "global",
+    "cfg_renorm_min": 0.0,
+    "cfg_interval": [0.0, 1.0],
+    "timestep_shift": 1.0,
+    "seed": null,
+    "max_images": 1,
+    "max_images_limit": 16
+  },
+  "resolution": {
+    "default": "1:1",
+    "allow_custom": true,
+    "buckets": [
+      { "name": "1:1", "width": 512, "height": 512 }
+    ]
+  },
+  "output_filter": {
+    "reasoning": { "start": "<think>", "end": "</think>" },
+    "visible_wrappers": [
+      { "start": "<answer>", "end": "</answer>" }
+    ]
+  },
+  "understanding_system_prompt": "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n",
+  "prompts": {
+    "text": { "kind": "bagel_text" },
+    "image": { "kind": "bagel_image" },
+    "auto_interleave": {
+      "kind": "bagel_auto_interleave",
+      "default_system": "You should first think about the planning process in the mind and then generate the image. \n     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here"
+    },
+    "understand": { "kind": "raw" },
+    "negative": { "kind": "bagel_image" }
+  }
+}

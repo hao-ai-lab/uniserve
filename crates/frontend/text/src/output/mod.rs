@@ -23,15 +23,15 @@ pub struct CollectedTextOutput {
     pub logprobs: Option<DecodedLogprobs>,
     pub token_ids: Vec<u32>,
     pub finish_reason: FinishReason,
- /// Connector-specific KV transfer parameters for disaggregated serving.
+    /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
 }
 
 #[allow(clippy::manual_async_fn, reason = "specify `Send` bound")]
 #[easy_ext::ext(TextOutputStreamExt)]
 impl<T: TextOutputStream> T {
- /// Collect the stream to completion and return the final decoded text plus
- /// terminal metadata.
+    /// Collect the stream to completion and return the final decoded text plus
+    /// terminal metadata.
     pub fn collect_output(self) -> impl Future<Output = Result<CollectedTextOutput>> + Send {
         async move {
             let stream = self;
@@ -95,8 +95,8 @@ impl<T: TextOutputStream> T {
                 }
             }
 
- // Note: this is actually unreachable, as the underlying stream always emit an
- // error on unexpected close.
+            // Note: this is actually unreachable, as the underlying stream always emit an
+            // error on unexpected close.
             Err(Error::StreamClosedBeforeTerminalOutput {
                 request_id: "unknown".to_string(),
             })

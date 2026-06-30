@@ -75,7 +75,7 @@ pub struct WaitingReasonLabels {
 /// Scheduler/batch-scoped Prometheus families exported from `SchedulerStats`.
 #[derive(MetricFamily)]
 pub struct SchedulerMetrics {
- // Scheduler state gauges.
+    // Scheduler state gauges.
     #[metric(
         name = "uniserve:num_requests_running",
         help = "Number of requests in model execution batches"
@@ -115,7 +115,7 @@ pub struct SchedulerMetrics {
     )]
     pub scheduler_queue_wait_max_us: Family<EngineLabels, U64Gauge>,
 
- // Prefix-cache counters, including the connector-backed external cache path.
+    // Prefix-cache counters, including the connector-backed external cache path.
     #[metric(
         name = "uniserve:prefix_cache_queries",
         help = "Prefix cache queries, in terms of number of queried tokens"
@@ -137,7 +137,7 @@ pub struct SchedulerMetrics {
     )]
     pub external_prefix_cache_hits: Family<EngineLabels, U64Counter>,
 
- // Speculative decoding counters.
+    // Speculative decoding counters.
     #[metric(
         name = "uniserve:spec_decode_num_drafts",
         help = "Number of spec decoding drafts."
@@ -159,7 +159,7 @@ pub struct SchedulerMetrics {
     )]
     pub spec_decode_num_accepted_tokens_per_pos: Family<EnginePositionLabels, U64Counter>,
 
- // Worker-local forward/kernel counters.
+    // Worker-local forward/kernel counters.
     #[metric(
         name = "uniserve:worker_attention_launches",
         help = "Worker attention launches."
@@ -170,13 +170,13 @@ pub struct SchedulerMetrics {
         help = "Worker attention time in microseconds."
     )]
     pub worker_attention_us: Family<EngineLabels, U64Counter>,
- /// per-attention-backend launch counts.
+    /// per-attention-backend launch counts.
     #[metric(
         name = "uniserve:worker_attention_backend_counts",
         help = "Worker attention launches by backend kernel family."
     )]
     pub worker_attention_backend_counts: Family<EngineBackendLabels, U64Counter>,
- /// per-runtime-mode CUDA-graph dispatch counts.
+    /// per-runtime-mode CUDA-graph dispatch counts.
     #[metric(
         name = "uniserve:worker_cuda_graph_runtime_mode_counts",
         help = "Worker forward dispatches by CUDA-graph runtime mode."
@@ -313,8 +313,8 @@ pub struct SchedulerMetrics {
     )]
     pub worker_spec_verify_path_counts: Family<EnginePathLabels, U64Counter>,
 
- // directly-measured batch latency, cumulative microseconds and the
- // resolved-batch count so dashboards can compute per-batch averages.
+    // directly-measured batch latency, cumulative microseconds and the
+    // resolved-batch count so dashboards can compute per-batch averages.
     #[metric(
         name = "uniserve:worker_exec_us",
         help = "Cumulative worker-reported batch compute time in microseconds."
@@ -332,7 +332,7 @@ pub struct SchedulerMetrics {
     )]
     pub batch_timing_count: Family<EngineLabels, U64Counter>,
 
- // Per-engine performance / MFU counters.
+    // Per-engine performance / MFU counters.
     #[metric(
         name = "uniserve:estimated_flops_per_gpu",
         help = "Estimated number of floating point operations per GPU (for Model Flops Utilization calculations)."
@@ -349,7 +349,7 @@ pub struct SchedulerMetrics {
     )]
     pub estimated_write_bytes_per_gpu: Family<EngineLabels, U64Counter>,
 
- // Sampled KV-cache residency histograms.
+    // Sampled KV-cache residency histograms.
     #[metric(
         name = "uniserve:kv_block_lifetime_seconds",
         help = "Histogram of KV cache block lifetime from allocation to eviction. Sampled metrics (controlled by --kv-cache-metrics-sample).",

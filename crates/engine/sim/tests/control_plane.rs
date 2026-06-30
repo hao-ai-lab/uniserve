@@ -517,9 +517,7 @@ fn scheduler_clamps_max_batch_to_worker_caps() {
     use uniserve_worker_wire::ExecutionConstraints;
 
     let mut sim = SimEngine::new();
-    sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
-        max_batch_ops: 3,
-    };
+    sim.mut_caps_for_test().execution_constraints = ExecutionConstraints { max_batch_ops: 3 };
     let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
@@ -707,7 +705,7 @@ fn run_until_control(abort: bool) -> FinishReason {
     );
     handle.submit(req).unwrap();
 
- // wait until it's actually generating, then issue the control command.
+    // wait until it's actually generating, then issue the control command.
     let mut saw_token = false;
     let deadline = Instant::now() + Duration::from_secs(10);
     while !saw_token && Instant::now() < deadline {
@@ -750,7 +748,7 @@ fn hybrid_groups_handshake_runs() {
     use uniserve_core::{KvCacheGroupSpec, KvGroupKind};
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
- // block 0 padding; group 0 full [1,2048), group 1 sliding-window [2048,4096).
+    // block 0 padding; group 0 full [1,2048), group 1 sliding-window [2048,4096).
     sim.set_groups(vec![
         KvCacheGroupSpec {
             group_id: 0,
@@ -818,8 +816,8 @@ fn prefix_cache_reuses_shared_prompt() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
- // 600 tokens => 2 full 256-token blocks + a partial; the 2 full blocks are
- // the cacheable shared prefix.
+    // 600 tokens => 2 full 256-token blocks + a partial; the 2 full blocks are
+    // the cacheable shared prefix.
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
 
     let run_one = |rid: u64, handle: &EngineHandle| {
@@ -847,7 +845,7 @@ fn prefix_cache_reuses_shared_prompt() {
         assert!(done, "req {rid} did not finish");
     };
 
- // cold: req1 populates the prefix cache.
+    // cold: req1 populates the prefix cache.
     run_one(1, &handle);
     assert!(
         stats.kv_cache.blocks_stored.load(Ordering::Relaxed) >= 2,
@@ -855,7 +853,7 @@ fn prefix_cache_reuses_shared_prompt() {
     );
     let hits_before = stats.prefix.hits.load(Ordering::Relaxed);
 
- // warm: req2 (same prompt) reuses the cached prefix.
+    // warm: req2 (same prompt) reuses the cached prefix.
     run_one(2, &handle);
     let hits_after = stats.prefix.hits.load(Ordering::Relaxed);
     assert!(
@@ -864,7 +862,7 @@ fn prefix_cache_reuses_shared_prompt() {
     );
     assert!(stats.prefix.hit_tokens.load(Ordering::Relaxed) >= 512);
 
- // resetting the prefix cache clears it.
+    // resetting the prefix cache clears it.
     handle.reset_prefix_cache();
     thread::sleep(Duration::from_millis(20));
 
@@ -887,7 +885,7 @@ fn chunked_prefill_interleaves_with_decode() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
- // long prompt (≈ 4 full 256-blocks) + a short concurrent request.
+    // long prompt (≈ 4 full 256-blocks) + a short concurrent request.
     let long_prompt: Vec<u32> = (0..1000u32).map(|i| (i % 91) + 7).collect();
     let (etx1, mut erx1) = tokio::sync::mpsc::unbounded_channel();
     handle
@@ -947,7 +945,7 @@ fn priority_preemption_and_recompute() {
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Priority);
     let stats = sched.stats_handle();
 
- // low-priority A, then (later) high-priority B; 1 usable block forces a choice.
+    // low-priority A, then (later) high-priority B; 1 usable block forces a choice.
     let (atx, mut arx) = tokio::sync::mpsc::unbounded_channel();
     let mut a = GenerateRequest::new(
         RequestId(1),
@@ -961,7 +959,7 @@ fn priority_preemption_and_recompute() {
     a.priority = 10;
     sched.submit_for_test(a);
 
- // step until A is running and decoding (holds the only block).
+    // step until A is running and decoding (holds the only block).
     for _ in 0..4 {
         sched.step();
     }
@@ -979,7 +977,7 @@ fn priority_preemption_and_recompute() {
     b.priority = 0; // higher priority (lower value)
     sched.submit_for_test(b);
 
- // drive to completion.
+    // drive to completion.
     for _ in 0..2000 {
         if !sched.step() {
             break;
@@ -1091,7 +1089,7 @@ fn allowed_tokens_restricts_output() {
 
 #[test]
 fn logit_bias_forces_token() {
- // strongly bias token 4321; it should dominate every step.
+    // strongly bias token 4321; it should dominate every step.
     let sp = SamplingParams {
         logit_bias: vec![(4321, 1000.0)],
         ..Default::default()
@@ -1106,8 +1104,8 @@ fn logit_bias_forces_token() {
 
 #[test]
 fn min_tokens_floor_overrides_early_eos() {
- // text_len=1 makes the sim want to stop almost immediately; min_tokens=5
- // forces at least 5 generated tokens before EOS is permitted.
+    // text_len=1 makes the sim want to stop almost immediately; min_tokens=5
+    // forces at least 5 generated tokens before EOS is permitted.
     let sp = SamplingParams {
         min_tokens: 5,
         ..Default::default()
@@ -1123,8 +1121,8 @@ fn min_tokens_floor_overrides_early_eos() {
 
 #[test]
 fn default_sampling_is_unchanged() {
- // No params set => greedy argmax of the synthetic distribution = the natural
- // token (1000 + (1*7+n)%5000); first token is 1007.
+    // No params set => greedy argmax of the synthetic distribution = the natural
+    // token (1000 + (1*7+n)%5000); first token is 1007.
     let (toks, _lp, done) = run_sampling(SamplingParams::default(), 8, 16);
     assert!(done);
     assert_eq!(toks[0], 1007);
@@ -1148,7 +1146,7 @@ fn multimodal_encode_then_cache_hit() {
 
     let run_img = |rid: u64, handle: &EngineHandle| -> bool {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
- // prompt_ids include placeholder positions for the image span [3, 7).
+        // prompt_ids include placeholder positions for the image span [3, 7).
         let mut req = GenerateRequest::new(
             RequestId(rid),
             vec![1, 2, 3, 0, 0, 0, 0, 9],
@@ -1241,7 +1239,7 @@ fn interleave_round_trip_text_image_text_image() {
     );
     handle.submit(req).unwrap();
 
- // record the modality sequence: 'T' for a text token, 'I' for an image.
+    // record the modality sequence: 'T' for a text token, 'I' for an image.
     let mut seq: Vec<char> = Vec::new();
     let mut finished = false;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1316,8 +1314,14 @@ fn auto_interleave_waits_for_model_image_starts() {
 
     assert!(finished, "request did not finish (seq={seq:?})");
     let images = seq.iter().filter(|&&c| c == 'I').count();
-    assert_eq!(images, 0, "image starts must be model-triggered (seq={seq:?})");
-    assert!(seq.iter().all(|&c| c == 'T'), "expected text-only stream (seq={seq:?})");
+    assert_eq!(
+        images, 0,
+        "image starts must be model-triggered (seq={seq:?})"
+    );
+    assert!(
+        seq.iter().all(|&c| c == 'T'),
+        "expected text-only stream (seq={seq:?})"
+    );
 }
 
 #[test]
@@ -1370,7 +1374,10 @@ fn auto_interleave_model_image_starts_spend_budget() {
 
     assert!(finished, "request did not finish (seq={seq:?})");
     let images = seq.iter().filter(|&&c| c == 'I').count();
-    assert_eq!(images, 3, "biased image starts should spend the image budget");
+    assert_eq!(
+        images, 3,
+        "biased image starts should spend the image budget"
+    );
     let first_i = seq.iter().position(|&c| c == 'I').unwrap();
     let second_i = seq
         .iter()
@@ -1379,10 +1386,7 @@ fn auto_interleave_model_image_starts_spend_budget() {
         .nth(1)
         .unwrap()
         .0;
-    assert_eq!(
-        first_i, 0,
-        "model image-start bias should draw before text"
-    );
+    assert_eq!(first_i, 0, "model image-start bias should draw before text");
     assert!(
         seq[first_i + 1..second_i].contains(&'T') || second_i == first_i + 1,
         "expected valid stream between model-triggered images (seq={seq:?})",
@@ -1508,7 +1512,7 @@ fn multiworker_executor_drives_scheduler_unchanged() {
         Box::new(SimExecutor::new(Box::new(sim))) as Box<dyn Executor>
     };
     let executor = Box::new(MultiprocExecutor::new(vec![mk(), mk()]));
- // rank-aware caps reflect the topology at the handshake.
+    // rank-aware caps reflect the topology at the handshake.
     assert_eq!(executor.caps().rank.tp_size, 2);
     let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -1671,8 +1675,8 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
     }
 
     let log = log.lock().unwrap();
- // Request 1 was preempted (drop_request) and re-registered on resumption:
- // it appears in new_reqs once per registration, i.e. exactly twice.
+    // Request 1 was preempted (drop_request) and re-registered on resumption:
+    // it appears in new_reqs once per registration, i.e. exactly twice.
     let reg_1 = log.new_reqs.iter().filter(|r| r.0 == 1).count();
     let reg_2 = log.new_reqs.iter().filter(|r| r.0 == 2).count();
     assert_eq!(
@@ -1690,9 +1694,9 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
         "preemption must drop the worker record"
     );
 
- // Per-step decode ops carry no block ids while the request stays within its
- // allocation — the first op after (re-)registration carries the initial
- // blocks in NewRequestData, so per-op deltas are empty until growth.
+    // Per-step decode ops carry no block ids while the request stays within its
+    // allocation — the first op after (re-)registration carries the initial
+    // blocks in NewRequestData, so per-op deltas are empty until growth.
     let deltas_1: Vec<usize> = log
         .blocks_per_op
         .iter()
@@ -1771,8 +1775,8 @@ fn auto_interleave_literal_trigger_starts_images() {
     sim.set_text_len(1_000_000); // never EOS on its own
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
- // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
- // After an image commits, the sim resets and the round repeats from 1007.
+    // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
+    // After an image commits, the sim resets and the round repeats from 1007.
     let trig = ControlTokens {
         image_start_ids: vec![1008, 1009],
         ..ControlTokens::default()
@@ -1819,7 +1823,7 @@ fn auto_interleave_literal_trigger_starts_images() {
         images, 2,
         "literal trigger must start both images (seq={seq:?})"
     );
- // The trigger fires mid-round: each image is preceded by the trigger text.
+    // The trigger fires mid-round: each image is preceded by the trigger text.
     let first_i = seq.iter().position(|&c| c == 'I').unwrap();
     assert!(
         seq[..first_i].iter().filter(|&&c| c == 'T').count() >= 3,
@@ -1838,7 +1842,7 @@ fn image_start_logit_bias_steers_interleave() {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000); // never EOS on its own
         let executor = Box::new(SimExecutor::new(Box::new(sim)));
- // an image-start token inside the sim's vocab
+        // an image-start token inside the sim's vocab
         let trig = ControlTokens {
             start_of_image: 2222,
             ..ControlTokens::default()
@@ -1886,13 +1890,13 @@ fn image_start_logit_bias_steers_interleave() {
         (text_before_first_image, images, finished)
     };
 
- // Eager: the trigger wins the first step — an image with no leading text.
+    // Eager: the trigger wins the first step — an image with no leading text.
     let (text_before, images, finished) = run(1000.0);
     assert!(finished);
     assert_eq!(images, 1, "positive bias must produce the image");
     assert_eq!(text_before, 0, "positive bias must draw before any text");
 
- // Suppressed: the trigger never wins; no image, terminates on max_tokens.
+    // Suppressed: the trigger never wins; no image, terminates on max_tokens.
     let (_, images, finished) = run(-1000.0);
     assert!(finished);
     assert_eq!(images, 0, "negative bias must suppress the image pathway");
@@ -2101,7 +2105,7 @@ fn resource_leases_drain_to_zero_after_completion() {
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
 
- // Keep receivers alive — a dropped receiver is treated as a cancellation.
+    // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
     let specs = [
         GenMode::Text,
@@ -2133,7 +2137,7 @@ fn resource_leases_drain_to_zero_after_completion() {
     for _ in 0..5000 {
         let progressed = sched.step();
         max_active = max_active.max(sched.stats.resources.active.load(Ordering::Relaxed));
- // converged when several consecutive steps make no progress.
+        // converged when several consecutive steps make no progress.
         idle_steps = if progressed { 0 } else { idle_steps + 1 };
         if idle_steps >= 3 {
             break;
@@ -2202,19 +2206,19 @@ fn policy_facts_and_decisions_are_recorded() {
         }
     }
 
- // Structured facts: idle after completion, blocks returned.
+    // Structured facts: idle after completion, blocks returned.
     let snap = sched.policy_snapshot();
     assert_eq!(snap.running, 0);
     assert_eq!(snap.in_flight, 0);
     assert!(snap.free_blocks > 0 && snap.total_blocks > 0);
 
- // Latency history populated for the op kinds that ran.
+    // Latency history populated for the op kinds that ran.
     assert!(
         sched.op_latency_us("decode_und").is_some() || sched.op_latency_us("prefill_und").is_some(),
         "per-op latency history must be observed"
     );
 
- // Explainable decisions: every request was admitted.
+    // Explainable decisions: every request was admitted.
     let decisions = sched.take_policy_decisions();
     let admitted = decisions
         .iter()
@@ -2224,7 +2228,7 @@ fn policy_facts_and_decisions_are_recorded() {
         admitted, 3,
         "all three requests should record an Admitted decision"
     );
- // draining empties the ring
+    // draining empties the ring
     assert!(sched.take_policy_decisions().is_empty());
 }
 
@@ -2261,7 +2265,7 @@ fn lifecycle_trace_and_health_snapshot() {
         }
     }
 
- // Health snapshot: idle, leak-free, alive (read before draining traces).
+    // Health snapshot: idle, leak-free, alive (read before draining traces).
     let h = sched.health_snapshot();
     assert_eq!(h.running, 0);
     assert_eq!(h.active_leases, 0);

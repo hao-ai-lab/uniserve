@@ -740,6 +740,72 @@ def test_native_loader_class_orchestrates_spec_and_from_native(tmp_path):
     torch.testing.assert_close(result.model.model.proj.weight, weight.to(torch.bfloat16))
 
 
+def test_native_loader_derives_tower_filter_from_meta_model(tmp_path):
+    from uniserve_worker.loader import NativeLoadSpec
+
+    class TinyConfig(SimpleNamespace):
+        @classmethod
+        def from_pretrained(cls, model_dir):
+            return cls(model_dir=model_dir)
+
+    class TinyTokenizer:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    class TinyNativeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.shared = nn.Linear(2, 2, bias=False)
+            self.gen = nn.Linear(2, 2, bias=False)
+
+    class TinyWrapper:
+        def __init__(self, inner):
+            self.model = inner
+
+        @classmethod
+        def native_load_spec(cls):
+            return NativeLoadSpec(
+                config_cls=TinyConfig,
+                model_cls=TinyNativeModel,
+                tokenizer_cls=TinyTokenizer,
+                param_filter_from_model=cls.tower_role_param_filter_from_model,
+            )
+
+        @classmethod
+        def tower_role_param_filter_from_model(cls, model, tower_role):
+            assert isinstance(model, TinyNativeModel)
+            if tower_role is None:
+                return None
+            if tower_role == "gen":
+                return lambda name: name == "gen.weight"
+            if tower_role == "und":
+                return lambda name: name != "gen.weight"
+            raise ValueError(tower_role)
+
+        @classmethod
+        def from_native(cls, inner, *, tokenizer, device, **kwargs):
+            del tokenizer, device, kwargs
+            return cls(inner)
+
+    shared = torch.ones(2, 2)
+    gen = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    save_file({"shared.weight": shared, "gen.weight": gen}, tmp_path / "model.safetensors")
+
+    result = get_loader("native").load_model(
+        TinyWrapper,
+        None,
+        device="cpu",
+        model_path=str(tmp_path),
+        tower_role="gen",
+    )
+
+    assert result.model.model.shared.weight.is_meta
+    assert not result.model.model.gen.weight.is_meta
+    torch.testing.assert_close(result.model.model.gen.weight, gen.to(torch.bfloat16))
+
+
 def test_native_transformers_loader_preserves_fp8_linear_checkpoint_tensors(tmp_path):
     class TinyConfig(SimpleNamespace):
         @classmethod

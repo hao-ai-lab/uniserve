@@ -63,7 +63,7 @@ pub struct KimiK2ToolParser {
 }
 
 impl KimiK2ToolParser {
- /// Create a Kimi K2 tool parser.
+    /// Create a Kimi K2 tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             buffer: String::new(),
@@ -72,7 +72,7 @@ impl KimiK2ToolParser {
         }
     }
 
- /// Apply one parsed Kimi K2 event to parser state and output.
+    /// Apply one parsed Kimi K2 event to parser state and output.
     fn apply_event(&mut self, event: KimiK2Event, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             KimiK2Event::Text { len: consumed_len } => {

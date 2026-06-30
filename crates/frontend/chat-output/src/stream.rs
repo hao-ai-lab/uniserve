@@ -21,7 +21,7 @@ pub struct CollectedAssistantMessage {
     pub token_ids: Vec<u32>,
     pub output_token_count: usize,
     pub finish_reason: FinishReason,
- /// Connector-specific KV transfer parameters for disaggregated serving.
+    /// Connector-specific KV transfer parameters for disaggregated serving.
     pub kv_transfer_params: Option<serde_json::Value>,
 }
 
@@ -39,13 +39,13 @@ impl ChatEventStream {
         }
     }
 
- /// Return the request ID associated with this stream.
+    /// Return the request ID associated with this stream.
     pub fn request_id(&self) -> &str {
         &self.request_id
     }
 
- /// Collect the stream to completion and return the final assembled
- /// assistant message.
+    /// Collect the stream to completion and return the final assembled
+    /// assistant message.
     pub async fn collect_message(mut self) -> Result<CollectedAssistantMessage> {
         use futures::StreamExt as _;
 
@@ -104,8 +104,8 @@ impl ChatEventStream {
             }
         }
 
- // Note: this is actually unreachable, as the underlying stream always emit an
- // error on unexpected close.
+        // Note: this is actually unreachable, as the underlying stream always emit an
+        // error on unexpected close.
         Err(Error::StreamClosedBeforeTerminalOutput {
             request_id: self.request_id,
         })

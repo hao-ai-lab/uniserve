@@ -60,7 +60,7 @@ pub struct Qwen3CoderToolParser {
 }
 
 impl Qwen3CoderToolParser {
- /// Create a Qwen Coder tool parser.
+    /// Create a Qwen Coder tool parser.
     fn new(tools: &[Tool]) -> Self {
         Self {
             buffer: String::new(),
@@ -70,7 +70,7 @@ impl Qwen3CoderToolParser {
         }
     }
 
- /// Apply one parsed Qwen Coder event to parser state and output.
+    /// Apply one parsed Qwen Coder event to parser state and output.
     fn apply_event(&mut self, event: QwenCoderEvent, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             QwenCoderEvent::Text { len: consumed_len } => {

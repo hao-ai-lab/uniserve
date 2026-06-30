@@ -72,7 +72,7 @@ impl PrefixCacheCoordinator {
                 toks,
                 self.hash_algo,
             );
-    // verify the candidate tokens against the cached block.
+            // verify the candidate tokens against the cached block.
             match bm.lookup_cached(h, toks) {
                 Some(b) => {
                     if bm.block_state(b) == BlockState::Cached {
@@ -103,10 +103,10 @@ impl PrefixCacheCoordinator {
             return;
         }
         let id = st.req.request_id;
-    // prompts with spliced image embeddings are content-specific; their
-    // placeholder ids would collide in the text hash, so they are excluded
-    // from prefix caching (the same policy as Gen latents). a request
-    // may also opt out of reading the prefix cache.
+        // prompts with spliced image embeddings are content-specific; their
+        // placeholder ids would collide in the text hash, so they are excluded
+        // from prefix caching (the same policy as Gen latents). a request
+        // may also opt out of reading the prefix cache.
         if !st.req.mm_items.is_empty() || st.req.skip_reading_prefix_cache {
             return;
         }
@@ -116,9 +116,9 @@ impl PrefixCacheCoordinator {
             return;
         }
         let num_full = prompt.len() / bs;
-    // Always leave at least the final token to (re)compute, so a fully
-    // block-aligned prompt still produces logits: cap the lookup at the
-    // number of *complete* blocks that precede the last token.
+        // Always leave at least the final token to (re)compute, so a fully
+        // block-aligned prompt still produces logits: cap the lookup at the
+        // number of *complete* blocks that precede the last token.
         let lookup_limit = if prompt.len() % bs == 0 {
             num_full.saturating_sub(1)
         } else {
@@ -142,8 +142,8 @@ impl PrefixCacheCoordinator {
 
         let mut cached = 0usize;
         for (i, &h) in hashes.iter().take(lookup_limit).enumerate() {
-    // pass the block's own tokens so the cache verifies content,
-    // not just the 64-bit hash, before reusing the block.
+            // pass the block's own tokens so the cache verifies content,
+            // not just the 64-bit hash, before reusing the block.
             let toks = &prompt[i * bs..(i + 1) * bs];
             if let Some(b) = bm.lookup_cached(h, toks)
                 && bm.acquire_cached(id, b, h, toks)
@@ -158,7 +158,10 @@ impl PrefixCacheCoordinator {
             .prefix
             .queries
             .fetch_add(lookup_limit as u64, Ordering::Relaxed);
-        stats.prefix.hits.fetch_add(cached as u64, Ordering::Relaxed);
+        stats
+            .prefix
+            .hits
+            .fetch_add(cached as u64, Ordering::Relaxed);
         stats
             .prefix
             .hit_tokens
@@ -173,12 +176,7 @@ impl PrefixCacheCoordinator {
     /// after a request's prompt is fully prefilled, publish its full prompt
     /// blocks to the prefix cache so later requests can reuse them. Idempotent
     /// (shared/reused blocks are already mapped).
-    pub(crate) fn cache_blocks(
-        &self,
-        st: &mut ReqState,
-        bm: &mut BlockManager,
-        block_size: usize,
-    ) {
+    pub(crate) fn cache_blocks(&self, st: &mut ReqState, bm: &mut BlockManager, block_size: usize) {
         if !self.enable {
             return;
         }
@@ -191,8 +189,8 @@ impl PrefixCacheCoordinator {
         let bs = block_size;
         let blocks = bm.blocks_for(id).to_vec();
         for (i, h) in hashes.iter().enumerate() {
-    // store the block's own tokens with its hash so later hits can
-    // verify content. Block i was hashed from prompt[i*bs..(i+1)*bs] (the
+            // store the block's own tokens with its hash so later hits can
+            // verify content. Block i was hashed from prompt[i*bs..(i+1)*bs] (the
             // same slice prefix_lookup used to compute `block_hashes`).
             let (start, end) = (i * bs, (i + 1) * bs);
             if let (Some(b), Some(toks)) = (blocks.get(i), prompt.get(start..end)) {

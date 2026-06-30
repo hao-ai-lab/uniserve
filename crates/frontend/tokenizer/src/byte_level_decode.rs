@@ -49,7 +49,7 @@ pub(crate) fn decode_byte_level<'a, I: IntoIterator<Item = &'a str>>(tokens: I) 
             if cp < CHAR_TO_BYTE.len() {
                 bytes.push(CHAR_TO_BYTE[cp]);
             } else {
- // Non-GPT2 codepoints (e.g. DeepSeek's U+FF5C, U+2581) pass through.
+                // Non-GPT2 codepoints (e.g. DeepSeek's U+FF5C, U+2581) pass through.
                 let mut buf = [0u8; 4];
                 bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
             }
@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn decode_space_marker() {
- // GPT-2 maps 0x20 → Ġ (U+0120).
+        // GPT-2 maps 0x20 → Ġ (U+0120).
         assert_eq!(
             decode_byte_level(["\u{120}Hello", "\u{120}world"]),
             " Hello world",
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn decode_multibyte_euro() {
- // € → 0xE2 0x82 0xAC, each mapped to a specific GPT-2 char.
+        // € → 0xE2 0x82 0xAC, each mapped to a specific GPT-2 char.
         let byte_to_char = build_byte_to_char_ref();
         let encoded: String = [0xE2u8, 0x82, 0xAC]
             .iter()

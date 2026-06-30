@@ -26,7 +26,7 @@ pub struct MistralToolParser {
 }
 
 impl MistralToolParser {
- /// Create a Mistral tool parser.
+    /// Create a Mistral tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(MISTRAL_CONFIG),

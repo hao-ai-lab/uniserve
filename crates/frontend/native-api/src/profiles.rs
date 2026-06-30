@@ -1,63 +1,16 @@
+use std::fs;
+use std::path::Path;
+
+use serde::Deserialize;
+use serde_json::Value;
 use uniserve_engine_client::GenMode;
 use uniserve_text::tokenizer::DynTokenizer;
 
-use super::defaults;
-use super::resolution::{BAGEL_BUCKETS, ResolutionBucket, ResolutionPolicy, SENSENOVA_BUCKETS};
+use super::resolution::{ResolutionBucket, ResolutionPolicy};
 use super::schema::NativeGenerateBody;
 
-const GEN_THINK_SYSTEM_PROMPT: &str = "You should first think about the planning process in the mind and then generate the image. \n\
-     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here";
-
-const SENSENOVA_INTERLEAVE_SYSTEM_PROMPT: &str = "You are a multimodal assistant capable of reasoning with both text and images. \
-You support two modes:\n\n\
-Think Mode: When reasoning is needed, you MUST start with a <think></think> block \
-and place all reasoning inside it. You MUST interleave text with generated images \
-using tags like <image1>, <image2>. Images can ONLY be generated between <think> \
-and </think>, and may be referenced in the final answer.\n\n\
-Non-Think Mode: When no reasoning is needed, directly provide the answer without \
-reasoning. Do not use tags like <image1>, <image2>; present any images naturally \
-alongside the text.\n\n\
-After the think block, always provide a concise, user-facing final answer. The \
-answer may include text, images, or both. Match the user's language in both \
-reasoning and the final answer.";
-
-const SENSENOVA_GENERATION_SYSTEM_PROMPT: &str = "You are an image generation and editing assistant that accurately understands \
-and executes user intent.\n\n\
-You support two modes:\n\n\
-1. Think Mode:\n\
-If the task requires reasoning, you MUST start with a <think></think> block. Put \
-all reasoning inside the block using plain text. DO NOT include any image tags. \
-Keep it reasonable and directly useful for producing the final image.\n\n\
-2. Non-Think Mode:\n\
-If no reasoning is needed, directly produce the final image.\n\n\
-Task Types:\n\n\
-A. Text-to-Image Generation:\n\
-- Generate a high-quality image based on the user's description.\n\
-- Ensure visual clarity, semantic consistency, and completeness.\n\
-- DO NOT introduce elements that contradict or override the user's intent.\n\n\
-B. Image Editing:\n\
-- Use the provided image(s) as input or reference for modification or transformation.\n\
-- The result can be an edited image or a new image based on the reference(s).\n\
-- Preserve all unspecified attributes unless explicitly changed.\n\n\
-General Rules:\n\
-- For any visible text in the image, follow the language specified for the \
-rendered text in the user's description, not the language of the prompt. If no \
-language is specified, use the user's input language.";
-
-pub const IU_SYSTEM_PROMPT: &str = "\nLet's think step by step to answer the question. For text-based thinking, \
-enclose the process within <think> </think>, e.g. <think> thinking process here \
-</think>. For visual thinking, enclose the content within <image_start> \
-</image_end>, e.g. <image_start> thinking image here </image_end>. Finally \
-conclude with the final answer wrapped in <answer></answer> tags, i.e.\
-<answer> answer here </answer>.\n";
-
-const SENSENOVA_IMAGE_PREFIX: &str = "<think>\n\n</think>\n\n<img>";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NativeModelFamily {
-    Bagel,
-    SenseNovaU1,
-}
+const BAGEL_PROFILE_JSON: &str = include_str!("../profiles/bagel.json");
+const SENSENOVA_PROFILE_JSON: &str = include_str!("../profiles/sensenova-u1.json");
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeControls {
@@ -70,11 +23,11 @@ pub struct NativeControls {
 
 #[derive(Debug, Clone)]
 pub struct NativeImageDefaults {
-    pub resolution: &'static str,
+    pub resolution: String,
     pub steps: u16,
     pub cfg_text_scale: f32,
     pub cfg_img_scale: f32,
-    pub cfg_renorm_type: &'static str,
+    pub cfg_renorm_type: String,
     pub cfg_renorm_min: f32,
     pub cfg_interval: (f32, f32),
     pub timestep_shift: f32,
@@ -83,91 +36,74 @@ pub struct NativeImageDefaults {
     pub max_images_limit: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDelimitedText {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeOutputFilter {
+    pub reasoning: Option<NativeDelimitedText>,
+    pub visible_wrappers: Vec<NativeDelimitedText>,
+}
+
+#[derive(Debug, Clone)]
+enum PromptRecipe {
+    Chatml {
+        default_system: Option<String>,
+        default_assistant_prefix: String,
+    },
+    BagelText,
+    BagelImage,
+    BagelAutoInterleave {
+        default_system: String,
+    },
+    Raw,
+}
+
+#[derive(Debug, Clone)]
+struct NativePromptRecipes {
+    text: PromptRecipe,
+    image: PromptRecipe,
+    auto_interleave: PromptRecipe,
+    understand: PromptRecipe,
+    negative: PromptRecipe,
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeModelProfile {
-    pub family: NativeModelFamily,
+    pub id: String,
     pub controls: NativeControls,
     pub image_defaults: NativeImageDefaults,
     pub resolution_policy: ResolutionPolicy,
+    pub output_filter: NativeOutputFilter,
+    default_mode: GenMode,
+    supported_modes: Vec<GenMode>,
+    prompts: NativePromptRecipes,
+    understanding_system_prompt: String,
 }
 
 impl Default for NativeModelProfile {
     fn default() -> Self {
-        Self::bagel(NativeControls::default())
+        profile_from_manifest(
+            serde_json::from_str(BAGEL_PROFILE_JSON).expect("built-in Bagel profile is valid JSON"),
+            None,
+        )
     }
 }
 
 impl NativeModelProfile {
-    fn bagel(controls: NativeControls) -> Self {
-        Self {
-            family: NativeModelFamily::Bagel,
-            controls,
-            image_defaults: NativeImageDefaults {
-                resolution: "1:1",
-                steps: defaults::DEFAULT_STEPS,
-                cfg_text_scale: defaults::DEFAULT_CFG_TEXT_SCALE,
-                cfg_img_scale: defaults::DEFAULT_CFG_IMG_SCALE,
-                cfg_renorm_type: defaults::BAGEL_DEFAULT_CFG_RENORM_TYPE,
-                cfg_renorm_min: defaults::DEFAULT_CFG_RENORM_MIN,
-                cfg_interval: defaults::DEFAULT_CFG_INTERVAL,
-                timestep_shift: defaults::BAGEL_DEFAULT_TIMESTEP_SHIFT,
-                seed: None,
-                max_images: defaults::DEFAULT_MAX_IMAGES,
-                max_images_limit: defaults::BAGEL_MAX_IMAGES,
-            },
-            resolution_policy: ResolutionPolicy {
-                default: ResolutionBucket {
-                    name: "1:1",
-                    width: defaults::BAGEL_DEFAULT_WIDTH,
-                    height: defaults::BAGEL_DEFAULT_HEIGHT,
-                },
-                buckets: BAGEL_BUCKETS,
-                allow_custom: true,
-            },
-        }
-    }
-
-    fn sensenova(controls: NativeControls) -> Self {
-        Self {
-            family: NativeModelFamily::SenseNovaU1,
-            controls,
-            image_defaults: NativeImageDefaults {
-                resolution: defaults::SENSENOVA_DEFAULT_RESOLUTION,
-                steps: defaults::DEFAULT_STEPS,
-                cfg_text_scale: defaults::DEFAULT_CFG_TEXT_SCALE,
-                cfg_img_scale: defaults::DEFAULT_CFG_IMG_SCALE,
-                cfg_renorm_type: defaults::SENSENOVA_DEFAULT_CFG_RENORM_TYPE,
-                cfg_renorm_min: defaults::DEFAULT_CFG_RENORM_MIN,
-                cfg_interval: defaults::DEFAULT_CFG_INTERVAL,
-                timestep_shift: defaults::SENSENOVA_DEFAULT_TIMESTEP_SHIFT,
-                seed: Some(defaults::SENSENOVA_DEFAULT_SEED),
-                max_images: 4,
-                max_images_limit: defaults::SENSENOVA_MAX_IMAGES,
-            },
-            resolution_policy: ResolutionPolicy {
-                default: ResolutionBucket {
-                    name: defaults::SENSENOVA_DEFAULT_RESOLUTION,
-                    width: defaults::SENSENOVA_DEFAULT_WIDTH,
-                    height: defaults::SENSENOVA_DEFAULT_HEIGHT,
-                },
-                buckets: SENSENOVA_BUCKETS,
-                allow_custom: false,
-            },
-        }
-    }
-
     pub fn default_mode_name(&self) -> &'static str {
-        match self.family {
-            NativeModelFamily::Bagel => "text",
-            NativeModelFamily::SenseNovaU1 => "interleave",
-        }
+        mode_name(self.default_mode)
     }
 
     pub fn supports_mode(&self, mode: GenMode) -> bool {
-        !matches!(
-            (self.family, mode),
-            (NativeModelFamily::SenseNovaU1, GenMode::InterleaveUnd)
-        )
+        self.supported_modes.contains(&mode)
+    }
+
+    pub fn understanding_system_prompt(&self) -> &str {
+        &self.understanding_system_prompt
     }
 
     pub fn build_prompt_ids(
@@ -176,89 +112,30 @@ impl NativeModelProfile {
         body: &NativeGenerateBody,
         mode: GenMode,
     ) -> Vec<u32> {
-        match self.family {
-            NativeModelFamily::SenseNovaU1 => {
-                let text = match mode {
-                    GenMode::Text => chatml(
-                        body.system_prompt.as_deref(),
-                        &body.prompt,
-                        body.assistant_prefix.as_deref().unwrap_or(""),
-                    ),
-                    GenMode::Image => chatml(
-                        Some(
-                            body.system_prompt
-                                .as_deref()
-                                .unwrap_or(SENSENOVA_GENERATION_SYSTEM_PROMPT),
-                        ),
-                        &body.prompt,
-                        body.assistant_prefix
-                            .as_deref()
-                            .unwrap_or(SENSENOVA_IMAGE_PREFIX),
-                    ),
-                    GenMode::AutoInterleave => chatml(
-                        Some(
-                            body.system_prompt
-                                .as_deref()
-                                .unwrap_or(SENSENOVA_INTERLEAVE_SYSTEM_PROMPT),
-                        ),
-                        &body.prompt,
-                        body.assistant_prefix.as_deref().unwrap_or(""),
-                    ),
-                    GenMode::InterleaveUnd => body.prompt.clone(),
-                };
-                encode(tok, &text)
-            }
-            NativeModelFamily::Bagel => match mode {
-                GenMode::Text => encode(
-                    tok,
-                    &format!(
-                        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
-                        body.prompt,
-                        body.assistant_prefix.as_deref().unwrap_or("")
-                    ),
-                ),
-                GenMode::Image => {
-                    let mut ids = vec![self.controls.bos];
-                    ids.extend(encode(tok, &body.prompt));
-                    ids.push(self.controls.eos);
-                    ids
-                }
-                GenMode::AutoInterleave => encode(
-                    tok,
-                    &format!(
-                        "<|im_start|>{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
-                        body.system_prompt
-                            .as_deref()
-                            .unwrap_or(GEN_THINK_SYSTEM_PROMPT),
-                        body.prompt,
-                        body.assistant_prefix.as_deref().unwrap_or("")
-                    ),
-                ),
-                GenMode::InterleaveUnd => encode(tok, &body.prompt),
-            },
-        }
+        let recipe = match mode {
+            GenMode::Text => &self.prompts.text,
+            GenMode::Image => &self.prompts.image,
+            GenMode::AutoInterleave => &self.prompts.auto_interleave,
+            GenMode::InterleaveUnd => &self.prompts.understand,
+        };
+        render_prompt(tok, &self.controls, recipe, body, &body.prompt)
     }
 
     pub fn build_negative_prompt_ids(&self, tok: &DynTokenizer, negative_prompt: &str) -> Vec<u32> {
         if negative_prompt.is_empty() {
             return Vec::new();
         }
-        match self.family {
-            NativeModelFamily::SenseNovaU1 => encode(
-                tok,
-                &chatml(
-                    Some(SENSENOVA_GENERATION_SYSTEM_PROMPT),
-                    negative_prompt,
-                    "<img>",
-                ),
-            ),
-            NativeModelFamily::Bagel => {
-                let mut ids = vec![self.controls.bos];
-                ids.extend(encode(tok, negative_prompt));
-                ids.push(self.controls.eos);
-                ids
-            }
-        }
+        let body = NativeGenerateBody {
+            prompt: negative_prompt.to_string(),
+            ..Default::default()
+        };
+        render_prompt(
+            tok,
+            &self.controls,
+            &self.prompts.negative,
+            &body,
+            negative_prompt,
+        )
     }
 
     pub fn wrap_understanding_text(&self, tok: &DynTokenizer, text: &str) -> Vec<u32> {
@@ -272,44 +149,191 @@ impl NativeModelProfile {
 pub fn resolve_native_profile(
     tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
 ) -> NativeModelProfile {
-    let id = |token: &str| tokenizer.token_to_id(token);
-    let vision_start = id("<|vision_start|>");
-    let vision_end = id("<|vision_end|>");
-    let img_start = id("<img>");
-    let img_end = id("</img>");
-    let img_context = id("<IMG_CONTEXT>");
-    let sensenova = img_start.is_some() && img_end.is_some() && img_context.is_some();
+    profile_from_key("bagel", tokenizer)
+}
 
-    let controls = NativeControls {
-        bos: id("<|im_start|>")
-            .or_else(|| id("<|begin_of_sentence|>"))
-            .unwrap_or(0),
-        eos: id("<|im_end|>")
-            .or_else(|| id("<|end_of_sentence|>"))
-            .or_else(|| id("<|endoftext|>"))
-            .unwrap_or(0),
-        start_of_image: if sensenova {
-            img_start
-        } else {
-            vision_start.or(img_start)
-        }
-        .unwrap_or(0),
-        end_of_image: if sensenova {
-            img_end
-        } else {
-            vision_end.or(img_end)
-        }
-        .unwrap_or(0),
-        image_start_ids: if sensenova {
-            Vec::new()
-        } else {
-            tokenizer.encode("image_start", false).unwrap_or_default()
-        },
-    };
-    if sensenova {
-        NativeModelProfile::sensenova(controls)
+pub fn resolve_native_profile_for_model(
+    model_ref: &str,
+    tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
+) -> NativeModelProfile {
+    if let Some(profile) = profile_from_model_manifest(model_ref, tokenizer) {
+        return profile;
+    }
+    let key = profile_key_from_model(model_ref).unwrap_or("bagel");
+    profile_from_key(key, tokenizer)
+}
+
+fn profile_from_key(
+    key: &str,
+    tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
+) -> NativeModelProfile {
+    let json = if key == "sensenova-u1" {
+        SENSENOVA_PROFILE_JSON
     } else {
-        NativeModelProfile::bagel(controls)
+        BAGEL_PROFILE_JSON
+    };
+    profile_from_manifest(
+        serde_json::from_str(json).expect("built-in native model profile is valid JSON"),
+        Some(tokenizer),
+    )
+}
+
+fn profile_from_model_manifest(
+    model_ref: &str,
+    tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
+) -> Option<NativeModelProfile> {
+    let path = Path::new(model_ref);
+    if !path.is_dir() {
+        return None;
+    }
+    let text = fs::read_to_string(path.join("uniserve_profile.json")).ok()?;
+    let manifest = serde_json::from_str::<ProfileManifest>(&text).ok()?;
+    Some(profile_from_manifest(manifest, Some(tokenizer)))
+}
+
+fn profile_from_manifest(
+    manifest: ProfileManifest,
+    tokenizer: Option<&dyn uniserve_text::tokenizer::Tokenizer>,
+) -> NativeModelProfile {
+    let controls = tokenizer
+        .map(|tok| controls_from_manifest(&manifest.control_tokens, tok))
+        .unwrap_or_default();
+    NativeModelProfile {
+        id: manifest.id,
+        controls,
+        image_defaults: manifest.image_defaults.into(),
+        resolution_policy: manifest.resolution.into(),
+        output_filter: manifest.output_filter.into(),
+        default_mode: parse_profile_mode(&manifest.default_mode),
+        supported_modes: manifest
+            .supported_modes
+            .iter()
+            .map(|mode| parse_profile_mode(mode))
+            .collect(),
+        prompts: manifest.prompts.into(),
+        understanding_system_prompt: manifest.understanding_system_prompt,
+    }
+}
+
+fn controls_from_manifest(
+    spec: &ControlTokenManifest,
+    tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
+) -> NativeControls {
+    NativeControls {
+        bos: first_token_id(tokenizer, &spec.bos),
+        eos: first_token_id(tokenizer, &spec.eos),
+        start_of_image: first_token_id(tokenizer, &spec.start_of_image),
+        end_of_image: first_token_id(tokenizer, &spec.end_of_image),
+        image_start_ids: spec
+            .image_start_text
+            .as_ref()
+            .and_then(|text| tokenizer.encode(text, false).ok())
+            .unwrap_or_default(),
+    }
+}
+
+fn first_token_id(
+    tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
+    candidates: &[String],
+) -> u32 {
+    candidates
+        .iter()
+        .find_map(|token| tokenizer.token_to_id(token))
+        .unwrap_or(0)
+}
+
+fn profile_key_from_model(model_ref: &str) -> Option<&'static str> {
+    let path = Path::new(model_ref);
+    if path.is_dir()
+        && let Ok(text) = fs::read_to_string(path.join("config.json"))
+        && let Ok(config) = serde_json::from_str::<Value>(&text)
+    {
+        return profile_key_from_config(&config);
+    }
+    let lower = model_ref.to_ascii_lowercase();
+    if lower.contains("sensenova") || lower.contains("neo_chat") || lower.contains("neo-unify") {
+        Some("sensenova-u1")
+    } else if lower.contains("bagel") {
+        Some("bagel")
+    } else {
+        None
+    }
+}
+
+fn profile_key_from_config(config: &Value) -> Option<&'static str> {
+    let model_type = config
+        .get("model_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let architectures: Vec<String> = config
+        .get("architectures")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if model_type == "neo_chat"
+        || model_type == "neo_unify"
+        || architectures.iter().any(|arch| {
+            matches!(
+                arch.as_str(),
+                "neochatmodel" | "neo_chat" | "neo-unify" | "neo_unify"
+            )
+        })
+    {
+        return Some("sensenova-u1");
+    }
+    if model_type.contains("bagel") || architectures.iter().any(|arch| arch.contains("bagel")) {
+        return Some("bagel");
+    }
+    None
+}
+
+fn render_prompt(
+    tok: &DynTokenizer,
+    controls: &NativeControls,
+    recipe: &PromptRecipe,
+    body: &NativeGenerateBody,
+    prompt: &str,
+) -> Vec<u32> {
+    match recipe {
+        PromptRecipe::Chatml {
+            default_system,
+            default_assistant_prefix,
+        } => {
+            let system = body.system_prompt.as_deref().or(default_system.as_deref());
+            let assistant_prefix = body
+                .assistant_prefix
+                .as_deref()
+                .unwrap_or(default_assistant_prefix);
+            encode(tok, &chatml(system, prompt, assistant_prefix))
+        }
+        PromptRecipe::BagelText => encode(
+            tok,
+            &format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
+                prompt,
+                body.assistant_prefix.as_deref().unwrap_or("")
+            ),
+        ),
+        PromptRecipe::BagelImage => {
+            let mut ids = vec![controls.bos];
+            ids.extend(encode(tok, prompt));
+            ids.push(controls.eos);
+            ids
+        }
+        PromptRecipe::BagelAutoInterleave { default_system } => encode(
+            tok,
+            &format!(
+                "<|im_start|>{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
+                body.system_prompt.as_deref().unwrap_or(default_system),
+                prompt,
+                body.assistant_prefix.as_deref().unwrap_or("")
+            ),
+        ),
+        PromptRecipe::Raw => encode(tok, prompt),
     }
 }
 
@@ -329,6 +353,207 @@ fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -> String {
     out.push_str("<|im_end|>\n<|im_start|>assistant\n");
     out.push_str(assistant_suffix);
     out
+}
+
+fn mode_name(mode: GenMode) -> &'static str {
+    match mode {
+        GenMode::Text => "text",
+        GenMode::Image => "image",
+        GenMode::AutoInterleave => "interleave",
+        GenMode::InterleaveUnd => "understand",
+    }
+}
+
+fn parse_profile_mode(value: &str) -> GenMode {
+    match value {
+        "text" => GenMode::Text,
+        "image" => GenMode::Image,
+        "auto" | "auto_interleave" | "interleave" => GenMode::AutoInterleave,
+        "understand" | "interleave_und" | "understanding" => GenMode::InterleaveUnd,
+        other => panic!("unknown native profile mode {other:?}"),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProfileManifest {
+    id: String,
+    control_tokens: ControlTokenManifest,
+    default_mode: String,
+    supported_modes: Vec<String>,
+    image_defaults: ImageDefaultsManifest,
+    resolution: ResolutionManifest,
+    output_filter: OutputFilterManifest,
+    prompts: PromptManifestSet,
+    understanding_system_prompt: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlTokenManifest {
+    bos: Vec<String>,
+    eos: Vec<String>,
+    start_of_image: Vec<String>,
+    end_of_image: Vec<String>,
+    #[serde(default)]
+    image_start_text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImageDefaultsManifest {
+    resolution: String,
+    steps: u16,
+    cfg_text_scale: f32,
+    cfg_img_scale: f32,
+    cfg_renorm_type: String,
+    cfg_renorm_min: f32,
+    cfg_interval: [f32; 2],
+    timestep_shift: f32,
+    seed: Option<u64>,
+    max_images: u16,
+    max_images_limit: u16,
+}
+
+impl From<ImageDefaultsManifest> for NativeImageDefaults {
+    fn from(value: ImageDefaultsManifest) -> Self {
+        Self {
+            resolution: value.resolution,
+            steps: value.steps,
+            cfg_text_scale: value.cfg_text_scale,
+            cfg_img_scale: value.cfg_img_scale,
+            cfg_renorm_type: value.cfg_renorm_type,
+            cfg_renorm_min: value.cfg_renorm_min,
+            cfg_interval: (value.cfg_interval[0], value.cfg_interval[1]),
+            timestep_shift: value.timestep_shift,
+            seed: value.seed,
+            max_images: value.max_images,
+            max_images_limit: value.max_images_limit,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionManifest {
+    default: String,
+    allow_custom: bool,
+    buckets: Vec<ResolutionBucketManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResolutionBucketManifest {
+    name: String,
+    width: u32,
+    height: u32,
+}
+
+impl From<ResolutionBucketManifest> for ResolutionBucket {
+    fn from(value: ResolutionBucketManifest) -> Self {
+        Self {
+            name: value.name,
+            width: value.width,
+            height: value.height,
+        }
+    }
+}
+
+impl From<ResolutionManifest> for ResolutionPolicy {
+    fn from(value: ResolutionManifest) -> Self {
+        let buckets: Vec<ResolutionBucket> = value.buckets.into_iter().map(Into::into).collect();
+        let default = buckets
+            .iter()
+            .find(|bucket| bucket.name.eq_ignore_ascii_case(&value.default))
+            .cloned()
+            .unwrap_or_else(|| {
+                buckets
+                    .first()
+                    .cloned()
+                    .expect("native profile must declare at least one resolution bucket")
+            });
+        Self {
+            default,
+            buckets,
+            allow_custom: value.allow_custom,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputFilterManifest {
+    reasoning: Option<DelimitedTextManifest>,
+    #[serde(default)]
+    visible_wrappers: Vec<DelimitedTextManifest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DelimitedTextManifest {
+    start: String,
+    end: String,
+}
+
+impl From<DelimitedTextManifest> for NativeDelimitedText {
+    fn from(value: DelimitedTextManifest) -> Self {
+        Self {
+            start: value.start,
+            end: value.end,
+        }
+    }
+}
+
+impl From<OutputFilterManifest> for NativeOutputFilter {
+    fn from(value: OutputFilterManifest) -> Self {
+        Self {
+            reasoning: value.reasoning.map(Into::into),
+            visible_wrappers: value.visible_wrappers.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptManifestSet {
+    text: PromptRecipeManifest,
+    image: PromptRecipeManifest,
+    auto_interleave: PromptRecipeManifest,
+    understand: PromptRecipeManifest,
+    negative: PromptRecipeManifest,
+}
+
+impl From<PromptManifestSet> for NativePromptRecipes {
+    fn from(value: PromptManifestSet) -> Self {
+        Self {
+            text: value.text.into(),
+            image: value.image.into(),
+            auto_interleave: value.auto_interleave.into(),
+            understand: value.understand.into(),
+            negative: value.negative.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptRecipeManifest {
+    kind: String,
+    #[serde(default)]
+    default_system: Option<String>,
+    #[serde(default)]
+    default_assistant_prefix: String,
+}
+
+impl From<PromptRecipeManifest> for PromptRecipe {
+    fn from(value: PromptRecipeManifest) -> Self {
+        match value.kind.as_str() {
+            "chatml" => PromptRecipe::Chatml {
+                default_system: value.default_system,
+                default_assistant_prefix: value.default_assistant_prefix,
+            },
+            "bagel_text" => PromptRecipe::BagelText,
+            "bagel_image" => PromptRecipe::BagelImage,
+            "bagel_auto_interleave" => PromptRecipe::BagelAutoInterleave {
+                default_system: value
+                    .default_system
+                    .expect("bagel_auto_interleave prompt requires default_system"),
+            },
+            "raw" => PromptRecipe::Raw,
+            other => panic!("unknown native prompt recipe {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -366,7 +591,6 @@ mod tests {
             match token {
                 "<img>" => Some(10),
                 "</img>" => Some(11),
-                "<IMG_CONTEXT>" => Some(12),
                 "<|im_start|>" => Some(13),
                 "<|im_end|>" => Some(14),
                 _ => None,
@@ -374,19 +598,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolves_sensenova_profile() {
-        let tok = ByteTokenizer;
-        let profile = resolve_native_profile(&tok);
-        assert_eq!(profile.family, NativeModelFamily::SenseNovaU1);
-        assert_eq!(profile.resolution_policy.default.width, 2048);
-        assert_eq!(profile.resolution_policy.default.height, 1152);
+    fn temp_model_config(config: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "uniserve-native-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        dir
     }
 
     #[test]
-    fn sensenova_image_prompt_uses_official_generation_prompt() {
+    fn resolves_sensenova_profile_from_model_metadata() {
+        let tok = ByteTokenizer;
+        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
+        let profile = resolve_native_profile_for_model(dir.to_str().unwrap(), &tok);
+        assert_eq!(profile.id, "sensenova-u1");
+        assert_eq!(profile.resolution_policy.default.width, 2048);
+        assert_eq!(profile.resolution_policy.default.height, 1152);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn loads_checkpoint_profile_manifest_before_metadata_fallback() {
+        let tok = ByteTokenizer;
+        let dir = temp_model_config(r#"{"architectures":["NEOChatModel"]}"#);
+        let mut manifest: serde_json::Value = serde_json::from_str(BAGEL_PROFILE_JSON).unwrap();
+        manifest["id"] = serde_json::Value::String("custom-profile".into());
+        std::fs::write(
+            dir.join("uniserve_profile.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let profile = resolve_native_profile_for_model(dir.to_str().unwrap(), &tok);
+        assert_eq!(profile.id, "custom-profile");
+        assert_eq!(profile.default_mode_name(), "text");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn sensenova_image_prompt_uses_profile_generation_prompt() {
         let tok: DynTokenizer = Arc::new(ByteTokenizer);
-        let profile = resolve_native_profile(&*tok);
+        let profile = profile_from_key("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint a lake".into(),
             mode: Some("image".into()),

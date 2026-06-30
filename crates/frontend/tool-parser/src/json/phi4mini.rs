@@ -8,7 +8,7 @@ const PHI4MINI_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     marker_whitespace: JsonToolCallWhitespace::Optional,
     delimiter: Some(","),
     name_key: "name",
- // Accept both key variants emitted by Phi-4 Mini tool-call templates.
+    // Accept both key variants emitted by Phi-4 Mini tool-call templates.
     arguments_key: &["arguments", "parameters"],
 };
 
@@ -30,7 +30,7 @@ pub struct Phi4MiniJsonToolParser {
 }
 
 impl Phi4MiniJsonToolParser {
- /// Create a phi-4-mini tool parser.
+    /// Create a phi-4-mini tool parser.
     fn new(_tools: &[Tool]) -> Self {
         Self {
             inner: JsonToolCallParser::new(PHI4MINI_CONFIG),
@@ -39,7 +39,7 @@ impl Phi4MiniJsonToolParser {
 }
 
 impl ToolParser for Phi4MiniJsonToolParser {
- /// Create a boxed phi-4-mini tool parser.
+    /// Create a boxed phi-4-mini tool parser.
     fn create(tools: &[Tool]) -> Result<Box<dyn ToolParser>>
     where
         Self: Sized + 'static,
@@ -47,17 +47,17 @@ impl ToolParser for Phi4MiniJsonToolParser {
         Ok(Box::new(Self::new(tools)))
     }
 
- /// Feed one decoded text chunk through the phi-4-mini parser.
+    /// Feed one decoded text chunk through the phi-4-mini parser.
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.inner.parse_into(chunk, output)
     }
 
- /// Flush any buffered partial state at end of stream.
+    /// Flush any buffered partial state at end of stream.
     fn finish(&mut self) -> Result<ToolParserOutput> {
         self.inner.finish()
     }
 
- /// Clear parser state and return currently uncommitted buffered text.
+    /// Clear parser state and return currently uncommitted buffered text.
     fn reset(&mut self) -> String {
         self.inner.reset()
     }
@@ -72,12 +72,12 @@ mod tests {
     use crate::test_utils::{collect_stream, split_by_chars, test_tools};
     use crate::{ToolParser, ToolParserTestExt as _};
 
- /// Build one phi-4-mini tool-call object: `{"name":..,"<args_key>":<args>}`.
+    /// Build one phi-4-mini tool-call object: `{"name":..,"<args_key>":<args>}`.
     fn build_call(function_name: &str, args_key: &str, arguments: &str) -> String {
         format!(r#"{{"name":"{function_name}","{args_key}":{arguments}}}"#)
     }
 
- /// Wrap tool-call objects in the `functools[..]` envelope.
+    /// Wrap tool-call objects in the `functools[..]` envelope.
     fn wrap(calls: &[String]) -> String {
         format!("functools[{}]", calls.join(","))
     }
@@ -152,8 +152,8 @@ mod tests {
         .assert_debug_eq(&result);
     }
 
- /// The shared JSON core scans matched braces, so bracket-bearing argument
- /// values are forwarded intact.
+    /// The shared JSON core scans matched braces, so bracket-bearing argument
+    /// values are forwarded intact.
     #[test]
     fn phi4mini_array_valued_arguments_are_not_truncated() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());
@@ -166,8 +166,8 @@ mod tests {
         assert_eq!(result.calls[0].arguments, arguments);
     }
 
- /// Preface text before a tool call is preserved as normal_text, consistent
- /// with the other JSON parsers in this crate.
+    /// Preface text before a tool call is preserved as normal_text, consistent
+    /// with the other JSON parsers in this crate.
     #[test]
     fn phi4mini_preserves_text_before_tool_call() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());
@@ -197,10 +197,10 @@ mod tests {
         assert_eq!(result.calls[0].arguments, arguments);
     }
 
- /// The bundled `tool_chat_template_phi4_mini.jinja` emits objects with
- /// whitespace after `:` and `,` (e.g. `{"name": "f", "arguments": {..}}`).
- /// Confirm the parser handles that real model format and preserves the
- /// inner argument spacing verbatim.
+    /// The bundled `tool_chat_template_phi4_mini.jinja` emits objects with
+    /// whitespace after `:` and `,` (e.g. `{"name": "f", "arguments": {..}}`).
+    /// Confirm the parser handles that real model format and preserves the
+    /// inner argument spacing verbatim.
     #[test]
     fn phi4mini_accepts_real_model_whitespace_format() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(result.calls[0].arguments, r#"{"location": "Tokyo"}"#);
     }
 
- /// Argument deltas are streamed through the shared JSON core.
+    /// Argument deltas are streamed through the shared JSON core.
     #[test]
     fn phi4mini_streaming_emits_argument_deltas() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());
@@ -279,7 +279,7 @@ mod tests {
         assert!(!parser.preserve_special_tokens());
     }
 
- /// The brace-scanning core handles nested arrays and objects in arguments.
+    /// The brace-scanning core handles nested arrays and objects in arguments.
     #[test]
     fn phi4mini_parses_nested_arrays_and_objects() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());
@@ -294,9 +294,9 @@ mod tests {
         assert_eq!(result.calls[0].arguments, arguments);
     }
 
- /// The chat template emits parallel calls as `},\n {` (comma + newline +
- /// indent). Confirm the `Optional` marker whitespace and `,` delimiter
- /// parse the real multi-call layout.
+    /// The chat template emits parallel calls as `},\n {` (comma + newline +
+    /// indent). Confirm the `Optional` marker whitespace and `,` delimiter
+    /// parse the real multi-call layout.
     #[test]
     fn phi4mini_parses_parallel_calls_in_template_format() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());
@@ -314,7 +314,7 @@ mod tests {
         assert_eq!(result.calls[1].name.as_deref(), Some("add"));
     }
 
- /// The shared core requires an object after the start marker.
+    /// The shared core requires an object after the start marker.
     #[test]
     fn phi4mini_empty_array_errors() {
         let mut parser = Phi4MiniJsonToolParser::new(&test_tools());

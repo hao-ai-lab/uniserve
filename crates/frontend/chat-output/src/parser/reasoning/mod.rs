@@ -36,16 +36,16 @@ type ReasoningParserCreator =
 pub type ReasoningParserFactory = ParserFactory<ReasoningParserCreator>;
 
 impl ReasoningParserFactory {
- /// Get the global reasoning parser factory with built-in registrations and
- /// model mappings.
+    /// Get the global reasoning parser factory with built-in registrations and
+    /// model mappings.
     pub fn global() -> &'static Self {
         static INSTANCE: LazyLock<ReasoningParserFactory> =
             LazyLock::new(ReasoningParserFactory::new);
         &INSTANCE
     }
 
- /// Create the default registry with built-in parser names and model
- /// mappings.
+    /// Create the default registry with built-in parser names and model
+    /// mappings.
     pub fn new() -> Self {
         let mut factory = Self::default();
 
@@ -88,7 +88,7 @@ impl ReasoningParserFactory {
         factory
     }
 
- /// Register one parser type that exposes a static `create` constructor.
+    /// Register one parser type that exposes a static `create` constructor.
     pub fn register_parser<T>(&mut self, name: &str) -> &mut Self
     where
         T: ReasoningParser + 'static,
@@ -96,7 +96,7 @@ impl ReasoningParserFactory {
         self.register_creator(name, T::create)
     }
 
- /// Construct a parser from an exact name.
+    /// Construct a parser from an exact name.
     pub fn create(
         &self,
         name: &str,

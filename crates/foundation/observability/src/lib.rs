@@ -36,7 +36,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
- /// Construct a new metrics registry.
+    /// Construct a new metrics registry.
     pub fn new() -> Self {
         let mut registry = Registry::default();
         let scheduler = SchedulerMetrics::register(&mut registry);
@@ -51,15 +51,15 @@ impl Metrics {
         }
     }
 
- /// Render the current metrics registry into Prometheus/OpenMetrics text
- /// format.
+    /// Render the current metrics registry into Prometheus/OpenMetrics text
+    /// format.
     pub fn render(&self) -> Result<String, fmt::Error> {
         let mut output = String::new();
         encode(&mut output, &self.registry)?;
         Ok(output)
     }
 
- /// Return the registry owned by this metrics object.
+    /// Return the registry owned by this metrics object.
     pub fn registry(&self) -> &Registry {
         &self.registry
     }

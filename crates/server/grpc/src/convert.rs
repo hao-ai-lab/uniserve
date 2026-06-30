@@ -59,10 +59,10 @@ pub(super) fn to_text_request(
     let mut sampling_params =
         build_sampling_params(req.temperature, sampling, decoding, stopping, response)?;
 
- // Thread KVCacheParameters → SamplingParams fields.
+    // Thread KVCacheParameters → SamplingParams fields.
     if let Some(kv) = kv {
- // Thread kv_transfer_params through uniserve_xargs, matching the HTTP route
- // convention.
+        // Thread kv_transfer_params through uniserve_xargs, matching the HTTP route
+        // convention.
         if let Some(kv_struct) = kv.kv_transfer_params.as_ref() {
             let kv_json = proto_struct_to_json(kv_struct);
             let map = sampling_params
@@ -107,24 +107,24 @@ fn build_sampling_params(
     stopping: Option<&pb::StoppingCriteria>,
     response: Option<&pb::ResponseOptions>,
 ) -> Result<SamplingParams, Status> {
- // Temperature is a top-level GenerateRequest field. Default to greedy (0.0) for
- // the gRPC API when the caller does not specify a value. This differs from
- // the HTTP/OpenAI API (which defaults to 1.0) and matches the convention of
- // programmatic generation APIs.
+    // Temperature is a top-level GenerateRequest field. Default to greedy (0.0) for
+    // the gRPC API when the caller does not specify a value. This differs from
+    // the HTTP/OpenAI API (which defaults to 1.0) and matches the convention of
+    // programmatic generation APIs.
     let temperature = temperature.or(Some(0.0));
     let mut params = SamplingParams {
         temperature,
         ..SamplingParams::default()
     };
 
- // RandomSampling: for every remaining sampling field the protobuf default (`0`)
- // is treated as "unset" and leaves the resolved value to the lowering
- // stage, which falls back to the model-provided default or a
- // neutral/disabled value otherwise.
+    // RandomSampling: for every remaining sampling field the protobuf default (`0`)
+    // is treated as "unset" and leaves the resolved value to the lowering
+    // stage, which falls back to the model-provided default or a
+    // neutral/disabled value otherwise.
     if let Some(s) = sampling {
- // num_sequences (n > 1) is not supported yet by the TextLlm layer; the response
- // path also hardcodes SequenceOutput.index = 0, so accepting >1 would silently
- // truncate output cardinality. Reject explicitly.
+        // num_sequences (n > 1) is not supported yet by the TextLlm layer; the response
+        // path also hardcodes SequenceOutput.index = 0, so accepting >1 would silently
+        // truncate output cardinality. Reject explicitly.
         if s.num_sequences > 1 {
             return Err(Status::invalid_argument(
                 "num_sequences > 1 is not supported",
@@ -142,7 +142,7 @@ fn build_sampling_params(
         params.seed = s.seed;
     }
 
- // DecodingParameters
+    // DecodingParameters
     if let Some(d) = decoding {
         if d.presence_penalty != 0.0 {
             params.presence_penalty = Some(d.presence_penalty);
@@ -162,7 +162,7 @@ fn build_sampling_params(
         params.structured_outputs = convert_structured_output(d)?;
     }
 
- // StoppingCriteria
+    // StoppingCriteria
     if let Some(s) = stopping {
         if s.max_new_tokens != 0 {
             params.max_tokens = Some(s.max_new_tokens);
@@ -176,7 +176,7 @@ fn build_sampling_params(
         params.ignore_eos = s.ignore_eos;
     }
 
- // ResponseOptions → logprobs
+    // ResponseOptions → logprobs
     if let Some(r) = response {
         if r.output_logprobs {
             let (count, token_ids) = candidate_logprob_spec(r.output_candidates.as_ref());
@@ -184,10 +184,10 @@ fn build_sampling_params(
             params.logprob_token_ids = token_ids;
         }
         if r.prompt_logprobs {
- // The engine wire protocol has one shared `logprob_token_ids` field
- // for output and prompt logprobs, so a per-token-id selector for prompt
- // candidates can't be honored independently. Reject it instead of silently
- // dropping the list.
+            // The engine wire protocol has one shared `logprob_token_ids` field
+            // for output and prompt logprobs, so a per-token-id selector for prompt
+            // candidates can't be honored independently. Reject it instead of silently
+            // dropping the list.
             if matches!(
                 r.prompt_candidates.as_ref().and_then(|c| c.select.as_ref()),
                 Some(pb::candidate_tokens::Select::TokenIds(_))
@@ -340,9 +340,9 @@ fn to_finish_info(finished: &Finished, token_ids: &[u32]) -> pb::FinishInfo {
                 Some(StopReason::Text(s)) => {
                     Some(pb::finish_info::StopReason::StopString(s.clone()))
                 }
- // EOS-driven stop: the engine matched the primary EOS token id but did not
- // echo it back as a `stop_reason`. The matched token is, by construction, the
- // last token of the terminal output batch, so we recover it from there.
+                // EOS-driven stop: the engine matched the primary EOS token id but did not
+                // echo it back as a `stop_reason`. The matched token is, by construction, the
+                // last token of the terminal output batch, so we recover it from there.
                 None => token_ids
                     .last()
                     .copied()
@@ -385,9 +385,9 @@ fn output_logprobs_to_proto(
 fn prompt_logprobs_to_proto(
     plp: &DecodedPromptLogprobs,
 ) -> (Vec<f32>, Vec<u32>, Vec<pb::CandidateTokenInfo>) {
- // The proto PromptInfo has flat parallel arrays covering all prompt positions.
- // DecodedPromptLogprobs has first_token separately + scored_positions for the
- // rest. The first prompt position has no scores, so we emit zeros for it.
+    // The proto PromptInfo has flat parallel arrays covering all prompt positions.
+    // DecodedPromptLogprobs has first_token separately + scored_positions for the
+    // rest. The first prompt position has no scores, so we emit zeros for it.
     let (mut logprobs, mut ranks, mut candidates) = positions_to_proto(&plp.scored_positions);
     logprobs.insert(0, 0.0);
     ranks.insert(0, 0);
@@ -405,13 +405,13 @@ fn positions_to_proto(
     let mut candidates = Vec::with_capacity(positions.len());
 
     for pos in positions {
- // First entry is the sampled/scored token.
+        // First entry is the sampled/scored token.
         if let Some(first) = pos.entries.first() {
             logprobs.push(first.logprob);
             ranks.push(first.rank);
         }
 
- // Extra candidates beyond the first.
+        // Extra candidates beyond the first.
         let entries = pos.entries.iter().skip(1);
         candidates.push(pb::CandidateTokenInfo {
             tokens: entries
@@ -471,11 +471,11 @@ fn json_to_proto_value(v: &serde_json::Value) -> prost_types::Value {
     let kind = match v {
         serde_json::Value::Null => Kind::NullValue(0),
         serde_json::Value::Bool(b) => Kind::BoolValue(*b),
- // prost's `Value::NumberValue` is an f64 (proto3 `double`), so any JSON number
- // must be widened to f64. `as_f64` is lossless for in-range values and only
- // fails for arbitrary-precision integers outside f64's range; fall back through
- // the integer accessors so we preserve magnitude (lossy) instead of silently
- // collapsing the value to 0.0.
+        // prost's `Value::NumberValue` is an f64 (proto3 `double`), so any JSON number
+        // must be widened to f64. `as_f64` is lossless for in-range values and only
+        // fails for arbitrary-precision integers outside f64's range; fall back through
+        // the integer accessors so we preserve magnitude (lossy) instead of silently
+        // collapsing the value to 0.0.
         serde_json::Value::Number(n) => {
             let f = n
                 .as_f64()
@@ -563,7 +563,7 @@ mod tests {
     fn unset_temperature_defaults_to_greedy() {
         let text = to_text_request(base_request(), false, &["test-model".to_string()])
             .expect("convert ok");
- // The gRPC API defaults to greedy (0.0) when temperature is not specified.
+        // The gRPC API defaults to greedy (0.0) when temperature is not specified.
         assert_eq!(text.sampling_params.temperature, Some(0.0));
     }
 
@@ -617,7 +617,7 @@ mod tests {
         };
         let text = to_text_request(req, false, &["test-model".to_string()]).expect("convert ok");
         assert_eq!(text.sampling_params.skip_reading_prefix_cache, None);
- // Prompt conversion still succeeds and reaches the expected variant.
+        // Prompt conversion still succeeds and reaches the expected variant.
         assert!(matches!(text.prompt, Prompt::Text(s) if s == "hi"));
     }
 
@@ -654,8 +654,8 @@ mod tests {
     #[test]
     fn explicit_stop_token_id_is_preserved() {
         let fin = finished(FinishReason::Stop(Some(StopReason::TokenId(42))));
- // Terminal token list should be ignored when an explicit stop reason is
- // present.
+        // Terminal token list should be ignored when an explicit stop reason is
+        // present.
         let info = to_finish_info(&fin, &[7, 42]);
 
         assert_eq!(info.finish_reason, PbFinishReason::Stop as i32);
@@ -715,15 +715,15 @@ mod tests {
     fn json_numbers_preserve_magnitude_in_proto_value() {
         use prost_types::value::Kind;
 
- // Small/representable values round-trip exactly.
+        // Small/representable values round-trip exactly.
         let v = json_to_proto_value(&serde_json::json!(42));
         assert!(matches!(v.kind, Some(Kind::NumberValue(n)) if n == 42.0));
 
         let v = json_to_proto_value(&serde_json::json!(-1.5));
         assert!(matches!(v.kind, Some(Kind::NumberValue(n)) if n == -1.5));
 
- // A large unsigned integer is widened to f64 (lossy precision is acceptable),
- // and must NOT silently collapse to 0.0.
+        // A large unsigned integer is widened to f64 (lossy precision is acceptable),
+        // and must NOT silently collapse to 0.0.
         let big = u64::MAX;
         let v = json_to_proto_value(&serde_json::json!(big));
         match v.kind {
