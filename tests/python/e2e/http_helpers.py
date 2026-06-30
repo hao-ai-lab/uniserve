@@ -103,13 +103,3 @@ def tiny_input_png_b64() -> str:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("ascii")
-
-
-def strip_b64(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    sanitized: list[dict[str, Any]] = []
-    for event in events:
-        copied = dict(event)
-        if "pixels_png_b64" in copied:
-            copied["pixels_png_b64"] = f"<base64:{len(event['pixels_png_b64'])} chars>"
-        sanitized.append(copied)
-    return sanitized

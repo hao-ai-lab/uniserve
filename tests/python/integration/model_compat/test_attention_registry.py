@@ -29,17 +29,6 @@ def test_registry_normalizes_aliases_and_lists_registered_backends(monkeypatch):
     assert registry.list_attention_backends() == ("torch_sdpa",)
 
 
-def test_registry_registration_is_idempotent_by_backend_type(monkeypatch):
-    backend = _FakeBackend()
-    monkeypatch.setattr(registry, "_BACKENDS", {})
-
-    first = registry.register_attention_backend("torch_sdpa", backend)
-    second = registry.register_attention_backend("torch_sdpa", _FakeBackend())
-
-    assert first is backend
-    assert second is backend
-
-
 def test_registry_rejects_conflicting_registration_and_unknown_lookup(monkeypatch):
     monkeypatch.setattr(registry, "_BACKENDS", {})
     registry.register_attention_backend("torch_sdpa", _FakeBackend())

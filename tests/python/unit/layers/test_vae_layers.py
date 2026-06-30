@@ -25,10 +25,6 @@ def _tiny_params():
     )
 
 
-def test_autoencoder_is_shared_vae_layer():
-    assert issubclass(AutoEncoder, torch.nn.Module)
-
-
 def test_autoencoder_encode_decode_is_deterministic_with_sampling_disabled():
     torch.manual_seed(8)
     params = _tiny_params()

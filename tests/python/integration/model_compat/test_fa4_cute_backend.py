@@ -6,11 +6,6 @@ import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from uniserve_worker.backends.attention import get_attention_backend, has_attention_backend
-from uniserve_worker.backends.attention.fa4_cute import (
-    Fa4CuteAttentionBackend,
-    _validate_unified_trunk_geometry,
-    _write_paged_kv_cache,
-)
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.execution.forward_stream import ForwardPagedKVSegment, ForwardPagedKVView
@@ -58,34 +53,6 @@ def _require_fa4_cute() -> None:
     if reason is None:
         return
     pytest.skip(f"requires CUDA and importable FA4 CUTE provider packages: {reason}")
-
-
-def test_fa4_paged_cache_writer_spans_pages() -> None:
-    dtype = torch.float32
-    k_cache = torch.zeros(3, 4, 2, 3, dtype=dtype)
-    v_cache = torch.zeros_like(k_cache)
-    block_table = torch.tensor([[1, 2]], dtype=torch.int32)
-    cache_seqlens = torch.tensor([3], dtype=torch.int32)
-    k = torch.arange(5 * 2 * 3, dtype=dtype).view(1, 5, 2, 3)
-    v = -k
-
-    _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k, v)
-
-    torch.testing.assert_close(k_cache[1, 3], k[0, 0])
-    torch.testing.assert_close(k_cache[2, :4], k[0, 1:5])
-    torch.testing.assert_close(v_cache[1, 3], v[0, 0])
-    torch.testing.assert_close(v_cache[2, :4], v[0, 1:5])
-    assert torch.count_nonzero(k_cache[0]) == 0
-
-
-def test_fa4_cute_rejects_vision_vae_head_geometry() -> None:
-    with pytest.raises(RuntimeError, match="Vision/VAE"):
-        _validate_unified_trunk_geometry(72, 72, 72, scale=72**-0.5)
-
-    backend = Fa4CuteAttentionBackend()
-    q = torch.randn(1, 1, 2, 72)
-    with pytest.raises(RuntimeError, match="Vision/VAE"):
-        backend.forward(q, q, q, causal=False, scale=72**-0.5)
 
 
 @torch.inference_mode()

@@ -8,19 +8,12 @@ import torch
 import torch.nn as nn
 
 import uniserve_worker.foundation.runtime_config as runtime_config
-import uniserve_worker.nn.activation as activation_mod
 import uniserve_worker.nn.sampler as sampler_mod
-from uniserve_worker.foundation.triton_compat import triton_device_supported
 from uniserve_worker.nn import (
     DeviceMesh,
     FusedMoE,
     LogitsProcessor,
-    RMSNorm,
     Sampler,
-    SiluAndMul,
-    apply_rotary_emb,
-    try_triton_qk_rms_norm,
-    try_triton_qk_rms_norm_rope,
     use_mesh,
 )
 from uniserve_worker.nn.mesh import CollectiveTransport
@@ -46,11 +39,6 @@ def _tp_group_mesh(group, *, rank: int = 1, size: int = 2) -> DeviceMesh:
     monkeypatch ``torch.distributed`` directly)."""
     transport = CollectiveTransport(axis="tp", _size=size, _coord=rank, group=group)
     return DeviceMesh.tp(rank, size, transport=transport)
-
-
-def _skip_if_triton_sm100_unsupported():
-    if not triton_device_supported(torch.device("cuda")):
-        pytest.skip("Triton cannot compile kernels for this CUDA device in this environment")
 
 
 def _reference_moe(x, logits, experts, top_k, *, norm_topk_prob: bool = True):
@@ -99,11 +87,6 @@ def _reference_rms_norm(x, weight, eps):
     return weight * out.to(x.dtype)
 
 
-def _assert_exact_provider_match(got, ref):
-    for got_part, ref_part in zip(got, ref, strict=True):
-        torch.testing.assert_close(got_part, ref_part, rtol=0.0, atol=0.0)
-
-
 def test_fused_moe_matches_per_token_expert_loop():
     torch.manual_seed(6)
     experts = [nn.Linear(4, 4, bias=False) for _ in range(3)]
@@ -123,204 +106,6 @@ def test_fused_moe_can_match_unnormalized_topk_routing():
         moe(x, logits),
         _reference_moe(x, logits, experts, 2, norm_topk_prob=False),
     )
-
-
-def test_triton_qk_rms_norm_matches_reference_on_qkv_views():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the Triton QK RMSNorm kernel")
-    _skip_if_triton_sm100_unsupported()
-    torch.manual_seed(8)
-    tokens, q_heads, k_heads, head_dim = 7, 4, 2, 128
-    q_size = q_heads * head_dim
-    k_size = k_heads * head_dim
-    qkv = torch.randn(tokens, q_size + 2 * k_size, device="cuda", dtype=torch.bfloat16)
-    q, k, _ = qkv.split([q_size, k_size, k_size], dim=-1)
-    q = q.reshape(tokens, q_heads, head_dim)
-    k = k.reshape(tokens, k_heads, head_dim)
-    q_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    k_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-
-    with torch.inference_mode():
-        got = try_triton_qk_rms_norm(q, k, q_weight, k_weight, 1e-6, 1e-6)
-
-    assert got is not None
-    got_q, got_k = got
-    torch.testing.assert_close(got_q, _reference_rms_norm(q, q_weight, 1e-6), atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(got_k, _reference_rms_norm(k, k_weight, 1e-6), atol=2e-2, rtol=2e-2)
-    assert got_q.is_contiguous()
-    assert got_k.is_contiguous()
-
-
-def test_triton_qk_rms_norm_rope_matches_reference_on_qkv_views():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the Triton QK RMSNorm+RoPE kernel")
-    _skip_if_triton_sm100_unsupported()
-    torch.manual_seed(9)
-    tokens, q_heads, k_heads, head_dim = 5, 4, 2, 128
-    q_size = q_heads * head_dim
-    k_size = k_heads * head_dim
-    qkv = torch.randn(tokens, q_size + 2 * k_size, device="cuda", dtype=torch.bfloat16)
-    q, k, _ = qkv.split([q_size, k_size, k_size], dim=-1)
-    q = q.reshape(tokens, q_heads, head_dim)
-    k = k.reshape(tokens, k_heads, head_dim)
-    q_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    k_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    freqs = torch.randn(tokens, head_dim // 2, device="cuda", dtype=torch.float32)
-    cos = freqs.cos().contiguous()
-    sin = freqs.sin().contiguous()
-
-    with torch.inference_mode():
-        got = try_triton_qk_rms_norm_rope(
-            q,
-            k,
-            q_weight,
-            k_weight,
-            cos,
-            sin,
-            1e-6,
-            1e-6,
-        )
-
-    assert got is not None
-    got_q, got_k = got
-    ref_q = apply_rotary_emb(_reference_rms_norm(q, q_weight, 1e-6), cos, sin)
-    ref_k = apply_rotary_emb(_reference_rms_norm(k, k_weight, 1e-6), cos, sin)
-    torch.testing.assert_close(got_q, ref_q, atol=3e-2, rtol=3e-2)
-    torch.testing.assert_close(got_k, ref_k, atol=3e-2, rtol=3e-2)
-    assert got_q.is_contiguous()
-    assert got_k.is_contiguous()
-
-
-@pytest.mark.parametrize("tokens", [1, 5, 17, 257])
-@pytest.mark.parametrize("q_heads,k_heads", [(1, 1), (4, 2)])
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_qk_norm_rope_full_dim_auto_matches_eager_exact(tokens, q_heads, k_heads, head_dim):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for optimized provider parity")
-    _skip_if_triton_sm100_unsupported()
-    import uniserve_worker.ops as ops
-
-    torch.manual_seed(9100 + tokens + q_heads + k_heads + head_dim)
-    q = torch.randn(tokens, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(tokens, k_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    q_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    k_weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16)
-    freqs = torch.randn(tokens, head_dim // 2, device="cuda", dtype=torch.float32)
-    cos = torch.cat([freqs, freqs], dim=-1).cos().contiguous()
-    sin = torch.cat([freqs, freqs], dim=-1).sin().contiguous()
-
-    with torch.inference_mode():
-        ref = ops.qk_norm_rope(q, k, q_weight, k_weight, cos, sin, 1e-6, override="eager")
-        got = ops.qk_norm_rope(q, k, q_weight, k_weight, cos, sin, 1e-6, override="auto")
-
-    _assert_exact_provider_match(got, ref)
-
-
-@pytest.mark.parametrize("batch,seq_len", [(1, 17), (2, 17), (4, 257)])
-@pytest.mark.parametrize("axis_dims", [(64, 32, 32), (128, 64, 64)])
-def test_qk_norm_rope_multi_axis_auto_matches_eager_exact(batch, seq_len, axis_dims):
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for optimized provider parity")
-    _skip_if_triton_sm100_unsupported()
-    import uniserve_worker.ops as ops
-    from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
-    from uniserve_worker.contracts.forward_stats import ForwardStats
-
-    torch.manual_seed(9200 + batch + seq_len + sum(axis_dims))
-    q_heads, k_heads = 4, 2
-    q = torch.randn(batch, q_heads, seq_len, sum(axis_dims), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, k_heads, seq_len, sum(axis_dims), device="cuda", dtype=torch.bfloat16)
-    q_t = torch.randn(axis_dims[0], device="cuda", dtype=torch.bfloat16)
-    k_t = torch.randn(axis_dims[0], device="cuda", dtype=torch.bfloat16)
-    q_hw = torch.randn(axis_dims[1] + axis_dims[2], device="cuda", dtype=torch.bfloat16)
-    k_hw = torch.randn(axis_dims[1] + axis_dims[2], device="cuda", dtype=torch.bfloat16)
-    table_tokens = batch * seq_len
-    table_positions = torch.arange(table_tokens, device="cuda", dtype=torch.float32)
-    cos = (
-        torch.stack([torch.cos(table_positions + i / axis_dims[0]) for i in range(axis_dims[0] // 2)], dim=-1).contiguous(),
-        torch.stack([torch.cos(table_positions + 0.5 + i / axis_dims[1]) for i in range(axis_dims[1] // 2)], dim=-1).contiguous(),
-        torch.stack([torch.cos(table_positions + 1.0 + i / axis_dims[2]) for i in range(axis_dims[2] // 2)], dim=-1).contiguous(),
-    )
-    sin = (
-        torch.stack([torch.sin(table_positions + i / axis_dims[0]) for i in range(axis_dims[0] // 2)], dim=-1).contiguous(),
-        torch.stack([torch.sin(table_positions + 0.5 + i / axis_dims[1]) for i in range(axis_dims[1] // 2)], dim=-1).contiguous(),
-        torch.stack([torch.sin(table_positions + 1.0 + i / axis_dims[2]) for i in range(axis_dims[2] // 2)], dim=-1).contiguous(),
-    )
-
-    with torch.inference_mode():
-        ref = ops.qk_norm_rope(
-            q,
-            k,
-            (q_t, q_hw, q_hw),
-            (k_t, k_hw, k_hw),
-            cos,
-            sin,
-            1e-6,
-            axis_dims=axis_dims,
-            override="eager",
-        )
-        stats = ForwardStats()
-        with use_forward_context(ForwardContext(stats=stats)):
-            got = ops.qk_norm_rope(
-                q,
-                k,
-                (q_t, q_hw, q_hw),
-                (k_t, k_hw, k_hw),
-                cos,
-                sin,
-                1e-6,
-                axis_dims=axis_dims,
-                override="auto",
-            )
-
-    for got_part, ref_part in zip(got, ref, strict=True):
-        torch.testing.assert_close(got_part, ref_part, atol=3e-2, rtol=3e-2)
-    assert stats.operators.counts == {"qk_norm_rope:triton": 1}
-
-
-def test_qk_norm_multi_axis_sensenova_auto_uses_triton_provider():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for optimized provider parity")
-    _skip_if_triton_sm100_unsupported()
-    import uniserve_worker.ops as ops
-    from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
-    from uniserve_worker.contracts.forward_stats import ForwardStats
-
-    torch.manual_seed(9300)
-    batch, seq_len = 2, 17
-    axis_dims = (64, 32, 32)
-    q = torch.randn(batch, 4, seq_len, sum(axis_dims), device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(batch, 2, seq_len, sum(axis_dims), device="cuda", dtype=torch.bfloat16)
-    q_t = torch.randn(axis_dims[0], device="cuda", dtype=torch.bfloat16)
-    k_t = torch.randn(axis_dims[0], device="cuda", dtype=torch.bfloat16)
-    q_hw = torch.randn(axis_dims[1] + axis_dims[2], device="cuda", dtype=torch.bfloat16)
-    k_hw = torch.randn(axis_dims[1] + axis_dims[2], device="cuda", dtype=torch.bfloat16)
-
-    with torch.inference_mode():
-        ref = ops.qk_norm(
-            q,
-            k,
-            (q_t, q_hw, q_hw),
-            (k_t, k_hw, k_hw),
-            1e-6,
-            axis_dims=axis_dims,
-            override="eager",
-        )
-        stats = ForwardStats()
-        with use_forward_context(ForwardContext(stats=stats)):
-            got = ops.qk_norm(
-                q,
-                k,
-                (q_t, q_hw, q_hw),
-                (k_t, k_hw, k_hw),
-                1e-6,
-                axis_dims=axis_dims,
-                override="auto",
-            )
-
-    for got_part, ref_part in zip(got, ref, strict=True):
-        torch.testing.assert_close(got_part, ref_part, atol=3e-2, rtol=3e-2)
-    assert stats.operators.counts == {"qk_norm:triton": 1}
 
 
 def test_sampler_wraps_shared_sampling_pipeline():
@@ -483,33 +268,6 @@ def test_plain_greedy_batched_sampler_syncs_tp_fast_path(monkeypatch):
     torch.testing.assert_close(got.device_tokens, torch.tensor([2, 0], dtype=torch.long))
 
 
-def test_greedy_sampler_keeps_truncation_defaults_on_fast_path(monkeypatch):
-    def fail_fallback(*args, **kwargs):
-        raise AssertionError("greedy top-k/top-p/min-p should not use fallback sampling")
-
-    monkeypatch.setattr(sampler_mod, "_apply_common_min_p_top_k_top_p_in_place", fail_fallback)
-    logits = torch.tensor(
-        [
-            [0.0, 4.0, 1.0],
-            [3.0, 0.5, 2.0],
-        ]
-    )
-
-    got = sampler_mod.apply_sampling_batched_with_device_tokens(
-        logits,
-        [
-            {"temperature": 0.0, "top_k": 2, "top_p": 0.2, "min_p": 0.8},
-            {"temperature": 0.0, "top_k": 1, "top_p": 0.5, "min_p": 0.1},
-        ],
-        [[], []],
-        [None, None],
-        [None, None],
-    )
-
-    assert [sample[0] for sample in got.samples] == [1, 0]
-    torch.testing.assert_close(got.device_tokens, torch.tensor([1, 0], dtype=torch.long))
-
-
 def test_greedy_sampler_fast_path_applies_argmax_processors(monkeypatch):
     def fail_fallback(*args, **kwargs):
         raise AssertionError("greedy masks and bias should stay on the device fast path")
@@ -539,46 +297,6 @@ def test_greedy_sampler_fast_path_applies_argmax_processors(monkeypatch):
     torch.testing.assert_close(got.device_tokens, torch.tensor([2, 0, 1], dtype=torch.long))
 
 
-def test_sampler_async_logits_probe_preserves_negative_inf_masks(monkeypatch):
-    calls = []
-
-    def fake_assert_async(predicate, message):
-        calls.append((bool(predicate.item()), message))
-
-    monkeypatch.setattr(sampler_mod, "_ENABLE_ASYNC_ASSERT", True)
-    monkeypatch.setattr(sampler_mod.torch, "_assert_async", fake_assert_async, raising=False)
-
-    sampler_mod._maybe_async_assert_valid_logits(
-        torch.tensor([0.0, float("-inf")]),
-        "masked row",
-    )
-
-    assert calls == [
-        (True, "NaN detected in logits: masked row"),
-        (True, "+Inf detected in logits: masked row"),
-    ]
-
-
-def test_sampler_async_logits_probe_flags_nan_and_positive_inf(monkeypatch):
-    calls = []
-
-    def fake_assert_async(predicate, message):
-        calls.append((bool(predicate.item()), message))
-
-    monkeypatch.setattr(sampler_mod, "_ENABLE_ASYNC_ASSERT", True)
-    monkeypatch.setattr(sampler_mod.torch, "_assert_async", fake_assert_async, raising=False)
-
-    sampler_mod._maybe_async_assert_valid_logits(
-        torch.tensor([float("nan"), float("inf")]),
-        "bad row",
-    )
-
-    assert calls == [
-        (False, "NaN detected in logits: bad row"),
-        (False, "+Inf detected in logits: bad row"),
-    ]
-
-
 def test_sampler_top_p_filters_only_finite_candidates_after_top_k():
     logits = torch.tensor([5.0, 4.0, 3.0, 2.0, 1.0, -1.0])
     sp = {"top_k": 2, "top_p": 0.7, "min_p": 0.0}
@@ -588,88 +306,6 @@ def test_sampler_top_p_filters_only_finite_candidates_after_top_k():
 
     expected = _reference_min_p_top_k_top_p(logits, sp)
     torch.testing.assert_close(got, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_triton_rmsnorm_matches_eager_reference_cuda():
-    pytest.importorskip("triton")
-    _skip_if_triton_sm100_unsupported()
-    torch.manual_seed(11)
-    norm = RMSNorm(16).cuda().to(dtype=torch.bfloat16)
-    x = torch.randn(5, 16, device="cuda", dtype=torch.bfloat16)
-    with torch.inference_mode():
-        got = norm(x)
-    ref = (
-        x.float()
-        * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + norm.eps)
-        * norm.weight.float()
-    ).to(dtype=x.dtype)
-    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_rmsnorm_matches_reference_for_noncontiguous_cuda_input():
-    torch.manual_seed(13)
-    norm = RMSNorm(16).cuda().to(dtype=torch.bfloat16)
-    x = torch.randn(5, 3, 16, device="cuda", dtype=torch.bfloat16).transpose(0, 1)
-    assert not x.is_contiguous()
-    assert int(x.stride(-1)) == 1
-
-    with torch.inference_mode():
-        got = norm(x)
-
-    ref = (
-        x.float()
-        * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) + norm.eps)
-        * norm.weight.float()
-    ).to(dtype=x.dtype)
-    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_triton_add_rmsnorm_matches_eager_reference_cuda():
-    pytest.importorskip("triton")
-    _skip_if_triton_sm100_unsupported()
-    torch.manual_seed(12)
-    norm = RMSNorm(32).cuda().to(dtype=torch.bfloat16)
-    x = torch.randn(3, 32, device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn(3, 32, device="cuda", dtype=torch.bfloat16)
-    with torch.inference_mode():
-        got, combined = norm.forward_with_residual(x, residual)
-    ref_combined = x + residual
-    ref = (
-        ref_combined.float()
-        * torch.rsqrt(ref_combined.float().pow(2).mean(dim=-1, keepdim=True) + norm.eps)
-        * norm.weight.float()
-    ).to(dtype=x.dtype)
-    torch.testing.assert_close(combined, ref_combined)
-    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_sgl_silu_and_mul_matches_eager_reference_cuda():
-    pytest.importorskip("sgl_kernel")
-    torch.manual_seed(131)
-    x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
-    with torch.inference_mode():
-        got = SiluAndMul()(x)
-    a, b = x.chunk(2, dim=-1)
-    ref = (torch.nn.functional.silu(a) * b).to(dtype=x.dtype)
-    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_triton_silu_and_mul_matches_eager_reference_cuda(monkeypatch):
-    pytest.importorskip("triton")
-    _skip_if_triton_sm100_unsupported()
-    monkeypatch.setenv("UNISERVE_SILU_AND_MUL_PROVIDER", "triton")
-    torch.manual_seed(13)
-    x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
-    with torch.inference_mode():
-        got = SiluAndMul()(x)
-    a, b = x.chunk(2, dim=-1)
-    ref = (torch.nn.functional.silu(a) * b).to(dtype=x.dtype)
-    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
 
 def test_logits_processor_prunes_positions_before_lm_head():

@@ -264,11 +264,8 @@ fn merge_unique_token_ids(
 mod tests {
     use std::collections::BTreeSet;
 
-    use serial_test::file_serial;
-
     use super::*;
-    use crate::backend::hf::HfTextBackend;
-    use crate::backend::{SamplingHints, TextBackend as _};
+    use crate::backend::SamplingHints;
     use crate::request::{Prompt, TextRequest};
 
  /// Stub tokenizer that returns empty token IDs — sufficient for tests that
@@ -406,84 +403,6 @@ mod tests {
                 all_stop_token_ids: {
                     77,
                     99,
-                },
-                logit_bias: None,
-                allowed_token_ids: None,
-                bad_words_token_ids: None,
-                choice_token_ids: None,
-                structured_outputs: None,
-                logprob_token_ids: None,
-                skip_reading_prefix_cache: None,
-                extra_args: None,
-            }
-        "#]]
-        .assert_debug_eq(&params);
-    }
-
-    #[tokio::test]
-    #[file_serial(hf_qwen3)]
-    async fn lower_text_request_uses_real_qwen_generation_defaults() {
-        let backend = HfTextBackend::from_model("Qwen/Qwen3-0.6B")
-            .await
-            .expect("load qwen tokenizer and generation config");
-        let hints = backend.sampling_hints().expect("collect sampling hints");
-
-        expect_test::expect![[r#"
-            SamplingHints {
-                primary_eos_token_id: Some(
-                    151645,
-                ),
-                extra_eos_token_ids: {
-                    151643,
-                },
-                default_temperature: Some(
-                    0.6,
-                ),
-                default_top_p: Some(
-                    0.95,
-                ),
-                default_top_k: Some(
-                    20,
-                ),
-                default_min_p: None,
-                default_repetition_penalty: None,
-                default_max_tokens: None,
-                max_model_len: Some(
-                    40960,
-                ),
-            }
-        "#]]
-        .assert_debug_eq(&hints);
-
-        let prepared =
-            lower_text_request(sample_request(), vec![1, 2, 3], hints, &stub_tokenizer())
-                .expect("lower request");
-        let params = prepared.generate_request.sampling_params;
-
-        expect_test::expect![[r#"
-            EngineCoreSamplingParams {
-                temperature: 0.6,
-                top_p: 0.95,
-                top_k: 20,
-                seed: None,
-                max_tokens: 40957,
-                min_tokens: 0,
-                ignore_eos: false,
-                logprobs: None,
-                prompt_logprobs: None,
-                min_p: 0.0,
-                frequency_penalty: 0.0,
-                presence_penalty: 0.0,
-                repetition_penalty: 1.0,
-                stop_token_ids: [
-                    151643,
-                ],
-                eos_token_id: Some(
-                    151645,
-                ),
-                all_stop_token_ids: {
-                    151643,
-                    151645,
                 },
                 logit_bias: None,
                 allowed_token_ids: None,

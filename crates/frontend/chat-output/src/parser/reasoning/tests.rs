@@ -3,6 +3,7 @@ use std::sync::Arc;
 use uniserve_tokenizer::Tokenizer;
 
 use super::{ReasoningParserFactory, names};
+use crate::Error;
 
 struct FakeTokenizer;
 
@@ -62,4 +63,52 @@ fn factory_rejects_unknown_parser_names() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("choose from"));
+}
+
+#[test]
+fn unknown_reasoning_parser_error_names_rejected_parser_and_lists_available() {
+ // Mirrors the tool-side contract: rejecting an unknown explicit reasoning
+ // parser name yields a ParserUnavailableByName error tagged with the
+ // "reasoning" kind, carrying the rejected name and the available parser
+ // names. We assert the variant plus a couple of stable built-in names
+ // instead of snapshotting the whole registry list.
+    let tokenizer = Arc::new(FakeTokenizer);
+    let factory = ReasoningParserFactory::new();
+    let error = match factory.create("nope-not-a-parser", tokenizer) {
+        Ok(_) => panic!("expected parser lookup to fail"),
+        Err(error) => error,
+    };
+
+    let Error::ParserUnavailableByName {
+        kind,
+        name,
+        available_names,
+    } = &error
+    else {
+        panic!("expected ParserUnavailableByName, got {error:?}");
+    };
+    assert_eq!(*kind, "reasoning");
+    assert_eq!(name, "nope-not-a-parser");
+    assert!(
+        available_names.iter().any(|n| n == names::QWEN3),
+        "available_names should include the qwen3 reasoning parser: {available_names:?}",
+    );
+    assert!(
+        available_names.iter().any(|n| n == names::DEEPSEEK_R1),
+        "available_names should include the deepseek_r1 reasoning parser: {available_names:?}",
+    );
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("nope-not-a-parser"),
+        "error message should name the rejected parser: {rendered}",
+    );
+    assert!(
+        rendered.contains("choose from"),
+        "error message should list available parsers: {rendered}",
+    );
+    assert!(
+        rendered.contains(names::QWEN3),
+        "error message should mention a stable available parser: {rendered}",
+    );
 }

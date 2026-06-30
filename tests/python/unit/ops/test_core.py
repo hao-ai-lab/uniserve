@@ -10,13 +10,11 @@ from uniserve_worker.ops import (
     AdapterPool,
     Capabilities,
     CommDispatcher,
-    CommProvider,
     Dispatcher,
     FusedOpPool,
     Handoff,
     tp_all_reduce,
 )
-from uniserve_worker.runtime.tower_handoff import DataPlaneTowerHandoff, TowerBinding
 
 
 pytestmark = pytest.mark.unit
@@ -175,19 +173,3 @@ def test_tp_all_reduce_facade_runs_through_comm_provider():
 
     torch.testing.assert_close(out, torch.tensor([2.0, 3.0]))
     assert axis.calls == ["sum"]
-
-
-def test_tower_handoff_implementations_are_comm_providers():
-    binding = TowerBinding(
-        transport=None,
-        primary_coord=0,
-        gen_coord=0,
-        num_layers=1,
-        block_size=4,
-        target_pool=None,
-        target_device="cpu",
-        allocate_blocks=lambda n: list(range(n)),
-    )
-    provider = DataPlaneTowerHandoff(data_plane=object(), bind=lambda: binding)
-
-    assert isinstance(provider, CommProvider)

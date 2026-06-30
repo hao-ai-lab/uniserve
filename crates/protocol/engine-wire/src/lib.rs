@@ -691,14 +691,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_msgpack_includes_type_name_and_value_fallback() {
-        let bytes = encode_msgpack(&BTreeMap::from([("status", "READY")])).unwrap();
-        let error = decode_msgpack::<u64>(&bytes).unwrap_err();
-
-        expect_test::expect![[r#"messagepack decode failed for u64: wrong msgpack marker FixMap(1); value fallback: {"status": "READY"}"#]].assert_eq(&error.to_report_string());
-    }
-
  /// The request-type byte derives from the `#[repr(u8)]` discriminant, so
  /// the type frame matches the pre-enum constants exactly.
     #[test]
@@ -807,5 +799,42 @@ mod tests {
     #[test]
     fn control_request_unknown_type_frame_is_none() {
         assert!(EngineCoreControlRequest::decode_frames(b"\x09", b"").is_none());
+    }
+
+ /// Decoding a payload whose msgpack marker does not match the target type
+ /// produces a structured `Error::Decode` naming the target type, with the
+ /// original value preserved as a fallback in the message.
+    #[test]
+    fn decode_msgpack_wrong_marker_reports_target_type_and_value_fallback() {
+ // A bare msgpack string where an `EngineCoreOutputs` array/struct is
+ // expected: the marker is wrong for the target type.
+        let payload = encode_msgpack(&"not an outputs struct".to_string()).unwrap();
+
+        let error = decode_msgpack::<EngineCoreOutputs>(&payload).unwrap_err();
+
+        match error {
+            Error::Decode {
+                target_type,
+                message,
+            } => {
+ // The target type is named (the &'static type_name path), not a
+ // generic "decode failed".
+                assert!(
+                    target_type.contains("EngineCoreOutputs"),
+                    "target_type should name EngineCoreOutputs, got {target_type:?}"
+                );
+ // The original value is preserved as a decodable fallback rather
+ // than discarded.
+                assert!(
+                    message.contains("value fallback"),
+                    "message should carry the value fallback, got {message:?}"
+                );
+                assert!(
+                    message.contains("not an outputs struct"),
+                    "message should preserve the original value, got {message:?}"
+                );
+            }
+            other => panic!("expected Error::Decode, got {other:?}"),
+        }
     }
 }

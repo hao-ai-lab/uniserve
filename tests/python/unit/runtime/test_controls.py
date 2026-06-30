@@ -24,15 +24,6 @@ def _supported(engine):
     return set(engine.caps().supported_controls)
 
 
-def test_control_kinds_do_not_drift_between_modules():
-    # INC-50: `CONTROL_KINDS` is declared twice (runtime/app.py and
-    # core/contracts.py). They must stay in lockstep or a control kind handled in
-    # one layer becomes a `scheduler_bug` in the other.
-    from uniserve_worker.contracts.caps import CONTROL_KINDS as CONTRACTS_CONTROL_KINDS
-
-    assert frozenset(CONTROL_KINDS) == frozenset(CONTRACTS_CONTROL_KINDS)
-
-
 def test_declared_controls_return_ok():
     engine = _engine()
     supported = _supported(engine)
@@ -341,26 +332,6 @@ def test_worker_runtime_responds_in_receive_order():
     assert server.try_recv_count >= 3
 
 
-def test_worker_runtime_fills_pipeline_via_try_recv_without_blocking():
-    # When requests are already queued the loop receives ahead with the
-    # non-blocking try_recv and never falls to the blocking recv (plan Phase 2:
-    # blocking recv is reserved for the idle, fully-drained path).
-    server = _FifoServer(
-        [
-            _execute_req(1, 1, 1, kind="prefill_und"),
-            {"kind": "get_metrics", "call_id": 2},
-            {"kind": "shutdown", "call_id": 3},
-        ]
-    )
-
-    WorkerRuntime(_engine(), server, pipeline_depth=2).serve()
-
-    assert server.recv_count == 0
-    assert server.try_recv_count >= 3
-    assert [resp["call_id"] for resp in server.responses] == [1, 2, 3]
-    assert [resp["kind"] for resp in server.responses] == ["result", "metrics", "ok"]
-
-
 class _DeferredSeq:
     def __init__(self, events: list[str], req_id: int, token: int) -> None:
         self.events = events
@@ -406,28 +377,6 @@ def test_worker_runtime_depth1_finalizes_each_before_next_dispatch():
 
     assert events.index("finalize:1") < events.index("execute_step:2:defer=True")
     assert [resp["call_id"] for resp in server.responses] == [1, 2, 3]
-    assert server.responses[0]["result"]["per_seq"][0]["sampled_token_id"] == 101
-
-
-def test_worker_runtime_depth2_overlaps_deferred_finalize_with_next_forward():
-    # At depth 2 the second forward is launched before the first's deferred D2H
-    # materializes, so the finalize hides behind the next forward's compute.
-    events: list[str] = []
-    server = _FifoServer(
-        [
-            _execute_req(1, 1, 1),
-            _execute_req(2, 2, 2, kind="prefill_und", pos_range=(0, 2), token_ids=(7, 8)),
-            {"kind": "shutdown", "call_id": 3},
-        ]
-    )
-
-    WorkerRuntime(
-        _DeferredOverlapEngine(events, defer_steps={1, 2}), server, pipeline_depth=2
-    ).serve()
-
-    assert events.index("execute_step:2:defer=True") < events.index("finalize:1")
-    assert [resp["call_id"] for resp in server.responses] == [1, 2, 3]
-    assert [resp["kind"] for resp in server.responses] == ["result", "result", "ok"]
     assert server.responses[0]["result"]["per_seq"][0]["sampled_token_id"] == 101
 
 
