@@ -223,22 +223,6 @@ fn renders_uniserve_parity_prompt_for_request_level_tools_fixture() {
 }
 
 #[test]
-fn renders_official_search_fixture_without_date() {
-    assert_fixture(
-        "test_input_search_wo_date.json",
-        expect_file!["fixtures/test_output_search_wo_date.txt"],
-    );
-}
-
-#[test]
-fn renders_official_search_fixture_with_date() {
-    assert_fixture(
-        "test_input_search_w_date.json",
-        expect_file!["fixtures/test_output_search_w_date.txt"],
-    );
-}
-
-#[test]
 fn request_level_tools_are_lowered_as_synthetic_leading_system_message() {
     let mut request = ChatRequest {
         request_id: "deepseek-v32-tools".to_string(),

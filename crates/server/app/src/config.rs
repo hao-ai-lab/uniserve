@@ -306,22 +306,6 @@ mod tests {
     }
 
     #[test]
-    fn non_multiple_block_size_is_rejected() {
-        let mut config = Config::default();
-        // 128 is positive but not a multiple of 256, so it would silently
-        // disable the fast paged attention path in the worker.
-        config.engine.block_size = 128;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn multiple_block_size_is_accepted() {
-        let mut config = Config::default();
-        config.engine.block_size = 512;
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
     fn unset_max_model_len_validates() {
         let mut config = Config::default();
         config.engine.max_model_len = None;

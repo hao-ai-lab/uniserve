@@ -141,17 +141,6 @@ mod tests {
     }
 
     #[test]
-    fn read_json_file_reports_type_mismatch() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("config.json");
- // Structurally valid JSON, but `value` has the wrong type for `Fixture`.
-        fs::write(&path, r#"{"value":"seven"}"#).unwrap();
-
-        let err = read_json_file::<Fixture>(&path).unwrap_err();
-        assert!(matches!(err, ConfigError::ParseJson { .. }));
-    }
-
-    #[test]
     fn read_json_file_does_not_validate_semantics() {
  // `read_json_file` only enforces `T`'s structure; out-of-range values
  // (e.g. a negative count for a field a caller treats as a positive

@@ -5,6 +5,8 @@ import importlib
 
 import pytest
 
+from uniserve_worker.contracts.op_kinds import OP_KINDS
+
 # All model runtime classes by short name. Class-level introspection
 # (supported_ops / supported_controls / adapter_mode / resource_plan) needs no
 # GPU; full instantiation (model load) does and is exercised in the e2e GPU run.
@@ -14,16 +16,10 @@ BACKEND_CLASSES: dict[str, tuple[str, str]] = {
     "bagel": ("uniserve_worker.models.bagel", "BagelForUnifiedGeneration"),
 }
 
-KNOWN_OP_KINDS = {
-    "prefill_und",
-    "decode_und",
-    "target_verify_und",
-    "denoise_gen",
-    "commit_gen",
-    "vit_encode",
-    "vae_encode",
-    "vae_decode",
-}
+# Sourced from the canonical contract vocabulary so a model declaring a real op
+# (e.g. commit_writeback) is never reported as "unknown" by a stale local copy,
+# and so this set can never drift from op_kinds.py.
+KNOWN_OP_KINDS = frozenset(OP_KINDS)
 KNOWN_CONTROLS = {
     "copy_blocks", "load_lora", "unload_lora", "free_encoder",
     "reset_prefix_cache", "sleep", "wake_up",

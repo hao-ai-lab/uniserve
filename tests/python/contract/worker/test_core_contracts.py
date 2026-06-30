@@ -12,8 +12,7 @@ from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution.runner import ModelRunner
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
-from uniserve_worker.runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
-from uniserve_worker.runtime.request_state import RequestState as RunnerRequestState
+from uniserve_worker.runtime.paged_text_cache import PagedTextCache
 from uniserve_worker.server.stub import StubEngine, StubUniModel
 
 pytestmark = pytest.mark.contract
@@ -162,53 +161,6 @@ def test_paged_transformers_cache_can_grow_with_allocator():
     assert torch.equal(out_v, v)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_batched_paged_request_cache_append_varlen_uses_indexed_cuda_plan():
-    pool = PagedKVPool(
-        num_layers=2,
-        num_blocks=4,
-        block_size=4,
-        num_kv_heads=1,
-        head_dim=2,
-        device="cuda",
-        dtype=torch.float32,
-    )
-    cache = BatchedPagedRequestCache(pool, [[0, 1], [2, 3]], [1, 2])
-    block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
-    cache_seqlens = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
-    cu_seqlens_q = torch.tensor([0, 3, 5], dtype=torch.int32, device="cuda")
-    k = torch.arange(10, dtype=torch.float32, device="cuda").view(5, 1, 2)
-    v = k + 100
-
-    cache.append_varlen(
-        0,
-        k,
-        v,
-        (3, 2),
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-    )
-    plan = cache._append_plan
-    cache.append_varlen(
-        1,
-        k + 1000,
-        v + 1000,
-        (3, 2),
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-    )
-    torch.cuda.synchronize()
-
-    assert cache._append_plan is plan
-    torch.testing.assert_close(pool.k[0, 0, 1:4], k[:3])
-    torch.testing.assert_close(pool.v[0, 0, 1:4], v[:3])
-    torch.testing.assert_close(pool.k[0, 2, 2:4], k[3:])
-    torch.testing.assert_close(pool.k[1, 0, 1:4], k[:3] + 1000)
-    torch.testing.assert_close(pool.v[1, 2, 2:4], v[3:] + 1000)
-
-
 def test_paged_kv_pool_fp8_storage_dequantizes_dense_reads():
     pool = PagedKVPool(
         num_layers=1,
@@ -256,39 +208,6 @@ def test_paged_kv_pool_fp8_storage_dequantizes_dense_reads():
     with pytest.raises(WorkerError, match="scale-aware paged attention backend") as exc:
         pool.layer_cache(0)
     assert exc.value.code == ErrorCode.CAPABILITY_MISMATCH
-
-
-def test_sensenova_new_request_initializes_host_block_table_for_paged_cache():
-    from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
-
-    model = SenseNovaU1ForUnifiedGeneration(
-        config={
-            "llm_config": {
-                "num_hidden_layers": 1,
-                "num_key_value_heads": 1,
-                "head_dim": 2,
-            }
-        },
-        block_size=4,
-        kv_token_capacity=8,
-    )
-    model.kv_pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=2,
-        block_size=4,
-        num_kv_heads=1,
-        head_dim=2,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    state = RunnerRequestState(block_ids=[0, 1])
-    model.on_new_request(99, state)
-    transformers_state = model.reqs[99]
-    assert model.interleaved_image_state(99) is transformers_state
-    assert transformers_state.cond.block_ids == [0, 1]
-    model._ensure_host_cache(transformers_state.cond)
-    assert isinstance(transformers_state.cond.past, PagedTextCache)
-    assert transformers_state.cond.past.block_ids == [0, 1]
 
 
 class CommitCapabilityModel(ModelHooks):

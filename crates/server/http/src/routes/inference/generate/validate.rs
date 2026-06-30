@@ -95,4 +95,55 @@ mod tests {
         };
         assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
     }
+
+    #[test]
+    fn validate_request_compat_rejects_zero_max_tokens() {
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "sampling_params": {"max_tokens": 0}
+        }))
+        .expect("parse request");
+        let error = validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect_err("max_tokens == 0 must be rejected");
+        assert_eq!(error.to_error_response().error.param.as_deref(), Some("sampling_params"));
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_one_max_tokens() {
+        // Boundary just above the rejected zero value.
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "sampling_params": {"max_tokens": 1}
+        }))
+        .expect("parse request");
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_out_of_range_prompt_logprobs() {
+        // Any negative value other than the -1 full-vocabulary sentinel is invalid.
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "sampling_params": {"prompt_logprobs": -2}
+        }))
+        .expect("parse request");
+        let error = validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect_err("prompt_logprobs == -2 must be rejected");
+        assert_eq!(error.to_error_response().error.param.as_deref(), Some("sampling_params"));
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_minus_one_prompt_logprobs() {
+        // -1 is the full-vocabulary sentinel and sits at the boundary of the valid range.
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "token_ids": [11, 22],
+            "sampling_params": {"prompt_logprobs": -1}
+        }))
+        .expect("parse request");
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok());
+    }
 }

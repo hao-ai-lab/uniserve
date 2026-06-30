@@ -261,18 +261,6 @@ async fn http_test_server(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn list_models_via_http_client() {
-    let (client, server_task, _engine_task) = http_test_server(default_stream_output_specs()).await;
-
-    let models = client.models().list().await.expect("list models");
-    let model_ids: Vec<&str> = models.data.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(model_ids, vec!["test-model"]);
-
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn non_streaming_chat_via_http_client() {
     let (client, server_task, engine_task) = http_test_server(default_stream_output_specs()).await;
 

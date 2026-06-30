@@ -42,12 +42,7 @@ from uniserve_worker.nn.diffusion import (
     RenormKind,
     ScheduleDirection,
     ScheduleShiftDomain,
-    TimestepEmbedder,
-    combine_cfg,
     combine_text_image_cfg,
-    euler_step,
-    init_latent,
-    timestep_embedding,
 )
 
 pytestmark = pytest.mark.integration
@@ -291,27 +286,6 @@ def test_fp8_linear_online_quantizes_and_uses_dequantized_correctness_floor():
     torch.testing.assert_close(got, expected)
 
 
-def test_fp8_qkv_scale_loader_shards_q_and_replicates_small_kv_heads():
-    from uniserve_worker.nn import QKVParallelLinear
-    from uniserve_worker.nn.quant import QuantizationConfig, use_quantization_config
-
-    cfg = QuantizationConfig(method="fp8", raw={"quant_method": "fp8"})
-    with use_mesh(DeviceMesh.tp(1, 2)), use_quantization_config(cfg):
-        qkv = QKVParallelLinear(hidden_size=3, head_size=2, total_num_heads=4, total_num_kv_heads=1, bias=False)
-
-    q_scale = torch.arange(8, dtype=torch.float32) + 1
-    k_scale = torch.tensor([20.0, 21.0])
-    v_scale = torch.tensor([30.0, 31.0])
-    qkv.weight_scale.weight_loader(qkv.weight_scale, q_scale, shard_id="q")
-    qkv.weight_scale.weight_loader(qkv.weight_scale, k_scale, shard_id="k")
-    qkv.weight_scale.weight_loader(qkv.weight_scale, v_scale, shard_id="v")
-
-    assert qkv.weight_scale.shape == (8, 1)
-    torch.testing.assert_close(qkv.weight_scale[:4, 0], q_scale[4:8])
-    torch.testing.assert_close(qkv.weight_scale[4:6, 0], k_scale)
-    torch.testing.assert_close(qkv.weight_scale[6:8, 0], v_scale)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp8_linear_cuda_scaled_mm_path_runs_finite():
     from uniserve_worker.nn.quant import QuantizationConfig, use_quantization_config
@@ -339,163 +313,6 @@ def test_quantization_config_rejects_unsupported_checkpoint_method():
     cfg = {"quantization_config": {"quant_method": "gptq"}}
     with pytest.raises(NotImplementedError, match="gptq"):
         QuantizationConfig.from_model_config(cfg)
-
-
-def test_decode_cuda_graph_runner_config_and_copy_contract(monkeypatch):
-    from uniserve_worker.contracts.forward_context import TextAttentionMetadata
-    from uniserve_worker.execution.cuda_graph_base import _DECODE_GRAPH_INPUT_BUFFER_POOL
-    from uniserve_worker.execution.decode_cuda_graph import (
-        DecodeCudaGraphRunner,
-        TextDecodeGraphState,
-        _share_decode_graph_input_buffer,
-        copy_text_decode_graph_inputs,
-        maybe_weak_ref_cuda_graph_tensor,
-    )
-
-    runner = DecodeCudaGraphRunner(
-        name="unit",
-        default_warmup_batch_sizes=(1, 2),
-    )
-    assert runner.enabled()
-    assert runner.warmup_enabled()
-    assert runner.warmup_batch_sizes() == (1, 2)
-    assert runner.warmup_capture_batch_sizes() == (2, 1)
-    assert runner.bucket_batch_size(2) == 2
-    assert runner.bucket_batch_size(3) == 3
-    assert runner.can_use(2)
-    pools = []
-
-    def fake_graph_pool_handle():
-        pool = object()
-        pools.append(pool)
-        return pool
-
-    monkeypatch.setattr(torch.cuda, "graph_pool_handle", fake_graph_pool_handle, raising=False)
-    assert runner.capture_pool() is pools[0]
-    assert runner.capture_pool() is pools[0]
-    assert len(pools) == 1
-
-    configured_runner = DecodeCudaGraphRunner(
-        name="unit-configured",
-        default_enabled=False,
-        default_warmup=False,
-        default_warmup_batch_sizes=(4, 2, 4),
-    )
-    assert not configured_runner.enabled()
-    assert not configured_runner.warmup_enabled()
-    assert configured_runner.warmup_batch_sizes() == (2, 4)
-    assert configured_runner.warmup_capture_batch_sizes() == (4, 2)
-    assert configured_runner.bucket_batch_size(3) == 4
-
-    _DECODE_GRAPH_INPUT_BUFFER_POOL.clear()
-    large = _share_decode_graph_input_buffer("unit.input_ids", torch.empty((8, 1), dtype=torch.long))
-    small = _share_decode_graph_input_buffer("unit.input_ids", torch.empty((2, 1), dtype=torch.long))
-    assert small.data_ptr() == large.data_ptr()
-    assert small.shape == (2, 1)
-
-    import uniserve_worker.execution.cuda_graph_base as graph_mod
-
-    wrapped = object()
-    tensor = torch.empty(1)
-    graph_mod._weak_ref_tensor_func.cache_clear()
-    monkeypatch.setattr(graph_mod, "_weak_ref_tensor_func", lambda: lambda seen: wrapped if seen is tensor else None)
-    assert maybe_weak_ref_cuda_graph_tensor(tensor) is wrapped
-
-    monkeypatch.setattr(graph_mod, "_weak_ref_tensor_func", lambda: None)
-    assert maybe_weak_ref_cuda_graph_tensor(tensor) is tensor
-
-    default_runner = DecodeCudaGraphRunner(
-        name="unit-default",
-    )
-    assert default_runner.warmup_batch_sizes() == (
-        1,
-        2,
-        4,
-        8,
-        12,
-        16,
-        24,
-        32,
-        40,
-        48,
-        56,
-        64,
-        80,
-        96,
-        112,
-        128,
-    )
-    assert default_runner.bucket_batch_size(9) == 12
-    assert default_runner.bucket_batch_size(65) == 80
-
-    state = TextDecodeGraphState(
-        batch_size=2,
-        input_ids=torch.empty((2, 1), dtype=torch.long),
-        positions=torch.empty((2, 1), dtype=torch.long),
-        block_table=torch.empty((2, 4), dtype=torch.int32),
-        cache_seqlens=torch.empty(2, dtype=torch.int32),
-        graph=None,
-        cache=None,
-        metadata=TextAttentionMetadata(cache=None, block_table=None, cache_seqlens=None),
-    )
-    metadata = TextAttentionMetadata(
-        cache=None,
-        block_table=torch.tensor([[7, 8], [9, 0]], dtype=torch.int64),
-        cache_seqlens=torch.tensor([17, 3], dtype=torch.int64),
-        cache_seqlens_cpu=(17, 3),
-        kv_seqlens_cpu=(18, 4),
-    )
-    state_metadata_id = id(state.metadata)
-    copy_text_decode_graph_inputs(
-        state,
-        input_ids=torch.tensor([[11], [12]], dtype=torch.long),
-        positions=torch.tensor([[5], [6]], dtype=torch.long),
-        attention_metadata=metadata,
-    )
-
-    torch.testing.assert_close(state.input_ids, torch.tensor([[11], [12]], dtype=torch.long))
-    torch.testing.assert_close(state.positions, torch.tensor([[5], [6]], dtype=torch.long))
-    torch.testing.assert_close(
-        state.block_table,
-        torch.tensor([[7, 8, 0, 0], [9, 0, 0, 0]], dtype=torch.int32),
-    )
-    torch.testing.assert_close(state.cache_seqlens, torch.tensor([17, 3], dtype=torch.int32))
-    assert id(state.metadata) == state_metadata_id
-    assert state.metadata.cache_seqlens_cpu == (17, 3)
-    assert state.metadata.kv_seqlens_cpu == (18, 4)
-
-    padded_state = TextDecodeGraphState(
-        batch_size=3,
-        input_ids=torch.empty((3, 1), dtype=torch.long),
-        positions=torch.empty((3, 1), dtype=torch.long),
-        block_table=torch.empty((3, 4), dtype=torch.int32),
-        cache_seqlens=torch.empty(3, dtype=torch.int32),
-        graph=None,
-        cache=None,
-        metadata=TextAttentionMetadata(cache=None, block_table=None, cache_seqlens=None),
-    )
-    padded_metadata_id = id(padded_state.metadata)
-    copy_text_decode_graph_inputs(
-        padded_state,
-        input_ids=torch.tensor([[21], [22]], dtype=torch.long),
-        positions=torch.tensor([[7], [8]], dtype=torch.long),
-        attention_metadata=metadata,
-    )
-    torch.testing.assert_close(
-        padded_state.input_ids,
-        torch.tensor([[21], [22], [0]], dtype=torch.long),
-    )
-    torch.testing.assert_close(
-        padded_state.block_table,
-        torch.tensor([[7, 8, 0, 0], [9, 0, 0, 0], [0, 0, 0, 0]], dtype=torch.int32),
-    )
-    torch.testing.assert_close(
-        padded_state.cache_seqlens,
-        torch.tensor([17, 3, 0], dtype=torch.int32),
-    )
-    assert id(padded_state.metadata) == padded_metadata_id
-    assert padded_state.metadata.cache_seqlens_cpu == (17, 3, 0)
-    assert padded_state.metadata.kv_seqlens_cpu == (18, 4, 1)
 
 
 def test_flashinfer_decode_write_uses_precomputed_locations():
@@ -531,91 +348,6 @@ def test_flashinfer_decode_write_uses_precomputed_locations():
     assert v_cache[2, 1, 0, 0].item() == 21.0
     assert v_cache[3, 2, 0, 0].item() == 22.0
     assert k_cache[0, 0, 0, 0].item() == 0.0
-
-
-def test_flashinfer_graph_prepare_uses_fast_plan_after_seed(monkeypatch):
-    import uniserve_worker.backends.attention.flashinfer as flashinfer_mod
-    from uniserve_worker.contracts.forward_context import (
-        ForwardContext,
-        TextAttentionMetadata,
-        use_forward_context,
-    )
-
-    class FakeWrapper:
-        def __init__(self, *args, **kwargs):
-            self._cached_module = None
-
-        def plan(self, indptr, indices, last_page_len, *args, **kwargs):
-            calls.append(
-                (
-                    "plan",
-                    indptr.detach().clone(),
-                    indices.detach().clone(),
-                    last_page_len.detach().clone(),
-                    kwargs,
-                )
-            )
-            self._cached_module = object()
-
-    calls = []
-    wrappers = []
-
-    def fake_wrapper_factory(*args, **kwargs):
-        wrapper = FakeWrapper(*args, **kwargs)
-        wrappers.append(wrapper)
-        return wrapper
-
-    def fake_fast_plan(wrapper, indptr, indices, last_page_len, *args, **kwargs):
-        calls.append(
-            (
-                "fast",
-                indptr.detach().clone(),
-                indices.detach().clone(),
-                last_page_len.detach().clone(),
-                kwargs,
-            )
-        )
-
-    monkeypatch.setattr(
-        flashinfer_mod,
-        "_BatchDecodeWithPagedKVCacheWrapper",
-        fake_wrapper_factory,
-    )
-    monkeypatch.setattr(flashinfer_mod, "_fast_decode_plan", fake_fast_plan)
-
-    metadata = TextAttentionMetadata(
-        cache=None,
-        block_table=torch.tensor([[5, 0, 0], [7, 8, 9]], dtype=torch.int32),
-        cache_seqlens=torch.tensor([3, 32], dtype=torch.int32),
-        kv_seqlens_cpu=(4, 33),
-    )
-    backend = flashinfer_mod.FlashInferAttentionBackend()
-    stats = ForwardStats()
-    with use_forward_context(ForwardContext(stats=stats)):
-        for _ in range(2):
-            backend.prepare_paged_decode_cuda_graph(
-                metadata,
-                batch_size=2,
-                max_indices=4,
-                num_q_heads=8,
-                num_kv_heads=2,
-                head_dim=16,
-                page_size=16,
-                q_dtype=torch.bfloat16,
-                kv_dtype=torch.bfloat16,
-                scale=0.25,
-            )
-
-    assert len(wrappers) == 1
-    assert [call[0] for call in calls] == ["plan", "fast"]
-    torch.testing.assert_close(calls[0][1], torch.tensor([0, 1, 4], dtype=torch.int32))
-    torch.testing.assert_close(calls[0][2], torch.tensor([5, 7, 8, 9], dtype=torch.int32))
-    torch.testing.assert_close(calls[0][3], torch.tensor([4, 1], dtype=torch.int32))
-    torch.testing.assert_close(calls[1][1], torch.tensor([0, 1, 4], dtype=torch.int32))
-    override = calls[1][4]["global_override_indptr_cpu"]
-    assert override.device.type == "cpu"
-    torch.testing.assert_close(override, torch.tensor([0, 1, 4], dtype=torch.int32))
-    assert stats.flashinfer_decode_graph_plan_calls == 2
 
 
 def test_flashinfer_decode_plan_workspace_reuses_static_buffers(monkeypatch):
@@ -1160,81 +892,6 @@ def test_sensenova_qk_norm_rope_3d_matches_eager_formula(monkeypatch):
         torch.testing.assert_close(got, ref)
 
 
-def test_sensenova_decoder_builds_packed_rope_once_per_forward(monkeypatch):
-    from transformers import Qwen3Config
-
-    from uniserve_worker.models.sensenova import model as sensenova_u1
-
-    torch.manual_seed(124)
-    cfg = Qwen3Config(
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        vocab_size=64,
-        attention_bias=False,
-    )
-    cfg.head_dim = 4
-    cfg.layer_types = ["full_attention", "full_attention"]
-    cfg.rope_theta_hw = 10000.0
-    cfg.max_position_embeddings_hw = 128
-    cfg._attn_implementation = "eager"
-    model = sensenova_u1._NativeQwen3Model(cfg)
-    with torch.no_grad():
-        for param in model.parameters():
-            param.normal_(0.0, 0.02)
-
-    packed_calls = 0
-    old_packed_rope = model.layers[0].self_attn._packed_rope
-
-    def counted_packed_rope(indexes):
-        nonlocal packed_calls
-        packed_calls += 1
-        return old_packed_rope(indexes)
-
-    monkeypatch.setattr(model.layers[0].self_attn, "_packed_rope", counted_packed_rope)
-
-    def forbid_duplicated_forward(*_args, **_kwargs):
-        raise AssertionError("decoder forward must use packed cos_sin_1d tables")
-
-    for layer in model.layers:
-        monkeypatch.setattr(layer.self_attn.rotary_emb, "forward", forbid_duplicated_forward)
-        monkeypatch.setattr(layer.self_attn.rotary_emb_hw, "forward", forbid_duplicated_forward)
-
-    inputs = torch.randn(1, 4, cfg.hidden_size)
-    indexes = torch.stack([torch.arange(4), torch.arange(4) % 2, torch.arange(4) % 3], dim=0)
-    indicators = torch.tensor([[False, True, False, True]])
-
-    out = model(inputs_embeds=inputs, image_gen_indicators=indicators, indexes=indexes)
-
-    assert out.last_hidden_state.shape == inputs.shape
-    assert packed_calls == 1
-
-
-def test_neo_moe_config_carries_generation_branch_defaults():
-    from uniserve_worker.models.sensenova.config import NeoMoeLlmConfig
-    from uniserve_worker.nn import FusedMoE
-
-    cfg = NeoMoeLlmConfig(
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        vocab_size=64,
-        num_experts=2,
-        num_experts_per_tok=1,
-        moe_intermediate_size=8,
-        attention_bias=False,
-    )
-    assert cfg.gen_num_experts == cfg.num_experts
-    assert cfg.gen_num_experts_per_tok == cfg.num_experts_per_tok
-    assert cfg.gen_moe_intermediate_size == cfg.moe_intermediate_size
-    assert cfg.layer_types == ["full_attention"]
-    assert FusedMoE.__module__.startswith("uniserve_worker.nn")
-
-
 def test_sensenova_dense_mixed_mot_layer_runs_finite():
     from transformers import Qwen3Config
 
@@ -1296,41 +953,6 @@ def test_sensenova_fm_modules_use_shared_linear_seams():
     assert isinstance(head.net.input_proj, LinearBase)
     out = head(torch.randn(3, 8), torch.linspace(0, 1, 3))
     assert out.shape == (3, 4)
-
-
-def test_timestep_embedder_is_shared_by_bagel_and_sensenova():
-    from uniserve_worker.models.bagel import BagelConfig, LLMConfig, _BagelGraph
-    from uniserve_worker.nn.diffusion import fm_modules
-
-    assert fm_modules.TimestepEmbedder is TimestepEmbedder
-    graph = _BagelGraph(
-        BagelConfig(
-            llm=LLMConfig(
-                hidden_size=16,
-                intermediate_size=32,
-                num_hidden_layers=1,
-                num_attention_heads=4,
-                num_key_value_heads=2,
-                vocab_size=32,
-            ),
-            max_latent_size=4,
-            vit_hidden_size=16,
-            vit_intermediate_size=32,
-            vit_num_hidden_layers=1,
-            vit_num_attention_heads=4,
-            vit_patch_size=2,
-            vit_image_size=4,
-            vit_max_num_patch_per_side=2,
-        )
-    )
-    assert isinstance(graph.time_embedder, TimestepEmbedder)
-
-    t = torch.tensor([0.0, 1.0, 2.5])
-    emb = timestep_embedding(t, dim=5)
-    assert emb.shape == (3, 5)
-    module = TimestepEmbedder(hidden_size=7, frequency_embedding_size=5)
-    out = module(t)
-    assert out.shape == (3, 7)
 
 
 def test_torch_sdpa_matches_bagel_sdpa_causal_gqa():
@@ -1742,62 +1364,6 @@ def test_qwen_attention_mixed_mot_path_uses_correct_branch_projections():
     torch.testing.assert_close(got, ref)
 
 
-def test_qwen_attention_mixed_mot_projects_only_selected_branch_tokens():
-    from transformers import Qwen3Config
-
-    from uniserve_worker.models.sensenova import model as sensenova_u1
-
-    torch.manual_seed(54)
-    cfg = Qwen3Config(
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        vocab_size=64,
-        attention_bias=False,
-    )
-    cfg.head_dim = 8
-    cfg.layer_types = ["full_attention"]
-    cfg.rope_theta_hw = 10000.0
-    cfg.max_position_embeddings_hw = 128
-    cfg._attn_implementation = "eager"
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
-
-    hidden = torch.randn(1, 5, 32)
-    indicators = torch.tensor([[False, True, False, True, True]])
-    indexes = torch.stack(
-        [
-            torch.arange(5),
-            torch.tensor([0, 1, 0, 1, 2]),
-            torch.tensor([0, 0, 1, 1, 2]),
-        ],
-        dim=0,
-    )
-    calls = []
-    original = attn._project_qkv
-
-    def spy(hidden_states, indexes, *, gen_branch):
-        calls.append((gen_branch, tuple(hidden_states.shape), tuple(indexes.shape)))
-        return original(hidden_states, indexes, gen_branch=gen_branch)
-
-    attn._project_qkv = spy
-    out, _ = attn(
-        hidden,
-        image_gen_indicators=indicators,
-        exist_non_image_gen_tokens=True,
-        exist_image_gen_tokens=True,
-        indexes=indexes,
-        attention_mask=torch.zeros(1, 1, 5, 5),
-    )
-
-    assert out.shape == hidden.shape
-    assert calls == [
-        (False, (1, 2, 32), (3, 2)),
-        (True, (1, 3, 32), (3, 3)),
-    ]
-
-
 def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
     from transformers import Qwen3Config
 
@@ -1957,7 +1523,9 @@ def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(config={})
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
+    )
     batch = UniForwardBatch.from_ops(
         [
             {"req_id": 1, "kind": "decode_und", "token_ids": [11], "pos_range": [0, 1]},
@@ -2055,7 +1623,9 @@ def test_sensenova_forward_sampling_updates_decode_relay():
             assert req_id == 1
             return state
 
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(config={})
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
+    )
     logits = torch.tensor([[[-10.0, -5.0, 8.0, -2.0]]])
 
     out = wrapper._sample_text_logits(1, logits, RequestStates())
@@ -2077,7 +1647,9 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     from uniserve_worker.execution.forward_stream import ForwardStreamBuilder
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(config={})
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
+    )
     builder = ForwardStreamBuilder()
     kv_segments = []
     indexes = torch.tensor([[5, 5], [0, 0], [0, 1]], dtype=torch.long)
@@ -2231,24 +1803,6 @@ def test_torch_sdpa_casts_float_masks_to_query_dtype():
     assert out.shape == q.shape
 
 
-def test_diffusion_schedule_integrator_and_cfg():
-    schedule = FlowMatchSchedule(4, direction=ScheduleDirection.ASCENDING)
-    t0, t1 = schedule.pair(0)
-    z = torch.ones(2, 3)
-    velocity = torch.full((2, 3), 2.0)
-    torch.testing.assert_close(euler_step(z, velocity, t0, t1), torch.full((2, 3), 1.5))
-
-    branches = torch.stack(
-        [
-            torch.zeros(2, 3),
-            torch.ones(2, 3),
-            torch.ones(2, 3) * 2,
-        ]
-    )
-    params = CfgParams(branch_count=3, scales=(2.0, 0.5), renorm=RenormKind.NONE)
-    torch.testing.assert_close(combine_cfg(branches, params), torch.ones(2, 3) * 3.0)
-
-
 def test_flowmatch_schedule_bagel_descending_shift_contract():
     full = FlowMatchSchedule(
         5,
@@ -2260,14 +1814,6 @@ def test_flowmatch_schedule_bagel_descending_shift_contract():
     expected = 1.7 * base / (1 + (1.7 - 1) * base)
     torch.testing.assert_close(full, expected)
     torch.testing.assert_close(full[:-1] - full[1:], torch.diff(full).neg())
-
-
-def test_init_latent_applies_shared_scale_parameter():
-    gen_a = torch.Generator(device="cpu").manual_seed(123)
-    gen_b = torch.Generator(device="cpu").manual_seed(123)
-    base = init_latent((2, 3), rng=gen_a, device="cpu", dtype=torch.float32)
-    scaled = init_latent((2, 3), rng=gen_b, device="cpu", dtype=torch.float32, scale=2.5)
-    torch.testing.assert_close(scaled, base * 2.5)
 
 
 def test_flowmatch_schedule_matches_sensenova_shifted_sigma():

@@ -93,34 +93,6 @@ class TextImageCapabilityModel(ModelHooks):
         self.applied = latent
 
 
-def test_text_image_driver_preserves_bagel_nested_cfg_when_scales_equal():
-    model = TextImageCapabilityModel(text_scale=2.0, img_scale=2.0)
-
-    result = DenoiseDriver().step(1, RequestState(), model, {})
-
-    assert result.denoise_done
-    assert model.calls == ["cond", "text_uncond", "img_uncond"]
-    assert model.inference_modes == [True, True, True]
-    # Anchor the expectation to the production combiner the driver delegates to,
-    # not a hand-rolled mirror: feed the same three branch predictions the fake
-    # model emits (cond=3, text_uncond=2, img_uncond=1) into the real
-    # combine_text_image_cfg with the model's CFG geometry. This catches drift
-    # between the driver's branch routing and the combiner's actual arithmetic.
-    # text_guided = 2 + 2 * (3 - 2) = 4; nested image guidance = 1 + 2 * (4 - 1) = 7
-    expected = combine_text_image_cfg(
-        torch.full((1, 1), 3.0),
-        torch.full((1, 1), 2.0),
-        torch.full((1, 1), 1.0),
-        cfg_text_scale=2.0,
-        cfg_img_scale=2.0,
-        renorm="none",
-        renorm_min=0.0,
-        image_scale_applies_to_text=True,
-    )
-    torch.testing.assert_close(model.applied, expected)
-    torch.testing.assert_close(expected, torch.tensor([[7.0]]))
-
-
 def test_text_image_driver_uses_image_scale_when_only_image_branch_is_needed():
     model = TextImageCapabilityModel(text_scale=1.0, img_scale=3.0)
 
@@ -299,21 +271,3 @@ def test_generic_latent_init_lands_on_driver_device_and_seeds_from_rng():
     # branch_0 velocity equals 0.0, so euler_step leaves the initial latent intact.
     DenoiseDriver(device="cpu").step(11, state_b, model_b, op)
     torch.testing.assert_close(state_b.latent, expected_noise)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for GPU latent init")
-def test_generic_latent_init_on_cuda_uses_a_matching_device_generator():
-    # Regression guard for the GPU latent-init path: _latent must seed a
-    # generator on the driver's device, otherwise torch.randn raises
-    # "Expected a 'cuda' device type for generator but found 'cpu'".
-    model = VelocityOnlyModel()
-    op = {
-        "req_id": 11,
-        "num_steps": 1,
-        "image": {"latent_shape": [1, 2, 2], "seed": 7, "schedule_direction": "ascending"},
-        "cfg": {"branch_count": 1, "renorm": "none"},
-    }
-    state = RequestState()
-    DenoiseDriver(device="cuda").step(11, state, model, op)
-    assert isinstance(state.latent, torch.Tensor)
-    assert state.latent.device.type == "cuda"

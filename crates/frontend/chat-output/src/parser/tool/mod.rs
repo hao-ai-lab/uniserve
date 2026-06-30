@@ -209,4 +209,87 @@ mod cross_registry_tests {
             );
         }
     }
+
+    #[test]
+    fn deepseek_tool_vs_reasoning_routing_divergence_is_pinned() {
+ // DeepSeek routing is intentionally divergent between the two
+ // hand-maintained tables. The tool table carries dedicated
+ // `deepseek-v3.1`/`deepseek-v3.2` parsers and routes `deepseek-r1` to the
+ // V3 *tool* parser, while the reasoning table keeps a distinct
+ // `deepseek_r1` reasoning parser and has no V3.1/V3.2 specialization (both
+ // collapse onto the shared `deepseek_v3` reasoning parser). Pin both sides
+ // so reordering or specializing one table without the other surfaces here.
+        let tool = ToolParserFactory::new();
+        let reasoning = ReasoningParserFactory::new();
+
+ // R1 diverges: tool routes to the V3 tool parser, reasoning to its own R1.
+        assert_eq!(
+            tool.resolve_name_for_model("deepseek-ai/DeepSeek-R1-0528"),
+            Some(names::DEEPSEEK_V3),
+            "deepseek-r1 tool routing changed",
+        );
+        assert_eq!(
+            reasoning.resolve_name_for_model("deepseek-ai/DeepSeek-R1-0528"),
+            Some(reasoning_names::DEEPSEEK_R1),
+            "deepseek-r1 reasoning routing changed",
+        );
+
+ // V3.1 / V3.2 diverge: tool has dedicated parsers, reasoning collapses to V3.
+        assert_eq!(
+            tool.resolve_name_for_model("deepseek-ai/DeepSeek-V3.1"),
+            Some(names::DEEPSEEK_V31),
+            "deepseek-v3.1 tool routing changed",
+        );
+        assert_eq!(
+            reasoning.resolve_name_for_model("deepseek-ai/DeepSeek-V3.1"),
+            Some(reasoning_names::DEEPSEEK_V3),
+            "deepseek-v3.1 reasoning routing changed",
+        );
+        assert_eq!(
+            tool.resolve_name_for_model("deepseek-ai/DeepSeek-V3.2-Exp"),
+            Some(names::DEEPSEEK_V32),
+            "deepseek-v3.2 tool routing changed",
+        );
+        assert_eq!(
+            reasoning.resolve_name_for_model("deepseek-ai/DeepSeek-V3.2-Exp"),
+            Some(reasoning_names::DEEPSEEK_V3),
+            "deepseek-v3.2 reasoning routing changed",
+        );
+
+ // V4 stays in sync: both tables route to their own deepseek_v4 entry.
+        assert_eq!(
+            tool.resolve_name_for_model("deepseek-ai/DeepSeek-V4"),
+            Some(names::DEEPSEEK_V4),
+            "deepseek-v4 tool routing changed",
+        );
+        assert_eq!(
+            reasoning.resolve_name_for_model("deepseek-ai/DeepSeek-V4"),
+            Some(reasoning_names::DEEPSEEK_V4),
+            "deepseek-v4 reasoning routing changed",
+        );
+    }
+
+    #[test]
+    fn internlm_tool_routing_has_no_reasoning_counterpart() {
+ // InternLM2 has a dedicated tool parser pattern but the reasoning table
+ // carries no InternLM pattern at all, so a versioned InternLM2 model that
+ // resolves on the tool side resolves to nothing on the reasoning side.
+ // Pin this asymmetry so adding/removing an InternLM reasoning pattern is a
+ // deliberate, visible change.
+        let tool = ToolParserFactory::new();
+        let reasoning = ReasoningParserFactory::new();
+
+        for model_id in ["internlm/internlm2-chat-7b", "internlm/internlm2_5-7b-chat"] {
+            assert_eq!(
+                tool.resolve_name_for_model(model_id),
+                Some(names::INTERNLM),
+                "internlm2 tool routing changed",
+            );
+            assert_eq!(
+                reasoning.resolve_name_for_model(model_id),
+                None,
+                "internlm2 unexpectedly gained a reasoning pattern",
+            );
+        }
+    }
 }

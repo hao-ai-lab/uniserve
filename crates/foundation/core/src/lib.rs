@@ -464,16 +464,62 @@ mod tests {
         assert!(ImageParams::default().validate().is_ok());
     }
 
+    // ----------------------------------------------------------------------
+    // now_unix_secs / now_unix_secs_u64 share one panic-free epoch source. The
+    // production functions read the wall clock, which is not injectable, so the
+    // exact conversion invariants are tested as a pure `SystemTime -> (f64, u64)`
+    // mapping with an injectable instant that mirrors the production expression
+    // (`duration_since(UNIX_EPOCH).unwrap_or_default()` then `.as_secs_f64()` /
+    // `.as_secs()`). The real functions get a lighter panic-free smoke check.
+    // ----------------------------------------------------------------------
+
+    /// Pure mirror of the two helpers with the clock injected as a `SystemTime`.
+    /// Returns `(fractional_secs, whole_secs)`; pre-epoch instants clamp to zero
+    /// exactly as `unwrap_or_default()` does in production.
+    fn epoch_conversion(clock: SystemTime) -> (f64, u64) {
+        let d = clock.duration_since(UNIX_EPOCH).unwrap_or_default();
+        (d.as_secs_f64(), d.as_secs())
+    }
+
     #[test]
-    fn now_unix_secs_helpers_agree() {
+    fn epoch_conversion_u64_is_floor_of_f64() {
+        // A fractional post-epoch instant: whole seconds equal floor of the
+        // fractional seconds.
+        let clock = UNIX_EPOCH + std::time::Duration::from_millis(1_234_750); // 1234.75s
+        let (frac, whole) = epoch_conversion(clock);
+        assert!((frac - 1234.75).abs() < 1e-6, "fractional secs preserved");
+        assert_eq!(whole, 1234, "whole secs == floor(fractional)");
+        assert_eq!(whole, frac.floor() as u64, "u64 helper == floor(f64 helper)");
+    }
+
+    #[test]
+    fn epoch_conversion_at_epoch_is_zero() {
+        let (frac, whole) = epoch_conversion(UNIX_EPOCH);
+        assert_eq!(frac, 0.0);
+        assert_eq!(whole, 0);
+    }
+
+    #[test]
+    fn epoch_conversion_clamps_pre_epoch_to_zero() {
+        // A clock set before the epoch makes `duration_since` error; the
+        // panic-free source clamps to a zero duration => 0.0 / 0, never panics.
+        let clock = UNIX_EPOCH - std::time::Duration::from_secs(5);
+        let (frac, whole) = epoch_conversion(clock);
+        assert_eq!(frac, 0.0, "pre-epoch clamps fractional to 0.0");
+        assert_eq!(whole, 0, "pre-epoch clamps whole to 0");
+    }
+
+    #[test]
+    fn real_clock_helpers_are_panic_free_and_non_negative() {
+        // Smoke check that both production helpers run without panicking on the
+        // live clock and return non-negative values from the shared source.
         let f = now_unix_secs();
         let u = now_unix_secs_u64();
-        assert!(f >= 0.0, "fractional epoch helper must be non-negative");
-        let floor = f as u64;
-        assert!(
-            u == floor || u == floor + 1 || u + 1 == floor,
-            "integer helper ({u}) must track the fractional helper floor ({floor})"
-        );
+        assert!(f.is_finite() && f >= 0.0, "fractional secs sane: {f}");
+        // u is u64 so inherently >= 0; assert it is in the same era as the float
+        // (within one second, allowing for the two separate clock reads).
+        let diff = (f.floor() as i128 - u as i128).abs();
+        assert!(diff <= 1, "integer and fractional helpers agree within 1s");
     }
 
     #[test]

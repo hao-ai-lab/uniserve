@@ -243,6 +243,58 @@ async fn grpc_test_server(
     (grpc_client, server_task, engine_task)
 }
 
+/// Spin up a gRPC server whose mock engine captures the first
+/// [`EngineCoreRequest`] it receives, sends it back over a oneshot channel, and
+/// then replies with `default_stream_output_specs`. This lets a test assert on
+/// the engine-side request that the gRPC conversion produced.
+async fn grpc_test_server_capturing_request() -> (
+    GenerateClient<tonic::transport::Channel>,
+    tokio::task::JoinHandle<()>,
+    MockEngineTask,
+    tokio::sync::oneshot::Receiver<uniserve_engine_client::protocol::EngineCoreRequest>,
+) {
+    let (client, mock) = EngineCoreClient::connect_mock("test-model");
+    let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(mock, move |mut mock| {
+        Box::pin(async move {
+            let request = mock.recv_request().await;
+            let _ = captured_tx.send(request.clone());
+            mock.send_outputs(engine_outputs_for_request(
+                &request.request_id,
+                default_stream_output_specs(),
+            ));
+        })
+    }));
+
+    let chat = ChatLlm::from_shared_backend(
+        test_llm(client),
+        Arc::new(FakeTextBackend) as Arc<dyn ChatTextBackend>,
+    );
+    let state = Arc::new(AppState::new(vec!["test-model".to_string()], chat));
+    let svc = GenerateServer::new(GenerateServiceImpl::new(state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind grpc listener");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server_task = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        TonicServer::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("grpc server");
+    });
+
+    let grpc_client = GenerateClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect grpc client");
+
+    (grpc_client, server_task, engine_task, captured_rx)
+}
+
 // ========================================================================================
 // Tests
 // ========================================================================================
@@ -479,42 +531,6 @@ async fn streaming_generate_missing_prompt_returns_invalid_argument() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn unary_generate_with_sampling_params() {
-    let (mut client, server_task, engine_task) =
-        grpc_test_server(default_stream_output_specs()).await;
-
-    let response = client
-        .generate(pb::GenerateRequest {
-            request_id: "test-sampling".to_string(),
-            model: "test-model".to_string(),
-            prompt: Some(pb::generate_request::Prompt::Text("test".to_string())),
-            temperature: Some(0.7),
-            sampling: Some(pb::RandomSampling {
-                top_k: 50,
-                top_p: 0.9,
-                seed: Some(42),
-                ..Default::default()
-            }),
-            stopping: Some(pb::StoppingCriteria {
-                max_new_tokens: 5,
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect("generate with sampling params")
-        .into_inner();
-
- // Verify the request was accepted and produced output.
-    let outputs = response.outputs.expect("outputs present");
-    assert_eq!(outputs.text, "hi");
-
-    engine_task.await.expect("mock engine task");
-    server_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
 async fn unary_generate_rejects_wrong_model() {
     let (mut client, server_task, _engine_task) =
         grpc_test_server(default_stream_output_specs()).await;
@@ -618,6 +634,58 @@ async fn unary_generate_output_text_defaults_to_true() {
 
     let outputs = response.outputs.expect("outputs present");
     assert_eq!(outputs.text, "hi");
+
+    engine_task.await.expect("mock engine task");
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn grpc_sampling_params_are_threaded_into_engine_request() {
+    let (mut client, server_task, engine_task, captured_rx) =
+        grpc_test_server_capturing_request().await;
+
+    client
+        .generate(pb::GenerateRequest {
+            request_id: "test-sampling".to_string(),
+            model: "test-model".to_string(),
+            prompt: Some(pb::generate_request::Prompt::Text("hello".to_string())),
+            temperature: Some(0.7),
+            sampling: Some(pb::RandomSampling {
+                top_k: 5,
+                top_p: 0.9,
+                seed: Some(123),
+                ..Default::default()
+            }),
+            stopping: Some(pb::StoppingCriteria {
+                max_new_tokens: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("unary generate")
+        .into_inner();
+
+    // Assert on the engine-side request the gRPC conversion produced, not on the
+    // canned output text.
+    let engine_request = captured_rx.await.expect("captured engine request");
+    let sampling = engine_request
+        .sampling_params
+        .expect("sampling_params present on engine request");
+
+    assert!(
+        (sampling.temperature - 0.7).abs() < 1e-6,
+        "temperature was {}",
+        sampling.temperature
+    );
+    assert_eq!(sampling.top_k, 5);
+    assert!(
+        (sampling.top_p - 0.9).abs() < 1e-6,
+        "top_p was {}",
+        sampling.top_p
+    );
+    assert_eq!(sampling.seed, Some(123));
 
     engine_task.await.expect("mock engine task");
     server_task.abort();

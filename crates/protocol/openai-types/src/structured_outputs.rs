@@ -47,3 +47,101 @@ pub enum ResponseFormat {
         extra: serde_json::Map<String, Value>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+ /// `{"type": "text"}` deserializes into the unit `Text` variant and
+ /// round-trips back to the same tagged JSON.
+    #[test]
+    fn text_format_round_trips() {
+        let json = serde_json::json!({"type": "text"});
+        let format: ResponseFormat = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(format, ResponseFormat::Text);
+        assert_eq!(serde_json::to_value(&format).unwrap(), json);
+    }
+
+ /// `json_object` uses snake_case tag renaming.
+    #[test]
+    fn json_object_format_round_trips() {
+        let json = serde_json::json!({"type": "json_object"});
+        let format: ResponseFormat = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(format, ResponseFormat::JsonObject);
+        assert_eq!(serde_json::to_value(&format).unwrap(), json);
+    }
+
+ /// A `json_schema` format carries the nested `JsonSchemaFormat` and
+ /// round-trips through serde preserving name/strict/schema.
+    #[test]
+    fn json_schema_format_round_trips() {
+        let json = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "person",
+                "schema": {"type": "object"},
+                "strict": true,
+            },
+        });
+
+        let format: ResponseFormat = serde_json::from_value(json.clone()).unwrap();
+        match &format {
+            ResponseFormat::JsonSchema { json_schema } => {
+                assert_eq!(json_schema.name, "person");
+                assert_eq!(json_schema.strict, Some(true));
+                assert_eq!(json_schema.schema, serde_json::json!({"type": "object"}));
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+
+        assert_eq!(serde_json::to_value(&format).unwrap(), json);
+    }
+
+ /// `JsonSchemaFormat::schema` accepts the `json_schema` alias as an
+ /// alternative key for the inner schema object.
+    #[test]
+    fn json_schema_format_accepts_schema_alias() {
+        let json = serde_json::json!({
+            "name": "thing",
+            "json_schema": {"type": "string"},
+        });
+
+        let format: JsonSchemaFormat = serde_json::from_value(json).unwrap();
+        assert_eq!(format.name, "thing");
+        assert_eq!(format.schema, serde_json::json!({"type": "string"}));
+        assert_eq!(format.description, None);
+        assert_eq!(format.strict, None);
+    }
+
+ /// The `structural_tag` variant captures the entire payload (including the
+ /// `type` tag) in its catch-all `extra` map and re-serializes it intact.
+    #[test]
+    fn structural_tag_captures_extra_payload_in_catch_all() {
+        let json = serde_json::json!({
+            "type": "structural_tag",
+            "structures": [{"begin": "<a>", "end": "</a>"}],
+            "triggers": ["<a>"],
+        });
+
+        let format: ResponseFormat = serde_json::from_value(json.clone()).unwrap();
+        match &format {
+            ResponseFormat::StructuralTag { extra } => {
+ // Dialect-specific fields are preserved opaquely in the catch-all.
+                assert_eq!(
+                    extra.get("structures"),
+                    Some(&serde_json::json!([{"begin": "<a>", "end": "</a>"}]))
+                );
+                assert_eq!(
+                    extra.get("triggers"),
+                    Some(&serde_json::json!(["<a>"]))
+                );
+            }
+            other => panic!("expected StructuralTag, got {other:?}"),
+        }
+
+ // The whole payload, including the type tag, round-trips unchanged.
+        assert_eq!(serde_json::to_value(&format).unwrap(), json);
+    }
+}

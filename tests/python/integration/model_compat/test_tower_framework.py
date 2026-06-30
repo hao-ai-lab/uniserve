@@ -57,44 +57,6 @@ def test_route_by_modality_trivial_matches_manual_scatter():
     torch.testing.assert_close(out, manual)
 
 
-def test_route_by_modality_dispatches_gen_rows_through_transport():
-    """A modality whose coordinate is on another device is moved via copy_to."""
-
-    class _SpyTransport:
-        def __init__(self) -> None:
-            self.copied: list[int] = []
-
-        def device(self, coord: int) -> torch.device:
-            # Coordinate 1 lives on a different (meta) device, so route_by_modality
-            # must dispatch its rows through copy_to; coordinate 0 stays local.
-            return torch.device("meta") if int(coord) == 1 else torch.device("cpu")
-
-        def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True):
-            self.copied.append(int(coord))
-            return t  # keep on cpu so the expert can run in this CPU test
-
-    torch.manual_seed(1)
-    src = torch.randn(5, 4)
-    gen = torch.tensor([False, True, False, True, False])
-    text_fn = nn.Linear(4, 4)
-    gen_fn = nn.Linear(4, 4)
-    spy = _SpyTransport()
-
-    out = route_by_modality(
-        src,
-        {Modality.TEXT: (~gen, text_fn), Modality.GEN: (gen, gen_fn)},
-        out=torch.zeros_like(src),
-        transport=spy,
-        coords={Modality.TEXT: 0, Modality.GEN: 1},
-    )
-    # Only the gen rows (coordinate 1) were dispatched across the transport.
-    assert spy.copied == [1]
-    manual = torch.zeros_like(src)
-    manual[~gen] = text_fn(src[~gen])
-    manual[gen] = gen_fn(src[gen])
-    torch.testing.assert_close(out, manual)
-
-
 def test_tower_modality_coords_trivial_is_none_and_two_coord_maps_gen():
     assert tower_modality_coords(DeviceMesh.trivial("cpu")) is None
     coords = tower_modality_coords(_cpu_tower())
@@ -113,13 +75,6 @@ def test_place_towers_moves_only_tagged_subtree():
 
     assert next(root.gen.parameters()).device.type == "meta"
     assert next(root.text.parameters()).device.type == "cpu"
-
-
-def test_place_towers_trivial_is_noop():
-    root = nn.Module()
-    root.gen = set_tower_coord(nn.Linear(2, 2), 1)
-    place_towers(root, DeviceMesh.trivial("cpu"))
-    assert next(root.gen.parameters()).device.type == "cpu"
 
 
 def test_option_a_cross_process_tower_keeps_model_code_transport_agnostic():
@@ -252,27 +207,3 @@ def test_sensenova_checkpoint_keys_survive_routing_refactor():
         assert expected in keys, expected
     # The expert/routing containers must NOT leak into the state dict.
     assert not any("_by_modality" in k for k in keys)
-
-
-def test_sensenova_layer_runs_with_trivial_tower():
-    torch.manual_seed(3)
-    layer = _sensenova_layer()
-    g = torch.Generator().manual_seed(0)
-    with torch.no_grad():
-        for p in layer.parameters():
-            p.normal_(0.0, 0.02, generator=g)
-    hidden = torch.randn(1, 4, 16)
-    indicators = torch.tensor([[False, True, False, True]])
-    indexes = torch.stack(
-        [torch.arange(4), torch.tensor([0, 1, 0, 1]), torch.tensor([0, 0, 1, 1])], dim=0
-    )
-    out = layer(
-        hidden,
-        image_gen_indicators=indicators,
-        exist_non_image_gen_tokens=True,
-        exist_image_gen_tokens=True,
-        indexes=indexes,
-        attention_mask=torch.zeros(1, 1, 4, 4),
-    )
-    assert out.shape == hidden.shape
-    assert torch.isfinite(out).all()

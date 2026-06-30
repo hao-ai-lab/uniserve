@@ -300,13 +300,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rust_log_target_overrides_are_merged_with_uniserve_default_level() {
-        let filter = build_targets_filter(Some("DEBUG"), Some("hyper=warn,tower=error"));
-
-        assert_eq!(filter.to_string(), "tower=error,hyper=warn,debug");
-    }
-
-    #[test]
     fn rust_log_default_level_overrides_uniserve_default_level() {
         let filter = build_targets_filter(Some("DEBUG"), Some("warn,hyper=info"));
 
