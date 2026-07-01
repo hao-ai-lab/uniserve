@@ -13,6 +13,7 @@ import torch.nn as nn
 from ..foundation.env import DEFAULT_COMPILE_BACKEND
 from ..foundation.errors import capability_mismatch
 from ..foundation.runtime_config import get_worker_config
+from ..foundation.triton_compat import ensure_blackwell_ptxas
 
 __all__ = [
     'is_compiled',
@@ -115,6 +116,7 @@ def maybe_compile_module(
     compile_fn = getattr(torch, "compile", None)
     if not callable(compile_fn):
         raise capability_mismatch("torch.compile is enabled but torch.compile is unavailable")
+    _prepare_compile_toolchain(module, label=label)
     kwargs: dict[str, Any] = {
         "backend": cfg.backend,
         "fullgraph": cfg.fullgraph,
@@ -137,6 +139,31 @@ def maybe_compile_module(
         cfg.dynamic,
     )
     return compiled
+
+
+def _prepare_compile_toolchain(module: nn.Module, *, label: str) -> None:
+    device = _first_module_device(module)
+    if device is None or device.type != "cuda":
+        return
+    try:
+        major, _minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        return
+    if int(major) < 10:
+        return
+    if ensure_blackwell_ptxas():
+        return
+    raise capability_mismatch(
+        f"torch.compile for {label} requires a CUDA 13+ ptxas on Blackwell GPUs"
+    )
+
+
+def _first_module_device(module: nn.Module) -> torch.device | None:
+    for tensor in module.parameters(recurse=True):
+        return tensor.device
+    for tensor in module.buffers(recurse=True):
+        return tensor.device
+    return None
 
 
 def compile_targets(

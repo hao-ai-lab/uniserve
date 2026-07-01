@@ -178,8 +178,12 @@ class RequestStateTable:
     def get(self, req_id: int) -> RequestState:
         return self._states.setdefault(req_id, RequestState())
 
-    def advance_denoise(self, req_id: int) -> None:
-        self.get(req_id).schedule_cursor += 1
+    def advance_denoise(self, req_id: int, num_steps_done: int | None = None) -> None:
+        state = self.get(req_id)
+        if num_steps_done is None:
+            state.schedule_cursor += 1
+            return
+        state.schedule_cursor = int(num_steps_done)
 
     def commit(self, req_id: int) -> None:
         self.get(req_id).clear_generation_state(reset_cursor=True)

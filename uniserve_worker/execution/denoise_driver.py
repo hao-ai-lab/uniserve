@@ -89,6 +89,9 @@ class DenoiseDriver:
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
         model: "DenoiseCapable",
     ) -> list[DenoiseOutput]:
+        step_counts = [_denoise_step_count(op) for _req_id, _state, op in items]
+        if any(count > 1 for count in step_counts):
+            return self._step_many_burst(items, model, step_counts)
         prepared = [
             (int(req_id), state, op, self._prepare(req_id, state, model, op))
             for req_id, state, op in items
@@ -102,6 +105,71 @@ class DenoiseDriver:
             self._finish_prepared_step(req_id, state, model, op, ctx)
             for req_id, state, op, ctx in prepared
         ]
+
+    def _step_many_burst(
+        self,
+        items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
+        model: "DenoiseCapable",
+        step_counts: Sequence[int],
+    ) -> list[DenoiseOutput]:
+        outputs: list[DenoiseOutput | None] = [None] * len(items)
+        active: list[dict[str, Any]] = []
+        for index, ((req_id, state, op), step_count) in enumerate(zip(items, step_counts, strict=True)):
+            op_dict = dict(op)
+            cursor = int(op_dict.get("timestep_idx", state.schedule_cursor) or 0)
+            active.append(
+                {
+                    "index": index,
+                    "req_id": int(req_id),
+                    "state": state,
+                    "op": op_dict,
+                    "cursor": cursor,
+                    "remaining": int(step_count),
+                }
+            )
+
+        while active:
+            prepared: list[tuple[dict[str, Any], Mapping[str, Any], DenoiseContext | TextImageDenoiseStep]] = []
+            for item in active:
+                op = dict(item["op"])
+                op["timestep_idx"] = int(item["cursor"])
+                prepared.append(
+                    (
+                        item,
+                        op,
+                        self._prepare(int(item["req_id"]), item["state"], model, op),
+                    )
+                )
+
+            if all(isinstance(ctx, TextImageDenoiseStep) for _item, _op, ctx in prepared):
+                step_outputs = self._text_image_steps(
+                    model,
+                    [ctx for _item, _op, ctx in prepared if isinstance(ctx, TextImageDenoiseStep)],
+                )
+            else:
+                step_outputs = [
+                    self._finish_prepared_step(
+                        int(item["req_id"]),
+                        item["state"],
+                        model,
+                        op,
+                        ctx,
+                    )
+                    for item, op, ctx in prepared
+                ]
+
+            next_active: list[dict[str, Any]] = []
+            for (item, _op, _ctx), output in zip(prepared, step_outputs, strict=True):
+                outputs[int(item["index"])] = output
+                item["remaining"] = int(item["remaining"]) - 1
+                item["cursor"] = int(output.num_steps_done)
+                if not output.denoise_done and int(item["remaining"]) > 0:
+                    next_active.append(item)
+            active = next_active
+
+        if any(output is None for output in outputs):
+            raise invalid_descriptor("denoise burst did not produce an output for every op")
+        return [output for output in outputs if output is not None]
 
     def _prepare(
         self,
@@ -248,6 +316,17 @@ def _prepare_denoise(
     op: Mapping[str, Any],
 ) -> DenoiseContext | TextImageDenoiseStep:
     return model.prepare_denoise(state, op)
+
+
+def _denoise_step_count(op: Mapping[str, Any]) -> int:
+    raw = op.get("denoise_step_count") or 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise invalid_descriptor("denoise_step_count must be a positive integer") from exc
+    if value <= 0:
+        raise invalid_descriptor("denoise_step_count must be positive")
+    return value
 
 
 def _text_image_batch_predictor(model: Any) -> Any | None:

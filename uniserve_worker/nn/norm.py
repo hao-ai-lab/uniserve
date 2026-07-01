@@ -342,37 +342,13 @@ def try_triton_qk_rms_norm(
     q_eps: float,
     k_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if (
-        triton is None
-        or not triton_fused_layers_enabled()
-        or not q.is_cuda
-        or not k.is_cuda
-        or not q_weight.is_cuda
-        or not k_weight.is_cuda
-        or not triton_device_supported(q.device)
-        or torch.is_grad_enabled()
-        or q.device != k.device
-        or q.dtype != k.dtype
-        or q.ndim != 3
-        or k.ndim != 3
-        or q.shape[-1] != k.shape[-1]
-        or q.shape[-1] != q_weight.numel()
-        or k.shape[-1] != k_weight.numel()
-        or not q_weight.is_contiguous()
-        or not k_weight.is_contiguous()
-        or int(q.stride(-1)) != 1
-        or int(k.stride(-1)) != 1
-    ):
+    if not can_run_triton_qk_rms_norm(q, k, q_weight, k_weight, q_eps, k_eps):
         return None
     head_dim = int(q.shape[-1])
-    if head_dim <= 0 or head_dim > 1024:
-        return None
     q_heads = int(q.shape[1])
     k_heads = int(k.shape[1])
     q_tokens = int(q.shape[0])
     k_tokens = int(k.shape[0])
-    if q_tokens <= 0 or k_tokens <= 0 or q_heads <= 0 or k_heads <= 0:
-        return None
     q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
     k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
     block, num_warps = _norm_launch_config(head_dim)
@@ -402,3 +378,46 @@ def try_triton_qk_rms_norm(
         num_warps=num_warps,
     )
     return q_out, k_out
+
+
+def can_run_triton_qk_rms_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    q_eps: float,
+    k_eps: float,
+) -> bool:
+    del q_eps, k_eps
+    if (
+        triton is None
+        or not triton_fused_layers_enabled()
+        or not q.is_cuda
+        or not k.is_cuda
+        or not q_weight.is_cuda
+        or not k_weight.is_cuda
+        or not triton_device_supported(q.device)
+        or torch.is_grad_enabled()
+        or q.device != k.device
+        or q.dtype != k.dtype
+        or q.ndim != 3
+        or k.ndim != 3
+        or q.shape[-1] != k.shape[-1]
+        or q.shape[-1] != q_weight.numel()
+        or k.shape[-1] != k_weight.numel()
+        or not q_weight.is_contiguous()
+        or not k_weight.is_contiguous()
+        or int(q.stride(-1)) != 1
+        or int(k.stride(-1)) != 1
+    ):
+        return False
+    head_dim = int(q.shape[-1])
+    if head_dim <= 0 or head_dim > 1024:
+        return False
+    q_heads = int(q.shape[1])
+    k_heads = int(k.shape[1])
+    q_tokens = int(q.shape[0])
+    k_tokens = int(k.shape[0])
+    if q_tokens <= 0 or k_tokens <= 0 or q_heads <= 0 or k_heads <= 0:
+        return False
+    return True

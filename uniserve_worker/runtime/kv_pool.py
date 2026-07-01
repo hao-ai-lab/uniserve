@@ -7,7 +7,8 @@ model attention code.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -24,6 +25,13 @@ __all__ = [
     'PagedKVPool',
     'PagedRequestCache',
 ]
+
+
+@dataclass
+class _VarlenAppendPlan:
+    key: tuple[object, ...]
+    page_ids: torch.Tensor
+    offsets: torch.Tensor
 
 
 class PagedKVPool:
@@ -279,6 +287,16 @@ class PagedRequestCache:
         # base_len is already coerced at the sole construction site (view()).
         self.base_len = base_len
         self._read_spans = self._spans(0, self.base_len)
+        self._block_table_cache: dict[torch.device, torch.Tensor] = {}
+        self._cache_seqlens_cache: dict[torch.device, torch.Tensor] = {}
+        self._append_plan: _VarlenAppendPlan | None = None
+
+    @property
+    def base_lens(self) -> tuple[int]:
+        return (int(self.base_len),)
+
+    def _target_device(self, device: torch.device | str | None = None) -> torch.device:
+        return torch.device(device if device is not None else self.pool.k.device)
 
     def _spans(self, start: int, n: int) -> list[tuple[int, int, int]]:
         return self.pool.spans(self.block_ids, start, n)
@@ -292,16 +310,126 @@ class PagedRequestCache:
     def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         self.pool.write(layer, self.block_ids, start=self.base_len, k=k, v=v)
 
+    def append_varlen(
+        self,
+        layer: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_lens: Sequence[int],
+        *,
+        block_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+    ) -> None:
+        if k.shape != v.shape:
+            raise invalid_descriptor("paged KV append key/value shapes must match")
+        if k.ndim != 3:
+            raise invalid_descriptor("paged KV append expects [tokens, heads, dim]")
+        query_lens = tuple(int(length) for length in query_lens)
+        if query_lens != (int(k.shape[0]),):
+            raise invalid_descriptor("single-row paged KV append requires one full-row query length")
+        if self._append_varlen_indexed(
+            int(layer),
+            k,
+            v,
+            total=int(k.shape[0]),
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+        ):
+            return
+        self.append(layer, k, v)
+
+    def _append_varlen_indexed(
+        self,
+        layer: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        total: int,
+        block_table: torch.Tensor | None,
+        cache_seqlens: torch.Tensor | None,
+        cu_seqlens_q: torch.Tensor | None,
+    ) -> bool:
+        if total <= 0:
+            return True
+        if block_table is None or cache_seqlens is None or cu_seqlens_q is None:
+            return False
+        if self.pool.is_quantized or not bool(getattr(self.pool, "supports_paged_attention_storage", True)):
+            return False
+        if not (k.is_cuda and v.is_cuda and self.pool.k.is_cuda and self.pool.v.is_cuda):
+            return False
+        if k.device != self.pool.k.device or v.device != self.pool.v.device:
+            return False
+        if int(block_table.shape[0]) != 1 or int(cache_seqlens.shape[0]) != 1:
+            return False
+        if int(cu_seqlens_q.numel()) != 2:
+            return False
+        if block_table.device != k.device or cache_seqlens.device != k.device or cu_seqlens_q.device != k.device:
+            return False
+        if k.shape[1:] != (self.pool.n_kv, self.pool.head_dim):
+            return False
+        plan = self._varlen_append_plan(
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            total=total,
+        )
+        self.pool.k[layer, plan.page_ids, plan.offsets] = k.to(dtype=self.pool.k.dtype)
+        self.pool.v[layer, plan.page_ids, plan.offsets] = v.to(dtype=self.pool.v.dtype)
+        return True
+
+    def _varlen_append_plan(
+        self,
+        *,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        total: int,
+    ) -> _VarlenAppendPlan:
+        key = (
+            int(block_table.data_ptr()),
+            int(cache_seqlens.data_ptr()),
+            int(cu_seqlens_q.data_ptr()),
+            tuple(int(dim) for dim in block_table.shape),
+            tuple(int(dim) for dim in cache_seqlens.shape),
+            tuple(int(dim) for dim in cu_seqlens_q.shape),
+            int(total),
+        )
+        cached = self._append_plan
+        if cached is not None and cached.key == key:
+            return cached
+        token_offsets = torch.arange(int(total), device=block_table.device, dtype=torch.int64)
+        positions = cache_seqlens[0].to(dtype=torch.int64) + token_offsets
+        block_slots = torch.div(positions, int(self.pool.block_size), rounding_mode="floor")
+        page_ids = block_table[0].to(dtype=torch.int64).index_select(0, block_slots).contiguous()
+        offsets = torch.remainder(positions, int(self.pool.block_size)).contiguous()
+        plan = _VarlenAppendPlan(key=key, page_ids=page_ids, offsets=offsets)
+        self._append_plan = plan
+        return plan
+
     def block_table(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        return torch.tensor(
+        target = self._target_device(device)
+        cached = self._block_table_cache.get(target)
+        if cached is not None:
+            return cached
+        out = torch.tensor(
             self.block_ids,
             dtype=torch.int32,
-            device=device if device is not None else self.pool.k.device,
+            device=target,
         ).unsqueeze(0)
+        self._block_table_cache[target] = out
+        return out
 
     def cache_seqlens(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        return torch.tensor(
+        target = self._target_device(device)
+        cached = self._cache_seqlens_cache.get(target)
+        if cached is not None:
+            return cached
+        out = torch.tensor(
             [self.base_len],
             dtype=torch.int32,
-            device=device if device is not None else self.pool.k.device,
+            device=target,
         )
+        self._cache_seqlens_cache[target] = out
+        return out

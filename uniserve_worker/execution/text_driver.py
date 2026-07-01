@@ -203,6 +203,37 @@ class TextDriver:
                 return verify_speculative_tokens(
                     self, model, text, request_states
                 )
+        if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
+            with profile_range("uniserve.text.decode_burst"):
+                return [
+                    self._decode_burst(
+                        dict(ops[0]),
+                        request_states,
+                        model,
+                        defer_cpu_results=defer_cpu_results,
+                    )
+                ]
+        return self._step_once(
+            text,
+            ops,
+            request_states,
+            model,
+            defer_cpu_results=defer_cpu_results,
+            defer_sampling=defer_sampling,
+            tensor_store=tensor_store,
+        )
+
+    def _step_once(
+        self,
+        text: "TextBatch",
+        ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        defer_cpu_results: bool = False,
+        defer_sampling: bool = False,
+        tensor_store: Any | None = None,
+    ) -> list[Any]:
         with profile_range("uniserve.text.forward"):
             logits_batch, req_ids = self._forward(model, text, request_states)
         # KV-length advance is system-owned now (derived from seq_lens), not the
@@ -223,6 +254,55 @@ class TextDriver:
                 start,
                 defer_cpu_results=defer_cpu_results,
             )
+
+    def _decode_burst(
+        self,
+        first_op: dict[str, Any],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        defer_cpu_results: bool = False,
+    ) -> dict[str, Any]:
+        from ..contracts.batches import UniForwardBatch
+
+        count = _positive_int(first_op.get("decode_token_count") or 1, "decode_token_count")
+        stop_ids = set(_int_list(first_op.get("decode_stop_token_ids") or []))
+        tokens: list[int] = []
+        last: dict[str, Any] = {}
+        op = dict(first_op)
+        op["decode_token_count"] = 1
+        op["decode_stop_token_ids"] = []
+        for _ in range(count):
+            fb = UniForwardBatch.from_ops([op])
+            text = fb.as_text()
+            out = self._step_once(
+                text,
+                [op],
+                request_states,
+                model,
+                defer_cpu_results=False,
+                defer_sampling=False,
+                tensor_store=None,
+            )[0]
+            result = _seq_result_dict(out)
+            tok = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
+            tokens.append(tok)
+            last = result
+            if tok in stop_ids:
+                break
+            next_pos = _next_decode_position(op)
+            op = dict(first_op)
+            op["new_block_ids"] = []
+            op["token_ids"] = [tok]
+            op["token_source"] = "last_sampled"
+            op["pos_range"] = [next_pos, next_pos + 1]
+            op["decode_token_count"] = 1
+            op["decode_stop_token_ids"] = []
+
+        result = dict(last)
+        result["sampled_token_id"] = tokens[-1]
+        result["sampled_token_ids"] = tokens
+        return result
 
     # ---- forward ---------------------------------------------------------
 
@@ -671,6 +751,53 @@ def _coalesce_relay_rows(rows: list[torch.Tensor]) -> torch.Tensor:
         return first.as_strided((len(rows),), (1,))
     except RuntimeError:
         return torch.cat([candidate.reshape(-1) for candidate in rows], dim=0)
+
+
+def _can_decode_burst(text: "TextBatch", ops: list[Mapping[str, Any]], *, defer_sampling: bool) -> bool:
+    if defer_sampling or text.mode != ForwardMode.DECODE or len(ops) != 1:
+        return False
+    if any(text.spec_token_ids):
+        return False
+    try:
+        return _positive_int(ops[0].get("decode_token_count") or 1, "decode_token_count") > 1
+    except Exception:
+        raise
+
+
+def _seq_result_dict(output: Any) -> dict[str, Any]:
+    if hasattr(output, "finalize") and callable(output.finalize):
+        finalized = output.finalize()
+        if isinstance(finalized, Mapping):
+            return dict(finalized)
+    if isinstance(output, ForwardOutputBase):
+        return dict(output.to_seq_result())
+    if isinstance(output, Mapping):
+        return dict(output)
+    raise invalid_descriptor(f"unsupported text burst output type {type(output).__name__}")
+
+
+def _positive_int(value: Any, where: str, *, minimum: int = 1) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise invalid_descriptor(f"{where} must be an integer >= {minimum}")
+    return int(value)
+
+
+def _int_list(value: Any) -> list[int]:
+    if not isinstance(value, (list, tuple)):
+        raise invalid_descriptor("decode_stop_token_ids must be a list")
+    out: list[int] = []
+    for idx, item in enumerate(value):
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise invalid_descriptor(f"decode_stop_token_ids[{idx}] must be a non-negative integer")
+        out.append(int(item))
+    return out
+
+
+def _next_decode_position(op: Mapping[str, Any]) -> int:
+    pos = op.get("pos_range") or [0, 0]
+    if not isinstance(pos, (list, tuple)) or len(pos) != 2:
+        raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
+    return _positive_int(pos[1], "decode burst op.pos_range[1]", minimum=0)
 
 
 def _same_tensor(lhs: Any, rhs: torch.Tensor) -> bool:

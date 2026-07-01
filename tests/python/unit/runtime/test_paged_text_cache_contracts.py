@@ -41,6 +41,30 @@ def _make_pool(
 
 
 # --------------------------------------------------------------------------
+# PagedTextCache.request_cache_for_update
+# --------------------------------------------------------------------------
+
+
+def test_update_view_reuses_request_cache_across_layers_for_one_span():
+    pool = _make_pool(block_size=4, num_blocks=16, num_layers=2)
+    cache = PagedTextCache(pool, [0], num_layers=2, length=0)
+
+    first = cache.request_cache_for_update(0, 1)
+    cache.finish_layer_update(0, 1)
+    second = cache.request_cache_for_update(1, 1)
+
+    assert second is first
+    assert second.block_table(device="cpu") is first.block_table(device="cpu")
+    assert second.cache_seqlens(device="cpu") is first.cache_seqlens(device="cpu")
+
+    cache.finish_layer_update(1, 1)
+    third = cache.request_cache_for_update(0, 1)
+
+    assert third is not first
+    assert third.base_len == 1
+
+
+# --------------------------------------------------------------------------
 # PagedTextCache.request_cache_for_transient
 # --------------------------------------------------------------------------
 
@@ -73,6 +97,25 @@ def test_transient_within_existing_capacity_does_not_call_allocator():
     assert calls == []
     assert list(cache.block_ids) == [0]
     assert view.base_len == 0
+
+
+def test_transient_view_reuses_metadata_cache_until_blocks_grow():
+    pool = _make_pool(block_size=4, num_blocks=16)
+    requested: list[int] = []
+
+    def allocate(n: int) -> list[int]:
+        requested.append(n)
+        start = 1 + sum(requested[:-1])
+        return list(range(start, start + n))
+
+    cache = PagedTextCache(pool, [0], num_layers=1, length=0, allocate_blocks=allocate)
+    first = cache.request_cache_for_transient(0, 2)
+    second = cache.request_cache_for_transient(0, 3)
+
+    assert first is second
+    grown = cache.request_cache_for_transient(0, 9)
+    assert grown is not first
+    assert requested == [2]
 
 
 def test_transient_overflow_grows_blocks_via_ceil_div_without_advancing_length():
@@ -163,6 +206,40 @@ def test_batched_cache_seqlens_reports_each_row_base_length():
 
     assert seqlens.dtype == torch.int32
     assert seqlens.tolist() == [3, 5]
+
+
+def test_batched_request_cache_reuses_metadata_tensors_per_device():
+    pool = _make_pool(block_size=4, num_blocks=16)
+    row0 = PagedTextCache(pool, [0, 1], num_layers=1, length=3)
+    row1 = PagedTextCache(pool, [2, 3], num_layers=1, length=5)
+    batched = BatchedPagedTextCache([row0, row1])
+
+    request = batched.request_cache_for_transient(0, 1)
+
+    assert request.block_table(device="cpu") is request.block_table(device="cpu")
+    assert request.cache_seqlens(device="cpu") is request.cache_seqlens(device="cpu")
+
+
+def test_batched_transient_view_reuses_request_cache_until_a_row_grows():
+    pool = _make_pool(block_size=4, num_blocks=16)
+    requested: list[int] = []
+
+    def allocate(n: int) -> list[int]:
+        requested.append(n)
+        start = 4 + sum(requested[:-1])
+        return list(range(start, start + n))
+
+    row0 = PagedTextCache(pool, [0], num_layers=1, length=1, allocate_blocks=allocate)
+    row1 = PagedTextCache(pool, [1], num_layers=1, length=2, allocate_blocks=allocate)
+    batched = BatchedPagedTextCache([row0, row1])
+
+    first = batched.request_cache_for_transient(0, 1)
+    second = batched.request_cache_for_transient(0, 2)
+    assert first is second
+
+    grown = batched.request_cache_for_transient(0, 5)
+    assert grown is not first
+    assert requested == [1, 1]
 
 
 def test_batched_get_seq_length_is_max_persistent_length():
@@ -299,6 +376,33 @@ def test_view_accepts_base_len_filling_host_blocks_exactly():
 
     assert view.base_len == 4
     assert view.length() == 4
+    assert view.block_table() is view.block_table()
+    assert view.cache_seqlens() is view.cache_seqlens()
+
+
+def test_single_request_cache_append_varlen_matches_append_without_advancing_length():
+    torch.manual_seed(22)
+    pool = _make_pool(num_layers=1, block_size=4, num_blocks=16, num_kv_heads=2, head_dim=3)
+    cache = PagedTextCache(pool, [0, 1, 2], num_layers=1, length=3)
+    view = cache.request_cache_for_transient(0, 5)
+    k = torch.randn(5, 2, 3)
+    v = torch.randn(5, 2, 3)
+
+    view.append_varlen(
+        0,
+        k,
+        v,
+        (5,),
+        block_table=view.block_table(device="cpu"),
+        cache_seqlens=view.cache_seqlens(device="cpu"),
+        cu_seqlens_q=torch.tensor([0, 5], dtype=torch.int32),
+    )
+
+    read_k, read_v = pool.read(0, [0, 1, 2], start=3, length=5)
+    torch.testing.assert_close(read_k, k)
+    torch.testing.assert_close(read_v, v)
+    assert cache.length == 3
+    assert view.base_lens == (3,)
 
 
 def test_view_rejects_block_id_outside_pool_capacity():
