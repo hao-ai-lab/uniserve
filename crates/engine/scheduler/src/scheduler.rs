@@ -33,6 +33,8 @@ pub const DEFAULT_MAX_BATCH: usize = 128;
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_NUM_SEQS: usize = 128;
 pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+pub const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
+pub const DEFAULT_DECODE_TOKEN_BURST: u16 = 1;
 /// Default admission backpressure bound: maximum waiting requests buffered
 /// before new submits are rejected at enqueue.
 pub const DEFAULT_MAX_NUM_WAITING: usize = 4096;
@@ -194,6 +196,8 @@ const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// enough that the idle engine is effectively asleep.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 const DECODE_LOOKAHEAD_ENV: &str = "UNISERVE_DECODE_LOOKAHEAD";
+const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
+const DECODE_TOKEN_BURST_ENV: &str = "UNISERVE_DECODE_TOKEN_BURST";
 
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> GenEvent {
     let (height, width, bytes, sha256) =
@@ -424,6 +428,12 @@ pub struct Scheduler {
     /// to plain text generation whose next logits processors do not depend on
     /// an unknown sampled token.
     decode_lookahead: bool,
+    /// Sequential denoise timesteps to execute per denoise op. The worker runs
+    /// the exact same Euler steps and reports the cumulative step cursor.
+    denoise_step_burst: u16,
+    /// Sequential greedy text decode tokens to execute per decode op when the
+    /// request has token-independent sampling/masking constraints.
+    decode_token_burst: u16,
     /// Default-off n-gram drafter and per-position acceptance accounting. The
     /// worker target-verifies the drafts and resolve commits only the accepted
     /// prefix.
@@ -561,6 +571,9 @@ struct InflightOp {
     op_id: Option<u64>,
     /// Speculative draft token ids attached to this op (empty when none).
     spec_tokens: Vec<u32>,
+    /// Sequential text decode tokens requested by this op. Values above one
+    /// make dependent decode lookahead unsafe until the op resolves.
+    decode_token_count: u16,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
 }
@@ -652,6 +665,8 @@ impl Scheduler {
         let spec_decode = crate::spec_decode::SpecDecodeAccounting::new(Arc::clone(&stats));
         let spec_ngram_max_tokens = spec_decode.max_ngram_tokens();
         let decode_lookahead = decode_lookahead_from_env();
+        let denoise_step_burst = denoise_step_burst_from_env();
+        let decode_token_burst = decode_token_burst_from_env();
         let mut trace_sink = crate::bench_trace::SchedulerTraceSink::from_env();
         if let Some(sink) = trace_sink.as_mut() {
             sink.record(&json!({
@@ -666,6 +681,8 @@ impl Scheduler {
                     "long_prefill_threshold": config.long_prefill_threshold,
                     "spec_ngram_max_tokens": spec_ngram_max_tokens,
                     "decode_lookahead": decode_lookahead,
+                    "denoise_step_burst": denoise_step_burst,
+                    "decode_token_burst": decode_token_burst,
                 },
                 "caps": {
                     "block_size": caps.block_size,
@@ -710,6 +727,8 @@ impl Scheduler {
             step_id: 0,
             inflight_ops: HashMap::new(),
             decode_lookahead,
+            denoise_step_burst,
+            decode_token_burst,
             spec_decode,
             fatal: false,
             ledger: crate::resources::ResourceLedger::new(),
@@ -1676,6 +1695,12 @@ impl Scheduler {
             .is_some_and(|items| items.iter().any(|op| !op.spec_tokens.is_empty()))
     }
 
+    fn inflight_has_multi_decode(&self, id: RequestId) -> bool {
+        self.inflight_ops
+            .get(&id)
+            .is_some_and(|items| items.iter().any(|op| op.decode_token_count > 1))
+    }
+
     /// Whether any in-flight op for `id` is something other than a plain decode
     /// (a prefill chunk, an image op, …). Used to gate decode-lookahead.
     fn inflight_has_non_decode(&self, id: RequestId) -> bool {
@@ -1692,6 +1717,7 @@ impl Scheduler {
                 kind: op.kind,
                 op_id: op.op_id,
                 spec_tokens: op.spec_token_ids.clone().unwrap_or_default(),
+                decode_token_count: op.decode_token_count.unwrap_or(1).max(1),
                 started,
             });
     }
@@ -2357,7 +2383,11 @@ impl Scheduler {
             return false;
         }
         let depth = self.inflight_decode_count(id);
-        if depth == 0 || self.inflight_has_non_decode(id) || self.inflight_has_spec_tokens(id) {
+        if depth == 0
+            || self.inflight_has_non_decode(id)
+            || self.inflight_has_spec_tokens(id)
+            || self.inflight_has_multi_decode(id)
+        {
             return false;
         }
         let sp = &st.req.sampling;
@@ -2373,6 +2403,79 @@ impl Scheduler {
             && sp.n_logprobs == 0
             && sp.bad_words_ids.is_empty()
             && !penalties
+    }
+
+    fn supports_spec_decode(&self) -> bool {
+        self.caps
+            .supported_ops
+            .iter()
+            .any(|kind| kind == opkind_str(OpKind::TargetVerifyUnd))
+    }
+
+    fn decode_burst_plan(
+        &self,
+        id: RequestId,
+        use_last_sampled: bool,
+        budget: usize,
+        allowed: Option<&[u32]>,
+    ) -> (u16, Option<Vec<u32>>) {
+        let Some(st) = self.running.get(&id) else {
+            return (1, None);
+        };
+        if self.decode_token_burst <= 1
+            || use_last_sampled
+            || budget <= 1
+            || st.phase != Phase::DecodeUnd
+            || st.req.mode == GenMode::InterleaveUnd
+            || st.grammar.is_some()
+            || allowed.is_some()
+        {
+            return (1, None);
+        }
+
+        let sp = &st.req.sampling;
+        let penalties = sp.repetition_penalty != 1.0
+            || sp.frequency_penalty != 0.0
+            || sp.presence_penalty != 0.0;
+        if sp.temperature > 0.0
+            || sp.n_logprobs != 0
+            || !sp.bad_words_ids.is_empty()
+            || penalties
+            || st.n_generated < sp.min_tokens
+        {
+            return (1, None);
+        }
+
+        let remaining = st.req.max_tokens.saturating_sub(st.n_generated);
+        let count = self
+            .decode_token_burst
+            .min(remaining.min(u16::MAX as usize).max(1) as u16)
+            .min(budget.min(u16::MAX as usize) as u16)
+            .max(1);
+        if count <= 1 {
+            return (1, None);
+        }
+
+        let mut stop_ids = Vec::new();
+        if !sp.ignore_eos {
+            stop_ids.extend(self.ctrl.eos.iter().copied());
+        }
+        stop_ids.extend(st.req.stop_token_ids.iter().copied());
+        if st.req.mode == GenMode::AutoInterleave
+            && st.images_done < st.req.image.max_images as usize
+        {
+            if self.ctrl.start_of_image != 0 {
+                stop_ids.push(self.ctrl.start_of_image);
+            }
+            // Literal multi-token image triggers are host-detected by suffix.
+            // Stopping on any member is conservative: it may shorten a burst,
+            // but it cannot decode past a trigger that the host would need to
+            // observe before scheduling the image phase.
+            stop_ids.extend(self.ctrl.image_start_ids.iter().copied());
+        }
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
+        (count, (!stop_ids.is_empty()).then_some(stop_ids))
     }
 
     fn peek_next_kind(&self, id: RequestId) -> Option<OpKind> {
@@ -2612,6 +2715,9 @@ impl Scheduler {
                     "new_block_ids_len": op.new_block_ids.len(),
                     "token_cost": op_token_cost(op),
                     "timestep_idx": op.timestep_idx,
+                    "denoise_step_count": op.denoise_step_count,
+                    "decode_token_count": op.decode_token_count,
+                    "decode_stop_token_ids_len": op.decode_stop_token_ids.as_ref().map(|ids| ids.len()).unwrap_or(0),
                     "cond_pos": op.cond_pos,
                     "image_in": op.image_in,
                     "mm_hash": op.mm_hash,
@@ -2832,20 +2938,31 @@ impl Scheduler {
                 let tok = if use_last_sampled { 0 } else { st.next_token };
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                let spec_token_ids = if !use_last_sampled && budget > 1 {
-                    self.running.get(&id).and_then(|st| {
-                        self.spec_decode.draft_tokens(
-                            st,
-                            tok,
-                            allowed.as_deref(),
-                            suppress.as_deref(),
-                        )
-                    })
-                } else {
-                    None
-                };
+                let (decode_token_count, decode_stop_token_ids) =
+                    self.decode_burst_plan(id, use_last_sampled, budget, allowed.as_deref());
+                let spec_token_ids =
+                    if !use_last_sampled && budget > 1 && self.supports_spec_decode() {
+                        self.running.get(&id).and_then(|st| {
+                            self.spec_decode.draft_tokens(
+                                st,
+                                tok,
+                                allowed.as_deref(),
+                                suppress.as_deref(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
                 let spec_len = spec_token_ids.as_ref().map_or(0, Vec::len);
-                if !self.bm.ensure_capacity(id, pos as usize + 1 + spec_len) {
+                let decode_len = if spec_len == 0 {
+                    decode_token_count.max(1) as usize
+                } else {
+                    1
+                };
+                if !self
+                    .bm
+                    .ensure_capacity(id, pos as usize + decode_len + spec_len)
+                {
                     return None;
                 }
                 Some(ForwardOp {
@@ -2861,6 +2978,8 @@ impl Scheduler {
                         TokenSource::Wire
                     },
                     spec_token_ids,
+                    decode_token_count: (decode_len > 1).then_some(decode_len as u16),
+                    decode_stop_token_ids,
                     recent_tokens: recent,
                     allowed_tokens: allowed,
                     suppress_tokens: suppress,
@@ -2880,6 +2999,8 @@ impl Scheduler {
                     return None;
                 }
                 let timestep = st.steps_done;
+                let remaining = st.req.image.steps.saturating_sub(timestep).max(1);
+                let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 // pure text->image path runs single-branch CFG.
                 let cfg = cfg_params(&st.req.image, 1);
                 let image_prompt = Self::image_prompt_for(st);
@@ -2890,6 +3011,7 @@ impl Scheduler {
                     new_block_ids: Vec::new(),
                     pos_range: (cond_pos, cond_pos + 1),
                     timestep_idx: Some(timestep),
+                    denoise_step_count: Some(denoise_step_count),
                     cond_pos: Some(cond_pos),
                     cfg: Some(cfg),
                     image_prompt,
@@ -3046,6 +3168,8 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let cond_pos = st.cond_pos;
                 let timestep = st.steps_done;
+                let remaining = st.req.image.steps.saturating_sub(timestep).max(1);
+                let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(
                     &st.req.image,
                     self.caps.max_cfg_branches.max(1).min(u8::MAX as u32) as u8,
@@ -3057,6 +3181,7 @@ impl Scheduler {
                     new_block_ids: Vec::new(),
                     pos_range: (cond_pos, cond_pos + 1),
                     timestep_idx: Some(timestep),
+                    denoise_step_count: Some(denoise_step_count),
                     cond_pos: Some(cond_pos),
                     cfg: Some(cfg),
                     ..Default::default()
@@ -3180,13 +3305,14 @@ impl Scheduler {
                 }
             }
             OpKind::DenoiseGen => {
-                let (image_id, h, w, steps) = {
+                let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
+                    let prev = st.steps_done;
                     st.steps_done = sr.num_steps_done.unwrap_or(st.steps_done + 1);
-                    (st.image_id, st.gen_h, st.gen_w, st.req.image.steps)
+                    (st.image_id, st.gen_h, st.gen_w, st.req.image.steps, prev)
                 };
                 let sd = self.running.get(&id).map(|s| s.steps_done).unwrap_or(0);
-                if sd == 1 {
+                if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
                         GenEvent::ImageBegin {
@@ -3196,9 +3322,9 @@ impl Scheduler {
                             steps,
                         },
                     );
-                    self.emit(id, GenEvent::ImageStep { image_id, step: sd });
-                } else {
-                    self.emit(id, GenEvent::ImageStep { image_id, step: sd });
+                }
+                for step in prev_sd.saturating_add(1)..=sd {
+                    self.emit(id, GenEvent::ImageStep { image_id, step });
                 }
                 if sr.denoise_done
                     && let Some(st) = self.running.get_mut(&id)
@@ -3369,12 +3495,16 @@ impl Scheduler {
         outputs.push((sampled, sr.sampled_logprob, true));
 
         for (tok, logprob, is_sampled) in outputs {
-            let (ignore_eos, min_tokens, max_tokens, n_generated) = match self.running.get(&id) {
+            let (ignore_eos, min_tokens, max_tokens, n_generated) = match self.running.get_mut(&id)
+            {
                 Some(st) => (
                     st.req.sampling.ignore_eos,
                     st.req.sampling.min_tokens,
                     st.req.max_tokens,
-                    st.n_generated,
+                    {
+                        st.n_generated += 1;
+                        st.n_generated
+                    },
                 ),
                 None => return,
             };
@@ -3388,8 +3518,20 @@ impl Scheduler {
             if stop_tok_hit {
                 return self.finish_with(id, FinishReason::Stop, Some(format!("token:{tok}")));
             }
-            if self.ctrl.eos.contains(&tok) && !ignore_eos && !under_floor {
-                return self.finish(id, FinishReason::Eos);
+            let hit_eos = self.ctrl.eos.contains(&tok) && !ignore_eos && !under_floor;
+            let hit_max = n_generated >= max_tokens;
+            if hit_eos || hit_max {
+                if !self.ctrl.eos.contains(&tok) {
+                    self.emit_text(id, tok, logprob);
+                }
+                return self.finish(
+                    id,
+                    if hit_max {
+                        FinishReason::MaxTokens
+                    } else {
+                        FinishReason::Eos
+                    },
+                );
             }
             self.emit_text(id, tok, logprob);
             if is_sampled
@@ -3404,13 +3546,95 @@ impl Scheduler {
                     matcher.advance(tok);
                 }
             }
-            let hit_max = self
-                .running
-                .get(&id)
-                .map(|s| s.n_generated >= max_tokens)
-                .unwrap_or(false);
-            if hit_max {
-                return self.finish(id, FinishReason::MaxTokens);
+        }
+    }
+
+    fn resolve_decode_text(&mut self, id: RequestId, sr: uniserve_worker_wire::SeqResult) {
+        self.bm.activate(id);
+        let tokens = sr
+            .sampled_token_ids
+            .clone()
+            .filter(|ids| !ids.is_empty())
+            .unwrap_or_else(|| vec![sr.sampled_token_id.unwrap_or(self.ctrl.eos[0])]);
+        if let Some(st) = self.running.get_mut(&id) {
+            st.pos += tokens.len() as u32;
+        }
+        for (idx, tok) in tokens.iter().copied().enumerate() {
+            let is_last = idx + 1 == tokens.len();
+            let logprob = is_last.then_some(sr.sampled_logprob).flatten();
+            let (mode, max_tokens, ignore_eos, min_tokens, images_done, max_images) = {
+                let Some(st) = self.running.get_mut(&id) else {
+                    return;
+                };
+                st.n_generated += 1;
+                (
+                    st.req.mode,
+                    st.req.max_tokens,
+                    st.req.sampling.ignore_eos,
+                    st.req.sampling.min_tokens,
+                    st.images_done,
+                    st.req.image.max_images as usize,
+                )
+            };
+            if tok == self.ctrl.start_of_image
+                && mode == GenMode::AutoInterleave
+                && images_done < max_images
+            {
+                return self.begin_image(id);
+            }
+            let n_gen = self.running.get(&id).map(|s| s.n_generated).unwrap_or(0);
+            let under_floor = n_gen < min_tokens;
+            let stop_tok_hit = !under_floor
+                && self
+                    .running
+                    .get(&id)
+                    .map(|s| s.req.stop_token_ids.contains(&tok))
+                    .unwrap_or(false);
+            if stop_tok_hit {
+                return self.finish_with(id, FinishReason::Stop, Some(format!("token:{tok}")));
+            }
+            let hit_eos = self.ctrl.eos.contains(&tok) && !ignore_eos && !under_floor;
+            let hit_max = n_gen >= max_tokens;
+            if hit_eos || hit_max {
+                if !self.ctrl.eos.contains(&tok) {
+                    self.emit_text(id, tok, logprob);
+                }
+                return self.finish(
+                    id,
+                    if hit_max {
+                        FinishReason::MaxTokens
+                    } else {
+                        FinishReason::Eos
+                    },
+                );
+            }
+            self.emit_text(id, tok, logprob);
+            if is_last
+                && let Some(top) = sr.top_logprobs.clone()
+                && !top.is_empty()
+            {
+                self.emit(id, GenEvent::TokenLogprobs { id: tok, top });
+            }
+            if let Some(st) = self.running.get_mut(&id) {
+                st.next_token = tok;
+                st.phase = Phase::DecodeUnd;
+                if let Some(matcher) = &mut st.grammar {
+                    matcher.advance(tok);
+                }
+            }
+            if mode == GenMode::AutoInterleave
+                && images_done < max_images
+                && !self.ctrl.image_start_ids.is_empty()
+            {
+                let triggered = self
+                    .running
+                    .get(&id)
+                    .map(|s| ends_with(&s.generated_ids, &self.ctrl.image_start_ids))
+                    .unwrap_or(false);
+                if triggered {
+                    self.begin_image(id);
+                    return;
+                }
             }
         }
     }
@@ -3427,6 +3651,9 @@ impl Scheduler {
         }
         if kind == OpKind::DecodeUnd && !draft_token_ids.is_empty() {
             return self.resolve_spec_decode_text(id, sr, draft_token_ids);
+        }
+        if kind == OpKind::DecodeUnd {
+            return self.resolve_decode_text(id, sr);
         }
         match kind {
             OpKind::PrefillUnd | OpKind::DecodeUnd => {
@@ -3560,18 +3787,20 @@ impl Scheduler {
                 }
             }
             OpKind::DenoiseGen => {
-                let (image_id, h, w, steps) = {
+                let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
+                    let prev = st.steps_done;
                     st.steps_done = sr.num_steps_done.unwrap_or(st.steps_done + 1);
                     (
                         st.image_id,
                         st.req.image.height,
                         st.req.image.width,
                         st.req.image.steps,
+                        prev,
                     )
                 };
                 let sd = self.running.get(&id).map(|s| s.steps_done).unwrap_or(0);
-                if sd == 1 {
+                if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
                         GenEvent::ImageBegin {
@@ -3581,9 +3810,9 @@ impl Scheduler {
                             steps,
                         },
                     );
-                    self.emit(id, GenEvent::ImageStep { image_id, step: sd });
-                } else {
-                    self.emit(id, GenEvent::ImageStep { image_id, step: sd });
+                }
+                for step in prev_sd.saturating_add(1)..=sd {
+                    self.emit(id, GenEvent::ImageStep { image_id, step });
                 }
                 if sr.denoise_done
                     && let Some(st) = self.running.get_mut(&id)
@@ -3859,7 +4088,11 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 fn op_token_cost(op: &ForwardOp) -> usize {
     match op.kind {
         OpKind::PrefillUnd => (op.pos_range.1 - op.pos_range.0) as usize,
-        OpKind::DecodeUnd => 1 + op.spec_token_ids.as_ref().map_or(0, Vec::len),
+        OpKind::DecodeUnd => {
+            op.decode_token_count.unwrap_or(1).max(1) as usize
+                + op.spec_token_ids.as_ref().map_or(0, Vec::len)
+        }
+        OpKind::DenoiseGen => op.denoise_step_count.unwrap_or(1).max(1) as usize,
         _ => 1,
     }
 }
@@ -3873,6 +4106,22 @@ fn decode_lookahead_from_env() -> bool {
             )
         })
         .unwrap_or(true)
+}
+
+fn denoise_step_burst_from_env() -> u16 {
+    env::var(DENOISE_STEP_BURST_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
+}
+
+fn decode_token_burst_from_env() -> u16 {
+    env::var(DECODE_TOKEN_BURST_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_DECODE_TOKEN_BURST)
 }
 
 /// Build the wire [`CfgParams`] for a denoise op.
@@ -3900,6 +4149,7 @@ mod tests {
             kind,
             op_id,
             spec_tokens: Vec::new(),
+            decode_token_count: 1,
             started: Instant::now(),
         }
     }
@@ -3966,10 +4216,22 @@ mod tests {
             spec_token_ids: Some(vec![99]),
             ..Default::default()
         };
+        let burst_decode = ForwardOp {
+            kind: OpKind::DecodeUnd,
+            decode_token_count: Some(16),
+            ..Default::default()
+        };
+        let denoise = ForwardOp {
+            kind: OpKind::DenoiseGen,
+            denoise_step_count: Some(8),
+            ..Default::default()
+        };
 
         assert_eq!(op_token_cost(&plain), 1);
         assert_eq!(op_token_cost(&drafted), 4);
         assert_eq!(op_token_cost(&prefill), 5);
+        assert_eq!(op_token_cost(&burst_decode), 16);
+        assert_eq!(op_token_cost(&denoise), 8);
     }
 
     #[test]
@@ -4060,6 +4322,50 @@ mod tests {
             ControlTokens::default(),
             DEFAULT_MAX_BATCH,
         )
+    }
+
+    fn drain_text_tokens(rx: &mut tokio::sync::mpsc::UnboundedReceiver<GenEvent>) -> Vec<u32> {
+        let mut tokens = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let GenEvent::TextToken { id, .. } = ev {
+                tokens.push(id);
+            }
+        }
+        tokens
+    }
+
+    #[test]
+    fn spec_decode_commits_accepted_and_sampled_tokens() {
+        let mut sched = test_scheduler();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(1, 4);
+        req.event_tx = tx;
+        sched.submit_for_test(req);
+        sched.admit();
+
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.phase = Phase::DecodeUnd;
+            st.pos = 4;
+            st.next_token = 10;
+        }
+        sched.resolve_spec_decode_text(
+            id,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(13),
+                num_accepted_tokens: Some(2),
+                ..Default::default()
+            },
+            vec![11, 12],
+        );
+
+        let st = sched.running.get(&id).expect("request still running");
+        assert_eq!(st.pos, 7);
+        assert_eq!(st.n_generated, 3);
+        assert_eq!(st.generated_ids, vec![11, 12, 13]);
+        assert_eq!(st.next_token, 13);
+        assert_eq!(drain_text_tokens(&mut rx), vec![11, 12, 13]);
     }
 
     // the waiting queue is bounded — submits past `max_num_waiting` are

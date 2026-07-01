@@ -519,6 +519,16 @@ def copy_text_decode_graph_inputs(
     if actual_batch < state.batch_size:
         state.input_ids[actual_batch:].zero_()
         state.positions[actual_batch:].zero_()
+    source_cache = getattr(attention_metadata, "cache", None)
+    if isinstance(state.cache, BatchedPagedRequestCache) and isinstance(source_cache, BatchedPagedRequestCache):
+        if len(source_cache.block_ids_by_row) != actual_batch or len(source_cache.base_lens) != actual_batch:
+            raise invalid_descriptor("decode CUDA graph cache row batch mismatch")
+        graph_block_rows = [list(row) for row in source_cache.block_ids_by_row]
+        graph_base_lens = [int(length) for length in source_cache.base_lens]
+        if actual_batch < state.batch_size:
+            graph_block_rows.extend([] for _ in range(state.batch_size - actual_batch))
+            graph_base_lens.extend(0 for _ in range(state.batch_size - actual_batch))
+        state.cache.reset_rows(graph_block_rows, graph_base_lens)
     block_table = attention_metadata.block_table
     if block_table is None:
         raise invalid_descriptor("decode CUDA graph block table is missing")

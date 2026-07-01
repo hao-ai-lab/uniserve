@@ -213,6 +213,15 @@ table ForwardOp {
   // the logits a `sample` op reads). base64 of the opaque Locator bytes — a
   // small descriptor, like image_b64; the host never parses it.
   locator:string;
+  // Number of sequential denoise timesteps this op asks the worker to execute.
+  // Scalar descriptor only; append-only for FlatBuffers compatibility.
+  denoise_step_count:ushort = null;
+  // Number of sequential greedy text decode tokens this op asks the worker to
+  // execute. Scalar descriptor only; append-only for FlatBuffers compatibility.
+  decode_token_count:ushort = null;
+  // Token ids that force a decode burst to stop immediately after sampling.
+  // Small id list only; append-only for FlatBuffers compatibility.
+  decode_stop_token_ids:[uint];
 }
 
 table ForwardBatch {
@@ -242,6 +251,10 @@ table SeqResult {
   // / embedding). base64 of the opaque Locator bytes; the host routes it to the
   // consumer op verbatim.
   locator:string;
+  // Tokens sampled by a sequential decode burst. Small id list only; append-only
+  // for FlatBuffers compatibility. `sampled_token_id` remains the last token for
+  // old scalar consumers.
+  sampled_token_ids:[uint];
 }
 
 table ForwardResult {

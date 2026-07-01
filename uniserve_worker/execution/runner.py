@@ -809,7 +809,10 @@ class ModelRunner:
 
     def _advance_op_state(self, mode: ForwardMode, result: Any) -> None:
         if mode == ForwardMode.DENOISE:
-            self.request_states.advance_denoise(int(result["req_id"]))
+            self.request_states.advance_denoise(
+                int(result["req_id"]),
+                int(result["num_steps_done"]) if result.get("num_steps_done") is not None else None,
+            )
         elif mode == ForwardMode.COMMIT:
             req_id = int(result["req_id"])
             self._accountant.release_class_if_managed("image_latent", req_id)
@@ -827,6 +830,11 @@ class ModelRunner:
     def _op_token_count(self, op: Mapping[str, Any]) -> int:
         mode = mode_for_op(str(op.get("kind")))
         if mode in _TEXT_DRIVER_MODES:
+            if mode == ForwardMode.DECODE:
+                try:
+                    return max(1, int(op.get("decode_token_count") or 1))
+                except (TypeError, ValueError):
+                    raise invalid_descriptor("decode_token_count must be a positive integer") from None
             tokens = op.get("token_ids") or []
             return len(tokens) if isinstance(tokens, (list, tuple)) else 0
         if mode == ForwardMode.DENOISE:
@@ -835,8 +843,13 @@ class ModelRunner:
             cfg = op.get("cfg")
             # Token throughput count matches denoise_driver branch iterations.
             branch_count = int(cfg.get("branch_count") or 1) if isinstance(cfg, Mapping) else 1
+            step_count = max(1, int(op.get("denoise_step_count") or 1))
             latent_rule = self.resource_plan.image_latent or LatentTokens(downsample=16)
-            return self._accountant.latent_units(op, state.image, latent_rule) * max(1, branch_count)
+            return (
+                self._accountant.latent_units(op, state.image, latent_rule)
+                * max(1, branch_count)
+                * step_count
+            )
         if mode == ForwardMode.COMMIT:
             req_id = int(op["req_id"])
             state = self.request_states.get(req_id)

@@ -226,6 +226,9 @@ fn op_to_fb(op: &ForwardOp) -> anyhow::Result<fbs::ForwardOpT> {
         recent_tokens: op.recent_tokens.clone(),
         mm_hash: op.mm_hash,
         spec_token_ids: op.spec_token_ids.clone(),
+        denoise_step_count: op.denoise_step_count,
+        decode_token_count: op.decode_token_count,
+        decode_stop_token_ids: op.decode_stop_token_ids.clone(),
         op_id: op.op_id,
         logits_handle: op.logits_handle,
         locator: op.locator.clone(),
@@ -258,6 +261,9 @@ fn op_from_fb(op: fbs::ForwardOpT) -> anyhow::Result<ForwardOp> {
         recent_tokens: op.recent_tokens,
         mm_hash: op.mm_hash,
         spec_token_ids: op.spec_token_ids,
+        denoise_step_count: op.denoise_step_count,
+        decode_token_count: op.decode_token_count,
+        decode_stop_token_ids: op.decode_stop_token_ids,
         op_id: op.op_id,
         logits_handle: op.logits_handle,
         locator: op.locator,
@@ -384,6 +390,7 @@ fn seq_result_to_fb(sr: &SeqResult) -> fbs::SeqResultT {
                 })
                 .collect()
         }),
+        sampled_token_ids: sr.sampled_token_ids.clone(),
         encoder_handle: sr.encoder_handle,
         num_tokens: sr.num_tokens,
         num_accepted_tokens: sr.num_accepted_tokens,
@@ -412,6 +419,7 @@ fn seq_result_from_fb(sr: fbs::SeqResultT) -> SeqResult {
                 .map(|item| (item.token_id, item.logprob))
                 .collect()
         }),
+        sampled_token_ids: sr.sampled_token_ids,
         encoder_handle: sr.encoder_handle,
         num_tokens: sr.num_tokens,
         num_accepted_tokens: sr.num_accepted_tokens,

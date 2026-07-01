@@ -153,6 +153,17 @@ pub struct ForwardOp {
     /// Reserved contract field: draft tokens for worker-side verify-and-accept
     /// speculative decoding. No drafter exists yet — this is the wire seam only.
     pub spec_token_ids: Option<Vec<u32>>,
+    /// Number of sequential denoise timesteps to run inside this op. This is a
+    /// scalar scheduler hint; the worker still returns one result with
+    /// `num_steps_done` set to the cumulative timestep cursor.
+    pub denoise_step_count: Option<u16>,
+    /// Number of sequential greedy text decode tokens to run inside this op.
+    /// This is a scalar scheduler hint; the worker still returns one result
+    /// with `sampled_token_ids` carrying every committed sampled token.
+    pub decode_token_count: Option<u16>,
+    /// Token ids that force a worker-side decode burst to stop immediately
+    /// after sampling. Small id list only; typically EOS/stop/image triggers.
+    pub decode_stop_token_ids: Option<Vec<u32>>,
     // ---- op-lifecycle id so the host correlates this op's result with the
     // submitted op. Scalar, never a tensor. ----
     pub op_id: Option<u64>,
@@ -187,6 +198,9 @@ impl Default for ForwardOp {
             recent_tokens: None,
             mm_hash: None,
             spec_token_ids: None,
+            denoise_step_count: None,
+            decode_token_count: None,
+            decode_stop_token_ids: None,
             image_b64: None,
             op_id: None,
             logits_handle: None,
@@ -219,6 +233,9 @@ pub struct SeqResult {
     pub sampled_logprob: Option<f32>,
     /// Top-`n_logprobs` `(token_id, logprob)` pairs for this step.
     pub top_logprobs: Option<Vec<(u32, f32)>>,
+    /// All token ids sampled by a sequential text decode burst. Small id list;
+    /// `sampled_token_id` remains the last token for scalar consumers.
+    pub sampled_token_ids: Option<Vec<u32>>,
     // ---- opaque worker-side handle to the encoder output produced by a
     // VitEncode/VaeEncode op. The embedding itself never returns to the host. ----
     pub encoder_handle: Option<u64>,
@@ -789,6 +806,9 @@ mod tests {
                 recent_tokens: Some(vec![3]),
                 mm_hash: Some(0xABCD),
                 spec_token_ids: Some(vec![5]),
+                denoise_step_count: Some(2),
+                decode_token_count: Some(4),
+                decode_stop_token_ids: Some(vec![9, 10]),
                 op_id: Some(44),
                 logits_handle: Some(0xBEEF),
                 locator: Some("bG9jYXRvcg==".into()),
@@ -808,6 +828,9 @@ mod tests {
             Some("clean scenic destination photograph")
         );
         assert_eq!(batch.ops[0].op_id, Some(44));
+        assert_eq!(batch.ops[0].denoise_step_count, Some(2));
+        assert_eq!(batch.ops[0].decode_token_count, Some(4));
+        assert_eq!(batch.ops[0].decode_stop_token_ids, Some(vec![9, 10]));
         assert_eq!(batch.ops[0].logits_handle, Some(0xBEEF));
         assert_eq!(batch.ops[0].locator.as_deref(), Some("bG9jYXRvcg=="));
     }
@@ -886,6 +909,8 @@ mod tests {
                     req_id: RequestId(5),
                     image_hw: Some((2048, 1152)),
                     image_png_b64: Some("AAAA".into()),
+                    sampled_token_id: Some(42),
+                    sampled_token_ids: Some(vec![40, 41, 42]),
                     op_id: Some(44),
                     logits_handle: Some(0x1234),
                     locator: Some("c2VxbG9j".into()),
@@ -918,6 +943,8 @@ mod tests {
         assert_eq!(forward_stats.flashinfer_decode_plan_calls, 2);
         assert_eq!(forward_stats.spec_verify_accepted_tokens, 3);
         assert_eq!(result.per_seq[0].image_hw, Some((2048, 1152)));
+        assert_eq!(result.per_seq[0].sampled_token_id, Some(42));
+        assert_eq!(result.per_seq[0].sampled_token_ids, Some(vec![40, 41, 42]));
         assert_eq!(result.per_seq[0].op_id, Some(44));
         assert_eq!(result.per_seq[0].logits_handle, Some(0x1234));
         assert_eq!(result.per_seq[0].locator.as_deref(), Some("c2VxbG9j"));
@@ -1163,24 +1190,27 @@ mod tests {
             req_id: _,
             kind: _,
             modality: _,
-            new_block_ids: _,   // logical block ids (scalars), never KV bytes
-            pos_range: _,       // (u32, u32) descriptor
-            token_ids: _,       // input token ids — small id list, not logits
-            token_source: _,    // enum selector
-            timestep_idx: _,    // scalar
-            cond_pos: _,        // scalar
-            cfg: _,             // CfgParams descriptor (scalars only)
-            image_in: _,        // StagedImageId handle (scalar)
-            image_prompt: _,    // short prompt string descriptor
-            image_b64: _,       // input image bytes (b64), output-style small result
-            group_id: _,        // scalar
-            allowed_tokens: _,  // id list
-            suppress_tokens: _, // id list
-            recent_tokens: _,   // bounded id list
-            mm_hash: _,         // content hash (scalar)
-            spec_token_ids: _,  // draft token ids (scalars)
-            op_id: _,           // lifecycle id (scalar)
-            logits_handle: _,   // opaque logits handle (scalar); logits stay off-wire
+            new_block_ids: _,         // logical block ids (scalars), never KV bytes
+            pos_range: _,             // (u32, u32) descriptor
+            token_ids: _,             // input token ids — small id list, not logits
+            token_source: _,          // enum selector
+            timestep_idx: _,          // scalar
+            cond_pos: _,              // scalar
+            cfg: _,                   // CfgParams descriptor (scalars only)
+            image_in: _,              // StagedImageId handle (scalar)
+            image_prompt: _,          // short prompt string descriptor
+            image_b64: _,             // input image bytes (b64), output-style small result
+            group_id: _,              // scalar
+            allowed_tokens: _,        // id list
+            suppress_tokens: _,       // id list
+            recent_tokens: _,         // bounded id list
+            mm_hash: _,               // content hash (scalar)
+            spec_token_ids: _,        // draft token ids (scalars)
+            denoise_step_count: _,    // scalar burst count for sequential denoise
+            decode_token_count: _,    // scalar burst count for sequential text decode
+            decode_stop_token_ids: _, // id list of scalar burst stop tokens
+            op_id: _,                 // lifecycle id (scalar)
+            logits_handle: _,         // opaque logits handle (scalar); logits stay off-wire
             locator: _, // base64 data-plane locator (small descriptor); tensor stays off-wire
         } = ForwardOp::default();
 
@@ -1193,6 +1223,7 @@ mod tests {
             image_hw: _,            // (u32, u32) descriptor
             sampled_logprob: _,     // scalar
             top_logprobs: _,        // (id, logprob) scalar pairs, never a logits tensor
+            sampled_token_ids: _,   // sampled token id list, never logits
             encoder_handle: _,      // opaque handle (scalar); embedding stays worker-side
             num_tokens: _,          // scalar
             num_accepted_tokens: _, // scalar

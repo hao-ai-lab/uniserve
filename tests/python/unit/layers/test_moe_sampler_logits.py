@@ -447,7 +447,29 @@ def test_ops_qk_norm_rope_batched_multi_axis_preserves_batch_tables():
     torch.testing.assert_close(got_k, ref_k)
 
 
-def test_triton_qk_norm_rope_override_declines_multi_axis_gqa():
+def test_triton_qk_norm_rope_provider_dispatches_multi_axis(monkeypatch):
+    from uniserve_worker.ops.providers import _TritonQKNormRopeProvider
+    from uniserve_worker.ops.requests import QKNormRopeReq
+
+    q = torch.empty(1, 1, 1, 8)
+    k = torch.empty(1, 1, 1, 8)
+    axis_dims = (4, 2, 2)
+    q_weights = (torch.empty(4), torch.empty(4), torch.empty(4))
+    k_weights = (torch.empty(4), torch.empty(4), torch.empty(4))
+    cos = (torch.empty(1, 2), torch.empty(1, 1), torch.empty(1, 1))
+    sin = (torch.empty(1, 2), torch.empty(1, 1), torch.empty(1, 1))
+    req = QKNormRopeReq(q, k, q_weights, k_weights, cos, sin, 1e-6, axis_dims=axis_dims)
+    marker = (object(), object())
+    provider = _TritonQKNormRopeProvider()
+
+    monkeypatch.setattr(provider, "_can_run_multi_axis", lambda seen: seen is req)
+    monkeypatch.setattr(provider, "_run_multi_axis", lambda seen: marker if seen is req else None)
+
+    assert provider.can_run(req)
+    assert provider.run(req) is marker
+
+
+def test_triton_qk_norm_rope_override_falls_back_when_multi_axis_ineligible():
     import uniserve_worker.ops as ops
     from uniserve_worker.ops.providers import _TritonQKNormRopeProvider
     from uniserve_worker.ops.requests import QKNormRopeReq
@@ -478,7 +500,7 @@ def test_triton_qk_norm_rope_override_declines_multi_axis_gqa():
 
     provider = _TritonQKNormRopeProvider()
     assert not provider.can_run(req)
-    with pytest.raises(RuntimeError, match="axis_dims"):
+    with pytest.raises(RuntimeError, match="ineligible"):
         provider.run(req)
 
     got_q, got_k = ops.qk_norm_rope(
@@ -505,6 +527,64 @@ def test_triton_qk_norm_rope_override_declines_multi_axis_gqa():
     )
     torch.testing.assert_close(got_q, ref_q)
     torch.testing.assert_close(got_k, ref_k)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_triton_qk_norm_rope_grouped_multi_axis_matches_eager_cuda():
+    import uniserve_worker.ops as ops
+    from uniserve_worker.foundation.triton_compat import triton_device_supported
+
+    if not triton_device_supported(torch.device("cuda")):
+        pytest.skip("Triton fused layers are not supported on this CUDA device")
+
+    torch.manual_seed(127)
+    batch, seq_len, q_heads, k_heads = 1, 1, 16, 4
+    axis_dims = (64, 32, 32)
+    dtype = torch.bfloat16
+    device = torch.device("cuda")
+    q = torch.randn(batch, q_heads, seq_len, sum(axis_dims), dtype=dtype, device=device)
+    k = torch.randn(batch, k_heads, seq_len, sum(axis_dims), dtype=dtype, device=device)
+    q_t = torch.randn(axis_dims[0], dtype=dtype, device=device)
+    k_t = torch.randn(axis_dims[0], dtype=dtype, device=device)
+    q_hw = torch.randn(axis_dims[1] + axis_dims[2], dtype=dtype, device=device)
+    k_hw = torch.randn(axis_dims[1] + axis_dims[2], dtype=dtype, device=device)
+    table_positions = torch.arange(batch * seq_len, dtype=torch.float32, device=device)
+    cos = (
+        torch.cos(table_positions[:, None] + torch.arange(axis_dims[0] // 2, device=device)).to(dtype),
+        torch.cos(table_positions[:, None] + torch.arange(axis_dims[1] // 2, device=device)).to(dtype),
+        torch.cos(table_positions[:, None] + torch.arange(axis_dims[2] // 2, device=device)).to(dtype),
+    )
+    sin = (
+        torch.sin(table_positions[:, None] + torch.arange(axis_dims[0] // 2, device=device)).to(dtype),
+        torch.sin(table_positions[:, None] + torch.arange(axis_dims[1] // 2, device=device)).to(dtype),
+        torch.sin(table_positions[:, None] + torch.arange(axis_dims[2] // 2, device=device)).to(dtype),
+    )
+
+    with torch.inference_mode():
+        got_q, got_k = ops.qk_norm_rope(
+            q,
+            k,
+            (q_t, q_hw, q_hw),
+            (k_t, k_hw, k_hw),
+            cos,
+            sin,
+            1e-6,
+            axis_dims=axis_dims,
+            override="triton",
+        )
+        ref_q, ref_k = ops.qk_norm_rope(
+            q,
+            k,
+            (q_t, q_hw, q_hw),
+            (k_t, k_hw, k_hw),
+            cos,
+            sin,
+            1e-6,
+            axis_dims=axis_dims,
+            override="eager",
+        )
+    torch.testing.assert_close(got_q, ref_q, atol=8e-2, rtol=8e-2)
+    torch.testing.assert_close(got_k, ref_k, atol=8e-2, rtol=8e-2)
 
 
 def test_ops_qk_norm_grouped_multi_axis_matches_reference():

@@ -22,7 +22,9 @@ def pil_image_to_png_b64(image: Image.Image) -> str:
     format is chosen in exactly one place.
     """
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    # Lossless PNG: lower compression keeps pixels identical while avoiding
+    # spending hundreds of milliseconds per 2K generated image on CPU deflate.
+    image.save(buffer, format="PNG", compress_level=1)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 

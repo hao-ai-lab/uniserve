@@ -201,11 +201,10 @@ def try_triton_qk_rms_norm_rope(
     q_eps: float,
     k_eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not _qk_rms_norm_rope_is_eligible(q, k, q_weight, k_weight, cos, sin):
+    if not can_run_triton_qk_rms_norm_rope(q, k, q_weight, k_weight, cos, sin, q_eps, k_eps):
         return None
     shape = _qk_rms_norm_rope_shape(q, k)
-    if shape is None:
-        return None
+    assert shape is not None
     q_tokens, k_tokens, q_heads, k_heads, dim = shape
     q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
     k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
@@ -238,6 +237,23 @@ def try_triton_qk_rms_norm_rope(
         num_warps=4,
     )
     return q_out, k_out
+
+
+def can_run_triton_qk_rms_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    q_eps: float,
+    k_eps: float,
+) -> bool:
+    del q_eps, k_eps
+    return (
+        _qk_rms_norm_rope_is_eligible(q, k, q_weight, k_weight, cos, sin)
+        and _qk_rms_norm_rope_shape(q, k) is not None
+    )
 
 
 def _qk_rms_norm_rope_is_eligible(

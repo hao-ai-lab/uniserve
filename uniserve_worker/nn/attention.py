@@ -32,6 +32,7 @@ class AttentionPath(enum.Enum):
 
     CONTIGUOUS_VARLEN = "contiguous_varlen"
     PAGED_VARLEN = "paged_varlen"
+    TRANSIENT_PAGED_VARLEN = "transient_paged_varlen"
     PAGED_DECODE = "paged_decode"
     EMPTY_PAGED_PREFILL = "empty_paged_prefill"
     DENSE = "dense"
@@ -113,6 +114,10 @@ class RadixAttention(nn.Module):
             return self._forward_paged_varlen(
                 ctx, preferred, q, k, v, causal=causal, scale=effective_scale
             )
+        if path is AttentionPath.TRANSIENT_PAGED_VARLEN:
+            return self._forward_transient_paged_varlen(
+                ctx, preferred, q, k, v, kv_cache=kv_cache, causal=causal, scale=effective_scale
+            )
         if path is AttentionPath.PAGED_DECODE:
             return self._forward_paged_decode(
                 ctx, preferred, q, k, v, kv_cache=kv_cache, causal=causal, scale=effective_scale
@@ -162,6 +167,8 @@ class RadixAttention(nn.Module):
                 return AttentionPath.CONTIGUOUS_VARLEN
             if self._can_run_paged_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
                 return AttentionPath.PAGED_VARLEN
+            if self._can_run_transient_paged_varlen(ctx, preferred, kv_cache, q, k, v):
+                return AttentionPath.TRANSIENT_PAGED_VARLEN
 
         if paged_eligible:
             if self.can_run_paged_attention(q, attn_mask, kv_cache=kv_cache, preferred=preferred, ctx=ctx):
@@ -259,6 +266,54 @@ class RadixAttention(nn.Module):
             override=self._attention_override(ctx, preferred),
         )
         return self._restore_padded_varlen_output(out, q, raw_tokens)
+
+    def _forward_transient_paged_varlen(
+        self,
+        ctx,
+        preferred: str,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        kv_cache,
+        causal: bool,
+        scale: float,
+    ) -> torch.Tensor:
+        metadata = self._transient_varlen_metadata(kv_cache, q)
+        if metadata is None:
+            raise RuntimeError("transient paged-varlen attention became ineligible")
+        query_lens_cpu, block_table, cache_seqlens, cu_seqlens_q, cu_seqlens_k, max_q, max_k = metadata
+        q_run = self._flatten_bhld(q)
+        k_run = self._flatten_bhld(k)
+        v_run = self._flatten_bhld(v)
+        kv_cache.append_varlen(
+            self.layer_id,
+            k_run,
+            v_run,
+            query_lens_cpu,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+        )
+        k_cache, v_cache = kv_cache.pool.layer_cache(self.layer_id)
+        out = ops.attention(
+            q_run,
+            k_cache,
+            v_cache,
+            regime=ops.AttentionRegime.EXTEND,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=causal,
+            scale=scale,
+            block_table=block_table,
+            ctx=ctx,
+            kv_cache=kv_cache,
+            override=self._attention_override(ctx, preferred),
+        )
+        batch, _heads, q_len, _head_dim = q.shape
+        return out.view(batch, q_len, int(out.shape[1]), int(out.shape[2])).transpose(1, 2).contiguous()
 
     def _forward_paged_decode(
         self,
@@ -645,6 +700,114 @@ class RadixAttention(nn.Module):
             ctx=ctx,
             override=RadixAttention._attention_override(ctx, preferred),
         )
+
+    @staticmethod
+    def _can_run_transient_paged_varlen(
+        ctx,
+        preferred: str,
+        kv_cache,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> bool:
+        if k.ndim != 4 or v.ndim != 4:
+            return False
+        if int(k.shape[0]) != int(q.shape[0]) or int(v.shape[0]) != int(q.shape[0]):
+            return False
+        if int(k.shape[2]) != int(q.shape[2]) or int(v.shape[2]) != int(q.shape[2]):
+            return False
+        metadata = RadixAttention._transient_varlen_metadata(kv_cache, q)
+        if metadata is None:
+            return False
+        _query_lens_cpu, block_table, _cache_seqlens, cu_seqlens_q, cu_seqlens_k, max_q, max_k = metadata
+        q_probe = q.new_empty((1, int(q.shape[1]), int(q.shape[3])))
+        k_probe = k.new_empty((1, int(k.shape[1]), int(k.shape[3])))
+        v_probe = v.new_empty((1, int(v.shape[1]), int(v.shape[3])))
+        return ops.can_run_attention(
+            q_probe,
+            k_probe,
+            v_probe,
+            regime=ops.AttentionRegime.EXTEND,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=True,
+            scale=1.0,
+            block_table=block_table,
+            kv_cache=kv_cache,
+            ctx=ctx,
+            override=RadixAttention._attention_override(ctx, preferred),
+        )
+
+    @staticmethod
+    def _transient_varlen_metadata(kv_cache, q: torch.Tensor):
+        if q.ndim != 4 or int(q.shape[2]) <= 1:
+            return None
+        batch = int(q.shape[0])
+        q_len = int(q.shape[2])
+        if batch <= 0 or q_len <= 0:
+            return None
+        if not (
+            hasattr(kv_cache, "pool")
+            and callable(getattr(kv_cache, "block_table", None))
+            and callable(getattr(kv_cache, "cache_seqlens", None))
+            and callable(getattr(kv_cache, "append_varlen", None))
+        ):
+            return None
+        base_lens = getattr(kv_cache, "base_lens", None)
+        if base_lens is None:
+            base_len = getattr(kv_cache, "base_len", None)
+            if base_len is None:
+                return None
+            base_lens = (int(base_len),)
+        else:
+            base_lens = tuple(int(length) for length in base_lens)
+        if len(base_lens) != batch or any(length < 0 for length in base_lens):
+            return None
+        device = q.device
+        key = (
+            str(device),
+            tuple(base_lens),
+            q_len,
+        )
+        cached = getattr(kv_cache, "_transient_varlen_metadata", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        block_table = kv_cache.block_table(device=device)
+        cache_seqlens = kv_cache.cache_seqlens(device=device)
+        if int(block_table.shape[0]) != batch or int(cache_seqlens.shape[0]) != batch:
+            return None
+        query_lens_cpu = tuple(q_len for _ in base_lens)
+        kv_lens_cpu = tuple(int(base_len) + q_len for base_len in base_lens)
+        cu_q_values = [0]
+        cu_k_values = [0]
+        for query_len, kv_len in zip(query_lens_cpu, kv_lens_cpu, strict=True):
+            cu_q_values.append(cu_q_values[-1] + int(query_len))
+            cu_k_values.append(cu_k_values[-1] + int(kv_len))
+        cu_seqlens_q = torch.tensor(cu_q_values, dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor(cu_k_values, dtype=torch.int32, device=device)
+        metadata = (
+            query_lens_cpu,
+            block_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max(query_lens_cpu, default=0),
+            max(kv_lens_cpu, default=0),
+        )
+        try:
+            setattr(kv_cache, "_transient_varlen_metadata", (key, metadata))
+        except Exception:
+            pass
+        return metadata
+
+    @staticmethod
+    def _flatten_bhld(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim != 4:
+            raise invalid_descriptor("transient paged-varlen attention expects [batch, heads, tokens, dim]")
+        batch, heads, tokens, dim = tensor.shape
+        return tensor.transpose(1, 2).reshape(int(batch) * int(tokens), int(heads), int(dim)).contiguous()
 
     @staticmethod
     def _raise_unsupported_paged_fallback(kv_cache) -> None:

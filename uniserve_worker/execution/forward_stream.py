@@ -1,7 +1,7 @@
 """Side-table builder for packed multimodal forward streams."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Literal
@@ -160,13 +160,24 @@ class ForwardPagedKVView:
             required = end if seg.write_kv else seg.base_len
             if required > len(seg.block_ids) * pool.block_size:
                 raise invalid_descriptor("forward paged segment blocks do not cover current append")
+        self._block_table_cache: dict[torch.device, torch.Tensor] = {}
+        self._cache_seqlens_before_cache: dict[torch.device, torch.Tensor] = {}
+        self._cache_seqlens_after_cache: dict[torch.device, torch.Tensor] = {}
+        self._persistent_cache_seqlens_after_cache: dict[torch.device, torch.Tensor] = {}
+
+    def _target_device(self, device: torch.device | str | None = None) -> torch.device:
+        return torch.device(device if device is not None else self.pool.k.device)
 
     def block_table(self, *, device: torch.device | str | None = None) -> torch.Tensor:
+        target = self._target_device(device)
+        cached = self._block_table_cache.get(target)
+        if cached is not None:
+            return cached
         max_blocks = max(len(seg.block_ids) for seg in self.segments)
         out = torch.zeros(
             (len(self.segments), max_blocks),
             dtype=torch.int32,
-            device=device if device is not None else self.pool.k.device,
+            device=target,
         )
         for row, seg in enumerate(self.segments):
             if seg.block_ids:
@@ -175,20 +186,21 @@ class ForwardPagedKVView:
                     dtype=torch.int32,
                     device=out.device,
                 )
+        self._block_table_cache[target] = out
         return out
 
     def cache_seqlens_before(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        return torch.tensor(
-            [seg.base_len for seg in self.segments],
-            dtype=torch.int32,
-            device=device if device is not None else self.pool.k.device,
+        return self._cached_int_vector(
+            self._cache_seqlens_before_cache,
+            (seg.base_len for seg in self.segments),
+            device=device,
         )
 
     def cache_seqlens_after(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        return torch.tensor(
-            [seg.base_len + seg.q_len for seg in self.segments],
-            dtype=torch.int32,
-            device=device if device is not None else self.pool.k.device,
+        return self._cached_int_vector(
+            self._cache_seqlens_after_cache,
+            (seg.base_len + seg.q_len for seg in self.segments),
+            device=device,
         )
 
     def persistent_cache_seqlens_after(
@@ -196,14 +208,29 @@ class ForwardPagedKVView:
         *,
         device: torch.device | str | None = None,
     ) -> torch.Tensor:
-        return torch.tensor(
-            [
+        return self._cached_int_vector(
+            self._persistent_cache_seqlens_after_cache,
+            (
                 seg.base_len + seg.q_len if seg.persist_kv else seg.base_len
                 for seg in self.segments
-            ],
-            dtype=torch.int32,
-            device=device if device is not None else self.pool.k.device,
+            ),
+            device=device,
         )
+
+    def _cached_int_vector(
+        self,
+        cache: dict[torch.device, torch.Tensor],
+        values: Iterable[int],
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        target = self._target_device(device)
+        cached = cache.get(target)
+        if cached is not None:
+            return cached
+        out = torch.tensor(list(values), dtype=torch.int32, device=target)
+        cache[target] = out
+        return out
 
     def append_packed(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         if k.shape != v.shape:

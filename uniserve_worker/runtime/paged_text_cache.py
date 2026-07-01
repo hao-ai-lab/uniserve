@@ -123,11 +123,15 @@ class PagedTextCache:
         self._active_start: int | None = None
         self._active_count: int | None = None
         self._updated_layers: set[int] = set()
+        self._update_view_cache: tuple[tuple[Any, ...], Any] | None = None
+        self._transient_view_cache: tuple[tuple[Any, ...], Any] | None = None
         if self.length:
             self.ensure_capacity(self.length)
 
     def set_blocks(self, block_ids: list[int] | tuple[int, ...]) -> None:
         self.block_ids = self.pool.validate_block_ids(block_ids)
+        self._update_view_cache = None
+        self._transient_view_cache = None
         self.ensure_capacity(self.length)
 
     def ensure_capacity(self, end: int) -> None:
@@ -142,6 +146,8 @@ class PagedTextCache:
             )
         needed = ceil_div(missing_tokens, self.pool.block_size)
         self.block_ids.extend(self.pool.validate_block_ids(self.allocate_blocks(needed)))
+        self._update_view_cache = None
+        self._transient_view_cache = None
         # ``allocate_blocks`` is only required to extend the contiguous tail; a
         # short return (fewer blocks than requested) would otherwise leave the
         # cache silently under-provisioned and surface as a confusing span error
@@ -156,7 +162,13 @@ class PagedTextCache:
     def request_cache_for_update(self, layer_idx: int, n_tokens: int):
         start = self.begin_layer_update(layer_idx, n_tokens)
         self.ensure_capacity(start + int(n_tokens))
-        return self.pool.view(self.block_ids, start)
+        key = (tuple(int(block_id) for block_id in self.block_ids), int(start))
+        cached = self._update_view_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        view = self.pool.view(self.block_ids, start)
+        self._update_view_cache = (key, view)
+        return view
 
     def request_cache_for_transient(self, layer_idx: int, n_tokens: int):
         """Return a page view for temporary tokens without advancing length.
@@ -170,13 +182,20 @@ class PagedTextCache:
         del layer_idx
         start = int(self.length)
         self.ensure_capacity(start + int(n_tokens))
-        return self.pool.view(self.block_ids, start)
+        key = (tuple(int(block_id) for block_id in self.block_ids), start)
+        cached = self._transient_view_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        view = self.pool.view(self.block_ids, start)
+        self._transient_view_cache = (key, view)
+        return view
 
     def cancel_layer_update(self, layer_idx: int) -> None:
         self._updated_layers.discard(int(layer_idx))
         if not self._updated_layers:
             self._active_start = None
             self._active_count = None
+            self._update_view_cache = None
 
     @contextmanager
     def span_update(self, layer_idx: int, n_tokens: int) -> Iterator[int]:
@@ -215,6 +234,7 @@ class PagedTextCache:
             self._active_start = self.length
             self._active_count = n_tokens
             self._updated_layers.clear()
+            self._update_view_cache = None
         elif self._active_count != n_tokens:
             raise invalid_descriptor(
                 "all layers in one paged cache update must append the same token count"
@@ -228,6 +248,7 @@ class PagedTextCache:
             self._active_start = None
             self._active_count = None
             self._updated_layers.clear()
+            self._update_view_cache = None
 
 
 class BatchedPagedRequestCache:
@@ -250,6 +271,25 @@ class BatchedPagedRequestCache:
             raise invalid_descriptor("batched paged request cache lengths must be non-negative")
         self.base_len = max(self.base_lens, default=0)
         self._append_plan: _VarlenAppendPlan | None = None
+        self._block_table_cache: dict[torch.device, torch.Tensor] = {}
+        self._cache_seqlens_cache: dict[torch.device, torch.Tensor] = {}
+
+    def reset_rows(
+        self,
+        block_ids_by_row: Sequence[Sequence[int]],
+        base_lens: Sequence[int],
+    ) -> None:
+        if len(block_ids_by_row) != len(self.block_ids_by_row) or len(base_lens) != len(self.base_lens):
+            raise invalid_descriptor("batched paged request cache reset shape mismatch")
+        new_lens = [int(length) for length in base_lens]
+        if any(length < 0 for length in new_lens):
+            raise invalid_descriptor("batched paged request cache lengths must be non-negative")
+        self.block_ids_by_row = [self.pool.validate_block_ids(ids) for ids in block_ids_by_row]
+        self.base_lens = new_lens
+        self.base_len = max(self.base_lens, default=0)
+        self._append_plan = None
+        self._block_table_cache.clear()
+        self._cache_seqlens_cache.clear()
 
     def block_table(
         self,
@@ -260,6 +300,10 @@ class BatchedPagedRequestCache:
         max_blocks = max(len(ids) for ids in self.block_ids_by_row)
         row_count = len(self.block_ids_by_row)
         target = torch.device(device if device is not None else self.pool.k.device)
+        if stager is None:
+            cached = self._block_table_cache.get(target)
+            if cached is not None:
+                return cached
         cpu = _cpu_int_buffer(
             row_count * max_blocks,
             pin=target.type == "cuda",
@@ -268,13 +312,16 @@ class BatchedPagedRequestCache:
         )
         _fill_block_table(cpu, self.block_ids_by_row, max_blocks)
         non_blocking = target.type == "cuda" and _is_pinned(cpu)
-        return _copy_cpu_int_to_device(
+        out = _copy_cpu_int_to_device(
             cpu,
             device=target,
             non_blocking=non_blocking,
             slot=stager,
             name="paged_block_table",
         ).view(row_count, max_blocks)
+        if stager is None:
+            self._block_table_cache[target] = out
+        return out
 
     def cache_seqlens(
         self,
@@ -283,6 +330,10 @@ class BatchedPagedRequestCache:
         stager: BufferStager | None = None,
     ) -> torch.Tensor:
         target = torch.device(device if device is not None else self.pool.k.device)
+        if stager is None:
+            cached = self._cache_seqlens_cache.get(target)
+            if cached is not None:
+                return cached
         cpu = _cpu_int_buffer(
             len(self.base_lens),
             pin=target.type == "cuda",
@@ -291,13 +342,16 @@ class BatchedPagedRequestCache:
         )
         _fill_cpu_int(cpu, self.base_lens)
         non_blocking = target.type == "cuda" and _is_pinned(cpu)
-        return _copy_cpu_int_to_device(
+        out = _copy_cpu_int_to_device(
             cpu,
             device=target,
             non_blocking=non_blocking,
             slot=stager,
             name="paged_cache_seqlens",
         )
+        if stager is None:
+            self._cache_seqlens_cache[target] = out
+        return out
 
     def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         if k.shape != v.shape:
@@ -456,6 +510,7 @@ class BatchedPagedTextCache:
                 raise invalid_descriptor("batched paged caches must have the same layer count")
         self.caches = list(caches)
         self.pool = pool
+        self._transient_view_cache: tuple[tuple[Any, ...], BatchedPagedRequestCache] | None = None
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         del layer_idx
@@ -468,11 +523,23 @@ class BatchedPagedTextCache:
             raise invalid_descriptor("batched transient cache requires positive token count")
         for cache in self.caches:
             cache.ensure_capacity(int(cache.length) + n_tokens)
-        return BatchedPagedRequestCache(
+        key = tuple(
+            (
+                tuple(int(block_id) for block_id in cache.block_ids),
+                int(cache.length),
+            )
+            for cache in self.caches
+        )
+        cached = self._transient_view_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        view = BatchedPagedRequestCache(
             self.pool,
             [cache.block_ids for cache in self.caches],
             [int(cache.length) for cache in self.caches],
         )
+        self._transient_view_cache = (key, view)
+        return view
 
 
 def _cpu_int_buffer(
@@ -486,7 +553,7 @@ def _cpu_int_buffer(
     # stager always provides it (no callable() probe needed).
     if slot is not None:
         return slot.int_buffer(name, numel, pin=pin)
-    if pin:
+    if pin and not _torch_is_compiling():
         try:
             return torch.empty(int(numel), dtype=torch.int32, pin_memory=True)
         except RuntimeError:
@@ -542,3 +609,12 @@ def _canonical_device(device: torch.device | str) -> torch.device:
 
 def _is_pinned(tensor: torch.Tensor) -> bool:
     return bool(getattr(tensor, "is_pinned", lambda: False)())
+
+
+def _torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    is_compiling = getattr(compiler, "is_compiling", None)
+    if callable(is_compiling):
+        return bool(is_compiling())
+    is_compiling = getattr(getattr(torch, "_dynamo", None), "is_compiling", None)
+    return bool(is_compiling()) if callable(is_compiling) else False
