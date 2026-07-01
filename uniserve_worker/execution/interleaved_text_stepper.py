@@ -14,6 +14,7 @@ Model-neutral: touches the concrete model only through the duck-typed
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
@@ -94,6 +95,9 @@ class InterleavedTextCacheDriver:
         self.owner = owner
         self.request_state_factory = request_state_factory
         self.image_start_token = image_start_token
+        # System-owned decode CUDA graph adapter, constructed lazily on first use
+        # so CPU/eager and non-CUDA integrations never import the graph stack.
+        self._decode_graph_runner: Any | None = None
 
     def state(self, op: dict[str, Any]) -> Any:
         req_id = int(op["req_id"])
@@ -102,7 +106,27 @@ class InterleavedTextCacheDriver:
             return hook(req_id)
         return self.owner.reqs.setdefault(req_id, self.request_state_factory())
 
+    def run_text_logits_batch(self, ops: Sequence[Mapping[str, Any]]) -> list[torch.Tensor]:
+        """Return one logits row per op, graphing the eligible one-token decode batch.
+
+        The system-owned decode graph adapter owns capture/replay for the eligible
+        one-token host-KV decode rows; a ``None`` result (ineligible batch, graph
+        miss, or non-fatal fallback) hands the whole batch to the scalar eager
+        path so no non-decode / ineligible text semantics ever change.
+        """
+
+        op_list = [dict(op) for op in ops]
+        if not op_list:
+            return []
+        graphed = self._decode_graph().maybe_run_batch(self, op_list)
+        if graphed is not None:
+            return graphed
+        return [self._run_text_logits_one(op) for op in op_list]
+
     def run_text_logits(self, op: dict[str, Any]) -> torch.Tensor:
+        return self._run_text_logits_one(dict(op))
+
+    def _run_text_logits_one(self, op: dict[str, Any]) -> torch.Tensor:
         st = self.state(op)
         self.extend_cache_blocks(st.cond, op)
         tokens = op.get("token_ids") or []
@@ -120,6 +144,15 @@ class InterleavedTextCacheDriver:
         else:
             self.append_ids(st.cond, tokens)
         return st.cond.last_logits[:, -1, :]
+
+    def _decode_graph(self) -> Any:
+        runner = self._decode_graph_runner
+        if runner is None:
+            from .interleaved_text_graph_runner import InterleavedTextDecodeGraphRunner
+
+            runner = InterleavedTextDecodeGraphRunner()
+            self._decode_graph_runner = runner
+        return runner
 
     def extend_cache_blocks(self, cache: TextCache, op: dict[str, Any]) -> None:
         # Host-issued KV block ids belong only to host-KV caches. Scratch caches

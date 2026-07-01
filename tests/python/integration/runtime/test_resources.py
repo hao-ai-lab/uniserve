@@ -69,7 +69,7 @@ def test_model_runner_resource_runtime_tracks_blocks_latents_and_drop():
     driver.execute(
         {
             "step_id": 1,
-            "new_reqs": [{"req_id": 7, "block_ids": [1, 2], "image": {"steps": 1}}],
+            "new_reqs": [{"req_id": 7, "block_ids": [1, 2], "image": {"height": 32, "width": 48, "steps": 1}}],
             "ops": [
                 {
                     "req_id": 7,
@@ -121,7 +121,7 @@ def test_model_runner_denoise_scratch_is_one_live_lease_per_cfg_branch():
     driver.execute(
         {
             "step_id": 1,
-            "new_reqs": [{"req_id": 17, "image": {"steps": 2}}],
+            "new_reqs": [{"req_id": 17, "image": {"height": 32, "width": 32, "steps": 2}}],
             "ops": [
                 {
                     "req_id": 17,
