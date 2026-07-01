@@ -316,7 +316,26 @@ def test_interleaved_text_stepper_is_system_owned():
 # type annotations but must never *construct* one (system-managed-worker-redesign
 # §6/§17 Phase 6 layering goal — "no pool/graph ownership left under models/").
 FORBIDDEN_MODEL_CONSTRUCTIONS = frozenset(
-    {"PagedKVPool", "DecodeCudaGraphRunner", "PrefillCudaGraphRunner", "TextGraphRunner"}
+    {
+        "PagedKVPool",
+        "DecodeCudaGraphRunner",
+        "PrefillCudaGraphRunner",
+        "TextGraphRunner",
+        "InterleavedTextDecodeGraphRunner",
+        # ``torch.cuda.CUDAGraph()`` — no model-local CUDA graph lifecycle. The
+        # old set omitted this, so the model-local ``_SenseNovaTextDecodeGraphRunner``
+        # (which captured its own ``torch.cuda.CUDAGraph``) slipped past the guard.
+        "CUDAGraph",
+    }
+)
+
+# Class-name shapes that denote CUDA-graph lifecycle ownership. A model may still
+# *reference* a system graph type in an annotation, but defining a class whose
+# name matches these means the model owns capture/replay state — which belongs to
+# ``execution``. Encoding the ownership shape (not a fixed name list) is what would
+# have caught ``_SenseNovaTextDecodeGraph{Runner,State,Past,RequestCache}``.
+MODEL_GRAPH_OWNER_CLASS_NAME = re.compile(
+    r"(?:CUDAGraph|CudaGraph|DecodeGraphRunner|PrefillGraphRunner|GraphRunner|GraphState|GraphPast|GraphRequestCache)"
 )
 
 
@@ -343,6 +362,25 @@ def test_models_tree_owns_no_pools_or_graphs():
             if name in FORBIDDEN_MODEL_CONSTRUCTIONS:
                 offenders.append(f"{_rel(path)}:{node.lineno} constructs {name}")
     assert offenders == [], f"models/ must not construct system-owned pools/graphs: {offenders}"
+
+
+def test_models_tree_defines_no_cuda_graph_runner_classes():
+    """Models must not *define* a CUDA-graph runner/state class.
+
+    The construction ban keyed on a fixed name list and so missed the model-local
+    ``_SenseNovaTextDecodeGraphRunner`` and its graph state/past/request-cache
+    helpers. Encode the ownership invariant by shape: no model file may define a
+    class whose name denotes CUDA-graph lifecycle ownership. Graph capture/replay
+    is a system (``execution``) responsibility.
+    """
+
+    offenders: list[str] = []
+    for path in _py_files(WORKER / "models"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and MODEL_GRAPH_OWNER_CLASS_NAME.search(node.name):
+                offenders.append(f"{_rel(path)}::{node.name}")
+    assert offenders == [], f"models/ must not define CUDA-graph runner/state classes: {offenders}"
 
 
 def test_python_tests_do_not_use_deleted_model_modules_as_live_oracles():

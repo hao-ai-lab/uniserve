@@ -20,7 +20,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 
 import uniserve_worker.ops as ops
 from ...contracts.batches import UniForwardBatch
-from ...contracts.forward_mode import ForwardMode, mode_for_op
+from ...contracts.forward_mode import ForwardMode
 from ...contracts.outputs import TextTokenOutput
 from ...contracts.resource_plan import (
     CapsDescriptor,
@@ -1834,286 +1834,6 @@ def check_checkpoint_compatibility(config_or_dict: Any) -> None:
         raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
 
 
-def _canonical_cuda_device(device: torch.device | str) -> torch.device:
-    dev = torch.device(device)
-    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return dev
-
-
-class _SenseNovaTextDecodeGraphRequestCache:
-    """Stable single-row paged-KV view used by the text decode CUDA graph."""
-
-    def __init__(self, pool: PagedKVPool, *, table_width: int, device: torch.device) -> None:
-        self.pool = pool
-        self.table_width = int(table_width)
-        self.base_len = 0
-        self.block_ids: list[int] = []
-        self._device = _canonical_cuda_device(device)
-        self._block_table = torch.empty((1, self.table_width), dtype=torch.int32, device=self._device)
-        self._cache_seqlens = torch.empty((1,), dtype=torch.int32, device=self._device)
-        self._host_block_table = self._new_host_int_buffer(self.table_width)
-        self._host_cache_seqlens = self._new_host_int_buffer(1)
-        self._last_block_ids: tuple[int, ...] | None = None
-
-    @property
-    def base_lens(self) -> tuple[int]:
-        return (int(self.base_len),)
-
-    def prepare(self, block_ids: Sequence[int], base_len: int) -> None:
-        ids = tuple(int(block_id) for block_id in block_ids)
-        if len(ids) > self.table_width:
-            raise invalid_descriptor("SenseNova text decode graph block table width is too small")
-        self.block_ids = list(ids)
-        self.base_len = int(base_len)
-        if ids != self._last_block_ids:
-            self._host_block_table.zero_()
-            for idx, block_id in enumerate(ids):
-                self._host_block_table[idx] = int(block_id)
-            self._block_table.copy_(self._host_block_table, non_blocking=self._host_block_table.is_pinned())
-            self._last_block_ids = ids
-        self._host_cache_seqlens[0] = int(base_len)
-        self._cache_seqlens.copy_(self._host_cache_seqlens, non_blocking=self._host_cache_seqlens.is_pinned())
-
-    def block_table(
-        self,
-        *,
-        device: torch.device | str | None = None,
-        stager: Any | None = None,
-    ) -> torch.Tensor:
-        del stager
-        if device is not None and _canonical_cuda_device(device) != self._device:
-            raise invalid_descriptor("SenseNova text decode graph block table device changed")
-        return self._block_table
-
-    def cache_seqlens(
-        self,
-        *,
-        device: torch.device | str | None = None,
-        stager: Any | None = None,
-    ) -> torch.Tensor:
-        del stager
-        if device is not None and _canonical_cuda_device(device) != self._device:
-            raise invalid_descriptor("SenseNova text decode graph cache seqlens device changed")
-        return self._cache_seqlens
-
-    def length(self) -> int:
-        return int(self.base_len)
-
-    def get(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        return self.pool.read(int(layer), self.block_ids, start=0, length=self.base_len)
-
-    def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        self.pool.write(int(layer), self.block_ids, start=self.base_len, k=k, v=v)
-
-    @staticmethod
-    def _new_host_int_buffer(numel: int) -> torch.Tensor:
-        try:
-            return torch.empty(int(numel), dtype=torch.int32, pin_memory=True)
-        except RuntimeError:
-            return torch.empty(int(numel), dtype=torch.int32)
-
-
-class _SenseNovaTextDecodeGraphPast:
-    """Graph-captured past object with the same update contract as PagedTextCache."""
-
-    def __init__(self, request_cache: _SenseNovaTextDecodeGraphRequestCache) -> None:
-        self.request_cache = request_cache
-        self.pool = request_cache.pool
-
-    def prepare(self, cache: PagedTextCache, *, base_len: int | None = None) -> None:
-        self.request_cache.prepare(
-            cache.block_ids,
-            int(cache.length) if base_len is None else int(base_len),
-        )
-
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        del layer_idx
-        return int(self.request_cache.base_len)
-
-    def request_cache_for_update(self, layer_idx: int, n_tokens: int):
-        del layer_idx
-        if int(n_tokens) != 1:
-            raise invalid_descriptor("SenseNova text decode graph only supports one-token decode")
-        return self.request_cache
-
-    def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
-        del layer_idx, n_tokens
-
-    def cancel_layer_update(self, layer_idx: int) -> None:
-        del layer_idx
-
-
-@dataclass
-class _SenseNovaTextDecodeGraphState:
-    graph: torch.cuda.CUDAGraph
-    input_ids: torch.Tensor
-    indexes: torch.Tensor
-    past: _SenseNovaTextDecodeGraphPast
-    logits: torch.Tensor | None = None
-
-
-class _SenseNovaTextDecodeGraphRunner:
-    """Single-row SenseNova text decode CUDA graph using the serial cache contract."""
-
-    def __init__(self) -> None:
-        self.states: dict[tuple[Any, ...], _SenseNovaTextDecodeGraphState] = {}
-        self._capture_pool: Any = None
-
-    def maybe_run(
-        self,
-        owner: "SenseNovaU1ForUnifiedGeneration",
-        op: dict[str, Any],
-    ) -> torch.Tensor | None:
-        if not bool(get_worker_config().cuda_graph):
-            return None
-        if not torch.cuda.is_available():
-            return None
-        device = _canonical_cuda_device(owner.device)
-        if device.type != "cuda":
-            return None
-        if owner.model is None:
-            return None
-        tokens = list(op.get("token_ids") or [])
-        if len(tokens) != 1:
-            return None
-        if mode_for_op(str(op.get("kind"))) != ForwardMode.DECODE:
-            return None
-
-        st = owner.interleaved_image_state(int(op["req_id"]))
-        cache = st.cond
-        if cache.past is None:
-            return None
-        if not isinstance(cache.past, PagedTextCache):
-            return None
-        if getattr(cache.past, "pool", None) is not owner.kv_pool:
-            return None
-
-        owner._extend_cache_blocks(cache, op)
-        owner._ensure_host_cache(cache)
-        if cache.past is None:
-            return None
-        base_len = int(cache.past.length)
-        cache.past.ensure_capacity(base_len + 1)
-        table_width = max(1, len(cache.past.block_ids))
-        key = self._key(owner, cache.past, table_width)
-        state = self.states.get(key)
-        if state is None:
-            state = self._new_state(owner, cache.past, table_width, device)
-            self.states[key] = state
-
-        token_id = int(tokens[0])
-        pos = int(cache.t_index) + 1
-        self._copy_inputs(state, token_id=token_id, pos=pos, cache=cache.past)
-        if state.logits is None:
-            self._capture(owner, state, device, token_id=token_id, pos=pos, cache=cache.past)
-        else:
-            state.graph.replay()
-        cache.past.length = base_len + 1
-        cache.t_index = pos
-        cache.last_token_id = token_id
-        cache.last_logits = state.logits
-        return state.logits[:, -1, :]
-
-    @staticmethod
-    def _key(
-        owner: "SenseNovaU1ForUnifiedGeneration",
-        cache: PagedTextCache,
-        table_width: int,
-    ) -> tuple[Any, ...]:
-        return (
-            id(owner.model.language_model),
-            id(cache.pool),
-            str(cache.pool.k.device),
-            str(cache.pool.dtype),
-            int(table_width),
-        )
-
-    def _new_state(
-        self,
-        owner: "SenseNovaU1ForUnifiedGeneration",
-        cache: PagedTextCache,
-        table_width: int,
-        device: torch.device,
-    ) -> _SenseNovaTextDecodeGraphState:
-        request_cache = _SenseNovaTextDecodeGraphRequestCache(
-            cache.pool,
-            table_width=table_width,
-            device=device,
-        )
-        return _SenseNovaTextDecodeGraphState(
-            graph=torch.cuda.CUDAGraph(),
-            input_ids=torch.empty((1, 1), dtype=torch.long, device=device),
-            indexes=torch.empty((3, 1), dtype=torch.long, device=device),
-            past=_SenseNovaTextDecodeGraphPast(request_cache),
-        )
-
-    def _capture(
-        self,
-        owner: "SenseNovaU1ForUnifiedGeneration",
-        state: _SenseNovaTextDecodeGraphState,
-        device: torch.device,
-        *,
-        token_id: int,
-        pos: int,
-        cache: PagedTextCache,
-    ) -> None:
-        def run() -> torch.Tensor:
-            outputs = owner.model.language_model(
-                input_ids=state.input_ids,
-                indexes=state.indexes,
-                past_key_values=state.past,
-                use_cache=True,
-            )
-            return outputs.logits
-
-        capture_base_len = max(0, len(cache.block_ids) * int(cache.pool.block_size) - 1)
-        self._copy_inputs(
-            state,
-            token_id=token_id,
-            pos=pos,
-            cache=cache,
-            base_len=capture_base_len,
-        )
-        current_stream = torch.cuda.current_stream(device)
-        warmup_stream = torch.cuda.Stream(device=device)
-        warmup_stream.wait_stream(current_stream)
-        with torch.cuda.stream(warmup_stream):
-            for _ in range(2):
-                state.logits = run()
-        current_stream.wait_stream(warmup_stream)
-        graph_kwargs = {}
-        capture_pool = self._capture_pool_handle()
-        if capture_pool is not None:
-            graph_kwargs["pool"] = capture_pool
-        with torch.cuda.graph(state.graph, **graph_kwargs):
-            state.logits = run()
-        self._copy_inputs(state, token_id=token_id, pos=pos, cache=cache)
-        state.graph.replay()
-
-    def _capture_pool_handle(self) -> Any:
-        if self._capture_pool is not None:
-            return self._capture_pool
-        graph_pool_handle = getattr(torch.cuda, "graph_pool_handle", None)
-        if callable(graph_pool_handle):
-            self._capture_pool = graph_pool_handle()
-        return self._capture_pool
-
-    @staticmethod
-    def _copy_inputs(
-        state: _SenseNovaTextDecodeGraphState,
-        *,
-        token_id: int,
-        pos: int,
-        cache: PagedTextCache,
-        base_len: int | None = None,
-    ) -> None:
-        state.input_ids.fill_(int(token_id))
-        state.indexes[0, 0] = int(pos)
-        state.indexes[1:, 0].zero_()
-        state.past.prepare(cache, base_len=base_len)
-
-
 class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
@@ -2159,7 +1879,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # Model-owned per-request interleaved image state, keyed by req_id and
         # cleared in drop_request (the authoritative owner).
         self.reqs: dict[int, InterleavedImageRequestState] = {}
-        self._text_decode_graph_runner = _SenseNovaTextDecodeGraphRunner()
 
         llm_cfg = self._init_token_geometry(config)
         self.resource_plan = ResourcePlan(
@@ -2802,16 +2521,25 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         return self._text_driver().state(op)
 
     def run_text_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor]:
-        op_list = [dict(op) for op in ops]
-        if not op_list:
-            return []
-        return [self.run_text_logits(op) for op in op_list]
+        # Batching + one-token decode CUDA graph are both system-owned by the
+        # interleaved text driver; the model only supplies the neural forward.
+        return self._text_driver().run_text_logits_batch(ops)
 
     def run_text_logits(self, op: dict[str, Any]):
-        graphed = self._text_decode_graph_runner.maybe_run(self, dict(op))
-        if graphed is not None:
-            return graphed
-        return self._text_driver().run_text_logits(op)
+        return self._text_driver().run_text_logits(dict(op))
+
+    def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
+        """Query-side geometry for the system decode-graph FlashInfer planner.
+
+        Returns ``(num_query_heads, attention_scale, query_dtype)``. The KV-side
+        geometry (heads / head dim / page size / dtype) is read off the shared KV
+        pool by the system adapter; only these query-side values are model-specific.
+        """
+
+        attn = self.model.language_model.model.layers[0].self_attn
+        # ``q_norm`` weight stays in compute dtype even under weight quantization,
+        # so it is the faithful dtype of the query tensor the decode kernel sees.
+        return int(attn.num_heads), float(attn.scaling), attn.q_norm.weight.dtype
 
     def _text_indexes(self, start: int, seq_len: int, *, device: torch.device | str | None = None) -> torch.Tensor:
         target = device if device is not None else self.device

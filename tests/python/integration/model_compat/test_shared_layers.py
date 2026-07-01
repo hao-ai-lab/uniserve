@@ -1946,7 +1946,11 @@ def test_sensenova_text_batch_delegates_to_scalar_text_stepper(monkeypatch):
         scalar_calls.append(dict(op))
         return torch.full((1, 8), float(len(scalar_calls)))
 
-    monkeypatch.setattr(wrapper, "run_text_logits", scalar_fallback)
+    # Batching + the one-token decode graph now live in the system text driver;
+    # the model's run_text_logits_batch delegates to it, and the driver falls back
+    # to its per-op scalar stepper for ineligible batches (here: multi-token prefill).
+    driver = wrapper._text_driver()
+    monkeypatch.setattr(driver, "_run_text_logits_one", scalar_fallback)
     logits = wrapper.run_text_logits_batch(
         [
             {
@@ -1980,7 +1984,7 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
 
     class FakeLanguage(nn.Module):
         def forward(self, **_kwargs):
-            raise AssertionError("fake graph runner should own the replay")
+            raise AssertionError("CPU decode must fall back to the scalar stepper, not the neural forward")
 
     wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
         config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
@@ -2011,7 +2015,8 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
         row = len(scalar_calls) - 1
         return torch.tensor([[float(row * 3), float(row * 3 + 1), float(row * 3 + 2)]])
 
-    monkeypatch.setattr(wrapper, "run_text_logits", scalar_fallback)
+    driver = wrapper._text_driver()
+    monkeypatch.setattr(driver, "_run_text_logits_one", scalar_fallback)
 
     logits = wrapper.run_text_logits_batch(
         [
@@ -2059,114 +2064,6 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     assert kv_segments[0].write_kv is True
     assert kv_segments[0].persist_kv is False
     assert kv_segments[0].branch_id == 1
-
-
-def test_sensenova_denoise_predict_uses_graph_runner_when_available(monkeypatch):
-    from uniserve_worker.models.sensenova import model as sensenova_u1
-    from uniserve_worker.runtime.kv_pool import PagedKVPool
-    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
-
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
-        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
-    )
-    pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=2,
-        block_size=8,
-        num_kv_heads=1,
-        head_dim=2,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    cache = PagedTextCache(pool, [0], num_layers=1)
-    img = SimpleNamespace(token_h=1, token_w=2, height=16, width=32)
-    image_embeds = torch.ones(1, 2, 4)
-    indexes = torch.tensor([[0, 0], [0, 0], [0, 1]], dtype=torch.long)
-    t = torch.tensor([0.5])
-    z = torch.zeros(1, 2, 3)
-    graph_velocity = torch.full_like(z, 7.0)
-
-    class FakeGraphRunner:
-        def __init__(self, result):
-            self.result = result
-            self.calls = 0
-
-        def maybe_run(self, owner, **kwargs):
-            self.calls += 1
-            assert owner is wrapper
-            assert kwargs["img"] is img
-            assert kwargs["cache"] is cache
-            assert kwargs["image_embeds"] is image_embeds
-            return self.result
-
-    class FakeModel:
-        def __init__(self):
-            self.calls = 0
-
-        def _t2i_predict_v(self, *args, **kwargs):
-            self.calls += 1
-            assert kwargs["image_size"] == (32, 16)
-            return torch.full_like(z, 3.0)
-
-    fake_model = FakeModel()
-    wrapper.model = fake_model
-    monkeypatch.setattr(wrapper, "_wait_gen_cache_ready", lambda _cache: None)
-    graph = FakeGraphRunner(graph_velocity)
-    wrapper._denoise_graph_runner = graph
-
-    out = wrapper._predict_v(img, image_embeds, indexes, cache, t, z)
-    torch.testing.assert_close(out, graph_velocity)
-    assert graph.calls == 1
-    assert fake_model.calls == 0
-
-    graph.result = None
-    out = wrapper._predict_v(img, image_embeds, indexes, cache, t, z)
-    torch.testing.assert_close(out, torch.full_like(z, 3.0))
-    assert graph.calls == 2
-    assert fake_model.calls == 1
-
-
-def test_sensenova_denoise_graph_key_reuses_equivalent_batched_wrappers():
-    from uniserve_worker.models.sensenova import model as sensenova_u1
-    from uniserve_worker.runtime.kv_pool import PagedKVPool
-    from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
-
-    pool = PagedKVPool(
-        num_layers=1,
-        num_blocks=8,
-        block_size=8,
-        num_kv_heads=1,
-        head_dim=2,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    row0 = PagedTextCache(pool, [0], num_layers=1, length=3)
-    row1 = PagedTextCache(pool, [1], num_layers=1, length=3)
-    image_embeds = torch.ones(2, 4, 8)
-    indexes_a = torch.zeros(3, 2, 4, dtype=torch.long)
-    indexes_b = torch.zeros(3, 2, 4, dtype=torch.long)
-    t = torch.tensor([0.5])
-    z = torch.zeros(2, 4, 3)
-    img = SimpleNamespace(token_h=2, token_w=2, height=64, width=64)
-
-    key_a = sensenova_u1._SenseNovaDenoiseGraphRunner._key(
-        image_embeds,
-        indexes_a,
-        BatchedPagedTextCache([row0, row1]),
-        t,
-        z,
-        img,
-    )
-    key_b = sensenova_u1._SenseNovaDenoiseGraphRunner._key(
-        image_embeds,
-        indexes_b,
-        BatchedPagedTextCache([row0, row1]),
-        t,
-        z,
-        img,
-    )
-
-    assert key_a == key_b
 
 
 def test_qwen_attention_paged_update_is_not_env_gated(monkeypatch):

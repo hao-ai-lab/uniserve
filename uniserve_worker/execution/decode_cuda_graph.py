@@ -36,6 +36,8 @@ __all__ = [
     'copy_text_decode_graph_inputs',
     'copy_text_initial_prefill_graph_inputs',
     'maybe_weak_ref_cuda_graph_tensor',
+    'resolve_paged_decode_graph_backend',
+    'prepare_paged_decode_graph_backend',
 ]
 
 @dataclass
@@ -586,6 +588,73 @@ def copy_text_decode_graph_inputs(
     state.metadata.kv_seqlens_cpu = kv_cpu
 
 
+def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> Any | None:
+    """Return the attention backend that can host a *captured* paged-decode graph.
+
+    A paged-decode graph is only correct when its backend refills the page-index /
+    length plan buffers before every replay (``prepare_paged_decode_cuda_graph``):
+    that is what lets a single captured graph adapt to sequence growth *and*
+    block-id changes with no baked plan. Backends without that method would bake
+    the capture-time plan into the graph and silently read stale/foreign pages on
+    later steps, so this returns ``None`` for them and the caller stays eager.
+
+    Paged-decode graphs are FlashInfer-only today, so a concrete non-FlashInfer
+    selection (e.g. ``torch_sdpa``) also returns ``None`` rather than silently
+    swapping the backend the eager run would have used.
+    """
+
+    from ..backends.attention import (
+        get_attention_backend,
+        has_attention_backend,
+        normalize_attention_backend_name,
+    )
+
+    normalized = normalize_attention_backend_name(attention_backend_name)
+    if normalized not in ("auto", "flashinfer"):
+        return None
+    if not has_attention_backend("flashinfer"):
+        return None
+    backend = get_attention_backend("flashinfer")
+    if not hasattr(backend, "prepare_paged_decode_cuda_graph"):
+        return None
+    return backend
+
+
+def prepare_paged_decode_graph_backend(
+    state: TextDecodeGraphState,
+    *,
+    backend: Any,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    scale: float | None,
+    max_indices: int,
+) -> None:
+    """Refill ``backend``'s graph-decode plan buffers for the pending replay.
+
+    Called from the runner's ``prepare_backend`` hook (outside the captured
+    region) after ``copy_text_decode_graph_inputs`` has refreshed ``state``'s
+    static block table + cache lengths. It re-plans the graph decode wrapper bound
+    to ``state.metadata`` from those tensors so the captured ``wrapper.run`` reads
+    the current pages/lengths — the mechanism that makes one capture correct across
+    growth and across requests.
+    """
+
+    backend.prepare_paged_decode_cuda_graph(
+        state.metadata,
+        batch_size=int(state.batch_size),
+        max_indices=int(max_indices),
+        num_q_heads=int(num_q_heads),
+        num_kv_heads=int(num_kv_heads),
+        head_dim=int(head_dim),
+        page_size=int(page_size),
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        scale=scale,
+    )
 
 
 from .prefill_cuda_graph import (  # noqa: E402
