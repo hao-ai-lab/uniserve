@@ -117,6 +117,13 @@ def _top_logprobs(value: Any, where: str, *, minimum: int) -> None:
             raise invalid_descriptor(f"{where}[{j}][1] must be a number")
 
 
+def _int_list(value: Any, where: str, *, minimum: int) -> None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise invalid_descriptor(f"{where} must be a list")
+    for j, item in enumerate(value):
+        _int(item, f"{where}[{j}]", minimum=minimum)
+
+
 def _image_hw(value: Any, where: str, *, minimum: int) -> None:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)) or len(value) != 2:
         raise invalid_descriptor(f"{where} must be [height, width]")
@@ -132,6 +139,7 @@ _FIELD_VALIDATORS: dict[str, Callable[..., None]] = {
     "str": lambda v, w, *, minimum: _str(v, w),
     "bool": lambda v, w, *, minimum: _bool(v, w),
     "top_logprobs": _top_logprobs,
+    "int_list": _int_list,
     "image_hw": _image_hw,
 }
 
@@ -177,6 +185,7 @@ def validate_against_schema(
 
 _TEXT_RESULT_SCHEMA: tuple[FieldSpec, ...] = (
     FieldSpec("sampled_token_id", "int", required=False),
+    FieldSpec("sampled_token_ids", "int_list", required=False),
     FieldSpec("sampled_logprob", "float", required=False),
     FieldSpec("top_logprobs", "top_logprobs", required=False),
 )

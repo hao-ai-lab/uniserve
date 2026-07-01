@@ -20,7 +20,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 
 import uniserve_worker.ops as ops
 from ...contracts.batches import UniForwardBatch
-from ...contracts.forward_mode import ForwardMode
+from ...contracts.forward_mode import ForwardMode, mode_for_op
 from ...contracts.outputs import TextTokenOutput
 from ...contracts.resource_plan import (
     CapsDescriptor,
@@ -47,6 +47,7 @@ from ...foundation.sizing import (
     ceil_div,
     derive_num_blocks,
 )
+from ...foundation.runtime_config import get_worker_config
 from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...loader.transformers import NativeLoadSpec
 from ...nn import (
@@ -413,15 +414,16 @@ class _NativeQwen3Attention(nn.Module):
             qkv_proj = self.qkv_proj
 
         split_sizes = [int(size) for size in qkv_proj.output_sizes]
-        if int(hidden_states.shape[-2]) == 1:
+        if gen_branch and int(hidden_states.shape[-2]) == 1:
             q_w, k_w, v_w = qkv_proj.weight.split(split_sizes, dim=0)
             if getattr(qkv_proj, "bias", None) is not None:
                 q_b, k_b, v_b = qkv_proj.bias.split(split_sizes, dim=0)
             else:
                 q_b = k_b = v_b = None
             # One-token autoregressive image decode is numerically sensitive to
-            # GEMM reassociation; use the same per-projection accumulation order
-            # for that decode shape while bulk prefill/denoise uses packed QKV.
+            # GEMM reassociation; keep the generation tower on the per-projection
+            # accumulation order while text decode uses the packed QKV path that
+            # text prefill already uses.
             q_flat = F.linear(hidden_states, q_w, q_b)
             k_flat = F.linear(hidden_states, k_w, k_b)
             v_flat = F.linear(hidden_states, v_w, v_b)
@@ -432,7 +434,7 @@ class _NativeQwen3Attention(nn.Module):
         key_states = k_flat.view(*input_shape, local_kv_heads, self.head_dim)
         value_states = v_flat.view(*input_shape, local_kv_heads, self.head_dim).transpose(1, 2)
 
-        (query_states_t, query_states_h, query_states_w), (key_states_t, key_states_h, key_states_w) = self._qk_norm_rope_3d(
+        query_states, key_states = self._qk_norm_rope_3d(
             query_states,
             key_states,
             indexes,
@@ -442,8 +444,6 @@ class _NativeQwen3Attention(nn.Module):
             k_norm_hw=k_norm_hw,
             packed_rope=packed_rope,
         )
-        query_states = torch.cat([query_states_t, query_states_h, query_states_w], dim=-1)
-        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
         return query_states, key_states, value_states
 
     def _qk_norm_rope_3d(
@@ -458,7 +458,7 @@ class _NativeQwen3Attention(nn.Module):
         k_norm_hw: RMSNorm,
         packed_rope: SenseNovaPackedRope | None = None,
         override: str | None = None,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if packed_rope is None:
             packed_rope = self._packed_rope(indexes)
         query_states, key_states = ops.qk_norm_rope(
@@ -472,24 +472,31 @@ class _NativeQwen3Attention(nn.Module):
             axis_dims=(self.head_dim // 2, self.head_dim // 4, self.head_dim // 4),
             override=override,
         )
-        query_states_t, query_states_h, query_states_w = query_states.split(
-            [self.head_dim // 2, self.head_dim // 4, self.head_dim // 4], dim=-1
-        )
-        key_states_t, key_states_h, key_states_w = key_states.split(
-            [self.head_dim // 2, self.head_dim // 4, self.head_dim // 4], dim=-1
-        )
-        return (query_states_t, query_states_h, query_states_w), (key_states_t, key_states_h, key_states_w)
+        return query_states, key_states
 
     def _packed_rope(self, indexes: torch.Tensor) -> SenseNovaPackedRope:
         if indexes.ndim != 2 or indexes.shape[0] != 3:
             raise ValueError("SenseNova packed RoPE expects flat indexes [3, N]")
-        cos_t, sin_t = self.rotary_emb.cos_sin_1d(indexes[0].to(device=self.rotary_emb.inv_freq.device))
-        cos_h, sin_h = self.rotary_emb_hw.cos_sin_1d(indexes[1].to(device=self.rotary_emb_hw.inv_freq.device))
-        cos_w, sin_w = self.rotary_emb_hw.cos_sin_1d(indexes[2].to(device=self.rotary_emb_hw.inv_freq.device))
         device = indexes.device
+        t_index = indexes[0]
+        h_index = indexes[1]
+        w_index = indexes[2]
+        if t_index.device != self.rotary_emb.inv_freq.device:
+            t_index = t_index.to(device=self.rotary_emb.inv_freq.device)
+        if h_index.device != self.rotary_emb_hw.inv_freq.device:
+            h_index = h_index.to(device=self.rotary_emb_hw.inv_freq.device)
+        if w_index.device != self.rotary_emb_hw.inv_freq.device:
+            w_index = w_index.to(device=self.rotary_emb_hw.inv_freq.device)
+        cos_t, sin_t = self.rotary_emb.cos_sin_1d(t_index)
+        cos_h, sin_h = self.rotary_emb_hw.cos_sin_1d(h_index)
+        cos_w, sin_w = self.rotary_emb_hw.cos_sin_1d(w_index)
+
+        def _on_index_device(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor if tensor.device == device else tensor.to(device=device)
+
         return SenseNovaPackedRope(
-            (cos_t.to(device=device), cos_h.to(device=device), cos_w.to(device=device)),
-            (sin_t.to(device=device), sin_h.to(device=device), sin_w.to(device=device)),
+            (_on_index_device(cos_t), _on_index_device(cos_h), _on_index_device(cos_w)),
+            (_on_index_device(sin_t), _on_index_device(sin_h), _on_index_device(sin_w)),
         )
 
     def _project_qkv_routed(
@@ -665,17 +672,33 @@ class _NativeQwen3Attention(nn.Module):
         # flags are precomputed once by the model; reuse them so the o_proj
         # routing avoids a per-layer device->host sync.
         gen = image_gen_indicators
-        q, k, v = self._project_qkv_flat_routed(
-            hidden_states,
-            indexes,
-            gen,
-            exist_non_image_gen_tokens=exist_non_image_gen_tokens,
-            exist_image_gen_tokens=exist_image_gen_tokens,
-            und=und,
-            packed_rope=packed_rope,
-        )
+        if exist_non_image_gen_tokens != exist_image_gen_tokens:
+            gen_branch = bool(exist_image_gen_tokens)
+            q_bhld, k_bhld, v_bhld = self._project_qkv(
+                hidden_states.unsqueeze(0),
+                indexes,
+                gen_branch=gen_branch,
+                packed_rope=packed_rope,
+            )
+            q = q_bhld.squeeze(0).transpose(0, 1).contiguous()
+            k = k_bhld.squeeze(0).transpose(0, 1).contiguous()
+            v = v_bhld.squeeze(0).transpose(0, 1).contiguous()
+        else:
+            q, k, v = self._project_qkv_flat_routed(
+                hidden_states,
+                indexes,
+                gen,
+                exist_non_image_gen_tokens=exist_non_image_gen_tokens,
+                exist_image_gen_tokens=exist_image_gen_tokens,
+                und=und,
+                packed_rope=packed_rope,
+            )
         out = self._attend_packed_visible(q, k, v, forward_stream=forward_stream, kv_view=kv_view)
         out = out.reshape(hidden_states.shape[0], -1).contiguous()
+        if exist_non_image_gen_tokens and not exist_image_gen_tokens:
+            return self.o_proj(out)
+        if not exist_non_image_gen_tokens and exist_image_gen_tokens:
+            return self.o_proj_mot_gen(out)
         return self._route_o_proj(
             out,
             text_mask=und,
@@ -804,9 +827,6 @@ class _NativeQwen3Attention(nn.Module):
         q, k, v = self._project_qkv(hidden_states, indexes, gen_branch=True, packed_rope=packed_rope)
         update_cache = kwargs.get("update_cache", True)
         if attention_mask is None:
-            q_bshd = q.transpose(1, 2).contiguous()
-            k_cur = k.transpose(1, 2).contiguous()
-            v_cur = v.transpose(1, 2).contiguous()
             if past_key_values is not None:
                 if update_cache:
                     paged = self._attend_paged_update(q, k, v, past_key_values, attention_mask=None)
@@ -814,6 +834,7 @@ class _NativeQwen3Attention(nn.Module):
                         out, _ = paged
                         return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), None
                     k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs=None)
+                    q_bshd = q.transpose(1, 2).contiguous()
                     k_attn = k.transpose(1, 2).contiguous()
                     v_attn = v.transpose(1, 2).contiguous()
                 else:
@@ -823,12 +844,18 @@ class _NativeQwen3Attention(nn.Module):
                         return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), None
                     layer = past_key_values.layers[self.layer_idx]
                     past_k, past_v = layer.keys, layer.values
+                    q_bshd = q.transpose(1, 2).contiguous()
+                    k_cur = k.transpose(1, 2).contiguous()
+                    v_cur = v.transpose(1, 2).contiguous()
                     if past_k is not None:
                         k_attn = torch.cat([past_k.transpose(1, 2).contiguous(), k_cur], dim=1)
                         v_attn = torch.cat([past_v.transpose(1, 2).contiguous(), v_cur], dim=1)
                     else:
                         k_attn, v_attn = k_cur, v_cur
             else:
+                q_bshd = q.transpose(1, 2).contiguous()
+                k_cur = k.transpose(1, 2).contiguous()
+                v_cur = v.transpose(1, 2).contiguous()
                 k_attn, v_attn = k_cur, v_cur
             out = self._attend_bshd(q_bshd, k_attn, v_attn)
             return self.o_proj_mot_gen(out.reshape(*input_shape, -1).contiguous()), None
@@ -1237,16 +1264,33 @@ class _NativeQwen3Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         use_cache: bool | None = None,
         cache_position: torch.Tensor | None = None,
+        exist_non_image_gen_tokens: bool | None = None,
+        exist_image_gen_tokens: bool | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
         del position_ids
         inputs_embeds = self._resolve_inputs_embeds(input_ids, inputs_embeds)
-        image_gen_indicators = self._resolve_image_gen_indicators(image_gen_indicators, inputs_embeds)
-        exist_non_image_gen_tokens = bool((~image_gen_indicators).any())
-        exist_image_gen_tokens = bool(image_gen_indicators.any())
+        if image_gen_indicators is None:
+            exist_non_image_gen_tokens = True if exist_non_image_gen_tokens is None else bool(exist_non_image_gen_tokens)
+            exist_image_gen_tokens = False if exist_image_gen_tokens is None else bool(exist_image_gen_tokens)
+            if exist_non_image_gen_tokens != exist_image_gen_tokens:
+                image_gen_indicators = torch.empty(
+                    0, dtype=torch.bool, device=inputs_embeds.device
+                )
+            else:
+                image_gen_indicators = self._resolve_image_gen_indicators(None, inputs_embeds)
+        else:
+            image_gen_indicators = self._resolve_image_gen_indicators(image_gen_indicators, inputs_embeds)
+            if exist_non_image_gen_tokens is None:
+                exist_non_image_gen_tokens = bool((~image_gen_indicators).any())
+            if exist_image_gen_tokens is None:
+                exist_image_gen_tokens = bool(image_gen_indicators.any())
         if use_cache and past_key_values is None:
             raise RuntimeError("native decoder serving requires an explicit paged cache")
-        cache_position = self._resolve_cache_position(cache_position, past_key_values, inputs_embeds)
+        if indexes is None:
+            cache_position = self._resolve_cache_position(cache_position, past_key_values, inputs_embeds)
+        elif cache_position is None:
+            cache_position = torch.empty(0, dtype=torch.long, device=inputs_embeds.device)
         indexes, causal_mask_mapping = self._resolve_indexes_and_masks(
             indexes,
             attention_mask,
@@ -1790,6 +1834,286 @@ def check_checkpoint_compatibility(config_or_dict: Any) -> None:
         raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
 
 
+def _canonical_cuda_device(device: torch.device | str) -> torch.device:
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return dev
+
+
+class _SenseNovaTextDecodeGraphRequestCache:
+    """Stable single-row paged-KV view used by the text decode CUDA graph."""
+
+    def __init__(self, pool: PagedKVPool, *, table_width: int, device: torch.device) -> None:
+        self.pool = pool
+        self.table_width = int(table_width)
+        self.base_len = 0
+        self.block_ids: list[int] = []
+        self._device = _canonical_cuda_device(device)
+        self._block_table = torch.empty((1, self.table_width), dtype=torch.int32, device=self._device)
+        self._cache_seqlens = torch.empty((1,), dtype=torch.int32, device=self._device)
+        self._host_block_table = self._new_host_int_buffer(self.table_width)
+        self._host_cache_seqlens = self._new_host_int_buffer(1)
+        self._last_block_ids: tuple[int, ...] | None = None
+
+    @property
+    def base_lens(self) -> tuple[int]:
+        return (int(self.base_len),)
+
+    def prepare(self, block_ids: Sequence[int], base_len: int) -> None:
+        ids = tuple(int(block_id) for block_id in block_ids)
+        if len(ids) > self.table_width:
+            raise invalid_descriptor("SenseNova text decode graph block table width is too small")
+        self.block_ids = list(ids)
+        self.base_len = int(base_len)
+        if ids != self._last_block_ids:
+            self._host_block_table.zero_()
+            for idx, block_id in enumerate(ids):
+                self._host_block_table[idx] = int(block_id)
+            self._block_table.copy_(self._host_block_table, non_blocking=self._host_block_table.is_pinned())
+            self._last_block_ids = ids
+        self._host_cache_seqlens[0] = int(base_len)
+        self._cache_seqlens.copy_(self._host_cache_seqlens, non_blocking=self._host_cache_seqlens.is_pinned())
+
+    def block_table(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        stager: Any | None = None,
+    ) -> torch.Tensor:
+        del stager
+        if device is not None and _canonical_cuda_device(device) != self._device:
+            raise invalid_descriptor("SenseNova text decode graph block table device changed")
+        return self._block_table
+
+    def cache_seqlens(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        stager: Any | None = None,
+    ) -> torch.Tensor:
+        del stager
+        if device is not None and _canonical_cuda_device(device) != self._device:
+            raise invalid_descriptor("SenseNova text decode graph cache seqlens device changed")
+        return self._cache_seqlens
+
+    def length(self) -> int:
+        return int(self.base_len)
+
+    def get(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.pool.read(int(layer), self.block_ids, start=0, length=self.base_len)
+
+    def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        self.pool.write(int(layer), self.block_ids, start=self.base_len, k=k, v=v)
+
+    @staticmethod
+    def _new_host_int_buffer(numel: int) -> torch.Tensor:
+        try:
+            return torch.empty(int(numel), dtype=torch.int32, pin_memory=True)
+        except RuntimeError:
+            return torch.empty(int(numel), dtype=torch.int32)
+
+
+class _SenseNovaTextDecodeGraphPast:
+    """Graph-captured past object with the same update contract as PagedTextCache."""
+
+    def __init__(self, request_cache: _SenseNovaTextDecodeGraphRequestCache) -> None:
+        self.request_cache = request_cache
+        self.pool = request_cache.pool
+
+    def prepare(self, cache: PagedTextCache, *, base_len: int | None = None) -> None:
+        self.request_cache.prepare(
+            cache.block_ids,
+            int(cache.length) if base_len is None else int(base_len),
+        )
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        del layer_idx
+        return int(self.request_cache.base_len)
+
+    def request_cache_for_update(self, layer_idx: int, n_tokens: int):
+        del layer_idx
+        if int(n_tokens) != 1:
+            raise invalid_descriptor("SenseNova text decode graph only supports one-token decode")
+        return self.request_cache
+
+    def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
+        del layer_idx, n_tokens
+
+    def cancel_layer_update(self, layer_idx: int) -> None:
+        del layer_idx
+
+
+@dataclass
+class _SenseNovaTextDecodeGraphState:
+    graph: torch.cuda.CUDAGraph
+    input_ids: torch.Tensor
+    indexes: torch.Tensor
+    past: _SenseNovaTextDecodeGraphPast
+    logits: torch.Tensor | None = None
+
+
+class _SenseNovaTextDecodeGraphRunner:
+    """Single-row SenseNova text decode CUDA graph using the serial cache contract."""
+
+    def __init__(self) -> None:
+        self.states: dict[tuple[Any, ...], _SenseNovaTextDecodeGraphState] = {}
+        self._capture_pool: Any = None
+
+    def maybe_run(
+        self,
+        owner: "SenseNovaU1ForUnifiedGeneration",
+        op: dict[str, Any],
+    ) -> torch.Tensor | None:
+        if not bool(get_worker_config().cuda_graph):
+            return None
+        if not torch.cuda.is_available():
+            return None
+        device = _canonical_cuda_device(owner.device)
+        if device.type != "cuda":
+            return None
+        if owner.model is None:
+            return None
+        tokens = list(op.get("token_ids") or [])
+        if len(tokens) != 1:
+            return None
+        if mode_for_op(str(op.get("kind"))) != ForwardMode.DECODE:
+            return None
+
+        st = owner.interleaved_image_state(int(op["req_id"]))
+        cache = st.cond
+        if cache.past is None:
+            return None
+        if not isinstance(cache.past, PagedTextCache):
+            return None
+        if getattr(cache.past, "pool", None) is not owner.kv_pool:
+            return None
+
+        owner._extend_cache_blocks(cache, op)
+        owner._ensure_host_cache(cache)
+        if cache.past is None:
+            return None
+        base_len = int(cache.past.length)
+        cache.past.ensure_capacity(base_len + 1)
+        table_width = max(1, len(cache.past.block_ids))
+        key = self._key(owner, cache.past, table_width)
+        state = self.states.get(key)
+        if state is None:
+            state = self._new_state(owner, cache.past, table_width, device)
+            self.states[key] = state
+
+        token_id = int(tokens[0])
+        pos = int(cache.t_index) + 1
+        self._copy_inputs(state, token_id=token_id, pos=pos, cache=cache.past)
+        if state.logits is None:
+            self._capture(owner, state, device, token_id=token_id, pos=pos, cache=cache.past)
+        else:
+            state.graph.replay()
+        cache.past.length = base_len + 1
+        cache.t_index = pos
+        cache.last_token_id = token_id
+        cache.last_logits = state.logits
+        return state.logits[:, -1, :]
+
+    @staticmethod
+    def _key(
+        owner: "SenseNovaU1ForUnifiedGeneration",
+        cache: PagedTextCache,
+        table_width: int,
+    ) -> tuple[Any, ...]:
+        return (
+            id(owner.model.language_model),
+            id(cache.pool),
+            str(cache.pool.k.device),
+            str(cache.pool.dtype),
+            int(table_width),
+        )
+
+    def _new_state(
+        self,
+        owner: "SenseNovaU1ForUnifiedGeneration",
+        cache: PagedTextCache,
+        table_width: int,
+        device: torch.device,
+    ) -> _SenseNovaTextDecodeGraphState:
+        request_cache = _SenseNovaTextDecodeGraphRequestCache(
+            cache.pool,
+            table_width=table_width,
+            device=device,
+        )
+        return _SenseNovaTextDecodeGraphState(
+            graph=torch.cuda.CUDAGraph(),
+            input_ids=torch.empty((1, 1), dtype=torch.long, device=device),
+            indexes=torch.empty((3, 1), dtype=torch.long, device=device),
+            past=_SenseNovaTextDecodeGraphPast(request_cache),
+        )
+
+    def _capture(
+        self,
+        owner: "SenseNovaU1ForUnifiedGeneration",
+        state: _SenseNovaTextDecodeGraphState,
+        device: torch.device,
+        *,
+        token_id: int,
+        pos: int,
+        cache: PagedTextCache,
+    ) -> None:
+        def run() -> torch.Tensor:
+            outputs = owner.model.language_model(
+                input_ids=state.input_ids,
+                indexes=state.indexes,
+                past_key_values=state.past,
+                use_cache=True,
+            )
+            return outputs.logits
+
+        capture_base_len = max(0, len(cache.block_ids) * int(cache.pool.block_size) - 1)
+        self._copy_inputs(
+            state,
+            token_id=token_id,
+            pos=pos,
+            cache=cache,
+            base_len=capture_base_len,
+        )
+        current_stream = torch.cuda.current_stream(device)
+        warmup_stream = torch.cuda.Stream(device=device)
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(2):
+                state.logits = run()
+        current_stream.wait_stream(warmup_stream)
+        graph_kwargs = {}
+        capture_pool = self._capture_pool_handle()
+        if capture_pool is not None:
+            graph_kwargs["pool"] = capture_pool
+        with torch.cuda.graph(state.graph, **graph_kwargs):
+            state.logits = run()
+        self._copy_inputs(state, token_id=token_id, pos=pos, cache=cache)
+        state.graph.replay()
+
+    def _capture_pool_handle(self) -> Any:
+        if self._capture_pool is not None:
+            return self._capture_pool
+        graph_pool_handle = getattr(torch.cuda, "graph_pool_handle", None)
+        if callable(graph_pool_handle):
+            self._capture_pool = graph_pool_handle()
+        return self._capture_pool
+
+    @staticmethod
+    def _copy_inputs(
+        state: _SenseNovaTextDecodeGraphState,
+        *,
+        token_id: int,
+        pos: int,
+        cache: PagedTextCache,
+        base_len: int | None = None,
+    ) -> None:
+        state.input_ids.fill_(int(token_id))
+        state.indexes[0, 0] = int(pos)
+        state.indexes[1:, 0].zero_()
+        state.past.prepare(cache, base_len=base_len)
+
+
 class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
@@ -1835,6 +2159,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # Model-owned per-request interleaved image state, keyed by req_id and
         # cleared in drop_request (the authoritative owner).
         self.reqs: dict[int, InterleavedImageRequestState] = {}
+        self._text_decode_graph_runner = _SenseNovaTextDecodeGraphRunner()
 
         llm_cfg = self._init_token_geometry(config)
         self.resource_plan = ResourcePlan(
@@ -1940,6 +2265,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         dtype = torch.bfloat16
         self._annotate_towers()
         place_towers(self.model, self.mesh)
+        self._ensure_rope_buffers_on_device(torch.device(str(self.device)))
         self.bytes_per_token = self._kv_bytes_per_token(dtype)
         scratch_blocks, gen_blocks = self._scratch_block_counts(gen_snapshot_kv_capacity)
         self.residency = ResidencyManager.build_gen(
@@ -1971,6 +2297,25 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self._scratch_blocks = scratch_blocks
         if gen_blocks is not None:
             self._gen_scratch_free = list(range(gen_blocks))
+
+    def _ensure_rope_buffers_on_device(self, device: torch.device | str) -> None:
+        if self.model is None:
+            return
+        language = getattr(self.model, "language_model", None)
+        decoder = getattr(language, "model", None)
+        layers = getattr(decoder, "layers", None)
+        if layers is None:
+            return
+        target = torch.device(device)
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            for name in ("rotary_emb", "rotary_emb_hw"):
+                rope = getattr(attn, name, None)
+                inv_freq = getattr(rope, "inv_freq", None)
+                if isinstance(rope, nn.Module) and isinstance(inv_freq, torch.Tensor) and inv_freq.device != target:
+                    rope.to(target)
 
     def _scratch_block_counts(self, gen_snapshot_kv_capacity: int | None) -> tuple[int, int | None]:
         image_scratch_blocks = max(1, ceil_div(self.max_latent_size, self.block_size))
@@ -2456,7 +2801,16 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def _state(self, op: dict[str, Any]) -> InterleavedImageRequestState:
         return self._text_driver().state(op)
 
+    def run_text_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor]:
+        op_list = [dict(op) for op in ops]
+        if not op_list:
+            return []
+        return [self.run_text_logits(op) for op in op_list]
+
     def run_text_logits(self, op: dict[str, Any]):
+        graphed = self._text_decode_graph_runner.maybe_run(self, dict(op))
+        if graphed is not None:
+            return graphed
         return self._text_driver().run_text_logits(op)
 
     def _text_indexes(self, start: int, seq_len: int, *, device: torch.device | str | None = None) -> torch.Tensor:

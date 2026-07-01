@@ -105,6 +105,7 @@ class ImageState:
     noise_scale: float
     height: int
     width: int
+    noise_scale_embedding: torch.Tensor | None = None
 
     @property
     def x_t(self) -> torch.Tensor:
@@ -281,6 +282,17 @@ class TextImageDenoiseOps:
         timesteps = schedule.timesteps(device=device)
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
         noise_scale = self._compute_noise_scale(grid_h, grid_w)
+        noise_scale_embedding = None
+        if self.model.add_noise_scale_embedding:
+            ns = torch.full(
+                (token_h * token_w,),
+                float(noise_scale) / float(self.model.noise_scale_max_value),
+                device=device,
+                dtype=timesteps.dtype,
+            )
+            noise_scale_embedding = self.model.fm_modules["noise_scale_embedder"](ns).view(
+                1, token_h * token_w, -1
+            )
 
         x_t = self._init_latent(st, params, device, noise_scale)
         cond_cache = self._denoise_cache(cond.past)
@@ -313,6 +325,7 @@ class TextImageDenoiseOps:
             noise_scale=float(noise_scale),
             height=params.height,
             width=params.width,
+            noise_scale_embedding=noise_scale_embedding,
         )
         image_state.x_t = x_t  # store the initial noise into the system LatentPool
         return image_state
@@ -445,6 +458,8 @@ class TextImageDenoiseOps:
     def prepare_denoise_step(
         self: TextImageDenoiseOwner, req_id: int, state: Any, op: dict
     ) -> TextImageDenoiseStep:
+        ctx = get_forward_context()
+        start = ctx.component_timer_start()
         st = self._state(dict(op))
         # Mode A (tower disaggregation): the gen pool never ran the und text, so
         # rebuild st.cond from the conditioning KV the und pool published (carried
@@ -455,11 +470,13 @@ class TextImageDenoiseOps:
             st.image_state = self._init_image_state(st, op)
         img = st.image_state
         step_i = int(op.get("timestep_idx") or 0)
+        ctx.record_component_elapsed("sensenova_denoise_prepare_state", start)
         # Gen-tower feature extraction and timestep embedding run on the gen
         # coordinate's device (the gen modules are Pinned there); the tower
         # transport, not a dedicated stream, orders the und->gen handoff.
         device = getattr(self, "gen_device", self.device)
         t, t_next = img.schedule.pair(step_i, device=device, dtype=img.timesteps.dtype)
+        start = ctx.component_timer_start()
         z = patchify_batch(img.x_t, self.latent_downsample)
         image_input = patchify_batch(img.x_t, self.model.patch_size, channel_first=True)
         gen_vit = self.model.fm_modules["vision_model_mot_gen"]
@@ -467,21 +484,28 @@ class TextImageDenoiseOps:
             device=device,
             dtype=next(gen_vit.parameters()).dtype,
         )
+        ctx.record_component_elapsed("sensenova_denoise_patchify", start)
+        start = ctx.component_timer_start()
         image_embeds = self.model.extract_feature(
             image_input.view(1 * img.grid_h * img.grid_w, -1),
             gen_model=True,
             grid_hw=img.grid_hw,
         ).view(1, img.token_h * img.token_w, -1)
+        ctx.record_component_elapsed("sensenova_denoise_vision_feature", start)
+        start = ctx.component_timer_start()
         t_expanded = t.expand(img.token_h * img.token_w)
         timestep_embeddings = self.model.fm_modules["timestep_embedder"](t_expanded).view(
             1, img.token_h * img.token_w, -1
         )
         if self.model.add_noise_scale_embedding:
-            ns = torch.full_like(t_expanded, img.noise_scale / self.model.noise_scale_max_value)
-            timestep_embeddings += self.model.fm_modules["noise_scale_embedder"](ns).view(
-                1, img.token_h * img.token_w, -1
-            )
+            if img.noise_scale_embedding is None:
+                ns = torch.full_like(t_expanded, img.noise_scale / self.model.noise_scale_max_value)
+                img.noise_scale_embedding = self.model.fm_modules["noise_scale_embedder"](ns).view(
+                    1, img.token_h * img.token_w, -1
+                )
+            timestep_embeddings += img.noise_scale_embedding
         image_embeds = image_embeds + timestep_embeddings
+        ctx.record_component_elapsed("sensenova_denoise_timestep_embed", start)
         total = int(img.schedule.num_steps)
         return TextImageDenoiseStep(
             req_id=int(req_id),
@@ -533,6 +557,13 @@ class TextImageDenoiseOps:
                     results[step_index][branch] = self.predict_denoise_velocity(step, branch)
                     continue
                 rows.append(DenoiseRow(step_index, step, branch, img, indexes, cache))
+
+        if len(rows) == 1:
+            row = rows[0]
+            results[row.step_index][row.branch] = self.predict_denoise_velocity(
+                row.step, row.branch
+            )
+            return results
 
         grouped: dict[tuple[Any, ...], list[DenoiseRow]] = {}
         for row in rows:

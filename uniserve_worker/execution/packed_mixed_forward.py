@@ -32,7 +32,7 @@ def run_packed_mixed_forward(
     kv_segments: list[ForwardPagedKVSegment] = []
     embed_chunks: list[torch.Tensor] = []
     indicators: list[torch.Tensor] = []
-    text_result_slots: list[tuple[int, int, int, PagedTextCache, PagedTextCache, int]] = []
+    text_result_slots: list[tuple[int, int, int, PagedTextCache, PagedTextCache, int, int]] = []
     denoise_result_slots: list[tuple[int, TextImageDenoiseStep, int, int]] = []
     first_pool = owner._forward_target_pool(denoise_steps)
     staged_text_caches: list[PagedTextCache] = []
@@ -76,6 +76,12 @@ def run_packed_mixed_forward(
                     request_states=request_states,
                     device=device,
                 )
+                last_input_token = int(tokens[-1])
+                if str(op.get("token_source") or "wire") == "last_sampled":
+                    relay = getattr(request_states.get(req_id), "decode_relay", None)
+                    relay_token = getattr(relay, "token_id", None)
+                    if relay_token is not None:
+                        last_input_token = int(relay_token)
                 embeds = embed(ids).reshape(q_len, -1)
                 segment_start = owner._append_packed_chunk(
                     embed_chunks,
@@ -97,7 +103,15 @@ def run_packed_mixed_forward(
                     device=device,
                 )
                 text_result_slots.append(
-                    (row_index, segment_start, q_len, persistent_cache, staged_cache, int(persistent_cache.length))
+                    (
+                        row_index,
+                        segment_start,
+                        q_len,
+                        persistent_cache,
+                        staged_cache,
+                        int(persistent_cache.length),
+                        last_input_token,
+                    )
                 )
             elif mode is ForwardMode.DENOISE:
                 step = next(step for result_index, step in denoise_steps if result_index == row_index)
@@ -148,7 +162,15 @@ def run_packed_mixed_forward(
             forward_stream=forward_stream,
             kv_view=kv_view,
         )
-        for row_index, start, q_len, persistent_cache, staged_cache, base_len in text_result_slots:
+        for (
+            row_index,
+            start,
+            q_len,
+            persistent_cache,
+            staged_cache,
+            base_len,
+            last_input_token,
+        ) in text_result_slots:
             op = batch.ops[row_index]
             req_id = int(op["req_id"])
             logits = language.lm_head(hidden[start:start + q_len].unsqueeze(0))
@@ -165,7 +187,7 @@ def run_packed_mixed_forward(
             position_id = int((op.get("pos_range") or [0, state.cond.t_index + q_len])[1])
             state.cond.t_index = position_id - 1
             state.cond.last_logits = logits
-            state.cond.last_token_id = int(results[row_index].sampled_token_id)
+            state.cond.last_token_id = int(last_input_token)
             owner._store_forward_sampled_token_relay(
                 request_states.get(req_id),
                 token_id=int(results[row_index].sampled_token_id),

@@ -132,6 +132,8 @@ def test_forward_paged_kv_view_appends_ragged_segments_into_one_pool():
     assert view.cache_seqlens_before().tolist() == [3, 7]
     assert view.cache_seqlens_after().tolist() == [5, 10]
     assert view.persistent_cache_seqlens_after().tolist() == [5, 10]
+    assert view.block_table() is view.block_table()
+    assert view.cache_seqlens_after() is view.cache_seqlens_after()
 
     k = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
     v = -k

@@ -276,9 +276,9 @@ class _TritonQKNormProvider:
             return False
         if isinstance(req.q_weight, tuple) or isinstance(req.k_weight, tuple):
             return False
-        try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
+        can_run_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").can_run_triton_qk_rms_norm
 
-        return try_triton_qk_rms_norm(req.q, req.k, req.q_weight, req.k_weight, req.eps, req.eps) is not None
+        return bool(can_run_triton_qk_rms_norm(req.q, req.k, req.q_weight, req.k_weight, req.eps, req.eps))
 
     def run(self, req: QKNormReq):
         if req.axis_dims is not None:
@@ -362,18 +362,29 @@ class _TritonQKNormRopeProvider:
 
     def can_run(self, req: QKNormRopeReq) -> bool:
         if req.axis_dims is not None:
-            return False
+            return self._can_run_multi_axis(req)
         if isinstance(req.q_weight, tuple) or isinstance(req.cos, tuple):
             return False
         if req.position_ids is not None or req.unsqueeze_dim != 1:
             return False
-        try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
+        can_run_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").can_run_triton_qk_rms_norm_rope
 
-        return try_triton_qk_rms_norm_rope(req.q, req.k, req.q_weight, req.k_weight, req.cos, req.sin, req.eps, req.eps) is not None
+        return bool(
+            can_run_triton_qk_rms_norm_rope(
+                req.q,
+                req.k,
+                req.q_weight,
+                req.k_weight,
+                req.cos,
+                req.sin,
+                req.eps,
+                req.eps,
+            )
+        )
 
     def run(self, req: QKNormRopeReq):
         if req.axis_dims is not None:
-            raise RuntimeError("triton qk_norm_rope only handles single-axis requests without axis_dims")
+            return self._run_multi_axis(req)
         if isinstance(req.q_weight, tuple) or isinstance(req.cos, tuple):
             raise RuntimeError("triton qk_norm_rope only handles single-axis requests without axis_dims")
         try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
@@ -394,6 +405,26 @@ class _TritonQKNormRopeProvider:
         # batch*seq tokens.
         flat = x.permute(0, 2, 1, 3).contiguous().reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3])
         return flat, tuple(x.shape), True
+
+    @staticmethod
+    def _axis_group(
+        x: torch.Tensor,
+        axis_dims: tuple[int, ...],
+        start_axis: int,
+        end_axis: int,
+    ) -> torch.Tensor:
+        start = sum(int(dim) for dim in axis_dims[:start_axis])
+        width = sum(int(dim) for dim in axis_dims[start_axis:end_axis])
+        return x[..., start : start + width]
+
+    def _flatten_axis_group(
+        self,
+        x: torch.Tensor,
+        axis_dims: tuple[int, ...],
+        start_axis: int,
+        end_axis: int,
+    ) -> tuple[torch.Tensor, tuple[int, ...], bool]:
+        return self._flatten_heads(self._axis_group(x, axis_dims, start_axis, end_axis))
 
     @staticmethod
     def _unflatten_heads(x: torch.Tensor, shape: tuple[int, ...], was_flattened: bool) -> torch.Tensor:
@@ -430,60 +461,159 @@ class _TritonQKNormRopeProvider:
             return False
         if not (req.q.is_cuda and req.k.is_cuda):
             return False
-        try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
-        try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
-        packed_rope = import_module("uniserve_worker.nn.rope")._TritonPackedRope()
-        q_parts = req.q.split(req.axis_dims, dim=-1)
-        k_parts = req.k.split(req.axis_dims, dim=-1)
+        norm_mod = import_module("uniserve_worker.nn.norm")
+        rope_mod = import_module("uniserve_worker.nn.rope")
+        tokens = self._flattened_token_count(req.q)
+        if tokens <= 0:
+            return False
+        if not self._qk_common_eligible(req, norm_mod):
+            return False
         axis = 0
         while axis < len(req.axis_dims):
             group_end = _EagerQKNormRopeProvider._shared_norm_group_end(req, axis)
-            q_group, _, _ = self._flatten_heads(torch.cat(q_parts[axis:group_end], dim=-1))
-            k_group, _, _ = self._flatten_heads(torch.cat(k_parts[axis:group_end], dim=-1))
+            group_dim = sum(int(dim) for dim in req.axis_dims[axis:group_end])
             if group_end == axis + 1:
                 cos = req.cos[axis]
                 sin = req.sin[axis]
-                if not self._can_repeat_rope(cos, int(q_group.shape[0])):
+                if not self._can_repeat_rope(cos, tokens):
                     return False
-                cos_flat = self._align_rope_table(cos, int(q_group.shape[0]))
-                sin_flat = self._align_rope_table(sin, int(q_group.shape[0]))
-                out = try_triton_qk_rms_norm_rope(
-                    q_group,
-                    k_group,
+                if not self._rope_table_shape_matches(cos, sin, tokens, group_dim):
+                    return False
+                if not self._qk_norm_rope_group_eligible(
+                    req,
+                    norm_mod,
+                    group_dim,
                     req.q_weight[axis],
                     req.k_weight[axis],
-                    cos_flat,
-                    sin_flat,
-                    req.eps,
-                    req.eps,
-                )
-                if out is None:
+                    cos,
+                    sin,
+                ):
                     return False
-            elif try_triton_qk_rms_norm(
-                q_group,
-                k_group,
-                req.q_weight[axis],
-                req.k_weight[axis],
-                req.eps,
-                req.eps,
-            ) is None:
-                return False
+            else:
+                if not self._qk_norm_group_eligible(
+                    req,
+                    norm_mod,
+                    group_dim,
+                    req.q_weight[axis],
+                    req.k_weight[axis],
+                ):
+                    return False
             for local_axis in range(axis, group_end):
-                q_flat, _, _ = self._flatten_heads(q_parts[local_axis])
                 cos = req.cos[local_axis]
                 sin = req.sin[local_axis]
-                if not self._can_repeat_rope(cos, int(q_flat.shape[0])):
+                axis_dim = int(req.axis_dims[local_axis])
+                if not self._can_repeat_rope(cos, tokens):
                     return False
-                cos_flat = self._align_rope_table(cos, int(q_flat.shape[0]))
-                sin_flat = self._align_rope_table(sin, int(q_flat.shape[0]))
-                if not packed_rope.is_eligible(q_flat, cos_flat, sin_flat):
+                if not self._rope_table_shape_matches(cos, sin, tokens, axis_dim):
+                    return False
+                if not self._packed_rope_axis_eligible(req, rope_mod, axis_dim, cos, sin):
                     return False
             axis = group_end
         return True
 
+    @staticmethod
+    def _flattened_token_count(x: torch.Tensor) -> int:
+        if x.ndim == 3:
+            return int(x.shape[0])
+        if x.ndim == 4:
+            return int(x.shape[0]) * int(x.shape[2])
+        return 0
+
+    @staticmethod
+    def _rope_table_shape_matches(cos: torch.Tensor, sin: torch.Tensor, tokens: int, axis_dim: int) -> bool:
+        return (
+            cos.ndim == 2
+            and sin.shape == cos.shape
+            and int(cos.shape[-1]) * 2 == int(axis_dim)
+            and _TritonQKNormRopeProvider._can_repeat_rope(cos, int(tokens))
+        )
+
+    @staticmethod
+    def _qk_common_eligible(req: QKNormRopeReq, norm_mod) -> bool:
+        q_heads = int(req.q.shape[1]) if req.q.ndim in (3, 4) else 0
+        k_heads = int(req.k.shape[1]) if req.k.ndim in (3, 4) else 0
+        return not (
+            norm_mod.triton is None
+            or not norm_mod.triton_fused_layers_enabled()
+            or torch.is_grad_enabled()
+            or not norm_mod.triton_device_supported(req.q.device)
+            or req.q.device != req.k.device
+            or req.q.dtype != req.k.dtype
+            or q_heads <= 0
+            or k_heads <= 0
+        )
+
+    @staticmethod
+    def _qk_norm_group_eligible(
+        req: QKNormRopeReq,
+        norm_mod,
+        group_dim: int,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+    ) -> bool:
+        del norm_mod
+        group_dim = int(group_dim)
+        return not (
+            group_dim <= 0
+            or group_dim > 1024
+            or not q_weight.is_cuda
+            or not k_weight.is_cuda
+            or q_weight.device != req.q.device
+            or k_weight.device != req.q.device
+            or int(q_weight.numel()) != group_dim
+            or int(k_weight.numel()) != group_dim
+            or not q_weight.is_contiguous()
+            or not k_weight.is_contiguous()
+        )
+
+    @staticmethod
+    def _qk_norm_rope_group_eligible(
+        req: QKNormRopeReq,
+        norm_mod,
+        group_dim: int,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> bool:
+        if not _TritonQKNormRopeProvider._qk_norm_group_eligible(
+            req, norm_mod, group_dim, q_weight, k_weight
+        ):
+            return False
+        group_dim = int(group_dim)
+        return not (
+            group_dim % 2 != 0
+            or cos.device != req.q.device
+            or sin.device != req.q.device
+            or not cos.is_cuda
+            or not sin.is_cuda
+        )
+
+    @staticmethod
+    def _packed_rope_axis_eligible(
+        req: QKNormRopeReq,
+        rope_mod,
+        axis_dim: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> bool:
+        axis_dim = int(axis_dim)
+        heads = int(req.q.shape[1]) if req.q.ndim in (3, 4) else 0
+        return not (
+            rope_mod.triton is None
+            or not rope_mod.triton_fused_layers_enabled()
+            or torch.is_grad_enabled()
+            or not rope_mod.triton_device_supported(req.q.device)
+            or axis_dim <= 0
+            or axis_dim % 2 != 0
+            or heads <= 0
+            or not cos.is_cuda
+            or not sin.is_cuda
+            or cos.device != req.q.device
+            or sin.device != req.q.device
+        )
+
     def _run_multi_axis(self, req: QKNormRopeReq):
-        q_parts = req.q.split(req.axis_dims, dim=-1)
-        k_parts = req.k.split(req.axis_dims, dim=-1)
         out_q = []
         out_k = []
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
@@ -492,8 +622,12 @@ class _TritonQKNormRopeProvider:
         axis = 0
         while axis < len(req.axis_dims):
             group_end = _EagerQKNormRopeProvider._shared_norm_group_end(req, axis)
-            q_group, q_shape, q_was_flattened = self._flatten_heads(torch.cat(q_parts[axis:group_end], dim=-1))
-            k_group, k_shape, k_was_flattened = self._flatten_heads(torch.cat(k_parts[axis:group_end], dim=-1))
+            q_group, q_shape, q_was_flattened = self._flatten_axis_group(
+                req.q, req.axis_dims, axis, group_end
+            )
+            k_group, k_shape, k_was_flattened = self._flatten_axis_group(
+                req.k, req.axis_dims, axis, group_end
+            )
             if group_end == axis + 1:
                 cos = req.cos[axis]
                 sin = req.sin[axis]
@@ -531,6 +665,8 @@ class _TritonQKNormRopeProvider:
                 for local, (q_normed_part, k_normed_part) in enumerate(zip(q_normed_parts, k_normed_parts, strict=True)):
                     cos = req.cos[axis + local]
                     sin = req.sin[axis + local]
+                    q_normed_part = q_normed_part.contiguous()
+                    k_normed_part = k_normed_part.contiguous()
                     cos_flat = self._align_rope_table(cos, int(q_normed_part.shape[0]))
                     sin_flat = self._align_rope_table(sin, int(q_normed_part.shape[0]))
                     q_rot = packed_rope.run(q_normed_part, cos_flat, sin_flat)

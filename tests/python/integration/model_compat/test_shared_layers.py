@@ -581,6 +581,29 @@ def test_torch_compile_helper_is_default_off_and_config_driven(monkeypatch):
     assert len(calls) == 2
 
 
+def test_torch_compile_helper_prepares_blackwell_ptxas(monkeypatch):
+    import uniserve_worker.runtime.compile as compile_mod
+    from uniserve_worker.runtime.compile import TorchCompileConfig
+
+    module = nn.Linear(2, 2)
+    calls = []
+
+    monkeypatch.setattr(compile_mod, "_first_module_device", lambda _module: torch.device("cuda"))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
+    monkeypatch.setattr(compile_mod, "ensure_blackwell_ptxas", lambda: calls.append("ptxas") or True)
+    monkeypatch.setattr(torch, "compile", lambda target, **_kwargs: target)
+
+    cfg = TorchCompileConfig(
+        enabled=True,
+        backend="eager",
+        mode=None,
+        fullgraph=False,
+        dynamic=None,
+    )
+    assert compile_mod.maybe_compile_module(module, label="unit.blackwell", config=cfg) is module
+    assert calls == ["ptxas"]
+
+
 def test_column_and_row_parallel_loaders_narrow_full_rank_weights():
     from uniserve_worker.nn import ColumnParallelLinear, RowParallelLinear
 
@@ -780,6 +803,57 @@ def test_sensenova_dense_decoder_uses_shared_linear_seams():
     assert lm.get_output_embeddings() is lm.lm_head
 
 
+def test_sensenova_text_single_token_uses_fused_qkv_projection(monkeypatch):
+    from transformers import Qwen3Config
+
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+
+    cfg = Qwen3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=64,
+        attention_bias=False,
+    )
+    cfg.head_dim = 4
+    cfg.layer_types = ["full_attention"]
+    cfg.rope_theta_hw = 10000.0
+    cfg.max_position_embeddings_hw = 128
+    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+
+    def fake_qk_norm_rope(query_states, key_states, _indexes, **_kwargs):
+        return query_states.split([2, 1, 1], dim=-1), key_states.split([2, 1, 1], dim=-1)
+
+    monkeypatch.setattr(attn, "_qk_norm_rope_3d", fake_qk_norm_rope)
+    text_calls = 0
+    gen_calls = 0
+    orig_text_forward = attn.qkv_proj.forward
+    orig_gen_forward = attn.qkv_proj_mot_gen.forward
+
+    def text_forward(x):
+        nonlocal text_calls
+        text_calls += 1
+        return orig_text_forward(x)
+
+    def gen_forward(x):
+        nonlocal gen_calls
+        gen_calls += 1
+        return orig_gen_forward(x)
+
+    monkeypatch.setattr(attn.qkv_proj, "forward", text_forward)
+    monkeypatch.setattr(attn.qkv_proj_mot_gen, "forward", gen_forward)
+
+    hidden = torch.randn(1, 1, cfg.hidden_size)
+    indexes = torch.zeros(3, 1, dtype=torch.long)
+    attn._project_qkv(hidden, indexes, gen_branch=False)
+    attn._project_qkv(hidden, indexes, gen_branch=True)
+
+    assert text_calls == 1
+    assert gen_calls == 0
+
+
 def test_sensenova_projection_loaders_match_checkpoint_linears():
     from transformers import Qwen3Config
 
@@ -886,9 +960,11 @@ def test_sensenova_qk_norm_rope_3d_matches_eager_formula(monkeypatch):
     cos_w, sin_w = attn.rotary_emb_hw.cos_sin_1d(indexes[2])
     q_w, k_w = apply_axis(q_w, k_w, cos_w, sin_w)
 
-    for got, ref in zip(got_q, (q_t, q_h, q_w), strict=True):
+    got_q_parts = got_q.split([attn.head_dim // 2, attn.head_dim // 4, attn.head_dim // 4], dim=-1)
+    got_k_parts = got_k.split([attn.head_dim // 2, attn.head_dim // 4, attn.head_dim // 4], dim=-1)
+    for got, ref in zip(got_q_parts, (q_t, q_h, q_w), strict=True):
         torch.testing.assert_close(got, ref)
-    for got, ref in zip(got_k, (k_t, k_h, k_w), strict=True):
+    for got, ref in zip(got_k_parts, (k_t, k_h, k_w), strict=True):
         torch.testing.assert_close(got, ref)
 
 
@@ -1274,6 +1350,88 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_metadata(monkeypat
     assert stats.attention_backend_counts == {"fake_varlen_paged_varlen": 1}
 
 
+def test_uni_attention_runs_transient_paged_varlen_without_context_metadata():
+    from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
+
+    class FakeVarlenBackend:
+        name = "fake_varlen"
+
+        def __init__(self):
+            self.calls = 0
+            self.args = None
+            self.kwargs = None
+
+        def capabilities(self):
+            return AttentionCapabilities(varlen_attention=True, varlen_paged_kv=True)
+
+        def forward_varlen(self, q, k_cache, v_cache, **kwargs):
+            self.calls += 1
+            self.args = (q, k_cache, v_cache)
+            self.kwargs = kwargs
+            return torch.zeros_like(q)
+
+    class FakePool:
+        block_size = 4
+        supports_paged_attention_storage = True
+
+        def __init__(self):
+            self.k_cache = torch.empty(8, 4, 2, 4)
+            self.v_cache = torch.empty(8, 4, 2, 4)
+
+        def layer_cache(self, layer):
+            assert layer == 0
+            return self.k_cache, self.v_cache
+
+    class FakeCache:
+        def __init__(self):
+            self.pool = FakePool()
+            self.base_lens = (3, 5)
+            self.append_calls = []
+            self._block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+            self._cache_seqlens = torch.tensor([3, 5], dtype=torch.int32)
+
+        def block_table(self, *, device=None):
+            return self._block_table.to(device=device)
+
+        def cache_seqlens(self, *, device=None):
+            return self._cache_seqlens.to(device=device)
+
+        def append_varlen(self, layer, k, v, query_lens, **kwargs):
+            self.append_calls.append((layer, k, v, tuple(query_lens), kwargs))
+
+    attn = RadixAttention(2, 2, 4, layer_id=0)
+    backend = FakeVarlenBackend()
+    cache = FakeCache()
+    q = torch.randn(2, 2, 3, 4)
+    k = torch.randn(2, 2, 3, 4)
+    v = torch.randn(2, 2, 3, 4)
+
+    with use_forward_context(ForwardContext(attention_backend=backend)):
+        out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=False)
+
+    assert out.shape == q.shape
+    assert backend.calls == 1
+    q_run, k_cache, v_cache = backend.args
+    torch.testing.assert_close(q_run, q.transpose(1, 2).reshape(6, 2, 4).contiguous())
+    assert k_cache is cache.pool.k_cache
+    assert v_cache is cache.pool.v_cache
+    assert backend.kwargs["causal"] is False
+    assert backend.kwargs["block_table"].tolist() == [[0, 1], [2, 3]]
+    assert backend.kwargs["cu_seqlens_q"].tolist() == [0, 3, 6]
+    assert backend.kwargs["cu_seqlens_k"].tolist() == [0, 6, 14]
+    assert backend.kwargs["max_seqlen_q"] == 3
+    assert backend.kwargs["max_seqlen_k"] == 8
+    assert len(cache.append_calls) == 1
+    layer, appended_k, appended_v, query_lens, append_kwargs = cache.append_calls[0]
+    assert layer == 0
+    torch.testing.assert_close(appended_k, k.transpose(1, 2).reshape(6, 2, 4).contiguous())
+    torch.testing.assert_close(appended_v, v.transpose(1, 2).reshape(6, 2, 4).contiguous())
+    assert query_lens == (3, 3)
+    assert append_kwargs["block_table"].tolist() == [[0, 1], [2, 3]]
+    assert append_kwargs["cache_seqlens"].tolist() == [3, 5]
+    assert append_kwargs["cu_seqlens_q"].tolist() == [0, 3, 6]
+
+
 def test_uni_attention_falls_back_for_non_trunk_fa4_geometry():
     from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 
@@ -1519,6 +1677,90 @@ def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
     torch.testing.assert_close(packed, dense, atol=1e-5, rtol=1e-5)
 
 
+def test_sensenova_packed_visible_all_gen_uses_single_modality_qkv(monkeypatch):
+    from transformers import Qwen3Config
+
+    from uniserve_worker.execution.forward_stream import ForwardStream
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+
+    cfg = Qwen3Config(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=64,
+        attention_bias=False,
+    )
+    cfg.head_dim = 8
+    cfg.layer_types = ["full_attention"]
+    cfg.rope_theta_hw = 10000.0
+    cfg.max_position_embeddings_hw = 128
+    cfg._attn_implementation = "eager"
+    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn.o_proj_mot_gen = nn.Identity()
+
+    hidden = torch.randn(5, 32)
+    indexes = torch.stack(
+        [
+            torch.full((5,), 7, dtype=torch.long),
+            torch.arange(5, dtype=torch.long),
+            torch.zeros(5, dtype=torch.long),
+        ],
+        dim=0,
+    )
+    stream = ForwardStream(
+        segments=(),
+        cu_seqlens_q=torch.tensor([0, 5], dtype=torch.int32),
+        visible_end=torch.full((1, 5), 5, dtype=torch.int32),
+        indexes=indexes,
+    )
+    calls: list[bool] = []
+
+    def fail_routed(*_args, **_kwargs):
+        raise AssertionError("all-gen packed visible should not use routed QKV")
+
+    def fake_project(hidden_states, got_indexes, *, gen_branch, packed_rope=None):
+        del packed_rope
+        calls.append(bool(gen_branch))
+        assert hidden_states.shape == (1, 5, 32)
+        torch.testing.assert_close(got_indexes, indexes)
+        q = torch.arange(1 * 4 * 5 * 8, dtype=hidden.dtype).reshape(1, 4, 5, 8)
+        k = torch.zeros(1, 2, 5, 8, dtype=hidden.dtype)
+        v = torch.zeros(1, 2, 5, 8, dtype=hidden.dtype)
+        return q, k, v
+
+    def fake_attend(q, k, v, *, forward_stream, kv_view):
+        del k, v, kv_view
+        assert forward_stream is stream
+        return q
+
+    monkeypatch.setattr(attn, "_project_qkv_flat_routed", fail_routed)
+    monkeypatch.setattr(attn, "_project_qkv", fake_project)
+    monkeypatch.setattr(attn, "_attend_packed_visible", fake_attend)
+
+    out = attn.forward_packed_visible(
+        hidden,
+        image_gen_indicators=torch.ones(5, dtype=torch.bool),
+        indexes=indexes,
+        exist_non_image_gen_tokens=False,
+        exist_image_gen_tokens=True,
+        und=torch.zeros(5, dtype=torch.bool),
+        forward_stream=stream,
+        kv_view=None,
+    )
+
+    expected = (
+        torch.arange(4 * 5 * 8, dtype=hidden.dtype)
+        .reshape(4, 5, 8)
+        .transpose(0, 1)
+        .contiguous()
+        .reshape(5, 32)
+    )
+    torch.testing.assert_close(out, expected)
+    assert calls == [True]
+
+
 def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.models.sensenova import model as sensenova_u1
@@ -1643,6 +1885,150 @@ def test_sensenova_forward_sampling_updates_decode_relay():
     torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([9], dtype=torch.long))
 
 
+def test_sensenova_text_batch_delegates_to_scalar_text_stepper(monkeypatch):
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+
+    class FakeDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward_packed_visible(
+            self,
+            inputs_embeds,
+            *,
+            image_gen_indicators,
+            indexes,
+            forward_stream,
+            kv_view,
+        ):
+            self.calls.append(
+                {
+                    "inputs": inputs_embeds.detach().clone(),
+                    "indicators": image_gen_indicators.detach().clone(),
+                    "indexes": indexes.detach().clone(),
+                    "visible_end": forward_stream.visible_end.detach().clone(),
+                    "segments": kv_view.segments,
+                }
+            )
+            return inputs_embeds + indexes[0].to(inputs_embeds.dtype).unsqueeze(1)
+
+    class FakeLanguage(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = FakeDecoder()
+            self.embed = nn.Embedding(16, 4)
+            self.lm_head = nn.Linear(4, 8, bias=False)
+
+        def get_input_embeddings(self):
+            return self.embed
+
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
+    )
+    language = FakeLanguage()
+    wrapper.model = SimpleNamespace(language_model=language)
+    wrapper.device = "cpu"
+    wrapper.kv_pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=4,
+        block_size=8,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    scalar_calls = []
+
+    def scalar_fallback(op):
+        scalar_calls.append(dict(op))
+        return torch.full((1, 8), float(len(scalar_calls)))
+
+    monkeypatch.setattr(wrapper, "run_text_logits", scalar_fallback)
+    logits = wrapper.run_text_logits_batch(
+        [
+            {
+                "req_id": 7,
+                "kind": "prefill_und",
+                "token_ids": [3, 4],
+                "pos_range": [0, 2],
+                "new_block_ids": [0],
+            }
+        ]
+    )
+
+    assert len(logits) == 1
+    assert tuple(logits[0].shape) == (1, 8)
+    torch.testing.assert_close(logits[0], torch.ones((1, 8)))
+    assert scalar_calls == [
+        {
+            "req_id": 7,
+            "kind": "prefill_und",
+            "token_ids": [3, 4],
+            "pos_range": [0, 2],
+            "new_block_ids": [0],
+        }
+    ]
+    assert language.model.calls == []
+
+
+def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatch):
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+
+    class FakeLanguage(nn.Module):
+        def forward(self, **_kwargs):
+            raise AssertionError("fake graph runner should own the replay")
+
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
+    )
+    wrapper.model = SimpleNamespace(language_model=FakeLanguage())
+    wrapper.device = "cpu"
+    wrapper.kv_pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=4,
+        block_size=8,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    for req_id, block_id, length in ((11, 0, 3), (12, 1, 5)):
+        state = wrapper.interleaved_image_state(req_id)
+        state.cond.block_ids = [block_id]
+        wrapper._ensure_host_cache(state.cond)
+        state.cond.past.length = length
+        state.cond.t_index = length - 1
+        state.cond.last_token_id = 100 + req_id
+
+    scalar_calls = []
+
+    def scalar_fallback(op):
+        scalar_calls.append(dict(op))
+        row = len(scalar_calls) - 1
+        return torch.tensor([[float(row * 3), float(row * 3 + 1), float(row * 3 + 2)]])
+
+    monkeypatch.setattr(wrapper, "run_text_logits", scalar_fallback)
+
+    logits = wrapper.run_text_logits_batch(
+        [
+            {"req_id": 11, "kind": "decode_und", "token_ids": [7], "pos_range": [3, 4]},
+            {"req_id": 12, "kind": "decode_und", "token_ids": [9], "pos_range": [5, 6]},
+        ]
+    )
+
+    assert len(logits) == 2
+    torch.testing.assert_close(logits[0], torch.tensor([[0.0, 1.0, 2.0]]))
+    torch.testing.assert_close(logits[1], torch.tensor([[3.0, 4.0, 5.0]]))
+    assert scalar_calls == [
+        {"req_id": 11, "kind": "decode_und", "token_ids": [7], "pos_range": [3, 4]},
+        {"req_id": 12, "kind": "decode_und", "token_ids": [9], "pos_range": [5, 6]},
+    ]
+
+
 def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     from uniserve_worker.execution.forward_stream import ForwardStreamBuilder
     from uniserve_worker.models.sensenova import model as sensenova_u1
@@ -1673,6 +2059,114 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     assert kv_segments[0].write_kv is True
     assert kv_segments[0].persist_kv is False
     assert kv_segments[0].branch_id == 1
+
+
+def test_sensenova_denoise_predict_uses_graph_runner_when_available(monkeypatch):
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
+
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
+    )
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=2,
+        block_size=8,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cache = PagedTextCache(pool, [0], num_layers=1)
+    img = SimpleNamespace(token_h=1, token_w=2, height=16, width=32)
+    image_embeds = torch.ones(1, 2, 4)
+    indexes = torch.tensor([[0, 0], [0, 0], [0, 1]], dtype=torch.long)
+    t = torch.tensor([0.5])
+    z = torch.zeros(1, 2, 3)
+    graph_velocity = torch.full_like(z, 7.0)
+
+    class FakeGraphRunner:
+        def __init__(self, result):
+            self.result = result
+            self.calls = 0
+
+        def maybe_run(self, owner, **kwargs):
+            self.calls += 1
+            assert owner is wrapper
+            assert kwargs["img"] is img
+            assert kwargs["cache"] is cache
+            assert kwargs["image_embeds"] is image_embeds
+            return self.result
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def _t2i_predict_v(self, *args, **kwargs):
+            self.calls += 1
+            assert kwargs["image_size"] == (32, 16)
+            return torch.full_like(z, 3.0)
+
+    fake_model = FakeModel()
+    wrapper.model = fake_model
+    monkeypatch.setattr(wrapper, "_wait_gen_cache_ready", lambda _cache: None)
+    graph = FakeGraphRunner(graph_velocity)
+    wrapper._denoise_graph_runner = graph
+
+    out = wrapper._predict_v(img, image_embeds, indexes, cache, t, z)
+    torch.testing.assert_close(out, graph_velocity)
+    assert graph.calls == 1
+    assert fake_model.calls == 0
+
+    graph.result = None
+    out = wrapper._predict_v(img, image_embeds, indexes, cache, t, z)
+    torch.testing.assert_close(out, torch.full_like(z, 3.0))
+    assert graph.calls == 2
+    assert fake_model.calls == 1
+
+
+def test_sensenova_denoise_graph_key_reuses_equivalent_batched_wrappers():
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
+
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=8,
+        block_size=8,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    row0 = PagedTextCache(pool, [0], num_layers=1, length=3)
+    row1 = PagedTextCache(pool, [1], num_layers=1, length=3)
+    image_embeds = torch.ones(2, 4, 8)
+    indexes_a = torch.zeros(3, 2, 4, dtype=torch.long)
+    indexes_b = torch.zeros(3, 2, 4, dtype=torch.long)
+    t = torch.tensor([0.5])
+    z = torch.zeros(2, 4, 3)
+    img = SimpleNamespace(token_h=2, token_w=2, height=64, width=64)
+
+    key_a = sensenova_u1._SenseNovaDenoiseGraphRunner._key(
+        image_embeds,
+        indexes_a,
+        BatchedPagedTextCache([row0, row1]),
+        t,
+        z,
+        img,
+    )
+    key_b = sensenova_u1._SenseNovaDenoiseGraphRunner._key(
+        image_embeds,
+        indexes_b,
+        BatchedPagedTextCache([row0, row1]),
+        t,
+        z,
+        img,
+    )
+
+    assert key_a == key_b
 
 
 def test_qwen_attention_paged_update_is_not_env_gated(monkeypatch):

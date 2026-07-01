@@ -50,6 +50,7 @@ RESPONSE_OPTIONAL_FIELDS = (
 # by the runtime in ``WorkerRuntime.handle``, not by output dataclasses.
 SEQ_RESULT_FIELDS = (
     "sampled_token_id",
+    "sampled_token_ids",
     "denoise_done",
     "num_steps_done",
     "image_png_b64",
