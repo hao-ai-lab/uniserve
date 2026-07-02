@@ -16,7 +16,9 @@ import torch.nn as nn
 from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+import uniserve_worker.ops as ops
 from ..contracts.batches import UniForwardBatch
+from ..contracts.forward_context import get_forward_context
 from ..contracts.resource_plan import (
     AdapterResourcePolicy,
     CapsDescriptor,
@@ -35,6 +37,7 @@ from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     DEFAULT_NUM_BLOCKS_FALLBACK,
+    ceil_div,
     derive_cuda_kv_capacity,
     derive_num_blocks,
 )
@@ -58,10 +61,16 @@ from ..nn.vision import (
     patchify,
 )
 from ..processors.bagel import BagelImageProcessor
+from ..runtime.block_allocator import BlockFreeList
 from ..runtime.image_params import parse_text_image_generation_params
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.lora import MergeOnLoadLoRA
+from ..runtime.paged_text_cache import (
+    BatchedPagedTextCache,
+    PagedTextCache,
+    copy_paged_text_cache_span,
+)
 from ..runtime.request_state import RequestState
 from ..runtime.residency import (
     GenResidencySpec,
@@ -292,7 +301,12 @@ class _BagelGraph(nn.Module):
             update_cache=update,
         )
 
-    def build_gen_segment(self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False) -> Segment:
+    def gen_segment_embeds(self, num_vae, vae_pos_ids, x_t, timestep) -> torch.Tensor:
+        """Marker/VAE-latent/timestep embeddings for one gen segment, ``[num_vae+2, hidden]``.
+
+        Shared by the eager per-branch :meth:`build_gen_segment` path and the
+        batched-rows denoise path so the two are byte-identical by construction.
+        """
         hidden = self.cfg.llm.hidden_size
         total = int(num_vae) + 2
         marker_ids = torch.tensor(
@@ -312,13 +326,22 @@ class _BagelGraph(nn.Module):
         embeds[0] = marker_emb[0]
         embeds[1 : 1 + int(num_vae)] = vae_emb
         embeds[1 + int(num_vae)] = marker_emb[1]
-        positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
-        is_gen = torch.zeros(total, dtype=torch.bool, device=self.device)
+        return embeds
+
+    def gen_segment_is_gen(self, num_vae) -> torch.Tensor:
+        """Gen-segment modality pattern: markers are text-modality, latents gen."""
+        is_gen = torch.zeros(int(num_vae) + 2, dtype=torch.bool, device=self.device)
         is_gen[1 : 1 + int(num_vae)] = True
+        return is_gen
+
+    def build_gen_segment(self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False) -> Segment:
+        total = int(num_vae) + 2
+        embeds = self.gen_segment_embeds(num_vae, vae_pos_ids, x_t, timestep)
+        positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
         return Segment(
             embeds=embeds,
             positions=positions,
-            is_gen=is_gen,
+            is_gen=self.gen_segment_is_gen(num_vae),
             cache=cache,
             causal=False,
             update_cache=update,
@@ -513,19 +536,34 @@ def _load_bagel(model_dir: str, device: str = "cuda") -> _BagelGraph:
 
 
 class GenState:
-    """Mutable image-generation state for one BAGEL denoise/commit cycle."""
+    """Mutable image-generation state for one BAGEL denoise/commit cycle.
+
+    ``paged_branch_caches`` (when set) maps CFG branch name -> scratch-pool
+    ``PagedTextCache`` holding that branch's prefix KV; the batched denoise
+    path attends over them with per-step transient gen rows. ``None`` keeps
+    the per-branch eager segment path (understanding-interleave, no scratch
+    pool, or an ineligible attention backend).
+    """
 
     __slots__ = ("x_t", "vae_pos_ids", "num_vae", "H", "W", "schedule",
                  "cfg_cache", "cfg_pos", "cfg_text_scale", "cfg_img_scale",
                  "cfg_renorm_type", "cfg_renorm_min", "cfg_interval", "cond_pos",
                  "understanding", "cond_branch_kvlen", "text_branch_pos", "text_branch_kvlen",
-                 "cfg_img_cache", "cfg_img_pos")
+                 "cfg_img_cache", "cfg_img_pos",
+                 "paged_branch_caches", "paged_branch_positions", "batched_caches")
 
 
 # BAGEL's start-of-image marker string (token id 151652 in the Qwen2 vocab).
 # The worker never tokenizes it (encode ops embed the marker directly); the
 # shared text driver takes it as configuration.
 _BAGEL_IMG_START_TOKEN = "<|vision_start|>"
+
+# Scratch (per-CFG-branch) KV pool capacity in tokens. Sized for several
+# concurrent denoises: each t2i image stages cond + text-uncond prefixes plus
+# one transient gen span (``num_vae + 2`` <= 4098 at the 64x64 latent cap) per
+# branch, ~9k tokens for a 1024x1024 image. The caps descriptor advertises
+# exactly this pool's capacity.
+_BAGEL_SCRATCH_CAPACITY_TOKENS = 65536
 
 
 @dataclass
@@ -601,11 +639,13 @@ class BagelForUnifiedGeneration(UniModelBase):
         self._gen_states: dict[int, GenState] = {}
         # Interleaved-text-driver owner surface: per-request driver states plus
         # the marker/eos ids the driver reads as configuration. BAGEL has no
-        # worker-side tokenizer (the host tokenizes) and no scratch pool (its
-        # CFG branches use transient KVCaches).
+        # worker-side tokenizer (the host tokenizes). The scratch pool holds
+        # the denoise CFG-branch prefixes and their transient gen rows.
         self.reqs: dict[int, BagelTextRequestState] = {}
         self.tokenizer = None
         self.scratch_pool: PagedKVPool | None = None
+        self._scratch_allocator = BlockFreeList()
+        self._scratch_blocks = 0
         self.eos_id = int(self.cfg.llm.eos_token_id)
         self.img_start_id = int(self.cfg.start_of_image_id)
         self.img_end_id = int(self.cfg.end_of_image_id)
@@ -625,6 +665,8 @@ class BagelForUnifiedGeneration(UniModelBase):
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
             self.residency = self._build_residency(c)
             self.pool = self.residency.kv
+            self.scratch_pool = self.residency.scratch
+            self._scratch_allocator.reset(self._scratch_blocks)
             self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
             self.lora = MergeOnLoadLoRA(self.model)
         else:
@@ -655,11 +697,15 @@ class BagelForUnifiedGeneration(UniModelBase):
             return int(sizing.token_capacity)
         return self.block_size * DEFAULT_NUM_BLOCKS_FALLBACK
 
+    def _scratch_num_blocks(self, block_size: int | None = None) -> int:
+        return ceil_div(_BAGEL_SCRATCH_CAPACITY_TOKENS, int(block_size or self.block_size))
+
     def _build_residency(self, cfg: LLMConfig) -> ResidencyManager:
         # System-owned residency: the worker-owned ResidencyManager constructs
         # and owns the KV pool; the model declares only geometry/sizing here.
-        # (Bagel's CFG uncond branches use transient KVCaches, not a scratch
-        # pool, so scratch_num_blocks=0.)
+        # The scratch pool holds the denoise CFG-branch prefix KV (staged cond
+        # + neg-prompt branches) and their per-step transient gen rows.
+        self._scratch_blocks = self._scratch_num_blocks()
         return ResidencyManager.build_gen(
             GenResidencySpec(
                 kv=KvCacheSpec(
@@ -672,7 +718,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                 num_blocks=self.num_blocks,
                 block_size=self.block_size,
                 device=self.device,
-                scratch_num_blocks=0,
+                scratch_num_blocks=self._scratch_blocks,
             )
         )
 
@@ -712,11 +758,14 @@ class BagelForUnifiedGeneration(UniModelBase):
         else:
             num_blocks = derive_num_blocks(block, cap, floor=64)
         c = self.cfg.llm
+        # Report the actual per-CFG-branch scratch pool capacity in tokens
+        # (the built pool's blocks when loaded, the planned sizing otherwise).
+        scratch_blocks = self._scratch_blocks if self.model is not None else self._scratch_num_blocks(block)
         return CapsDescriptor(
             block_size=block,
             num_blocks=num_blocks,
             num_layers=c.num_hidden_layers,
-            scratch_capacity_tokens=int(cap or block * num_blocks),
+            scratch_capacity_tokens=int(scratch_blocks * block),
             max_latent_size=self.cfg.latent_token_capacity,
             latent_downsample=self.cfg.latent_downsample,
             max_vae_grid_tokens=self.cfg.latent_token_capacity,
@@ -757,7 +806,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         r = int(req_id)
         state = self.states.pop(r, None)
         self.reqs.pop(r, None)
-        self._gen_states.pop(r, None)
+        self._pop_gen_state(r)
         self._gen_records.pop(r, None)
         if state is not None:
             state.kv_lengths.pop("default", None)
@@ -809,7 +858,19 @@ class BagelForUnifiedGeneration(UniModelBase):
         self._gen_states[int(req_id)] = value
 
     def _pop_gen_state(self, req_id: int) -> GenState | None:
-        return self._gen_states.pop(int(req_id), None)
+        gs = self._gen_states.pop(int(req_id), None)
+        if gs is not None:
+            self._release_paged_denoise_branches(gs)
+        return gs
+
+    def _release_paged_denoise_branches(self, gs: GenState) -> None:
+        caches = gs.paged_branch_caches
+        if not caches:
+            return
+        for cache in caches.values():
+            self._release_scratch_cache(cache)
+        gs.paged_branch_caches = None
+        gs.batched_caches = {}
 
     def _extend_blocks(self, op) -> list[int]:
         state = self._state(int(op["req_id"]))
@@ -826,6 +887,19 @@ class BagelForUnifiedGeneration(UniModelBase):
     @property
     def num_layers(self) -> int:
         return int(self.cfg.llm.num_hidden_layers)
+
+    def allocate_scratch_blocks(self, count: int) -> list[int]:
+        if self.scratch_pool is None:
+            raise capability_mismatch("BAGEL scratch KV pool is not initialized")
+        return self._scratch_allocator.allocate(count, label="BAGEL scratch KV pool")
+
+    def _release_scratch_cache(self, cache: Any) -> None:
+        if cache is None:
+            return
+        if self.scratch_pool is not None and getattr(cache, "pool", None) is self.scratch_pool:
+            self._scratch_allocator.release(
+                int(block_id) for block_id in getattr(cache, "block_ids", [])
+            )
 
     def _text_driver(self) -> InterleavedTextCacheDriver:
         driver = self._shared_text_driver
@@ -1002,6 +1076,9 @@ class BagelForUnifiedGeneration(UniModelBase):
         ip = rec.get("image") or {}
         cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
         gs = GenState()
+        gs.paged_branch_caches = None
+        gs.paged_branch_positions = {}
+        gs.batched_caches = {}
         gs.cond_pos = op["cond_pos"]
         dims = rec.get("dims")
         parse_ip = dict(ip)
@@ -1051,13 +1128,128 @@ class BagelForUnifiedGeneration(UniModelBase):
             gs.text_branch_pos = gs.text_branch_kvlen = 0
             gs.cfg_img_cache = None
             gs.cfg_img_pos = 0
-            gs.cfg_cache = m.new_cache()
-            gs.cfg_pos = 0
-            neg = rec.get("neg_token_ids")
-            if gs.cfg_text_scale > 1.0 and neg:
-                m.run([m.build_und_segment(neg, 0, gs.cfg_cache, update=True)])
-                gs.cfg_pos = len(neg)
+            gs.cfg_cache = None
+            neg = list(rec.get("neg_token_ids") or [])
+            gs.cfg_pos = len(neg) if (gs.cfg_text_scale > 1.0 and neg) else 0
+            self._init_paged_denoise_branches(op, gs, neg)
+            if gs.paged_branch_caches is None:
+                # Eager per-branch fallback: transient in-RAM KV branches
+                # driven through the segment API (pre-scratch-pool semantics).
+                gs.cfg_cache = m.new_cache()
+                if gs.cfg_text_scale > 1.0 and neg:
+                    m.run([m.build_und_segment(neg, 0, gs.cfg_cache, update=True)])
         self._set_gen_state(op["req_id"], gs)
+
+    def _init_paged_denoise_branches(self, op, gs: GenState, neg: list[int]) -> None:
+        """Stage the t2i CFG branch prefixes into scratch-paged caches.
+
+        The batched denoise path runs all active branches as rows of ONE
+        gen-expert forward over a ``BatchedPagedTextCache``, which requires
+        every row — the cond prefix included — to live in one KV pool, with
+        each step's transient gen rows written past the row's fixed prefix.
+        The request pool satisfies neither constraint (the neg branch cannot
+        share it, and pure-t2i requests carry no host-allocated capacity for
+        the ``num_vae + 2`` transient span), so the cond prefix KV
+        ``[0, cond_kvlen)`` is copied once per image into the scratch pool —
+        the same staging SenseNova's tower handoff performs on its
+        trivial-tower path. The neg-prompt (text-uncond) branch prefills
+        directly into scratch through the shared paged und-stack forward.
+
+        Any ineligibility (no scratch pool, understanding-interleave branches,
+        quantized KV store, a backend without paged attention, or scratch
+        exhaustion) leaves ``gs.paged_branch_caches`` ``None`` and the eager
+        per-branch segment path fully authoritative.
+        """
+        if self.scratch_pool is None or gs.understanding:
+            return
+        m = self.model
+        total_gen = int(gs.num_vae) + 2
+        cond_len = int(gs.cond_branch_kvlen)
+        caches: dict[str, PagedTextCache] = {}
+        positions: dict[str, int] = {}
+        try:
+            cond_cache = PagedTextCache(
+                self.scratch_pool,
+                [],
+                num_layers=self.num_layers,
+                allocate_blocks=self.allocate_scratch_blocks,
+            )
+            caches["cond"] = cond_cache
+            if not self._paged_denoise_attention_available(cond_cache):
+                self._release_scratch_cache(cond_cache)
+                return
+            cond_cache.ensure_capacity(cond_len + total_gen)
+            if cond_len:
+                copy_paged_text_cache_span(
+                    self.pool.view(self._state(int(op["req_id"])).block_ids, cond_len),
+                    cond_cache,
+                    start=0,
+                    length=cond_len,
+                    num_layers=self.num_layers,
+                )
+            cond_cache.length = cond_len
+            positions["cond"] = int(gs.cond_pos)
+            if gs.cfg_text_scale > 1.0:
+                tu_cache = PagedTextCache(
+                    self.scratch_pool,
+                    [],
+                    num_layers=self.num_layers,
+                    allocate_blocks=self.allocate_scratch_blocks,
+                )
+                caches["text_uncond"] = tu_cache
+                tu_cache.ensure_capacity(len(neg) + total_gen)
+                if neg:
+                    ids = torch.as_tensor(neg, dtype=torch.long, device=self.device)
+                    m.lm.forward_paged_text(
+                        m.embed_tokens(ids).to(torch.bfloat16),
+                        torch.arange(len(neg), device=self.device),
+                        tu_cache,
+                    )
+                positions["text_uncond"] = int(gs.cfg_pos)
+        except RuntimeError:
+            # Worker-local scratch exhaustion (BlockFreeList) is the one
+            # recoverable failure here: release and keep the eager path.
+            for cache in caches.values():
+                self._release_scratch_cache(cache)
+            logger.warning(
+                "BAGEL scratch staging for denoise CFG branches failed; "
+                "falling back to the per-branch segment path",
+                exc_info=True,
+            )
+            return
+        gs.paged_branch_caches = caches
+        gs.paged_branch_positions = positions
+        gs.batched_caches = {}
+
+    def _paged_denoise_attention_available(self, cache: PagedTextCache) -> bool:
+        """Probe whether the scratch pool + backend support batched paged denoise.
+
+        Mirrors SenseNova's ``_batched_paged_denoise_available``: a pure
+        capability probe (providers answer ``can_run`` without executing);
+        unsupported configurations return False and keep the eager per-branch
+        path, while an exception here is a provider bug that must surface.
+        """
+        pool = cache.pool
+        if not bool(getattr(pool, "supports_paged_attention_storage", True)):
+            return False
+        if not pool.k.is_cuda:
+            return False
+        ctx = get_forward_context()
+        preferred = ctx.attention_backend_name or self.attention_backend or "auto"
+        probe = torch.empty((1, 1, 1, self.cfg.llm.head_dim), device=pool.k.device, dtype=pool.dtype)
+        return ops.can_run_attention(
+            probe,
+            probe,
+            probe,
+            regime=ops.AttentionRegime.DECODE,
+            causal=True,
+            scale=1.0,
+            ctx=ctx,
+            kv_cache=cache,
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=probe.device),
+            cache_seqlens=torch.zeros((1,), dtype=torch.int32, device=probe.device),
+            override=preferred,
+        )
 
     def prepare_denoise_step(self, req_id: int, state, op: dict) -> TextImageDenoiseStep:
         r = int(req_id)
@@ -1101,10 +1293,79 @@ class BagelForUnifiedGeneration(UniModelBase):
         del t, latent
         return self.predict_denoise_velocity(ctx, branch)
 
+    def predict_text_image_velocity_batch(self, steps, branches_by_step):
+        """Batched denoise: all CFG branches of a step as rows of ONE gen forward.
+
+        The denoise driver prefers this over per-branch ``predict_velocity``
+        calls. Steps whose branches are not fully staged in scratch-paged
+        caches (understanding-interleave, or no scratch/backend support) run
+        the per-branch path with its exact existing semantics.
+        """
+        self._ensure_loaded()
+        results: list[dict[str, torch.Tensor]] = []
+        for step, branches in zip(steps, branches_by_step):
+            gs = step.extra["gs"]
+            caches = gs.paged_branch_caches
+            names = tuple(branches)
+            if caches is not None and all(branch in caches for branch in names):
+                results.append(self._predict_denoise_velocity_rows(step, gs, names))
+            else:
+                results.append(
+                    {branch: self.predict_denoise_velocity(step, branch) for branch in names}
+                )
+        return results
+
+    def _predict_denoise_velocity_rows(
+        self, step: TextImageDenoiseStep, gs: GenState, branches: tuple[str, ...]
+    ) -> dict[str, torch.Tensor]:
+        """Run the given CFG branches as rows of one batched MoT gen forward.
+
+        Per-row math matches the per-branch ``build_gen_segment`` path exactly
+        (shared embedding builder, same modality routing / rope / bidirectional
+        visibility over [branch prefix + gen rows]); only the attention kernel
+        changes from the dense per-layer prefix gather to the batched
+        transient paged-varlen read, and the branch GEMMs run once as rows.
+        """
+        m = self.model
+        caches = gs.paged_branch_caches
+        num_vae = int(gs.num_vae)
+        total = num_vae + 2
+        embeds = m.gen_segment_embeds(
+            num_vae, gs.vae_pos_ids, step.latent, float(step.t.detach().float().item())
+        )
+        rows = len(branches)
+        positions = (
+            torch.tensor(
+                [int(gs.paged_branch_positions[branch]) for branch in branches],
+                dtype=torch.long,
+                device=self.device,
+            )
+            .unsqueeze(1)
+            .expand(rows, total)
+        )
+        batched = gs.batched_caches.get(branches)
+        if batched is None:
+            batched = BatchedPagedTextCache([caches[branch] for branch in branches])
+            gs.batched_caches[branches] = batched
+        hidden = m.lm.forward_paged_gen_batch(
+            embeds.unsqueeze(0).expand(rows, total, embeds.shape[-1]),
+            positions,
+            m.gen_segment_is_gen(num_vae),
+            batched,
+        )
+        velocity = m.llm2vae(hidden[:, 1 : 1 + num_vae].to(torch.bfloat16))
+        return {branch: velocity[row] for row, branch in enumerate(branches)}
+
     def predict_denoise_velocity(self, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:
         self._ensure_loaded()
         m = self.model
         gs = step.extra["gs"]
+        caches = gs.paged_branch_caches
+        if caches is not None and branch in caches:
+            # Single-row batched path: the staged scratch branches are the only
+            # prefill of the CFG prefixes, so per-branch prediction rides the
+            # same substrate (B=1) rather than a diverging in-RAM copy.
+            return self._predict_denoise_velocity_rows(step, gs, (branch,))[branch]
         if branch == "cond":
             cache = self.pool.view(self._state(step.req_id).block_ids, gs.cond_branch_kvlen)
             position = gs.cond_pos
