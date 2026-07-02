@@ -314,7 +314,11 @@ class RadixAttention(nn.Module):
             override=self._attention_override(ctx, preferred),
         )
         batch, _heads, q_len, _head_dim = q.shape
-        return out.view(batch, q_len, int(out.shape[1]), int(out.shape[2])).transpose(1, 2).contiguous()
+        # Return a [batch, heads, tokens, dim] *view* over the kernel's
+        # token-major output. Values are identical to the previously returned
+        # materialized copy; callers that need a different layout re-transpose,
+        # which lands back on the contiguous token-major storage for free.
+        return out.view(batch, q_len, int(out.shape[1]), int(out.shape[2])).transpose(1, 2)
 
     def _forward_paged_decode(
         self,
