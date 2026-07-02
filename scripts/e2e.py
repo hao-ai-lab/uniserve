@@ -35,7 +35,7 @@ from typing import Any
 from urllib import request as urlrequest
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "scripts" / "verify_config.json"
+DEFAULT_CONFIG = ROOT / "scripts" / "e2e_config.json"
 
 
 def load_config(path: Path) -> dict[str, Any]:
