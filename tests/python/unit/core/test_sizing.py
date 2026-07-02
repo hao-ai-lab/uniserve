@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.foundation.sizing import derive_cuda_kv_capacity, derive_num_blocks
+from uniserve_worker.foundation.sizing import (
+    derive_cuda_kv_capacity,
+    derive_num_blocks,
+    derive_runtime_kv_capacity,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -52,6 +56,63 @@ def test_derive_cuda_kv_capacity_returns_none_for_non_cuda_device(monkeypatch):
         )
         is None
     )
+
+
+def test_derive_runtime_kv_capacity_prefers_explicit_tokens(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    capacity = derive_runtime_kv_capacity(
+        block_size=16,
+        kv_token_capacity=48,
+        bytes_per_token=10,
+        device="cuda:0",
+        memory_fraction=0.5,
+        floor=4,
+    )
+
+    assert capacity.num_blocks == 4
+    assert capacity.token_capacity == 64
+    assert capacity.cuda is None
+
+
+def test_derive_runtime_kv_capacity_uses_cuda_when_available(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (1_000, 2_000))
+
+    capacity = derive_runtime_kv_capacity(
+        block_size=16,
+        kv_token_capacity=None,
+        bytes_per_token=10,
+        device="cuda:0",
+        memory_fraction=0.5,
+        floor=4,
+    )
+
+    assert capacity.num_blocks == 4
+    assert capacity.token_capacity == 64
+    assert capacity.cuda is not None
+
+
+def test_derive_runtime_kv_capacity_falls_back_to_default_blocks(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    capacity = derive_runtime_kv_capacity(
+        block_size=16,
+        kv_token_capacity=None,
+        bytes_per_token=10,
+        device="cuda:0",
+        memory_fraction=0.5,
+    )
+
+    assert capacity.num_blocks == 4096
+    assert capacity.token_capacity == 4096 * 16
+    assert capacity.cuda is None
 
 
 def test_sensenova_num_blocks_uses_shared_formula():

@@ -227,7 +227,7 @@ def run_packed_mixed_forward(
         raise capability_mismatch("packed mixed forward failed for an admitted mixed batch") from exc
     finally:
         for staged in staged_text_caches:
-            owner._release_scratch_cache(staged)
+            owner.residency.release_scratch_cache(staged)
 
 
 def _append_packed_chunk(

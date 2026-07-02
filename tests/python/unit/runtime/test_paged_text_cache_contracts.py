@@ -17,6 +17,7 @@ from uniserve_worker.runtime.paged_text_cache import (
     BatchedPagedTextCache,
     PagedTextCache,
 )
+from uniserve_worker.runtime.residency import ScratchKvPool
 
 pytestmark = pytest.mark.unit
 
@@ -38,6 +39,46 @@ def _make_pool(
         device="cpu",
         dtype=torch.float32,
     )
+
+
+def _make_scratch_pool(
+    *,
+    num_layers: int = 1,
+    num_blocks: int = 4,
+    block_size: int = 4,
+    num_kv_heads: int = 2,
+    head_dim: int = 3,
+) -> ScratchKvPool:
+    return ScratchKvPool(
+        num_layers=num_layers,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        device="cpu",
+        dtype=torch.float32,
+        label="test scratch KV pool",
+    )
+
+
+def test_scratch_pool_owns_transient_block_leases():
+    pool = _make_scratch_pool(num_blocks=3, block_size=4)
+    cache = PagedTextCache(
+        pool,
+        [],
+        num_layers=1,
+        allocate_blocks=pool.allocate_blocks,
+    )
+
+    cache.ensure_capacity(9)
+
+    assert cache.block_ids == [0, 1, 2]
+    with pytest.raises(RuntimeError, match="test scratch KV pool exhausted"):
+        pool.allocate_blocks(1)
+
+    pool.release_cache(cache)
+
+    assert pool.allocate_blocks(3) == [0, 1, 2]
 
 
 # --------------------------------------------------------------------------

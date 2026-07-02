@@ -39,8 +39,8 @@ from ..foundation.runtime_config import get_worker_config
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
-    derive_cuda_kv_capacity,
     derive_num_blocks,
+    derive_runtime_kv_capacity,
 )
 from ..loader.weight_utils import WeightLoadReport, stacked_params_mapping_loop
 from ..nn import (
@@ -558,46 +558,33 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         kv_token_capacity: int | None,
         compute_dtype: torch.dtype,
     ) -> int:
-        if kv_token_capacity is not None and int(kv_token_capacity) > 0:
-            return derive_num_blocks(block_size, kv_token_capacity)
-        auto_blocks = self._auto_fit_num_blocks(block_size=block_size, compute_dtype=compute_dtype)
-        if auto_blocks is not None:
-            return auto_blocks
-        return derive_num_blocks(block_size, None)
-
-    def _auto_fit_num_blocks(
-        self,
-        *,
-        block_size: int,
-        compute_dtype: torch.dtype,
-    ) -> int | None:
         try:
             param = next(self.parameters())
+            device = getattr(param, "device", None)
         except StopIteration:
-            return None
-        bytes_per_token = max(1, self._kv_bytes_per_token(compute_dtype))
-        sizing = derive_cuda_kv_capacity(
-            device=getattr(param, "device", None),
+            device = None
+        capacity = derive_runtime_kv_capacity(
             block_size=block_size,
-            bytes_per_token=bytes_per_token,
+            kv_token_capacity=kv_token_capacity,
+            bytes_per_token=self._kv_bytes_per_token(compute_dtype),
+            device=device,
             memory_fraction=get_worker_config().kv_memory_fraction,
         )
-        if sizing is None:
-            return None
-        logger.info(
-            "auto-sized Qwen3 KV pool",
-            extra={
-                "device": sizing.device,
-                "free_bytes": sizing.free_bytes,
-                "total_bytes": sizing.total_bytes,
-                "fraction": sizing.memory_fraction,
-                "bytes_per_token": sizing.bytes_per_token,
-                "block_size": sizing.block_size,
-                "num_blocks": sizing.num_blocks,
-                "token_capacity": sizing.token_capacity,
-            },
-        )
-        return sizing.num_blocks
+        if capacity.cuda is not None:
+            logger.info(
+                "auto-sized Qwen3 KV pool",
+                extra={
+                    "device": capacity.cuda.device,
+                    "free_bytes": capacity.cuda.free_bytes,
+                    "total_bytes": capacity.cuda.total_bytes,
+                    "fraction": capacity.cuda.memory_fraction,
+                    "bytes_per_token": capacity.cuda.bytes_per_token,
+                    "block_size": capacity.cuda.block_size,
+                    "num_blocks": capacity.cuda.num_blocks,
+                    "token_capacity": capacity.cuda.token_capacity,
+                },
+            )
+        return capacity.num_blocks
 
     def load_weights(self, weights) -> set[str]:
         stacked = [

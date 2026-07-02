@@ -9,9 +9,11 @@ __all__ = [
     'DEFAULT_MAX_BATCH_OPS',
     'DEFAULT_BLOCK_SIZE',
     'CudaKVCapacity',
+    'RuntimeKVCapacity',
     'ceil_div',
     'derive_cuda_kv_capacity',
     'derive_num_blocks',
+    'derive_runtime_kv_capacity',
 ]
 
 # Number of KV blocks assumed when a model declares no explicit token capacity
@@ -33,6 +35,15 @@ class CudaKVCapacity:
     block_size: int
     token_capacity: int
     num_blocks: int
+
+
+@dataclass(frozen=True)
+class RuntimeKVCapacity:
+    block_size: int
+    bytes_per_token: int
+    token_capacity: int
+    num_blocks: int
+    cuda: CudaKVCapacity | None = None
 
 
 def ceil_div(value: int, divisor: int) -> int:
@@ -120,4 +131,59 @@ def derive_cuda_kv_capacity(
         block_size=block,
         token_capacity=int(num_blocks * block),
         num_blocks=int(num_blocks),
+    )
+
+
+def derive_runtime_kv_capacity(
+    *,
+    block_size: int,
+    kv_token_capacity: int | None,
+    bytes_per_token: int,
+    device: Any = None,
+    memory_fraction: float = 1.0,
+    floor: int = 1,
+    default_blocks: int | None = None,
+) -> RuntimeKVCapacity:
+    """Resolve the worker-facing KV capacity policy in one place.
+
+    Explicit token capacity wins. Otherwise CUDA free-memory sizing is used
+    when available. CPU/unavailable-CUDA paths fall back to
+    :func:`derive_num_blocks`' shared default block policy.
+    """
+
+    block = int(block_size)
+    token_bytes = max(1, int(bytes_per_token))
+    if kv_token_capacity is not None and int(kv_token_capacity) > 0:
+        blocks = derive_num_blocks(block, kv_token_capacity, floor=floor)
+        return RuntimeKVCapacity(
+            block_size=block,
+            bytes_per_token=token_bytes,
+            token_capacity=int(blocks * block),
+            num_blocks=int(blocks),
+            cuda=None,
+        )
+
+    cuda = derive_cuda_kv_capacity(
+        device=device,
+        block_size=block,
+        bytes_per_token=token_bytes,
+        memory_fraction=memory_fraction,
+        floor=floor,
+    )
+    if cuda is not None:
+        return RuntimeKVCapacity(
+            block_size=block,
+            bytes_per_token=token_bytes,
+            token_capacity=int(cuda.token_capacity),
+            num_blocks=int(cuda.num_blocks),
+            cuda=cuda,
+        )
+
+    blocks = derive_num_blocks(block, None, default_blocks=default_blocks, floor=floor)
+    return RuntimeKVCapacity(
+        block_size=block,
+        bytes_per_token=token_bytes,
+        token_capacity=int(blocks * block),
+        num_blocks=int(blocks),
+        cuda=None,
     )
