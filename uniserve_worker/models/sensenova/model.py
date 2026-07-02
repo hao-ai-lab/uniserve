@@ -1819,6 +1819,12 @@ class NEOChatModel(nn.Module):
             update_cache=False,
             use_cache=True,
             pre_norm_out=pre_norm_out,
+            # The indicators above are all-ones by construction; passing the
+            # exist flags explicitly skips the decoder's ``bool(mask.any())``
+            # derivation — a per-step device->host sync that is also illegal
+            # inside denoise-step CUDA graph capture.
+            exist_non_image_gen_tokens=False,
+            exist_image_gen_tokens=True,
         )
         x_pred = self._t2i_hidden_to_x_pred(
             outputs.last_hidden_state,
