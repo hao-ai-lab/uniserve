@@ -104,6 +104,10 @@ def server_log_path(config: dict[str, Any], name: str) -> Path:
 
 
 def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any]) -> list[str]:
+    # A server spec with an explicit ``command`` launches any backend (e.g. a
+    # vLLM-Omni comparison server); the default builds a UniServe launch.
+    if spec.get("command"):
+        return [str(part) for part in spec["command"]]
     cmd = [
         str(ROOT / config.get("server_bin", "target/debug/uniserve")),
         "serve",
@@ -539,7 +543,10 @@ def list_items(args: argparse.Namespace) -> None:
                 print(f"{name}\t{resolved.get('served_model_name', '')}\t{resolved.get('host', '')}:{resolved.get('port', '')}")
         elif section == "workloads":
             for name, spec in sorted(config.get("workloads", {}).items()):
-                print(f"{name}\t{spec.get('type', '')}\tserver={spec.get('server', '-')}")
+                line = f"{name}\t{spec.get('type', '')}\tserver={spec.get('server', '-')}"
+                if spec.get("description"):
+                    line += f"\n\t{spec['description']}"
+                print(line)
         elif section == "suites":
             for name, items in sorted(config.get("suites", {}).items()):
                 print(f"{name}\t{','.join(items)}")

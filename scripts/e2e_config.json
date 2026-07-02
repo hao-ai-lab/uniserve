@@ -87,6 +87,47 @@
         "4096"
       ],
       "host": "127.0.0.1"
+    },
+    "sensenova-omni": {
+      "served_model_name": "/home/hal-ysun/models/SenseNova-U1-8B-MoT-Interleaved-local",
+      "host": "127.0.0.1",
+      "port": 8091,
+      "cuda_visible_devices": "1",
+      "command": [
+        "/home/hal-ysun/omni-bench-venv/bin/vllm",
+        "serve",
+        "/home/hal-ysun/models/SenseNova-U1-8B-MoT-Interleaved-local",
+        "--omni",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8091"
+      ],
+      "description": "vLLM-Omni serving SenseNova-U1 (single-stage diffusion pipeline) for same-workload comparison; slow cold start (several minutes)."
+    },
+    "bagel-omni": {
+      "served_model_name": "/home/hal-ysun/models/BAGEL-7B-MoT",
+      "host": "127.0.0.1",
+      "port": 8092,
+      "cuda_visible_devices": "1",
+      "env": {
+        "VLLM_OMNI_USE_QUACK_FP8": "0"
+      },
+      "command": [
+        "/home/hal-ysun/omni-bench-venv/bin/vllm",
+        "serve",
+        "/home/hal-ysun/models/BAGEL-7B-MoT",
+        "--omni",
+        "--attention-config",
+        "{\"backend\": \"TRITON_ATTN\"}",
+        "--mm-encoder-attn-backend",
+        "TORCH_SDPA",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8092"
+      ],
+      "description": "vLLM-Omni serving BAGEL (two-stage Thinker+DiT). Triton/SDPA attention overrides dodge its broken FlashAttention-CuTe build on this aarch64 stack."
     }
   },
   "workloads": {
@@ -112,7 +153,8 @@
       "expect_image_width": 2048,
       "expect_image_height": 1152,
       "expect_image_steps": 50,
-      "timeout_s": 900
+      "timeout_s": 900,
+      "description": "The guarded tour-guide case: one interleave request ('travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate', temp 0, max 4 images 2048x1152@50 steps). Expected: the model autonomously weaves narrative text with exactly 4 generated images (one per destination) in a single SSE stream \u2014 4x(image_begin + 50 image_step + image_done), 0 errors, ~2800 text tokens at TP1, and every image readable/coherent/non-collapsed/non-duplicated (inspect saved PNGs)."
     },
     "qwen3-sharegpt-stress": {
       "type": "bench",
@@ -125,7 +167,8 @@
       "seed": 0,
       "output_file": "qwen3-sharegpt-stress.json",
       "expect_completed": 200,
-      "expect_failed": 0
+      "expect_failed": 0,
+      "description": "Legacy text-serving stress: 200 ShareGPT prompts at 16 req/s against Qwen3-32B; expects all 200 completed, 0 failed."
     },
     "sensenova-t2i-seed42": {
       "type": "generate",
@@ -143,7 +186,8 @@
       "expect_images": 1,
       "expect_image_steps": 50,
       "expect_image_width": 2048,
-      "expect_image_height": 1152
+      "expect_image_height": 1152,
+      "description": "Pure text-to-image gate on the native API (mode=image): seed-42 bicycle prompt at 2048x1152, exactly 50 denoise steps, exactly one PNG of exact size. Guards the prefill->denoise->commit chain and the resolution-bucket policy."
     },
     "sensenova-i2t-house": {
       "type": "generate",
@@ -160,7 +204,8 @@
         "height": 640
       },
       "expect_images": 0,
-      "expect_min_text_tokens": 32
+      "expect_min_text_tokens": 32,
+      "description": "Image-understanding gate (mode=understand): a deterministic synthetic scene (red house, brown roof, yellow sun, blue sky, green ground) is injected as input_image_b64; the model must stream >=32 tokens of description at temp 0 and finish cleanly. Guards the encode->prefill->decode chain (marker-in-prompt patch injection)."
     },
     "bagel-t2i-seed42": {
       "type": "generate",
@@ -178,7 +223,8 @@
       "expect_images": 1,
       "expect_image_steps": 50,
       "expect_image_width": 1024,
-      "expect_image_height": 1024
+      "expect_image_height": 1024,
+      "description": "BAGEL pure t2i gate (mode=image): seed-42 bicycle prompt at 1024x1024, exactly 50 steps, one exact-size PNG. Guards BAGEL's paged-extend prefill, batched CFG denoise, and VAE-decode commit on the unified runtime."
     },
     "bagel-i2t-house": {
       "type": "generate",
@@ -195,7 +241,8 @@
         "height": 640
       },
       "expect_images": 0,
-      "expect_min_text_tokens": 32
+      "expect_min_text_tokens": 32,
+      "description": "BAGEL understanding gate over the same synthetic scene: >=32 tokens at temp 0, clean finish. Guards the dual-encode (VAE+ViT) ingest and the graphed/burst decode."
     },
     "sensenova-t2i-perf": {
       "type": "uniserve_bench",
@@ -225,7 +272,8 @@
         "image_latency_ms.mean": {
           "max": 8000
         }
-      }
+      },
+      "description": "Perf tripwire through the shared harness: 4 prompts from the committed t2i set, closed-loop c=1, warmup 1. Bound trips only if the path regresses to a known-slow regime. Healthy ~4.8-5.6s/image."
     },
     "sensenova-i2t-perf": {
       "type": "uniserve_bench",
@@ -256,7 +304,8 @@
         "mean_itl_ms": {
           "max": 9
         }
-      }
+      },
+      "description": "Perf tripwire: 4 synthetic-image descriptions, greedy, 256 tokens. Floor trips on regression to eager per-token decode. Healthy ~160-170 tok/s, ITL ~5ms."
     },
     "bagel-t2i-perf": {
       "type": "uniserve_bench",
@@ -286,7 +335,8 @@
         "image_latency_ms.mean": {
           "max": 10000
         }
-      }
+      },
+      "description": "Perf tripwire through the shared harness: 4 prompts from the committed t2i set, closed-loop c=1, warmup 1. Bound trips only if the path regresses to a known-slow regime. Healthy ~6.6s/image (eager pre-unification path was 15.4s)."
     },
     "bagel-i2t-perf": {
       "type": "uniserve_bench",
@@ -317,7 +367,108 @@
         "mean_itl_ms": {
           "max": 9
         }
-      }
+      },
+      "description": "Perf tripwire: 4 synthetic-image descriptions, greedy, 256 tokens. Floor trips on regression to eager per-token decode. Healthy ~155-165 tok/s (eager path was 15.6 tok/s)."
+    },
+    "sensenova-t2i-perf-omni": {
+      "type": "uniserve_bench",
+      "server": "sensenova-omni",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "trace",
+        "--dataset-path",
+        "benchmarks/serving/sensenova/t2i_prompts.jsonl",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "2048",
+        "--height",
+        "1152"
+      ],
+      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as sensenova-t2i-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
+    },
+    "sensenova-i2t-perf-omni": {
+      "type": "uniserve_bench",
+      "server": "sensenova-omni",
+      "task": "i2t",
+      "args": [
+        "--dataset",
+        "synthetic-images",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--max-tokens",
+        "256",
+        "--temperature",
+        "0",
+        "--seed",
+        "42",
+        "--i2t-wire",
+        "openai_chat"
+      ],
+      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as sensenova-i2t-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
+    },
+    "bagel-t2i-perf-omni": {
+      "type": "uniserve_bench",
+      "server": "bagel-omni",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "trace",
+        "--dataset-path",
+        "benchmarks/serving/sensenova/t2i_prompts.jsonl",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "1024",
+        "--height",
+        "1024"
+      ],
+      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as bagel-t2i-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
+    },
+    "bagel-i2t-perf-omni": {
+      "type": "uniserve_bench",
+      "server": "bagel-omni",
+      "task": "i2t",
+      "args": [
+        "--dataset",
+        "synthetic-images",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--max-tokens",
+        "256",
+        "--temperature",
+        "0",
+        "--seed",
+        "42",
+        "--i2t-wire",
+        "openai_chat"
+      ],
+      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as bagel-i2t-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
     }
   },
   "suites": {
@@ -356,6 +507,28 @@
       "sensenova-i2t-perf",
       "bagel-t2i-perf",
       "bagel-i2t-perf"
+    ],
+    "sensenova-vs-omni": [
+      "sensenova-t2i-perf",
+      "sensenova-i2t-perf",
+      "sensenova-t2i-perf-omni",
+      "sensenova-i2t-perf-omni"
+    ],
+    "bagel-vs-omni": [
+      "bagel-t2i-perf",
+      "bagel-i2t-perf",
+      "bagel-t2i-perf-omni",
+      "bagel-i2t-perf-omni"
+    ],
+    "matrix-vs-omni": [
+      "sensenova-t2i-perf",
+      "sensenova-i2t-perf",
+      "sensenova-t2i-perf-omni",
+      "sensenova-i2t-perf-omni",
+      "bagel-t2i-perf",
+      "bagel-i2t-perf",
+      "bagel-t2i-perf-omni",
+      "bagel-i2t-perf-omni"
     ]
   }
 }
