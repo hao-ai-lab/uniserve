@@ -438,6 +438,81 @@ class MoTDecoderLayer(nn.Module):
         normed = expert.post_norm(hidden_states)
         return hidden_states + expert.mlp(normed.to(torch.bfloat16))
 
+    def forward_paged_gen_batch(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        text_idx: torch.Tensor | None,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_values: Any,
+        batch: int,
+        n_tokens: int,
+    ) -> torch.Tensor:
+        """One layer step over ``batch`` transient CFG-branch rows of one gen segment.
+
+        The batched-rows twin of the eager ``Segment(causal=False,
+        update_cache=False)`` gen lane in :meth:`forward`: per-token math is
+        identical, and attention runs the GEN expert for every row (marker
+        tokens included, exactly like the eager path's per-segment expert
+        selection) over ``[row prefix + row tokens]`` through the batched
+        transient paged protocol (``request_cache_for_transient``): row K/V
+        land in scratch pages past each row's fixed base length — overwritten
+        next step, never persisted — and the paged varlen kernel reads the
+        prefix in place of the eager path's per-layer ``cache.get`` gather +
+        concat.
+
+        Modality dispatch is *indexed*, not boolean-masked: a gen segment is
+        almost entirely gen-modality (only the two image markers per row are
+        text), so the GEN expert computes every token and the TEXT expert
+        overwrites the ``text_idx`` rows. Row-wise ops (norms) are exact
+        either way; for the GEMMs this only changes the batch a row sits in.
+        Boolean ``mask``-indexing here would issue hundreds of ``nonzero``
+        device syncs + masked scatters per step — the measured dominant cost.
+        Single-device only: this path performs no tower-transport routing
+        (models with a non-trivial tower axis must keep the routed
+        :meth:`forward` segment path).
+        """
+        gen = self.experts[Modality.GEN]
+        text = self.experts[Modality.TEXT]
+        normed = gen.input_norm(hidden_states)
+        normed_text = None
+        if text_idx is not None:
+            normed_text = text.input_norm(hidden_states.index_select(0, text_idx))
+            normed.index_copy_(0, text_idx, normed_text)
+        q, k, v = gen.project_qkv(normed, cos, sin)
+        if text_idx is not None:
+            tq, tk, tv = text.project_qkv(
+                normed_text,
+                cos.index_select(0, text_idx),
+                sin.index_select(0, text_idx),
+            )
+            q.index_copy_(0, text_idx, tq)
+            k.index_copy_(0, text_idx, tk)
+            v.index_copy_(0, text_idx, tv)
+        # Token-major [batch*n_tokens, heads, dim] -> [batch, heads, n_tokens, dim]
+        # views (the transient varlen path flattens back to token-major for free).
+        q = q.view(batch, n_tokens, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, n_tokens, self.n_kv, self.head_dim).transpose(1, 2)
+        v = v.view(batch, n_tokens, self.n_kv, self.head_dim).transpose(1, 2)
+        cache = past_key_values.request_cache_for_transient(layer_idx, n_tokens)
+        attn = gen.attend(layer_idx, q, k, v, cache, False, True)
+        attn_values = attn.transpose(1, 2).reshape(batch * n_tokens, self.q_size)
+        attn_out = gen.o_proj(attn_values)
+        if text_idx is not None:
+            attn_out.index_copy_(
+                0, text_idx, text.o_proj(attn_values.index_select(0, text_idx))
+            )
+        hidden_states = hidden_states + attn_out
+        normed = gen.post_norm(hidden_states)
+        normed_text = None
+        if text_idx is not None:
+            normed_text = text.post_norm(hidden_states.index_select(0, text_idx))
+        mlp_out = gen.mlp(normed.to(torch.bfloat16))
+        if text_idx is not None:
+            mlp_out.index_copy_(0, text_idx, text.mlp(normed_text.to(torch.bfloat16)))
+        return hidden_states + mlp_out
+
     def _present_routes(
         self, text_mask, gen_mask, any_text, any_gen,
     ) -> dict[Modality, tuple[torch.Tensor, ModalityExpert]]:
@@ -630,6 +705,60 @@ class MoTModel(nn.Module):
                 layer_idx, hidden_states, cos, sin, past_key_values
             )
         return self.norm(hidden_states)
+
+    @torch.no_grad()
+    def forward_paged_gen_batch(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        is_gen: torch.Tensor,
+        past_key_values: Any,
+    ) -> torch.Tensor:
+        """Run all layers over ``B`` CFG-branch rows of one shared gen segment.
+
+        ``inputs_embeds`` is ``[B, T, hidden]`` (rows may be expanded views of
+        one segment: CFG branches share the latent/timestep embedding),
+        ``positions`` is ``[B, T]`` 1-D rope positions (branches differ only by
+        their scalar position offset), and ``is_gen`` is the shared per-token
+        modality pattern ``[T]`` (markers are text-modality, VAE latents gen).
+        ``past_key_values`` implements the batched transient paged protocol
+        (``request_cache_for_transient``) over per-row prefix caches sharing
+        one pool. Returns modality-routed final-norm hidden ``[B, T, hidden]``.
+        """
+        batch, n_tokens, hidden_size = inputs_embeds.shape
+        hidden_states = inputs_embeds.reshape(batch * n_tokens, hidden_size)
+        cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
+        # Flat indexes of the (few) text-modality rows — one nonzero for the
+        # whole step; the per-layer dispatch is index-based (see the layer's
+        # ``forward_paged_gen_batch`` docstring).
+        text_base = (~is_gen.reshape(-1)).nonzero(as_tuple=False).reshape(-1)
+        if int(text_base.numel()):
+            row_offsets = (
+                torch.arange(batch, device=text_base.device, dtype=text_base.dtype)
+                * n_tokens
+            )
+            text_idx = (row_offsets.unsqueeze(1) + text_base.unsqueeze(0)).reshape(-1)
+        else:
+            text_idx = None
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = layer.forward_paged_gen_batch(
+                layer_idx,
+                hidden_states,
+                text_idx,
+                cos,
+                sin,
+                past_key_values,
+                batch,
+                n_tokens,
+            )
+        out = self.final_norm[Modality.GEN](hidden_states)
+        if text_idx is not None:
+            out.index_copy_(
+                0,
+                text_idx,
+                self.final_norm[Modality.TEXT](hidden_states.index_select(0, text_idx)),
+            )
+        return out.view(batch, n_tokens, hidden_size)
 
     @torch.no_grad()
     def forward_segments(self, segs: list[Segment]) -> list[torch.Tensor]:
