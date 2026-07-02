@@ -3056,7 +3056,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # drop any replay state so the next pure-denoise step recomputes
         # instead of replaying a stale residual.
         for _row_index, step in denoise_steps:
-            residual_state = getattr(step.extra.get("img"), "residual_cache", None)
+            extra = getattr(step, "extra", None)
+            img = extra.get("img") if isinstance(extra, dict) else None
+            residual_state = getattr(img, "residual_cache", None)
             if residual_state is not None:
                 residual_state.invalidate()
         if run_packed_mixed_forward(self, batch, request_states, denoise_steps, results):
