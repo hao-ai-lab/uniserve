@@ -7,6 +7,8 @@ import os
 import time
 import torch
 
+from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
+
 Req = TypeVar("Req")
 Res = TypeVar("Res")
 DispatchReq = TypeVar("DispatchReq")
@@ -71,14 +73,6 @@ class CommProvider(Protocol[DispatchReq, CombineRes]):
     def combine(self, handoff: Handoff, *, mesh: Any | None = None) -> CombineRes: ...
 
 
-def _torch_is_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    is_compiling = getattr(compiler, "is_compiling", None)
-    if callable(is_compiling):
-        return bool(is_compiling())
-    dynamo = getattr(torch, "_dynamo", None)
-    is_compiling = getattr(dynamo, "is_compiling", None)
-    return bool(is_compiling()) if callable(is_compiling) else False
 
 
 class Dispatcher(Generic[Req, Res]):

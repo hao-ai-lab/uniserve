@@ -1,11 +1,13 @@
 """Provider packs backed by existing in-tree kernels."""
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from importlib import import_module
 import torch
 import torch.nn.functional as F
 
+from ..foundation.env import env_flag
 from .core import Capabilities, CommDispatcher, Dispatcher, Handoff
 from .requests import (
     AddRmsNormReq,
@@ -394,6 +396,50 @@ class _TritonQKNormRopeProvider:
             raise RuntimeError("triton qk_norm_rope became ineligible")
         return out
 
+    def _try_identity_tail_fused(
+        self, req: QKNormRopeReq
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """One-launch path for multi-axis calls whose tail axes are identity.
+
+        Applies when the caller declared every axis after the first as
+        zero-position (``identity_axes``), the tail axes share one norm weight
+        (a single shared-norm group), and the 3-D fused kernel accepts the
+        tensors. Falls back to the general multi-axis pipeline otherwise. The
+        fused kernel preserves each group's exact rounding order, so this is a
+        launch-count optimization, not a numerics change.
+        """
+        if req.identity_axes is None or len(req.axis_dims) < 2:
+            return None
+        if tuple(req.identity_axes) != tuple(range(1, len(req.axis_dims))):
+            return None
+        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 0) != 1:
+            return None
+        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 1) != len(req.axis_dims):
+            return None
+        if req.q.ndim != 3 or req.k.ndim != 3:
+            return None
+        rope = import_module("uniserve_worker.nn.rope")
+        rope_dim = int(req.axis_dims[0])
+        tokens = int(req.q.shape[0])
+        cos0, sin0 = req.cos[0], req.sin[0]
+        if not (self._can_repeat_rope(cos0, tokens) and self._can_repeat_rope(sin0, tokens)):
+            return None
+        cos = self._align_rope_table(cos0, tokens)
+        sin = self._align_rope_table(sin0, tokens)
+        return rope.try_triton_qk_split_rms_norm_rope(
+            req.q,
+            req.k,
+            req.q_weight[0],
+            req.q_weight[1],
+            req.k_weight[0],
+            req.k_weight[1],
+            cos,
+            sin,
+            req.eps,
+            req.eps,
+            rope_dim=rope_dim,
+        )
+
     @staticmethod
     def _flatten_heads(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], bool]:
         if x.ndim == 3:
@@ -614,6 +660,9 @@ class _TritonQKNormRopeProvider:
         )
 
     def _run_multi_axis(self, req: QKNormRopeReq):
+        fused = self._try_identity_tail_fused(req)
+        if fused is not None:
+            return fused
         out_q = []
         out_k = []
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
@@ -804,7 +853,15 @@ class _EagerQKNormRopeProvider:
             return self._run_multi_axis(req, apply_rotary_pos_emb=apply_rotary_pos_emb, apply_rotary_emb=apply_rotary_emb)
 
         q, k = _EagerQKNormProvider().run(QKNormReq(req.q, req.k, req.q_weight, req.k_weight, req.eps))
-        return apply_rotary_pos_emb(q, k, req.cos, req.sin, req.position_ids, req.unsqueeze_dim)
+        return self._apply_rope_axis(
+            q,
+            k,
+            req.cos,
+            req.sin,
+            apply_rotary_pos_emb=apply_rotary_pos_emb,
+            apply_rotary_emb=apply_rotary_emb,
+            unsqueeze_dim=req.unsqueeze_dim,
+        )
 
 
 @lru_cache(maxsize=1)
@@ -1030,6 +1087,144 @@ def attention_dispatcher():
     )
 
 
+logger = logging.getLogger(__name__)
+
+
+class _SymmMemTpAllReduceProvider:
+    """One-shot NVLink all-reduce over torch symmetric memory for small payloads.
+
+    Per-token decode under tensor parallelism issues ~2 all-reduces per layer on
+    tiny (hidden-size) activations, where NCCL's ring protocol is pure latency.
+    A one-shot symmetric-memory reduce (each rank reads its peers' buffers over
+    NVLink and reduces locally) halves that latency and is CUDA-graph
+    capturable. Large payloads (prefill/denoise activations) fall through to
+    the standard provider, whose bandwidth-optimal ring wins there.
+
+    The staging buffers are rendezvoused collectively, so eligibility must be
+    rank-deterministic: it depends only on the request shape/dtype/op and
+    process-wide state that is identical across SPMD ranks. Buffers are created
+    eagerly on first eligible use (warmup runs precede any graph capture);
+    inside an active capture a missing buffer falls back to the standard
+    provider, which NCCL captures correctly.
+    """
+
+    name = "symm_mem"
+    operator = "tp_all_reduce"
+
+    # One-shot reads (world-1) x payload over NVLink; past ~half a megabyte the
+    # bandwidth-optimal ring catches up, so stay in the latency regime only.
+    _MAX_BYTES = 512 * 1024
+    # Distinct payload sizes worth pinning symmetric buffers for. Decode uses
+    # one (hidden) size per model; refuse pathological diversity.
+    _MAX_POOL_ENTRIES = 8
+    _DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+    def __init__(self) -> None:
+        self._buffers: dict[tuple[str, torch.dtype, int], torch.Tensor] = {}
+        self._disabled = False
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(tags=frozenset({self.name, self.operator, "cuda_graph"}))
+
+    @staticmethod
+    def _runtime():
+        try:
+            import torch.distributed._symmetric_memory as symm_mem
+        except ImportError:
+            return None
+        if not hasattr(torch.ops, "symm_mem"):
+            return None
+        return symm_mem
+
+    @staticmethod
+    def _group_name(transport) -> str | None:
+        group = getattr(transport, "group", None)
+        if group is None:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                return None
+            group = torch.distributed.group.WORLD
+        return getattr(group, "group_name", None)
+
+    def can_dispatch(self, req: TpAllReduceReq, *, mesh=None) -> bool:
+        del mesh
+        if self._disabled or env_flag("UNISERVE_DISABLE_SYMM_ALLREDUCE"):
+            return False
+        transport = getattr(req.axis, "transport", None)
+        if transport is None or not hasattr(transport, "group"):
+            return False
+        if int(getattr(transport, "size", 1)) <= 1:
+            return False
+        tensor = req.tensor
+        if str(req.op).lower() != "sum" or not tensor.is_cuda:
+            return False
+        if tensor.dtype not in self._DTYPES:
+            return False
+        if tensor.numel() * tensor.element_size() > self._MAX_BYTES:
+            return False
+        if self._runtime() is None:
+            return False
+        if self._group_name(transport) is None:
+            return False
+        key = (str(tensor.device), tensor.dtype, int(tensor.numel()))
+        if key not in self._buffers:
+            if len(self._buffers) >= self._MAX_POOL_ENTRIES:
+                return False
+            # Buffer creation involves a collective rendezvous, which cannot run
+            # inside an active CUDA graph capture. SPMD lockstep makes this
+            # check rank-deterministic (all ranks capture the same step).
+            if torch.cuda.is_current_stream_capturing():
+                return False
+        return True
+
+    def dispatch(self, req: TpAllReduceReq, *, mesh=None) -> Handoff:
+        del mesh
+        symm_mem = self._runtime()
+        transport = getattr(req.axis, "transport", None)
+        group_name = self._group_name(transport)
+        tensor = req.tensor
+        key = (str(tensor.device), tensor.dtype, int(tensor.numel()))
+        buffer = self._buffers.get(key)
+        if buffer is None:
+            buffer = symm_mem.empty(int(tensor.numel()), dtype=tensor.dtype, device=tensor.device)
+            handle = symm_mem.rendezvous(buffer, group=group_name)
+            if handle is None:
+                # Rendezvous declined (unsupported topology). Downgrade loudly,
+                # once, and answer this call via the standard transport so the
+                # forward still completes; SPMD ranks decline together because
+                # rendezvous is itself collective.
+                self._disabled = True
+                logger.warning(
+                    "symmetric-memory rendezvous unavailable; tp_all_reduce stays on the standard transport"
+                )
+                return Handoff(
+                    format="tensor",
+                    payload=transport.all_reduce(tensor, req.op),
+                    metadata={"axis": getattr(req.axis, "name", "tp"), "op": req.op},
+                )
+            self._buffers[key] = buffer
+            logger.info(
+                "symmetric-memory one-shot tp_all_reduce active: %s x %s on %s",
+                int(tensor.numel()),
+                tensor.dtype,
+                tensor.device,
+            )
+        buffer.copy_(tensor.reshape(-1))
+        reduced = torch.ops.symm_mem.one_shot_all_reduce(buffer, "sum", group_name)
+        return Handoff(
+            format="tensor",
+            payload=reduced.view(tensor.shape),
+            metadata={"axis": getattr(req.axis, "name", "tp"), "op": req.op},
+        )
+
+    def can_combine(self, handoff: Handoff, *, mesh=None) -> bool:
+        del mesh
+        return handoff.format == "tensor"
+
+    def combine(self, handoff: Handoff, *, mesh=None):
+        del mesh
+        return handoff.payload
+
+
 class _StandardTpAllReduceProvider:
     name = "standard"
     operator = "tp_all_reduce"
@@ -1063,4 +1258,8 @@ class _StandardTpAllReduceProvider:
 
 @lru_cache(maxsize=1)
 def tp_all_reduce_dispatcher():
-    return CommDispatcher("tp_all_reduce", [_StandardTpAllReduceProvider()])
+    return CommDispatcher(
+        "tp_all_reduce",
+        [_SymmMemTpAllReduceProvider(), _StandardTpAllReduceProvider()],
+        env_override="UNISERVE_TP_ALLREDUCE_PROVIDER",
+    )

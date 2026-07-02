@@ -18,11 +18,13 @@ import torch
 from ..contracts.batches import TextBatch
 from ..contracts.forward_batch import ForwardBatch
 from ..foundation.errors import invalid_descriptor
-
-try:  # Optional fast host packing path; minimal environments may not carry numpy.
-    import numpy as _np
-except Exception:  # pragma: no cover - availability depends on worker image.
-    _np = None
+from .host_staging import (
+    canonical_device as _canonical_device,
+    copy_cpu_to_device,
+    cpu_int_staging_buffer,
+    fill_cpu_ints as _fill_cpu_long,
+    is_pinned as _is_pinned,
+)
 
 __all__ = ["TextTensorStager", "TextTensorStagingSlot", "stage_text_forward_batch"]
 
@@ -352,13 +354,6 @@ def _stage_text_index_tensors(
     }
 
 
-def _canonical_device(device: torch.device | str) -> torch.device:
-    dev = torch.device(device)
-    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return dev
-
-
 def _cpu_long_buffer(
     numel: int,
     *,
@@ -366,14 +361,7 @@ def _cpu_long_buffer(
     slot: TextTensorStagingSlot | None = None,
     name: str = "buffer",
 ) -> torch.Tensor:
-    if slot is not None:
-        return slot.long_buffer(name, numel, pin=pin)
-    if pin:
-        try:
-            return torch.empty(int(numel), dtype=torch.long, pin_memory=True)
-        except RuntimeError:
-            pass
-    return torch.empty(int(numel), dtype=torch.long)
+    return cpu_int_staging_buffer(numel, dtype=torch.long, pin=pin, slot=slot, name=name)
 
 
 def _tensor_from_ints(
@@ -443,32 +431,7 @@ def _padded_override(
     return padded
 
 
-def _copy_cpu_long_to_device(
-    cpu: torch.Tensor,
-    *,
-    device: torch.device,
-    non_blocking: bool,
-    slot: TextTensorStagingSlot | None,
-    name: str,
-) -> torch.Tensor:
-    if slot is None or device.type != "cuda":
-        return cpu.to(device=device, non_blocking=non_blocking)
-    out = slot.device_buffer(name, int(cpu.numel()), dtype=cpu.dtype, device=device)
-    out.copy_(cpu, non_blocking=non_blocking)
-    return out
-
-
-def _fill_cpu_long(cpu: torch.Tensor, values: Sequence[int]) -> None:
-    # One bulk host->host conversion for every size: a Python list of a few
-    # hundred ints converts in a single C call, which is cheaper than the N
-    # individual tensor __setitem__ ATen ops the old <=1024 scalar loop issued
-    # on the per-forward staging path.
-    if len(values) == 0:
-        return
-    if _np is not None:
-        cpu.copy_(torch.from_numpy(_np.asarray(values, dtype=_np.int64)))
-        return
-    cpu.copy_(torch.as_tensor(values, dtype=torch.long))
+_copy_cpu_long_to_device = copy_cpu_to_device
 
 
 def _validate_input_ids_override(
@@ -518,7 +481,3 @@ def _apply_input_id_replacements(
         if int(value.numel()) != 1:
             raise invalid_descriptor("input_ids replacement tensors must contain one token")
         flat[idx:idx + 1].copy_(value.reshape(1), non_blocking=True)
-
-
-def _is_pinned(tensor: torch.Tensor) -> bool:
-    return bool(getattr(tensor, "is_pinned", lambda: False)())

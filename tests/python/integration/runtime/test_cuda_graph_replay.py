@@ -51,13 +51,19 @@ _VOCAB = 32
 _HIDDEN = 16
 
 
-def _kv_pool(device: torch.device, *, num_blocks: int = 16, block_size: int = 4) -> PagedKVPool:
+def _kv_pool(
+    device: torch.device,
+    *,
+    num_blocks: int = 16,
+    block_size: int = 4,
+    head_dim: int = 8,
+) -> PagedKVPool:
     return PagedKVPool(
         num_layers=1,
         num_blocks=num_blocks,
         block_size=block_size,
         num_kv_heads=1,
-        head_dim=8,
+        head_dim=head_dim,
         device=device,
         dtype=torch.bfloat16,
     )
@@ -105,6 +111,12 @@ class _LinearLogitsModel:
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, fb) -> torch.Tensor:
         del fb
         return self.logits(input_ids, positions)
+
+    def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
+        # Plausible query geometry matching the test pool; the fake forward
+        # never runs attention, but declaring it keeps the model eligible for
+        # the decode graph and exercises the real FlashInfer re-plan hook.
+        return 1, 1.0, torch.bfloat16
 
 
 # --------------------------------------------------------------------------- #
@@ -476,7 +488,9 @@ def test_text_graph_runner_decode_replay_matches_eager_forward():
     device = torch.device("cuda")
     torch.manual_seed(4)
     model = _LinearLogitsModel(device, seed=4)
-    pool = _kv_pool(device)
+    # FlashInfer's decode kernels require a real head_dim; the graph runner now
+    # re-plans the backend before every replay, so the pool must be plannable.
+    pool = _kv_pool(device, head_dim=64)
     runner = TextGraphRunner(kv_pool=pool, num_blocks=16, block_size=4, device=device)
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)

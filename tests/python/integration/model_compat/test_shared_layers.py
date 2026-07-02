@@ -790,9 +790,9 @@ def test_sensenova_dense_decoder_uses_shared_linear_seams():
     cfg.layer_types = ["full_attention"]
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
-    mlp = sensenova_u1._NativeQwen3MLP(cfg)
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
-    lm = sensenova_u1._NativeQwen3ForCausalLM(cfg)
+    mlp = sensenova_u1._SenseNovaMLP(cfg)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
+    lm = sensenova_u1._SenseNovaLanguageModel(cfg)
     assert isinstance(mlp.gate_up_proj, MergedColumnParallelLinear)
     assert isinstance(attn.attn, RadixAttention)
     assert isinstance(attn.qkv_proj, QKVParallelLinear)
@@ -821,7 +821,7 @@ def test_sensenova_text_single_token_uses_fused_qkv_projection(monkeypatch):
     cfg.layer_types = ["full_attention"]
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
 
     def fake_qk_norm_rope(query_states, key_states, _indexes, **_kwargs):
         return query_states.split([2, 1, 1], dim=-1), key_states.split([2, 1, 1], dim=-1)
@@ -873,8 +873,8 @@ def test_sensenova_projection_loaders_match_checkpoint_linears():
     cfg.layer_types = ["full_attention"]
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
-    mlp = sensenova_u1._NativeQwen3MLP(cfg)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
+    mlp = sensenova_u1._SenseNovaMLP(cfg)
 
     q = torch.randn(cfg.num_attention_heads * cfg.head_dim, cfg.hidden_size)
     k = torch.randn(cfg.num_key_value_heads * cfg.head_dim, cfg.hidden_size)
@@ -922,7 +922,7 @@ def test_sensenova_qk_norm_rope_3d_matches_eager_formula(monkeypatch):
     cfg.layer_types = ["full_attention"]
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
     query_states = torch.randn(1, 5, attn.num_heads, attn.head_dim)
     key_states = torch.randn(1, 5, attn.num_kv_heads, attn.head_dim)
     indexes = torch.stack([torch.arange(5), torch.arange(5) % 3, torch.arange(5) % 2], dim=0)
@@ -988,7 +988,7 @@ def test_sensenova_dense_mixed_mot_layer_runs_finite():
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    layer = sensenova_u1._NativeQwen3DecoderLayer(cfg, layer_idx=0)
+    layer = sensenova_u1._SenseNovaDecoderLayer(cfg, layer_idx=0)
     # Deterministic local-generator init (load-time-init MoT params are torch.empty);
     # removes the uninitialized-memory dependence so the xfail below is stable.
     _g = torch.Generator().manual_seed(0)
@@ -1089,7 +1089,7 @@ def test_qwen_attention_helper_matches_torch_sdpa_layout():
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
     ref = get_attention_backend("torch_sdpa").forward(query, key, value, causal=False, scale=8**-0.5)
     got, _ = attn._attend_bhld(query, key, value, None)
     torch.testing.assert_close(got, ref.transpose(1, 2).contiguous())
@@ -1477,7 +1477,7 @@ def test_qwen_attention_mixed_mot_path_uses_correct_branch_projections():
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
     # The MoT gen-branch projections are load-time-initialized (torch.empty), so the
     # forward otherwise depends on uninitialized memory (order/allocation-flaky).
     # Seed every param from a LOCAL generator: fully deterministic, distinct per
@@ -1594,7 +1594,7 @@ def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    model = sensenova_u1._NativeQwen3Model(cfg)
+    model = sensenova_u1._SenseNovaDecoderModel(cfg)
     # Deterministic local-generator init (load-time-init MoT params are torch.empty);
     # removes the uninitialized-memory dependence so the xfail below is stable.
     _g = torch.Generator().manual_seed(0)
@@ -1697,7 +1697,7 @@ def test_sensenova_packed_visible_all_gen_uses_single_modality_qkv(monkeypatch):
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
     attn.o_proj_mot_gen = nn.Identity()
 
     hidden = torch.randn(5, 32)
@@ -1795,7 +1795,7 @@ def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
 
 
 def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
-    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.execution import packed_mixed_forward
 
     relay_tensor = torch.tensor([7], dtype=torch.long)
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=relay_tensor))
@@ -1805,7 +1805,7 @@ def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
             assert req_id == 1
             return state
 
-    ids = sensenova_u1.SenseNovaU1ForUnifiedGeneration._forward_text_input_ids(
+    ids = packed_mixed_forward._forward_text_input_ids(
         {
             "req_id": 1,
             "kind": "decode_und",
@@ -1823,7 +1823,7 @@ def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
 
 
 def test_sensenova_forward_text_input_ids_requires_last_sampled_relay():
-    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.execution import packed_mixed_forward
 
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=None))
 
@@ -1833,7 +1833,7 @@ def test_sensenova_forward_text_input_ids_requires_last_sampled_relay():
             return state
 
     with pytest.raises(WorkerError, match="last_sampled"):
-        sensenova_u1.SenseNovaU1ForUnifiedGeneration._forward_text_input_ids(
+        packed_mixed_forward._forward_text_input_ids(
             {
                 "req_id": 1,
                 "kind": "decode_und",
@@ -1848,7 +1848,7 @@ def test_sensenova_forward_text_input_ids_requires_last_sampled_relay():
 
 
 def test_sensenova_forward_sampling_updates_decode_relay():
-    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.execution import packed_mixed_forward
 
     state = SimpleNamespace(
         sampling={"temperature": 0.0},
@@ -1865,13 +1865,10 @@ def test_sensenova_forward_sampling_updates_decode_relay():
             assert req_id == 1
             return state
 
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
-        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
-    )
     logits = torch.tensor([[[-10.0, -5.0, 8.0, -2.0]]])
 
-    out = wrapper._sample_text_logits(1, logits, RequestStates())
-    wrapper._store_forward_sampled_token_relay(
+    out = packed_mixed_forward._sample_text_logits(1, logits, RequestStates())
+    packed_mixed_forward._store_forward_sampled_token_relay(
         state,
         token_id=out.sampled_token_id,
         device=torch.device("cpu"),
@@ -2133,7 +2130,7 @@ def test_qwen_attention_paged_update_is_not_env_gated(monkeypatch):
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    attn = sensenova_u1._NativeQwen3Attention(cfg, layer_idx=0)
+    attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
     backend = FakePagedBackend()
 
     query = torch.randn(1, 4, 2, 8)

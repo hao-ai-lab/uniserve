@@ -16,6 +16,13 @@ import torch
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import ceil_div
 from .cache_protocols import BufferStager
+from .host_staging import (
+    canonical_device as _canonical_device,
+    copy_cpu_to_device,
+    cpu_int_staging_buffer,
+    fill_cpu_ints as _fill_cpu_int,
+    is_pinned as _is_pinned,
+)
 from .kv_pool import PagedKVPool
 
 __all__ = [
@@ -23,6 +30,8 @@ __all__ = [
     'PagedTextCache',
     'BatchedPagedRequestCache',
     'BatchedPagedTextCache',
+    'copy_paged_text_cache_span',
+    'stage_paged_text_cache_prefix',
 ]
 
 
@@ -249,6 +258,68 @@ class PagedTextCache:
             self._active_count = None
             self._updated_layers.clear()
             self._update_view_cache = None
+
+
+def stage_paged_text_cache_prefix(
+    source: PagedTextCache,
+    *,
+    target_pool: PagedKVPool,
+    allocate_blocks: Callable[[int], list[int]],
+    num_layers: int,
+    end_len: int,
+) -> PagedTextCache:
+    """Create a writable cache in ``target_pool`` with ``source`` prefix copied."""
+
+    staged = PagedTextCache(
+        target_pool,
+        [],
+        num_layers=int(num_layers),
+        length=int(source.length),
+        allocate_blocks=allocate_blocks,
+    )
+    staged.ensure_capacity(int(end_len))
+    copy_paged_text_cache_span(
+        source,
+        staged,
+        start=0,
+        length=int(source.length),
+        num_layers=int(num_layers),
+        missing_message="cannot stage mixed forward prefix without a paged source cache",
+    )
+    return staged
+
+
+def copy_paged_text_cache_span(
+    source: PagedTextCache,
+    target: PagedTextCache,
+    *,
+    start: int,
+    length: int,
+    num_layers: int,
+    missing_message: str = "paged text K/V span is missing",
+) -> None:
+    """Copy a logical KV span between paged text caches."""
+
+    start = int(start)
+    length = int(length)
+    if length <= 0:
+        return
+    source_pool = getattr(source, "pool", None)
+    source_blocks = list(getattr(source, "block_ids", []) or [])
+    if source_pool is None or not source_blocks:
+        raise RuntimeError(missing_message)
+    target.ensure_capacity(start + length)
+    for layer_idx in range(int(num_layers)):
+        k, v = source_pool.read(layer_idx, source_blocks, start=start, length=length)
+        if k is None or v is None:
+            raise RuntimeError(missing_message)
+        target.pool.write(
+            layer_idx,
+            target.block_ids,
+            start=start,
+            k=k.to(target.pool.k.device),
+            v=v.to(target.pool.v.device),
+        )
 
 
 class BatchedPagedRequestCache:
@@ -549,21 +620,7 @@ def _cpu_int_buffer(
     slot: BufferStager | None = None,
     name: str = "buffer",
 ) -> torch.Tensor:
-    # ``int_buffer`` is structurally guaranteed by BufferStager, so a non-None
-    # stager always provides it (no callable() probe needed).
-    if slot is not None:
-        return slot.int_buffer(name, numel, pin=pin)
-    if pin and not _torch_is_compiling():
-        try:
-            return torch.empty(int(numel), dtype=torch.int32, pin_memory=True)
-        except RuntimeError:
-            pass
-    return torch.empty(int(numel), dtype=torch.int32)
-
-
-def _fill_cpu_int(cpu: torch.Tensor, values: Sequence[int]) -> None:
-    for idx, value in enumerate(values):
-        cpu[idx] = int(value)
+    return cpu_int_staging_buffer(numel, dtype=torch.int32, pin=pin, slot=slot, name=name)
 
 
 def _fill_block_table(
@@ -575,46 +632,10 @@ def _fill_block_table(
     width = int(width)
     for block_ids in rows:
         n = len(block_ids)
-        for col, block_id in enumerate(block_ids):
-            cpu[offset + col] = int(block_id)
+        _fill_cpu_int(cpu[offset:offset + n], block_ids)
         if n < width:
             cpu[offset + n: offset + width].zero_()
         offset += width
 
 
-def _copy_cpu_int_to_device(
-    cpu: torch.Tensor,
-    *,
-    device: torch.device,
-    non_blocking: bool,
-    slot: BufferStager | None,
-    name: str,
-) -> torch.Tensor:
-    device = _canonical_device(device)
-    # ``device_buffer`` is structurally guaranteed by BufferStager; the device
-    # staging path is only taken for a CUDA target with a stager present.
-    if slot is None or device.type != "cuda":
-        return cpu.to(device=device, non_blocking=non_blocking)
-    out = slot.device_buffer(name, int(cpu.numel()), dtype=cpu.dtype, device=device)
-    out.copy_(cpu, non_blocking=non_blocking)
-    return out
-
-
-def _canonical_device(device: torch.device | str) -> torch.device:
-    dev = torch.device(device)
-    if dev.type == "cuda" and dev.index is None and torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return dev
-
-
-def _is_pinned(tensor: torch.Tensor) -> bool:
-    return bool(getattr(tensor, "is_pinned", lambda: False)())
-
-
-def _torch_is_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    is_compiling = getattr(compiler, "is_compiling", None)
-    if callable(is_compiling):
-        return bool(is_compiling())
-    is_compiling = getattr(getattr(torch, "_dynamo", None), "is_compiling", None)
-    return bool(is_compiling()) if callable(is_compiling) else False
+_copy_cpu_int_to_device = copy_cpu_to_device

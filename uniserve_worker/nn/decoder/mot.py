@@ -10,17 +10,25 @@ from __future__ import annotations
 import enum
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn as nn
 
 from ..attention import RadixAttention
-from ..linear import LinearBase, MergedColumnParallelLinear, QKVParallelLinear
+from ..linear import (
+    LinearBase,
+    QKVParallelLinear,
+    RowParallelLinear,
+    local_attention_head_count,
+    local_kv_head_count,
+)
 from ..mesh import get_current_mesh
 from ..norm import RMSNorm
 from ..placement import set_tower_coord
 from ..rope import apply_rotary_emb, get_rope
+from .qwen import Qwen3MLP
 from ..vocab_parallel_embedding import VocabParallelEmbedding
 
 __all__ = [
@@ -175,18 +183,16 @@ class Segment:
     update_cache: bool         # append new K/V into cache after attention
 
 
-class MoTMLP(nn.Module):
-    """SiLU-gated feed-forward block for one MoT modality."""
+def MoTMLP(hidden: int, inter: int) -> Qwen3MLP:
+    """SiLU-gated feed-forward block for one MoT modality.
 
-    def __init__(self, hidden: int, inter: int):
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(hidden, (inter, inter), bias=False)
-        self.down_proj = LinearBase(inter, hidden, bias=False)
-        self.act = nn.SiLU()
-
-    def forward(self, x):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(self.act(gate) * up)
+    The block itself is the shared :class:`Qwen3MLP` (fused merged gate/up
+    projection + ``silu_and_mul``); this factory only adapts the MoT
+    ``(hidden, inter)`` construction signature onto its config surface.
+    """
+    return Qwen3MLP(
+        SimpleNamespace(hidden_size=hidden, intermediate_size=inter, hidden_act="silu")
+    )
 
 
 @dataclass(frozen=True)
@@ -270,9 +276,15 @@ class MoTDecoderLayer(nn.Module):
     def __init__(self, cfg: Any):
         super().__init__()
         h, hd = cfg.hidden_size, cfg.head_dim
-        self.n_heads = cfg.num_attention_heads
-        self.n_kv = cfg.num_key_value_heads
+        self.total_n_heads = int(cfg.num_attention_heads)
+        self.total_n_kv = int(cfg.num_key_value_heads)
+        # Local (per-tensor-parallel-rank) head counts: activations downstream
+        # of the sharded qkv projections carry these, and the shared helpers
+        # keep the split rule identical to QKVParallelLinear's shard sizes.
+        self.n_heads = local_attention_head_count(self.total_n_heads)
+        self.n_kv = local_kv_head_count(self.total_n_kv)
         self.head_dim = hd
+        self.total_q_size = self.total_n_heads * hd
         self.q_size = self.n_heads * hd
         self.kv_size = self.n_kv * hd
         self.scale = 1.0 / (hd**0.5)
@@ -292,8 +304,10 @@ class MoTDecoderLayer(nn.Module):
 
     def _init_text_expert_modules(self, cfg: Any, hidden_size: int, head_dim: int) -> None:
         self.input_layernorm = RMSNorm(hidden_size, cfg.rms_norm_eps)
-        self.qkv_proj = QKVParallelLinear(hidden_size, head_dim, self.n_heads, self.n_kv, bias=True)
-        self.o_proj = LinearBase(self.q_size, hidden_size, bias=False)
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size, head_dim, self.total_n_heads, self.total_n_kv, bias=True
+        )
+        self.o_proj = RowParallelLinear(self.total_q_size, hidden_size, bias=False)
         self.q_norm = RMSNorm(head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, cfg.rms_norm_eps)
         self.attn = RadixAttention(self.n_heads, self.n_kv, head_dim)
@@ -302,8 +316,10 @@ class MoTDecoderLayer(nn.Module):
 
     def _init_gen_expert_modules(self, cfg: Any, hidden_size: int, head_dim: int) -> None:
         self.input_layernorm_moe_gen = RMSNorm(hidden_size, cfg.rms_norm_eps)
-        self.qkv_proj_moe_gen = QKVParallelLinear(hidden_size, head_dim, self.n_heads, self.n_kv, bias=True)
-        self.o_proj_moe_gen = LinearBase(self.q_size, hidden_size, bias=False)
+        self.qkv_proj_moe_gen = QKVParallelLinear(
+            hidden_size, head_dim, self.total_n_heads, self.total_n_kv, bias=True
+        )
+        self.o_proj_moe_gen = RowParallelLinear(self.total_q_size, hidden_size, bias=False)
         self.q_norm_moe_gen = RMSNorm(head_dim, cfg.rms_norm_eps)
         self.k_norm_moe_gen = RMSNorm(head_dim, cfg.rms_norm_eps)
         self.attn_moe_gen = RadixAttention(self.n_heads, self.n_kv, head_dim)
@@ -343,7 +359,7 @@ class MoTDecoderLayer(nn.Module):
         k_norm: RMSNorm,
         attn: RadixAttention,
         post_norm: RMSNorm,
-        mlp: MoTMLP,
+        mlp: Qwen3MLP,
     ) -> ModalityExpert:
         return ModalityExpert(
             input_norm=input_norm,

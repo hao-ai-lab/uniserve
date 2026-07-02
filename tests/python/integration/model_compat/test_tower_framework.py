@@ -186,7 +186,7 @@ def _sensenova_layer():
     cfg.layer_types = ["full_attention"]
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
-    return sensenova._NativeQwen3DecoderLayer(cfg, layer_idx=0)
+    return sensenova._SenseNovaDecoderLayer(cfg, layer_idx=0)
 
 
 def test_sensenova_checkpoint_keys_survive_routing_refactor():

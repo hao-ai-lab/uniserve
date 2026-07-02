@@ -6,7 +6,6 @@ use the worker-owned paged KV pool through the shared ``RadixAttention`` seam.
 """
 from __future__ import annotations
 
-import bisect
 import copy
 import logging
 from dataclasses import dataclass
@@ -21,7 +20,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 import uniserve_worker.ops as ops
 from ...contracts.batches import UniForwardBatch
 from ...contracts.forward_mode import ForwardMode
-from ...contracts.outputs import TextTokenOutput
 from ...contracts.resource_plan import (
     CapsDescriptor,
     KvBlockResourcePolicy,
@@ -65,10 +63,10 @@ from ...nn import (
     get_rope,
     get_tower_coord,
     place_towers,
-    Sampler,
     set_tower_coord,
 )
-from ...nn.decoder import Modality, route_by_modality, tower_modality_coords
+from ...nn.decoder import Qwen3MLP, Modality, route_by_modality, tower_modality_coords
+from ...nn.linear import local_kv_head_count as _local_kv_head_count
 from ...nn.diffusion import ConvDecoder, FlowMatchingHead, TimestepEmbedder
 from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
 from ...nn.quant import (
@@ -78,9 +76,10 @@ from ...nn.quant import (
     use_quantization_config,
 )
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
-from ...runtime.compile import CompileTarget, TorchCompileConfig, compile_model_pieces
+from ...runtime.block_allocator import BlockFreeList
+from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
-from ...runtime.paged_text_cache import PagedTextCache
+from ...runtime.paged_text_cache import PagedTextCache, stage_paged_text_cache_prefix
 from ...runtime.request_state import RequestState as RunnerRequestState
 from ...runtime.residency import GenResidencySpec, KvCacheSpec, ResidencyManager
 from ...runtime.tower_handoff import (
@@ -127,6 +126,12 @@ MAX_VIT_GRID_TOKENS = 70 * 70
 COMMIT_MARKER_TOKENS = 2
 GEN_ROPE_ADVANCE = 2
 MAX_CFG_BRANCHES = 3
+
+# Resolution-aware modes apply sqrt sequence-length scaling; the others leave the
+# base noise scale unchanged. Unknown string modes are treated like fixed scale.
+_NOISE_RESOLUTION_EXPONENT = 0.5
+_NOISE_DYNAMIC_SQRT_EXPONENT = 0.5
+_NOISE_RESOLUTION_MODES = frozenset({"resolution", "dynamic", "dynamic_sqrt"})
 
 logger = logging.getLogger(__name__)
 
@@ -214,12 +219,17 @@ def _flatten_3d_indexes(indexes: torch.Tensor, batch: int, seq_len: int) -> torc
 class SenseNovaPackedRope:
     cos: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     sin: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    # Structural caller guarantee that every h/w index in this forward is zero
+    # (pure text tokens), so the spatial rotations are the identity and the
+    # attention path may use the fused single-launch norm+RoPE kernel.
+    hw_identity: bool = False
 
     def select(self, mask: torch.Tensor) -> "SenseNovaPackedRope":
         positions = mask.nonzero(as_tuple=False).flatten()
         return SenseNovaPackedRope(
             tuple(axis.index_select(0, positions) for axis in self.cos),
             tuple(axis.index_select(0, positions) for axis in self.sin),
+            hw_identity=self.hw_identity,
         )
 
 
@@ -312,51 +322,47 @@ def _resolve_tower(mesh: Any | None = None) -> tuple[Any | None, dict[Modality, 
     return transport, coords
 
 
-class _NativeQwen3MLP(nn.Module):
-    def __init__(self, config: Any) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            (config.intermediate_size, config.intermediate_size),
-            bias=False,
-            weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
-        )
-        self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(ops.silu_and_mul(self.gate_up_proj(x)))
+def _SenseNovaMLP(config: Any) -> Qwen3MLP:
+    return Qwen3MLP(config, weight_mode=WeightMode.FUSED_GATE_UP_LINEAR)
 
 
-class _NativeQwen3Attention(nn.Module):
+class _SenseNovaAttention(nn.Module):
     def __init__(self, config: Any, layer_idx: int) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = int(layer_idx)
         self.head_dim = int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
-        self.num_heads = int(config.num_attention_heads)
-        self.num_kv_heads = int(config.num_key_value_heads)
+        self.total_num_heads = int(config.num_attention_heads)
+        self.total_num_kv_heads = int(config.num_key_value_heads)
         self.scaling = self.head_dim**-0.5
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            layer_id=self.layer_idx,
-        )
 
-        q_out = self.num_heads * self.head_dim
+        q_out = self.total_num_heads * self.head_dim
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
-            self.num_heads,
-            self.num_kv_heads,
+            self.total_num_heads,
+            self.total_num_kv_heads,
             bias=config.attention_bias,
         )
         self.qkv_proj_mot_gen = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=config.attention_bias,
+        )
+        # Local (per-tensor-parallel-rank) head counts, derived from the sharded
+        # projection exactly like Qwen3: activations downstream of qkv_proj carry
+        # these local counts, and both towers share one geometry.
+        self.num_heads = int(self.qkv_proj.output_sizes[0]) // self.head_dim
+        self.num_kv_heads = int(self.qkv_proj.output_sizes[1]) // self.head_dim
+        if self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError("SenseNova local attention heads must be positive")
+        self.attn = RadixAttention(
             self.num_heads,
             self.num_kv_heads,
-            bias=config.attention_bias,
+            self.head_dim,
+            layer_id=self.layer_idx,
         )
         self.o_proj = RowParallelLinear(q_out, config.hidden_size, bias=config.attention_bias)
         self.o_proj_mot_gen = RowParallelLinear(q_out, config.hidden_size, bias=config.attention_bias)
@@ -461,6 +467,31 @@ class _NativeQwen3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if packed_rope is None:
             packed_rope = self._packed_rope(indexes)
+        axis_dims = (self.head_dim // 2, self.head_dim // 4, self.head_dim // 4)
+        if packed_rope.hw_identity and query_states.ndim == 4:
+            # Pure-text forward: the caller structurally guarantees zero h/w
+            # positions, so the spatial rotations are the identity and the
+            # provider may take its fused single-launch path. Flattening
+            # [B, L, H, D] -> [B*L, H, D] keeps the canonical token-major rope
+            # layout without the transpose-driven copies of the 4-D path.
+            batch, seq_len, q_heads, dim = query_states.shape
+            k_heads = int(key_states.shape[2])
+            q_flat, k_flat = ops.qk_norm_rope(
+                query_states.reshape(batch * seq_len, q_heads, dim),
+                key_states.reshape(batch * seq_len, k_heads, dim),
+                (q_norm.weight, q_norm_hw.weight, q_norm_hw.weight),
+                (k_norm.weight, k_norm_hw.weight, k_norm_hw.weight),
+                packed_rope.cos,
+                packed_rope.sin,
+                q_norm.eps,
+                axis_dims=axis_dims,
+                identity_axes=(1, 2),
+                override=override,
+            )
+            return (
+                q_flat.view(batch, seq_len, q_heads, dim).transpose(1, 2),
+                k_flat.view(batch, seq_len, k_heads, dim).transpose(1, 2),
+            )
         query_states, key_states = ops.qk_norm_rope(
             query_states.transpose(1, 2),
             key_states.transpose(1, 2),
@@ -469,12 +500,14 @@ class _NativeQwen3Attention(nn.Module):
             packed_rope.cos,
             packed_rope.sin,
             q_norm.eps,
-            axis_dims=(self.head_dim // 2, self.head_dim // 4, self.head_dim // 4),
+            axis_dims=axis_dims,
             override=override,
         )
         return query_states, key_states
 
-    def _packed_rope(self, indexes: torch.Tensor) -> SenseNovaPackedRope:
+    def _packed_rope(
+        self, indexes: torch.Tensor, *, hw_identity: bool = False
+    ) -> SenseNovaPackedRope:
         if indexes.ndim != 2 or indexes.shape[0] != 3:
             raise ValueError("SenseNova packed RoPE expects flat indexes [3, N]")
         device = indexes.device
@@ -497,6 +530,7 @@ class _NativeQwen3Attention(nn.Module):
         return SenseNovaPackedRope(
             (_on_index_device(cos_t), _on_index_device(cos_h), _on_index_device(cos_w)),
             (_on_index_device(sin_t), _on_index_device(sin_h), _on_index_device(sin_w)),
+            hw_identity=hw_identity,
         )
 
     def _project_qkv_routed(
@@ -960,12 +994,12 @@ class _NativeQwen3Attention(nn.Module):
         return routed, weights
 
 
-class _NativeQwen3DecoderLayer(nn.Module):
+class _SenseNovaDecoderLayer(nn.Module):
     def __init__(self, config: Any, layer_idx: int) -> None:
         super().__init__()
-        self.self_attn = _NativeQwen3Attention(config, layer_idx)
-        self.mlp = _NativeQwen3MLP(config)
-        self.mlp_mot_gen = _NativeQwen3MLP(config)
+        self.self_attn = _SenseNovaAttention(config, layer_idx)
+        self.mlp = _SenseNovaMLP(config)
+        self.mlp_mot_gen = _SenseNovaMLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1229,7 +1263,7 @@ class _NativeQwen3DecoderLayer(nn.Module):
         return residual + mlp_out
 
 
-class _NativeQwen3Model(nn.Module):
+class _SenseNovaDecoderModel(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
         self.config = config
@@ -1241,7 +1275,7 @@ class _NativeQwen3Model(nn.Module):
             self.padding_idx,
         )
         self.layers = nn.ModuleList(
-            [_NativeQwen3DecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            [_SenseNovaDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1266,6 +1300,7 @@ class _NativeQwen3Model(nn.Module):
         cache_position: torch.Tensor | None = None,
         exist_non_image_gen_tokens: bool | None = None,
         exist_image_gen_tokens: bool | None = None,
+        text_only_rope: bool = False,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
         del position_ids
@@ -1298,7 +1333,11 @@ class _NativeQwen3Model(nn.Module):
             cache_position,
         )
         flat_indexes = _flatten_3d_indexes(indexes, inputs_embeds.shape[0], inputs_embeds.shape[1])
-        packed_rope = self.layers[0].self_attn._packed_rope(flat_indexes) if self.layers else None
+        packed_rope = (
+            self.layers[0].self_attn._packed_rope(flat_indexes, hw_identity=bool(text_only_rope))
+            if self.layers
+            else None
+        )
 
         if exist_non_image_gen_tokens != exist_image_gen_tokens:
             hidden_states = self._forward_single_modality_layers(
@@ -1519,11 +1558,11 @@ class _NativeQwen3Model(nn.Module):
         )
 
 
-class _NativeQwen3ForCausalLM(nn.Module):
+class _SenseNovaLanguageModel(nn.Module):
     def __init__(self, config: Any) -> None:
         super().__init__()
         self.config = config
-        self.model = _NativeQwen3Model(config)
+        self.model = _SenseNovaDecoderModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1626,7 +1665,7 @@ class NEOChatModel(nn.Module):
         """
         self.vision_model = NeoVisionModel(config.vision_config)
         vision_model_mot_gen = NeoVisionModel(config.vision_config)
-        self.language_model = _NativeQwen3ForCausalLM(config.llm_config)
+        self.language_model = _SenseNovaLanguageModel(config.llm_config)
 
         fm_head = self._build_fm_head(config, hidden=hidden, output_dim=output_dim)
 
@@ -1889,7 +1928,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
 
         n_kv, head_dim = self._init_kv_geometry(config, llm_cfg, kv_token_capacity)
         self._init_empty_residency_state()
-        self._torch_compile_applied = False
         if self.model is not None:
             self._init_loaded_model_residency(n_kv, head_dim, gen_snapshot_kv_capacity)
             self._maybe_compile_piecewise()
@@ -1957,6 +1995,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self.num_layers = int(llm_cfg.num_hidden_layers)
             n_kv = int(llm_cfg.num_key_value_heads)
             head_dim = int(llm_cfg.head_dim)
+        # KV pools store this rank's shard: divide by tp_size with the same
+        # "a KV group too small to split stays whole" rule QKVParallelLinear
+        # applies, so pool geometry always matches what sharded attention writes.
+        n_kv = _local_kv_head_count(n_kv)
         self.kv_cache_dtype = get_current_kv_cache_dtype(config)
         if self.kv_cache_dtype in {None, "auto", "native", "compute"}:
             self.kv_cache_dtype = "bf16"
@@ -1970,8 +2012,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.kv_pool: PagedKVPool | None = None
         self.scratch_pool: PagedKVPool | None = None
         self.gen_scratch_pool: PagedKVPool | None = None
-        self._scratch_free: list[int] = []
-        self._gen_scratch_free: list[int] = []
+        self._scratch_allocator = BlockFreeList()
+        self._gen_scratch_allocator = BlockFreeList()
         self._scratch_blocks = 0
         self.residency = ResidencyManager()
 
@@ -2012,10 +2054,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.kv_pool = self.residency.kv
         self.scratch_pool = self.residency.scratch
         self.gen_scratch_pool = self.residency.gen_scratch
-        self._scratch_free = list(range(scratch_blocks))
+        self._scratch_allocator.reset(scratch_blocks)
         self._scratch_blocks = scratch_blocks
         if gen_blocks is not None:
-            self._gen_scratch_free = list(range(gen_blocks))
+            self._gen_scratch_allocator.reset(gen_blocks)
 
     def _ensure_rope_buffers_on_device(self, device: torch.device | str) -> None:
         if self.model is None:
@@ -2196,20 +2238,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             store_dtype=self.kv_cache_dtype,
         )
 
-    def _maybe_compile_piecewise(self) -> None:
-        if self._torch_compile_applied:
-            return
-        cfg = TorchCompileConfig.from_runtime_config()
-        if not cfg.enabled:
-            return
-        report = compile_model_pieces(self, config=cfg)
-        self._torch_compile_applied = True
-        if report.compiled:
-            logger.info(
-                "enabled SenseNova native Qwen3 model-stack torch.compile pieces count=%s",
-                report.compiled,
-            )
-
     def _annotate_towers(self) -> None:
         """Tag the generation-tower modules ``Pinned(tower, gen)`` for placement.
 
@@ -2258,42 +2286,12 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             raise invalid_descriptor("commit locator must be a typed data-plane Locator")
         return locator.to_wire_json()
 
-    @staticmethod
-    def _alloc_from_free_list(free_list: list[int], count: int, *, label: str) -> list[int]:
-        """Pop ``count`` block ids off a scratch free-list (shared by the
-        understanding and generation-device scratch pools)."""
-        count = int(count)
-        if count <= 0:
-            return []
-        if len(free_list) < count:
-            raise RuntimeError(
-                f"SenseNova {label} KV pool exhausted: need {count}, have {len(free_list)}"
-            )
-        out = free_list[:count]
-        del free_list[:count]
-        return out
-
-    @staticmethod
-    def _release_to_free_list(free_list: list[int], block_ids: Sequence[int]) -> None:
-        """Return block ids to a sorted, deduplicated scratch free-list.
-
-        Shared by both scratch pools. The list is kept sorted-and-unique by
-        merge-inserting only the not-yet-present ids, so a release is linear in
-        the free-list size instead of re-sorting the whole growing list each
-        time.         Already-present ids (double-free) are dropped without error.
-        """
-        for block_id in block_ids:
-            block_id = int(block_id)
-            position = bisect.bisect_left(free_list, block_id)
-            if position < len(free_list) and free_list[position] == block_id:
-                continue
-            free_list.insert(position, block_id)
-
     def allocate_gen_scratch_blocks(self, count: int) -> list[int]:
         if self.gen_scratch_pool is None:
             raise RuntimeError("SenseNova gen snapshot KV pool is not initialized")
-        return self._alloc_from_free_list(
-            self._gen_scratch_free, count, label="gen snapshot"
+        return self._gen_scratch_allocator.allocate(
+            count,
+            label="SenseNova gen snapshot KV pool",
         )
 
     def _resolve_tower_binding(self) -> TowerBinding:
@@ -2528,6 +2526,145 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def run_text_logits(self, op: dict[str, Any]):
         return self._text_driver().run_text_logits(dict(op))
 
+    def interleaved_text_forward(self, **kwargs: Any) -> CausalLMOutputWithPast:
+        return self.model.language_model(**kwargs)
+
+    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.language_model.get_input_embeddings()(input_ids)
+
+    def interleaved_text_inputs(self, query: str) -> tuple[torch.Tensor, torch.Tensor, Any]:
+        return self.model._build_t2i_text_inputs(self.tokenizer, query)
+
+    def interleaved_empty_image_start_query(self, image_start_token: str) -> str:
+        return self.model._build_t2i_query("", append_text=image_start_token)
+
+    def interleaved_image_query(self, text: str, *, append_text: str) -> str:
+        return self.model._build_t2i_query(text, append_text=append_text)
+
+    def interleaved_image_indexes(
+        self,
+        token_h: int,
+        token_w: int,
+        text_len: int,
+        *,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        return self.model._build_t2i_image_indexes(token_h, token_w, text_len, device=device)
+
+    def interleaved_image_predict_velocity(
+        self,
+        image_embeds: torch.Tensor,
+        indexes: torch.Tensor,
+        attention_mask: Any,
+        cache: Any,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int],
+    ) -> torch.Tensor:
+        return self.model._t2i_predict_v(
+            image_embeds,
+            indexes,
+            attention_mask,
+            cache,
+            t,
+            z,
+            image_token_num=image_token_num,
+            image_size=image_size,
+        )
+
+    def interleaved_image_patch_size(self) -> int:
+        return int(self.model.patch_size)
+
+    def interleaved_image_downsample_ratio(self) -> float:
+        return float(self.model.downsample_ratio)
+
+    def interleaved_image_features(
+        self,
+        image_input: torch.Tensor,
+        *,
+        grid_hw: torch.Tensor,
+        gen_model: bool = False,
+    ) -> torch.Tensor:
+        return self.model.extract_feature(image_input, gen_model=gen_model, grid_hw=grid_hw)
+
+    def interleaved_image_gen_feature_dtype(self) -> torch.dtype:
+        gen_vit = self.model.fm_modules["vision_model_mot_gen"]
+        return next(gen_vit.parameters()).dtype
+
+    def interleaved_image_noise_scale(self, grid_h: int, grid_w: int) -> float:
+        noise_scale = self.model.noise_scale
+        mode = getattr(self.model.noise_scale_mode, "value", self.model.noise_scale_mode)
+        if str(mode) in _NOISE_RESOLUTION_MODES:
+            base = float(self.model.noise_scale_base_image_seq_len)
+            seq_len_ratio = float(grid_h * grid_w) / (self.merge_size**2) / base
+            noise_scale = seq_len_ratio**_NOISE_RESOLUTION_EXPONENT * float(noise_scale)
+            if str(mode) == "dynamic_sqrt":
+                noise_scale = noise_scale**_NOISE_DYNAMIC_SQRT_EXPONENT
+        return min(float(noise_scale), float(self.model.noise_scale_max_value))
+
+    def interleaved_image_noise_scale_embedding(
+        self,
+        noise_scale: float,
+        token_count: int,
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> torch.Tensor | None:
+        if not bool(self.model.add_noise_scale_embedding):
+            return None
+        ns = torch.full(
+            (int(token_count),),
+            float(noise_scale) / float(self.model.noise_scale_max_value),
+            device=device,
+            dtype=dtype,
+        )
+        return self.model.fm_modules["noise_scale_embedder"](ns).view(1, int(token_count), -1)
+
+    def interleaved_image_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor:
+        return self.model.fm_modules["timestep_embedder"](t_values)
+
+    def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.language_model.get_input_embeddings()(input_ids)
+
+    def packed_decoder_forward(
+        self,
+        input_embeds: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_stream: Any,
+        kv_view: Any,
+    ) -> torch.Tensor:
+        return self.model.language_model.model.forward_packed_visible(
+            input_embeds,
+            image_gen_indicators=image_gen_indicators,
+            indexes=indexes,
+            forward_stream=forward_stream,
+            kv_view=kv_view,
+        )
+
+    def packed_text_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.model.language_model.lm_head(hidden_states)
+
+    def packed_hidden_to_velocity(
+        self,
+        hidden_states: torch.Tensor,
+        t: torch.Tensor,
+        latent: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int] | None,
+    ) -> torch.Tensor:
+        return self.model._t2i_hidden_to_velocity(
+            hidden_states,
+            t,
+            latent,
+            image_token_num=image_token_num,
+            image_size=image_size,
+        )
+
     def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
         """Query-side geometry for the system decode-graph FlashInfer planner.
 
@@ -2536,10 +2673,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         pool by the system adapter; only these query-side values are model-specific.
         """
 
-        attn = self.model.language_model.model.layers[0].self_attn
-        # ``q_norm`` weight stays in compute dtype even under weight quantization,
-        # so it is the faithful dtype of the query tensor the decode kernel sees.
-        return int(attn.num_heads), float(attn.scaling), attn.q_norm.weight.dtype
+        return self._text_decode_graph_query_geometry_from(
+            self.model.language_model.model.layers[0].self_attn
+        )
 
     def _text_indexes(self, start: int, seq_len: int, *, device: torch.device | str | None = None) -> torch.Tensor:
         target = device if device is not None else self.device
@@ -2569,28 +2705,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def allocate_scratch_blocks(self, count: int) -> list[int]:
         if self.scratch_pool is None:
             raise RuntimeError("SenseNova scratch KV pool is not initialized")
-        return self._alloc_from_free_list(self._scratch_free, count, label="scratch")
-
-    def _copy_cache_prefix(self, source: Any, target: PagedTextCache, length: int) -> None:
-        length = int(length)
-        if length <= 0:
-            return
-        source_pool = getattr(source, "pool", None)
-        source_blocks = list(getattr(source, "block_ids", []) or [])
-        if source_pool is None or not source_blocks:
-            raise RuntimeError("cannot stage mixed forward prefix without a paged source cache")
-        target.ensure_capacity(length)
-        for layer_idx in range(self.num_layers):
-            k, v = source_pool.read(layer_idx, source_blocks, start=0, length=length)
-            if k is None or v is None:
-                raise RuntimeError("source prefix KV is missing for mixed forward")
-            target.pool.write(
-                layer_idx,
-                target.block_ids,
-                start=0,
-                k=k.to(target.pool.k.device),
-                v=v.to(target.pool.v.device),
-            )
+        return self._scratch_allocator.allocate(
+            count,
+            label="SenseNova scratch KV pool",
+        )
 
     def on_new_request(self, req_id: int, state: RunnerRequestState) -> None:
         self.runner_states[int(req_id)] = state
@@ -2636,9 +2754,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         pool = getattr(cache, "pool", None)
         block_ids = [int(block_id) for block_id in getattr(cache, "block_ids", [])]
         if self.scratch_pool is not None and pool is self.scratch_pool:
-            self._release_to_free_list(self._scratch_free, block_ids)
+            self._scratch_allocator.release(block_ids)
         elif self.gen_scratch_pool is not None and pool is self.gen_scratch_pool:
-            self._release_to_free_list(self._gen_scratch_free, block_ids)
+            self._gen_scratch_allocator.release(block_ids)
 
     def prepare_denoise(self, state: RunnerRequestState, op: dict[str, Any] | Any) -> TextImageDenoiseStep:
         req_id = int(op["req_id"])
@@ -2657,85 +2775,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def predict_text_image_velocity_batch(self, steps, branches_by_step):
         return TextImageDenoiseOps.predict_text_image_velocity_batch(self, steps, branches_by_step)
 
-    def _sample_text_logits(self, req_id: int, logits: torch.Tensor, request_states: Any) -> TextTokenOutput:
-        state = request_states.get(int(req_id))
-        sampling = dict(state.sampling or {})
-        token, logprob, top_logprobs = Sampler().sample(
-            logits.reshape(-1, logits.shape[-1])[-1],
-            sampling,
-            n_logprobs=int(sampling.get("n_logprobs", 0) or 0),
-        )
-        return TextTokenOutput(
-            req_id=int(req_id),
-            sampled_token_id=int(token),
-            sampled_logprob=logprob,
-            top_logprobs=top_logprobs,
-        )
-
-    @staticmethod
-    def _store_forward_sampled_token_relay(
-        state: Any,
-        *,
-        token_id: int,
-        device: torch.device,
-        position_id: int | None = None,
-    ) -> None:
-        relay = getattr(state, "decode_relay", None)
-        if relay is None:
-            return
-        token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
-        if token_tensor.device.type == "cuda":
-            token_tensor.record_stream(torch.cuda.current_stream(token_tensor.device))
-        relay.token_id = int(token_id)
-        relay.token_tensor = token_tensor
-        if position_id is not None:
-            position_tensor = torch.tensor([int(position_id)], dtype=torch.long, device=device)
-            if position_tensor.device.type == "cuda":
-                position_tensor.record_stream(torch.cuda.current_stream(position_tensor.device))
-            relay.position_id = int(position_id)
-            relay.position_tensor = position_tensor
-
-    @staticmethod
-    def _forward_text_input_ids(
-        op: Mapping[str, Any],
-        *,
-        req_id: int,
-        tokens: Sequence[int],
-        request_states: Any,
-        device: torch.device,
-    ) -> torch.Tensor:
-        source = str(op.get("token_source") or "wire")
-        if source not in {"wire", "last_sampled"}:
-            raise invalid_descriptor(f"unsupported text token_source {source!r}")
-        if source == "wire":
-            return torch.tensor(list(tokens), dtype=torch.long, device=device)
-        if len(tokens) != 1:
-            raise invalid_descriptor(
-                "decode op requested token_source='last_sampled' but does not have exactly one token"
-            )
-        state = request_states.get(int(req_id))
-        relay = getattr(getattr(state, "decode_relay", None), "token_tensor", None)
-        if not isinstance(relay, torch.Tensor) or relay.dtype != torch.long or relay.device != device:
-            raise invalid_descriptor(
-                "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
-            )
-        return relay.reshape(1)
-
-    @staticmethod
-    def _append_packed_chunk(
-        embed_chunks: list[torch.Tensor],
-        indicators: list[torch.Tensor],
-        embeds: torch.Tensor,
-        *,
-        image_tokens: bool,
-        device: torch.device,
-    ) -> int:
-        start = sum(chunk.shape[0] for chunk in embed_chunks)
-        q_len = int(embeds.shape[0])
-        embed_chunks.append(embeds)
-        indicators.append(torch.full((q_len,), bool(image_tokens), dtype=torch.bool, device=device))
-        return start
-
     @staticmethod
     def _same_kv_pool(pool: Any, first_pool: Any) -> bool:
         return first_pool is None or pool is first_pool
@@ -2753,42 +2792,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             allocator = self.allocate_scratch_blocks
         else:
             raise RuntimeError("forward text staging target must be a scratch KV pool")
-        staged = PagedTextCache(
-            target_pool,
-            [],
-            num_layers=self.num_layers,
+        return stage_paged_text_cache_prefix(
+            source,
+            target_pool=target_pool,
             allocate_blocks=allocator,
+            num_layers=self.num_layers,
+            end_len=int(end_len),
         )
-        staged.ensure_capacity(int(end_len))
-        staged.length = int(source.length)
-        self._copy_cache_prefix(source, staged, int(source.length))
-        return staged
-
-    @staticmethod
-    def _copy_cache_span(
-        source: PagedTextCache,
-        target: PagedTextCache,
-        *,
-        start: int,
-        length: int,
-        num_layers: int,
-    ) -> None:
-        start = int(start)
-        length = int(length)
-        if length <= 0:
-            return
-        target.ensure_capacity(start + length)
-        for layer_idx in range(int(num_layers)):
-            k, v = source.pool.read(layer_idx, source.block_ids, start=start, length=length)
-            if k is None or v is None:
-                raise RuntimeError("forward text K/V span is missing from staged cache")
-            target.pool.write(
-                layer_idx,
-                target.block_ids,
-                start=start,
-                k=k.to(target.pool.k.device),
-                v=v.to(target.pool.v.device),
-            )
 
     def _forward_target_pool(self, denoise_steps: list[tuple[int, TextImageDenoiseStep]]) -> PagedKVPool | None:
         target_pool = None

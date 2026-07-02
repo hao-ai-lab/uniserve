@@ -99,6 +99,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--model-dtype", default="bfloat16")
     ap.add_argument("--transformers-trust-remote-code", action="store_true", default=False)
     ap.add_argument("--transformers-attn-implementation", default="uniserve")
+    ap.add_argument(
+        "--allow-transformers-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "explicitly allow the generic Hugging Face fallback for unknown "
+            "architectures; native UniModel implementations are required by default"
+        ),
+    )
     ap.add_argument("--disable-model-arch", action="append", default=[])
     ap.add_argument("--strict-model-imports", action="store_true", default=False)
     ap.add_argument("--tp-rank", type=int, default=0, help="tensor-parallel rank")

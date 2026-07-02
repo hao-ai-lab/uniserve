@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 import torch
 
 from ..foundation.errors import model_execution_error
+from ..nn.logits import forced_eos_logits
 from ..runtime.masks import create_block_causal_mask, create_causal_mask
 from ..runtime.paged_text_cache import PagedTextCache
 from ..runtime.request_state import append_new_block_ids
@@ -34,18 +35,70 @@ __all__ = [
     "InterleavedModelOwner",
     "InterleavedTextCacheDriver",
     "InterleavedTextStepper",
+    "resolve_op_token_ids",
 ]
 
 
-@dataclass
-class TextCache:
-    """Paged text KV cache and decode state for one interleaved branch."""
+def resolve_op_token_ids(op: Mapping[str, Any]) -> list[int]:
+    """Resolve one op's input token ids, synchronizing a pending relay if needed.
 
-    past: Any = None
-    block_ids: list[int] = field(default_factory=list)
-    t_index: int = -1
-    last_logits: torch.Tensor | None = None
-    last_token_id: int | None = None
+    ``last_sampled`` ops from the pipelined decode burst carry the sampled
+    token only as a device relay tensor (``op['token_tensor']``); the eager
+    path materializes it here (the graph path consumes the tensor directly and
+    never synchronizes).
+    """
+
+    source = str(op.get("token_source") or "wire")
+    tokens = list(op.get("token_ids") or [])
+    if source != "last_sampled":
+        return tokens
+    if len(tokens) != 1:
+        raise model_execution_error(
+            "decode op requested token_source='last_sampled' but does not have exactly one token"
+        )
+    relay = op.get("token_tensor")
+    if isinstance(relay, torch.Tensor):
+        return [int(relay.reshape(-1)[0].item())]
+    if int(tokens[0]) < 0:
+        raise model_execution_error(
+            "decode op requested token_source='last_sampled' but carries neither "
+            "a relay tensor nor a resolved token id"
+        )
+    return [int(tokens[0])]
+
+
+class TextCache:
+    """Paged text KV cache and decode state for one interleaved branch.
+
+    ``last_token_id`` may be committed either as a resolved CPU int or as a
+    pending device relay tensor (the pipelined decode burst commits the tensor
+    so the graph replay loop never synchronizes on the token value). The
+    property materializes a pending tensor on first read; readers only consult
+    it at modality transitions, long after the producing kernel has finished.
+    """
+
+    def __init__(self) -> None:
+        self.past: Any = None
+        self.block_ids: list[int] = []
+        self.t_index: int = -1
+        self.last_logits: torch.Tensor | None = None
+        self._last_token_id: int | None = None
+        self._last_token_tensor: torch.Tensor | None = None
+
+    @property
+    def last_token_id(self) -> int | None:
+        if self._last_token_tensor is not None:
+            self._last_token_id = int(self._last_token_tensor.reshape(-1)[0].item())
+            self._last_token_tensor = None
+        return self._last_token_id
+
+    @last_token_id.setter
+    def last_token_id(self, value: int | None) -> None:
+        self._last_token_tensor = None
+        self._last_token_id = None if value is None else int(value)
+
+    def set_last_token_tensor(self, tensor: torch.Tensor) -> None:
+        self._last_token_tensor = tensor
 
 
 class InterleavedModelOwner(Protocol):
@@ -74,6 +127,19 @@ class InterleavedModelOwner(Protocol):
     # state) are kept ``Any`` here: this system component is duck-typed against the
     # concrete model and must not name model-layer types.
     def allocate_scratch_blocks(self, count: int) -> list[int]: ...
+    def interleaved_text_forward(self, **kwargs: Any) -> Any: ...
+    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+    def interleaved_text_inputs(self, query: str) -> tuple[torch.Tensor, torch.Tensor, Any]: ...
+    def interleaved_empty_image_start_query(self, image_start_token: str) -> str: ...
+    def interleaved_image_patch_size(self) -> int: ...
+    def interleaved_image_downsample_ratio(self) -> float: ...
+    def interleaved_image_features(
+        self,
+        image_input: torch.Tensor,
+        *,
+        grid_hw: torch.Tensor,
+        gen_model: bool = False,
+    ) -> torch.Tensor: ...
     def _state(self, op: dict[str, Any]) -> Any: ...
     def _extend_cache_blocks(self, cache: "TextCache", op: dict[str, Any]) -> None: ...
     def _ensure_host_cache(self, cache: "TextCache") -> None: ...
@@ -129,12 +195,11 @@ class InterleavedTextCacheDriver:
     def _run_text_logits_one(self, op: dict[str, Any]) -> torch.Tensor:
         st = self.state(op)
         self.extend_cache_blocks(st.cond, op)
-        tokens = op.get("token_ids") or []
+        tokens = resolve_op_token_ids(op)
         if not tokens:
-            eos_id = int(self.owner.eos_id or 0)
-            logits = torch.full((1, eos_id + 1), float("-inf"), device=self.owner.device)
-            logits[0, eos_id] = 0.0
-            return logits
+            return forced_eos_logits(
+                int(self.owner.eos_id or 0), device=self.owner.device, batch_shape=(1,)
+            )
 
         if st.cond.past is None:
             self.ensure_host_cache(st.cond)
@@ -190,23 +255,24 @@ class InterleavedTextCacheDriver:
             raise model_execution_error("text prefix requires an initialized paged cache")
         input_ids = torch.tensor([tokens], dtype=torch.long, device=self.owner.device)
         indexes = self.text_indexes(start, len(tokens))
-        outputs = self.owner.model.language_model.model(
+        outputs = self.owner.interleaved_text_forward(
             input_ids=input_ids,
             indexes=indexes,
+            text_only_rope=True,
             attention_mask={"full_attention": create_block_causal_mask(indexes[0])},
             past_key_values=cache.past,
             use_cache=True,
         )
         cache.past = outputs.past_key_values
         cache.t_index = int(indexes[0].max().item())
-        cache.last_logits = self.owner.model.language_model.lm_head(outputs.last_hidden_state)
+        cache.last_logits = outputs.logits
         cache.last_token_id = int(tokens[-1])
 
     def prefix_from_query(self, query: str) -> TextCache:
         cache = TextCache()
         self.ensure_scratch_cache(cache)
-        ids, indexes, attn = self.owner.model._build_t2i_text_inputs(self.owner.tokenizer, query)
-        outputs = self.owner.model.language_model.model(
+        ids, indexes, attn = self.owner.interleaved_text_inputs(query)
+        outputs = self.owner.interleaved_text_forward(
             input_ids=ids,
             indexes=indexes,
             attention_mask=attn,
@@ -215,21 +281,22 @@ class InterleavedTextCacheDriver:
         )
         cache.past = outputs.past_key_values
         cache.t_index = int(indexes[0].max().item())
-        cache.last_logits = self.owner.model.language_model.lm_head(outputs.last_hidden_state)
+        cache.last_logits = outputs.logits
         cache.last_token_id = int(ids[0, -1].item())
         return cache
 
     def append_ids(self, cache: TextCache, tokens: list[int]) -> None:
         input_ids = torch.tensor([tokens], dtype=torch.long, device=self.owner.device)
         seq_len = input_ids.shape[1]
-        embeds = self.owner.model.language_model.get_input_embeddings()(input_ids)
+        embeds = self.owner.interleaved_text_embeddings(input_ids)
         indexes = self.text_indexes(cache.t_index + 1, seq_len)
         past_len = cache.past.get_seq_length()
         mask = torch.zeros(1, 1, seq_len, past_len + seq_len, device=self.owner.device)
         mask[:, :, :, past_len:] = create_causal_mask(seq_len, device=self.owner.device)
-        outputs = self.owner.model.language_model(
+        outputs = self.owner.interleaved_text_forward(
             inputs_embeds=embeds,
             indexes=indexes,
+            text_only_rope=True,
             attention_mask={"full_attention": mask},
             past_key_values=cache.past,
             use_cache=True,
@@ -242,11 +309,12 @@ class InterleavedTextCacheDriver:
     def append_one(self, cache: TextCache, token_id: int) -> None:
         ids = torch.tensor([token_id], dtype=torch.long, device=self.owner.device)
         indexes = self.text_indexes(cache.t_index + 1, 1)
-        outputs = self.owner.model.language_model(
+        outputs = self.owner.interleaved_text_forward(
             input_ids=ids.unsqueeze(0),
             indexes=indexes,
             past_key_values=cache.past,
             use_cache=True,
+            text_only_rope=True,
         )
         cache.past = outputs.past_key_values
         cache.t_index += 1
@@ -259,7 +327,7 @@ class InterleavedTextCacheDriver:
         self.append_one(cache, int(self.owner.img_start_id))
 
     def empty_img_start_prefix(self) -> TextCache:
-        query = self.owner.model._build_t2i_query("", append_text=self.image_start_token)
+        query = self.owner.interleaved_empty_image_start_query(self.image_start_token)
         return self.prefix_from_query(query)
 
     def text_indexes(self, start: int, seq_len: int) -> torch.Tensor:

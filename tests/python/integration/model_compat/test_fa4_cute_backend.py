@@ -20,7 +20,7 @@ from uniserve_kernel import mm_attn_varlen
 # KERNEL_*: a single attention op (one forward_paged / forward_visible_end call) vs SDPA.
 #   The only error source is the bf16 matmul/softmax inside one kernel invocation, so a tight
 #   1e-2 bound is appropriate.
-# MODEL_*: a full one-layer _NativeQwen3Model forward vs the eager reference. Error accumulates
+# MODEL_*: a full one-layer _SenseNovaDecoderModel forward vs the eager reference. Error accumulates
 #   through QKV/o projections, RoPE, MLP and the residual add (all bf16) on top of the attention
 #   op, so the looser 4e-2 bound accounts for that extra accumulation.
 KERNEL_CONFORMANCE_ATOL = 0.01
@@ -274,7 +274,7 @@ def test_sensenova_packed_visible_path_uses_real_fa4_and_matches_dense() -> None
     cfg.rope_theta_hw = 10000.0
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
-    model = sensenova_u1._NativeQwen3Model(cfg).to(device=device, dtype=dtype).eval()
+    model = sensenova_u1._SenseNovaDecoderModel(cfg).to(device=device, dtype=dtype).eval()
     hidden = torch.randn(5, cfg.hidden_size, device=device, dtype=dtype)
     indicators = torch.tensor([False, False, True, True, True], device=device)
     indexes = torch.stack(

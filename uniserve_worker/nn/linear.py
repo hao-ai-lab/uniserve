@@ -257,6 +257,29 @@ class MergedColumnParallelLinear(LinearBase):
         )
 
 
+def local_attention_head_count(total_heads: int, *, mesh: DeviceMesh | None = None) -> int:
+    """This tensor-parallel rank's query-head count (query heads always shard)."""
+    mesh = mesh or get_current_mesh()
+    return divide(int(total_heads), mesh.tp_size)
+
+
+def local_kv_head_count(total_kv_heads: int, *, mesh: DeviceMesh | None = None) -> int:
+    """This tensor-parallel rank's KV-head count.
+
+    The single owner of the attention KV sharding rule: a KV group divides
+    across the tp axis when it is large enough and stays whole (replicated)
+    when it is not. :class:`QKVParallelLinear` bakes the same decision into its
+    local shard sizes, and KV-pool/caps geometry must use this helper so pool
+    layouts can never drift from what sharded attention actually writes.
+    """
+    mesh = mesh or get_current_mesh()
+    total = int(total_kv_heads)
+    tp_size = int(mesh.tp_size)
+    if tp_size <= 1 or total < tp_size:
+        return total
+    return divide(total, tp_size)
+
+
 class QKVParallelLinear(MergedColumnParallelLinear):
     def __init__(
         self,
@@ -277,11 +300,8 @@ class QKVParallelLinear(MergedColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         q_size = total_num_heads * head_size
         kv_size = total_num_kv_heads * head_size
-        q_size_local = divide(q_size, mesh.tp_size)
-        if total_num_kv_heads >= mesh.tp_size:
-            kv_size_local = divide(kv_size, mesh.tp_size)
-        else:
-            kv_size_local = kv_size
+        q_size_local = local_attention_head_count(total_num_heads, mesh=mesh) * head_size
+        kv_size_local = local_kv_head_count(total_num_kv_heads, mesh=mesh) * head_size
         # The q/k/v -> 0/1/2 shard-id mapping is carried by WeightMode; the
         # k/v "replicated" decision falls out of the size==global_size test in
         # the base merged plan (a kv group too small to split stays whole).

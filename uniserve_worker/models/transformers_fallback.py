@@ -6,23 +6,28 @@ native ports continue to provide the optimized multimodal/diffusion paths.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
+from ..execution.interleaved_text_stepper import resolve_op_token_ids
 from ..execution.model_base import UniModelBase
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_lease_violation
 from ..foundation.runtime_config import get_worker_config
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..loader.transformers import dtype_from_name, infer_input_device
 from ..nn import RadixAttention
+from ..nn.logits import forced_eos_logits
 
 __all__ = [
     'TransformersForCausalLM',
     'EntryClass',
 ]
+
+logger = logging.getLogger(__name__)
 
 _ATTN_IMPL = "uniserve"
 
@@ -136,12 +141,9 @@ class _HFTextPath:
     @torch.inference_mode()
     def run_text_logits(self, op: dict[str, Any]) -> torch.Tensor:
         req_id = int(op["req_id"])
-        tokens = [int(token) for token in (op.get("token_ids") or [])]
+        tokens = [int(token) for token in resolve_op_token_ids(op)]
         if not tokens:
-            eos = int(self.owner.eos_id)
-            logits = torch.full((eos + 1,), float("-inf"), device=self.owner.device)
-            logits[eos] = 0.0
-            return logits
+            return forced_eos_logits(int(self.owner.eos_id), device=self.owner.device)
 
         state = self.states.setdefault(req_id, _HFTextState())
         # The fallback grows HF's contiguous past_key_values per request and does
@@ -239,6 +241,12 @@ class TransformersForCausalLM(UniModelBase):
             msg = str(exc).lower()
             if attn_impl != _ATTN_IMPL or "attn_implementation" not in msg:
                 raise
+            logger.warning(
+                "model rejected the %r attention implementation; downgrading to "
+                "'sdpa' (paged attention disabled for this fallback model)",
+                attn_impl,
+                extra={"model_path": str(model_path), "error": str(exc)},
+            )
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 config=config,

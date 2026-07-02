@@ -22,6 +22,7 @@ from .decode_cuda_graph import (
     PrefillCudaGraphRunner,
     TextDecodeGraphState,
     TextInitialPrefillGraphState,
+    resolve_paged_decode_graph_prepare,
 )
 
 if TYPE_CHECKING:
@@ -43,11 +44,15 @@ class TextGraphRunner:
         num_blocks: int,
         block_size: int,
         device: "torch.device",
+        attention_backend_name: str | None = None,
     ) -> None:
         self.kv_pool = kv_pool
         self.num_blocks = int(num_blocks)
         self.block_size = int(block_size)
         self.device = device
+        # Startup (warmup) has no forward context to read the backend name from;
+        # per-forward calls prefer the context's resolved name.
+        self.attention_backend_name = attention_backend_name
         runtime = get_worker_config()
         self._decode = DecodeCudaGraphRunner(
             name="text",
@@ -94,16 +99,41 @@ class TextGraphRunner:
             return None
         if input_ids.ndim != 2 or int(input_ids.shape[1]) != 1:
             return None
+        batch_size = int(input_ids.shape[0])
+        prepare_backend = self._decode_prepare_backend(
+            model,
+            attention_backend_name=getattr(ctx, "attention_backend_name", None)
+            or self.attention_backend_name,
+        )
+        if prepare_backend is None:
+            # A captured paged-decode graph is only correct when the backend can
+            # refill its plan buffers before every replay; without that, the
+            # capture-time plan is baked in and later steps silently read stale
+            # pages. Stay eager rather than capture a wrong graph.
+            return None
         return self._decode.maybe_run(
             kv_pool=self.kv_pool,
             num_blocks=self.num_blocks,
-            batch_size=int(input_ids.shape[0]),
+            batch_size=batch_size,
             input_ids=input_ids,
             positions=positions,
             attention_metadata=metadata,
             ctx=ctx,
             forward_fn=lambda state: self._decode_forward(model, state),
-            prepare_backend=None,
+            prepare_backend=prepare_backend,
+        )
+
+    def _decode_prepare_backend(
+        self,
+        model: Any,
+        *,
+        attention_backend_name: str | None,
+    ) -> Any | None:
+        return resolve_paged_decode_graph_prepare(
+            owner=model,
+            kv_pool=self.kv_pool,
+            num_blocks=self.num_blocks,
+            attention_backend_name=attention_backend_name,
         )
 
     def _maybe_prefill(self, model, input_ids, positions, fb, metadata, ctx):
@@ -187,13 +217,22 @@ class TextGraphRunner:
         if self.device.type != "cuda":
             return
         if self._decode.enabled() and self._decode.warmup_enabled():
-            self._decode.warmup(
-                kv_pool=self.kv_pool,
-                num_blocks=self.num_blocks,
-                device=self.device,
-                forward_fn=lambda state: self._decode_forward(model, state),
-                prepare_backend=None,
+            prepare_backend = self._decode_prepare_backend(
+                model, attention_backend_name=self.attention_backend_name
             )
+            if prepare_backend is None:
+                logger.info(
+                    "skipping decode graph warmup: no graph-capable paged-decode "
+                    "backend or model geometry hook; decode stays eager"
+                )
+            else:
+                self._decode.warmup(
+                    kv_pool=self.kv_pool,
+                    num_blocks=self.num_blocks,
+                    device=self.device,
+                    forward_fn=lambda state: self._decode_forward(model, state),
+                    prepare_backend=prepare_backend,
+                )
         if self._prefill.enabled() and self._prefill.warmup_enabled():
             self._prefill.warmup(
                 kv_pool=self.kv_pool,

@@ -33,6 +33,8 @@ _EXPORTS: dict[str, str] = {
     "LinearBase": "linear",
     "MergedColumnParallelLinear": "linear",
     "QKVParallelLinear": "linear",
+    "local_attention_head_count": "linear",
+    "local_kv_head_count": "linear",
     "RowParallelLinear": "linear",
     "default_weight_loader": "linear",
     # logits
@@ -129,6 +131,8 @@ __all__ = [
     "Pinned",
     "Placement",
     "QKVParallelLinear",
+    "local_attention_head_count",
+    "local_kv_head_count",
     "RMSNorm",
     "Region",
     "Replicate",
