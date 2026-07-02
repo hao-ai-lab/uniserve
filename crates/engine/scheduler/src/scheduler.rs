@@ -3089,6 +3089,46 @@ impl Scheduler {
     /// Build the next op for an InterleaveUnd request. Block addressing uses the
     /// full worst-case mapping (exact image token counts come from the worker),
     /// which the reservation allocated at admission.
+    /// Burst plan for understanding-mode text decode. Rounds always close on
+    /// <|im_end|>, so eos is unconditionally a burst stop; the KV capacity is
+    /// pre-reserved worst-case at admission, so no per-token block gating is
+    /// needed beyond the step budget.
+    fn iu_decode_burst_plan(&self, id: RequestId, budget: usize) -> (u16, Option<Vec<u32>>) {
+        let Some(st) = self.running.get(&id) else {
+            return (1, None);
+        };
+        let sp = &st.req.sampling;
+        let penalties = sp.repetition_penalty != 1.0
+            || sp.frequency_penalty != 0.0
+            || sp.presence_penalty != 0.0;
+        if self.decode_token_burst <= 1
+            || budget <= 1
+            || st.iu_closing
+            || st.grammar.is_some()
+            || sp.temperature > 0.0
+            || sp.n_logprobs != 0
+            || !sp.bad_words_ids.is_empty()
+            || penalties
+            || st.n_generated < sp.min_tokens
+        {
+            return (1, None);
+        }
+        let remaining = st.req.max_tokens.saturating_sub(st.n_generated);
+        let count = self
+            .decode_token_burst
+            .min(remaining.min(u16::MAX as usize).max(1) as u16)
+            .min(budget.min(u16::MAX as usize) as u16)
+            .max(1);
+        if count <= 1 {
+            return (1, None);
+        }
+        let mut stop_ids: Vec<u32> = self.ctrl.eos.clone();
+        stop_ids.extend(st.req.stop_token_ids.iter().copied());
+        stop_ids.sort_unstable();
+        stop_ids.dedup();
+        (count, Some(stop_ids))
+    }
+
     fn next_op_iu(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
         let (phase, wc) = {
             let st = self.running.get(&id)?;
@@ -3171,6 +3211,7 @@ impl Scheduler {
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
                 let (pos, tok) = (st.pos, st.next_token);
+                let (burst_count, burst_stop_ids) = self.iu_decode_burst_plan(id, budget);
                 if let Some(s) = self.running.get_mut(&id) {
                     s.pos += 1;
                     s.kvlen += 1;
@@ -3182,6 +3223,8 @@ impl Scheduler {
                     new_block_ids: self.take_new_blocks(id),
                     pos_range: (pos, pos + 1),
                     token_ids: Some(vec![tok]),
+                    decode_token_count: (burst_count > 1).then_some(burst_count),
+                    decode_stop_token_ids: burst_stop_ids,
                     ..Default::default()
                 })
             }
@@ -3276,35 +3319,54 @@ impl Scheduler {
             }
             OpKind::DecodeUnd => {
                 self.bm.activate(id);
-                let tok = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
                 let closing = self.running.get(&id).map(|s| s.iu_closing).unwrap_or(false);
                 if closing {
                     // the <|im_end|> is now committed; decide image vs finish.
-                    let (triggered, images_done, max_images, n_gen, max_tokens) = {
-                        let st = self.running.get(&id).unwrap();
-                        (
-                            contains_subseq(&st.round_tokens, &self.ctrl.image_start_ids),
-                            st.images_done,
-                            st.req.image.max_images as usize,
-                            st.n_generated,
-                            st.req.max_tokens,
-                        )
-                    };
                     if let Some(s) = self.running.get_mut(&id) {
                         s.iu_closing = false;
                     }
-                    if triggered && images_done < max_images && n_gen < max_tokens {
-                        return self.begin_image_iu(id);
-                    }
-                    return self.finish(
-                        id,
-                        if n_gen >= max_tokens {
-                            FinishReason::MaxTokens
-                        } else {
-                            FinishReason::Eos
-                        },
-                    );
+                    return self.close_iu_round(id);
                 }
+                if let Some(tokens) = sr.sampled_token_ids.as_ref().filter(|t| !t.is_empty()) {
+                    // Worker-side decode burst: every committed token arrives at
+                    // once, and when the burst stopped on <|im_end|> the worker's
+                    // speculative stop-token forward already fed it into KV — the
+                    // round closes here directly instead of via an iu_closing op.
+                    let tokens = tokens.clone();
+                    let count = tokens.len() as u32;
+                    let stopped_on_eos = tokens
+                        .last()
+                        .is_some_and(|tok| self.ctrl.eos.contains(tok));
+                    // The op's build advanced pos/kvlen by 1; the worker appended
+                    // one KV row per launched forward (`count` without a stop,
+                    // `count + 1` including the speculative stop-token feed).
+                    let extra = if stopped_on_eos { count } else { count - 1 };
+                    if let Some(s) = self.running.get_mut(&id) {
+                        s.pos += extra;
+                        s.kvlen += extra;
+                    }
+                    for &tok in &tokens {
+                        if self.ctrl.eos.contains(&tok) {
+                            break;
+                        }
+                        self.emit_text(id, tok, None);
+                        let (n_gen, max_tokens) = {
+                            let st = self.running.get_mut(&id).unwrap();
+                            st.round_tokens.push(tok);
+                            st.n_generated += 1;
+                            st.next_token = tok;
+                            (st.n_generated, st.req.max_tokens)
+                        };
+                        if n_gen >= max_tokens {
+                            return self.finish(id, FinishReason::MaxTokens);
+                        }
+                    }
+                    if stopped_on_eos {
+                        return self.close_iu_round(id);
+                    }
+                    return;
+                }
+                let tok = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
                 if self.ctrl.eos.contains(&tok) {
                     // close the round: feed <|im_end|> into KV, transition on its resolve.
                     if let Some(s) = self.running.get_mut(&id) {
@@ -3394,6 +3456,35 @@ impl Scheduler {
             }
             _ => {}
         }
+    }
+
+    /// Decide image-vs-finish once a round's <|im_end|> KV is committed —
+    /// shared by the legacy iu_closing op resolve and the burst path (whose
+    /// speculative stop-token forward already fed <|im_end|>).
+    fn close_iu_round(&mut self, id: RequestId) {
+        let (triggered, images_done, max_images, n_gen, max_tokens) = {
+            let Some(st) = self.running.get(&id) else {
+                return;
+            };
+            (
+                contains_subseq(&st.round_tokens, &self.ctrl.image_start_ids),
+                st.images_done,
+                st.req.image.max_images as usize,
+                st.n_generated,
+                st.req.max_tokens,
+            )
+        };
+        if triggered && images_done < max_images && n_gen < max_tokens {
+            return self.begin_image_iu(id);
+        }
+        self.finish(
+            id,
+            if n_gen >= max_tokens {
+                FinishReason::MaxTokens
+            } else {
+                FinishReason::Eos
+            },
+        )
     }
 
     fn begin_image_iu(&mut self, id: RequestId) {
@@ -4447,6 +4538,68 @@ mod tests {
             !sched.running.contains_key(&id),
             "cancelled request must be reaped after its op resolves"
         );
+    }
+
+    // An understanding-mode decode burst commits every returned token; a burst
+    // that stopped on <|im_end|> closes the round directly (its KV was already
+    // fed by the worker's speculative stop-token forward — no iu_closing op).
+    #[test]
+    fn understanding_decode_burst_commits_tokens_and_closes_round_on_eos() {
+        let mut sched = test_scheduler();
+        sched.ctrl.eos = vec![99];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(1, 4);
+        req.mode = GenMode::InterleaveUnd;
+        req.max_tokens = 64;
+        req.event_tx = tx;
+        sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.phase = Phase::DecodeUnd;
+            st.pos = 10;
+            st.kvlen = 10;
+        }
+
+        // Full burst, no stop: every token commits, pos/kvlen advance by k-1
+        // beyond the op build's +1 (which this direct resolve call skips).
+        sched.resolve_iu(
+            id,
+            OpKind::DecodeUnd,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(6),
+                sampled_token_ids: Some(vec![5, 6]),
+                ..Default::default()
+            },
+        );
+        {
+            let st = sched.running.get(&id).expect("still running");
+            assert_eq!(st.n_generated, 2);
+            assert_eq!(st.round_tokens, vec![5, 6]);
+            assert_eq!(st.next_token, 6);
+            assert_eq!(st.pos, 11);
+            assert_eq!(st.kvlen, 11);
+        }
+        assert_eq!(drain_text_tokens(&mut rx), vec![5, 6]);
+
+        // Burst tail hits eos: the committed tokens emit, the round closes
+        // without an iu_closing hop, and (no image trigger) the request ends.
+        sched.resolve_iu(
+            id,
+            OpKind::DecodeUnd,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(99),
+                sampled_token_ids: Some(vec![7, 99]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !sched.running.contains_key(&id),
+            "eos-terminated burst must finish the request"
+        );
+        assert_eq!(drain_text_tokens(&mut rx), vec![7]);
     }
 
     // Understanding-interleave input images dual-encode (VAE then ViT) only

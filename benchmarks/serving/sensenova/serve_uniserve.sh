@@ -6,6 +6,8 @@
 #   TP=1                      tensor-parallel ranks (1 or 4)
 #   TEACACHE=0                1 -> enable the denoise residual cache (threshold 0.2)
 #   TEACACHE_THRESHOLD=0.2
+#   DECODE_BURST=8            worker-side decode burst length (1 disables; greedy
+#                             text decode only — semantics-identical, ~+20% tok/s)
 #
 # Writes the server pid to $RUN_DIR/uniserve.pid and logs to $RUN_DIR/uniserve.log.
 set -euo pipefail
@@ -16,6 +18,7 @@ PORT="${PORT:-18082}"
 TP="${TP:-1}"
 TEACACHE="${TEACACHE:-0}"
 TEACACHE_THRESHOLD="${TEACACHE_THRESHOLD:-0.2}"
+export UNISERVE_DECODE_TOKEN_BURST="${DECODE_BURST:-8}"
 RUN_DIR="${RUN_DIR:-$ROOT/benchmarks/serving/sensenova/run}"
 mkdir -p "$RUN_DIR"
 
