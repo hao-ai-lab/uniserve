@@ -294,6 +294,151 @@ if triton is not None:
             block_b,
         )
 
+    @triton.jit
+    def _multi_axis_rms_norm_rope_row(
+        x_ptr,
+        base,
+        head_w_ptr,
+        tail_w_ptr,
+        cos0_ptr,
+        sin0_ptr,
+        cos1_ptr,
+        sin1_ptr,
+        cos2_ptr,
+        sin2_ptr,
+        out_ptr,
+        out_base,
+        token,
+        stride_2: tl.constexpr,
+        dim0: tl.constexpr,
+        half0: tl.constexpr,
+        axis_dim: tl.constexpr,
+        axis_half: tl.constexpr,
+        tail_dim: tl.constexpr,
+        eps: tl.constexpr,
+        block_a: tl.constexpr,
+        block_b: tl.constexpr,
+    ):
+        # Head group [0, dim0): RMS over dim0 + NeoX RoPE by cos0/sin0. The
+        # rounding chain matches _qk_rms_norm_rope_kernel exactly (norm ->
+        # cast -> weight -> cast, RoPE in fp32 over the rounded values).
+        offs_a = tl.arange(0, block_a)
+        col_a = offs_a < dim0
+        d_half = offs_a % half0
+        second = half0 + d_half
+        first_half = offs_a < half0
+        xa = tl.load(x_ptr + base + offs_a * stride_2, mask=col_a, other=0.0).to(tl.float32)
+        var_a = tl.sum(xa * xa, axis=0) / dim0
+        inv_a = tl.rsqrt(var_a + eps)
+        x1 = tl.load(x_ptr + base + d_half * stride_2, mask=col_a, other=0.0).to(tl.float32)
+        x2 = tl.load(x_ptr + base + second * stride_2, mask=col_a, other=0.0).to(tl.float32)
+        w1 = tl.load(head_w_ptr + d_half, mask=col_a, other=0.0).to(tl.float32)
+        w2 = tl.load(head_w_ptr + second, mask=col_a, other=0.0).to(tl.float32)
+        cos = tl.load(cos0_ptr + token * half0 + d_half, mask=col_a, other=0.0).to(tl.float32)
+        sin = tl.load(sin0_ptr + token * half0 + d_half, mask=col_a, other=0.0).to(tl.float32)
+        x1n = (x1 * inv_a).to(out_ptr.dtype.element_ty).to(tl.float32)
+        x2n = (x2 * inv_a).to(out_ptr.dtype.element_ty).to(tl.float32)
+        x1n = (x1n * w1).to(out_ptr.dtype.element_ty).to(tl.float32)
+        x2n = (x2n * w2).to(out_ptr.dtype.element_ty).to(tl.float32)
+        rot = tl.where(first_half, x1n * cos - x2n * sin, x2n * cos + x1n * sin)
+        tl.store(out_ptr + out_base + offs_a, rot, mask=col_a)
+
+        # Tail group [dim0, dim0+tail_dim): one shared RMS over tail_dim
+        # (matching _qk_rms_norm_kernel's (x * rsqrt) * w chain), rounded to
+        # the output dtype exactly where the unfused pipeline stored the
+        # normed tensor, then the two tail axes are NeoX-rotated in fp32 by
+        # their own tables exactly as _packed_rope_kernel reloads and rotates
+        # the rounded values.
+        offs_b = tl.arange(0, block_b)
+        col_b = offs_b < tail_dim
+        xb = tl.load(x_ptr + base + (dim0 + offs_b) * stride_2, mask=col_b, other=0.0).to(tl.float32)
+        var_b = tl.sum(xb * xb, axis=0) / tail_dim
+        inv_b = tl.rsqrt(var_b + eps)
+        is_second_axis = offs_b >= axis_dim
+        dj = (offs_b % axis_dim) % axis_half
+        src1 = tl.where(is_second_axis, axis_dim, 0) + dj
+        src2 = src1 + axis_half
+        y1 = tl.load(x_ptr + base + (dim0 + src1) * stride_2, mask=col_b, other=0.0).to(tl.float32)
+        y2 = tl.load(x_ptr + base + (dim0 + src2) * stride_2, mask=col_b, other=0.0).to(tl.float32)
+        wv1 = tl.load(tail_w_ptr + src1, mask=col_b, other=0.0).to(tl.float32)
+        wv2 = tl.load(tail_w_ptr + src2, mask=col_b, other=0.0).to(tl.float32)
+        y1n = (y1 * inv_b * wv1).to(out_ptr.dtype.element_ty).to(tl.float32)
+        y2n = (y2 * inv_b * wv2).to(out_ptr.dtype.element_ty).to(tl.float32)
+        c1 = tl.load(cos1_ptr + token * axis_half + dj, mask=col_b & (~is_second_axis), other=0.0).to(tl.float32)
+        s1 = tl.load(sin1_ptr + token * axis_half + dj, mask=col_b & (~is_second_axis), other=0.0).to(tl.float32)
+        c2 = tl.load(cos2_ptr + token * axis_half + dj, mask=col_b & is_second_axis, other=0.0).to(tl.float32)
+        s2 = tl.load(sin2_ptr + token * axis_half + dj, mask=col_b & is_second_axis, other=0.0).to(tl.float32)
+        cb = tl.where(is_second_axis, c2, c1)
+        sb = tl.where(is_second_axis, s2, s1)
+        first_b = (offs_b % axis_dim) < axis_half
+        rot_b = tl.where(first_b, y1n * cb - y2n * sb, y2n * cb + y1n * sb)
+        tl.store(out_ptr + out_base + dim0 + offs_b, rot_b, mask=col_b)
+
+    @triton.jit
+    def _qk_multi_axis_rms_norm_rope_kernel(
+        q_ptr,
+        k_ptr,
+        q_head_w_ptr,
+        q_tail_w_ptr,
+        k_head_w_ptr,
+        k_tail_w_ptr,
+        cos0_ptr,
+        sin0_ptr,
+        cos1_ptr,
+        sin1_ptr,
+        cos2_ptr,
+        sin2_ptr,
+        q_out_ptr,
+        k_out_ptr,
+        q_rows: tl.constexpr,
+        k_rows: tl.constexpr,
+        q_heads: tl.constexpr,
+        k_heads: tl.constexpr,
+        q_stride_0: tl.constexpr,
+        q_stride_1: tl.constexpr,
+        q_stride_2: tl.constexpr,
+        k_stride_0: tl.constexpr,
+        k_stride_1: tl.constexpr,
+        k_stride_2: tl.constexpr,
+        dim: tl.constexpr,
+        dim0: tl.constexpr,
+        half0: tl.constexpr,
+        axis_dim: tl.constexpr,
+        axis_half: tl.constexpr,
+        tail_dim: tl.constexpr,
+        q_eps: tl.constexpr,
+        k_eps: tl.constexpr,
+        block_a: tl.constexpr,
+        block_b: tl.constexpr,
+    ):
+        # One program per (token, head) row; the branch predicate is uniform
+        # per program and depends only on program_id, so each program executes
+        # exactly one row body (capture-safe, no tensor-value branching).
+        pid = tl.program_id(0)
+        if pid < q_rows:
+            token = pid // q_heads
+            head = pid - token * q_heads
+            base = token * q_stride_0 + head * q_stride_1
+            _multi_axis_rms_norm_rope_row(
+                q_ptr, base, q_head_w_ptr, q_tail_w_ptr,
+                cos0_ptr, sin0_ptr, cos1_ptr, sin1_ptr, cos2_ptr, sin2_ptr,
+                q_out_ptr, pid * dim, token,
+                q_stride_2, dim0, half0, axis_dim, axis_half, tail_dim, q_eps,
+                block_a, block_b,
+            )
+        else:
+            k_pid = pid - q_rows
+            token = k_pid // k_heads
+            head = k_pid - token * k_heads
+            base = token * k_stride_0 + head * k_stride_1
+            _multi_axis_rms_norm_rope_row(
+                k_ptr, base, k_head_w_ptr, k_tail_w_ptr,
+                cos0_ptr, sin0_ptr, cos1_ptr, sin1_ptr, cos2_ptr, sin2_ptr,
+                k_out_ptr, k_pid * dim, token,
+                k_stride_2, dim0, half0, axis_dim, axis_half, tail_dim, k_eps,
+                block_a, block_b,
+            )
+
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -457,6 +602,174 @@ def try_triton_qk_split_rms_norm_rope(
         num_warps=4,
     )
     return q_out, k_out
+
+
+def try_triton_qk_multi_axis_rms_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_head_weight: torch.Tensor,
+    q_tail_weight: torch.Tensor,
+    k_head_weight: torch.Tensor,
+    k_tail_weight: torch.Tensor,
+    cos: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    sin: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    q_eps: float,
+    k_eps: float,
+    *,
+    axis_dims: tuple[int, int, int],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Fused 3-axis QK RMSNorm+RoPE with a rotated two-axis tail group.
+
+    ``q``/``k`` are ``[tokens, heads, dim]`` with ``axis_dims = (d0, d1, d1)``:
+    dims ``[0, d0)`` are RMS-normed with the head weight and NeoX-rotated by
+    ``cos[0]``/``sin[0]``; dims ``[d0, dim)`` share one RMS over ``2*d1`` with
+    the tail weight and each ``d1``-wide axis is then NeoX-rotated by its own
+    table (``cos[1]``/``cos[2]``, each ``[tokens, d1 // 2]``). This is the
+    one-launch form of the general multi-axis pipeline (norm+rope kernel,
+    shared-norm kernel, two packed-rope launches per tensor, plus the
+    interleaving contiguous/cat copies) and preserves each group's exact
+    per-element arithmetic and rounding order:
+    * head group: the _qk_rms_norm_rope_kernel chain verbatim;
+    * tail group: _qk_rms_norm_kernel's ``(x * rsqrt(var + eps)) * w`` with a
+      single rounding to the output dtype standing in for its global store,
+      then _packed_rope_kernel's fp32 rotation of the rounded values.
+    Reduction order note: both groups reduce a 1D power-of-two row tile
+    (<= 64 wide) with ``tl.sum`` in one shot, the same tile shapes the
+    unfused kernels use. With one element per lane (any num_warps >= 2 for
+    tiles <= 64) the generated tree is per-warp butterfly + one cross-warp
+    combine, identical to the unfused kernels' num_warps=4 launches; this is
+    verified bitwise against the unfused pipeline in
+    tests/python/unit/layers/test_multi_axis_qk_norm_rope_fused.py. num_warps=1
+    (two elements per lane, thread-local pre-sum) changes the tree and is not
+    used. Eligibility is restricted to the verified tile family
+    (next_power_of_2 of both group widths in {32, 64}).
+    """
+
+    if not can_run_triton_qk_multi_axis_rms_norm_rope(
+        q,
+        k,
+        q_head_weight,
+        q_tail_weight,
+        k_head_weight,
+        k_tail_weight,
+        cos,
+        sin,
+        axis_dims=axis_dims,
+    ):
+        return None
+    tokens, q_heads = int(q.shape[0]), int(q.shape[1])
+    k_heads = int(k.shape[1])
+    dim = int(q.shape[-1])
+    dim0, axis_dim, _ = (int(v) for v in axis_dims)
+    tail_dim = dim - dim0
+    q_out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    k_out = torch.empty_like(k, memory_format=torch.contiguous_format)
+    q_rows = tokens * q_heads
+    k_rows = tokens * k_heads
+    _qk_multi_axis_rms_norm_rope_kernel[(q_rows + k_rows,)](
+        q,
+        k,
+        q_head_weight,
+        q_tail_weight,
+        k_head_weight,
+        k_tail_weight,
+        cos[0],
+        sin[0],
+        cos[1],
+        sin[1],
+        cos[2],
+        sin[2],
+        q_out,
+        k_out,
+        q_rows,
+        k_rows,
+        q_heads,
+        k_heads,
+        int(q.stride(0)),
+        int(q.stride(1)),
+        int(q.stride(2)),
+        int(k.stride(0)),
+        int(k.stride(1)),
+        int(k.stride(2)),
+        dim,
+        dim0,
+        dim0 // 2,
+        axis_dim,
+        axis_dim // 2,
+        tail_dim,
+        float(q_eps),
+        float(k_eps),
+        triton.next_power_of_2(dim0),
+        triton.next_power_of_2(tail_dim),
+        num_warps=2,
+    )
+    return q_out, k_out
+
+
+def can_run_triton_qk_multi_axis_rms_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_head_weight: torch.Tensor,
+    q_tail_weight: torch.Tensor,
+    k_head_weight: torch.Tensor,
+    k_tail_weight: torch.Tensor,
+    cos: tuple[torch.Tensor, ...],
+    sin: tuple[torch.Tensor, ...],
+    *,
+    axis_dims: tuple[int, ...],
+) -> bool:
+    if triton is None or not triton_fused_layers_enabled() or torch.is_grad_enabled():
+        return False
+    if len(axis_dims) != 3 or len(cos) != 3 or len(sin) != 3:
+        return False
+    if not _qk_rms_norm_rope_tensors_on_supported_device(
+        q, k, q_head_weight, k_head_weight, cos[0], sin[0]
+    ):
+        return False
+    if not (q_tail_weight.is_cuda and k_tail_weight.is_cuda):
+        return False
+    dim0, axis_dim, axis_dim2 = (int(v) for v in axis_dims)
+    if axis_dim != axis_dim2 or dim0 <= 0 or axis_dim <= 0:
+        return False
+    if dim0 % 2 != 0 or axis_dim % 2 != 0:
+        return False
+    tail_dim = 2 * axis_dim
+    # Only the bitwise-verified reduction tile family (see the launch note).
+    if triton.next_power_of_2(dim0) not in (32, 64):
+        return False
+    if triton.next_power_of_2(tail_dim) not in (32, 64):
+        return False
+    if q.ndim != 3 or k.ndim != 3 or q.dtype != k.dtype:
+        return False
+    tokens = int(q.shape[0])
+    dim = int(q.shape[-1])
+    if dim != dim0 + tail_dim or int(k.shape[-1]) != dim:
+        return False
+    if tokens <= 0 or int(k.shape[0]) != tokens:
+        return False
+    if int(q.shape[1]) <= 0 or int(k.shape[1]) <= 0:
+        return False
+    if int(q.stride(-1)) != 1 or int(k.stride(-1)) != 1:
+        return False
+    for weight, width in (
+        (q_head_weight, dim0),
+        (k_head_weight, dim0),
+        (q_tail_weight, tail_dim),
+        (k_tail_weight, tail_dim),
+    ):
+        if int(weight.numel()) != width or not weight.is_contiguous():
+            return False
+    for axis, width in ((0, dim0), (1, axis_dim), (2, axis_dim)):
+        cos_a, sin_a = cos[axis], sin[axis]
+        if not (cos_a.is_cuda and sin_a.is_cuda and cos_a.device == q.device and sin_a.device == q.device):
+            return False
+        if cos_a.ndim != 2 or sin_a.shape != cos_a.shape:
+            return False
+        if int(cos_a.shape[0]) != tokens or int(cos_a.shape[-1]) != width // 2:
+            return False
+        if not (cos_a.is_contiguous() and sin_a.is_contiguous()):
+            return False
+    return True
 
 
 def can_run_triton_qk_split_rms_norm_rope(
