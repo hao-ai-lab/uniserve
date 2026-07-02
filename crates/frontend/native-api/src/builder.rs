@@ -73,7 +73,7 @@ impl<'a> NativeRequestBuilder<'a> {
             return self.build_understanding(body);
         }
 
-        let image = self.resolve_image_params(body)?;
+        let image = self.resolve_image_params(body, mode)?;
         let negative_prompt = body.negative_prompt();
         let prompt_ids = self.profile.build_prompt_ids(&self.tokenizer, body, mode);
         let neg_prompt_ids = self
@@ -229,7 +229,7 @@ impl<'a> NativeRequestBuilder<'a> {
                 .build_negative_prompt_ids(&self.tokenizer, &negative_prompt),
             prompt_ids,
             sampling: self.resolve_sampling(body, GenMode::InterleaveUnd)?,
-            image: self.resolve_image_params(body)?,
+            image: self.resolve_image_params(body, GenMode::InterleaveUnd)?,
             mode: GenMode::InterleaveUnd,
             max_tokens: body.max_tokens.unwrap_or(defaults::DEFAULT_MAX_TOKENS),
             mm_items,
@@ -237,7 +237,11 @@ impl<'a> NativeRequestBuilder<'a> {
         })
     }
 
-    fn resolve_image_params(&self, body: &NativeGenerateBody) -> Result<ImageParams, BuildError> {
+    fn resolve_image_params(
+        &self,
+        body: &NativeGenerateBody,
+        mode: GenMode,
+    ) -> Result<ImageParams, BuildError> {
         let image_body = body.image();
         let defaults = &self.profile.image_defaults;
         let resolution = resolve_resolution(
@@ -292,7 +296,13 @@ impl<'a> NativeRequestBuilder<'a> {
             negative_prompt,
             max_images,
             image_prompts: image_body.prompts,
-            retain_images: image_body.retain_images.unwrap_or(true),
+            // Pure image mode ends at the commit: writing the finished image
+            // back into the text KV (a full image-length forward, twice with a
+            // CFG cache) feeds nothing. Retention stays the default wherever a
+            // decode can consume it; explicit client values are always honored.
+            retain_images: image_body
+                .retain_images
+                .unwrap_or(mode != GenMode::Image),
         })
     }
 
@@ -590,8 +600,29 @@ mod tests {
         assert_eq!(request.image.cfg_text_scale, 3.0);
         assert_eq!(request.image.max_images, 2);
         assert_eq!(request.image.seed, Some(7));
-        assert!(request.image.retain_images);
+        // Pure image mode ends at the commit, so KV retention defaults off
+        // (nothing decodes after it); an explicit client value still wins.
+        assert!(!request.image.retain_images);
         assert!(request.image.image_prompts.is_empty());
+    }
+
+    #[test]
+    fn image_mode_respects_explicit_retain_images() {
+        let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
+        let body = NativeGenerateBody {
+            prompt: "paint".into(),
+            mode: Some("image".into()),
+            image: Some(super::super::schema::NativeImageBody {
+                retain_images: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = NativeRequestBuilder::new(tok, &profile)
+            .build(&body)
+            .unwrap();
+        assert!(request.image.retain_images);
     }
 
     #[test]
