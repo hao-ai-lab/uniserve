@@ -67,7 +67,13 @@ from ...nn import (
 )
 from ...nn.decoder import Qwen3MLP, Modality, route_by_modality, tower_modality_coords
 from ...nn.linear import local_kv_head_count as _local_kv_head_count
-from ...nn.diffusion import ConvDecoder, FlowMatchingHead, TimestepEmbedder
+from ...nn.diffusion import (
+    ConvDecoder,
+    FlowMatchingHead,
+    ScheduleDirection,
+    ScheduleShiftDomain,
+    TimestepEmbedder,
+)
 from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
 from ...nn.quant import (
     QuantizationConfig,
@@ -1888,6 +1894,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         scratch=PerBranch(),
     )
     velocity_parameterization = "velocity"
+    # Denoise configuration consumed by the system TextImageDenoiseOps engine.
+    denoise_schedule_direction = ScheduleDirection.ASCENDING
+    denoise_schedule_shift_domain = ScheduleShiftDomain.SIGMA
+    denoise_cfg_recipe = CfgRecipe.ADDITIVE_DELTAS
 
     def __init__(
         self,
