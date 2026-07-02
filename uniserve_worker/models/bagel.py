@@ -61,7 +61,12 @@ from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.lora import MergeOnLoadLoRA
 from ..runtime.request_state import RequestState
-from ..runtime.residency import GenResidencySpec, KvCacheSpec, ResidencyManager
+from ..runtime.residency import (
+    GenResidencySpec,
+    KvCacheSpec,
+    ResidencyManager,
+    encoder_handle_from_mm_hash,
+)
 
 __all__ = [
     'LLMConfig',
@@ -777,16 +782,7 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     @staticmethod
     def _encoder_handle(mm_hash: Any) -> int:
-        """Derive a stable, nonzero 64-bit encoder handle from the image hash.
-
-        The handle must be deterministic from ``mm_hash`` and nonzero (0 means
-        no handle). A SplitMix64 finalizer spreads the hash across the u64 space.
-        """
-        x = int(mm_hash or 0) & 0xFFFFFFFFFFFFFFFF
-        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
-        x = (x ^ (x >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
-        x = (x ^ (x >> 31)) & 0xFFFFFFFFFFFFFFFF
-        return x or 0x9E3779B97F4A7C15
+        return encoder_handle_from_mm_hash(mm_hash)
 
     def run_encode(self, op):
         self._ensure_loaded()

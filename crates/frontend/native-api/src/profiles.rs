@@ -19,6 +19,10 @@ pub struct NativeControls {
     pub start_of_image: u32,
     pub end_of_image: u32,
     pub image_start_ids: Vec<u32>,
+    /// Tokenizer-resolved literal text of the image begin/end markers, for
+    /// profiles that carry input-image markers inside the prompt stream.
+    pub start_of_image_text: String,
+    pub end_of_image_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +86,7 @@ pub struct NativeModelProfile {
     supported_modes: Vec<GenMode>,
     prompts: NativePromptRecipes,
     understanding_system_prompt: String,
+    understanding_markers_in_prompt: bool,
 }
 
 impl Default for NativeModelProfile {
@@ -104,6 +109,24 @@ impl NativeModelProfile {
 
     pub fn understanding_system_prompt(&self) -> &str {
         &self.understanding_system_prompt
+    }
+
+    /// Whether understanding-mode input images ride as markers inside the
+    /// prompt token stream (the encode op fills the gap between them).
+    pub fn understanding_markers_in_prompt(&self) -> bool {
+        self.understanding_markers_in_prompt
+    }
+
+    /// Render the understanding-mode prompt through the profile's `understand`
+    /// recipe (used by marker-in-prompt profiles; the legacy path wraps text
+    /// with bos/eos directly).
+    pub fn build_understanding_prompt_ids(
+        &self,
+        tok: &DynTokenizer,
+        body: &NativeGenerateBody,
+        user_text: &str,
+    ) -> Vec<u32> {
+        render_prompt(tok, &self.controls, &self.prompts.understand, body, user_text)
     }
 
     pub fn build_prompt_ids(
@@ -212,6 +235,7 @@ fn profile_from_manifest(
             .collect(),
         prompts: manifest.prompts.into(),
         understanding_system_prompt: manifest.understanding_system_prompt,
+        understanding_markers_in_prompt: manifest.understanding.markers_in_prompt,
     }
 }
 
@@ -219,17 +243,31 @@ fn controls_from_manifest(
     spec: &ControlTokenManifest,
     tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
 ) -> NativeControls {
+    let (start_of_image, start_of_image_text) = first_token(tokenizer, &spec.start_of_image);
+    let (end_of_image, end_of_image_text) = first_token(tokenizer, &spec.end_of_image);
     NativeControls {
         bos: first_token_id(tokenizer, &spec.bos),
         eos: first_token_id(tokenizer, &spec.eos),
-        start_of_image: first_token_id(tokenizer, &spec.start_of_image),
-        end_of_image: first_token_id(tokenizer, &spec.end_of_image),
+        start_of_image,
+        end_of_image,
         image_start_ids: spec
             .image_start_text
             .as_ref()
             .and_then(|text| tokenizer.encode(text, false).ok())
             .unwrap_or_default(),
+        start_of_image_text,
+        end_of_image_text,
     }
+}
+
+fn first_token(
+    tokenizer: &dyn uniserve_text::tokenizer::Tokenizer,
+    candidates: &[String],
+) -> (u32, String) {
+    candidates
+        .iter()
+        .find_map(|token| tokenizer.token_to_id(token).map(|id| (id, token.clone())))
+        .unwrap_or((0, String::new()))
 }
 
 fn first_token_id(
@@ -385,6 +423,19 @@ struct ProfileManifest {
     output_filter: OutputFilterManifest,
     prompts: PromptManifestSet,
     understanding_system_prompt: String,
+    #[serde(default)]
+    understanding: UnderstandingManifest,
+}
+
+/// Understanding-mode (i2t) request-construction policy.
+#[derive(Debug, Deserialize, Default)]
+struct UnderstandingManifest {
+    /// When true the image begin/end markers are ordinary prompt tokens and
+    /// the encode op fills the gap between them (one shared temporal RoPE
+    /// index per image). When false (legacy default) the worker emits the
+    /// markers itself during the encode op.
+    #[serde(default)]
+    markers_in_prompt: bool,
 }
 
 #[derive(Debug, Deserialize)]

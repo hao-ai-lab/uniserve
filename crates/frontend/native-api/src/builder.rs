@@ -97,6 +97,9 @@ impl<'a> NativeRequestBuilder<'a> {
         &self,
         body: &NativeGenerateBody,
     ) -> Result<NativeGenerateRequest, BuildError> {
+        if self.profile.understanding_markers_in_prompt() {
+            return self.build_understanding_marked(body);
+        }
         let input_images = body.input_images();
         let first_image = input_images
             .first()
@@ -154,6 +157,82 @@ impl<'a> NativeRequestBuilder<'a> {
                 num_tokens: first_image.num_tokens.unwrap_or(0),
                 b64: first_image.b64.clone(),
             }],
+            stop_token_ids: body.stop_token_ids.clone(),
+        })
+    }
+
+    /// Understanding build for marker-in-prompt profiles: the image begin/end
+    /// markers are ordinary prompt tokens rendered through the profile's
+    /// `understand` recipe; each image's encode op fills the gap between its
+    /// markers at one shared temporal RoPE index. Image-generation parameters
+    /// resolve exactly like the other modes (profile defaults + user
+    /// overrides), so a model that decides to answer with an image uses its
+    /// normal generation policy.
+    fn build_understanding_marked(
+        &self,
+        body: &NativeGenerateBody,
+    ) -> Result<NativeGenerateRequest, BuildError> {
+        let input_images = body.input_images();
+        if input_images.is_empty() {
+            return Err(BuildError::new("understand mode requires an input image"));
+        }
+        let controls = &self.profile.controls;
+        if controls.start_of_image_text.is_empty() || controls.end_of_image_text.is_empty() {
+            return Err(BuildError::new(
+                "model profile declares no image marker tokens for understanding inputs",
+            ));
+        }
+        let mut user_text = String::new();
+        if input_images.len() == 1 {
+            user_text.push_str(&controls.start_of_image_text);
+            user_text.push_str(&controls.end_of_image_text);
+            user_text.push('\n');
+        } else {
+            for index in 0..input_images.len() {
+                user_text.push_str(&format!(
+                    "Image-{}:{}{}\n",
+                    index + 1,
+                    controls.start_of_image_text,
+                    controls.end_of_image_text
+                ));
+            }
+        }
+        user_text.push_str(&body.prompt);
+        let prompt_ids =
+            self.profile
+                .build_understanding_prompt_ids(&self.tokenizer, body, &user_text);
+        // The markers precede any user text, so the first N occurrences of the
+        // end marker are ours; each image's patch block replaces the gap ahead
+        // of its end marker.
+        let end_id = controls.end_of_image;
+        let mut marker_positions = prompt_ids
+            .iter()
+            .enumerate()
+            .filter(|&(_, &token)| token == end_id)
+            .map(|(index, _)| index as u32);
+        let mut mm_items = Vec::with_capacity(input_images.len());
+        for image in &input_images {
+            let position = marker_positions.next().ok_or_else(|| {
+                BuildError::new("understanding prompt lost its input-image markers")
+            })?;
+            mm_items.push(MmItem {
+                hash: fnv1a(image.b64.as_bytes()),
+                position,
+                num_tokens: image.num_tokens.unwrap_or(0),
+                b64: image.b64.clone(),
+            });
+        }
+        let negative_prompt = body.negative_prompt();
+        Ok(NativeGenerateRequest {
+            neg_prompt_ids: self
+                .profile
+                .build_negative_prompt_ids(&self.tokenizer, &negative_prompt),
+            prompt_ids,
+            sampling: self.resolve_sampling(body, GenMode::InterleaveUnd)?,
+            image: self.resolve_image_params(body)?,
+            mode: GenMode::InterleaveUnd,
+            max_tokens: body.max_tokens.unwrap_or(defaults::DEFAULT_MAX_TOKENS),
+            mm_items,
             stop_token_ids: body.stop_token_ids.clone(),
         })
     }
@@ -336,7 +415,26 @@ mod tests {
             text: &str,
             _add_special_tokens: bool,
         ) -> uniserve_text::tokenizer::Result<Vec<u32>> {
-            Ok(text.bytes().map(u32::from).collect())
+            // Added tokens encode atomically (as the real tokenizer does);
+            // everything else byte-encodes.
+            const MARKERS: [(&str, u32); 2] = [("<img>", 151670), ("</img>", 151671)];
+            let mut ids = Vec::new();
+            let mut rest = text;
+            'outer: while !rest.is_empty() {
+                for (marker, id) in MARKERS {
+                    if let Some(stripped) = rest.strip_prefix(marker) {
+                        ids.push(id);
+                        rest = stripped;
+                        continue 'outer;
+                    }
+                }
+                let mut chars = rest.chars();
+                let ch = chars.next().expect("non-empty");
+                let mut buf = [0u8; 4];
+                ids.extend(ch.encode_utf8(&mut buf).bytes().map(u32::from));
+                rest = chars.as_str();
+            }
+            Ok(ids)
         }
 
         fn decode(
@@ -386,6 +484,65 @@ mod tests {
         assert!(request.image.retain_images);
         assert!(request.image.image_prompts.is_empty());
         assert_eq!(request.max_tokens, 32768);
+    }
+
+    #[test]
+    fn sensenova_understand_builds_marked_mm_items() {
+        let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
+        let body = NativeGenerateBody {
+            prompt: "Describe this image in detail.".into(),
+            mode: Some("understand".into()),
+            input_image_b64: Some("aGVsbG8=".into()),
+            ..Default::default()
+        };
+        let request = NativeRequestBuilder::new(tok, &profile)
+            .build(&body)
+            .unwrap();
+        assert_eq!(request.mode, GenMode::InterleaveUnd);
+        assert_eq!(request.mm_items.len(), 1);
+        let position = request.mm_items[0].position as usize;
+        // The encode gap sits exactly between the in-prompt markers.
+        assert_eq!(request.prompt_ids[position], 151671, "position is the </img> token");
+        assert_eq!(request.prompt_ids[position - 1], 151670, "preceded by <img>");
+        // No CFG branch for plain understanding: negative ids stay empty.
+        assert!(request.neg_prompt_ids.is_empty());
+        // Understanding image params resolve like the other modes (profile bucket).
+        assert_eq!(request.image.width, 2048);
+        assert_eq!(request.image.height, 1152);
+    }
+
+    #[test]
+    fn sensenova_understand_multi_image_positions_are_ordered() {
+        let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
+        let body = NativeGenerateBody {
+            prompt: "Compare the two images.".into(),
+            mode: Some("understand".into()),
+            input_images: vec![
+                super::super::schema::NativeInputImage {
+                    b64: "aQ==".into(),
+                    position: None,
+                    num_tokens: None,
+                },
+                super::super::schema::NativeInputImage {
+                    b64: "ag==".into(),
+                    position: None,
+                    num_tokens: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let request = NativeRequestBuilder::new(tok, &profile)
+            .build(&body)
+            .unwrap();
+        assert_eq!(request.mm_items.len(), 2);
+        let first = request.mm_items[0].position as usize;
+        let second = request.mm_items[1].position as usize;
+        assert!(first < second);
+        assert_eq!(request.prompt_ids[first], 151671);
+        assert_eq!(request.prompt_ids[second], 151671);
+        assert_ne!(request.mm_items[0].hash, request.mm_items[1].hash);
     }
 
     #[test]

@@ -87,7 +87,13 @@ from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
 from ...runtime.paged_text_cache import PagedTextCache, stage_paged_text_cache_prefix
 from ...runtime.request_state import RequestState as RunnerRequestState
-from ...runtime.residency import GenResidencySpec, KvCacheSpec, ResidencyManager
+from ...processors.registry import get_processor_for_model
+from ...runtime.residency import (
+    GenResidencySpec,
+    KvCacheSpec,
+    ResidencyManager,
+    encoder_handle_from_mm_hash,
+)
 from ...runtime.tower_handoff import (
     ConditioningSnapshot,
     DataPlaneTowerHandoff,
@@ -96,6 +102,7 @@ from ...runtime.tower_handoff import (
     TowerHandoff,
 )
 from ...runtime.transfer import Locator
+from ...execution.input_image_ingest import InputImageIngestDriver
 from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
 from ...execution.interleaved_image_denoise import (
     ImageState,
@@ -1885,8 +1892,15 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
     architectures = ("NEOChatModel", "neo_chat", "neo-unify", "neo_unify")
-    supported_ops = ("prefill_und", "decode_und", "denoise_gen", "commit_gen", "commit_writeback")
-    supported_controls: tuple[str, ...] = ()
+    supported_ops = (
+        "prefill_und",
+        "decode_und",
+        "denoise_gen",
+        "commit_gen",
+        "commit_writeback",
+        "vit_encode",
+    )
+    supported_controls: tuple[str, ...] = ("free_encoder",)
     adapter_mode = "none"
     resource_plan = ResourcePlan(
         kv_block=KvBlockResourcePolicy.PER_BLOCK,
@@ -2714,6 +2728,76 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             return self._commit_driver().commit_writeback(op)
         return self._commit_driver().commit_generated_image(op)
 
+    def _ingest_driver(self) -> InputImageIngestDriver:
+        driver = getattr(self, "_shared_ingest_driver", None)
+        if driver is None:
+            driver = InputImageIngestDriver(self)
+            self._shared_ingest_driver = driver
+        return driver
+
+    def _understanding_processor(self) -> Any:
+        processor = getattr(self, "_shared_understanding_processor", None)
+        if processor is None:
+            processor = get_processor_for_model(type(self))
+            if processor is None:
+                raise capability_mismatch(
+                    "no multimodal processor is registered for SenseNova understanding inputs"
+                )
+            self._shared_understanding_processor = processor
+        return processor
+
+    def encode_image(self, pixels=None, grid=None, *, op: dict[str, Any]) -> dict[str, Any]:
+        """Ingest an external understanding image (``vit_encode``).
+
+        The engine hands the image bytes plus the shared temporal RoPE index
+        (``cond_pos``); the begin/end markers are ordinary prompt tokens, so
+        this op appends only the patch block into the conditional text cache
+        and reports how many vision tokens it added.
+        """
+        del pixels, grid
+        if self.model is None:
+            raise RuntimeError("SenseNova model weights are not loaded")
+        op = dict(op)
+        req_id = int(op["req_id"])
+        image_b64 = op.get("image_b64")
+        if not image_b64:
+            raise invalid_descriptor("vit_encode requires image_b64 input bytes")
+        cond_pos = op.get("cond_pos")
+        if cond_pos is None:
+            raise invalid_descriptor("vit_encode requires the shared temporal index (cond_pos)")
+
+        st = self._state(op)
+        text_driver = self._text_driver()
+        text_driver.extend_cache_blocks(st.cond, op)
+        text_driver.ensure_host_cache(st.cond)
+
+        processor = self._understanding_processor()
+        image = processor.decode_image_b64(str(image_b64))
+        image_hw = [int(image.height), int(image.width)]
+        flattened, grid_hw = processor.understanding_patches(image)
+        flattened = flattened.to(device=self.device, dtype=self.model.dtype)
+
+        num_tokens = self._ingest_driver().ingest_understanding_image(
+            st.cond,
+            flattened,
+            grid_hw,
+            t_index=int(cond_pos),
+        )
+        handle = encoder_handle_from_mm_hash(op.get("mm_hash"))
+        self.residency.encoder.put(handle, {"kind": "vit_encode", "num_tokens": num_tokens})
+        return {
+            "req_id": req_id,
+            "encoder_handle": handle,
+            "num_tokens": num_tokens,
+            "image_hw": image_hw,
+        }
+
+    def free_encoder(self, handles: Any) -> None:
+        # Encoder-output residency is system-owned: the handle store lives on
+        # the ResidencyManager, not the model.
+        for handle in handles or []:
+            self.residency.encoder.pop(int(handle))
+
     def allocate_scratch_blocks(self, count: int) -> list[int]:
         if self.scratch_pool is None:
             raise RuntimeError("SenseNova scratch KV pool is not initialized")
@@ -2950,10 +3034,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         if self.model is None:
             raise RuntimeError("SenseNova model weights are not loaded")
         if isinstance(input_ids, UniForwardBatch):
-            batch = input_ids
-            if batch.mode == ForwardMode.ENCODE:
-                return [{"req_id": req_id} for req_id in batch.as_encode().req_ids]
-            raise RuntimeError(f"SenseNova direct batch forward is unsupported for {batch.mode}")
+            raise RuntimeError(
+                f"SenseNova direct batch forward is unsupported for {input_ids.mode}"
+            )
         del positions, kv, mode, input_embeds, request_state
         if op is None:
             raise RuntimeError("SenseNova text forward requires the source op")
