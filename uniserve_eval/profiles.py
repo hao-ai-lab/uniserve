@@ -1,6 +1,6 @@
-"""Profile loading and resolution for the e2e driver.
+"""Profile loading and resolution for the serving evaluation driver.
 
-A profiles file (default ``uniserve_e2e/profiles.json``) declares three
+A profiles file (default ``uniserve_eval/profiles.json``) declares three
 sections:
 
   servers   — how to launch one serving backend (UniServe ``serve_args`` or an

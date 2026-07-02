@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_e2e import compare
+from uniserve_eval import compare
 
 pytestmark = pytest.mark.unit
 

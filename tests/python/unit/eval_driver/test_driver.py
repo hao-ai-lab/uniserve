@@ -5,9 +5,9 @@ import json
 
 import pytest
 
-import uniserve_e2e.backends
-import uniserve_e2e.verify
-from uniserve_e2e import cli
+import uniserve_eval.backends
+import uniserve_eval.verify
+from uniserve_eval import cli
 
 pytestmark = pytest.mark.unit
 
@@ -61,9 +61,9 @@ def test_run_suite_can_manage_verify_workload_servers(tmp_path, monkeypatch):
     def fake_verify(args):
         events.append(("verify", args.workload))
 
-    monkeypatch.setattr(uniserve_e2e.backends, "clean", fake_clean)
-    monkeypatch.setattr(uniserve_e2e.backends, "launch", fake_launch)
-    monkeypatch.setattr(uniserve_e2e.verify, "verify", fake_verify)
+    monkeypatch.setattr(uniserve_eval.backends, "clean", fake_clean)
+    monkeypatch.setattr(uniserve_eval.backends, "launch", fake_launch)
+    monkeypatch.setattr(uniserve_eval.verify, "verify", fake_verify)
 
     cli.run_suite(
         argparse.Namespace(

@@ -2,7 +2,7 @@
 
 Historically three near-identical "read a UniServe SSE stream into a list of
 event dicts" parsers existed (``tests/python/e2e/http_helpers.post_sse``,
-``uniserve_e2e.harness.runner.BenchmarkRunner._post_sse`` and
+``uniserve_eval.harness.runner.BenchmarkRunner._post_sse`` and
 ``mixed_batch_benchmark.read_sse``). They each reimplemented the same
 ``data:`` framing/JSON-decode logic and slowly diverged. This module is the one
 place that logic lives; every reader routes its raw lines through

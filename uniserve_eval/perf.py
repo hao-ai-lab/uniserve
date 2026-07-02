@@ -1,6 +1,6 @@
 """Perf points through the measurement harness (workload type ``perf``).
 
-Runs one operating point via ``uniserve_e2e.harness`` against the workload's
+Runs one operating point via ``uniserve_eval.harness`` against the workload's
 server and gates on optional ``expect_metrics`` bounds: dotted paths into the
 summary's ``metrics`` tree with ``min``/``max`` floors and ceilings. Any failed
 request also fails the workload.
@@ -44,7 +44,7 @@ def perf(args: argparse.Namespace) -> None:
     cmd = [
         str(ROOT / config.get("python", ".venv/bin/python")),
         "-m",
-        "uniserve_e2e.harness.cli",
+        "uniserve_eval.harness.cli",
         "--base-url",
         f"http://{server.get('host', '127.0.0.1')}:{server['port']}",
         "--task",

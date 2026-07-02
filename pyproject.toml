@@ -56,16 +56,16 @@ gpu = [
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"
-uniserve-e2e = "uniserve_e2e.cli:main"
+uniserve-eval = "uniserve_eval.cli:main"
 
 [tool.setuptools.packages.find]
 # Optional kernel provider packs are packaged independently (for example
 # `uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
 # a missing provider install.
-include = ["uniserve_worker*", "uniserve_e2e*"]
+include = ["uniserve_worker*", "uniserve_eval*"]
 
 [tool.setuptools.package-data]
-uniserve_e2e = ["profiles.json", "data/*.jsonl", "harness/schemas/*.json"]
+uniserve_eval = ["profiles.json", "data/*.jsonl", "harness/schemas/*.json"]
 
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
@@ -110,8 +110,8 @@ ignore = ["E501"]
 python_version = "3.11"
 # Source of truth for the type-check scope. Must match the explicit paths
 # passed by CI (.github/workflows/ci.yml) and the justfile `lint` target
-# (`mypy uniserve_worker uniserve_e2e`) so bare/editor invocations agree with CI.
-files = ["uniserve_worker", "uniserve_e2e"]
+# (`mypy uniserve_worker uniserve_eval`) so bare/editor invocations agree with CI.
+files = ["uniserve_worker", "uniserve_eval"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -123,13 +123,13 @@ ignore_missing_imports = true
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Keep aligned with [tool.mypy].files and the CI/justfile type-check scope.
-include = ["uniserve_worker", "uniserve_e2e"]
+include = ["uniserve_worker", "uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"
 
 [tool.coverage.run]
 branch = true
-source = ["uniserve_worker", "uniserve_e2e"]
+source = ["uniserve_worker", "uniserve_eval"]
 
 [tool.coverage.report]
 show_missing = true
