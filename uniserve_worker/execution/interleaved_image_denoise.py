@@ -1,4 +1,22 @@
-"""Engine-owned helpers for interleaved text and image generation models."""
+"""System-owned denoise engine for interleaved text-and-image generation.
+
+Contract: this engine drives pixel-space ``(1, 3, H, W)`` flow-match latents
+(patchified via the owner's geometry hooks) whose CFG branches live in paged
+text-KV caches (scratch-pool ``PagedTextCache`` rows with 3-axis t/h/w rope
+indexes), with per-request latent residency in the system ``LatentPool``.
+Models that match this contract plug in through ``TextImageDenoiseOwner``;
+schedule direction/shift-domain and the CFG recipe are owner-supplied
+configuration.
+
+Non-goal: unified models whose denoise substrate differs by mechanism rather
+than configuration — e.g. transient in-RAM KV branches driven through a
+segment API (no paged/scratch caches, no block tables), VAE patch-token
+latents held on the request state (no ``LatentPool``), scalar rope positions,
+and a VAE-decode commit. Such models already share the ``DenoiseDriver`` /
+``nn.diffusion`` schedule and CFG machinery directly; adopting this engine
+would mean rewriting their cache substrate, not configuring it. See
+``docs/rfcs/interleaved-image-denoise-lift.md`` for the named analysis.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,32 +25,25 @@ from typing import TYPE_CHECKING, Any, Protocol, Sequence
 import torch
 
 import uniserve_worker.ops as ops
-from ...contracts.forward_context import get_forward_context
-from ...execution.denoise_driver import TextImageDenoiseStep
-from ...execution.interleaved_text_stepper import (
-    InterleavedModelOwner,
-    InterleavedTextCacheDriver,
-    TextCache,
-)
-from ...foundation.errors import invalid_descriptor, model_execution_error
-from ...nn.diffusion import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain, init_latent
-from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
-from ...runtime.masks import build_commit_attention_mask
-from ...nn.vision import build_abs_positions_from_grid_hw, patchify_batch, unpatchify_batch
-from ...runtime.image_params import (
+from ..contracts.forward_context import get_forward_context
+from ..foundation.errors import invalid_descriptor, model_execution_error
+from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain, init_latent
+from ..nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
+from ..nn.vision import build_abs_positions_from_grid_hw, patchify_batch, unpatchify_batch
+from ..runtime.image_params import (
     TextImageGenerationParams as _ImageParams,
     parse_text_image_generation_params,
 )
-from ...runtime.image_utils import tensor_to_png_b64
-from ...runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
+from ..runtime.image_utils import tensor_to_png_b64
+from ..runtime.masks import build_commit_attention_mask
+from ..runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
+from .denoise_driver import TextImageDenoiseStep
+from .interleaved_text_stepper import InterleavedModelOwner, TextCache
 
 __all__ = [
-    'TextCache',
     'ImageState',
     'DenoiseRow',
     'InterleavedImageRequestState',
-    'InterleavedModelOwner',
-    'InterleavedTextCacheDriver',
     'TextImageDenoiseOwner',
     'TextImageDenoiseOps',
     'GeneratedImageCommitDriver',
@@ -418,7 +429,7 @@ class TextImageDenoiseOps:
             st.image_state = self._init_image_state(st, op)
         img = st.image_state
         step_i = int(op.get("timestep_idx") or 0)
-        ctx.record_component_elapsed("sensenova_denoise_prepare_state", start)
+        ctx.record_component_elapsed("interleaved_denoise_prepare_state", start)
         # Gen-tower feature extraction and timestep embedding run on the gen
         # coordinate's device (the gen modules are Pinned there); the tower
         # transport, not a dedicated stream, orders the und->gen handoff.
@@ -435,14 +446,14 @@ class TextImageDenoiseOps:
             device=device,
             dtype=self.interleaved_image_gen_feature_dtype(),
         )
-        ctx.record_component_elapsed("sensenova_denoise_patchify", start)
+        ctx.record_component_elapsed("interleaved_denoise_patchify", start)
         start = ctx.component_timer_start()
         image_embeds = self.interleaved_image_features(
             image_input.view(1 * img.grid_h * img.grid_w, -1),
             gen_model=True,
             grid_hw=img.grid_hw,
         ).view(1, img.token_h * img.token_w, -1)
-        ctx.record_component_elapsed("sensenova_denoise_vision_feature", start)
+        ctx.record_component_elapsed("interleaved_denoise_vision_feature", start)
         start = ctx.component_timer_start()
         t_expanded = t.expand(img.token_h * img.token_w)
         timestep_embeddings = self.interleaved_image_timestep_embeddings(t_expanded).view(
@@ -458,7 +469,7 @@ class TextImageDenoiseOps:
         if img.noise_scale_embedding is not None:
             timestep_embeddings += img.noise_scale_embedding
         image_embeds = image_embeds + timestep_embeddings
-        ctx.record_component_elapsed("sensenova_denoise_timestep_embed", start)
+        ctx.record_component_elapsed("interleaved_denoise_timestep_embed", start)
         total = int(img.schedule.num_steps)
         return TextImageDenoiseStep(
             req_id=int(req_id),

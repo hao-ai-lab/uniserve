@@ -278,10 +278,10 @@ def test_models_tree_matches_target_file_set():
         "qwen3.py",
         "bagel.py",
     }
-    # SenseNova-U1 is its own package (model + config + interleaved_image moved
-    # out of the shared contract layer).
+    # SenseNova-U1 is its own package; the interleaved image denoise/commit
+    # orchestration is system-owned under execution/, not model-local.
     sensenova = {p.name for p in (models / "sensenova").glob("*.py")}
-    assert sensenova == {"__init__.py", "model.py", "config.py", "interleaved_image.py"}
+    assert sensenova == {"__init__.py", "model.py", "config.py"}
 
 
 def test_interleaved_text_stepper_is_system_owned():
@@ -323,7 +323,7 @@ def test_interleaved_text_execution_uses_owner_adapter_not_model_backbone():
 
 
 def test_generated_image_commit_driver_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "models" / "sensenova" / "interleaved_image.py").read_text(
+    source = (WORKER / "execution" / "interleaved_image_denoise.py").read_text(
         encoding="utf-8"
     )
     commit_driver_source = source[source.index("class GeneratedImageCommitDriver") :]
@@ -331,7 +331,7 @@ def test_generated_image_commit_driver_uses_owner_adapter_not_model_backbone():
 
 
 def test_interleaved_image_mixin_uses_owner_adapter_for_t2i_model_primitives():
-    source = (WORKER / "models" / "sensenova" / "interleaved_image.py").read_text(
+    source = (WORKER / "execution" / "interleaved_image_denoise.py").read_text(
         encoding="utf-8"
     )
     forbidden = ("self.model.",)
