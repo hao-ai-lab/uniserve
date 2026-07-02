@@ -5,14 +5,15 @@ import json
 
 import pytest
 
-import scripts.e2e as e2e
-
+import uniserve_e2e.backends
+import uniserve_e2e.verify
+from uniserve_e2e import cli
 
 pytestmark = pytest.mark.unit
 
 
-def test_run_suite_can_manage_generate_workload_servers(tmp_path, monkeypatch):
-    config_path = tmp_path / "e2e_config.json"
+def test_run_suite_can_manage_verify_workload_servers(tmp_path, monkeypatch):
+    config_path = tmp_path / "profiles.json"
     config_path.write_text(
         json.dumps(
             {
@@ -32,13 +33,13 @@ def test_run_suite_can_manage_generate_workload_servers(tmp_path, monkeypatch):
                 },
                 "workloads": {
                     "off": {
-                        "type": "generate",
+                        "type": "verify",
                         "server": "off-server",
                         "manage_server": True,
                         "payload": {},
                     },
                     "on": {
-                        "type": "generate",
+                        "type": "verify",
                         "server": "on-server",
                         "manage_server": True,
                         "payload": {},
@@ -57,14 +58,14 @@ def test_run_suite_can_manage_generate_workload_servers(tmp_path, monkeypatch):
     def fake_launch(args):
         events.append(("launch", args.server))
 
-    def fake_generate(args):
-        events.append(("generate", args.workload))
+    def fake_verify(args):
+        events.append(("verify", args.workload))
 
-    monkeypatch.setattr(e2e, "clean", fake_clean)
-    monkeypatch.setattr(e2e, "launch", fake_launch)
-    monkeypatch.setattr(e2e, "generate", fake_generate)
+    monkeypatch.setattr(uniserve_e2e.backends, "clean", fake_clean)
+    monkeypatch.setattr(uniserve_e2e.backends, "launch", fake_launch)
+    monkeypatch.setattr(uniserve_e2e.verify, "verify", fake_verify)
 
-    e2e.run_suite(
+    cli.run_suite(
         argparse.Namespace(
             config=config_path,
             suite="fusion",
@@ -78,10 +79,10 @@ def test_run_suite_can_manage_generate_workload_servers(tmp_path, monkeypatch):
     assert events == [
         ("clean", "off-server"),
         ("launch", "off-server"),
-        ("generate", "off"),
+        ("verify", "off"),
         ("clean", "off-server"),
         ("clean", "on-server"),
         ("launch", "on-server"),
-        ("generate", "on"),
+        ("verify", "on"),
         ("clean", "on-server"),
     ]

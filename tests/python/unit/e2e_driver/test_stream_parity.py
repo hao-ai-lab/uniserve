@@ -17,8 +17,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from benchmarks.serving.uniserve_bench.metrics import summarize_stream
-from benchmarks.serving.uniserve_bench.metrics.common import RequestRecord
+from uniserve_e2e.harness.metrics import summarize_stream
+from uniserve_e2e.harness.metrics.common import RequestRecord
 
 pytestmark = [pytest.mark.unit]
 
