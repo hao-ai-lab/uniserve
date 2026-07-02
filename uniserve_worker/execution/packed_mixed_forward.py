@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import torch
 
 from ..contracts.batches import UniForwardBatch
 from ..contracts.forward_mode import ForwardMode
-from ..foundation.errors import capability_mismatch
-from ..runtime.paged_text_cache import PagedTextCache
+from ..contracts.outputs import TextTokenOutput
+from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..nn import Sampler
+from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from .denoise_driver import TextImageDenoiseStep, combine_text_image_velocity, text_image_branches
 from .forward_stream import ForwardPagedKVSegment, ForwardPagedKVView, ForwardStreamBuilder
 
@@ -25,9 +27,6 @@ def run_packed_mixed_forward(
 ) -> bool:
     if owner.model is None or not denoise_steps:
         return False
-    language = owner.model.language_model
-    decoder = language.model
-    embed = language.get_input_embeddings()
     builder = ForwardStreamBuilder()
     kv_segments: list[ForwardPagedKVSegment] = []
     embed_chunks: list[torch.Tensor] = []
@@ -69,7 +68,7 @@ def run_packed_mixed_forward(
                 if not owner._same_kv_pool(pool, first_pool):
                     return False
                 first_pool = pool if first_pool is None else first_pool
-                ids = owner._forward_text_input_ids(
+                ids = _forward_text_input_ids(
                     op,
                     req_id=req_id,
                     tokens=tokens,
@@ -82,8 +81,8 @@ def run_packed_mixed_forward(
                     relay_token = getattr(relay, "token_id", None)
                     if relay_token is not None:
                         last_input_token = int(relay_token)
-                embeds = embed(ids).reshape(q_len, -1)
-                segment_start = owner._append_packed_chunk(
+                embeds = owner.packed_text_embeddings(ids).reshape(q_len, -1)
+                segment_start = _append_packed_chunk(
                     embed_chunks,
                     indicators,
                     embeds,
@@ -129,7 +128,7 @@ def run_packed_mixed_forward(
                     q_len = int(step.extra["image_embeds"].shape[1])
                     if indexes is None or tuple(indexes.shape) != (3, q_len):
                         return False
-                    segment_start = owner._append_packed_chunk(
+                    segment_start = _append_packed_chunk(
                         embed_chunks,
                         indicators,
                         step.extra["image_embeds"].reshape(q_len, -1),
@@ -155,7 +154,7 @@ def run_packed_mixed_forward(
             return False
         forward_stream = builder.build(device=device)
         kv_view = ForwardPagedKVView(first_pool, kv_segments)
-        hidden = decoder.forward_packed_visible(
+        hidden = owner.packed_decoder_forward(
             torch.cat(embed_chunks, dim=0),
             image_gen_indicators=torch.cat(indicators, dim=0),
             indexes=forward_stream.indexes,
@@ -173,22 +172,23 @@ def run_packed_mixed_forward(
         ) in text_result_slots:
             op = batch.ops[row_index]
             req_id = int(op["req_id"])
-            logits = language.lm_head(hidden[start:start + q_len].unsqueeze(0))
-            results[row_index] = owner._sample_text_logits(req_id, logits, request_states)
+            logits = owner.packed_text_logits(hidden[start:start + q_len].unsqueeze(0))
+            results[row_index] = _sample_text_logits(req_id, logits, request_states)
             if staged_cache is not persistent_cache:
-                owner._copy_cache_span(
+                copy_paged_text_cache_span(
                     staged_cache,
                     persistent_cache,
                     start=base_len,
                     length=q_len,
                     num_layers=owner.num_layers,
+                    missing_message="forward text K/V span is missing from staged cache",
                 )
             state = owner.interleaved_image_state(req_id)
             position_id = int((op.get("pos_range") or [0, state.cond.t_index + q_len])[1])
             state.cond.t_index = position_id - 1
             state.cond.last_logits = logits
             state.cond.last_token_id = int(last_input_token)
-            owner._store_forward_sampled_token_relay(
+            _store_forward_sampled_token_relay(
                 request_states.get(req_id),
                 token_id=int(results[row_index].sampled_token_id),
                 device=device,
@@ -200,7 +200,7 @@ def run_packed_mixed_forward(
         for row_index, step, start, q_len in denoise_result_slots:
             img = step.extra["img"]
             branch = text_image_branches(step)[len(branch_velocities.setdefault(row_index, {}))]
-            velocity = owner.model._t2i_hidden_to_velocity(
+            velocity = owner.packed_hidden_to_velocity(
                 hidden[start:start + q_len].unsqueeze(0),
                 step.t,
                 step.latent,
@@ -228,3 +228,83 @@ def run_packed_mixed_forward(
     finally:
         for staged in staged_text_caches:
             owner._release_scratch_cache(staged)
+
+
+def _append_packed_chunk(
+    embed_chunks: list[torch.Tensor],
+    indicators: list[torch.Tensor],
+    embeds: torch.Tensor,
+    *,
+    image_tokens: bool,
+    device: torch.device,
+) -> int:
+    start = sum(chunk.shape[0] for chunk in embed_chunks)
+    q_len = int(embeds.shape[0])
+    embed_chunks.append(embeds)
+    indicators.append(torch.full((q_len,), bool(image_tokens), dtype=torch.bool, device=device))
+    return start
+
+
+def _sample_text_logits(req_id: int, logits: torch.Tensor, request_states: Any) -> TextTokenOutput:
+    state = request_states.get(int(req_id))
+    sampling = dict(state.sampling or {})
+    token, logprob, top_logprobs = Sampler().sample(
+        logits.reshape(-1, logits.shape[-1])[-1],
+        sampling,
+        n_logprobs=int(sampling.get("n_logprobs", 0) or 0),
+    )
+    return TextTokenOutput(
+        req_id=int(req_id),
+        sampled_token_id=int(token),
+        sampled_logprob=logprob,
+        top_logprobs=top_logprobs,
+    )
+
+
+def _store_forward_sampled_token_relay(
+    state: Any,
+    *,
+    token_id: int,
+    device: torch.device,
+    position_id: int | None = None,
+) -> None:
+    relay = getattr(state, "decode_relay", None)
+    if relay is None:
+        return
+    token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+    if token_tensor.device.type == "cuda":
+        token_tensor.record_stream(torch.cuda.current_stream(token_tensor.device))
+    relay.token_id = int(token_id)
+    relay.token_tensor = token_tensor
+    if position_id is not None:
+        position_tensor = torch.tensor([int(position_id)], dtype=torch.long, device=device)
+        if position_tensor.device.type == "cuda":
+            position_tensor.record_stream(torch.cuda.current_stream(position_tensor.device))
+        relay.position_id = int(position_id)
+        relay.position_tensor = position_tensor
+
+
+def _forward_text_input_ids(
+    op: Mapping[str, Any],
+    *,
+    req_id: int,
+    tokens: Sequence[int],
+    request_states: Any,
+    device: torch.device,
+) -> torch.Tensor:
+    source = str(op.get("token_source") or "wire")
+    if source not in {"wire", "last_sampled"}:
+        raise invalid_descriptor(f"unsupported text token_source {source!r}")
+    if source == "wire":
+        return torch.tensor(list(tokens), dtype=torch.long, device=device)
+    if len(tokens) != 1:
+        raise invalid_descriptor(
+            "decode op requested token_source='last_sampled' but does not have exactly one token"
+        )
+    state = request_states.get(int(req_id))
+    relay = getattr(getattr(state, "decode_relay", None), "token_tensor", None)
+    if not isinstance(relay, torch.Tensor) or relay.dtype != torch.long or relay.device != device:
+        raise invalid_descriptor(
+            "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
+        )
+    return relay.reshape(1)

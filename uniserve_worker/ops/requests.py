@@ -58,6 +58,11 @@ class QKNormRopeReq:
     position_ids: torch.Tensor | None = None
     unsqueeze_dim: int = 1
     axis_dims: tuple[int, ...] | None = None
+    # Caller-declared axes whose positions are all zero for every token in this
+    # call (a zero-angle rotation is the identity). A pure optimization hint:
+    # providers may fuse or skip those axes' rotations; ignoring it is always
+    # correct because the supplied cos/sin tables already encode the identity.
+    identity_axes: tuple[int, ...] | None = None
     quant: Any | None = None
     adapters: Any | None = None
 

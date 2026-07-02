@@ -24,8 +24,10 @@ _DECODE_GRAPH_INPUT_BUFFER_POOL_LOCK = threading.Lock()
 # reliably clears first-call side effects.
 _CAPTURE_WARMUP_ITERS = 2
 
-# Default metric prefix; model runners may override (e.g. ``qwen3_``).
-_DEFAULT_METRIC_PREFIX = "qwen3_"
+# Default metric prefix; runners may override. Every production text runner
+# passes ``text_`` explicitly; the default matches so component metrics land in
+# one namespace regardless of construction site.
+_DEFAULT_METRIC_PREFIX = "text_"
 
 def maybe_weak_ref_cuda_graph_tensor(tensor: Any) -> Any:
     if not isinstance(tensor, torch.Tensor):

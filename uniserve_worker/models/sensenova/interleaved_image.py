@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, Sequence
 
 import torch
@@ -20,12 +19,14 @@ from ...nn.diffusion import FlowMatchSchedule, ScheduleDirection, ScheduleShiftD
 from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
 from ...runtime.masks import build_commit_attention_mask
 from ...nn.vision import build_abs_positions_from_grid_hw, patchify_batch, unpatchify_batch
-from ...runtime.image_params import required_image_height, required_image_width
+from ...runtime.image_params import (
+    TextImageGenerationParams as _ImageParams,
+    parse_text_image_generation_params,
+)
 from ...runtime.image_utils import tensor_to_png_b64
 from ...runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
 __all__ = [
-    'NoiseScaleMode',
     'TextCache',
     'ImageState',
     'DenoiseRow',
@@ -43,34 +44,6 @@ if TYPE_CHECKING:
 # ImageNet channel statistics for re-normalizing a generated image before ViT re-encoding.
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
-
-# Resolution-aware noise scaling raises the per-token sequence-length ratio to
-# this power (a square root: noise std scales with sqrt of the token count
-# relative to the reference sequence length). ``dynamic_sqrt`` then applies the
-# same square-root exponent a second time to further damp the resolution term.
-_NOISE_RESOLUTION_EXPONENT = 0.5
-_NOISE_DYNAMIC_SQRT_EXPONENT = 0.5
-
-
-class NoiseScaleMode(str, Enum):
-    """Initial-noise scaling convention.
-
-    Values match ``model.noise_scale_mode`` string config. ``FIXED`` leaves
-    ``noise_scale`` unchanged; resolution-aware modes scale it by token-count ratio.
-    """
-
-    FIXED = "fixed"
-    RESOLUTION = "resolution"
-    DYNAMIC = "dynamic"
-    DYNAMIC_SQRT = "dynamic_sqrt"
-
-
-# Resolution-aware modes apply sqrt sequence-length scaling; the others leave the
-# base noise scale unchanged. Unknown string modes are treated like FIXED.
-_NOISE_RESOLUTION_MODES = frozenset(
-    {NoiseScaleMode.RESOLUTION, NoiseScaleMode.DYNAMIC, NoiseScaleMode.DYNAMIC_SQRT}
-)
-
 
 @dataclass
 class ImageState:
@@ -117,40 +90,6 @@ class ImageState:
 
 
 @dataclass
-class _ImageParams:
-    """Parsed per-request image-generation parameters.
-
-    Bundles the scalar fields read out of ``InterleavedImageRequestState.image``
-    so the parse step can be separated from cache setup, index construction and
-    latent initialization without threading a dozen locals between them.
-    """
-
-    width: int
-    height: int
-    steps: int
-    cfg_text: float
-    cfg_img: float
-    cfg_interval: tuple[float, float]
-    cfg_norm: str
-    cfg_renorm_min: float
-    timestep_shift: float
-    retain_images: bool
-    seed: int | None
-
-
-def _image_param(ip: dict, key: str, default: Any) -> Any:
-    value = ip.get(key, default)
-    return default if value is None else value
-
-
-def _required_image_param(ip: dict, key: str) -> Any:
-    value = ip.get(key)
-    if value is None:
-        raise invalid_descriptor(f"image.{key} is required")
-    return value
-
-
-@dataclass
 class DenoiseRow:
     """One CFG branch of one denoise step queued for batched velocity prediction."""
 
@@ -187,7 +126,6 @@ class TextImageDenoiseOwner(Protocol):
     """
 
     # Collaborator attributes.
-    model: Any
     device: Any
     gen_device: Any
     latent_downsample: int
@@ -205,6 +143,46 @@ class TextImageDenoiseOwner(Protocol):
     def _empty_img_start_prefix(self) -> "TextCache": ...
     def _denoise_cache(self, cache: Any) -> Any: ...
     def _wait_gen_cache_ready(self, cache: Any) -> None: ...
+    def interleaved_image_query(self, text: str, *, append_text: str) -> str: ...
+    def interleaved_image_indexes(
+        self,
+        token_h: int,
+        token_w: int,
+        text_len: int,
+        *,
+        device: Any,
+    ) -> torch.Tensor: ...
+    def interleaved_image_predict_velocity(
+        self,
+        image_embeds: torch.Tensor,
+        indexes: torch.Tensor,
+        attention_mask: Any,
+        cache: Any,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int],
+    ) -> torch.Tensor: ...
+    def interleaved_image_patch_size(self) -> int: ...
+    def interleaved_image_features(
+        self,
+        image_input: torch.Tensor,
+        *,
+        grid_hw: torch.Tensor,
+        gen_model: bool = False,
+    ) -> torch.Tensor: ...
+    def interleaved_image_gen_feature_dtype(self) -> torch.dtype: ...
+    def interleaved_image_noise_scale(self, grid_h: int, grid_w: int) -> float: ...
+    def interleaved_image_noise_scale_embedding(
+        self,
+        noise_scale: float,
+        token_count: int,
+        *,
+        dtype: torch.dtype,
+        device: Any,
+    ) -> torch.Tensor | None: ...
+    def interleaved_image_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor: ...
 
     # Mixin methods (from TextImageDenoiseOps) reached through ``self``.
     def _init_image_state(
@@ -266,8 +244,9 @@ class TextImageDenoiseOps:
 
         token_h = params.height // self.latent_downsample
         token_w = params.width // self.latent_downsample
-        grid_h = params.height // self.model.patch_size
-        grid_w = params.width // self.model.patch_size
+        patch_size = self.interleaved_image_patch_size()
+        grid_h = params.height // patch_size
+        grid_w = params.width // patch_size
         device = getattr(self, "gen_device", self.device)
         indexes_cond, indexes_tu, indexes_iu = self._build_indexes(
             st, cond, token_h, token_w, device
@@ -282,17 +261,12 @@ class TextImageDenoiseOps:
         timesteps = schedule.timesteps(device=device)
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
         noise_scale = self._compute_noise_scale(grid_h, grid_w)
-        noise_scale_embedding = None
-        if self.model.add_noise_scale_embedding:
-            ns = torch.full(
-                (token_h * token_w,),
-                float(noise_scale) / float(self.model.noise_scale_max_value),
-                device=device,
-                dtype=timesteps.dtype,
-            )
-            noise_scale_embedding = self.model.fm_modules["noise_scale_embedder"](ns).view(
-                1, token_h * token_w, -1
-            )
+        noise_scale_embedding = self.interleaved_image_noise_scale_embedding(
+            noise_scale,
+            token_h * token_w,
+            dtype=timesteps.dtype,
+            device=device,
+        )
 
         x_t = self._init_latent(st, params, device, noise_scale)
         cond_cache = self._denoise_cache(cond.past)
@@ -331,25 +305,7 @@ class TextImageDenoiseOps:
         return image_state
 
     def _parse_image_params(self: TextImageDenoiseOwner, ip: dict) -> _ImageParams:
-        steps = int(_required_image_param(ip, "steps"))
-        if steps <= 0:
-            raise invalid_descriptor("image.steps must be positive")
-        cfg_interval = tuple(_required_image_param(ip, "cfg_interval"))
-        if len(cfg_interval) != 2:
-            raise invalid_descriptor("image.cfg_interval must contain exactly two values")
-        return _ImageParams(
-            width=required_image_width(ip),
-            height=required_image_height(ip),
-            steps=steps,
-            cfg_text=float(_required_image_param(ip, "cfg_text_scale")),
-            cfg_img=float(_required_image_param(ip, "cfg_img_scale")),
-            cfg_interval=(float(cfg_interval[0]), float(cfg_interval[1])),
-            cfg_norm=str(_required_image_param(ip, "cfg_renorm_type")),
-            cfg_renorm_min=float(_required_image_param(ip, "cfg_renorm_min")),
-            timestep_shift=float(_required_image_param(ip, "timestep_shift")),
-            retain_images=bool(_image_param(ip, "retain_images", True)),
-            seed=ip.get("seed"),
-        )
+        return parse_text_image_generation_params(ip)
 
     def _setup_cfg_caches(
         self: TextImageDenoiseOwner,
@@ -372,7 +328,7 @@ class TextImageDenoiseOps:
                 raise invalid_descriptor(
                     "Mode A cuda_ipc tower split does not support per-op image_prompt overrides yet"
                 )
-            query = self.model._build_t2i_query(
+            query = self.interleaved_image_query(
                 image_prompt.strip(),
                 append_text=self._img_start_token,
             )
@@ -410,31 +366,23 @@ class TextImageDenoiseOps:
         token_w: int,
         device: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        indexes_cond = self.model._build_t2i_image_indexes(
+        indexes_cond = self.interleaved_image_indexes(
             token_h, token_w, cond.t_index + 1, device=device
         )
         indexes_tu = (
-            self.model._build_t2i_image_indexes(token_h, token_w, st.tu.t_index + 1, device=device)
+            self.interleaved_image_indexes(token_h, token_w, st.tu.t_index + 1, device=device)
             if st.tu.past is not None
             else None
         )
         indexes_iu = (
-            self.model._build_t2i_image_indexes(token_h, token_w, st.iu.t_index + 1, device=device)
+            self.interleaved_image_indexes(token_h, token_w, st.iu.t_index + 1, device=device)
             if st.iu.past is not None
             else None
         )
         return indexes_cond, indexes_tu, indexes_iu
 
     def _compute_noise_scale(self: TextImageDenoiseOwner, grid_h: int, grid_w: int) -> float:
-        noise_scale = self.model.noise_scale
-        mode = self.model.noise_scale_mode
-        if mode in _NOISE_RESOLUTION_MODES:
-            base = float(self.model.noise_scale_base_image_seq_len)
-            seq_len_ratio = float(grid_h * grid_w) / (self.merge_size**2) / base
-            noise_scale = seq_len_ratio**_NOISE_RESOLUTION_EXPONENT * float(noise_scale)
-            if mode == NoiseScaleMode.DYNAMIC_SQRT:
-                noise_scale = noise_scale**_NOISE_DYNAMIC_SQRT_EXPONENT
-        return min(noise_scale, self.model.noise_scale_max_value)
+        return self.interleaved_image_noise_scale(grid_h, grid_w)
 
     def _init_latent(
         self: TextImageDenoiseOwner,
@@ -478,15 +426,18 @@ class TextImageDenoiseOps:
         t, t_next = img.schedule.pair(step_i, device=device, dtype=img.timesteps.dtype)
         start = ctx.component_timer_start()
         z = patchify_batch(img.x_t, self.latent_downsample)
-        image_input = patchify_batch(img.x_t, self.model.patch_size, channel_first=True)
-        gen_vit = self.model.fm_modules["vision_model_mot_gen"]
+        image_input = patchify_batch(
+            img.x_t,
+            self.interleaved_image_patch_size(),
+            channel_first=True,
+        )
         image_input = image_input.to(
             device=device,
-            dtype=next(gen_vit.parameters()).dtype,
+            dtype=self.interleaved_image_gen_feature_dtype(),
         )
         ctx.record_component_elapsed("sensenova_denoise_patchify", start)
         start = ctx.component_timer_start()
-        image_embeds = self.model.extract_feature(
+        image_embeds = self.interleaved_image_features(
             image_input.view(1 * img.grid_h * img.grid_w, -1),
             gen_model=True,
             grid_hw=img.grid_hw,
@@ -494,15 +445,17 @@ class TextImageDenoiseOps:
         ctx.record_component_elapsed("sensenova_denoise_vision_feature", start)
         start = ctx.component_timer_start()
         t_expanded = t.expand(img.token_h * img.token_w)
-        timestep_embeddings = self.model.fm_modules["timestep_embedder"](t_expanded).view(
+        timestep_embeddings = self.interleaved_image_timestep_embeddings(t_expanded).view(
             1, img.token_h * img.token_w, -1
         )
-        if self.model.add_noise_scale_embedding:
-            if img.noise_scale_embedding is None:
-                ns = torch.full_like(t_expanded, img.noise_scale / self.model.noise_scale_max_value)
-                img.noise_scale_embedding = self.model.fm_modules["noise_scale_embedder"](ns).view(
-                    1, img.token_h * img.token_w, -1
-                )
+        if img.noise_scale_embedding is None:
+            img.noise_scale_embedding = self.interleaved_image_noise_scale_embedding(
+                img.noise_scale,
+                img.token_h * img.token_w,
+                dtype=t_expanded.dtype,
+                device=device,
+            )
+        if img.noise_scale_embedding is not None:
             timestep_embeddings += img.noise_scale_embedding
         image_embeds = image_embeds + timestep_embeddings
         ctx.record_component_elapsed("sensenova_denoise_timestep_embed", start)
@@ -649,23 +602,24 @@ class TextImageDenoiseOps:
             return False
         ctx = get_forward_context()
         preferred = ctx.attention_backend_name or getattr(self, "attention_backend", "auto")
-        try:
-            probe = image_embeds.new_empty((1, 1, 1, image_embeds.shape[-1]))
-            return ops.can_run_attention(
-                probe,
-                probe,
-                probe,
-                regime=ops.AttentionRegime.DECODE,
-                causal=True,
-                scale=1.0,
-                ctx=ctx,
-                kv_cache=cache,
-                block_table=image_embeds.new_empty((1, 1), dtype=torch.int32),
-                cache_seqlens=image_embeds.new_empty((1,), dtype=torch.int32),
-                override=preferred,
-            )
-        except Exception:
-            return False
+        # ``can_run_attention`` is a pure capability probe (providers answer
+        # can_run without executing); unsupported configurations return False,
+        # and an exception here is a provider bug that must surface, not a
+        # signal to silently take the slower per-row denoise path.
+        probe = image_embeds.new_empty((1, 1, 1, image_embeds.shape[-1]))
+        return ops.can_run_attention(
+            probe,
+            probe,
+            probe,
+            regime=ops.AttentionRegime.DECODE,
+            causal=True,
+            scale=1.0,
+            ctx=ctx,
+            kv_cache=cache,
+            block_table=image_embeds.new_empty((1, 1), dtype=torch.int32),
+            cache_seqlens=image_embeds.new_empty((1,), dtype=torch.int32),
+            override=preferred,
+        )
 
     def _predict_v_batched(
         self: TextImageDenoiseOwner,
@@ -712,7 +666,7 @@ class TextImageDenoiseOps:
             raise model_execution_error("required CFG cache is not initialized")
         # B2: wait the snapshot's readiness before the gen tower reads the replica.
         self._wait_gen_cache_ready(cache)
-        return self.model._t2i_predict_v(
+        return self.interleaved_image_predict_velocity(
             image_embeds,
             indexes,
             {"full_attention": None},
@@ -743,7 +697,7 @@ class GeneratedImageCommitDriver:
         )
         und_img = (raw_img - mean) / std
         channels, height, width = und_img[0].shape
-        patch_size = self.owner.model.patch_size
+        patch_size = self.owner.interleaved_image_patch_size()
         grid_h = height // patch_size
         grid_w = width // patch_size
         flattened = (
@@ -752,17 +706,17 @@ class GeneratedImageCommitDriver:
             .permute(1, 3, 0, 2, 4)
             .reshape(grid_h * grid_w, channels * patch_size**2)
         )
-        vit_embeds = self.owner.model.extract_feature(
+        vit_embeds = self.owner.interleaved_image_features(
             flattened,
             grid_hw=image_state.grid_hw[:1].to(self.owner.device),
         ).unsqueeze(0)
         img_end = torch.tensor([[self.owner.img_end_id]], dtype=torch.long, device=self.owner.device)
-        img_end_embed = self.owner.model.language_model.get_input_embeddings()(img_end)
+        img_end_embed = self.owner.interleaved_text_embeddings(img_end)
         embeds = torch.cat([vit_embeds, img_end_embed], dim=1)
         num_image_tokens = vit_embeds.shape[1]
 
         abs_w, abs_h = build_abs_positions_from_grid_hw(
-            image_state.grid_hw[:1] // int(1 / self.owner.model.downsample_ratio),
+            image_state.grid_hw[:1] // int(1 / self.owner.interleaved_image_downsample_ratio()),
             device=self.owner.device,
         )
         past_len = cache.past.get_seq_length()
@@ -780,7 +734,7 @@ class GeneratedImageCommitDriver:
             past_len=past_len,
             device=self.owner.device,
         )
-        outputs = self.owner.model.language_model(
+        outputs = self.owner.interleaved_text_forward(
             inputs_embeds=embeds,
             indexes=indexes,
             attention_mask={"full_attention": mask},
@@ -856,8 +810,9 @@ class GeneratedImageCommitDriver:
         width = int(params.width)
         token_h = height // self.owner.latent_downsample
         token_w = width // self.owner.latent_downsample
-        grid_h = height // self.owner.model.patch_size
-        grid_w = width // self.owner.model.patch_size
+        patch_size = self.owner.interleaved_image_patch_size()
+        grid_h = height // patch_size
+        grid_w = width // patch_size
         device = self.owner.device
         latent_handle = int(op["req_id"])
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)

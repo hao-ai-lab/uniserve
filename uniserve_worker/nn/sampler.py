@@ -351,7 +351,7 @@ def apply_sampling_batched_with_device_tokens(
     if greedy_logits is not None:
         return _draw_greedy_fast_path(state, greedy_logits, defer_cpu=defer_cpu)
 
-    work = logits.float().clone()
+    work = _writable_float_work(logits)
     _apply_mask_bias_penalty_stage(state, work)
     sampled_rows = _apply_temperature_stage(state, work)
     _apply_truncation_stage(state, work)
@@ -565,17 +565,35 @@ def _device_to_host_stage(
     return deferred.finalize()
 
 
+# Device index tensors for suppress/allowed lists, keyed by content. These
+# lists are per-request constants consumed every decode step; rebuilding them
+# per step issues a pageable host->device copy whose implicit
+# cudaStreamSynchronize blocks the CPU behind the in-flight decode graph
+# replay and serializes the whole decode pipeline. The cache bounds itself by
+# clearing at capacity (lists are tiny and few per serving session).
+_INDEX_TENSOR_CACHE: dict[tuple[str, tuple[int, ...], int], torch.Tensor] = {}
+_INDEX_TENSOR_CACHE_MAX = 512
+
+
 def _valid_index_tensor(
     values: list[int] | tuple[int, ...],
     vocab: int,
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    return torch.tensor(
-        [int(token_id) for token_id in values if 0 <= int(token_id) < vocab],
+    key = (str(device), tuple(int(token_id) for token_id in values), int(vocab))
+    cached = _INDEX_TENSOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tensor = torch.tensor(
+        [token_id for token_id in key[1] if 0 <= token_id < vocab],
         dtype=torch.long,
         device=device,
     )
+    if len(_INDEX_TENSOR_CACHE) >= _INDEX_TENSOR_CACHE_MAX:
+        _INDEX_TENSOR_CACHE.clear()
+    _INDEX_TENSOR_CACHE[key] = tensor
+    return tensor
 
 
 def apply_allowed_mask_(
@@ -611,7 +629,10 @@ def apply_suppress_(
         return
     idx = _valid_index_tensor(suppress, vocab, device=logits.device)
     if idx.numel() > 0:
-        logits[idx] = NEG_INF
+        # ``logits[idx] = NEG_INF`` wraps the Python float into a CPU scalar
+        # tensor and copies it host->device with an implicit stream synchronize
+        # every call; ``index_fill_`` takes the scalar by value with no copy.
+        logits.index_fill_(0, idx, NEG_INF)
 
 
 def apply_logit_bias_(
@@ -635,6 +656,17 @@ def apply_logit_bias_(
             )
 
 
+def _writable_float_work(logits: torch.Tensor) -> torch.Tensor:
+    """Fresh fp32 working copy of ``logits`` with exactly one copy.
+
+    ``.float()`` on a non-fp32 tensor already materializes a new fp32 tensor;
+    cloning again would copy the full vocab row a second time per step. Only
+    an already-fp32 input needs the explicit clone to stay writable.
+    """
+    work = logits.float()
+    return logits.clone() if work is logits else work
+
+
 def _greedy_device_fast_path_logits(
     logits: torch.Tensor,
     sampling_params: list[dict[str, Any]],
@@ -648,7 +680,7 @@ def _greedy_device_fast_path_logits(
     if not _greedy_path_needs_argmax_processors(sampling_params, recent, allowed, suppress):
         return logits
 
-    work = logits.float().clone()
+    work = _writable_float_work(logits)
     for row in range(int(work.shape[0])):
         row_logits = work[row]
         sp = sampling_params[row]

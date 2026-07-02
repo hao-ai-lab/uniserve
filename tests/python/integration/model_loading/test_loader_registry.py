@@ -45,7 +45,19 @@ def test_registry_resolves_real_model_entries():
     assert resolve_model_cls(("Qwen3ForCausalLM",)).__name__ == "Qwen3ForCausalLM"
 
 
-def test_registry_falls_back_to_generic_transformers_for_unknown_architecture():
+def test_registry_rejects_unknown_architecture_without_explicit_transformers_fallback(monkeypatch):
+    _set_worker_runtime(monkeypatch, allow_transformers_fallback=False)
+
+    with pytest.raises(WorkerError) as excinfo:
+        resolve_model_cls(("CompletelyNewCausalLM",))
+
+    assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
+    assert "--allow-transformers-fallback" in str(excinfo.value)
+
+
+def test_registry_falls_back_to_generic_transformers_only_when_enabled(monkeypatch):
+    _set_worker_runtime(monkeypatch, allow_transformers_fallback=True)
+
     cls = resolve_model_cls(("CompletelyNewCausalLM",))
     assert cls.__name__ == "TransformersForCausalLM"
     assert cls.fallback is True
@@ -281,15 +293,6 @@ def test_runner_driver_executes_registered_stub_model():
     assert "sampled_token_id" in result["per_seq"][0]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Production defect: Qwen3Attention._try_fused_prefill calls self.rotary_emb, "
-        "which is never assigned on Qwen3Attention (the rope module lives on Qwen3Model "
-        "as self.rotary and cos/sin are passed into forward). Any non-batched prefill_und "
-        "raises AttributeError. Remove this xfail when the production path is fixed."
-    ),
-)
 def test_qwen3_entry_executes_through_text_driver():
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
     from uniserve_worker.nn import ParallelLMHead, VocabParallelEmbedding
@@ -424,7 +427,7 @@ def test_qwen3_runtime_applies_opt_in_model_stack_compile(monkeypatch):
 def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
     from uniserve_worker.models.sensenova.model import (
         SenseNovaU1ForUnifiedGeneration,
-        _NativeQwen3DecoderLayer,
+        _SenseNovaDecoderLayer,
     )
 
     calls = []
@@ -456,7 +459,7 @@ def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
         rope_theta_hw=10000.0,
         max_position_embeddings_hw=128,
     )
-    layer = _NativeQwen3DecoderLayer(layer_cfg, layer_idx=0)
+    layer = _SenseNovaDecoderLayer(layer_cfg, layer_idx=0)
     decoder = nn.Module()
     decoder.layers = nn.ModuleList([layer])
     language_model = nn.Module()

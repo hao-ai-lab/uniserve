@@ -51,6 +51,11 @@ __all__ = [
 
 _KV_LANE = "text"
 
+# Wire token id carried by pipelined-burst ``last_sampled`` ops whose real token
+# still lives only in the device relay tensor. Deliberately invalid: any path
+# that embeds the wire token instead of consuming the relay fails loudly.
+_RELAY_PLACEHOLDER_TOKEN_ID = -1
+
 
 def text_input_id_replacements_from_relays(
     text: "TextBatch",
@@ -272,7 +277,29 @@ class TextDriver:
         op = dict(first_op)
         op["decode_token_count"] = 1
         op["decode_stop_token_ids"] = []
-        for _ in range(count):
+
+        def resolve(out: Any) -> dict[str, Any]:
+            result = _seq_result_dict(out)
+            tok = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
+            tokens.append(tok)
+            return result
+
+        # Pipelined one-token decode: step k+1's forward is launched from the
+        # device-resident sampled-token relay (``token_source='last_sampled'``)
+        # BEFORE step k's CPU token id is read, so the GPU->CPU token
+        # synchronize overlaps the next step's GPU work instead of serializing
+        # the loop on it. ``pending`` holds the one not-yet-finalized step.
+        #
+        # When the resolved token is a stop token, one forward has already been
+        # launched speculatively with that stop token as its input. Its output
+        # is discarded without sampling a result token, and its cache append is
+        # the same append the non-burst flow performs next when it conditions
+        # on the stop token (e.g. the interleaved driver's
+        # ``append_img_start_if_needed``), so request state stays equivalent to
+        # the sequential loop.
+        pending: Any = None
+        launched = 0
+        while launched < count:
             fb = UniForwardBatch.from_ops([op])
             text = fb.as_text()
             out = self._step_once(
@@ -280,24 +307,33 @@ class TextDriver:
                 [op],
                 request_states,
                 model,
-                defer_cpu_results=False,
+                defer_cpu_results=True,
                 defer_sampling=False,
                 tensor_store=None,
             )[0]
-            result = _seq_result_dict(out)
-            tok = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
-            tokens.append(tok)
-            last = result
-            if tok in stop_ids:
+            launched += 1
+            if pending is not None:
+                last = resolve(pending)
+                pending = None
+                if tokens[-1] in stop_ids:
+                    out = None
+                    break
+            pending = out
+            if launched >= count:
                 break
             next_pos = _next_decode_position(op)
             op = dict(first_op)
             op["new_block_ids"] = []
-            op["token_ids"] = [tok]
+            # Placeholder id: every decode path consumes the device relay for
+            # ``last_sampled`` ops; an invalid id here fails loudly if one ever
+            # reads the wire tokens instead.
+            op["token_ids"] = [_RELAY_PLACEHOLDER_TOKEN_ID]
             op["token_source"] = "last_sampled"
             op["pos_range"] = [next_pos, next_pos + 1]
             op["decode_token_count"] = 1
             op["decode_stop_token_ids"] = []
+        if pending is not None:
+            last = resolve(pending)
 
         result = dict(last)
         result["sampled_token_id"] = tokens[-1]
@@ -318,7 +354,7 @@ class TextDriver:
             # their modality FSM) declare no ``kv_cache_spec``; the system owns no
             # pool for them. They expose their own per-op text logits and the
             # driver still owns the post-model sampler.
-            return self._model_owned_kv_forward(model, text)
+            return self._model_owned_kv_forward(model, text, request_states)
         ctx = get_forward_context()
         device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
         batched = self.gate is not None and self.gate.batched_capable(
@@ -332,15 +368,34 @@ class TextDriver:
         self,
         model: Any,
         text: "TextBatch",
+        request_states: RequestStateTable,
     ) -> tuple[torch.Tensor, list[int]]:
         """Run a self-managing model's per-op text logits and stack them.
 
         Accepts a batched ``run_text_logits_batch`` or a per-op
         ``run_text_logits``; both return a raw logits tensor per op, coerced to
         one ``[vocab]`` row. Req ids come from the op order, not the tensors.
+
+        The driver owns the decode-relay lookup: ``last_sampled`` ops get the
+        device relay tensor attached as ``op['token_tensor']`` (and the resolved
+        id when the CPU copy has landed) so the model side can consume the
+        sampled token without a GPU synchronize and without reaching into
+        system request state.
         """
 
-        ops = list(text.ops)
+        ops = [dict(op) for op in text.ops]
+        for op in ops:
+            if str(op.get("token_source") or "wire") != "last_sampled":
+                continue
+            relay = request_states.get(int(op["req_id"])).decode_relay
+            tensor = relay.token_tensor
+            if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.long:
+                raise invalid_descriptor(
+                    "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
+                )
+            op["token_tensor"] = tensor
+            if relay.token_id is not None:
+                op["token_ids"] = [int(relay.token_id)]
         outputs = list(model.run_text_logits_batch(ops))
         rows = [self._coerce_logits_row(out) for out in outputs]
         return torch.stack(rows, dim=0), [int(op["req_id"]) for op in ops]

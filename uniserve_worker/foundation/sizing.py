@@ -1,11 +1,16 @@
 """Shared scalar sizing helpers for worker capacity declarations."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 __all__ = [
     'DEFAULT_NUM_BLOCKS_FALLBACK',
     'DEFAULT_MAX_BATCH_OPS',
     'DEFAULT_BLOCK_SIZE',
+    'CudaKVCapacity',
     'ceil_div',
+    'derive_cuda_kv_capacity',
     'derive_num_blocks',
 ]
 
@@ -16,6 +21,18 @@ DEFAULT_NUM_BLOCKS_FALLBACK = 4096
 DEFAULT_MAX_BATCH_OPS = 1024
 
 DEFAULT_BLOCK_SIZE = 256
+
+
+@dataclass(frozen=True)
+class CudaKVCapacity:
+    device: str
+    free_bytes: int
+    total_bytes: int
+    memory_fraction: float
+    bytes_per_token: int
+    block_size: int
+    token_capacity: int
+    num_blocks: int
 
 
 def ceil_div(value: int, divisor: int) -> int:
@@ -51,3 +68,56 @@ def derive_num_blocks(
     else:
         blocks = int(kv_token_capacity) // block
     return max(min_blocks, blocks)
+
+
+def derive_cuda_kv_capacity(
+    *,
+    device: Any,
+    block_size: int,
+    bytes_per_token: int,
+    memory_fraction: float,
+    floor: int = 1,
+) -> CudaKVCapacity | None:
+    """Derive KV token/block capacity from currently free CUDA memory.
+
+    CUDA visibility and free-memory accounting are deployment concerns, so model
+    classes call this helper instead of reaching into ``torch.cuda`` directly.
+    ``None`` means CUDA sizing is unavailable and callers should use their
+    non-CUDA capacity policy.
+    """
+
+    try:
+        import torch
+    except Exception:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+    try:
+        cuda_device = torch.device(device)
+    except Exception:
+        return None
+    if cuda_device.type != "cuda":
+        return None
+    block = int(block_size)
+    token_bytes = max(1, int(bytes_per_token))
+    if block <= 0:
+        return None
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(cuda_device)
+    except Exception:
+        return None
+    fraction = float(memory_fraction)
+    usable_bytes = max(0, int(float(free_bytes) * fraction))
+    raw_token_capacity = usable_bytes // token_bytes
+    num_blocks = max(max(1, int(floor)), int(raw_token_capacity) // block)
+    return CudaKVCapacity(
+        device=str(cuda_device),
+        free_bytes=int(free_bytes),
+        total_bytes=int(total_bytes),
+        memory_fraction=fraction,
+        bytes_per_token=token_bytes,
+        block_size=block,
+        token_capacity=int(num_blocks * block),
+        num_blocks=int(num_blocks),
+    )

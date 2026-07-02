@@ -45,6 +45,22 @@
         "--max-num-batched-tokens",
         "1024"
       ]
+    },
+    "sensenova-u1-tp4": {
+      "extends": "sensenova-u1-single",
+      "cuda_visible_devices": "0,1,2,3",
+      "serve_args": [
+        "--kv-token-capacity",
+        "65536",
+        "--max-num-seqs",
+        "1",
+        "--max-batch",
+        "4",
+        "--max-num-batched-tokens",
+        "4096",
+        "--worker-ranks",
+        "4"
+      ]
     }
   },
   "workloads": {

@@ -1,8 +1,6 @@
 """BAGEL UniModel entry backed by the shared runner."""
 from __future__ import annotations
 
-import base64
-import io
 import json
 import logging
 import math
@@ -30,9 +28,16 @@ from ..contracts.resource_plan import (
 from ..execution.denoise_driver import TextImageDenoiseStep
 from ..execution.model_base import UniModelBase
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS, derive_num_blocks
+from ..foundation.runtime_config import get_worker_config
+from ..foundation.sizing import (
+    DEFAULT_BLOCK_SIZE,
+    DEFAULT_MAX_BATCH_OPS,
+    DEFAULT_NUM_BLOCKS_FALLBACK,
+    derive_cuda_kv_capacity,
+    derive_num_blocks,
+)
 from ..loader.weight_utils import iter_weights, stacked_params_mapping_loop, tensor_shape
-from ..nn import LinearBase, MLPConnector, ParallelLMHead
+from ..nn import LinearBase, MLPConnector, ParallelLMHead, local_kv_head_count
 from ..nn.decoder import KVCache, MoTModel, Segment
 from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, TimestepEmbedder, init_latent
 from ..nn.diffusion.cfg import CfgRecipe
@@ -51,6 +56,8 @@ from ..nn.vision import (
     patchify,
 )
 from ..processors.bagel import BagelImageProcessor
+from ..runtime.image_params import parse_text_image_generation_params
+from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.lora import MergeOnLoadLoRA
 from ..runtime.request_state import RequestState
@@ -69,8 +76,6 @@ logger = logging.getLogger(__name__)
 _BAGEL_RMS_NORM_EPS = 1e-6
 _BAGEL_ROPE_THETA = 1_000_000.0
 _BAGEL_VIT_LAYER_NORM_EPS = 1e-6
-_BAGEL_DEFAULT_KV_TOKEN_CAPACITY_BLOCKS = 4096
-_BAGEL_CUDA_FREE_MEMORY_KV_FRACTION = 0.40
 
 
 def _weights_file(model_dir: str) -> str:
@@ -601,10 +606,16 @@ class BagelForUnifiedGeneration(UniModelBase):
     def _resolve_kv_token_capacity(self) -> int:
         if self.kv_token_capacity is not None:
             return int(self.kv_token_capacity)
-        if self.device.startswith("cuda") and torch.cuda.is_available():
-            free, _ = torch.cuda.mem_get_info()
-            return int(free * _BAGEL_CUDA_FREE_MEMORY_KV_FRACTION / self.bytes_per_token)
-        return self.block_size * _BAGEL_DEFAULT_KV_TOKEN_CAPACITY_BLOCKS
+        sizing = derive_cuda_kv_capacity(
+            device=self.device,
+            block_size=self.block_size,
+            bytes_per_token=self.bytes_per_token,
+            memory_fraction=get_worker_config().kv_memory_fraction,
+            floor=64,
+        )
+        if sizing is not None:
+            return int(sizing.token_capacity)
+        return self.block_size * DEFAULT_NUM_BLOCKS_FALLBACK
 
     def _build_residency(self, cfg: LLMConfig) -> ResidencyManager:
         # System-owned residency: the worker-owned ResidencyManager constructs
@@ -615,7 +626,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             GenResidencySpec(
                 kv=KvCacheSpec(
                     num_layers=cfg.num_hidden_layers,
-                    num_kv_heads=cfg.num_key_value_heads,
+                    num_kv_heads=local_kv_head_count(cfg.num_key_value_heads),
                     head_dim=cfg.head_dim,
                     dtype=torch.bfloat16,
                     store_dtype=self._kv_store_dtype_for(torch.bfloat16),
@@ -684,7 +695,7 @@ class BagelForUnifiedGeneration(UniModelBase):
     def _kv_bytes_per_token(self, compute_dtype: torch.dtype) -> int:
         c = self.cfg.llm
         return kv_cache_bytes_per_token(
-            num_kv_heads=c.num_key_value_heads,
+            num_kv_heads=local_kv_head_count(c.num_key_value_heads),
             head_dim=c.head_dim,
             num_layers=c.num_hidden_layers,
             compute_dtype=compute_dtype,
@@ -847,36 +858,27 @@ class BagelForUnifiedGeneration(UniModelBase):
     def run_text_logits(self, op):
         return self.run_text_logits_batch([dict(op)])[0]
 
-    @staticmethod
-    def _require_image_param(ip: dict, key: str, req_id: Any):
-        """Fetch a client-controlled image param, failing loudly if absent.
-
-        These come straight from the request's `image` dict; a missing key is a
-        malformed request rather than a worker bug, so raise a descriptive error
-        instead of letting a bare KeyError surface as an opaque crash.
-        """
-        if key not in ip:
-            raise invalid_descriptor(
-                f"BAGEL image generation request {req_id} is missing "
-                f"required image param {key!r}"
-            )
-        return ip[key]
-
     def _init_gen(self, op):
         self._ensure_loaded()
         m = self.model
         state = self._state(int(op["req_id"]))
         rec = self._record(op["req_id"])
         ip = rec.get("image") or {}
-        req_id = op["req_id"]
+        cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
         gs = GenState()
         gs.cond_pos = op["cond_pos"]
         dims = rec.get("dims")
+        parse_ip = dict(ip)
         if dims is not None:
-            gs.H, gs.W = int(dims[0]), int(dims[1])
-        else:
-            gs.H = self._require_image_param(ip, "height", req_id)
-            gs.W = self._require_image_param(ip, "width", req_id)
+            parse_ip["height"] = int(dims[0])
+            parse_ip["width"] = int(dims[1])
+        params = parse_text_image_generation_params(
+            parse_ip,
+            cfg=cfg,
+            timestep_shift_default=m.cfg.timestep_shift,
+        )
+        gs.H = int(params.height)
+        gs.W = int(params.width)
         h, w = m.latent_hw(gs.H, gs.W)
         gs.num_vae = h * w
         gs.vae_pos_ids = m.latent_position_ids(gs.H, gs.W).to(self.device)
@@ -888,24 +890,15 @@ class BagelForUnifiedGeneration(UniModelBase):
             dtype=torch.bfloat16,
         )
         gs.schedule = FlowMatchSchedule(
-            num_steps=int(self._require_image_param(ip, "steps", req_id)),
-            shift=float(ip.get("timestep_shift", m.cfg.timestep_shift)),
+            num_steps=int(params.steps),
+            shift=float(params.timestep_shift),
             direction=ScheduleDirection.DESCENDING,
         )
-        cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
-        gs.cfg_text_scale = float(
-            cfg.get("text_scale", self._require_image_param(ip, "cfg_text_scale", req_id))
-        )
-        gs.cfg_img_scale = float(
-            cfg.get("img_scale", self._require_image_param(ip, "cfg_img_scale", req_id))
-        )
-        gs.cfg_renorm_type = str(
-            cfg.get("renorm_type", cfg.get("renorm", self._require_image_param(ip, "cfg_renorm_type", req_id)))
-        )
-        gs.cfg_renorm_min = float(
-            cfg.get("renorm_min", self._require_image_param(ip, "cfg_renorm_min", req_id))
-        )
-        gs.cfg_interval = tuple(cfg.get("interval") or self._require_image_param(ip, "cfg_interval", req_id))
+        gs.cfg_text_scale = float(params.cfg_text)
+        gs.cfg_img_scale = float(params.cfg_img)
+        gs.cfg_renorm_type = str(params.cfg_norm)
+        gs.cfg_renorm_min = float(params.cfg_renorm_min)
+        gs.cfg_interval = tuple(params.cfg_interval)
         gs.understanding = bool(rec.get("understanding_interleave"))
         if gs.understanding:
             gs.cond_branch_kvlen = int(self._length(op["req_id"]) or gs.cond_pos)
@@ -1044,9 +1037,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             base += nt + 2
             self._set_length(r, base)
             added = (nv + 2) + (nt + 2)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode()
+            b64 = pil_image_to_png_b64(img)
             self._pop_gen_state(r)
             return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W],
                     "num_tokens": added}
@@ -1054,9 +1045,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         commit_seg = m.build_gen_segment(gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True)
         m.run([commit_seg])
         self._set_length(r, gs.cond_pos + gs.num_vae + 2)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
+        b64 = pil_image_to_png_b64(img)
         self._pop_gen_state(r)
         return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W]}
 
