@@ -5,14 +5,14 @@ import json
 
 import pytest
 
-import scripts.verify as verify
+import scripts.e2e as e2e
 
 
 pytestmark = pytest.mark.unit
 
 
 def test_run_suite_can_manage_generate_workload_servers(tmp_path, monkeypatch):
-    config_path = tmp_path / "verify_config.json"
+    config_path = tmp_path / "e2e_config.json"
     config_path.write_text(
         json.dumps(
             {
@@ -60,11 +60,11 @@ def test_run_suite_can_manage_generate_workload_servers(tmp_path, monkeypatch):
     def fake_generate(args):
         events.append(("generate", args.workload))
 
-    monkeypatch.setattr(verify, "clean", fake_clean)
-    monkeypatch.setattr(verify, "launch", fake_launch)
-    monkeypatch.setattr(verify, "generate", fake_generate)
+    monkeypatch.setattr(e2e, "clean", fake_clean)
+    monkeypatch.setattr(e2e, "launch", fake_launch)
+    monkeypatch.setattr(e2e, "generate", fake_generate)
 
-    verify.run_suite(
+    e2e.run_suite(
         argparse.Namespace(
             config=config_path,
             suite="fusion",

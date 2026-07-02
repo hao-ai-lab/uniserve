@@ -396,6 +396,7 @@ def test_packed_mixed_forward_uses_owner_adapter_not_model_backbone():
 FORBIDDEN_MODEL_CONSTRUCTIONS = frozenset(
     {
         "PagedKVPool",
+        "BatchedPagedTextCache",
         "DecodeCudaGraphRunner",
         "PrefillCudaGraphRunner",
         "TextGraphRunner",
@@ -456,7 +457,12 @@ def test_models_do_not_query_cuda_memory_directly():
 
 def test_models_do_not_define_local_block_free_list_allocators():
     offenders: list[str] = []
-    forbidden = ("_alloc_from_free_list", "_release_to_free_list", "bisect.bisect_left")
+    forbidden = (
+        "BlockFreeList",
+        "_alloc_from_free_list",
+        "_release_to_free_list",
+        "bisect.bisect_left",
+    )
     for path in _py_files(WORKER / "models"):
         text = path.read_text(encoding="utf-8")
         for needle in forbidden:
@@ -664,7 +670,7 @@ def test_mixed_forward_side_tables_use_forward_names():
 def test_sensenova_qk_norm_rope_has_no_model_local_legacy_path():
     model_source = (WORKER / "models" / "sensenova" / "model.py").read_text(encoding="utf-8")
     provider_source = (WORKER / "ops" / "providers.py").read_text(encoding="utf-8")
-    config_source = (ROOT / "scripts" / "verify_config.json").read_text(encoding="utf-8")
+    config_source = (ROOT / "scripts" / "e2e_config.json").read_text(encoding="utf-8")
     spec_source = (ROOT / "specs" / "backend_ops.md").read_text(encoding="utf-8")
 
     assert "_qk_norm_rope_3d_legacy" not in model_source
