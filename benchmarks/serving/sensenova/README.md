@@ -59,4 +59,4 @@ generation to the model's blessed buckets by policy), `SEED` (42),
 
 Results land under each `--output-dir` as `summary.json` / `summary.md` /
 `requests.jsonl`. Only image *speed* is measured here; image quality gates
-live in `scripts/verify.py` workloads.
+live in `scripts/e2e.py` workloads (see docs/e2e-verification.md).
