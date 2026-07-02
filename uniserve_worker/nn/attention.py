@@ -34,6 +34,7 @@ class AttentionPath(enum.Enum):
     CONTIGUOUS_VARLEN = "contiguous_varlen"
     PAGED_VARLEN = "paged_varlen"
     TRANSIENT_PAGED_VARLEN = "transient_paged_varlen"
+    PAGED_EXTEND = "paged_extend"
     PAGED_DECODE = "paged_decode"
     EMPTY_PAGED_PREFILL = "empty_paged_prefill"
     DENSE = "dense"
@@ -119,6 +120,10 @@ class RadixAttention(nn.Module):
             return self._forward_transient_paged_varlen(
                 ctx, preferred, q, k, v, kv_cache=kv_cache, causal=causal, scale=effective_scale
             )
+        if path is AttentionPath.PAGED_EXTEND:
+            return self._forward_paged_extend(
+                ctx, preferred, q, k, v, kv_cache=kv_cache, causal=causal, scale=effective_scale
+            )
         if path is AttentionPath.PAGED_DECODE:
             return self._forward_paged_decode(
                 ctx, preferred, q, k, v, kv_cache=kv_cache, causal=causal, scale=effective_scale
@@ -170,6 +175,14 @@ class RadixAttention(nn.Module):
                 return AttentionPath.PAGED_VARLEN
             if self._can_run_transient_paged_varlen(ctx, preferred, kv_cache, q, k, v):
                 return AttentionPath.TRANSIENT_PAGED_VARLEN
+            # Self-managing segment decoders pass a single-request paged view
+            # directly with token-major [L, H, D] q/k/v and no system-built
+            # per-forward plan. A multi-token append+attend on such a view is a
+            # one-sequence EXTEND whose plan the view itself supplies; without
+            # this branch it would fall through to the paged-decode path, which
+            # reads a 3-D q as one-token *rows* and corrupts the write.
+            if attn_mask is None and self._can_run_paged_extend(ctx, preferred, kv_cache, q, k, v):
+                return AttentionPath.PAGED_EXTEND
 
         if paged_eligible:
             if self.can_run_paged_attention(q, attn_mask, kv_cache=kv_cache, preferred=preferred, ctx=ctx):
@@ -320,6 +333,133 @@ class RadixAttention(nn.Module):
         # which lands back on the contiguous token-major storage for free.
         return out.view(batch, q_len, int(out.shape[1]), int(out.shape[2])).transpose(1, 2)
 
+    @staticmethod
+    def _paged_extend_metadata(kv_cache, q: torch.Tensor):
+        """Derive the one-sequence EXTEND plan from a directly-passed view.
+
+        Eligible only for the self-managed shape: token-major 3-D multi-token
+        q against a single-request paged view exposing the append surface
+        (``append_varlen``/``block_table``/``cache_seqlens``/``length``).
+        System-planned batches (4-D q, batched views, per-forward metadata)
+        never reach this — their branches resolve earlier.
+        """
+        if q.ndim != 3 or int(q.shape[0]) <= 1:
+            return None
+        base_lens = getattr(kv_cache, "base_lens", None)
+        if base_lens is None or len(tuple(base_lens)) != 1:
+            return None
+        if not callable(getattr(kv_cache, "append_varlen", None)):
+            return None
+        block_table_fn = getattr(kv_cache, "block_table", None)
+        cache_seqlens_fn = getattr(kv_cache, "cache_seqlens", None)
+        length_fn = getattr(kv_cache, "length", None)
+        if not (callable(block_table_fn) and callable(cache_seqlens_fn) and callable(length_fn)):
+            return None
+        device = q.device
+        n_tokens = int(q.shape[0])
+        past = int(length_fn())
+        block_table = block_table_fn(device=device)
+        cache_seqlens = cache_seqlens_fn(device=device)
+        block_size = int(getattr(getattr(kv_cache, "pool", None), "block_size", 0) or 0)
+        if block_size <= 0:
+            return None
+        if int(block_table.shape[-1]) * block_size < past + n_tokens:
+            raise RuntimeError(
+                "paged-extend view capacity is smaller than the appended sequence "
+                f"({int(block_table.shape[-1])} blocks x {block_size} < {past} + {n_tokens})"
+            )
+        cu_seqlens_q = torch.tensor([0, n_tokens], dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor([0, past + n_tokens], dtype=torch.int32, device=device)
+        return (
+            [n_tokens],
+            block_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            n_tokens,
+            past + n_tokens,
+        )
+
+    @staticmethod
+    def _can_run_paged_extend(
+        ctx,
+        preferred: str,
+        kv_cache,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> bool:
+        if k.ndim != 3 or v.ndim != 3:
+            return False
+        if int(k.shape[0]) != int(q.shape[0]) or int(v.shape[0]) != int(q.shape[0]):
+            return False
+        metadata = RadixAttention._paged_extend_metadata(kv_cache, q)
+        if metadata is None:
+            return False
+        _query_lens_cpu, block_table, _cache_seqlens, cu_seqlens_q, cu_seqlens_k, max_q, max_k = metadata
+        q_probe = q.new_empty((1, int(q.shape[1]), int(q.shape[2])))
+        k_probe = k.new_empty((1, int(k.shape[1]), int(k.shape[2])))
+        v_probe = v.new_empty((1, int(v.shape[1]), int(v.shape[2])))
+        return ops.can_run_attention(
+            q_probe,
+            k_probe,
+            v_probe,
+            regime=ops.AttentionRegime.EXTEND,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=True,
+            scale=1.0,
+            block_table=block_table,
+            kv_cache=kv_cache,
+            ctx=ctx,
+            override=RadixAttention._attention_override(ctx, preferred),
+        )
+
+    def _forward_paged_extend(
+        self,
+        ctx,
+        preferred: str,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        kv_cache,
+        causal: bool,
+        scale: float,
+    ) -> torch.Tensor:
+        metadata = self._paged_extend_metadata(kv_cache, q)
+        if metadata is None:
+            raise RuntimeError("paged-extend attention became ineligible")
+        query_lens_cpu, block_table, cache_seqlens, cu_seqlens_q, cu_seqlens_k, max_q, max_k = metadata
+        kv_cache.append_varlen(
+            self.layer_id,
+            k,
+            v,
+            query_lens_cpu,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+        )
+        k_cache, v_cache = kv_cache.pool.layer_cache(self.layer_id)
+        return ops.attention(
+            q,
+            k_cache,
+            v_cache,
+            regime=ops.AttentionRegime.EXTEND,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=causal,
+            scale=scale,
+            block_table=block_table,
+            ctx=ctx,
+            kv_cache=kv_cache,
+            override=self._attention_override(ctx, preferred),
+        )
+
     def _forward_paged_decode(
         self,
         ctx,
@@ -334,6 +474,14 @@ class RadixAttention(nn.Module):
     ) -> torch.Tensor:
         k_cache, v_cache = kv_cache.pool.layer_cache(self.layer_id)
         block_table, cache_seqlens = self._paged_metadata_tensors(ctx, kv_cache, q.device)
+        if q.ndim == 3 and int(q.shape[0]) != int(block_table.shape[0]):
+            # One decode row per block-table row is the contract; a mismatch
+            # means a multi-token single-sequence segment was misrouted here
+            # (its tokens would be scattered as rows) — fail before writing.
+            raise RuntimeError(
+                f"paged decode row mismatch: q has {int(q.shape[0])} rows but the "
+                f"plan covers {int(block_table.shape[0])} request(s)"
+            )
         # Decode q/k/v arrive as ``[batch, heads, dim]`` (one token per row). A
         # paged kernel's BLHD/BHD layout normalizer treats a 3-D tensor as
         # ``[L, H, D]`` (one sequence), which would fold the *batch* into the
