@@ -102,6 +102,7 @@ from ...runtime.tower_handoff import (
     TowerHandoff,
 )
 from ...runtime.transfer import Locator
+from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
 from ...execution.input_image_ingest import InputImageIngestDriver
 from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
 from ...execution.interleaved_image_denoise import (
@@ -140,6 +141,16 @@ MAX_BATCH_OPS = DEFAULT_MAX_BATCH_OPS
 MAX_VIT_GRID_TOKENS = 70 * 70
 COMMIT_MARKER_TOKENS = 2
 GEN_ROPE_ADVANCE = 2
+# Rescale polynomial (highest degree first) for the timestep-aware denoise
+# residual cache, calibrated for SenseNova-U1's gen branch by the reference
+# implementation (vLLM-Omni TeaCache coefficients for SenseNovaU1ForCausalLM).
+_DENOISE_RESIDUAL_RESCALE_COEFFS = (
+    9.07281930e04,
+    -2.17699186e04,
+    1.83940990e03,
+    -6.30339273e01,
+    7.61309272e-01,
+)
 MAX_CFG_BRANCHES = 3
 
 # Resolution-aware modes apply sqrt sequence-length scaling; the others leave the
@@ -1456,6 +1467,7 @@ class _SenseNovaDecoderModel(nn.Module):
         past_key_values: Any,
         cache_position: torch.Tensor,
         packed_rope: SenseNovaPackedRope | None,
+        pre_norm_out: list[torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
         residual = None
@@ -1474,6 +1486,12 @@ class _SenseNovaDecoderModel(nn.Module):
                 **kwargs,
             )
         norm = self.norm_mot_gen if exist_image_gen_tokens else self.norm
+        if pre_norm_out is not None:
+            # Denoise residual-reuse capture: expose the pre-final-norm stream
+            # (block-stack output) alongside the normal normalized output.
+            pre_norm = hidden_states if residual is None else hidden_states + residual
+            pre_norm_out.append(pre_norm)
+            return norm(pre_norm)
         if residual is None:
             return norm(hidden_states)
         hidden_states, _ = norm.forward_with_residual(hidden_states, residual, in_place=True)
@@ -1780,12 +1798,14 @@ class NEOChatModel(nn.Module):
         image_token_num: int,
         timestep_embeddings: torch.Tensor | None = None,
         image_size: tuple[int, int] | None = None,
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # timestep_embeddings is part of the cross-file _t2i_predict_v call
         # contract (interleaved_image / reference denoise drivers pass it) but
         # this native path conditions on t inside _t2i_hidden_to_x_pred, so the
         # precomputed embedding is unused here.
         del timestep_embeddings
+        pre_norm_out: list[torch.Tensor] | None = [] if return_hidden else None
         outputs = self.language_model.model(
             inputs_embeds=input_embeds,
             image_gen_indicators=torch.ones(
@@ -1798,6 +1818,7 @@ class NEOChatModel(nn.Module):
             past_key_values=past_key_values,
             update_cache=False,
             use_cache=True,
+            pre_norm_out=pre_norm_out,
         )
         x_pred = self._t2i_hidden_to_x_pred(
             outputs.last_hidden_state,
@@ -1806,7 +1827,14 @@ class NEOChatModel(nn.Module):
             image_token_num=image_token_num,
             image_size=image_size,
         )
-        return (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
+        velocity = (x_pred - z) / (1 - t).clamp_min(self.config.t_eps)
+        if return_hidden:
+            if not pre_norm_out:
+                raise RuntimeError("denoise forward did not capture the pre-norm stream")
+            # The residual-reuse contract caches the *pre-final-norm* stream;
+            # the replay path re-applies the final norm via the adapter.
+            return velocity, pre_norm_out[0]
+        return velocity
 
     def _t2i_hidden_to_x_pred(
         self,
@@ -2588,7 +2616,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         *,
         image_token_num: int,
         image_size: tuple[int, int],
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.model._t2i_predict_v(
             image_embeds,
             indexes,
@@ -2598,6 +2627,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             z,
             image_token_num=image_token_num,
             image_size=image_size,
+            return_hidden=return_hidden,
         )
 
     def interleaved_image_patch_size(self) -> int:
@@ -2871,6 +2901,29 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def predict_text_image_velocity_batch(self, steps, branches_by_step):
         return TextImageDenoiseOps.predict_text_image_velocity_batch(self, steps, branches_by_step)
 
+    def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheAdapter | None:
+        """Timestep-aware residual-reuse adapter (TeaCache) for SenseNova-U1.
+
+        The decision embedding is the layer-0 generation-branch input norm of
+        the step embeddings — the same signal the reference implementation
+        calibrated its rescale polynomial on (vLLM-Omni TeaCache coefficients
+        for ``SenseNovaU1ForCausalLM``).
+        """
+        if self.model is None:
+            return None
+        adapter = getattr(self, "_shared_denoise_residual_adapter", None)
+        if adapter is None:
+            decoder = self.model.language_model.model
+            decision_norm = decoder.layers[0].input_layernorm_mot_gen
+            final_norm = decoder.norm_mot_gen
+            adapter = DenoiseResidualCacheAdapter(
+                decision_embedding=lambda embeds: decision_norm(embeds),
+                rescale_coefficients=_DENOISE_RESIDUAL_RESCALE_COEFFS,
+                finalize_hidden=lambda hidden: final_norm(hidden),
+            )
+            self._shared_denoise_residual_adapter = adapter
+        return adapter
+
     @staticmethod
     def _same_kv_pool(pool: Any, first_pool: Any) -> bool:
         return first_pool is None or pool is first_pool
@@ -2999,6 +3052,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                 denoise_steps.append((row_index, step))
             elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
                 raise RuntimeError(f"unsupported mixed SenseNova mode {mode.value!r}")
+        # Packed-mixed denoise runs outside the residual-reuse policy's view:
+        # drop any replay state so the next pure-denoise step recomputes
+        # instead of replaying a stale residual.
+        for _row_index, step in denoise_steps:
+            residual_state = getattr(step.extra.get("img"), "residual_cache", None)
+            if residual_state is not None:
+                residual_state.invalidate()
         if run_packed_mixed_forward(self, batch, request_states, denoise_steps, results):
             return results
         raise capability_mismatch(
