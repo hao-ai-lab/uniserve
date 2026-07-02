@@ -56,13 +56,16 @@ gpu = [
 
 [project.scripts]
 uniserve-worker = "uniserve_worker.main:main"
-uniserve-bench = "benchmarks.serving.uniserve_bench.cli:main"
+uniserve-e2e = "uniserve_e2e.cli:main"
 
 [tool.setuptools.packages.find]
 # Optional kernel provider packs are packaged independently (for example
 # `uniserve_kernel/pyproject.toml`) so the root worker distribution cannot mask
 # a missing provider install.
-include = ["uniserve_worker*", "benchmarks*"]
+include = ["uniserve_worker*", "uniserve_e2e*"]
+
+[tool.setuptools.package-data]
+uniserve_e2e = ["profiles.json", "data/*.jsonl", "harness/schemas/*.json"]
 
 # Native worker IPC extension (PyO3).
 [[tool.setuptools-rust.ext-modules]]
@@ -106,9 +109,9 @@ ignore = ["E501"]
 [tool.mypy]
 python_version = "3.11"
 # Source of truth for the type-check scope. Must match the explicit paths
-# passed by CI (.github/workflows/ci.yml) and the Makefile `lint` target
-# (`mypy uniserve_worker benchmarks`) so bare/editor invocations agree with CI.
-files = ["uniserve_worker", "benchmarks"]
+# passed by CI (.github/workflows/ci.yml) and the justfile `lint` target
+# (`mypy uniserve_worker uniserve_e2e`) so bare/editor invocations agree with CI.
+files = ["uniserve_worker", "uniserve_e2e"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -119,14 +122,14 @@ ignore_missing_imports = true
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
-# Keep aligned with [tool.mypy].files and the CI/Makefile type-check scope.
-include = ["uniserve_worker", "benchmarks"]
+# Keep aligned with [tool.mypy].files and the CI/justfile type-check scope.
+include = ["uniserve_worker", "uniserve_e2e"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"
 
 [tool.coverage.run]
 branch = true
-source = ["uniserve_worker", "benchmarks"]
+source = ["uniserve_worker", "uniserve_e2e"]
 
 [tool.coverage.report]
 show_missing = true
