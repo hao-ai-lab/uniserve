@@ -129,11 +129,11 @@ Fast suites (architecture, unit, contract, model_compat shared-layers) plus
 the real workload:
 
 ```
-uniserve-e2e verify sensenova-travel-interleave-4x
+uniserve-eval verify sensenova-travel-interleave-4x
 ```
 
 Gates: image_count == 4, images 2048x1152, event_counts.image_step == 200,
 errors == [], images readable/coherent/non-duplicated, no
-`uniserve_e2e/profiles.json` diff. Behavior identity expected: the lift is
+`uniserve_eval/profiles.json` diff. Behavior identity expected: the lift is
 code motion plus literals replaced by attributes set to the same literals.
 Metrics vs pre-lift baseline are recorded in the PR/summary.

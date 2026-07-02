@@ -8,8 +8,6 @@ from pathlib import Path
 import httpx
 import pytest
 
-from uniserve_e2e.harness.runner import BenchmarkRunner
-from uniserve_e2e.harness.spec import BenchmarkSpec, TaskName
 from tests.python.e2e.http_helpers import (
     find_free_port,
     png_size_from_b64,
@@ -18,6 +16,8 @@ from tests.python.e2e.http_helpers import (
     server_process,
     tiny_input_png_b64,
 )
+from uniserve_eval.harness.runner import BenchmarkRunner
+from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 
 pytestmark = [pytest.mark.e2e]
 

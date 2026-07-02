@@ -8,7 +8,7 @@ so >1.0 always reads "candidate is better". The table prints to stdout and is
 written with its raw data under ``<artifact_root>/comparisons/<name>/`` as
 ``compare.md`` + ``compare.json``.
 
-Runs standalone (``uniserve-e2e compare <workload> <workload> [...]``) and
+Runs standalone (``uniserve-eval compare <workload> <workload> [...]``) and
 automatically after suites that declare ``compare`` groups.
 """
 
@@ -58,7 +58,7 @@ def _load_summaries(config: dict[str, Any], names: list[str]) -> dict[str, dict[
         if not path.exists():
             raise SystemExit(
                 f"no summary for workload {name!r} at {path}; "
-                f"run the point first: uniserve-e2e perf {name}"
+                f"run the point first: uniserve-eval perf {name}"
             )
         summaries[name] = json.loads(path.read_text(encoding="utf-8"))
     return summaries

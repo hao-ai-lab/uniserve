@@ -144,7 +144,7 @@ crates/                        Rust workspace (see Cargo.toml for the full crate
   server/                      HTTP + gRPC server apps
   bin/                         the `uniserve` CLI binary
 uniserve_worker/               forward-only Python worker: models, layers, model loaders, runtime
-uniserve_e2e/                  e2e verification driver + serving measurement harness (`uniserve-e2e`)
+uniserve_eval/                  serving evaluation driver + measurement harness (`uniserve-eval`)
 justfile                       development & release recipes (replaces Makefile)
 ```
 
