@@ -103,6 +103,7 @@ from ...runtime.tower_handoff import (
 )
 from ...runtime.transfer import Locator
 from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
+from ...execution.denoise_step_graph import release_denoise_step_graphs
 from ...execution.input_image_ingest import InputImageIngestDriver
 from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
 from ...execution.interleaved_image_denoise import (
@@ -2546,6 +2547,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def _release_image_state_caches(self, image_state: ImageState | None) -> None:
         if image_state is None:
             return
+        # Denoise-step CUDA graphs are keyed on this image's staged CFG caches;
+        # free them (and their graph-scoped attention wrappers) before the
+        # scratch blocks are reclaimed.
+        release_denoise_step_graphs(self, image_state)
         # The latent trajectory lives in the system LatentPool; free its handle
         # so the buffer is reclaimed at commit/drop.
         self.residency.latent.free(image_state.latent_handle)

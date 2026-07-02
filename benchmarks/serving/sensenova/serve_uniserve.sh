@@ -8,6 +8,9 @@
 #   TEACACHE_THRESHOLD=0.2
 #   DECODE_BURST=8            worker-side decode burst length (1 disables; greedy
 #                             text decode only — semantics-identical, ~+20% tok/s)
+#   DENOISE_GRAPH=0           1 -> capture/replay the batched denoise step as a
+#                             per-image CUDA graph (UNISERVE_DENOISE_STEP_GRAPH).
+#                             Net win at TP4 (CPU-launch-bound); leave off at TP1.
 #
 # Writes the server pid to $RUN_DIR/uniserve.pid and logs to $RUN_DIR/uniserve.log.
 set -euo pipefail
@@ -33,6 +36,10 @@ fi
 if [[ "$TEACACHE" == "1" ]]; then
   export UNISERVE_DENOISE_RESIDUAL_CACHE=1
   export UNISERVE_DENOISE_RESIDUAL_CACHE_THRESHOLD="$TEACACHE_THRESHOLD"
+fi
+
+if [[ "${DENOISE_GRAPH:-0}" == "1" ]]; then
+  export UNISERVE_DENOISE_STEP_GRAPH=1
 fi
 
 nohup "$ROOT/target/debug/uniserve" serve "$MODEL" \

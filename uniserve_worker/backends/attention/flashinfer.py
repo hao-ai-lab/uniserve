@@ -334,9 +334,17 @@ class FlashInferAttentionBackend(_WrapperPool):
             raise RuntimeError("flashinfer paged prefill wrapper is not available")
         inputs = self._prepare_varlen_prefill_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k, block_table)
 
-        wrapper_key, wrapper = self._prefill_wrapper(inputs.q.device)
         ctx = get_forward_context()
         metadata = getattr(ctx, "attention_metadata", None)
+        # Metadata-identity routing: a forward whose context carries a bound
+        # graph metadata sentinel runs on that graph's exclusive wrapper (so the
+        # capture warmup plans it and the capture bakes only its ``run``); all
+        # other forwards keep the shared prefill wrapper.
+        graph_wrapper = self._prefill_graph_wrapper_for_metadata(metadata)
+        if graph_wrapper is not None:
+            wrapper_key, wrapper = graph_wrapper
+        else:
+            wrapper_key, wrapper = self._prefill_wrapper(inputs.q.device)
         plan_key = _prefill_plan_key(
             metadata,
             inputs.block_table,
@@ -523,6 +531,57 @@ class FlashInferAttentionBackend(_WrapperPool):
         )
         self._decode_plan_cache.remember(inputs.wrapper_key, plan_key, metadata)
         self._metadata_graph_wrappers[id(metadata)] = (inputs.wrapper_key, _weakref_or_none(metadata))
+
+    def bind_paged_prefill_graph_wrapper(self, metadata: Any, *, device: torch.device | str) -> None:
+        """Bind ``metadata`` to a graph-scoped *exclusive* prefill wrapper.
+
+        A captured prefill ``wrapper.run`` bakes the wrapper's plan (its host
+        ``_plan_info`` scalars plus the device int-workspace contents written by
+        ``plan``) into the CUDA graph. The shared prefill wrapper is re-planned
+        by every other varlen forward in the process, so a graph that captured
+        it would replay against a foreign plan. Binding allocates a fresh
+        ``scope`` nonce and routes every ``forward_varlen`` whose forward
+        context carries ``metadata`` (identity) to the exclusive wrapper; the
+        capture warmup then builds its plan once through the normal path and
+        nothing else can ever invalidate it. Release with
+        :meth:`release_paged_prefill_graph_wrapper` when the graph is freed.
+        """
+
+        if _BatchPrefillWithPagedKVCacheWrapper is None:
+            raise RuntimeError("flashinfer paged prefill wrapper is not available")
+        if metadata is None:
+            raise ValueError("graph prefill wrapper binding requires a metadata identity")
+        from .flashinfer_pool import _PREFILL_GRAPH_SCOPES
+
+        scope = next(_PREFILL_GRAPH_SCOPES)
+        key, _wrapper = self._prefill_graph_wrapper(torch.device(device), scope=scope)
+        self._metadata_prefill_graph_wrappers[id(metadata)] = (key, _weakref_or_none(metadata))
+
+    def paged_prefill_graph_wrapper_planned(self, metadata: Any) -> bool:
+        """Whether the wrapper bound to ``metadata`` has been planned.
+
+        The denoise-step graph runner asserts this after capture: if the
+        dispatcher routed the captured attention to a different backend, the
+        exclusive wrapper never planned and the capture must be discarded
+        rather than replayed against undefined plan state.
+        """
+
+        bound = self._prefill_graph_wrapper_for_metadata(metadata)
+        if bound is None:
+            return False
+        _key, wrapper = bound
+        return getattr(wrapper, "_plan_info", None) is not None
+
+    def release_paged_prefill_graph_wrapper(self, metadata: Any) -> None:
+        """Drop the exclusive prefill wrapper (and its caches) bound to ``metadata``."""
+
+        entry = self._metadata_prefill_graph_wrappers.pop(id(metadata), None)
+        if entry is None:
+            return
+        wrapper_key, _metadata_ref = entry
+        self._prefill_wrappers.pop(wrapper_key, None)
+        self._prefill_plan_workspaces.pop(wrapper_key, None)
+        self._prefill_plan_cache.forget(wrapper_key)
 
     def _decode_graph_plan_inputs(
         self,

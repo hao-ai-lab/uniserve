@@ -41,6 +41,7 @@ from .denoise_residual_cache import (
     ImageResidualCacheState,
     resolve_denoise_residual_cache_policy,
 )
+from .denoise_step_graph import maybe_run_denoise_step_graph
 from .interleaved_text_stepper import TextCache
 
 __all__ = [
@@ -761,6 +762,12 @@ class TextImageDenoiseOps:
         img = first.img
         for row in rows:
             self._wait_gen_cache_ready(row.cache)
+        # Capture-or-replay the whole batched step as one CUDA graph when the
+        # per-image geometry allows it (env-gated, default off); ``None`` means
+        # the eager path below stays authoritative.
+        graphed = maybe_run_denoise_step_graph(self, rows, return_hidden=return_hidden)
+        if graphed is not None:
+            return graphed
         image_embeds = torch.cat([row.step.extra["image_embeds"] for row in rows], dim=0)
         indexes = torch.stack([row.indexes for row in rows], dim=1).contiguous()
         cache = BatchedPagedTextCache([row.cache for row in rows])
