@@ -82,7 +82,6 @@ from ...nn.quant import (
     use_quantization_config,
 )
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
-from ...runtime.block_allocator import BlockFreeList
 from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
 from ...runtime.paged_text_cache import PagedTextCache, stage_paged_text_cache_prefix
@@ -2079,8 +2078,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.kv_pool: PagedKVPool | None = None
         self.scratch_pool: PagedKVPool | None = None
         self.gen_scratch_pool: PagedKVPool | None = None
-        self._scratch_allocator = BlockFreeList()
-        self._gen_scratch_allocator = BlockFreeList()
         self._scratch_blocks = 0
         self.residency = ResidencyManager()
 
@@ -2121,10 +2118,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.kv_pool = self.residency.kv
         self.scratch_pool = self.residency.scratch
         self.gen_scratch_pool = self.residency.gen_scratch
-        self._scratch_allocator.reset(scratch_blocks)
         self._scratch_blocks = scratch_blocks
-        if gen_blocks is not None:
-            self._gen_scratch_allocator.reset(gen_blocks)
 
     def _ensure_rope_buffers_on_device(self, device: torch.device | str) -> None:
         if self.model is None:
@@ -2353,14 +2347,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             raise invalid_descriptor("commit locator must be a typed data-plane Locator")
         return locator.to_wire_json()
 
-    def allocate_gen_scratch_blocks(self, count: int) -> list[int]:
-        if self.gen_scratch_pool is None:
-            raise RuntimeError("SenseNova gen snapshot KV pool is not initialized")
-        return self._gen_scratch_allocator.allocate(
-            count,
-            label="SenseNova gen snapshot KV pool",
-        )
-
     def _resolve_tower_binding(self) -> TowerBinding:
         """Resolve the live destination residency + coordinates for a crossing.
 
@@ -2369,6 +2355,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         the per-branch scratch pool as a writable replica, byte-identical to the
         single-device path."""
         if self._tower_coords is not None:
+            allocate_blocks = self.residency.require_allocator_for_pool(
+                self.gen_scratch_pool,
+                label="SenseNova gen snapshot KV pool",
+            )
             return TowerBinding(
                 transport=self._tower_transport,
                 primary_coord=self._tower_coords[Modality.TEXT],
@@ -2377,8 +2367,12 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                 block_size=self.block_size,
                 target_pool=self.gen_scratch_pool,
                 target_device=self.gen_device,
-                allocate_blocks=self.allocate_gen_scratch_blocks,
+                allocate_blocks=allocate_blocks,
             )
+        allocate_blocks = self.residency.require_allocator_for_pool(
+            self.scratch_pool,
+            label="SenseNova scratch KV pool",
+        )
         return TowerBinding(
             transport=None,
             primary_coord=0,
@@ -2387,7 +2381,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             block_size=self.block_size,
             target_pool=self.scratch_pool,
             target_device=self.device,
-            allocate_blocks=self.allocate_scratch_blocks,
+            allocate_blocks=allocate_blocks,
         )
 
     def _denoise_cache(self, cache: Any) -> Any:
@@ -2395,16 +2389,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
 
         The whole und->gen KV crossing is owned by :class:`TowerHandoff`."""
         return self._tower_handoff.stage_conditioning(cache)
-
-    def _allocator_for_cache(self, cache: Any) -> Any:
-        pool = getattr(cache, "pool", None)
-        if pool is self.kv_pool:
-            return None
-        if pool is self.gen_scratch_pool:
-            return self.allocate_gen_scratch_blocks
-        if pool is self.scratch_pool:
-            return self.allocate_scratch_blocks
-        return None
 
     def bind_data_plane_handoff(self, transport: Any) -> None:
         """Bind the Mode-A cross-process und<->gen handoff to a data-plane transport.
@@ -2487,7 +2471,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         if replica is None:
             return
         target.past = replica
-        target.past.allocate_blocks = self._allocator_for_cache(replica)
+        target.past.allocate_blocks = self.residency.allocator_for_cache(replica)
         target.block_ids = list(replica.block_ids)
         target.t_index = int(t_index)
         target.last_token_id = (
@@ -2508,7 +2492,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             return
         snapshot = ConditioningSnapshot.from_wire(locator)
         for cache in (st.cond, st.tu, st.iu):
-            self._release_scratch_cache(getattr(cache, "past", None))
+            self.residency.release_scratch_cache(getattr(cache, "past", None))
         st.cond = TextCache()
         st.tu = TextCache()
         st.iu = TextCache()
@@ -2516,7 +2500,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         if replica is None:
             return
         st.cond.past = replica
-        st.cond.past.allocate_blocks = self._allocator_for_cache(replica)
+        st.cond.past.allocate_blocks = self.residency.allocator_for_cache(replica)
         st.cond.block_ids = list(replica.block_ids)
         st.cond.t_index = int(snapshot.t_index)
         st.cond.last_token_id = (
@@ -2566,7 +2550,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             if cache is None or cache_id in seen or cache_id in live_cache_ids:
                 continue
             seen.add(cache_id)
-            self._release_scratch_cache(cache)
+            self.residency.release_scratch_cache(cache)
 
     def _text_driver(self) -> InterleavedTextCacheDriver:
         driver = getattr(self, "_shared_text_driver", None)
@@ -2845,14 +2829,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         for handle in handles or []:
             self.residency.encoder.pop(int(handle))
 
-    def allocate_scratch_blocks(self, count: int) -> list[int]:
-        if self.scratch_pool is None:
-            raise RuntimeError("SenseNova scratch KV pool is not initialized")
-        return self._scratch_allocator.allocate(
-            count,
-            label="SenseNova scratch KV pool",
-        )
-
     def on_new_request(self, req_id: int, state: RunnerRequestState) -> None:
         self.runner_states[int(req_id)] = state
         image_state = self._new_interleaved_image_state(state)
@@ -2888,18 +2864,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         st = self.reqs.pop(req_id, None)
         if st is not None:
             self._release_image_state_caches(st.image_state)
-            self._release_scratch_cache(st.tu.past)
-            self._release_scratch_cache(st.iu.past)
-
-    def _release_scratch_cache(self, cache: Any) -> None:
-        if cache is None:
-            return
-        pool = getattr(cache, "pool", None)
-        block_ids = [int(block_id) for block_id in getattr(cache, "block_ids", [])]
-        if self.scratch_pool is not None and pool is self.scratch_pool:
-            self._scratch_allocator.release(block_ids)
-        elif self.gen_scratch_pool is not None and pool is self.gen_scratch_pool:
-            self._gen_scratch_allocator.release(block_ids)
+            self.residency.release_scratch_cache(st.tu.past)
+            self.residency.release_scratch_cache(st.iu.past)
 
     def prepare_denoise(self, state: RunnerRequestState, op: dict[str, Any] | Any) -> TextImageDenoiseStep:
         req_id = int(op["req_id"])
@@ -2952,12 +2918,12 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         target_pool: PagedKVPool,
         end_len: int,
     ) -> PagedTextCache:
-        if target_pool is self.gen_scratch_pool:
-            allocator = self.allocate_gen_scratch_blocks
-        elif target_pool is self.scratch_pool:
-            allocator = self.allocate_scratch_blocks
-        else:
+        if target_pool is not self.gen_scratch_pool and target_pool is not self.scratch_pool:
             raise RuntimeError("forward text staging target must be a scratch KV pool")
+        allocator = self.residency.require_allocator_for_pool(
+            target_pool,
+            label="forward scratch KV pool",
+        )
         return stage_paged_text_cache_prefix(
             source,
             target_pool=target_pool,

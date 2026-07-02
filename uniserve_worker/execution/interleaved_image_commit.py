@@ -41,16 +41,15 @@ class GeneratedImageCommitOwner(InterleavedModelOwner, Protocol):
     """Collaborator surface the commit driver needs beyond the base owner.
 
     Extends :class:`~uniserve_worker.execution.interleaved_text_stepper.InterleavedModelOwner`
-    with cache-allocator and image-parameter access plus the dataplane commit
-    hooks. The dataplane hooks are exercised only when ``_dataplane_handoff``
-    is not ``None``; single-device owners may implement them as raising stubs.
+    with image-parameter access plus the dataplane commit hooks. The dataplane
+    hooks are exercised only when ``_dataplane_handoff`` is not ``None``;
+    single-device owners may implement them as raising stubs.
     """
 
     latent_downsample: int
     residency: Any                 # ResidencyManager; .latent backs ImageState.x_t
     _dataplane_handoff: Any | None
 
-    def _allocator_for_cache(self, cache: Any) -> Any: ...
     def _parse_image_params(self, ip: dict) -> Any: ...
     def publish_generated_latent_for_commit(self, image_state: Any) -> Any: ...
     def fetch_commit_latent(self, locator: Any) -> torch.Tensor: ...
@@ -135,9 +134,9 @@ class GeneratedImageCommitDriver:
             locator = self.owner.publish_generated_latent_for_commit(image_state)
             st.image_state = None
             self.owner._release_image_state_caches(image_state)
-            self.owner._release_scratch_cache(st.cond.past)
-            self.owner._release_scratch_cache(st.tu.past)
-            self.owner._release_scratch_cache(st.iu.past)
+            self.owner.residency.release_scratch_cache(st.cond.past)
+            self.owner.residency.release_scratch_cache(st.tu.past)
+            self.owner.residency.release_scratch_cache(st.iu.past)
             st.cond = TextCache()
             st.tu = TextCache()
             st.iu = TextCache()
@@ -152,10 +151,14 @@ class GeneratedImageCommitDriver:
             self.owner._extend_cache_blocks(st.cond, op)
             self.owner._ensure_host_cache(st.cond)
             if st.cond.past is not None:
-                st.cond.past.allocate_blocks = self.owner._allocator_for_cache(st.cond.past)
+                st.cond.past.allocate_blocks = self.owner.residency.allocator_for_cache(
+                    st.cond.past
+                )
             self.append_generated_image(st.cond, image_state)
             if st.tu.past is not None:
-                st.tu.past.allocate_blocks = self.owner._allocator_for_cache(st.tu.past)
+                st.tu.past.allocate_blocks = self.owner.residency.allocator_for_cache(
+                    st.tu.past
+                )
                 self.append_generated_image(st.tu, image_state)
         return self._finalize_commit(op, st, image_state, png_b64)
 
@@ -175,10 +178,14 @@ class GeneratedImageCommitDriver:
             self.owner._extend_cache_blocks(st.cond, op)
             self.owner._ensure_host_cache(st.cond)
             if st.cond.past is not None:
-                st.cond.past.allocate_blocks = self.owner._allocator_for_cache(st.cond.past)
+                st.cond.past.allocate_blocks = self.owner.residency.allocator_for_cache(
+                    st.cond.past
+                )
             self.append_generated_image(st.cond, image_state)
             if st.tu.past is not None:
-                st.tu.past.allocate_blocks = self.owner._allocator_for_cache(st.tu.past)
+                st.tu.past.allocate_blocks = self.owner.residency.allocator_for_cache(
+                    st.tu.past
+                )
                 self.append_generated_image(st.tu, image_state)
         return self._finalize_commit(op, st, image_state, None)
 
@@ -232,7 +239,7 @@ class GeneratedImageCommitDriver:
         logits = st.cond.last_logits[:, -1, :].float()
         st.image_state = None
         self.owner._release_image_state_caches(image_state)
-        self.owner._release_scratch_cache(st.iu.past)
+        self.owner.residency.release_scratch_cache(st.iu.past)
         st.iu = TextCache()
         out = {
             "req_id": op["req_id"],

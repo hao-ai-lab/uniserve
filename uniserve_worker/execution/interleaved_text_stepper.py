@@ -119,6 +119,7 @@ class InterleavedModelOwner(Protocol):
     reqs: dict[int, Any]
     kv_pool: "PagedKVPool | None"
     scratch_pool: "PagedKVPool | None"
+    residency: Any
     num_layers: int
     eos_id: int
     img_start_id: int
@@ -127,7 +128,6 @@ class InterleavedModelOwner(Protocol):
     # Collaborator methods. Model-specific state types (the request state / image
     # state) are kept ``Any`` here: this system component is duck-typed against the
     # concrete model and must not name model-layer types.
-    def allocate_scratch_blocks(self, count: int) -> list[int]: ...
     def interleaved_text_forward(self, **kwargs: Any) -> Any: ...
     def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
     def interleaved_text_inputs(self, query: str) -> tuple[torch.Tensor, torch.Tensor, Any]: ...
@@ -144,7 +144,6 @@ class InterleavedModelOwner(Protocol):
     def _state(self, op: dict[str, Any]) -> Any: ...
     def _extend_cache_blocks(self, cache: "TextCache", op: dict[str, Any]) -> None: ...
     def _ensure_host_cache(self, cache: "TextCache") -> None: ...
-    def _release_scratch_cache(self, cache: Any) -> None: ...
     def _release_image_state_caches(self, image_state: Any) -> None: ...
     def _prepare_generated_image_for_commit(self, image_state: Any) -> torch.Tensor: ...
 
@@ -244,11 +243,15 @@ class InterleavedTextCacheDriver:
             return
         if self.owner.scratch_pool is None:
             raise model_execution_error("scratch KV pool is not initialized")
+        allocate_blocks = self.owner.residency.require_allocator_for_pool(
+            self.owner.scratch_pool,
+            label="scratch KV pool",
+        )
         cache.past = PagedTextCache(
             self.owner.scratch_pool,
             [],
             num_layers=self.owner.num_layers,
-            allocate_blocks=self.owner.allocate_scratch_blocks,
+            allocate_blocks=allocate_blocks,
         )
 
     def prefix_forward_ids(self, cache: TextCache, tokens: list[int], start: int = 0) -> None:
