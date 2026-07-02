@@ -112,6 +112,11 @@ class _PlanCache:
     ) -> None:
         self._plan_keys[wrapper_key] = (plan_key, _weakref_or_none(metadata))
 
+    def forget(self, wrapper_key: "WrapperKey") -> None:
+        """Drop the cached plan for ``wrapper_key`` (graph-scoped wrapper release)."""
+
+        self._plan_keys.pop(wrapper_key, None)
+
     def plan_or_reuse(
         self,
         *,

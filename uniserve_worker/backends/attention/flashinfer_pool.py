@@ -1,6 +1,7 @@
 """FlashInfer wrapper pool, workspace buffers, and plan-tensor workspaces."""
 from __future__ import annotations
 
+import itertools
 import weakref
 from typing import Any, NamedTuple
 
@@ -16,6 +17,11 @@ from .flashinfer_plan import (
 
 _DEFAULT_WORKSPACE_SIZE = 512 * 1024 * 1024
 
+# Nonce source for graph-scoped exclusive prefill wrappers. Each CUDA-graph
+# capture that bakes a prefill ``wrapper.run`` binds its own wrapper keyed by a
+# fresh scope so no other plan call can ever touch the captured wrapper's state.
+_PREFILL_GRAPH_SCOPES = itertools.count(1)
+
 
 class WrapperKey(NamedTuple):
     """Identity of a cached flashinfer wrapper and its plan caches.
@@ -27,7 +33,9 @@ class WrapperKey(NamedTuple):
     discriminating fields (``kind``, ``backend``) are read by name instead of by
     index. ``kind`` is one of ``"decode"``, ``"decode_graph"`` or ``"prefill"``;
     ``use_tensor_cores`` is ``None`` for prefill keys and ``batch_size`` /
-    ``max_indices`` are set only for cuda-graph decode keys.
+    ``max_indices`` are set only for cuda-graph decode keys. ``scope`` is a
+    nonce isolating a graph-scoped *exclusive* prefill wrapper (one per captured
+    graph); the shared prefill wrapper keeps ``scope=None``.
     """
 
     kind: str
@@ -36,6 +44,7 @@ class WrapperKey(NamedTuple):
     use_tensor_cores: bool | None = None
     batch_size: int | None = None
     max_indices: int | None = None
+    scope: int | None = None
 
     @property
     def is_graph(self) -> bool:
@@ -65,6 +74,7 @@ class _WrapperPool:
         self._decode_plan_workspaces: dict[WrapperKey, _DecodePlanWorkspace] = {}
         self._prefill_plan_workspaces: dict[WrapperKey, _PrefillPlanWorkspace] = {}
         self._metadata_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
+        self._metadata_prefill_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
         self._decode_fast_plan_signatures: dict[WrapperKey, tuple[Any, ...]] = {}
 
     def _decode_wrapper(
@@ -159,6 +169,45 @@ class _WrapperPool:
             )
             self._prefill_wrappers[key] = wrapper
         return key, wrapper
+
+    def _prefill_graph_wrapper(self, device: torch.device, *, scope: int) -> tuple[WrapperKey, Any]:
+        """Construct (or return) the exclusive prefill wrapper for ``scope``.
+
+        Exclusive wrappers share the device float workspace (transient kernel
+        scratch, serialized on the compute stream) but own their int workspace,
+        so a plan against the shared prefill wrapper can never mutate the plan
+        state a captured graph baked from this one.
+        """
+        from . import flashinfer as _fi
+
+        device_key = _device_key(device)
+        backend = get_worker_config().flashinfer.prefill_backend
+        key = WrapperKey("prefill", device_key, backend, scope=int(scope))
+        wrapper = self._prefill_wrappers.get(key)
+        if wrapper is None:
+            workspace = self._workspace(device)
+            wrapper = _fi._BatchPrefillWithPagedKVCacheWrapper(
+                workspace,
+                "NHD",
+                backend=backend,
+            )
+            self._prefill_wrappers[key] = wrapper
+        return key, wrapper
+
+    def _prefill_graph_wrapper_for_metadata(self, metadata: Any) -> tuple[WrapperKey, Any] | None:
+        if metadata is None:
+            return None
+        entry = self._metadata_prefill_graph_wrappers.get(id(metadata))
+        if entry is None:
+            return None
+        wrapper_key, metadata_ref = entry
+        if metadata_ref is not None and metadata_ref() is not metadata:
+            self._metadata_prefill_graph_wrappers.pop(id(metadata), None)
+            return None
+        wrapper = self._prefill_wrappers.get(wrapper_key)
+        if wrapper is None:
+            return None
+        return wrapper_key, wrapper
 
     def _plan_decode(
         self,
