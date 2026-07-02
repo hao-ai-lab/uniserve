@@ -16,12 +16,13 @@ STEPS="${STEPS:-50}"
 WIDTH="${WIDTH:-2048}"
 HEIGHT="${HEIGHT:-1152}"
 SEED="${SEED:-42}"
+MODEL_NAME="${MODEL_NAME:-SenseNova-U1}"
 PY="$ROOT/.venv/bin/python"
 
 case "$KIND" in
   t2i)
     exec "$PY" -m benchmarks.serving.uniserve_bench.cli \
-      --base-url "$BASE_URL" --task t2i --model SenseNova-U1 \
+      --base-url "$BASE_URL" --task t2i --model "$MODEL_NAME" \
       --output-dir "$OUT" \
       --dataset trace --dataset-path "$ROOT/benchmarks/serving/sensenova/t2i_prompts.jsonl" \
       --num-prompts "$NUM_PROMPTS" --max-concurrency 1 --warmup-requests 1 \
@@ -31,7 +32,7 @@ case "$KIND" in
     WIRE=native
     [[ "$KIND" == "i2t-chat" ]] && WIRE=openai_chat
     exec "$PY" -m benchmarks.serving.uniserve_bench.cli \
-      --base-url "$BASE_URL" --task i2t --model SenseNova-U1 \
+      --base-url "$BASE_URL" --task i2t --model "$MODEL_NAME" \
       --output-dir "$OUT" \
       --dataset synthetic-images \
       --num-prompts "$NUM_PROMPTS" --max-concurrency 1 --warmup-requests 1 \
