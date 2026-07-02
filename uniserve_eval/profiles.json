@@ -494,7 +494,7 @@
       ],
       "description": "vLLM-Omni comparison point: byte-for-byte the same workload as bagel-i2t-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
     },
-    "sensenova-t2i-mjhq": {
+    "sensenova-t2i-mjhq-smoke": {
       "type": "perf",
       "server": "sensenova-u1-perf",
       "task": "t2i",
@@ -521,9 +521,9 @@
           "max": 8000
         }
       },
-      "description": "Real-dataset t2i point: 8 MJHQ-30K photography captions (auto-downloaded from HF) at 2048x1152, 50 steps, seed 42. Same bounds as the trace-based tripwire; exercises realistic prompt lengths/content instead of the committed prompt set."
+      "description": "Real-dataset t2i point: 8 MJHQ-30K photography captions (auto-downloaded from HF) at 2048x1152, 50 steps, seed 42. Same bounds as the trace-based tripwire; exercises realistic prompt lengths/content instead of the committed prompt set. Smoke profile: small N for quick signal."
     },
-    "bagel-t2i-mjhq": {
+    "bagel-t2i-mjhq-smoke": {
       "type": "perf",
       "server": "bagel-single",
       "task": "t2i",
@@ -550,9 +550,9 @@
           "max": 10000
         }
       },
-      "description": "Real-dataset t2i point for BAGEL: 8 MJHQ-30K captions at 1024x1024, 50 steps, seed 42."
+      "description": "Real-dataset t2i point for BAGEL: 8 MJHQ-30K captions at 1024x1024, 50 steps, seed 42. Smoke profile: small N for quick signal."
     },
-    "sensenova-interleave-ueval": {
+    "sensenova-interleave-ueval-smoke": {
       "type": "perf",
       "server": "sensenova-u1-perf",
       "task": "interleave",
@@ -583,7 +583,98 @@
           "max": 9
         }
       },
-      "description": "Real-dataset interleave point: 3 UEval prompts (zlab-princeton/UEval \u2014 1000 real interleaved-generation tasks like 'show each step both visually and textually'), up to 2 images each at 2048x1152/50 steps. The model decides image count/placement per prompt, so image totals vary; stream metrics gate only text ITL (image spans are excluded from ITL by the harness). Complements the deterministic tour-guide gate with realistic prompt diversity."
+      "description": "Real-dataset interleave point: 3 UEval prompts (zlab-princeton/UEval \u2014 1000 real interleaved-generation tasks like 'show each step both visually and textually'), up to 2 images each at 2048x1152/50 steps. The model decides image count/placement per prompt, so image totals vary; stream metrics gate only text ITL (image spans are excluded from ITL by the harness). Complements the deterministic tour-guide gate with realistic prompt diversity. Smoke profile: small N for quick signal."
+    },
+    "sensenova-t2i-mjhq-full": {
+      "type": "perf",
+      "server": "sensenova-u1-perf",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "mjhq",
+        "--num-prompts",
+        "100",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "2048",
+        "--height",
+        "1152"
+      ],
+      "expect_metrics": {
+        "image_latency_ms.mean": {
+          "max": 8000
+        }
+      },
+      "description": "Real-dataset t2i, full profile: 100 MJHQ-30K photography captions (auto-downloaded from HF) at 2048x1152, 50 steps, seed 42 \u2014 ~10 min at healthy speed, for stable percentiles. Use -smoke (8 prompts) for iteration."
+    },
+    "bagel-t2i-mjhq-full": {
+      "type": "perf",
+      "server": "bagel-single",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "mjhq",
+        "--num-prompts",
+        "100",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "1024",
+        "--height",
+        "1024"
+      ],
+      "expect_metrics": {
+        "image_latency_ms.mean": {
+          "max": 10000
+        }
+      },
+      "description": "Real-dataset t2i for BAGEL, full profile: 100 MJHQ-30K captions at 1024x1024, 50 steps, seed 42 \u2014 ~12 min at healthy speed. Use -smoke for iteration."
+    },
+    "sensenova-interleave-ueval-full": {
+      "type": "perf",
+      "server": "sensenova-u1-perf",
+      "task": "interleave",
+      "args": [
+        "--dataset",
+        "ueval",
+        "--num-prompts",
+        "1000",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--max-tokens",
+        "2048",
+        "--max-images",
+        "2",
+        "--width",
+        "2048",
+        "--height",
+        "1152",
+        "--steps",
+        "50",
+        "--seed",
+        "42"
+      ],
+      "expect_metrics": {
+        "mean_itl_ms": {
+          "max": 9
+        }
+      },
+      "description": "Real-dataset interleave, full profile: the complete 1,000-prompt UEval set (zlab-princeton/UEval), up to 2 images each at 2048x1152/50 steps \u2014 a serious run, ~6 h at ~21 s/request. The model decides image count/placement per prompt; gates only text ITL (image spans excluded by the harness). Use -smoke (3 prompts) for iteration."
     }
   },
   "suites": {
@@ -689,11 +780,18 @@
         ]
       ]
     },
-    "realdata-perf": {
+    "realdata-smoke": {
       "workloads": [
-        "sensenova-t2i-mjhq",
-        "sensenova-interleave-ueval",
-        "bagel-t2i-mjhq"
+        "sensenova-t2i-mjhq-smoke",
+        "sensenova-interleave-ueval-smoke",
+        "bagel-t2i-mjhq-smoke"
+      ]
+    },
+    "realdata-full": {
+      "workloads": [
+        "sensenova-t2i-mjhq-full",
+        "sensenova-interleave-ueval-full",
+        "bagel-t2i-mjhq-full"
       ]
     }
   }
