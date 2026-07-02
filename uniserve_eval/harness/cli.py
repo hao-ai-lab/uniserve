@@ -8,12 +8,12 @@ them.
 Examples:
 
   # LLM serving (ShareGPT), sglang-comparable
-  python -m uniserve_e2e.harness.cli \
+  python -m uniserve_eval.harness.cli \
       --base-url http://127.0.0.1:18080 --task text --model Qwen3-32B \
       --num-prompts 1000 --request-rate inf --output-dir results/text
 
   # text-to-image (MJHQ-30K) latency/throughput at a few concurrencies
-  python -m uniserve_e2e.harness.cli \
+  python -m uniserve_eval.harness.cli \
       --base-url http://127.0.0.1:18080 --task t2i --model SenseNova-U1 \
       --num-prompts 200 --max-concurrencies 1,2,4 --output-dir results/t2i
 """
@@ -32,7 +32,7 @@ from .spec import DEFAULT_DATASETS, DEFAULT_ENDPOINTS, BenchmarkSpec, TaskName
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="uniserve-e2e-harness", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="uniserve-eval-harness", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--task", required=True, choices=[task.value for task in TaskName])

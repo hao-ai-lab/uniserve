@@ -548,7 +548,7 @@ def test_backend_provider_pack_imports_do_not_mutate_sys_path_or_use_env_paths()
     """Kernel providers are importable packages, never runtime path injections."""
 
     offenders: list[str] = []
-    for root in (WORKER, ROOT / "uniserve_kernel", ROOT / "scripts", ROOT / "uniserve_e2e"):
+    for root in (WORKER, ROOT / "uniserve_kernel", ROOT / "scripts", ROOT / "uniserve_eval"):
         if not root.exists():
             continue
         for path in _py_files(root):
@@ -670,7 +670,7 @@ def test_mixed_forward_side_tables_use_forward_names():
 def test_sensenova_qk_norm_rope_has_no_model_local_legacy_path():
     model_source = (WORKER / "models" / "sensenova" / "model.py").read_text(encoding="utf-8")
     provider_source = (WORKER / "ops" / "providers.py").read_text(encoding="utf-8")
-    config_source = (ROOT / "uniserve_e2e" / "profiles.json").read_text(encoding="utf-8")
+    config_source = (ROOT / "uniserve_eval" / "profiles.json").read_text(encoding="utf-8")
     spec_source = (ROOT / "specs" / "backend_ops.md").read_text(encoding="utf-8")
 
     assert "_qk_norm_rope_3d_legacy" not in model_source

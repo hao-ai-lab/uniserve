@@ -1,16 +1,16 @@
-# End-to-end verification and benchmarking (`uniserve-e2e`)
+# Serving Evaluation and Benchmarking (`uniserve-eval`)
 
-`uniserve_e2e` is the profile-driven package that launches serving backends, runs correctness gates against them over public HTTP APIs, runs performance points through its measurement harness — including vLLM-Omni comparison servers under byte-for-byte the same workloads — and compares measured points side by side. Everything it does is declared in `uniserve_e2e/profiles.json`; the code owns only mechanics. The CLI is installed as `uniserve-e2e` (equivalently `python -m uniserve_e2e`).
+`uniserve_eval` is the profile-driven package that launches serving backends, runs correctness gates against them over public HTTP APIs, runs performance points through its measurement harness — including vLLM-Omni comparison servers under byte-for-byte the same workloads — and compares measured points side by side. Everything it does is declared in `uniserve_eval/profiles.json`; the code owns only mechanics. The CLI is installed as `uniserve-eval` (equivalently `python -m uniserve_eval`).
 
 ```
-uniserve-e2e list                                    # servers / workloads / suites, with descriptions
-uniserve-e2e launch sensenova-u1-single              # start one server (pid + log under artifacts/)
-uniserve-e2e verify bagel-t2i-seed42                 # one correctness workload against it
-uniserve-e2e perf bagel-i2t-perf                     # one perf point (gated)
-uniserve-e2e perf sensenova-t2i-perf-omni            # the same point against vLLM-Omni (measured, ungated)
-uniserve-e2e compare sensenova-t2i-perf sensenova-t2i-perf-omni   # side-by-side table from their artifacts
-uniserve-e2e run verify-all --manage-servers         # a suite, launching/cleaning servers per workload
-uniserve-e2e clean --all                             # stop everything it started
+uniserve-eval list                                    # servers / workloads / suites, with descriptions
+uniserve-eval launch sensenova-u1-single              # start one server (pid + log under artifacts/)
+uniserve-eval verify bagel-t2i-seed42                 # one correctness workload against it
+uniserve-eval perf bagel-i2t-perf                     # one perf point (gated)
+uniserve-eval perf sensenova-t2i-perf-omni            # the same point against vLLM-Omni (measured, ungated)
+uniserve-eval compare sensenova-t2i-perf sensenova-t2i-perf-omni   # side-by-side table from their artifacts
+uniserve-eval run verify-all --manage-servers         # a suite, launching/cleaning servers per workload
+uniserve-eval clean --all                             # stop everything it started
 ```
 
 ## Concepts
@@ -31,11 +31,11 @@ These gates are UniServe-native-API-only by design; cross-backend comparison hap
 
 ### `perf` — measurement points (`perf` subcommand)
 
-Runs a point through the measurement harness (`uniserve_e2e/harness`, invoked as `python -m uniserve_e2e.harness.cli`) against the workload's server: `task` (t2i / i2t / text / interleave) plus raw harness `args` (dataset, sizes, steps, seed, concurrency, warmup). Optional `expect_metrics` gates dotted metric paths with min/max bounds; any failed request also fails the workload.
+Runs a point through the measurement harness (`uniserve_eval/harness`, invoked as `python -m uniserve_eval.harness.cli`) against the workload's server: `task` (t2i / i2t / text / interleave) plus raw harness `args` (dataset, sizes, steps, seed, concurrency, warmup). Optional `expect_metrics` gates dotted metric paths with min/max bounds; any failed request also fails the workload.
 
 Two flavors coexist:
 - **Tripwires** (UniServe servers, with bounds): deliberately loose floors/ceilings that trip only when a path regresses to a known-slow regime — e.g. BAGEL i2t falling from the graphed/burst decode (~160 tok/s) back to eager per-token (~16 tok/s). They are not headline numbers and are insensitive to run-to-run noise.
-- **Comparison points** (`*-omni`, no bounds): byte-for-byte the same workload — same prompt file (`uniserve_e2e/data/t2i_prompts.jsonl`), sizes, steps, seed, concurrency, warmup — against a vLLM-Omni server declared with an explicit launch `command`. Same harness, same metrics pipeline, so numbers are directly comparable. The i2t mirrors switch only the wire (`--i2t-wire openai_chat`, since vLLM-Omni's understanding path is its chat API and does not stream).
+- **Comparison points** (`*-omni`, no bounds): byte-for-byte the same workload — same prompt file (`uniserve_eval/data/t2i_prompts.jsonl`), sizes, steps, seed, concurrency, warmup — against a vLLM-Omni server declared with an explicit launch `command`. Same harness, same metrics pipeline, so numbers are directly comparable. The i2t mirrors switch only the wire (`--i2t-wire openai_chat`, since vLLM-Omni's understanding path is its chat API and does not stream).
 
 ### `script` — generic escape hatch
 
@@ -43,7 +43,7 @@ Runs `python <script> <args>` from the repo root with the workload's `env`, plus
 
 ## `compare` — side-by-side tables from measured artifacts
 
-`uniserve-e2e compare <workload> <workload> [...]` reads each workload's `artifacts/workloads/<name>/summary.json` (run the perf points first — it errors otherwise) and prints a markdown table with rows = metrics and one column per workload, plus a ratio column per candidate against the first workload (the baseline). Higher-is-better metrics (throughput, images/min) are reported as candidate/baseline; latency metrics as baseline/candidate — so >1.0 always reads "candidate is better". The metric set follows the summaries' `metric_family` (image: mean/p50 image latency + images/min; stream: output throughput, TTFT, ITL, E2E), plus request/ok counts and harness-sampled peak GPU memory when present; mixed families are refused. The table is also written to `artifacts/comparisons/<name>/compare.md` + `compare.json`. Suites with `compare` groups run these automatically after their workloads.
+`uniserve-eval compare <workload> <workload> [...]` reads each workload's `artifacts/workloads/<name>/summary.json` (run the perf points first — it errors otherwise) and prints a markdown table with rows = metrics and one column per workload, plus a ratio column per candidate against the first workload (the baseline). Higher-is-better metrics (throughput, images/min) are reported as candidate/baseline; latency metrics as baseline/candidate — so >1.0 always reads "candidate is better". The metric set follows the summaries' `metric_family` (image: mean/p50 image latency + images/min; stream: output throughput, TTFT, ITL, E2E), plus request/ok counts and harness-sampled peak GPU memory when present; mixed families are refused. The table is also written to `artifacts/comparisons/<name>/compare.md` + `compare.json`. Suites with `compare` groups run these automatically after their workloads.
 
 ## Workload catalog and expected behavior
 

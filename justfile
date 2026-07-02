@@ -22,8 +22,8 @@ bench-build:
 
 # Lint: fmt + clippy + ruff + mypy
 lint: fmt clippy
-    {{python}} -m ruff check uniserve_worker uniserve_e2e tests/python
-    {{python}} -m mypy uniserve_worker uniserve_e2e
+    {{python}} -m ruff check uniserve_worker uniserve_eval tests/python
+    {{python}} -m mypy uniserve_worker uniserve_eval
 
 # Fast Python tests (unit / contract / architecture)
 test-python-fast:
@@ -51,11 +51,11 @@ test-all: fmt clippy test-rust bench-build test-python-fast test-python-integrat
 
 # Quick benchmark smoke test
 bench-smoke: build-debug
-    {{python}} -m uniserve_e2e.harness.cli \
+    {{python}} -m uniserve_eval.harness.cli \
         --base-url http://127.0.0.1:18080 \
         --model sim-model \
         --task interleave \
         --dataset trace \
-        --dataset-path uniserve_e2e/data/smoke_trace.jsonl \
+        --dataset-path uniserve_eval/data/smoke_trace.jsonl \
         --output-dir results/benchmarks/smoke \
         --smoke
