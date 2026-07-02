@@ -322,8 +322,49 @@ def test_interleaved_text_execution_uses_owner_adapter_not_model_backbone():
     assert offenders == []
 
 
+def test_interleaved_image_engine_is_system_owned():
+    """The interleaved image denoise/commit orchestration is a system component.
+
+    The denoise engine (``TextImageDenoiseOps`` + state/protocol types) and the
+    generated-image commit driver live under ``execution`` (the system), not
+    ``models`` -- a model only provides the duck-typed compute primitives. A
+    model file may import these names (re-export), but must not *define* them.
+    """
+
+    owned_by_module = {
+        WORKER / "execution" / "interleaved_image_denoise.py": {
+            "ImageState",
+            "DenoiseRow",
+            "InterleavedImageRequestState",
+            "TextImageDenoiseOwner",
+            "TextImageDenoiseOps",
+        },
+        WORKER / "execution" / "interleaved_image_commit.py": {
+            "GeneratedImageCommitOwner",
+            "GeneratedImageCommitDriver",
+        },
+    }
+    for module, owned in owned_by_module.items():
+        assert module.is_file(), f"{_rel(module)} must exist (system interleaved image engine)"
+        defined = {
+            node.name
+            for node in ast.walk(ast.parse(module.read_text(encoding="utf-8")))
+            if isinstance(node, ast.ClassDef)
+        }
+        assert owned <= defined, f"{_rel(module)} must define {owned}, has {defined}"
+
+    all_owned = set().union(*owned_by_module.values())
+    offenders: list[str] = []
+    for path in _py_files(WORKER / "models"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name in all_owned:
+                offenders.append(f"{_rel(path)}::{node.name}")
+    assert offenders == [], f"models/ must not define system image-engine classes: {offenders}"
+
+
 def test_generated_image_commit_driver_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "execution" / "interleaved_image_denoise.py").read_text(
+    source = (WORKER / "execution" / "interleaved_image_commit.py").read_text(
         encoding="utf-8"
     )
     commit_driver_source = source[source.index("class GeneratedImageCommitDriver") :]

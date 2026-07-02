@@ -90,8 +90,8 @@ from ...runtime.tower_handoff import (
     TowerHandoff,
 )
 from ...runtime.transfer import Locator
+from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
 from ...execution.interleaved_image_denoise import (
-    GeneratedImageCommitDriver,
     ImageState,
     InterleavedImageRequestState,
     TextImageDenoiseOps,
