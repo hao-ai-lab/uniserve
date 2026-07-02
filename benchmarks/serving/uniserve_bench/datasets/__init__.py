@@ -12,19 +12,23 @@ from ..spec import BenchmarkSpec, TaskName
 from .mjhq import load_mjhq
 from .pie_bench import load_pie_bench
 from .sharegpt import load_sharegpt
+from .synthetic_images import load_image_dir, load_synthetic_images
 from .trace import trace_items
 from .ueval import load_ueval
 
 __all__ = [
     "load_dataset_rows",
+    "load_image_dir",
     "load_mjhq",
     "load_pie_bench",
     "load_sharegpt",
+    "load_synthetic_images",
     "load_ueval",
     "trace_items",
 ]
 
 _PIE_BENCH_ALIASES = {"pie-bench", "pie_bench", "piebench", "pie"}
+_SYNTHETIC_IMAGE_ALIASES = {"synthetic-images", "synthetic_images", "synthetic"}
 
 
 def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> list[dict[str, Any]]:
@@ -51,6 +55,20 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
 
     if dataset == "mjhq" or spec.task == TaskName.T2I:
         return load_mjhq(path, spec.num_prompts, seed=spec.seed)
+
+    if dataset in _SYNTHETIC_IMAGE_ALIASES or (
+        not dataset and spec.task == TaskName.I2T
+    ):
+        return load_synthetic_images(
+            spec.num_prompts, seed=spec.seed, question=spec.i2t_question
+        )
+
+    if dataset == "image-dir":
+        if not path:
+            raise ValueError("dataset 'image-dir' requires --dataset-path")
+        return load_image_dir(
+            path, spec.num_prompts, seed=spec.seed, question=spec.i2t_question
+        )
 
     if dataset in _PIE_BENCH_ALIASES or spec.task == TaskName.I2I:
         return load_pie_bench(path, spec.num_prompts, seed=spec.seed)
