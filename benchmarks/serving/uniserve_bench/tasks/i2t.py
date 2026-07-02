@@ -22,6 +22,9 @@ class I2TTask(BenchmarkTask):
         max_tokens = int(item.get("max_tokens", self.spec.max_tokens or 512))
         image_b64 = item.get("input_image_b64")
         if self.spec.i2t_wire == "openai_chat":
+            # Diffusion-pipeline chat backends (vLLM-Omni) answer with one
+            # non-streamed chat.completion JSON regardless of ``stream``, so
+            # this wire measures E2E + tokens (no TTFT/ITL decomposition).
             payload: dict[str, Any] = {
                 "model": self.spec.model,
                 "messages": [
@@ -37,11 +40,8 @@ class I2TTask(BenchmarkTask):
                     }
                 ],
                 "modalities": ["text"],
-                "stream": True,
-                "stream_options": {"include_usage": True},
                 "temperature": self.spec.temperature,
                 "max_tokens": max_tokens,
-                "max_completion_tokens": max_tokens,
             }
             if self.spec.extra_request_body:
                 payload.update(self.spec.extra_request_body)
@@ -50,7 +50,7 @@ class I2TTask(BenchmarkTask):
                 if self.spec.endpoint != "/generate"
                 else "/v1/chat/completions"
             )
-            return TaskRequest(endpoint=endpoint, payload=payload, kind="openai_chat")
+            return TaskRequest(endpoint=endpoint, payload=payload, kind="openai_chat_json")
 
         payload = {
             "prompt": item["prompt"],

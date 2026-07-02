@@ -48,6 +48,8 @@ async def send_request(
     try:
         if request.kind == "images_generations":
             await _send_images(client, url, payload, record)
+        elif request.kind == "openai_chat_json":
+            await _send_chat_json(client, url, payload, record)
         elif request.kind == "openai_chat":
             await _send_sse(
                 client, url, payload, record, protocol="openai",
@@ -94,6 +96,52 @@ async def _send_images(
         record.images = max(1, count)
         # Non-streaming: every returned image shares the request E2E latency.
         record.image_latencies = [record.latency] * record.images
+
+
+async def _send_chat_json(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict[str, Any],
+    record: RequestRecord,
+) -> None:
+    """One non-streamed chat completion (diffusion-pipeline chat backends)."""
+    response = await client.post(url, json=payload)
+    record.latency = time.perf_counter() - record.start_time
+    record.status_code = response.status_code
+    try:
+        data = response.json()
+    except Exception:  # noqa: BLE001 - non-JSON body is a protocol failure.
+        record.success = False
+        record.classifier = f"transport_status_{response.status_code}"
+        record.error = response.text[:500]
+        return
+    choices = data.get("choices") if isinstance(data, dict) else None
+    content = ""
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        raw = (message or {}).get("content")
+        if isinstance(raw, str):
+            content = raw
+        elif isinstance(raw, list):
+            content = "".join(
+                part.get("text", "")
+                for part in raw
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+    record.generated_text = content
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(usage, dict):
+        if isinstance(usage.get("completion_tokens"), int):
+            record.output_len = int(usage["completion_tokens"])
+        if isinstance(usage.get("prompt_tokens"), int):
+            record.prompt_len = int(usage["prompt_tokens"])
+    transport_ok = response.status_code < 400
+    record.success = transport_ok and bool(content)
+    record.classifier = "ok" if record.success else (
+        f"transport_status_{response.status_code}" if not transport_ok else "empty_completion"
+    )
+    # Non-streaming: the full completion shares the request E2E latency.
+    record.ttft = record.latency
 
 
 async def _send_sse(
