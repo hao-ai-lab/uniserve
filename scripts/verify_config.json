@@ -61,6 +61,32 @@
         "--worker-ranks",
         "4"
       ]
+    },
+    "sensenova-u1-perf": {
+      "extends": "sensenova-u1-single",
+      "env": {
+        "UNISERVE_DECODE_TOKEN_BURST": "8"
+      }
+    },
+    "bagel-single": {
+      "model": "/home/hal-ysun/models/BAGEL-7B-MoT",
+      "served_model_name": "BAGEL",
+      "port": 18083,
+      "cuda_visible_devices": "0",
+      "env": {
+        "UNISERVE_DECODE_TOKEN_BURST": "8"
+      },
+      "serve_args": [
+        "--kv-token-capacity",
+        "65536",
+        "--max-num-seqs",
+        "1",
+        "--max-batch",
+        "4",
+        "--max-num-batched-tokens",
+        "4096"
+      ],
+      "host": "127.0.0.1"
     }
   },
   "workloads": {
@@ -100,6 +126,198 @@
       "output_file": "qwen3-sharegpt-stress.json",
       "expect_completed": 200,
       "expect_failed": 0
+    },
+    "sensenova-t2i-seed42": {
+      "type": "generate",
+      "server": "sensenova-u1-single",
+      "payload": {
+        "mode": "image",
+        "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
+        "seed": 42,
+        "image": {
+          "width": 2048,
+          "height": 1152,
+          "steps": 50
+        }
+      },
+      "expect_images": 1,
+      "expect_image_steps": 50,
+      "expect_image_width": 2048,
+      "expect_image_height": 1152
+    },
+    "sensenova-i2t-house": {
+      "type": "generate",
+      "server": "sensenova-u1-single",
+      "payload": {
+        "mode": "understand",
+        "prompt": "Describe this image in detail.",
+        "max_tokens": 128,
+        "temperature": 0
+      },
+      "input_image_synthetic": {
+        "seed": 0,
+        "width": 960,
+        "height": 640
+      },
+      "expect_images": 0,
+      "expect_min_text_tokens": 32
+    },
+    "bagel-t2i-seed42": {
+      "type": "generate",
+      "server": "bagel-single",
+      "payload": {
+        "mode": "image",
+        "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
+        "seed": 42,
+        "image": {
+          "width": 1024,
+          "height": 1024,
+          "steps": 50
+        }
+      },
+      "expect_images": 1,
+      "expect_image_steps": 50,
+      "expect_image_width": 1024,
+      "expect_image_height": 1024
+    },
+    "bagel-i2t-house": {
+      "type": "generate",
+      "server": "bagel-single",
+      "payload": {
+        "mode": "understand",
+        "prompt": "Describe this image in detail.",
+        "max_tokens": 128,
+        "temperature": 0
+      },
+      "input_image_synthetic": {
+        "seed": 0,
+        "width": 960,
+        "height": 640
+      },
+      "expect_images": 0,
+      "expect_min_text_tokens": 32
+    },
+    "sensenova-t2i-perf": {
+      "type": "uniserve_bench",
+      "server": "sensenova-u1-perf",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "trace",
+        "--dataset-path",
+        "benchmarks/serving/sensenova/t2i_prompts.jsonl",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "2048",
+        "--height",
+        "1152"
+      ],
+      "expect_metrics": {
+        "image_latency_ms.mean": {
+          "max": 8000
+        }
+      }
+    },
+    "sensenova-i2t-perf": {
+      "type": "uniserve_bench",
+      "server": "sensenova-u1-perf",
+      "task": "i2t",
+      "args": [
+        "--dataset",
+        "synthetic-images",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--max-tokens",
+        "256",
+        "--temperature",
+        "0",
+        "--seed",
+        "42",
+        "--i2t-wire",
+        "native"
+      ],
+      "expect_metrics": {
+        "output_throughput": {
+          "min": 120
+        },
+        "mean_itl_ms": {
+          "max": 9
+        }
+      }
+    },
+    "bagel-t2i-perf": {
+      "type": "uniserve_bench",
+      "server": "bagel-single",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "trace",
+        "--dataset-path",
+        "benchmarks/serving/sensenova/t2i_prompts.jsonl",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "1024",
+        "--height",
+        "1024"
+      ],
+      "expect_metrics": {
+        "image_latency_ms.mean": {
+          "max": 10000
+        }
+      }
+    },
+    "bagel-i2t-perf": {
+      "type": "uniserve_bench",
+      "server": "bagel-single",
+      "task": "i2t",
+      "args": [
+        "--dataset",
+        "synthetic-images",
+        "--num-prompts",
+        "4",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--max-tokens",
+        "256",
+        "--temperature",
+        "0",
+        "--seed",
+        "42",
+        "--i2t-wire",
+        "native"
+      ],
+      "expect_metrics": {
+        "output_throughput": {
+          "min": 100
+        },
+        "mean_itl_ms": {
+          "max": 9
+        }
+      }
     }
   },
   "suites": {
@@ -108,6 +326,36 @@
     ],
     "sensenova-u1-mode-a": [
       "sensenova-travel-interleave-4x"
+    ],
+    "sensenova-verify": [
+      "sensenova-t2i-seed42",
+      "sensenova-i2t-house",
+      "sensenova-travel-interleave-4x"
+    ],
+    "bagel-verify": [
+      "bagel-t2i-seed42",
+      "bagel-i2t-house"
+    ],
+    "sensenova-perf": [
+      "sensenova-t2i-perf",
+      "sensenova-i2t-perf"
+    ],
+    "bagel-perf": [
+      "bagel-t2i-perf",
+      "bagel-i2t-perf"
+    ],
+    "verify-all": [
+      "sensenova-t2i-seed42",
+      "sensenova-i2t-house",
+      "sensenova-travel-interleave-4x",
+      "bagel-t2i-seed42",
+      "bagel-i2t-house"
+    ],
+    "perf-all": [
+      "sensenova-t2i-perf",
+      "sensenova-i2t-perf",
+      "bagel-t2i-perf",
+      "bagel-i2t-perf"
     ]
   }
 }
