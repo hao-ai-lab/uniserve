@@ -20,6 +20,7 @@ import numpy as np
 from .artifacts import ArtifactWriter
 from .core.arrival import run_load
 from .core.client import send_request
+from .core.gpu_sampler import GpuMemorySampler
 from .datasets import load_dataset_rows
 from .metrics.common import RequestRecord
 from .report import build_summary, render_markdown, spec_to_dict
@@ -78,14 +79,21 @@ class BenchmarkRunner:
                 warm = {**row, "output_len": 32, "max_tokens": 32}
                 return await self._submit(client, warm)
 
-            records, dur_s = await run_load(
-                rows,
-                request_rate=self.spec.request_rate,
-                max_concurrency=self.spec.max_concurrency,
-                submit=submit,
-                warmup_submit=warmup_submit,
-                warmup_requests=self.spec.warmup_requests,
-            )
+            sampler = GpuMemorySampler() if self.spec.sample_gpu_memory else None
+            if sampler is not None:
+                sampler.start()
+            try:
+                records, dur_s = await run_load(
+                    rows,
+                    request_rate=self.spec.request_rate,
+                    max_concurrency=self.spec.max_concurrency,
+                    submit=submit,
+                    warmup_submit=warmup_submit,
+                    warmup_requests=self.spec.warmup_requests,
+                )
+            finally:
+                if sampler is not None:
+                    sampler.stop()
             server_info = await self._fetch_server_info(client)
 
         summary = build_summary(
@@ -96,6 +104,8 @@ class BenchmarkRunner:
             tokenizer=tokenizer,
             server_info=server_info,
         )
+        if sampler is not None:
+            summary["gpu_memory"] = sampler.summary()
 
         self.writer.write_json("summary.json", summary)
         for record in records:
