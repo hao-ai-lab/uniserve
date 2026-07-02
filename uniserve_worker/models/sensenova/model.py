@@ -494,12 +494,18 @@ class _SenseNovaAttention(nn.Module):
         if packed_rope is None:
             packed_rope = self._packed_rope(indexes)
         axis_dims = (self.head_dim // 2, self.head_dim // 4, self.head_dim // 4)
-        if packed_rope.hw_identity and query_states.ndim == 4:
-            # Pure-text forward: the caller structurally guarantees zero h/w
-            # positions, so the spatial rotations are the identity and the
-            # provider may take its fused single-launch path. Flattening
-            # [B, L, H, D] -> [B*L, H, D] keeps the canonical token-major rope
-            # layout without the transpose-driven copies of the 4-D path.
+        if query_states.ndim == 4:
+            # Flatten [B, L, H, D] -> [B*L, H, D]: a free view of the projection
+            # output that keeps the canonical token-major rope layout. For the
+            # pure-text forward (hw_identity) the provider takes its fused
+            # single-launch path; for spatial (image) tokens the multi-axis
+            # provider consumes the token-major rows directly, so it skips the
+            # per-group transpose->contiguous flatten/unflatten copies of the
+            # 4-D path. The norm/rope kernels are stride-aware and see the same
+            # shapes and values either way, so results are bit-identical; only
+            # the storage layout behind the returned [B, H, L, D] views changes
+            # (token-major, which is also what the varlen attention flattener
+            # wants, making its materialization a no-op).
             batch, seq_len, q_heads, dim = query_states.shape
             k_heads = int(key_states.shape[2])
             q_flat, k_flat = ops.qk_norm_rope(
@@ -511,7 +517,7 @@ class _SenseNovaAttention(nn.Module):
                 packed_rope.sin,
                 q_norm.eps,
                 axis_dims=axis_dims,
-                identity_axes=(1, 2),
+                identity_axes=(1, 2) if packed_rope.hw_identity else None,
                 override=override,
             )
             return (
