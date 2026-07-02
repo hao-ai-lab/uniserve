@@ -36,6 +36,11 @@ from ..runtime.image_params import (
 )
 from ..runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 from .denoise_driver import TextImageDenoiseStep
+from .denoise_residual_cache import (
+    DenoiseResidualCacheAdapter,
+    ImageResidualCacheState,
+    resolve_denoise_residual_cache_policy,
+)
 from .interleaved_text_stepper import TextCache
 
 __all__ = [
@@ -48,6 +53,17 @@ __all__ = [
 
 if TYPE_CHECKING:
     pass
+
+_RESIDUAL_CACHE_POLICY = None
+
+
+def _denoise_residual_cache_policy():
+    """Process-wide policy, resolved from the environment once on first use."""
+    global _RESIDUAL_CACHE_POLICY
+    if _RESIDUAL_CACHE_POLICY is None:
+        _RESIDUAL_CACHE_POLICY = resolve_denoise_residual_cache_policy()
+    return _RESIDUAL_CACHE_POLICY
+
 
 @dataclass
 class ImageState:
@@ -83,6 +99,10 @@ class ImageState:
     height: int
     width: int
     noise_scale_embedding: torch.Tensor | None = None
+    # Timestep-aware residual-reuse state (see denoise_residual_cache); engaged
+    # only when the policy is enabled and the owner supplies an adapter. Rides
+    # the image state so its memory ends with the image commit.
+    residual_cache: ImageResidualCacheState | None = None
 
     @property
     def x_t(self) -> torch.Tensor:
@@ -175,7 +195,18 @@ class TextImageDenoiseOwner(Protocol):
         *,
         image_token_num: int,
         image_size: tuple[int, int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+    def packed_hidden_to_velocity(
+        self,
+        hidden_states: torch.Tensor,
+        t: torch.Tensor,
+        latent: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int] | None,
     ) -> torch.Tensor: ...
+    def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheAdapter | None: ...
     def interleaved_image_patch_size(self) -> int: ...
     def interleaved_image_features(
         self,
@@ -221,8 +252,8 @@ class TextImageDenoiseOwner(Protocol):
         noise_scale: float,
     ) -> torch.Tensor: ...
     def predict_denoise_velocity(
-        self, step: "TextImageDenoiseStep", branch: str
-    ) -> torch.Tensor: ...
+        self, step: "TextImageDenoiseStep", branch: str, *, return_hidden: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
     def _denoise_branch_inputs(
         self, img: "ImageState", branch: str
     ) -> tuple[torch.Tensor, Any]: ...
@@ -230,7 +261,9 @@ class TextImageDenoiseOwner(Protocol):
     def _batched_paged_denoise_available(
         self, image_embeds: torch.Tensor, cache: "PagedTextCache"
     ) -> bool: ...
-    def _predict_v_batched(self, rows: "Sequence[DenoiseRow]") -> torch.Tensor: ...
+    def _predict_v_batched(
+        self, rows: "Sequence[DenoiseRow]", *, return_hidden: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
     def _predict_v(
         self,
         img: "ImageState",
@@ -239,7 +272,12 @@ class TextImageDenoiseOwner(Protocol):
         cache: Any,
         t: torch.Tensor,
         z: torch.Tensor,
-    ) -> torch.Tensor: ...
+        *,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+    def _denoise_residual_state(
+        self, img: "ImageState"
+    ) -> ImageResidualCacheState | None: ...
 
 
 class TextImageDenoiseOps:
@@ -494,8 +532,12 @@ class TextImageDenoiseOps:
         )
 
     def predict_denoise_velocity(
-        self: TextImageDenoiseOwner, step: TextImageDenoiseStep, branch: str
-    ) -> torch.Tensor:
+        self: TextImageDenoiseOwner,
+        step: TextImageDenoiseStep,
+        branch: str,
+        *,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         img = step.extra["img"]
         indexes, cache = self._denoise_branch_inputs(img, branch)
         return self._predict_v(
@@ -505,7 +547,45 @@ class TextImageDenoiseOps:
             cache,
             step.t,
             step.latent,
+            return_hidden=return_hidden,
         )
+
+    def _denoise_residual_state(
+        self: TextImageDenoiseOwner, img: ImageState
+    ) -> ImageResidualCacheState | None:
+        policy = _denoise_residual_cache_policy()
+        adapter = self.denoise_residual_cache_adapter()
+        if not policy.active(adapter):
+            return None
+        state = img.residual_cache
+        if state is None:
+            state = ImageResidualCacheState(
+                threshold=policy.threshold,
+                coefficients=adapter.rescale_coefficients,
+            )
+            img.residual_cache = state
+        return state
+
+    def denoise_residual_cache_adapter(
+        self: TextImageDenoiseOwner,
+    ) -> DenoiseResidualCacheAdapter | None:
+        """Default: no residual-reuse adapter — the cache never engages."""
+        return None
+
+    def _predict_row_recorded(
+        self: TextImageDenoiseOwner,
+        row: DenoiseRow,
+        state: ImageResidualCacheState | None,
+    ) -> torch.Tensor:
+        if state is None:
+            velocity = self.predict_denoise_velocity(row.step, row.branch)
+            assert isinstance(velocity, torch.Tensor)
+            return velocity
+        velocity, hidden = self.predict_denoise_velocity(
+            row.step, row.branch, return_hidden=True
+        )
+        state.record(str(row.branch), row.step.extra["image_embeds"], hidden)
+        return velocity
 
     def predict_text_image_velocity_batch(
         self: TextImageDenoiseOwner,
@@ -514,19 +594,45 @@ class TextImageDenoiseOps:
     ) -> list[dict[str, torch.Tensor]]:
         results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
         rows: list[DenoiseRow] = []
+        states: dict[int, ImageResidualCacheState | None] = {}
         for step_index, (step, branches) in enumerate(zip(steps, branches_by_step)):
             img = step.extra["img"]
+            state = self._denoise_residual_state(img)
+            states[step_index] = state
+            if state is not None:
+                adapter = self.denoise_residual_cache_adapter()
+                assert adapter is not None
+                image_embeds = step.extra["image_embeds"]
+                decision = adapter.decision_embedding(image_embeds)
+                if state.decide_reuse(decision, tuple(str(b) for b in branches)):
+                    # Replay: pre-norm hidden ≈ input embeds + previous
+                    # residual, re-finalized (final norm), then the ordinary
+                    # hidden→velocity head. No backbone forward.
+                    for branch in branches:
+                        hidden = adapter.finalize_hidden(
+                            state.replay(str(branch), image_embeds)
+                        )
+                        results[step_index][branch] = self.packed_hidden_to_velocity(
+                            hidden,
+                            step.t,
+                            step.latent,
+                            image_token_num=img.token_h * img.token_w,
+                            image_size=(img.width, img.height),
+                        )
+                    continue
             for branch in branches:
                 indexes, cache = self._denoise_branch_inputs(img, branch)
                 if not isinstance(cache, PagedTextCache):
-                    results[step_index][branch] = self.predict_denoise_velocity(step, branch)
+                    results[step_index][branch] = self._predict_row_recorded(
+                        DenoiseRow(step_index, step, branch, img, indexes, cache), state
+                    )
                     continue
                 rows.append(DenoiseRow(step_index, step, branch, img, indexes, cache))
 
         if len(rows) == 1:
             row = rows[0]
-            results[row.step_index][row.branch] = self.predict_denoise_velocity(
-                row.step, row.branch
+            results[row.step_index][row.branch] = self._predict_row_recorded(
+                row, states.get(row.step_index)
             )
             return results
 
@@ -534,8 +640,8 @@ class TextImageDenoiseOps:
         for row in rows:
             key = self._batched_denoise_row_key(row)
             if key is None:
-                results[row.step_index][row.branch] = self.predict_denoise_velocity(
-                    row.step, row.branch
+                results[row.step_index][row.branch] = self._predict_row_recorded(
+                    row, states.get(row.step_index)
                 )
                 continue
             grouped.setdefault(key, []).append(row)
@@ -543,15 +649,27 @@ class TextImageDenoiseOps:
         for group in grouped.values():
             if len(group) == 1:
                 row = group[0]
-                results[row.step_index][row.branch] = self.predict_denoise_velocity(
-                    row.step, row.branch
+                results[row.step_index][row.branch] = self._predict_row_recorded(
+                    row, states.get(row.step_index)
                 )
                 continue
-            batched = self._predict_v_batched(group)
+            record = any(states.get(row.step_index) is not None for row in group)
+            if record:
+                batched, hidden = self._predict_v_batched(group, return_hidden=True)
+            else:
+                batched = self._predict_v_batched(group)
+                hidden = None
             for row_index, row in enumerate(group):
                 results[row.step_index][row.branch] = batched[
                     row_index : row_index + 1
                 ].contiguous()
+                state = states.get(row.step_index)
+                if state is not None and hidden is not None:
+                    state.record(
+                        str(row.branch),
+                        row.step.extra["image_embeds"],
+                        hidden[row_index : row_index + 1].contiguous(),
+                    )
         return results
 
     def _denoise_branch_inputs(self, img: ImageState, branch: str) -> tuple[torch.Tensor, Any]:
@@ -636,7 +754,9 @@ class TextImageDenoiseOps:
     def _predict_v_batched(
         self: TextImageDenoiseOwner,
         rows: Sequence[DenoiseRow],
-    ) -> torch.Tensor:
+        *,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         first = rows[0]
         img = first.img
         for row in rows:
@@ -652,6 +772,7 @@ class TextImageDenoiseOps:
             cache,
             first.step.t,
             z,
+            return_hidden=return_hidden,
         )
 
     def apply_denoise_update(
@@ -673,7 +794,9 @@ class TextImageDenoiseOps:
         cache: Any,
         t: torch.Tensor,
         z: torch.Tensor,
-    ) -> torch.Tensor:
+        *,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if indexes is None or cache is None:
             raise model_execution_error("required CFG cache is not initialized")
         # B2: wait the snapshot's readiness before the gen tower reads the replica.
@@ -687,4 +810,5 @@ class TextImageDenoiseOps:
             z,
             image_token_num=img.token_h * img.token_w,
             image_size=(img.width, img.height),
+            return_hidden=return_hidden,
         )
