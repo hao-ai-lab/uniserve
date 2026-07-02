@@ -8,7 +8,26 @@ from ..foundation.runtime_config import get_worker_config
 
 __all__ = [
     'LogitsProcessor',
+    'forced_eos_logits',
 ]
+
+
+def forced_eos_logits(
+    eos_id: int,
+    *,
+    device: torch.device | str,
+    batch_shape: tuple[int, ...] = (),
+) -> torch.Tensor:
+    """Synthetic one-hot logits row that forces EOS.
+
+    Used for empty-token text ops, where the contract still requires a logits
+    tensor but no model forward runs; sampling any distribution over these
+    logits yields ``eos_id``.
+    """
+    eos = int(eos_id)
+    logits = torch.full((*batch_shape, eos + 1), float("-inf"), device=device)
+    logits[..., eos] = 0.0
+    return logits
 
 
 def _logits_chunk_size() -> int:

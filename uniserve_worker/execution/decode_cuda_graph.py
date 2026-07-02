@@ -620,6 +620,54 @@ def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> An
     return backend
 
 
+def resolve_paged_decode_graph_prepare(
+    *,
+    owner: Any,
+    kv_pool: PagedKVPool,
+    num_blocks: int,
+    attention_backend_name: str | None,
+    before: Callable[[TextDecodeGraphState, Any], None] | None = None,
+) -> Callable[[TextDecodeGraphState, Any], None] | None:
+    """Build the per-replay decode-graph prepare hook, or ``None`` to stay eager.
+
+    The single assembly point for paged-decode graph preparation shared by the
+    thin :class:`~uniserve_worker.execution.text_graph_runner.TextGraphRunner`
+    and the interleaved decode adapter: KV-side geometry comes off the shared
+    pool, query-side geometry from the owner's
+    ``text_decode_graph_query_geometry`` hook, and the backend must expose
+    graph-aware planning (otherwise the capture-time plan would be baked in and
+    the caller must stay eager). ``before`` runs first on every capture/replay
+    for caller-specific static state (e.g. the interleaved indexes sidecar).
+    """
+
+    geometry_hook = getattr(owner, "text_decode_graph_query_geometry", None)
+    if not callable(geometry_hook):
+        return None
+    backend = resolve_paged_decode_graph_backend(attention_backend_name)
+    if backend is None:
+        return None
+    num_q_heads, scale, q_dtype = geometry_hook()
+    num_blocks = int(num_blocks)
+
+    def prepare(state: TextDecodeGraphState, ctx: Any) -> None:
+        if before is not None:
+            before(state, ctx)
+        prepare_paged_decode_graph_backend(
+            state,
+            backend=backend,
+            num_q_heads=int(num_q_heads),
+            num_kv_heads=int(kv_pool.n_kv),
+            head_dim=int(kv_pool.head_dim),
+            page_size=int(kv_pool.block_size),
+            q_dtype=q_dtype,
+            kv_dtype=kv_pool.k.dtype,
+            scale=scale,
+            max_indices=num_blocks * int(state.batch_size),
+        )
+
+    return prepare
+
+
 def prepare_paged_decode_graph_backend(
     state: TextDecodeGraphState,
     *,

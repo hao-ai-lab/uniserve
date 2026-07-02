@@ -325,6 +325,7 @@ class ModelRunner:
                 num_blocks=int(residency.kv.num_blocks),
                 block_size=int(residency.kv.block_size),
                 device=device,
+                attention_backend_name=self.attention_backend_name,
             )
             try:
                 graph_runner.warmup(model)

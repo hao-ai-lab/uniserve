@@ -39,24 +39,24 @@ from ..foundation.runtime_config import get_worker_config
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
+    derive_cuda_kv_capacity,
     derive_num_blocks,
 )
 from ..loader.weight_utils import WeightLoadReport, stacked_params_mapping_loop
 from ..nn import (
     FusedMoE,
-    GeluAndMul,
     LinearBase,
-    MergedColumnParallelLinear,
     ParallelLMHead,
     QKVParallelLinear,
     RadixAttention,
     RMSNorm,
     RowParallelLinear,
-    SiluAndMul,
     VocabParallelEmbedding,
     get_current_mesh,
     get_rope,
+    local_kv_head_count,
 )
+from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
 from ..nn.quant import (
     QuantizationConfig,
@@ -65,7 +65,7 @@ from ..nn.quant import (
     use_quantization_config,
 )
 from ..nn.quant.kv_cache import KV_CACHE_NO_OVERRIDE_SENTINELS
-from ..runtime.compile import CompileTarget, TorchCompileConfig, compile_model_pieces
+from ..runtime.compile import CompileTarget
 from ..runtime.residency import KvCacheSpec
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,7 @@ class Qwen3Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         batched = len(state_shape) == 2
         batched_decode = batched and int(state_shape[1]) == 1
-        fused_prefill = self._try_fused_prefill(qkv, state_shape, forward_batch, batched, positions)
+        fused_prefill = self._try_fused_prefill(qkv, state_shape, forward_batch, batched, cos, sin, positions)
         if fused_prefill is not None:
             return fused_prefill
 
@@ -172,6 +172,8 @@ class Qwen3Attention(nn.Module):
         state_shape: torch.Size,
         forward_batch: "ForwardBatch",
         batched: bool,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
         positions: torch.Tensor | None,
     ) -> torch.Tensor | None:
         if batched or positions is None:
@@ -179,7 +181,6 @@ class Qwen3Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_attn = q.reshape(-1, self.num_heads, self.head_dim)
         k_attn = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        cos, sin = self.rotary_emb.cos_sin_1d(positions.reshape(-1))
         q_attn, k_attn = ops.qk_norm_rope(
             q_attn,
             k_attn,
@@ -191,6 +192,8 @@ class Qwen3Attention(nn.Module):
             override=None,
         )
         v_attn = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        q_attn = q_attn.to(dtype=v_attn.dtype)
+        k_attn = k_attn.to(dtype=v_attn.dtype)
         out = self.attn(q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale)
         return self.o_proj(out.reshape(*state_shape, self.q_size))
 
@@ -255,35 +258,6 @@ class Qwen3Attention(nn.Module):
         if batched:
             return out.transpose(1, 2).reshape(*state_shape, self.q_size)
         return out.reshape(*state_shape, self.q_size)
-
-def _fused_gate_up_act(hidden_act: str) -> nn.Module:
-    """Pick the gate-up (split-then-multiply) activation for the fused MLP."""
-    key = str(hidden_act or "silu").lower()
-    if key in {"silu", "swish", "silu_and_mul", "swiglu"}:
-        return SiluAndMul()
-    if key in {"gelu", "gelu_and_mul", "geglu"}:
-        return GeluAndMul()
-    if key in {"gelu_pytorch_tanh", "gelu_tanh"}:
-        return GeluAndMul(approximate="tanh")
-    raise ValueError(f"Qwen3MLP does not support hidden_act={hidden_act!r}")
-
-
-class Qwen3MLP(nn.Module):
-    """SwiGLU-style feed-forward block with parallel gate/up projection."""
-
-    def __init__(self, cfg: SimpleNamespace) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            cfg.hidden_size,
-            (cfg.intermediate_size, cfg.intermediate_size),
-            bias=False,
-        )
-        self.act = _fused_gate_up_act(getattr(cfg, "hidden_act", "silu"))
-        self.down_proj = RowParallelLinear(cfg.intermediate_size, cfg.hidden_size, bias=False)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act(self.gate_up_proj(hidden_states)))
-
 
 class Qwen3MoE(nn.Module):
     """Mixture-of-experts feed-forward routed by a learned gate."""
@@ -412,7 +386,6 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         self.num_blocks = derive_num_blocks(self.block_size, None)
         self.output_vocab_size: int | None = None
         self.kv_cache_dtype = _requested_kv_cache_dtype(self.config)
-        self._torch_compile_applied = False
         self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
 
     @property
@@ -424,7 +397,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         param = next(self.parameters())
         return KvCacheSpec(
             num_layers=int(self.num_layers),
-            num_kv_heads=self._local_num_kv_heads(),
+            num_kv_heads=local_kv_head_count(int(self.config.num_key_value_heads)),
             head_dim=int(self.config.head_dim),
             dtype=param.dtype,
             store_dtype=self._kv_store_dtype_for(param.dtype),
@@ -566,37 +539,17 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
             ):
                 param.data = param.data.to(dtype=dtype)
 
-    def _maybe_compile_piecewise(self) -> None:
-        if self._torch_compile_applied:
-            return
-        cfg = TorchCompileConfig.from_runtime_config()
-        if not cfg.enabled:
-            return
-        report = compile_model_pieces(self, config=cfg)
-        self._torch_compile_applied = True
-        if report.compiled:
-            logger.info("enabled Qwen3 model-stack torch.compile pieces count=%s", report.compiled)
-
     def _kv_bytes_per_token(self, compute_dtype: torch.dtype) -> int:
         return kv_cache_bytes_per_token(
-            num_kv_heads=self._local_num_kv_heads(),
+            num_kv_heads=local_kv_head_count(int(self.config.num_key_value_heads)),
             head_dim=self.config.head_dim,
             num_layers=self.num_layers,
             compute_dtype=compute_dtype,
             store_dtype=self.kv_cache_dtype,
         )
 
-    def _local_num_kv_heads(self) -> int:
-        if len(self.model.layers) > 0:
-            return int(self.model.layers[0].self_attn.num_kv_heads)
-        mesh = getattr(self, "mesh", get_current_mesh())
-        total = int(self.config.num_key_value_heads)
-        tp_size = int(mesh.tp_size)
-        if total >= tp_size:
-            if total % tp_size != 0:
-                raise ValueError(f"{total} KV heads is not divisible by tp_size {tp_size}")
-            return total // tp_size
-        return total
+    def text_decode_graph_query_geometry(self) -> tuple[int, float, "torch.dtype"]:
+        return self._text_decode_graph_query_geometry_from(self.model.layers[0].self_attn)
 
     def _runtime_num_blocks(
         self,
@@ -622,35 +575,29 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
             param = next(self.parameters())
         except StopIteration:
             return None
-        device = getattr(param, "device", None)
-        if device is None or device.type != "cuda" or not torch.cuda.is_available():
-            return None
-        block = int(block_size)
-        if block <= 0:
-            return None
-        try:
-            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-        except Exception:
-            return None
         bytes_per_token = max(1, self._kv_bytes_per_token(compute_dtype))
-        fraction = get_worker_config().kv_memory_fraction
-        usable_bytes = max(0, int(float(free_bytes) * fraction))
-        token_capacity = usable_bytes // bytes_per_token
-        blocks = max(1, int(token_capacity) // block)
+        sizing = derive_cuda_kv_capacity(
+            device=getattr(param, "device", None),
+            block_size=block_size,
+            bytes_per_token=bytes_per_token,
+            memory_fraction=get_worker_config().kv_memory_fraction,
+        )
+        if sizing is None:
+            return None
         logger.info(
             "auto-sized Qwen3 KV pool",
             extra={
-                "device": str(device),
-                "free_bytes": int(free_bytes),
-                "total_bytes": int(total_bytes),
-                "fraction": fraction,
-                "bytes_per_token": bytes_per_token,
-                "block_size": block,
-                "num_blocks": blocks,
-                "token_capacity": blocks * block,
+                "device": sizing.device,
+                "free_bytes": sizing.free_bytes,
+                "total_bytes": sizing.total_bytes,
+                "fraction": sizing.memory_fraction,
+                "bytes_per_token": sizing.bytes_per_token,
+                "block_size": sizing.block_size,
+                "num_blocks": sizing.num_blocks,
+                "token_capacity": sizing.token_capacity,
             },
         )
-        return blocks
+        return sizing.num_blocks
 
     def load_weights(self, weights) -> set[str]:
         stacked = [

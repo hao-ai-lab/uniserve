@@ -5,6 +5,7 @@ import torch
 
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.sensenova.interleaved_image import TextImageDenoiseOps
+from uniserve_worker.runtime.image_params import parse_text_image_generation_params
 from uniserve_worker.runtime.masks import build_commit_attention_mask
 
 pytestmark = pytest.mark.unit
@@ -49,3 +50,36 @@ def test_image_params_preserve_zero_cfg_values_and_reject_zero_steps():
         ops._parse_image_params({"steps": 1})
     with pytest.raises(WorkerError):
         ops._parse_image_params({"height": 512, "width": 512, "steps": 1})
+
+
+def test_shared_text_image_params_apply_cfg_overrides_without_losing_zero_values():
+    params = parse_text_image_generation_params(
+        {
+            "height": 512,
+            "width": 768,
+            "steps": 2,
+            "cfg_text_scale": 7.0,
+            "cfg_img_scale": 3.0,
+            "cfg_interval": [0.25, 0.75],
+            "cfg_renorm_type": "global",
+            "cfg_renorm_min": 1.0,
+        },
+        cfg={
+            "text_scale": 0.0,
+            "img_scale": 0.0,
+            "interval": [0.0, 1.0],
+            "renorm": "none",
+            "renorm_min": 0.0,
+        },
+        timestep_shift_default=1.25,
+    )
+
+    assert params.width == 768
+    assert params.height == 512
+    assert params.steps == 2
+    assert params.cfg_text == 0.0
+    assert params.cfg_img == 0.0
+    assert params.cfg_interval == (0.0, 1.0)
+    assert params.cfg_norm == "none"
+    assert params.cfg_renorm_min == 0.0
+    assert params.timestep_shift == 1.25

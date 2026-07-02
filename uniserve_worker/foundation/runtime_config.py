@@ -107,6 +107,7 @@ class WorkerRuntimeConfig:
     model_dtype: str = "bfloat16"
     transformers_trust_remote_code: bool = False
     transformers_attn_implementation: str = "uniserve"
+    allow_transformers_fallback: bool = False
     disabled_model_archs: tuple[str, ...] = ()
     strict_model_imports: bool = False
     kv_cache_dtype: str | None = None
@@ -147,6 +148,7 @@ def worker_config_from_args(args: Any) -> WorkerRuntimeConfig:
         model_dtype=str(args.model_dtype),
         transformers_trust_remote_code=bool(args.transformers_trust_remote_code),
         transformers_attn_implementation=str(args.transformers_attn_implementation),
+        allow_transformers_fallback=bool(getattr(args, "allow_transformers_fallback", False)),
         disabled_model_archs=tuple(str(v) for v in (args.disable_model_arch or ())),
         strict_model_imports=bool(args.strict_model_imports),
         kv_cache_dtype=_none_if_empty(args.kv_cache_dtype),

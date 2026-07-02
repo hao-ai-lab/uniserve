@@ -9,6 +9,7 @@ from torch import nn
 
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.runtime_config import get_worker_config
+from ..nn.placement import get_shard_plan
 from ..nn.quant import QuantizationConfig, use_quantization_config
 from ..nn.quant.base import process_quantized_modules
 from ..nn.quant.load_state import (
@@ -392,8 +393,34 @@ def _should_load_with_weight_loader(tensor: torch.Tensor, target: torch.Tensor) 
     if not has_weight_loader(target):
         return False
     if tuple(tensor.shape) != tuple(target.shape):
-        return allow_shape_mismatch(target)
+        return allow_shape_mismatch(target) or _shard_plan_expects_global_shape(tensor, target)
     return True
+
+
+def _shard_plan_expects_global_shape(tensor: torch.Tensor, target: torch.Tensor) -> bool:
+    """True when a tensor-parallel shard plan explains the shape mismatch.
+
+    Under tp>1 every sharded ``LinearBase`` parameter is materialized at its
+    local (narrowed) shape while the checkpoint streams the global tensor; the
+    param's ``weight_loader`` performs the narrowing. Accept the mismatch only
+    when narrowing the checkpoint shape by the plan's spec reproduces the
+    target shape exactly, so genuinely wrong checkpoints still fail loudly on
+    the direct-write path.
+    """
+    plan = get_shard_plan(target)
+    if plan is None:
+        return False
+    spec = plan.spec
+    if spec.replicated or int(spec.size) <= 1:
+        return False
+    if tensor.ndim != target.ndim or int(spec.axis) >= tensor.ndim:
+        return False
+    expected = list(tensor.shape)
+    dim = int(expected[int(spec.axis)])
+    if dim % int(spec.size) != 0:
+        return False
+    expected[int(spec.axis)] = dim // int(spec.size)
+    return tuple(expected) == tuple(target.shape)
 
 
 def _target_dtype_for_loaded_tensor(

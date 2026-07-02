@@ -11,6 +11,7 @@ import uniserve_worker.ops as ops
 from ..contracts.forward_context import get_forward_context
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import capability_mismatch, invalid_descriptor
+from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
 
 __all__ = [
     'AttentionPath',
@@ -824,11 +825,3 @@ class RadixAttention(nn.Module):
         )
 
 
-def _torch_is_compiling() -> bool:
-    compiler = getattr(torch, "compiler", None)
-    is_compiling = getattr(compiler, "is_compiling", None)
-    if callable(is_compiling):
-        return bool(is_compiling())
-    dynamo = getattr(torch, "_dynamo", None)
-    is_compiling = getattr(dynamo, "is_compiling", None)
-    return bool(is_compiling()) if callable(is_compiling) else False

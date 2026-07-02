@@ -53,11 +53,12 @@ class ModelRegistry:
                 continue
             if arch in self._classes:
                 return self._classes[arch]
-        if self._fallback_cls is not None:
+        config = get_worker_config()
+        if self._fallback_cls is not None and bool(config.allow_transformers_fallback):
             fallback_names = tuple(getattr(self._fallback_cls, "architectures", (self._fallback_cls.__name__,)))
             if any(name not in disabled for name in fallback_names):
                 logger.warning(
-                    "no UniModel registered for requested architectures; degrading to fallback",
+                    "no UniModel registered for requested architectures; explicit fallback is enabled",
                     extra={
                         "architectures": list(architectures),
                         "fallback_model_class": getattr(self._fallback_cls, "__name__", repr(self._fallback_cls)),
@@ -65,9 +66,10 @@ class ModelRegistry:
                 )
                 return self._fallback_cls
         known = ", ".join(sorted(self._classes)) or "<none>"
-        raise capability_mismatch(
-            f"no UniModel registered for architectures {architectures!r}; known architectures: {known}"
-        )
+        message = f"no UniModel registered for architectures {architectures!r}; known architectures: {known}"
+        if self._fallback_cls is not None and not bool(config.allow_transformers_fallback):
+            message += "; generic Transformers fallback is disabled by default, pass --allow-transformers-fallback to opt in"
+        raise capability_mismatch(message)
 
     def registered_classes(self) -> tuple[Type[UniModel], ...]:
         """Distinct registered model classes (a name may map several aliases)."""

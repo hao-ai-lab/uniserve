@@ -172,6 +172,30 @@ def test_resolve_raises_capability_mismatch_for_unknown_arch(_two_arch_registry)
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
 
 
+def test_resolve_rejects_unknown_arch_with_fallback_disabled(_restore_worker_config):
+    registry = ModelRegistry()
+    registry.register(_FallbackA, names=_FallbackA.architectures)
+    runtime_config_module.set_worker_config(
+        replace(_restore_worker_config, allow_transformers_fallback=False)
+    )
+
+    with pytest.raises(WorkerError) as excinfo:
+        registry.resolve(("NoSuchArch",))
+
+    assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
+    assert "--allow-transformers-fallback" in str(excinfo.value)
+
+
+def test_resolve_returns_fallback_only_when_explicitly_enabled(_restore_worker_config):
+    registry = ModelRegistry()
+    registry.register(_FallbackA, names=_FallbackA.architectures)
+    runtime_config_module.set_worker_config(
+        replace(_restore_worker_config, allow_transformers_fallback=True)
+    )
+
+    assert registry.resolve(("NoSuchArch",)) is _FallbackA
+
+
 # --------------------------------------------------------------------------- #
 # BagelImageProcessor.decode_image_b64
 # --------------------------------------------------------------------------- #

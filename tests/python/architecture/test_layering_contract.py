@@ -312,6 +312,43 @@ def test_interleaved_text_stepper_is_system_owned():
     assert offenders == [], f"models/ must not define system stepper classes: {offenders}"
 
 
+def test_interleaved_text_execution_uses_owner_adapter_not_model_backbone():
+    offenders: list[str] = []
+    for rel in ("execution/interleaved_text_stepper.py", "execution/interleaved_text_graph_runner.py"):
+        source = (WORKER / rel).read_text(encoding="utf-8")
+        for needle in ("owner.model.language_model", "owner.model._build_t2i"):
+            if needle in source:
+                offenders.append(f"{rel} contains {needle}")
+    assert offenders == []
+
+
+def test_generated_image_commit_driver_uses_owner_adapter_not_model_backbone():
+    source = (WORKER / "models" / "sensenova" / "interleaved_image.py").read_text(
+        encoding="utf-8"
+    )
+    commit_driver_source = source[source.index("class GeneratedImageCommitDriver") :]
+    assert "self.owner.model." not in commit_driver_source
+
+
+def test_interleaved_image_mixin_uses_owner_adapter_for_t2i_model_primitives():
+    source = (WORKER / "models" / "sensenova" / "interleaved_image.py").read_text(
+        encoding="utf-8"
+    )
+    forbidden = ("self.model.",)
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+
+
+def test_sensenova_does_not_define_a_second_native_qwen3_backbone_namespace():
+    source = (WORKER / "models" / "sensenova" / "model.py").read_text(encoding="utf-8")
+    assert "_NativeQwen3" not in source
+
+
+def test_packed_mixed_forward_uses_owner_adapter_not_model_backbone():
+    source = (WORKER / "execution" / "packed_mixed_forward.py").read_text(encoding="utf-8")
+    assert "owner.model." not in source
+
+
 # Residency/graph classes the system owns: a model file may *reference* them in
 # type annotations but must never *construct* one (system-managed-worker-redesign
 # §6/§17 Phase 6 layering goal — "no pool/graph ownership left under models/").
@@ -362,6 +399,71 @@ def test_models_tree_owns_no_pools_or_graphs():
             if name in FORBIDDEN_MODEL_CONSTRUCTIONS:
                 offenders.append(f"{_rel(path)}:{node.lineno} constructs {name}")
     assert offenders == [], f"models/ must not construct system-owned pools/graphs: {offenders}"
+
+
+def test_models_do_not_query_cuda_memory_directly():
+    """CUDA free-memory policy belongs to the system sizing layer, not models."""
+
+    offenders: list[str] = []
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        for needle in ("mem_get_info",):
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
+def test_models_do_not_define_local_block_free_list_allocators():
+    offenders: list[str] = []
+    forbidden = ("_alloc_from_free_list", "_release_to_free_list", "bisect.bisect_left")
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
+def test_models_do_not_define_local_text_image_param_parsers():
+    offenders: list[str] = []
+    forbidden = (
+        "class _ImageParams",
+        "def _image_param",
+        "def _required_image_param",
+        "def _require_image_param",
+    )
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
+def test_models_do_not_define_local_paged_cache_copy_helpers():
+    offenders: list[str] = []
+    forbidden = ("def _copy_cache_prefix", "def _copy_cache_span", "def _append_packed_chunk")
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
+def test_models_do_not_define_packed_forward_sampling_or_relay_helpers():
+    offenders: list[str] = []
+    forbidden = (
+        "def _sample_text_logits",
+        "def _store_forward_sampled_token_relay",
+        "def _forward_text_input_ids",
+    )
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
 
 
 def test_models_tree_defines_no_cuda_graph_runner_classes():
@@ -573,3 +675,84 @@ def test_vision_attention_invokes_varlen_only_through_ops_attention():
     offenders = [needle for needle in forbidden if needle in source]
     assert offenders == []
     assert "ops.attention(" in source
+
+
+def test_models_do_not_inline_png_or_base64_wire_encoding():
+    """PNG/base64 output encoding is a wire-format policy owned by runtime/image_utils."""
+
+    offenders: list[str] = []
+    forbidden = ("BytesIO", "b64encode", 'format="PNG"')
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
+def test_torch_is_compiling_has_a_single_owner():
+    """torch.compile introspection lives in foundation.torch_compat only."""
+
+    offenders: list[str] = []
+    owner = WORKER / "foundation" / "torch_compat.py"
+    for path in _py_files(WORKER):
+        if path == owner:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "def torch_is_compiling" in text or "def _torch_is_compiling" in text:
+            offenders.append(_rel(path))
+    assert offenders == []
+
+
+def test_models_do_not_redefine_piecewise_compile_helper():
+    """Config-gated piecewise torch.compile application is UniModelBase glue."""
+
+    offenders: list[str] = []
+    for path in _py_files(WORKER / "models"):
+        text = path.read_text(encoding="utf-8")
+        if "def _maybe_compile_piecewise" in text:
+            offenders.append(_rel(path))
+    assert offenders == []
+
+
+def test_host_staging_helpers_have_a_single_owner():
+    """Pinned-host staging mechanics live in runtime.host_staging only."""
+
+    offenders: list[str] = []
+    owner = WORKER / "runtime" / "host_staging.py"
+    forbidden = ("def _canonical_device", "def canonical_device", "def _fill_cpu_long", "def _fill_cpu_int")
+    for path in _py_files(WORKER):
+        if path == owner:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
+def test_tp_head_sharding_rule_has_a_single_owner():
+    """The attention head/KV tp-sharding rule lives in nn.linear only.
+
+    Models and other layers must consume ``local_attention_head_count`` /
+    ``local_kv_head_count`` rather than re-deriving per-rank head counts from
+    ``tp_size`` arithmetic, so pool geometry and sharded projections can never
+    drift apart.
+    """
+
+    owner = WORKER / "nn" / "linear.py"
+    offenders: list[str] = []
+    forbidden = (
+        "def _local_kv_head_count",
+        "def _local_num_kv_heads",
+        "def local_kv_head_count",
+        "def local_attention_head_count",
+    )
+    for path in _py_files(WORKER):
+        if path == owner:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
