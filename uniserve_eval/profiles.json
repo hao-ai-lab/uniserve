@@ -493,6 +493,97 @@
         "openai_chat"
       ],
       "description": "vLLM-Omni comparison point: byte-for-byte the same workload as bagel-i2t-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
+    },
+    "sensenova-t2i-mjhq": {
+      "type": "perf",
+      "server": "sensenova-u1-perf",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "mjhq",
+        "--num-prompts",
+        "8",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "2048",
+        "--height",
+        "1152"
+      ],
+      "expect_metrics": {
+        "image_latency_ms.mean": {
+          "max": 8000
+        }
+      },
+      "description": "Real-dataset t2i point: 8 MJHQ-30K photography captions (auto-downloaded from HF) at 2048x1152, 50 steps, seed 42. Same bounds as the trace-based tripwire; exercises realistic prompt lengths/content instead of the committed prompt set."
+    },
+    "bagel-t2i-mjhq": {
+      "type": "perf",
+      "server": "bagel-single",
+      "task": "t2i",
+      "args": [
+        "--dataset",
+        "mjhq",
+        "--num-prompts",
+        "8",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--steps",
+        "50",
+        "--seed",
+        "42",
+        "--width",
+        "1024",
+        "--height",
+        "1024"
+      ],
+      "expect_metrics": {
+        "image_latency_ms.mean": {
+          "max": 10000
+        }
+      },
+      "description": "Real-dataset t2i point for BAGEL: 8 MJHQ-30K captions at 1024x1024, 50 steps, seed 42."
+    },
+    "sensenova-interleave-ueval": {
+      "type": "perf",
+      "server": "sensenova-u1-perf",
+      "task": "interleave",
+      "args": [
+        "--dataset",
+        "ueval",
+        "--num-prompts",
+        "3",
+        "--max-concurrency",
+        "1",
+        "--warmup-requests",
+        "1",
+        "--max-tokens",
+        "2048",
+        "--max-images",
+        "2",
+        "--width",
+        "2048",
+        "--height",
+        "1152",
+        "--steps",
+        "50",
+        "--seed",
+        "42"
+      ],
+      "expect_metrics": {
+        "mean_itl_ms": {
+          "max": 9
+        }
+      },
+      "description": "Real-dataset interleave point: 3 UEval prompts (zlab-princeton/UEval \u2014 1000 real interleaved-generation tasks like 'show each step both visually and textually'), up to 2 images each at 2048x1152/50 steps. The model decides image count/placement per prompt, so image totals vary; stream metrics gate only text ITL (image spans are excluded from ITL by the harness). Complements the deterministic tour-guide gate with realistic prompt diversity."
     }
   },
   "suites": {
@@ -596,6 +687,13 @@
           "bagel-i2t-perf",
           "bagel-i2t-perf-omni"
         ]
+      ]
+    },
+    "realdata-perf": {
+      "workloads": [
+        "sensenova-t2i-mjhq",
+        "sensenova-interleave-ueval",
+        "bagel-t2i-mjhq"
       ]
     }
   }
