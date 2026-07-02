@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Protocol, Sequence
 
 import torch
 
-import uniserve_worker.ops as ops
 from ..contracts.forward_context import get_forward_context
 from ..foundation.errors import invalid_descriptor, model_execution_error
 from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, ScheduleShiftDomain, init_latent
@@ -43,6 +42,7 @@ from .denoise_residual_cache import (
 )
 from .denoise_step_graph import maybe_run_denoise_step_graph
 from .interleaved_text_stepper import TextCache
+from .paged_denoise import can_run_paged_denoise_attention
 
 __all__ = [
     'ImageState',
@@ -725,31 +725,10 @@ class TextImageDenoiseOps:
         image_embeds: torch.Tensor,
         cache: PagedTextCache,
     ) -> bool:
-        if image_embeds.device.type != "cuda" or not image_embeds.is_cuda:
-            return False
-        pool = getattr(cache, "pool", None)
-        block_size = int(getattr(pool, "block_size", 0) or 0)
-        if pool is None or block_size <= 0:
-            return False
-        ctx = get_forward_context()
-        preferred = ctx.attention_backend_name or getattr(self, "attention_backend", "auto")
-        # ``can_run_attention`` is a pure capability probe (providers answer
-        # can_run without executing); unsupported configurations return False,
-        # and an exception here is a provider bug that must surface, not a
-        # signal to silently take the slower per-row denoise path.
-        probe = image_embeds.new_empty((1, 1, 1, image_embeds.shape[-1]))
-        return ops.can_run_attention(
-            probe,
-            probe,
-            probe,
-            regime=ops.AttentionRegime.DECODE,
-            causal=True,
-            scale=1.0,
-            ctx=ctx,
-            kv_cache=cache,
-            block_table=image_embeds.new_empty((1, 1), dtype=torch.int32),
-            cache_seqlens=image_embeds.new_empty((1,), dtype=torch.int32),
-            override=preferred,
+        return can_run_paged_denoise_attention(
+            cache,
+            prototype=image_embeds,
+            attention_backend=getattr(self, "attention_backend", "auto"),
         )
 
     def _predict_v_batched(

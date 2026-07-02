@@ -11,9 +11,11 @@ lease-balance cross-check; the tensors have a single system owner here.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .block_allocator import BlockFreeList
 from .kv_pool import PagedKVPool
 
 if TYPE_CHECKING:
@@ -41,10 +43,26 @@ KvPool = PagedKVPool
 class ScratchKvPool(PagedKVPool):
     """The per-CFG-branch uncond KV pool (``scratch`` resource class).
 
-    Identical storage to ``KvPool``; a distinct system type so the residency
-    layer names the uncond-branch scratch residency apart from the request-owned
-    text KV.
+    Identical storage to ``KvPool`` plus a worker-local free-list for transient
+    block leases. Host-issued KV ids belong to the request ``kv`` pool; scratch
+    and gen-scratch ids are owned entirely by residency.
     """
+
+    def __init__(self, *args: Any, label: str = "scratch KV pool", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.label = str(label)
+        self._allocator = BlockFreeList(self.num_blocks)
+
+    def allocate_blocks(self, count: int) -> list[int]:
+        return self._allocator.allocate(int(count), label=self.label)
+
+    def release_blocks(self, block_ids: Iterable[int]) -> None:
+        self._allocator.release(int(block_id) for block_id in block_ids)
+
+    def release_cache(self, cache: Any) -> None:
+        if cache is None or getattr(cache, "pool", None) is not self:
+            return
+        self.release_blocks(getattr(cache, "block_ids", []) or [])
 
 
 class LatentPool:
@@ -241,10 +259,11 @@ class ResidencyManager:
                 device=spec.device,
                 dtype=spec.kv.dtype,
                 store_dtype=spec.kv.store_dtype,
+                label="scratch KV pool",
             )
         gen_scratch = None
         if spec.gen_scratch_num_blocks is not None and spec.gen_device is not None:
-            gen_scratch = PagedKVPool(
+            gen_scratch = ScratchKvPool(
                 num_layers=int(spec.kv.num_layers),
                 num_blocks=int(spec.gen_scratch_num_blocks),
                 block_size=int(spec.block_size),
@@ -254,6 +273,7 @@ class ResidencyManager:
                 dtype=spec.kv.dtype,
                 store_dtype=spec.kv.store_dtype,
                 tower_coord=spec.gen_tower_coord,
+                label="gen scratch KV pool",
             )
         return cls(
             kv=kv,
@@ -267,3 +287,27 @@ class ResidencyManager:
         if self.kv is None:
             raise RuntimeError("ResidencyManager has no KV pool (model declares no kv_block class)")
         return self.kv
+
+    def allocator_for_pool(self, pool: Any) -> Any:
+        if pool is self.scratch or pool is self.gen_scratch:
+            allocate = getattr(pool, "allocate_blocks", None)
+            if callable(allocate):
+                return allocate
+        return None
+
+    def require_allocator_for_pool(self, pool: Any, *, label: str = "scratch KV pool") -> Any:
+        allocate = self.allocator_for_pool(pool)
+        if not callable(allocate):
+            raise RuntimeError(f"{label} allocator is not initialized")
+        return allocate
+
+    def allocator_for_cache(self, cache: Any) -> Any:
+        return self.allocator_for_pool(getattr(cache, "pool", None))
+
+    def release_scratch_cache(self, cache: Any) -> None:
+        pool = getattr(cache, "pool", None)
+        if pool is not self.scratch and pool is not self.gen_scratch:
+            return
+        release = getattr(pool, "release_cache", None)
+        if callable(release):
+            release(cache)
