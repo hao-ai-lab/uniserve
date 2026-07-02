@@ -90,15 +90,17 @@ from ...runtime.tower_handoff import (
     TowerHandoff,
 )
 from ...runtime.transfer import Locator
-from .config import NeoChatConfig
-from .interleaved_image import (
+from ...execution.interleaved_image_denoise import (
     GeneratedImageCommitDriver,
     ImageState,
     InterleavedImageRequestState,
-    InterleavedTextCacheDriver,
-    TextCache,
     TextImageDenoiseOps,
 )
+from ...execution.interleaved_text_stepper import (
+    InterleavedTextCacheDriver,
+    TextCache,
+)
+from .config import NeoChatConfig
 
 __all__ = [
     'IMG_START_TOKEN',

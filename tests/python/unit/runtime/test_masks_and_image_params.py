@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.models.sensenova.interleaved_image import TextImageDenoiseOps
+from uniserve_worker.execution.interleaved_image_denoise import TextImageDenoiseOps
 from uniserve_worker.runtime.image_params import parse_text_image_generation_params
 from uniserve_worker.runtime.masks import build_commit_attention_mask
 
