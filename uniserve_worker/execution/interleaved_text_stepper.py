@@ -105,8 +105,9 @@ class InterleavedModelOwner(Protocol):
     """Collaborator surface a concrete model must provide to the interleaved
     text/image cache and commit drivers.
 
-    ``InterleavedTextCacheDriver`` and ``GeneratedImageCommitDriver`` own the
-    cache-append and commit flow but delegate model- and pool-specific work back
+    ``InterleavedTextCacheDriver`` owns the cache-append flow (and
+    ``interleaved_image_commit.GeneratedImageCommitOwner`` extends this surface
+    for the commit driver) but delegates model- and pool-specific work back
     to the concrete owner through the members declared here. Every member is part
     of the drivers' contract; the concrete owner must define all of them.
     """
