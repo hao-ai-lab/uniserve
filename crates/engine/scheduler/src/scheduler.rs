@@ -1513,9 +1513,15 @@ impl Scheduler {
             }
             // Exact image token counts come back from the worker's encode ops;
             // reserve generously up front for the input image + each generated
-            // reasoning image, both dual-encoded (VAE clean + ViT).
+            // reasoning image. The VAE half of the dual-encode budgets only
+            // when the worker implements it.
             GenMode::InterleaveUnd => {
-                let per_image = self.cap_max_vae_grid_tokens()
+                let vae_tokens = if self.supports_vae_encode() {
+                    self.cap_max_vae_grid_tokens()
+                } else {
+                    0
+                };
+                let per_image = vae_tokens
                     + self.cap_max_vit_grid_tokens()
                     + 2 * self.cap_commit_marker_tokens();
                 prompt_len + req.max_tokens + per_image * (1 + req.image.max_images as usize)
@@ -2412,6 +2418,17 @@ impl Scheduler {
             .any(|kind| kind == opkind_str(OpKind::TargetVerifyUnd))
     }
 
+    /// Whether the worker implements the VAE half of the understanding
+    /// dual-encode. Models without a VAE (e.g. patch-space denoisers) declare
+    /// only `vit_encode`; their input images single-encode and budget no VAE
+    /// grid tokens.
+    fn supports_vae_encode(&self) -> bool {
+        self.caps
+            .supported_ops
+            .iter()
+            .any(|kind| kind == opkind_str(OpKind::VaeEncode))
+    }
+
     fn decode_burst_plan(
         &self,
         id: RequestId,
@@ -2481,7 +2498,11 @@ impl Scheduler {
     fn peek_next_kind(&self, id: RequestId) -> Option<OpKind> {
         let st = self.running.get(&id)?;
         Some(match st.phase {
-            Phase::Encode if st.req.mode == GenMode::InterleaveUnd && st.iu_encode_step == 0 => {
+            Phase::Encode
+                if st.req.mode == GenMode::InterleaveUnd
+                    && st.iu_encode_step == 0
+                    && self.supports_vae_encode() =>
+            {
                 OpKind::VaeEncode
             }
             Phase::Encode => OpKind::VitEncode,
@@ -3127,7 +3148,7 @@ impl Scheduler {
                 let item = st.req.mm_items.get(st.mm_cursor)?.clone();
                 let pos = st.pos;
                 let step = st.iu_encode_step;
-                let (kind, modality) = if step == 0 {
+                let (kind, modality) = if step == 0 && self.supports_vae_encode() {
                     (OpKind::VaeEncode, Modality::Gen)
                 } else {
                     (OpKind::VitEncode, Modality::Und)
@@ -4426,6 +4447,42 @@ mod tests {
             !sched.running.contains_key(&id),
             "cancelled request must be reaped after its op resolves"
         );
+    }
+
+    // Understanding-interleave input images dual-encode (VAE then ViT) only
+    // when the worker declares `vae_encode`; a VAE-less model single-encodes
+    // straight through ViT at the image's in-prompt position.
+    #[test]
+    fn understanding_encode_respects_vae_capability() {
+        for (has_vae, expected_first) in
+            [(false, OpKind::VitEncode), (true, OpKind::VaeEncode)]
+        {
+            let mut sched = test_scheduler();
+            if has_vae {
+                sched.caps.supported_ops.push("vae_encode".into());
+            }
+            let mut req = test_request(1, 5);
+            req.mode = GenMode::InterleaveUnd;
+            req.mm_items = vec![uniserve_engine_api::MmItem {
+                hash: 7,
+                position: 2,
+                num_tokens: 0,
+                b64: "aGVsbG8=".into(),
+            }];
+            sched.submit_for_test(req);
+            sched.admit();
+            let id = RequestId(1);
+
+            // Prefill chunks to the image boundary...
+            let op = sched.next_op(id, 64).expect("prefill op");
+            assert_eq!(op.kind, OpKind::PrefillUnd);
+            assert_eq!(op.pos_range, (0, 2));
+            // ...then the encode fires at the in-prompt marker gap.
+            let op = sched.next_op(id, 64).expect("encode op");
+            assert_eq!(op.kind, expected_first, "has_vae={has_vae}");
+            assert_eq!(op.cond_pos, Some(2));
+            assert_eq!(op.image_b64.as_deref(), Some("aGVsbG8="));
+        }
     }
 
     // an AutoInterleave request that has committed an image is not
