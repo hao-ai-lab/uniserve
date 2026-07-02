@@ -1037,10 +1037,19 @@ class BagelForUnifiedGeneration(UniModelBase):
             self._pop_gen_state(r)
             return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W],
                     "num_tokens": added}
-        view = self.pool.view(self._state(r).block_ids, gs.cond_pos)
-        commit_seg = m.build_gen_segment(gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True)
-        m.run([commit_seg])
-        self._set_length(r, gs.cond_pos + gs.num_vae + 2)
+        rec = self._record(r)
+        retain_images = bool((rec.get("image") or {}).get("retain_images", True))
+        if retain_images:
+            # Interleave continuation: persist the generated latents into the
+            # request KV so following text conditions on the image. The engine
+            # allocates these blocks only when retention is requested (pure
+            # image mode ends at the commit and skips both).
+            view = self.pool.view(self._state(r).block_ids, gs.cond_pos)
+            commit_seg = m.build_gen_segment(
+                gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True
+            )
+            m.run([commit_seg])
+            self._set_length(r, gs.cond_pos + gs.num_vae + 2)
         b64 = pil_image_to_png_b64(img)
         self._pop_gen_state(r)
         return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W]}
