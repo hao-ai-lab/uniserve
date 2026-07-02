@@ -61,6 +61,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=int)
     parser.add_argument("--max-images", type=int, default=1)
     parser.add_argument("--i2i-mode", default="image")
+    parser.add_argument(
+        "--i2t-wire",
+        default="native",
+        choices=["native", "openai_chat"],
+        help="i2t request shape: UniServe native /generate vs OpenAI chat with image_url",
+    )
+    parser.add_argument("--i2t-question", default="Describe this image in detail.")
+    parser.add_argument(
+        "--no-gpu-memory",
+        action="store_true",
+        help="disable the harness-side nvidia-smi peak-memory sampler",
+    )
 
     parser.add_argument("--sharegpt-output-len", type=int)
     parser.add_argument("--sharegpt-context-len", type=int)
@@ -106,6 +118,9 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         steps=args.steps,
         max_images=args.max_images,
         i2i_mode=args.i2i_mode,
+        i2t_wire=args.i2t_wire,
+        i2t_question=args.i2t_question,
+        sample_gpu_memory=not args.no_gpu_memory,
         tokenizer=args.tokenizer,
         sharegpt_output_len=args.sharegpt_output_len,
         sharegpt_context_len=args.sharegpt_context_len,

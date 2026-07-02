@@ -8,9 +8,11 @@ from .base import BenchmarkTask, TaskRequest
 class T2ITask(BenchmarkTask):
     """Text-to-image via OpenAI-style ``/v1/images/generations`` (non-streaming).
 
-    Request body matches the UniServe handler: ``prompt`` plus optional
-    ``size="WxH"``, ``steps`` and ``seed``. The response is a single JSON
-    ``{"data": [{"b64_json", ...}]}`` object.
+    Request body carries ``prompt`` plus optional ``size="WxH"`` and a seed,
+    with the step count under both accepted spellings — ``steps`` (UniServe)
+    and ``num_inference_steps`` (vLLM-Omni) — since each server ignores the
+    other's field. The response is a single JSON ``{"data": [{"b64_json",
+    ...}]}`` object either way.
     """
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
@@ -22,8 +24,10 @@ class T2ITask(BenchmarkTask):
         steps = item.get("steps", self.spec.steps)
         if steps is not None:
             payload["steps"] = int(steps)
-        if item.get("seed") is not None:
-            payload["seed"] = int(item["seed"])
+            payload["num_inference_steps"] = int(steps)
+        seed = item.get("seed", self.spec.seed)
+        if seed is not None:
+            payload["seed"] = int(seed)
         if self.spec.extra_request_body:
             payload.update(self.spec.extra_request_body)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="images_generations")
