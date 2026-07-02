@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from PIL import Image
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from ..contracts.batches import UniForwardBatch
 from ..contracts.resource_plan import (
@@ -26,6 +27,7 @@ from ..contracts.resource_plan import (
     ResourcePlan,
 )
 from ..execution.denoise_driver import TextImageDenoiseStep
+from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
 from ..execution.model_base import UniModelBase
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import get_worker_config
@@ -72,6 +74,7 @@ __all__ = [
     'LLMConfig',
     'BagelConfig',
     'GenState',
+    'BagelTextRequestState',
     'BagelForUnifiedGeneration',
     'EntryClass',
 ]
@@ -519,6 +522,25 @@ class GenState:
                  "cfg_img_cache", "cfg_img_pos")
 
 
+# BAGEL's start-of-image marker string (token id 151652 in the Qwen2 vocab).
+# The worker never tokenizes it (encode ops embed the marker directly); the
+# shared text driver takes it as configuration.
+_BAGEL_IMG_START_TOKEN = "<|vision_start|>"
+
+
+@dataclass
+class BagelTextRequestState:
+    """Per-request text-cache state for the shared interleaved text driver.
+
+    ``cond`` is the single conditional text branch; its ``block_ids`` list is
+    shared (same object) with the runner ``RequestState.block_ids`` so the
+    driver's text ops and BAGEL's encode/denoise/commit ops ingest host
+    ``new_block_ids`` into one list and every path sees every block.
+    """
+
+    cond: TextCache = field(default_factory=TextCache)
+
+
 class BagelForUnifiedGeneration(UniModelBase):
     """BAGEL unified text/image model with VAE denoise and ViT/VAE encode paths."""
 
@@ -577,6 +599,17 @@ class BagelForUnifiedGeneration(UniModelBase):
         # Per-request generation side tables, keyed by req_id; cleared in drop_request.
         self._gen_records: dict[int, dict] = {}
         self._gen_states: dict[int, GenState] = {}
+        # Interleaved-text-driver owner surface: per-request driver states plus
+        # the marker/eos ids the driver reads as configuration. BAGEL has no
+        # worker-side tokenizer (the host tokenizes) and no scratch pool (its
+        # CFG branches use transient KVCaches).
+        self.reqs: dict[int, BagelTextRequestState] = {}
+        self.tokenizer = None
+        self.scratch_pool: PagedKVPool | None = None
+        self.eos_id = int(self.cfg.llm.eos_token_id)
+        self.img_start_id = int(self.cfg.start_of_image_id)
+        self.img_end_id = int(self.cfg.end_of_image_id)
+        self._shared_text_driver: InterleavedTextCacheDriver | None = None
         self.pool: PagedKVPool | None = None
         self.residency = ResidencyManager()
         self.lora: MergeOnLoadLoRA | None = None
@@ -710,6 +743,8 @@ class BagelForUnifiedGeneration(UniModelBase):
     def on_new_request(self, req_id: int, state: RequestState) -> None:
         r = int(req_id)
         self.states[r] = state
+        self.reqs.pop(r, None)
+        self.interleaved_image_state(r)
         self._gen_records[r] = {
             "sampling": dict(state.sampling or {}),
             "image": dict(state.image or {}),
@@ -721,6 +756,7 @@ class BagelForUnifiedGeneration(UniModelBase):
     def drop_request(self, req_id: int) -> None:
         r = int(req_id)
         state = self.states.pop(r, None)
+        self.reqs.pop(r, None)
         self._gen_states.pop(r, None)
         self._gen_records.pop(r, None)
         if state is not None:
@@ -780,6 +816,98 @@ class BagelForUnifiedGeneration(UniModelBase):
         state.append_new_block_ids(op.get("new_block_ids"))
         return state.block_ids
 
+    # ---- shared interleaved text driver (owner surface) --------------------
+
+    @property
+    def kv_pool(self) -> PagedKVPool | None:
+        # The interleaved text driver's name for the request KV pool.
+        return self.pool
+
+    @property
+    def num_layers(self) -> int:
+        return int(self.cfg.llm.num_hidden_layers)
+
+    def _text_driver(self) -> InterleavedTextCacheDriver:
+        driver = self._shared_text_driver
+        if driver is None:
+            driver = InterleavedTextCacheDriver(
+                self,
+                request_state_factory=BagelTextRequestState,
+                image_start_token=_BAGEL_IMG_START_TOKEN,
+            )
+            self._shared_text_driver = driver
+        return driver
+
+    def interleaved_image_state(self, req_id: int) -> BagelTextRequestState:
+        req_id = int(req_id)
+        st = self.reqs.get(req_id)
+        if st is None:
+            st = BagelTextRequestState()
+            # Share one block list between the driver's text cache and the
+            # runner request state (see BagelTextRequestState docstring).
+            st.cond.block_ids = self._state(req_id).block_ids
+            self.reqs[req_id] = st
+        return st
+
+    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self._ensure_loaded().model.embed_tokens(input_ids).to(torch.bfloat16)
+
+    def interleaved_text_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        indexes: torch.Tensor | None = None,
+        attention_mask: Any = None,
+        past_key_values: Any = None,
+        use_cache: bool = True,
+        text_only_rope: bool = False,
+    ) -> CausalLMOutputWithPast:
+        """Run the MoT understanding expert stack over the shared paged text KV.
+
+        The interleaved text driver only ever sends strictly-causal pure-text
+        spans here (BAGEL is 1-D rope, so only ``indexes[0]`` is consumed; the
+        spatial rows are zero). Its block-causal / past-visible masks are
+        therefore equivalent to plain causal attention — exactly what the
+        paged extend/decode path computes and what the eager
+        ``Segment(causal=True)`` path this replaces computed — so
+        ``attention_mask`` is intentionally not materialized.
+        """
+        del attention_mask, use_cache, text_only_rope
+        m = self._ensure_loaded().model
+        if (input_ids is None) == (inputs_embeds is None):
+            raise invalid_descriptor(
+                "BAGEL interleaved text forward requires exactly one of input_ids or inputs_embeds"
+            )
+        if indexes is None or past_key_values is None:
+            raise invalid_descriptor(
+                "BAGEL interleaved text forward requires indexes and a paged cache"
+            )
+        if inputs_embeds is None:
+            inputs_embeds = m.embed_tokens(input_ids).to(torch.bfloat16)
+        batch, seq_len = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
+        hidden = m.lm.forward_paged_text(
+            inputs_embeds.reshape(batch * seq_len, -1),
+            indexes[0].reshape(-1),
+            past_key_values,
+        )
+        # Only the last token per row feeds sampling; keep the lm_head GEMM on
+        # exactly those rows (bitwise-identical to the eager
+        # ``logits(hidden[-1:])`` it replaces).
+        last_hidden = hidden.view(batch, seq_len, -1)[:, -1, :]
+        logits = m.logits(last_hidden).unsqueeze(1)
+        return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values)
+
+    def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
+        """Query-side geometry for the system decode-graph FlashInfer planner.
+
+        KV-side geometry (heads / head dim / page size / dtype) is read off the
+        shared pool by the system adapter; the query side comes from the MoT
+        text expert (tensor-parallel-local head count, softmax scale, and the
+        bf16 dtype ``project_qkv`` emits).
+        """
+        layer = self._ensure_loaded().model.lm.layers[0]
+        return int(layer.n_heads), float(layer.scale), torch.bfloat16
+
     @staticmethod
     def _encoder_handle(mm_hash: Any) -> int:
         return encoder_handle_from_mm_hash(mm_hash)
@@ -787,10 +915,16 @@ class BagelForUnifiedGeneration(UniModelBase):
     def run_encode(self, op):
         self._ensure_loaded()
         m = self.model
-        r = op["req_id"]
-        blocks = self._extend_blocks(op)
-        base_len = self._length(r)
-        view = self.pool.view(blocks, base_len)
+        r = int(op["req_id"])
+        # Encode writes image KV into the same paged text cache the shared
+        # driver serves text from: extend blocks / base length through the
+        # driver's TextCache so both paths agree on one residency state.
+        driver = self._text_driver()
+        st = self.interleaved_image_state(r)
+        driver.extend_cache_blocks(st.cond, op)
+        driver.ensure_host_cache(st.cond)
+        base_len = int(st.cond.past.length)
+        view = self.pool.view(st.cond.block_ids, base_len)
         rope = int(op["cond_pos"])
         pre = self.image_processor.prepare_from_b64(op["image_b64"])
         image_hw = [pre.size[1], pre.size[0]]
@@ -806,6 +940,10 @@ class BagelForUnifiedGeneration(UniModelBase):
             m.run([m.build_und_image_segment(vemb, rope, view, update=True)])
             added = n + 2
         new_len = base_len + added
+        # The image span consumed `added` KV slots but a single rope position;
+        # advance the driver's text cache for both so following text ops
+        # continue from the right KV length and position.
+        self._sync_text_cache_after_image(r, length=new_len, last_position=rope)
         self._set_length(r, new_len)
         rec = self._record(r)
         rec["dims"] = image_hw
@@ -826,29 +964,31 @@ class BagelForUnifiedGeneration(UniModelBase):
         del pixels, grid
         return self.run_encode(dict(op))
 
-    def _cache_view(self, op):
-        self._ensure_loaded()
-        r = op["req_id"]
-        blocks = self._extend_blocks(op)
-        base_len = self._length(r)
-        return self.pool.view(blocks, base_len)
-
     def run_text_logits_batch(self, ops):
+        """Text prefill/decode through the shared interleaved text driver.
+
+        Batching and the one-token decode CUDA graph are system-owned by the
+        driver; BAGEL contributes only the MoT und-expert forward
+        (``interleaved_text_forward``). The host's ``pos_range`` stays
+        authoritative for every op's rope position — matching the pre-driver
+        Segment path, since BAGEL's 1-D positions do not advance across image
+        spans the way KV length does — and the request-state KV-length mirror
+        is refreshed from the text cache afterwards for the encode/denoise/
+        commit paths that read it.
+        """
         self._ensure_loaded()
-        m = self.model
-        segs, views = [], []
-        for op in ops:
-            view = self._cache_view(op)
-            pos_start = op["pos_range"][0]
-            seg = m.build_und_segment(op["token_ids"], pos_start, view, update=True)
-            segs.append(seg)
-            views.append((op, view))
-        hiddens = m.run(segs)
-        out = []
-        for (op, view), hidden in zip(views, hiddens):
-            logits = m.logits(hidden[-1:]).float().squeeze(0)
-            self._set_length(op["req_id"], view.base_len + len(op["token_ids"]))
-            out.append(logits)
+        op_list = [dict(op) for op in ops]
+        for op in op_list:
+            st = self.interleaved_image_state(int(op["req_id"]))
+            pos_range = op.get("pos_range")
+            if st.cond.past is not None and pos_range:
+                st.cond.t_index = int(pos_range[0]) - 1
+        out = self._text_driver().run_text_logits_batch(op_list)
+        for op in op_list:
+            r = int(op["req_id"])
+            st = self.interleaved_image_state(r)
+            if st.cond.past is not None:
+                self._set_length(r, int(st.cond.past.length))
         return out
 
     def run_text_logits(self, op):
@@ -1000,6 +1140,18 @@ class BagelForUnifiedGeneration(UniModelBase):
     def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
         self.apply_denoise_update(ctx, latent)
 
+    def _sync_text_cache_after_image(self, req_id: int, *, length: int, last_position: int) -> None:
+        """Advance the driver's text cache past an image KV span written outside it.
+
+        Encode/commit write image KV through raw pool views; the shared text
+        driver must resume text from the post-image KV length and rope
+        position (block ids are already shared, so only length/position move).
+        """
+        st = self.interleaved_image_state(int(req_id))
+        self._text_driver().ensure_host_cache(st.cond)
+        st.cond.past.length = int(length)
+        st.cond.t_index = int(last_position)
+
     def commit_generated_image(self, req_id: int, state, op) -> dict:
         return self._commit_generated_image(dict(op))
 
@@ -1032,6 +1184,10 @@ class BagelForUnifiedGeneration(UniModelBase):
             m.run([m.build_und_image_segment(vemb, rope + 1, v2, update=True)])
             base += nt + 2
             self._set_length(r, base)
+            # Keep the shared text driver's cache authoritative: the committed
+            # image spans consumed KV up to `base` and rope positions
+            # rope / rope + 1; following text continues at rope + 2.
+            self._sync_text_cache_after_image(r, length=base, last_position=rope + 1)
             added = (nv + 2) + (nt + 2)
             b64 = pil_image_to_png_b64(img)
             self._pop_gen_state(r)
@@ -1050,6 +1206,10 @@ class BagelForUnifiedGeneration(UniModelBase):
             )
             m.run([commit_seg])
             self._set_length(r, gs.cond_pos + gs.num_vae + 2)
+            # gen_rope_advance=2: following text continues at cond_pos + 2.
+            self._sync_text_cache_after_image(
+                r, length=gs.cond_pos + gs.num_vae + 2, last_position=gs.cond_pos + 1
+            )
         b64 = pil_image_to_png_b64(img)
         self._pop_gen_state(r)
         return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W]}
