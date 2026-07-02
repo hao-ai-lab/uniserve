@@ -135,6 +135,14 @@ class TextImageDenoiseOwner(Protocol):
     latent_downsample: int
     merge_size: int
     _img_start_token: str
+    residency: Any                 # ResidencyManager; .latent backs ImageState.x_t
+    attention_backend: str         # preferred attention provider ("auto" allowed)
+    _dataplane_handoff: Any | None  # Mode A tower handoff; None on single-device owners
+
+    # Owner-supplied denoise configuration (models differ only by these enums).
+    denoise_schedule_direction: ScheduleDirection
+    denoise_schedule_shift_domain: ScheduleShiftDomain
+    denoise_cfg_recipe: CfgRecipe
 
     # Collaborator methods.
     def _state(self, op: dict[str, Any]) -> "InterleavedImageRequestState": ...
@@ -259,8 +267,8 @@ class TextImageDenoiseOps:
         schedule = FlowMatchSchedule(
             num_steps=params.steps,
             shift=params.timestep_shift,
-            direction=ScheduleDirection.ASCENDING,
-            shift_domain=ScheduleShiftDomain.SIGMA,
+            direction=self.denoise_schedule_direction,
+            shift_domain=self.denoise_schedule_shift_domain,
         )
         timesteps = schedule.timesteps(device=device)
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
@@ -342,7 +350,7 @@ class TextImageDenoiseOps:
         cfg_plan = build_text_image_cfg_plan(
             cfg_text_scale=params.cfg_text,
             cfg_img_scale=params.cfg_img,
-            recipe=CfgRecipe.ADDITIVE_DELTAS,
+            recipe=self.denoise_cfg_recipe,
             renorm=params.cfg_norm,
             renorm_min=params.cfg_renorm_min,
         )
@@ -478,7 +486,7 @@ class TextImageDenoiseOps:
             cfg_interval=img.cfg_interval,
             cfg_renorm_type=img.cfg_norm,
             cfg_renorm_min=img.cfg_renorm_min,
-            image_scale_applies_to_text=CfgRecipe.ADDITIVE_DELTAS,
+            image_scale_applies_to_text=self.denoise_cfg_recipe,
             extra={
                 "img": img,
                 "image_embeds": image_embeds,
