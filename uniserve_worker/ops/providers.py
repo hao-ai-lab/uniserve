@@ -440,6 +440,51 @@ class _TritonQKNormRopeProvider:
             rope_dim=rope_dim,
         )
 
+    def _try_rotated_tail_fused(
+        self, req: QKNormRopeReq
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """One-launch path for 3-axis calls whose tail axes share one norm.
+
+        Applies to the SenseNova spatial-token layout: axis 0 is its own
+        norm+RoPE group and axes 1..2 share a single norm weight while each
+        keeps its own (non-identity) rotation table. The fused kernel
+        reproduces the general pipeline's per-element arithmetic and rounding
+        order exactly (see try_triton_qk_multi_axis_rms_norm_rope), so this is
+        a launch-count/traffic optimization, not a numerics change. Anything
+        that does not match falls back to the general multi-axis pipeline.
+        """
+        if len(req.axis_dims) != 3:
+            return None
+        if req.q.ndim != 3 or req.k.ndim != 3:
+            return None
+        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 0) != 1:
+            return None
+        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 1) != len(req.axis_dims):
+            return None
+        tokens = int(req.q.shape[0])
+        cos_tables: list[torch.Tensor] = []
+        sin_tables: list[torch.Tensor] = []
+        for axis in range(3):
+            cos_a, sin_a = req.cos[axis], req.sin[axis]
+            if not (self._can_repeat_rope(cos_a, tokens) and self._can_repeat_rope(sin_a, tokens)):
+                return None
+            cos_tables.append(self._align_rope_table(cos_a, tokens))
+            sin_tables.append(self._align_rope_table(sin_a, tokens))
+        rope = import_module("uniserve_worker.nn.rope")
+        return rope.try_triton_qk_multi_axis_rms_norm_rope(
+            req.q,
+            req.k,
+            req.q_weight[0],
+            req.q_weight[1],
+            req.k_weight[0],
+            req.k_weight[1],
+            (cos_tables[0], cos_tables[1], cos_tables[2]),
+            (sin_tables[0], sin_tables[1], sin_tables[2]),
+            req.eps,
+            req.eps,
+            axis_dims=tuple(int(v) for v in req.axis_dims),
+        )
+
     @staticmethod
     def _flatten_heads(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], bool]:
         if x.ndim == 3:
@@ -661,6 +706,9 @@ class _TritonQKNormRopeProvider:
 
     def _run_multi_axis(self, req: QKNormRopeReq):
         fused = self._try_identity_tail_fused(req)
+        if fused is not None:
+            return fused
+        fused = self._try_rotated_tail_fused(req)
         if fused is not None:
             return fused
         out_q = []

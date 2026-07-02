@@ -24,24 +24,30 @@ except Exception:  # pragma: no cover
 
 
 # Triton block tile for the fused SiLU-and-mul kernel; fixed by the kernel build.
-_TRITON_ACT_BLOCK = 256
+# 1024 columns per program x 4 warps gives each thread 8 contiguous elements
+# (16B vectorized bf16 loads); the previous flat 256-element blocks left the
+# loads unvectorizable behind a per-element div/mod and ran ~2.3x slower on the
+# denoise-sized [4608, 12288] call. SiLU-and-mul is purely elementwise (no
+# reduction anywhere), so launch geometry cannot change any output value: every
+# element still computes bf16(x/(1+exp(-x))) * y in fp32 exactly as before.
+_TRITON_ACT_BLOCK = 1024
 
 
 if triton is not None:
 
     @triton.jit
-    def _silu_and_mul_kernel(x_ptr, out_ptr, n_cols: tl.constexpr, total: tl.constexpr, block: tl.constexpr):
-        pid = tl.program_id(0)
-        offs = pid * block + tl.arange(0, block)
-        mask = offs < total
-        row = offs // n_cols
-        col = offs - row * n_cols
+    def _silu_and_mul_kernel(x_ptr, out_ptr, n_cols: tl.constexpr, block: tl.constexpr):
+        # 2D grid: axis 0 walks rows, axis 1 walks column blocks. Offsets are
+        # contiguous within a program, so no integer div/mod per element.
+        row = tl.program_id(0)
+        cols = tl.program_id(1) * block + tl.arange(0, block)
+        mask = cols < n_cols
         base = row * (n_cols * 2)
-        x = tl.load(x_ptr + base + col, mask=mask, other=0.0).to(tl.float32)
-        y = tl.load(x_ptr + base + n_cols + col, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+        y = tl.load(x_ptr + base + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
         silu = (x / (1.0 + tl.exp(-x))).to(tl.bfloat16).to(tl.float32)
         out = silu * y
-        tl.store(out_ptr + offs, out, mask=mask)
+        tl.store(out_ptr + row * n_cols + cols, out, mask=mask)
 
 
 def _act_inputs_eligible(x: torch.Tensor, y: torch.Tensor | None) -> bool:
@@ -72,10 +78,12 @@ class _TritonSiluAndMul:
     def run(self, x: torch.Tensor, y: torch.Tensor | None) -> torch.Tensor:
         n_cols = int(x.shape[-1] // 2)
         out = torch.empty((*x.shape[:-1], n_cols), dtype=x.dtype, device=x.device)
-        total = out.numel()
+        rows = out.numel() // n_cols
         block = _TRITON_ACT_BLOCK
-        grid = (triton.cdiv(total, block),)
-        _silu_and_mul_kernel[grid](x, out, n_cols, total, block, num_warps=4)
+        # Rows on axis 0 (the 2^31-limited axis); column blocks on axis 1,
+        # which stays tiny (n_cols/block) for every model width in tree.
+        grid = (rows, triton.cdiv(n_cols, block))
+        _silu_and_mul_kernel[grid](x, out, n_cols, block, num_warps=4)
         return out
 
 
