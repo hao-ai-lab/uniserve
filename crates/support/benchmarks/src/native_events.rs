@@ -12,7 +12,7 @@ use uniserve_testkit::{PngInfo, image_done_json_metadata};
 /// consumes already-serialized JSON (`&[Value]`) rather than `GenEvent`s. If the
 /// production type strings change, update these constants together with the
 /// Python mirror in
-/// `benchmarks/serving/uniserve_bench/response_classifier.py`. The
+/// `uniserve_e2e/harness/response_classifier.py`. The
 /// `vocabulary_matches_native_api` test below guards the full set.
 pub mod event_type {
     pub const SCHEDULED: &str = "scheduled";
@@ -48,7 +48,7 @@ impl NativeEventSummary {
     /// emitter sends exactly one terminal event per stream, so a duplicate
     /// `finished` is a protocol violation. This matches the Python classifier
     /// `classify_native_events` in
-    /// `benchmarks/serving/uniserve_bench/response_classifier.py`.
+    /// `uniserve_e2e/harness/response_classifier.py`.
     pub fn passed_contract(&self) -> bool {
         self.finished == 1 && self.rejected == 0 && self.errors == 0
     }
@@ -135,7 +135,7 @@ mod tests {
         // Pins the canonical event-type strings. These MUST stay in lockstep
         // with `event_json` / `is_terminal` in
         // `crates/frontend/native-api/src/events.rs` and the Python mirror in
-        // `benchmarks/serving/uniserve_bench/response_classifier.py`. A rename
+        // `uniserve_e2e/harness/response_classifier.py`. A rename
         // in the production emitter that is not mirrored here will fail this
         // test instead of silently desynchronizing the classifiers.
         let all = [

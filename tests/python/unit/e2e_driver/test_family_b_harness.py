@@ -25,24 +25,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from benchmarks.serving.uniserve_bench import cli
-from benchmarks.serving.uniserve_bench.datasets import (
+from uniserve_e2e.harness import cli
+from uniserve_e2e.harness.datasets import (
     load_dataset_rows,
     load_sharegpt,
     load_ueval,
     trace_items,
 )
-from benchmarks.serving.uniserve_bench.metrics import summarize_image
-from benchmarks.serving.uniserve_bench.metrics.common import RequestRecord
-from benchmarks.serving.uniserve_bench.report import build_summary
-from benchmarks.serving.uniserve_bench.response_classifier import (
+from uniserve_e2e.harness.metrics import summarize_image
+from uniserve_e2e.harness.metrics.common import RequestRecord
+from uniserve_e2e.harness.report import build_summary
+from uniserve_e2e.harness.response_classifier import (
     classify_json_image_response,
     classify_native_events,
     classify_openai_events,
 )
-from benchmarks.serving.uniserve_bench.runner import RunResult
-from benchmarks.serving.uniserve_bench.spec import BenchmarkSpec, TaskName
-from benchmarks.serving.uniserve_bench.sse import TERMINAL_EVENT_TYPES, iter_sse_events
+from uniserve_e2e.harness.runner import RunResult
+from uniserve_e2e.harness.spec import BenchmarkSpec, TaskName
+from uniserve_e2e.harness.sse import TERMINAL_EVENT_TYPES, iter_sse_events
 
 pytestmark = [pytest.mark.unit]
 

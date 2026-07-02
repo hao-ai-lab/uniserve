@@ -14,7 +14,7 @@ LLM-serving numbers are directly comparable to SGLang's. The key contracts:
   1-second bucketing (token times reconstructed from ``start_time + ttft`` then
   cumulative ITLs).
 
-The parity test in ``tests/python/unit/benchmarks/test_stream_parity.py`` pins
+The parity test in ``tests/python/unit/e2e_driver/test_stream_parity.py`` pins
 this against the exact SGLang formulas.
 """
 from __future__ import annotations
