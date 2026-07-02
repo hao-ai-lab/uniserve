@@ -400,6 +400,44 @@ class MoTDecoderLayer(nn.Module):
         ):
             set_tower_coord(module, gen_coord)
 
+    def forward_paged_text(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_values: Any,
+    ) -> torch.Tensor:
+        """One text-modality (und) layer step over a shared paged text cache.
+
+        The interleaved text driver's serving path: token-major
+        ``hidden_states`` ``[tokens, hidden]`` attend causally against the
+        request's paged KV through the duck-typed layer-update protocol
+        (``request_cache_for_update`` / ``finish_layer_update`` /
+        ``cancel_layer_update``). The protocol hands RadixAttention the same
+        per-request page view the eager ``Segment(causal=True)`` path passes
+        (PAGED_EXTEND for a multi-token span, PAGED_DECODE for one token), so
+        the numerics match :meth:`forward`'s text lane exactly.
+        """
+        expert = self.experts[Modality.TEXT]
+        n_tokens = int(hidden_states.shape[0])
+        normed = expert.input_norm(hidden_states)
+        q, k, v = expert.project_qkv(normed, cos, sin)
+        cache = past_key_values.request_cache_for_update(layer_idx, n_tokens)
+        try:
+            attn_values = expert.attend(layer_idx, q, k, v, cache, True, True)
+        except BaseException:
+            cancel = getattr(past_key_values, "cancel_layer_update", None)
+            if callable(cancel):
+                cancel(layer_idx)
+            raise
+        past_key_values.finish_layer_update(layer_idx, n_tokens)
+        hidden_states = hidden_states + expert.o_proj(
+            attn_values.reshape(n_tokens, self.q_size)
+        )
+        normed = expert.post_norm(hidden_states)
+        return hidden_states + expert.mlp(normed.to(torch.bfloat16))
+
     def _present_routes(
         self, text_mask, gen_mask, any_text, any_gen,
     ) -> dict[Modality, tuple[torch.Tensor, ModalityExpert]]:
@@ -569,6 +607,29 @@ class MoTModel(nn.Module):
         )
         if self._tower_coords is not None:
             set_tower_coord(self.norm_moe_gen, self._tower_coords[Modality.GEN])
+
+    @torch.no_grad()
+    def forward_paged_text(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: Any,
+    ) -> torch.Tensor:
+        """Run the text (und) expert stack over one shared paged text cache.
+
+        Token-major ``inputs_embeds`` ``[tokens, hidden]`` with 1-D rope
+        ``positions`` ``[tokens]``; ``past_key_values`` implements the paged
+        layer-update protocol (``PagedTextCache`` eagerly, the system decode
+        graph's past adapter under capture/replay). Returns final-norm hidden
+        states ``[tokens, hidden]``.
+        """
+        cos, sin = self.rotary.cos_sin_1d(positions)
+        hidden_states = inputs_embeds
+        for layer_idx, layer in enumerate(self.layers):
+            hidden_states = layer.forward_paged_text(
+                layer_idx, hidden_states, cos, sin, past_key_values
+            )
+        return self.norm(hidden_states)
 
     @torch.no_grad()
     def forward_segments(self, segs: list[Segment]) -> list[torch.Tensor]:
