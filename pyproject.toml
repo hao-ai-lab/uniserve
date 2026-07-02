@@ -26,6 +26,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench);
+# the loaders raise a clear ImportError pointing here when missing, and
+# --dataset-path local files work without this extra.
+eval-datasets = [
+    "datasets>=3",
+    "pyarrow<20",
+]
 test = [
     "coverage[toml]>=7.6",
     "pytest>=8.1",

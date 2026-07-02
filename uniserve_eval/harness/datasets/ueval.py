@@ -1,6 +1,6 @@
 """UEval prompt loader for interleaved text+image generation benchmarking.
 
-UEval (``zlab-princeton/UEval``, hosted at ``primerL/UEval-all``) has 1,000
+UEval (``zlab-princeton/UEval``) has 1,000
 expert-curated prompts across 8 real-world domains that require both text and
 images in the output. For a speed benchmark we only need the request prompt; the
 rubric-based quality scoring is out of scope.
@@ -16,7 +16,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-UEVAL_HF_REPO = "primerL/UEval-all"
+UEVAL_HF_REPO = "zlab-princeton/UEval"
 _PROMPT_FIELDS = ("prompt", "question", "instruction", "input", "query", "text")
 
 

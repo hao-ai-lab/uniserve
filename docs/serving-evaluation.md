@@ -65,6 +65,14 @@ Native `understand` mode over the injected synthetic scene, "Describe this image
 
 Same shape per model pair: t2i runs 4 prompts from the committed prompt set (closed-loop, concurrency 1, warmup 1, seed 42, 50 steps, model-native resolution); i2t runs 4 synthetic-image descriptions (greedy, 256 tokens). Healthy references at the time bounds were set (1× GB200): SenseNova t2i ~4.8–5.6 s/image and i2t ~160–170 tok/s (ITL ~5 ms); BAGEL t2i ~6.6 s/image and i2t ~155–165 tok/s. Bounds: t2i mean ceilings 8 s (SenseNova) / 10 s (BAGEL); i2t floors 120 / 100 tok/s with ITL ceiling 9 ms. The `-omni` mirrors measure vLLM-Omni under identical workloads with no bounds (references: SenseNova t2i ~6.9 s, i2t ~10 tok/s; BAGEL t2i ~10.8 s, i2t ~144 tok/s).
 
+### Real-dataset workloads: `sensenova-t2i-mjhq`, `bagel-t2i-mjhq`, `sensenova-interleave-ueval` (suite `realdata-perf`)
+
+The hermetic workloads above use committed prompts and synthetic images so gates run from a clean checkout with zero downloads. These points complement them with real datasets, auto-downloaded from the Hugging Face hub on first use (install the `eval-datasets` extra: `pip install -e '.[eval-datasets]'`; every loader also accepts `--dataset-path` for a local file instead).
+
+- **MJHQ t2i** (`--dataset mjhq`, `playgroundai/MJHQ-30K`): 8 real photography captions per point, same sizes/steps/seed/bounds as the trace-based tripwires — realistic prompt length and content diversity.
+- **UEval interleave** (`--dataset ueval`, `zlab-princeton/UEval`, 1,000 real interleaved-generation tasks such as "How to reset a forgotten password on Windows? Show each step both visually and textually"): 3 prompts, up to 2 images each at 2048×1152/50 steps. Expected behavior: the model decides image count and placement per prompt, so image totals legitimately vary run to run; the harness reports the image sub-block (per-image generation time, TTFI) and gates only text ITL, which excludes image spans by construction. This is the realistic companion to the deterministic tour-guide gate. Healthy reference: 3/3 ok, ~5.3 s per generated image, text ITL ~5 ms.
+- **ShareGPT text** is already real-dataset (`qwen3-sharegpt-stress` below). **PIE-Bench** (i2i editing) has a working loader, but the server-side input-conditioned image mode is not yet functional, so no workload is declared for it — add one when i2i lands.
+
 ### `qwen3-sharegpt-stress`
 
 Text-serving stress through the shared harness: 200 ShareGPT prompts at 16 req/s against Qwen3-32B (`--max-tokens 4096`, seed 42); gated on all 200 requests completing (`expect_metrics: completed ≥ 200`), and any failed request fails the point.
