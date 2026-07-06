@@ -29,6 +29,17 @@ def test_registry_normalizes_aliases_and_lists_registered_backends(monkeypatch):
     assert registry.list_attention_backends() == ("torch_sdpa",)
 
 
+def test_fa4_cute_backend_name_is_registered_when_provider_module_imports():
+    from uniserve_kernel import mm_attn_varlen
+    from uniserve_worker.backends.attention import get_attention_backend, has_attention_backend
+
+    assert has_attention_backend("fa4_cute")
+    backend = get_attention_backend("fa4_cute")
+    caps = backend.capabilities()
+    assert caps.available is mm_attn_varlen.available()
+    assert caps.visible_end is mm_attn_varlen.available()
+
+
 def test_registry_rejects_conflicting_registration_and_unknown_lookup(monkeypatch):
     monkeypatch.setattr(registry, "_BACKENDS", {})
     registry.register_attention_backend("torch_sdpa", _FakeBackend())

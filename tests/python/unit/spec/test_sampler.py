@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 from uniserve_worker.spec import speculative_sample_target_only
 
 pytestmark = pytest.mark.unit

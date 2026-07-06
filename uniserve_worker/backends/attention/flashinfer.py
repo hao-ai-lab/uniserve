@@ -102,6 +102,7 @@ class FlashInferAttentionBackend(_WrapperPool):
             paged_kv=has_paged_decode,
             varlen_attention=has_paged_prefill,
             varlen_paged_kv=has_paged_prefill,
+            requires_paged_varlen=True,
             paged_block_size_multiple=1,
             min_head_dim=64,
             paged_decode_only=True,

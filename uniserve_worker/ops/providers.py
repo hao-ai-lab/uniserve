@@ -4,8 +4,8 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from importlib import import_module
+
 import torch
-import torch.nn.functional as F
 
 from ..foundation.env import env_flag
 from .core import Capabilities, CommDispatcher, Dispatcher, Handoff
@@ -20,7 +20,6 @@ from .requests import (
     SiluAndMulReq,
     TpAllReduceReq,
 )
-
 
 _SGL_ALIGNMENT_BYTES = 16
 
@@ -936,6 +935,7 @@ class _AttentionBackendProvider:
                 "paged_kv": bool(getattr(caps, "paged_kv", False)),
                 "varlen_attention": bool(getattr(caps, "varlen_attention", False)),
                 "varlen_paged_kv": bool(getattr(caps, "varlen_paged_kv", False)),
+                "requires_paged_varlen": bool(getattr(caps, "requires_paged_varlen", False)),
                 "visible_end": bool(getattr(caps, "visible_end", False)),
                 "trunk_geometries": getattr(caps, "trunk_geometries", frozenset()),
                 "paged_block_size_multiple": int(getattr(caps, "paged_block_size_multiple", 1) or 1),
@@ -1005,6 +1005,8 @@ class _AttentionBackendProvider:
 
     def can_run(self, req: AttentionReq) -> bool:
         caps = self.backend.capabilities()
+        if not bool(getattr(caps, "available", True)):
+            return False
         if self.name in {"sgl_kernel", "flashinfer", "flash_attn", "fa4_cute"} and req.q.device.type != "cuda":
             return False
         if not self._head_dim_supported(caps, req.q.shape[-1]):
@@ -1020,6 +1022,8 @@ class _AttentionBackendProvider:
                     and bool(getattr(caps, "varlen_paged_kv", False))
                     and self._paged_storage_supported(caps, req)
                 )
+            if bool(getattr(caps, "requires_paged_varlen", False)):
+                return False
             return bool(getattr(caps, "varlen_attention", False))
         if req.regime is AttentionRegime.DECODE or req.block_table is not None or req.kv_cache is not None:
             if bool(getattr(caps, "paged_decode_only", False)) and not self._is_one_token_decode(req):
@@ -1049,6 +1053,7 @@ class _AttentionBackendProvider:
                 max_seqlen_k=req.max_seqlen_k,
                 scale=req.scale,
                 use_prefix_bounds=req.use_prefix_bounds,
+                fully_visible=req.fully_visible,
             )
         if req.cu_seqlens_q is not None and req.cu_seqlens_k is not None and hasattr(self.backend, "forward_varlen"):
             return self.backend.forward_varlen(
@@ -1233,7 +1238,12 @@ class _SymmMemTpAllReduceProvider:
         key = (str(tensor.device), tensor.dtype, int(tensor.numel()))
         buffer = self._buffers.get(key)
         if buffer is None:
-            buffer = symm_mem.empty(int(tensor.numel()), dtype=tensor.dtype, device=tensor.device)
+            # ``dispatch`` can first run under torch.inference_mode() during
+            # graph warmup/capture. Cached communication buffers are mutated on
+            # every later call, including non-inference setup paths, so allocate
+            # them as normal tensors regardless of the caller's current mode.
+            with torch.inference_mode(False):
+                buffer = symm_mem.empty(int(tensor.numel()), dtype=tensor.dtype, device=tensor.device)
             handle = symm_mem.rendezvous(buffer, group=group_name)
             if handle is None:
                 # Rendezvous declined (unsupported topology). Downgrade loudly,

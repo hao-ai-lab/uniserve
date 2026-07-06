@@ -10,7 +10,12 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Mapping, cast
 
-from ..backends.attention import get_attention_backend, normalize_attention_backend_name
+import torch
+
+from ..backends.attention import (
+    get_attention_backend,
+    normalize_attention_backend_name,
+)
 from ..contracts.batches import ExecuteBatch, UniForwardBatch
 from ..contracts.caps import Caps
 from ..contracts.forward_context import ForwardContext, use_forward_context
@@ -460,7 +465,7 @@ class ModelRunner:
             )
             group_start = time.perf_counter_ns() if forward_stats is not None else 0
             stream_ctx = self._forward_stream_context(fb)
-            with use_forward_context(ctx), stream_ctx:
+            with torch.inference_mode(), use_forward_context(ctx), stream_ctx:
                 outputs = self._dispatch_by_mode(
                     fb, group, defer_text_cpu_results=defer_text_cpu_results
                 )
@@ -550,7 +555,7 @@ class ModelRunner:
         group: list[tuple[int, Mapping[str, Any]]],
         defer_text_cpu_results: bool,
     ) -> list[Any] | None:
-        if self._is_decode_denoise_forward_batch(fb):
+        if self.forward_driver.can_run(self.model, fb) or self._is_text_denoise_forward_batch(fb):
             if _MIXED_PROOF_ENABLED:
                 self._log_mixed_proof(fb, group)
             with profile_range("uniserve.runner.forward"):
@@ -658,10 +663,10 @@ class ModelRunner:
         """Group ops for one forward step.
 
         ``supports_mixed_modes`` selects per-mode (not per-position) grouping via
-        ``_mode_ordered_groups``. Decode+denoise mixed windows admitted by
-        ``ForwardAdmissionRouter`` run as one forward. All-text extend+decode
-        windows still require the system ``TextBackendGate``; otherwise the batch
-        splits per-mode.
+        ``_mode_ordered_groups``. Mixed windows admitted by
+        ``ForwardAdmissionRouter`` run as one forward when the model exposes the
+        mixed-forward seam; generic text-only models still require the system
+        ``TextBackendGate`` and otherwise split per-mode.
         """
         if self.batch_policy.supports_mixed_modes:
             decision = ForwardAdmissionRouter.from_runtime_config().decide(ops)
@@ -674,14 +679,25 @@ class ModelRunner:
     def _accepts_forward_batch(self, ops: list[Mapping[str, Any]], decision: Any) -> bool:
         """Whether the admitted mixed window can actually run as one forward.
 
-        Text-only extend+decode windows run through the system ``TextBackendGate``.
-        Decode+denoise generation windows are accepted unconditionally once the
-        admission router selects them; if the model hook is missing, dispatch
-        fails loudly instead of splitting per-mode.
+        Text-only extend+decode windows prefer a model-owned packed forward when
+        the model exposes ``run_forward``. Generic text models run through the
+        system ``TextBackendGate``. Decode+denoise generation windows admitted by
+        ``ForwardAdmissionRouter`` use model-owned packed forward only when the
+        model exposes that hook; otherwise they stay on the per-mode drivers.
         """
 
+        has_forward_hook = callable(getattr(self.model, "run_forward", None))
         if not decision.requires_model_acceptance:
-            return bool(decision.use_forward)
+            return bool(decision.use_forward) and has_forward_hook
+        modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
+        if (
+            bool(decision.use_forward)
+            and ForwardMode.DECODE in modes
+            and ForwardMode.EXTEND in modes
+            and set(modes) <= _TEXT_DRIVER_MODES
+            and has_forward_hook
+        ):
+            return True
         if self.text_gate is not None:
             return self.text_gate.mixed_capable(
                 ops, attention_backend_name=self.attention_backend_name
@@ -689,14 +705,16 @@ class ModelRunner:
         return False
 
     @staticmethod
-    def _is_decode_denoise_forward_batch(fb: UniForwardBatch) -> bool:
-        modes = set(fb.op_modes)
+    def _is_text_denoise_modes(modes: tuple[ForwardMode, ...]) -> bool:
+        mode_set = set(modes)
         return (
-            fb.mode is ForwardMode.MIXED
-            and ForwardMode.DECODE in modes
-            and ForwardMode.DENOISE in modes
-            and modes <= {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE}
+            bool(mode_set & {ForwardMode.EXTEND, ForwardMode.DECODE})
+            and ForwardMode.DENOISE in mode_set
         )
+
+    @staticmethod
+    def _is_text_denoise_forward_batch(fb: UniForwardBatch) -> bool:
+        return fb.mode is ForwardMode.MIXED and ModelRunner._is_text_denoise_modes(fb.op_modes)
 
     def _contiguous_groups(
         self, ops: list[Mapping[str, Any]]
@@ -756,10 +774,11 @@ class ModelRunner:
         # Per-step "mixed forward executed" trace (opt-in via the proof flag).
         n_ext = sum(1 for m in fb.op_modes if m == ForwardMode.EXTEND)
         n_dec = sum(1 for m in fb.op_modes if m == ForwardMode.DECODE)
+        n_den = sum(1 for m in fb.op_modes if m == ForwardMode.DENOISE)
         n_tok = sum(len(op.get("token_ids") or []) for _, op in group)
         _MIXED_PROOF_LOG.info(
-            "MIXED FORWARD executed: %d ops (%d extend + %d decode), %d tokens",
-            len(fb.ops), n_ext, n_dec, n_tok,
+            "MIXED FORWARD executed: %d ops (%d extend + %d decode + %d denoise), %d tokens",
+            len(fb.ops), n_ext, n_dec, n_den, n_tok,
         )
 
     def _log_text_mixed_split(self, ops: list[Mapping[str, Any]], decision: Any) -> None:
@@ -822,6 +841,14 @@ class ModelRunner:
             self.request_states.commit(req_id)
 
     def _record_group_shape(self, stats: ForwardStats, fb: UniForwardBatch) -> None:
+        if fb.mode is ForwardMode.MIXED:
+            for mode, op in zip(fb.op_modes, fb.ops):
+                stats.record_mode_shape(
+                    mode.value,
+                    ops=1,
+                    tokens=self._op_token_count(op),
+                )
+            return
         stats.record_mode_shape(
             fb.mode.value,
             ops=len(fb.ops),

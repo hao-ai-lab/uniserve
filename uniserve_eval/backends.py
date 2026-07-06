@@ -15,11 +15,14 @@ import signal
 import socket
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 from .profiles import (
     ROOT,
+    expand_profile_value,
     load_config,
+    require_resolved_profile_value,
     server_dir,
     server_log_path,
     server_pid_path,
@@ -28,11 +31,22 @@ from .profiles import (
 )
 
 
-def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any]) -> list[str]:
+def _repo_path(config: dict[str, Any], key: str, default: str) -> str:
+    value = str(expand_profile_value(config.get(key, default)))
+    return str(Path(value) if Path(value).is_absolute() else ROOT / value)
+
+
+def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any], *, strict_env: bool = False) -> list[str]:
+    spec = expand_profile_value(spec)
+    config = expand_profile_value(config)
+    if strict_env:
+        require_resolved_profile_value(spec, context="server spec")
+        require_resolved_profile_value(config.get("python", ""), context="config python")
+        require_resolved_profile_value(config.get("server_bin", ""), context="config server_bin")
     if spec.get("command"):
         return [str(part) for part in spec["command"]]
     cmd = [
-        str(ROOT / config.get("server_bin", "target/debug/uniserve")),
+        _repo_path(config, "server_bin", "target/debug/uniserve"),
         "serve",
         spec["model"],
         "--served-model-name",
@@ -42,7 +56,7 @@ def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any]) -> list[str]:
         "--port",
         str(spec["port"]),
         "--worker-python",
-        str(ROOT / config.get("python", ".venv/bin/python")),
+        _repo_path(config, "python", ".venv/bin/python"),
     ]
     cmd.extend(str(part) for part in spec.get("serve_args", []))
     return cmd
@@ -64,12 +78,14 @@ def wait_for_port(host: str, port: int, timeout_s: float) -> None:
 def launch(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     spec = server_spec(config, args.server)
+    if spec.get("abstract"):
+        raise SystemExit(f"server {args.server!r} is an abstract base profile and cannot be launched")
     out_dir = server_dir(config, args.server)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = build_serve_cmd(config, spec)
+    cmd = build_serve_cmd(config, spec, strict_env=True)
     env = os.environ.copy()
     if spec.get("cuda_visible_devices") is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(spec["cuda_visible_devices"])
+        env["CUDA_VISIBLE_DEVICES"] = str(expand_profile_value(spec["cuda_visible_devices"]))
     env.update(spec_env(spec))
     log_path = server_log_path(config, args.server)
     print("launch:", " ".join(cmd))
@@ -98,6 +114,8 @@ def clean(args: argparse.Namespace) -> None:
     names = list(config.get("servers", {})) if args.all else [args.server]
     for name in names:
         if not name:
+            continue
+        if server_spec(config, name).get("abstract"):
             continue
         pid_file = server_pid_path(config, name)
         if not pid_file.exists():

@@ -23,6 +23,19 @@ _DEFAULT_WORKSPACE_SIZE = 512 * 1024 * 1024
 _PREFILL_GRAPH_SCOPES = itertools.count(1)
 
 
+def _empty_mutable(
+    size: int | tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    # FlashInfer plan/workspace buffers are rewritten across forward passes.
+    # Keep them out of inference tensor mode even when first allocated during
+    # model inference.
+    with torch.inference_mode(False):
+        return torch.empty(size, dtype=dtype, device=device)
+
+
 class WrapperKey(NamedTuple):
     """Identity of a cached flashinfer wrapper and its plan caches.
 
@@ -136,9 +149,9 @@ class _WrapperPool:
         wrapper = self._decode_wrappers.get(key)
         if wrapper is None:
             workspace = self._workspace(device)
-            indptr = torch.empty((int(batch_size) + 1,), dtype=torch.int32, device=device)
-            indices = torch.empty((max(1, int(max_indices)),), dtype=torch.int32, device=device)
-            last_page_len = torch.empty((int(batch_size),), dtype=torch.int32, device=device)
+            indptr = _empty_mutable((int(batch_size) + 1,), dtype=torch.int32, device=device)
+            indices = _empty_mutable((max(1, int(max_indices)),), dtype=torch.int32, device=device)
+            last_page_len = _empty_mutable((int(batch_size),), dtype=torch.int32, device=device)
             wrapper = _fi._BatchDecodeWithPagedKVCacheWrapper(
                 workspace,
                 "NHD",
@@ -506,7 +519,7 @@ class _WrapperPool:
         key = (_device_key(device), size)
         workspace = self._workspace_buffers.get(key)
         if workspace is None:
-            workspace = torch.empty(size, dtype=torch.uint8, device=device)
+            workspace = _empty_mutable(size, dtype=torch.uint8, device=device)
             self._workspace_buffers[key] = workspace
         return workspace
 
@@ -535,7 +548,7 @@ class _WrapperPool:
                     indptr=indptr,
                     indices=indices,
                     last_page_len=last_page_len,
-                    page_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+                    page_counts=_empty_mutable(batch_size, dtype=torch.int32, device=device),
                 )
                 self._decode_plan_workspaces[wrapper_key] = workspace
             return workspace
@@ -550,10 +563,10 @@ class _WrapperPool:
             or int(workspace.page_counts.numel()) < batch_size
         ):
             workspace = _DecodePlanWorkspace(
-                indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-                indices=torch.empty(max_indices, dtype=torch.int32, device=device),
-                last_page_len=torch.empty(batch_size, dtype=torch.int32, device=device),
-                page_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+                indptr=_empty_mutable(batch_size + 1, dtype=torch.int32, device=device),
+                indices=_empty_mutable(max_indices, dtype=torch.int32, device=device),
+                last_page_len=_empty_mutable(batch_size, dtype=torch.int32, device=device),
+                page_counts=_empty_mutable(batch_size, dtype=torch.int32, device=device),
             )
             self._decode_plan_workspaces[wrapper_key] = workspace
         return workspace
@@ -579,11 +592,11 @@ class _WrapperPool:
             or int(workspace.page_counts.numel()) < batch_size
         ):
             workspace = _PrefillPlanWorkspace(
-                qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-                kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
-                indices=torch.empty(max_indices, dtype=torch.int32, device=device),
-                last_page_len=torch.empty(batch_size, dtype=torch.int32, device=device),
-                page_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+                qo_indptr=_empty_mutable(batch_size + 1, dtype=torch.int32, device=device),
+                kv_indptr=_empty_mutable(batch_size + 1, dtype=torch.int32, device=device),
+                indices=_empty_mutable(max_indices, dtype=torch.int32, device=device),
+                last_page_len=_empty_mutable(batch_size, dtype=torch.int32, device=device),
+                page_counts=_empty_mutable(batch_size, dtype=torch.int32, device=device),
             )
             self._prefill_plan_workspaces[wrapper_key] = workspace
         return workspace

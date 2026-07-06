@@ -19,13 +19,17 @@ is not duplicated here.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pytest
 
+import uniserve_eval.harness.core.client as client_module
 from uniserve_eval.harness import cli
+from uniserve_eval.harness.core.client import _parse_native, _send_sse
 from uniserve_eval.harness.datasets import (
     load_dataset_rows,
     load_sharegpt,
@@ -42,7 +46,13 @@ from uniserve_eval.harness.response_classifier import (
 )
 from uniserve_eval.harness.runner import RunResult
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
-from uniserve_eval.harness.sse import TERMINAL_EVENT_TYPES, iter_sse_events
+from uniserve_eval.harness.sse import (
+    TERMINAL_EVENT_TYPES,
+    aiter_sse_events,
+    aiter_sse_events_from_text,
+    iter_sse_events,
+)
+from uniserve_eval.harness.tasks.interleave import InterleaveTask
 
 pytestmark = [pytest.mark.unit]
 
@@ -150,6 +160,16 @@ def test_classify_openai_events_routes_payloads() -> None:
     )
 
 
+def test_classify_openai_events_counts_reasoning_content_as_text() -> None:
+    events = [
+        {"choices": [{"delta": {"reasoning_content": "thinking"}}]},
+        {"choices": [{"delta": {}, "finish_reason": "length"}]},
+        {"type": "sse_done"},
+    ]
+
+    assert classify_openai_events(events) == (True, "ok")
+
+
 def test_classify_json_image_response_routes_payloads() -> None:
     assert classify_json_image_response({"data": [{"b64_json": "AAAA"}]}) == (True, "ok")
     assert classify_json_image_response({}) == (False, "protocol_empty_image_data")
@@ -158,6 +178,69 @@ def test_classify_json_image_response_routes_payloads() -> None:
         False,
         "protocol_missing_image_payload",
     )
+
+
+def test_native_parser_excludes_image_step_gaps_from_text_itl() -> None:
+    record = RequestRecord(request_id="interleave", task="interleave")
+    record.start_time = 10.0
+    events = [
+        {"type": "text", "text": "a", "_client_t": 11.0},
+        {"type": "image_begin", "image_id": 1, "steps": 2, "_client_t": 11.5},
+        {"type": "text", "text": "b", "_client_t": 12.0},
+        {"type": "image_step", "image_id": 1, "step": 1, "_client_t": 13.0},
+        {"type": "text", "text": "c", "_client_t": 14.0},
+        {"type": "image_done", "image_id": 1, "_client_t": 15.0},
+        {"type": "text", "text": "d", "_client_t": 16.0},
+        {"type": "text", "text": "e", "_client_t": 16.25},
+        {
+            "type": "finished",
+            "reason": "max_tokens",
+            "stop_reason": "token:42",
+            "completion_tokens": 5,
+            "images": 1,
+        },
+    ]
+
+    _parse_native(events, record, prompt_len_fallback=3)
+
+    assert record.generated_text == "abcde"
+    assert record.ttft == pytest.approx(1.0)
+    assert record.itl == pytest.approx([0.25])
+    assert record.output_len == 5
+    assert record.images == 1
+    assert record.image_gen_seconds == pytest.approx([3.5])
+    assert record.finish_reason == "max_tokens"
+    assert record.stop_reason == "token:42"
+    assert record.record_dict()["finish_reason"] == "max_tokens"
+
+
+def test_interleave_task_omits_image_cap_unless_explicit() -> None:
+    uncapped = InterleaveTask(
+        BenchmarkSpec(
+            task=TaskName.INTERLEAVE,
+            model="SenseNova-U1",
+            max_tokens=8192,
+            width=2048,
+            height=1152,
+            steps=50,
+        )
+    ).build_request({"prompt": "show each step visually and textually"})
+
+    assert uncapped.payload["image"] == {"width": 2048, "height": 1152, "steps": 50}
+
+    capped = InterleaveTask(
+        BenchmarkSpec(
+            task=TaskName.INTERLEAVE,
+            model="SenseNova-U1",
+            max_tokens=8192,
+            max_images=8,
+            width=2048,
+            height=1152,
+            steps=50,
+        )
+    ).build_request({"prompt": "show each step visually and textually"})
+
+    assert capped.payload["image"]["max_images"] == 8
 
 
 # --- SSE framing --------------------------------------------------------------
@@ -233,6 +316,89 @@ def test_iter_sse_events_stop_on_terminal_halts_after_first_terminal() -> None:
     events = list(iter_sse_events(lines, stop_on=TERMINAL_EVENT_TYPES))
 
     assert events == [{"type": "text"}, {"type": "finished"}]
+
+
+def test_iter_sse_events_stop_on_terminal_without_trailing_blank_line() -> None:
+    lines = [
+        "data: {\"type\": \"text\"}",
+        "",
+        "data: {\"type\": \"finished\"}",
+        "data: {\"type\": \"text\", \"after\": true}",
+        "",
+    ]
+
+    events = list(iter_sse_events(lines, stop_on=TERMINAL_EVENT_TYPES))
+
+    assert events == [{"type": "text"}, {"type": "finished"}]
+
+
+def test_aiter_sse_events_stop_on_terminal_without_waiting_for_eof() -> None:
+    async def lines() -> object:
+        yield "data: {\"type\": \"text\"}"
+        yield ""
+        yield "data: {\"type\": \"finished\"}"
+        await asyncio.sleep(60.0)
+        yield "data: {\"type\": \"text\", \"after\": true}"
+
+    async def run_once() -> list[dict[str, object]]:
+        return await asyncio.wait_for(
+            aiter_sse_events(lines(), stop_on=TERMINAL_EVENT_TYPES),
+            timeout=0.25,
+        )
+
+    events = asyncio.run(run_once())
+
+    assert events == [{"type": "text"}, {"type": "finished"}]
+
+
+def test_aiter_sse_events_from_text_stops_on_terminal_without_newline_or_eof() -> None:
+    async def chunks() -> object:
+        yield "data: {\"type\": \"text\"}\n\n"
+        yield "data: {\"type\": \"fin"
+        yield "ished\"}"
+        await asyncio.sleep(60.0)
+        yield "\n\ndata: {\"type\": \"text\", \"after\": true}\n\n"
+
+    async def run_once() -> list[dict[str, object]]:
+        return await asyncio.wait_for(
+            aiter_sse_events_from_text(chunks(), stop_on=TERMINAL_EVENT_TYPES),
+            timeout=0.25,
+        )
+
+    events = asyncio.run(run_once())
+
+    assert events == [{"type": "text"}, {"type": "finished"}]
+
+
+def test_native_send_sse_stops_on_terminal_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[object] = []
+
+    async def fake_aiter_sse_events(_lines: object, **kwargs: object) -> list[dict[str, object]]:
+        captured.append(kwargs.get("stop_on"))
+        return [{"type": "text", "text": "x", "_client_t": 2.0}, {"type": "finished", "_client_t": 3.0}]
+
+    monkeypatch.setattr(client_module, "aiter_sse_events_from_text", fake_aiter_sse_events)
+
+    async def run_once() -> None:
+        transport = httpx.MockTransport(lambda _request: httpx.Response(200, text=""))
+        async with httpx.AsyncClient(transport=transport) as async_client:
+            record = RequestRecord(request_id="native", task="interleave")
+            record.start_time = 1.0
+            await _send_sse(
+                async_client,
+                "http://test/generate",
+                {},
+                record,
+                protocol="native",
+                prompt_len=0,
+                output_len_fallback=0,
+            )
+            assert record.success is True
+            assert record.latency == pytest.approx(2.0)
+
+    asyncio.run(run_once())
+
+    assert captured == [TERMINAL_EVENT_TYPES]
 
 
 def test_iter_sse_events_records_malformed_payload_when_policy_is_record() -> None:

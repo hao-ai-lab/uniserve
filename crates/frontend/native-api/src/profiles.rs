@@ -126,7 +126,13 @@ impl NativeModelProfile {
         body: &NativeGenerateBody,
         user_text: &str,
     ) -> Vec<u32> {
-        render_prompt(tok, &self.controls, &self.prompts.understand, body, user_text)
+        render_prompt(
+            tok,
+            &self.controls,
+            &self.prompts.understand,
+            body,
+            user_text,
+        )
     }
 
     pub fn build_prompt_ids(

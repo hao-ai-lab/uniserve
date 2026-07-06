@@ -17,10 +17,13 @@ from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import ceil_div
 from .cache_protocols import BufferStager
 from .host_staging import (
-    canonical_device as _canonical_device,
     copy_cpu_to_device,
     cpu_int_staging_buffer,
+)
+from .host_staging import (
     fill_cpu_ints as _fill_cpu_int,
+)
+from .host_staging import (
     is_pinned as _is_pinned,
 )
 from .kv_pool import PagedKVPool

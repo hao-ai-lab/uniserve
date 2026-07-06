@@ -37,6 +37,7 @@ from typing import Any, Callable, Literal
 TERMINAL_EVENT_TYPES: frozenset[str] = frozenset({"finished", "error", "rejected"})
 
 ParseErrorPolicy = Literal["raise", "record"]
+_INCOMPLETE = object()
 
 
 def _decode_event(
@@ -61,6 +62,24 @@ def _decode_event(
             "_client_t": received,
             "error": f"invalid SSE JSON payload: {data!r} ({error})",
         }
+    if stamp_time and isinstance(event, dict):
+        event["_client_t"] = received
+    return event
+
+
+def _try_decode_complete_event(
+    data: str,
+    received: float,
+    *,
+    stamp_time: bool,
+) -> Any:
+    """Decode a complete JSON/SSE sentinel payload, or return ``_INCOMPLETE``."""
+    if data == "[DONE]":
+        return {"type": "sse_done", "_client_t": received} if stamp_time else {"type": "sse_done"}
+    try:
+        event = json.loads(data)
+    except JSONDecodeError:
+        return _INCOMPLETE
     if stamp_time and isinstance(event, dict):
         event["_client_t"] = received
     return event
@@ -114,6 +133,16 @@ def iter_sse_events(
         if data.startswith(" "):
             data = data[1:]
         data_lines.append(data)
+        if stop_on is not None:
+            event = _try_decode_complete_event(
+                "\n".join(data_lines),
+                time.perf_counter(),
+                stamp_time=stamp_time,
+            )
+            if event is not _INCOMPLETE and stop(event):
+                data_lines = []
+                yield event
+                return
     for event in flush():
         yield event
         if stop(event):
@@ -164,6 +193,115 @@ async def aiter_sse_events(
         if data.startswith(" "):
             data = data[1:]
         data_lines.append(data)
+        if stop_on is not None:
+            event = _try_decode_complete_event(
+                "\n".join(data_lines),
+                time.perf_counter(),
+                stamp_time=stamp_time,
+            )
+            if event is not _INCOMPLETE and stop(event):
+                data_lines = []
+                events.append(event)
+                return events
+    flush()
+    return events
+
+
+async def aiter_sse_events_from_text(
+    chunks: AsyncIterable[str],
+    *,
+    stamp_time: bool = False,
+    on_parse_error: ParseErrorPolicy = "raise",
+    stop_on: Callable[[Any], bool] | frozenset[str] | None = None,
+) -> list[Any]:
+    """Decode SSE records from arbitrary text chunks.
+
+    Unlike ``httpx.Response.aiter_lines()``, this path can observe a final
+    terminal ``data:`` record that has been flushed as bytes but is not followed
+    by a newline or response EOF yet.
+    """
+    stop = _make_stop(stop_on)
+    events: list[Any] = []
+    data_lines: list[str] = []
+    line_buffer = ""
+
+    def flush() -> bool:
+        nonlocal data_lines
+        if not data_lines:
+            return False
+        data = "\n".join(data_lines)
+        data_lines = []
+        event = _decode_event(
+            data,
+            time.perf_counter(),
+            stamp_time=stamp_time,
+            on_parse_error=on_parse_error,
+        )
+        events.append(event)
+        return stop(event)
+
+    def process_line(line: str) -> bool:
+        nonlocal data_lines
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line == "":
+            return flush()
+        if line.startswith(":") or not line.startswith("data:"):
+            return False
+        data = line.removeprefix("data:")
+        if data.startswith(" "):
+            data = data[1:]
+        data_lines.append(data)
+        if stop_on is None:
+            return False
+        event = _try_decode_complete_event(
+            "\n".join(data_lines),
+            time.perf_counter(),
+            stamp_time=stamp_time,
+        )
+        if event is _INCOMPLETE or not stop(event):
+            return False
+        data_lines = []
+        events.append(event)
+        return True
+
+    def process_pending_terminal() -> bool:
+        nonlocal data_lines, line_buffer
+        line = line_buffer[:-1] if line_buffer.endswith("\r") else line_buffer
+        if stop_on is None or not line.startswith("data:"):
+            return False
+        data = line.removeprefix("data:")
+        if data.startswith(" "):
+            data = data[1:]
+        event = _try_decode_complete_event(
+            "\n".join([*data_lines, data]),
+            time.perf_counter(),
+            stamp_time=stamp_time,
+        )
+        if event is _INCOMPLETE or not stop(event):
+            return False
+        data_lines = []
+        line_buffer = ""
+        events.append(event)
+        return True
+
+    async for chunk in chunks:
+        if not chunk:
+            continue
+        line_buffer += chunk
+        while True:
+            newline = line_buffer.find("\n")
+            if newline < 0:
+                break
+            line = line_buffer[:newline]
+            line_buffer = line_buffer[newline + 1 :]
+            if process_line(line):
+                return events
+        if process_pending_terminal():
+            return events
+
+    if line_buffer and process_line(line_buffer):
+        return events
     flush()
     return events
 

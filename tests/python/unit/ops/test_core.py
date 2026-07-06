@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
-
 import torch
 
+from uniserve_worker.backends.attention import AttentionCapabilities
+from uniserve_worker.backends.attention.text_dispatch import TextBackendGate
 from uniserve_worker.ops import (
     AdapterPool,
+    AttentionRegime,
+    AttentionReq,
     Capabilities,
     CommDispatcher,
     Dispatcher,
@@ -15,7 +18,7 @@ from uniserve_worker.ops import (
     Handoff,
     tp_all_reduce,
 )
-
+from uniserve_worker.ops.providers import _AttentionBackendProvider
 
 pytestmark = pytest.mark.unit
 
@@ -173,3 +176,79 @@ def test_tp_all_reduce_facade_runs_through_comm_provider():
 
     torch.testing.assert_close(out, torch.tensor([2.0, 3.0]))
     assert axis.calls == ["sum"]
+
+
+def test_attention_provider_skips_paged_only_varlen_without_block_table():
+    class _PagedOnlyVarlenBackend:
+        name = "paged_only_varlen"
+
+        def capabilities(self):
+            return AttentionCapabilities(
+                varlen_attention=True,
+                varlen_paged_kv=True,
+                requires_paged_varlen=True,
+            )
+
+    provider = _AttentionBackendProvider(_PagedOnlyVarlenBackend())
+    q = torch.empty(3, 2, 4)
+    k = torch.empty(3, 2, 4)
+    v = torch.empty(3, 2, 4)
+    cu = torch.tensor([0, 1, 3], dtype=torch.int32)
+    req = AttentionReq(
+        q=q,
+        k=k,
+        v=v,
+        regime=AttentionRegime.EXTEND,
+        causal=True,
+        scale=1.0,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=2,
+        max_seqlen_k=2,
+    )
+
+    assert not provider.can_run(req)
+    assert provider.can_run(
+        AttentionReq(
+            q=q,
+            k=torch.empty(4, 2, 2, 4),
+            v=torch.empty(4, 2, 2, 4),
+            regime=AttentionRegime.EXTEND,
+            causal=True,
+            scale=1.0,
+            block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=2,
+            max_seqlen_k=2,
+        )
+    )
+
+
+def test_text_backend_gate_skips_paged_only_varlen_for_initial_ragged_prefill(monkeypatch):
+    class _PagedOnlyVarlenProvider:
+        name = "paged_only_varlen"
+
+        def capabilities(self):
+            return Capabilities(
+                attrs={
+                    "varlen_attention": True,
+                    "varlen_paged_kv": True,
+                    "requires_paged_varlen": True,
+                    "min_head_dim": 1,
+                    "paged_block_size_multiple": 1,
+                }
+            )
+
+    class _Dispatcher:
+        def ordered(self, override):
+            del override
+            return (_PagedOnlyVarlenProvider(),)
+
+    import uniserve_worker.ops as ops
+
+    monkeypatch.setattr(ops, "attention_dispatcher", lambda: _Dispatcher())
+    gate = TextBackendGate(head_dim=4, block_size=2, device_type="cuda")
+
+    assert not gate._varlen_available(None, needs_paged_kv=False)
+    assert gate._varlen_available(None, needs_paged_kv=True)

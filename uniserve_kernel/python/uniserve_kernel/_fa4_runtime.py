@@ -1,12 +1,78 @@
 """Loader for the optional FlashAttention CUTE visible-end runtime."""
 from __future__ import annotations
 
+from importlib import metadata
+from pathlib import Path
+
+
+def _append_package_path(package_path: object, path: str, *, prepend: bool = False) -> None:
+    try:
+        present = path in package_path
+    except TypeError:
+        present = False
+    if present:
+        return
+    insert = getattr(package_path, "insert", None)
+    if prepend and callable(insert):
+        insert(0, path)
+        return
+    append = getattr(package_path, "append", None)
+    if callable(append):
+        append(path)
+        return
+    raise ImportError("flash_attn package path cannot be extended for flash_attn.cute")
+
+
+def _install_flash_attn_4_cute_path() -> None:
+    """Expose ``flash-attn-4``'s CUTE subpackage under legacy ``flash_attn``.
+
+    Some deployment images also install FA2 as a regular ``flash_attn`` package
+    in system site-packages. ``flash-attn-4`` contributes ``flash_attn/cute`` as
+    a provider package, but Python will not discover that subpackage once FA2's
+    regular package wins top-level import resolution. Extend the package's own
+    search path to the provider distribution instead of mutating process import
+    paths.
+    """
+
+    try:
+        dist = metadata.distribution("flash-attn-4")
+    except metadata.PackageNotFoundError as exc:  # pragma: no cover
+        raise ImportError(
+            "FlashAttention CUTE runtime is unavailable. Install "
+            "flash-attn-4[cu13]."
+        ) from exc
+
+    provider_root: Path | None = None
+    for entry in dist.files or ():
+        if entry.as_posix() == "flash_attn/cute/interface.py":
+            provider_root = Path(dist.locate_file(entry)).parent.parent
+            break
+    if provider_root is None:  # pragma: no cover
+        raise ImportError(
+            "FlashAttention CUTE runtime is unavailable. The installed "
+            "flash-attn-4 package does not contain flash_attn.cute.interface."
+        )
+
+    import flash_attn as flash_attn_pkg
+
+    package_path = getattr(flash_attn_pkg, "__path__", None)
+    if package_path is None:  # pragma: no cover
+        raise ImportError("flash_attn is not a package and cannot expose flash_attn.cute")
+    overlay_root = Path(__file__).resolve().parent / "_fa4_overlay" / "flash_attn"
+    overlay_path = str(overlay_root)
+    if overlay_root.exists():
+        _append_package_path(package_path, overlay_path, prepend=True)
+    provider_path = str(provider_root)
+    _append_package_path(package_path, provider_path)
+
+
 try:  # pragma: no cover - optional runtime dependency.
+    _install_flash_attn_4_cute_path()
     from flash_attn.cute.interface import _flash_attn_fwd as flash_attn_fwd  # type: ignore
 except Exception as exc:  # pragma: no cover
     raise ImportError(
-        "FlashAttention CUTE runtime is unavailable. Install a provider package "
-        "that exposes flash_attn.cute.interface._flash_attn_fwd."
+        "FlashAttention CUTE runtime is unavailable. Install flash-attn-4[cu13] "
+        "with its CUTE runtime dependencies."
     ) from exc
 
 from ._visible_end_mask import hybrid_multimodal_mask

@@ -38,6 +38,22 @@ def append_new_block_ids(
     return False
 
 
+def _merge_registered_block_ids(block_ids: list[int], registered: list[int]) -> None:
+    if not registered:
+        return
+    if not block_ids:
+        block_ids.extend(registered)
+        return
+    if block_ids == registered:
+        return
+    if len(registered) > len(block_ids) and registered[: len(block_ids)] == block_ids:
+        block_ids[:] = registered
+        return
+    if len(block_ids) >= len(registered) and block_ids[: len(registered)] == registered:
+        return
+    append_new_block_ids(block_ids, registered)
+
+
 class RequestLifecycle(StrEnum):
     CREATED = "created"
     ACTIVE = "active"
@@ -155,6 +171,7 @@ class RequestStateTable:
 
     def create_or_update(self, req_id: int, new_req: dict[str, Any]) -> RequestState:
         state = self._states.get(req_id)
+        existed = state is not None
         if state is None:
             state = RequestState()
             self._states[req_id] = state
@@ -167,7 +184,11 @@ class RequestStateTable:
         state.image = dict(new_req.get("image") or {})
         state.neg_token_ids = list(new_req.get("neg_token_ids") or [])
         if "block_ids" in new_req:
-            state.block_ids = list(new_req.get("block_ids") or [])
+            incoming = [int(block_id) for block_id in (new_req.get("block_ids") or [])]
+            if existed:
+                _merge_registered_block_ids(state.block_ids, incoming)
+            else:
+                state.block_ids = incoming
         state.lora_id = new_req.get("lora_id")
         state.raw_new_request = dict(new_req)
         cfg = new_req.get("cfg") or state.image.get("cfg")

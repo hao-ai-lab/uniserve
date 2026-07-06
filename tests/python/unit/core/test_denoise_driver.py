@@ -5,7 +5,11 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.denoise_driver import DenoiseDriver, TextImageDenoiseStep
+from uniserve_worker.execution.denoise_driver import (
+    DenoiseDriver,
+    TextImageDenoiseStep,
+    text_image_cfg_branch_count,
+)
 from uniserve_worker.execution.runner import ModelRunner
 from uniserve_worker.nn.diffusion import combine_text_image_cfg
 from uniserve_worker.runtime.request_state import RequestState
@@ -79,6 +83,7 @@ class TextImageCapabilityModel(ModelHooks):
             cfg_interval=(0.0, 1.0),
             cfg_renorm_type="none",
             cfg_renorm_min=0.0,
+            cfg_branch_count=text_image_cfg_branch_count(op),
             image_scale_applies_to_text=True,
         )
 
@@ -114,6 +119,15 @@ def test_text_image_driver_uses_image_scale_when_only_image_branch_is_needed():
     )
     torch.testing.assert_close(model.applied, expected)
     torch.testing.assert_close(expected, torch.tensor([[7.0]]))
+
+
+def test_text_image_driver_honors_explicit_single_branch_cfg_bound():
+    model = TextImageCapabilityModel(text_scale=4.0, img_scale=1.0)
+
+    DenoiseDriver().step(1, RequestState(), model, {"cfg": {"branch_count": 1}})
+
+    assert model.calls == ["cond"]
+    torch.testing.assert_close(model.applied, torch.tensor([[3.0]]))
 
 
 class BatchedTextImageCapabilityModel(ModelHooks):

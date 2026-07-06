@@ -7,12 +7,12 @@ import pytest
 import torch
 
 import uniserve_worker.execution.interleaved_image_denoise as denoise_mod
+from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
 from uniserve_worker.execution.denoise_residual_cache import (
     DenoiseResidualCacheAdapter,
     DenoiseResidualCachePolicy,
     ImageResidualCacheState,
 )
-from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
 from uniserve_worker.execution.interleaved_image_denoise import (
     ImageState,
     TextImageDenoiseOps,

@@ -115,11 +115,10 @@ def test_derive_runtime_kv_capacity_falls_back_to_default_blocks(monkeypatch):
     assert capacity.cuda is None
 
 
-def test_sensenova_num_blocks_uses_shared_formula():
-    # INC-52: sensenova's no-capacity fallback now routes through the shared
-    # derive_num_blocks (4096 blocks), matching qwen3/transformers/bagel instead
-    # of advertising ~16 blocks — a 256x divergence in the default production
-    # (no --kv-token-capacity) path.
+def test_sensenova_caps_reserve_decode_graph_padding_block():
+    # SenseNova still derives the physical no-capacity fallback through the
+    # shared formula, then withholds one worker-local block from scheduler caps
+    # for decode-graph padding.
     from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
 
     model = SenseNovaU1ForUnifiedGeneration(
@@ -127,8 +126,31 @@ def test_sensenova_num_blocks_uses_shared_formula():
     )
 
     assert model.num_blocks == 4096
-    assert model.caps(block_size=256, kv_token_capacity=None).num_blocks == 4096
-    assert model.caps(block_size=256, kv_token_capacity=512).num_blocks == 2
+    assert model.caps(block_size=256, kv_token_capacity=None).num_blocks == 4095
+    assert model.caps(block_size=256, kv_token_capacity=512).num_blocks == 1
+
+
+def test_sensenova_latent_and_scratch_capacity_scale_for_concurrent_interleave():
+    from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
+
+    model = SenseNovaU1ForUnifiedGeneration(
+        config={
+            "max_image_seq_len": 4096,
+            "llm_config": {
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+            },
+        },
+        block_size=16,
+        kv_token_capacity=65536,
+    )
+
+    caps = model.caps(block_size=16, kv_token_capacity=65536)
+
+    assert caps.max_latent_size == 65536
+    assert caps.max_vae_grid_tokens == 4096
+    assert caps.scratch_capacity_tokens >= (4096 + (65536 // 16) * 4) * 16
 
 
 def test_bagel_num_blocks_snapshot_keeps_floor_semantics():

@@ -7,9 +7,9 @@ global-shaped checkpoint tensors through the shard-narrowing weight loader.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
-import pytest
 
 from uniserve_worker.loader.transformers import _shard_plan_expects_global_shape
 from uniserve_worker.nn.mesh import DeviceMesh, use_mesh

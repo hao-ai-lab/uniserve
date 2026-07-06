@@ -300,9 +300,7 @@ impl<'a> NativeRequestBuilder<'a> {
             // back into the text KV (a full image-length forward, twice with a
             // CFG cache) feeds nothing. Retention stays the default wherever a
             // decode can consume it; explicit client values are always honored.
-            retain_images: image_body
-                .retain_images
-                .unwrap_or(mode != GenMode::Image),
+            retain_images: image_body.retain_images.unwrap_or(mode != GenMode::Image),
         })
     }
 
@@ -513,8 +511,15 @@ mod tests {
         assert_eq!(request.mm_items.len(), 1);
         let position = request.mm_items[0].position as usize;
         // The encode gap sits exactly between the in-prompt markers.
-        assert_eq!(request.prompt_ids[position], 151671, "position is the </img> token");
-        assert_eq!(request.prompt_ids[position - 1], 151670, "preceded by <img>");
+        assert_eq!(
+            request.prompt_ids[position], 151671,
+            "position is the </img> token"
+        );
+        assert_eq!(
+            request.prompt_ids[position - 1],
+            151670,
+            "preceded by <img>"
+        );
         // No CFG branch for plain understanding: negative ids stay empty.
         assert!(request.neg_prompt_ids.is_empty());
         // Understanding image params resolve like the other modes (profile bucket).

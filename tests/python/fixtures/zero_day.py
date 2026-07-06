@@ -10,10 +10,10 @@ from typing import Any
 
 import torch
 
+from uniserve_worker.contracts.batch_policy import BatchPolicy
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import LatentTokens, PerBranch, ResourcePlan
-from uniserve_worker.contracts.batch_policy import BatchPolicy
 
 
 class UniServeZeroDayCfgZeroStarModel(ModelHooks):

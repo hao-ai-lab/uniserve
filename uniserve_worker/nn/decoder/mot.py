@@ -28,8 +28,8 @@ from ..mesh import get_current_mesh
 from ..norm import RMSNorm
 from ..placement import set_tower_coord
 from ..rope import apply_rotary_emb, get_rope
-from .qwen import Qwen3MLP
 from ..vocab_parallel_embedding import VocabParallelEmbedding
+from .qwen import Qwen3MLP
 
 __all__ = [
     'Modality',

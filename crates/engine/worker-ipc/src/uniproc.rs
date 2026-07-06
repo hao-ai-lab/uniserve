@@ -64,7 +64,6 @@ pub struct WorkerLaunchConfig {
     pub prefill_cuda_graph_warmup_tokens: Option<String>,
     pub mixed_text_max_tokens: u32,
     pub varlen_prefill: bool,
-    pub forward_max_memory_bound_tokens: u32,
     pub green_contexts: bool,
     pub logits_processor_chunk_size: u32,
     pub flashinfer_workspace_size: u64,
@@ -104,7 +103,6 @@ impl Default for WorkerLaunchConfig {
             prefill_cuda_graph_warmup_tokens: None,
             mixed_text_max_tokens: 8192,
             varlen_prefill: true,
-            forward_max_memory_bound_tokens: 281,
             green_contexts: false,
             logits_processor_chunk_size: 0,
             flashinfer_workspace_size: 512 * 1024 * 1024,
@@ -185,8 +183,6 @@ impl WorkerLaunchConfig {
         if !self.varlen_prefill {
             cmd.arg("--no-varlen-prefill");
         }
-        cmd.arg("--forward-max-memory-bound-tokens")
-            .arg(self.forward_max_memory_bound_tokens.to_string());
         if self.green_contexts {
             cmd.arg("--green-contexts");
         }
@@ -394,7 +390,7 @@ impl UniprocExecutor {
         defer_sampling: bool,
         worker_config: &WorkerLaunchConfig,
     ) -> anyhow::Result<Self> {
-        let depth = pipeline_depth.max(1);
+        let depth = effective_worker_pipeline_depth(pipeline_depth, tp_size);
         let max_payload = req_slot_cap.max(resp_slot_cap).max(1);
         let service = service_name(&format!("{}_{}_{}", std::process::id(), tp_rank, nano_id()));
         // The host is authoritative for the boundary mode: resolve it once and
@@ -983,9 +979,21 @@ fn nano_id() -> u64 {
     (nanos << 16) | (seq & 0xffff)
 }
 
+fn effective_worker_pipeline_depth(requested: usize, tp_size: u32) -> usize {
+    let requested = requested.max(1);
+    if tp_size > 1 {
+        // Tensor-parallel ranks must enter collectives in the same order. A
+        // per-rank Python pipeline can let one rank finalize an older response
+        // while another rank starts the next forward, which is illegal for NCCL.
+        1
+    } else {
+        requested
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::nano_id;
+    use super::{effective_worker_pipeline_depth, nano_id};
     use std::collections::HashSet;
 
     #[test]
@@ -999,5 +1007,13 @@ mod tests {
             n,
             "nano_id produced a collision within a tight loop"
         );
+    }
+
+    #[test]
+    fn tensor_parallel_workers_do_not_pipeline_across_collectives() {
+        assert_eq!(effective_worker_pipeline_depth(4, 1), 4);
+        assert_eq!(effective_worker_pipeline_depth(0, 1), 1);
+        assert_eq!(effective_worker_pipeline_depth(4, 2), 1);
+        assert_eq!(effective_worker_pipeline_depth(4, 8), 1);
     }
 }
