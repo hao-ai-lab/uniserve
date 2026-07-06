@@ -1,92 +1,39 @@
 {
-  "artifact_root": "artifacts",
+  "artifact_root": "artifacts/eval",
   "python": ".venv/bin/python",
-  "server_bin": "target/debug/uniserve",
+  "server_bin": "target/release/uniserve",
+  "shared": {
+    "environment": {
+      "UNISERVE_QWEN3_MODEL": "Path to Qwen3-32B",
+      "UNISERVE_SENSENOVA_MODEL": "Path to SenseNova-U1-8B-MoT-Interleaved-local",
+      "UNISERVE_BAGEL_MODEL": "Path to BAGEL-7B-MoT",
+      "UNISERVE_SHAREGPT_PATH": "Path to ShareGPT_V3_unfiltered_cleaned_split.json",
+      "UNISERVE_SGLANG_PYTHON": "Python executable for refs/sglang",
+      "UNISERVE_OMNI_VLLM": "vllm executable for vllm-omni"
+    }
+  },
   "servers": {
-    "qwen3-32b": {
-      "model": "/home/hal-ysun/models/Qwen3-32B",
-      "served_model_name": "Qwen3-32B",
+    "benchmark/server/_uniserve-mixed-base": {
       "host": "127.0.0.1",
-      "port": 18081,
       "cuda_visible_devices": "0",
-      "serve_args": []
-    },
-    "sensenova-u1-single": {
-      "model": "/home/hal-ysun/models/SenseNova-U1-8B-MoT-Interleaved-local",
-      "served_model_name": "SenseNova-U1",
-      "host": "127.0.0.1",
-      "port": 18082,
-      "cuda_visible_devices": "0",
-      "serve_args": [
-        "--kv-token-capacity",
-        "65536",
-        "--max-num-seqs",
-        "1",
-        "--max-batch",
-        "4",
-        "--max-num-batched-tokens",
-        "4096"
-      ]
-    },
-    "sensenova-u1-disagg": {
-      "extends": "sensenova-u1-single",
-      "cuda_visible_devices": "0,1",
-      "serve_args": [
-        "--workers",
-        "und:1,gen:1",
-        "--transfer",
-        "und->gen=cuda_ipc",
-        "--kv-token-capacity",
-        "65536",
-        "--max-num-seqs",
-        "1",
-        "--max-batch",
-        "4",
-        "--max-num-batched-tokens",
-        "1024"
-      ]
-    },
-    "sensenova-u1-tp4": {
-      "extends": "sensenova-u1-single",
-      "cuda_visible_devices": "0,1,2,3",
-      "serve_args": [
-        "--kv-token-capacity",
-        "65536",
-        "--max-num-seqs",
-        "1",
-        "--max-batch",
-        "4",
-        "--max-num-batched-tokens",
-        "4096",
-        "--worker-ranks",
-        "4"
-      ]
-    },
-    "sensenova-u1-tp4-graph": {
-      "extends": "sensenova-u1-tp4",
       "env": {
-        "UNISERVE_DENOISE_STEP_GRAPH": "1",
         "UNISERVE_DECODE_TOKEN_BURST": "8"
       },
-      "description": "sensenova-u1-tp4 plus per-image denoise-step CUDA graphs and decode bursts. Net win at TP4 (CPU-launch-bound); leave the step graph off at TP1."
+      "serve_args": [
+        "--kv-token-capacity",
+        "65536",
+        "--max-num-seqs",
+        "128",
+        "--max-batch",
+        "128",
+        "--max-num-batched-tokens",
+        "8192"
+      ],
+      "description": "Base UniServe benchmark server settings for mixed workloads.",
+      "abstract": true
     },
-    "sensenova-u1-perf": {
-      "extends": "sensenova-u1-single",
-      "env": {
-        "UNISERVE_DECODE_TOKEN_BURST": "8"
-      }
-    },
-    "sensenova-u1-teacache": {
-      "extends": "sensenova-u1-perf",
-      "env": {
-        "UNISERVE_DENOISE_RESIDUAL_CACHE": "1"
-      },
-      "description": "sensenova-u1-perf plus the opt-in TeaCache denoise residual cache (threshold defaults to 0.2). Off in gates: default-path outputs are the guarded identities."
-    },
-    "bagel-single": {
-      "model": "/home/hal-ysun/models/BAGEL-7B-MoT",
-      "served_model_name": "BAGEL",
-      "port": 18083,
+    "gate/server/_uniserve-base": {
+      "host": "127.0.0.1",
       "cuda_visible_devices": "0",
       "env": {
         "UNISERVE_DECODE_TOKEN_BURST": "8"
@@ -101,37 +48,87 @@
         "--max-num-batched-tokens",
         "4096"
       ],
-      "host": "127.0.0.1"
+      "description": "Base UniServe gate/tripwire server settings.",
+      "abstract": true
     },
-    "sensenova-omni": {
-      "served_model_name": "/home/hal-ysun/models/SenseNova-U1-8B-MoT-Interleaved-local",
+    "benchmark/server/qwen-uniserve": {
+      "model": "${UNISERVE_QWEN3_MODEL}",
+      "served_model_name": "Qwen3-32B",
+      "host": "127.0.0.1",
+      "port": 18081,
+      "cuda_visible_devices": "0",
+      "serve_args": [],
+      "description": "UniServe Qwen3-32B benchmark server."
+    },
+    "benchmark/server/qwen-sglang": {
+      "served_model_name": "Qwen3-32B",
+      "host": "127.0.0.1",
+      "port": 18080,
+      "cuda_visible_devices": "0",
+      "env": {
+        "PYTHONPATH": "refs/sglang/python"
+      },
+      "command": [
+        "${UNISERVE_SGLANG_PYTHON}",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        "${UNISERVE_QWEN3_MODEL}",
+        "--served-model-name",
+        "Qwen3-32B",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "18080",
+        "--trust-remote-code"
+      ],
+      "description": "SGLang Qwen3-32B benchmark server."
+    },
+    "benchmark/server/sensenova-uniserve": {
+      "model": "${UNISERVE_SENSENOVA_MODEL}",
+      "served_model_name": "SenseNova-U1",
+      "port": 18082,
+      "description": "UniServe SenseNova benchmark server.",
+      "extends": "benchmark/server/_uniserve-mixed-base",
+      "abstract": false
+    },
+    "benchmark/server/sensenova-omni": {
+      "served_model_name": "${UNISERVE_SENSENOVA_MODEL}",
       "host": "127.0.0.1",
       "port": 8091,
-      "cuda_visible_devices": "1",
+      "cuda_visible_devices": "0",
       "command": [
-        "/home/hal-ysun/omni-bench-venv/bin/vllm",
+        "${UNISERVE_OMNI_VLLM}",
         "serve",
-        "/home/hal-ysun/models/SenseNova-U1-8B-MoT-Interleaved-local",
+        "${UNISERVE_SENSENOVA_MODEL}",
         "--omni",
         "--host",
         "127.0.0.1",
         "--port",
         "8091"
       ],
-      "description": "vLLM-Omni serving SenseNova-U1 (single-stage diffusion pipeline) for same-workload comparison; slow cold start (several minutes)."
+      "description": "vllm-omni SenseNova benchmark server."
     },
-    "bagel-omni": {
-      "served_model_name": "/home/hal-ysun/models/BAGEL-7B-MoT",
+    "benchmark/server/bagel-uniserve": {
+      "model": "${UNISERVE_BAGEL_MODEL}",
+      "served_model_name": "BAGEL",
+      "port": 18083,
+      "description": "UniServe BAGEL benchmark server.",
+      "extends": "benchmark/server/_uniserve-mixed-base",
+      "abstract": false
+    },
+    "benchmark/server/bagel-omni": {
+      "served_model_name": "${UNISERVE_BAGEL_MODEL}",
       "host": "127.0.0.1",
       "port": 8092,
-      "cuda_visible_devices": "1",
+      "cuda_visible_devices": "0",
       "env": {
         "VLLM_OMNI_USE_QUACK_FP8": "0"
       },
       "command": [
-        "/home/hal-ysun/omni-bench-venv/bin/vllm",
+        "${UNISERVE_OMNI_VLLM}",
         "serve",
-        "/home/hal-ysun/models/BAGEL-7B-MoT",
+        "${UNISERVE_BAGEL_MODEL}",
         "--omni",
         "--attention-config",
         "{\"backend\": \"TRITON_ATTN\"}",
@@ -142,61 +139,29 @@
         "--port",
         "8092"
       ],
-      "description": "vLLM-Omni serving BAGEL (two-stage Thinker+DiT). Triton/SDPA attention overrides dodge its broken FlashAttention-CuTe build on this aarch64 stack."
+      "description": "vllm-omni BAGEL benchmark server."
+    },
+    "gate/server/sensenova": {
+      "model": "${UNISERVE_SENSENOVA_MODEL}",
+      "served_model_name": "SenseNova-U1",
+      "port": 18082,
+      "description": "UniServe SenseNova correctness/perf-tripwire server.",
+      "extends": "gate/server/_uniserve-base",
+      "abstract": false
+    },
+    "gate/server/bagel": {
+      "model": "${UNISERVE_BAGEL_MODEL}",
+      "served_model_name": "BAGEL",
+      "port": 18083,
+      "description": "UniServe BAGEL correctness/perf-tripwire server.",
+      "extends": "gate/server/_uniserve-base",
+      "abstract": false
     }
   },
   "workloads": {
-    "sensenova-travel-interleave-4x": {
+    "gate/sensenova/t2i-seed42": {
       "type": "verify",
-      "server": "sensenova-u1-single",
-      "output_dir": "sensenova-travel-interleave-4x",
-      "payload": {
-        "mode": "interleave",
-        "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
-        "max_tokens": 4096,
-        "temperature": 0,
-        "image": {
-          "resolution": "16:9",
-          "width": 2048,
-          "height": 1152,
-          "steps": 50,
-          "max_images": 4,
-          "retain_images": true
-        }
-      },
-      "expect_images": 4,
-      "expect_image_width": 2048,
-      "expect_image_height": 1152,
-      "expect_image_steps": 50,
-      "timeout_s": 900,
-      "description": "The guarded tour-guide case: one interleave request ('travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate', temp 0, max 4 images 2048x1152@50 steps). Expected: the model autonomously weaves narrative text with exactly 4 generated images (one per destination) in a single SSE stream \u2014 4x(image_begin + 50 image_step + image_done), 0 errors, ~2800 text tokens at TP1, and every image readable/coherent/non-collapsed/non-duplicated (inspect saved PNGs)."
-    },
-    "qwen3-sharegpt-stress": {
-      "type": "perf",
-      "server": "qwen3-32b",
-      "task": "text",
-      "args": [
-        "--dataset",
-        "sharegpt",
-        "--num-prompts",
-        "200",
-        "--request-rate",
-        "16",
-        "--max-tokens",
-        "4096",
-        "--seed",
-        "42"
-      ],
-      "expect_metrics": {
-        "completed": {
-          "min": 200
-        }
-      },
-      "description": "Text-serving stress through the shared harness: 200 ShareGPT prompts at 16 req/s against Qwen3-32B; expects all 200 requests completed."
-    },
-    "sensenova-t2i-seed42": {
-      "type": "verify",
-      "server": "sensenova-u1-single",
+      "server": "gate/server/sensenova",
       "payload": {
         "mode": "image",
         "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
@@ -211,11 +176,11 @@
       "expect_image_steps": 50,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
-      "description": "Pure text-to-image gate on the native API (mode=image): seed-42 bicycle prompt at 2048x1152, exactly 50 denoise steps, exactly one PNG of exact size. Guards the prefill->denoise->commit chain and the resolution-bucket policy."
+      "description": "SenseNova native image correctness gate."
     },
-    "sensenova-i2t-house": {
+    "gate/sensenova/i2t-house": {
       "type": "verify",
-      "server": "sensenova-u1-single",
+      "server": "gate/server/sensenova",
       "payload": {
         "mode": "understand",
         "prompt": "Describe this image in detail.",
@@ -229,11 +194,34 @@
       },
       "expect_images": 0,
       "expect_min_text_tokens": 32,
-      "description": "Image-understanding gate (mode=understand): a deterministic synthetic scene (red house, brown roof, yellow sun, blue sky, green ground) is injected as input_image_b64; the model must stream >=32 tokens of description at temp 0 and finish cleanly. Guards the encode->prefill->decode chain (marker-in-prompt patch injection)."
+      "description": "SenseNova image-understanding correctness gate."
     },
-    "bagel-t2i-seed42": {
+    "gate/sensenova/interleave-travel": {
       "type": "verify",
-      "server": "bagel-single",
+      "server": "gate/server/sensenova",
+      "payload": {
+        "mode": "interleave",
+        "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
+        "max_tokens": 4096,
+        "temperature": 0,
+        "image": {
+          "width": 2048,
+          "height": 1152,
+          "steps": 50,
+          "max_images": 4,
+          "retain_images": true
+        }
+      },
+      "expect_images": 4,
+      "expect_image_width": 2048,
+      "expect_image_height": 1152,
+      "expect_image_steps": 50,
+      "timeout_s": 900,
+      "description": "SenseNova interleave correctness gate."
+    },
+    "gate/bagel/t2i-seed42": {
+      "type": "verify",
+      "server": "gate/server/bagel",
       "payload": {
         "mode": "image",
         "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
@@ -248,11 +236,11 @@
       "expect_image_steps": 50,
       "expect_image_width": 1024,
       "expect_image_height": 1024,
-      "description": "BAGEL pure t2i gate (mode=image): seed-42 bicycle prompt at 1024x1024, exactly 50 steps, one exact-size PNG. Guards BAGEL's paged-extend prefill, batched CFG denoise, and VAE-decode commit on the unified runtime."
+      "description": "BAGEL native image correctness gate."
     },
-    "bagel-i2t-house": {
+    "gate/bagel/i2t-house": {
       "type": "verify",
-      "server": "bagel-single",
+      "server": "gate/server/bagel",
       "payload": {
         "mode": "understand",
         "prompt": "Describe this image in detail.",
@@ -266,11 +254,11 @@
       },
       "expect_images": 0,
       "expect_min_text_tokens": 32,
-      "description": "BAGEL understanding gate over the same synthetic scene: >=32 tokens at temp 0, clean finish. Guards the dual-encode (VAE+ViT) ingest and the graphed/burst decode."
+      "description": "BAGEL image-understanding correctness gate."
     },
-    "sensenova-t2i-perf": {
+    "perf/tripwire/sensenova/t2i": {
       "type": "perf",
-      "server": "sensenova-u1-perf",
+      "server": "gate/server/sensenova",
       "task": "t2i",
       "args": [
         "--dataset",
@@ -279,7 +267,7 @@
         "uniserve_eval/data/t2i_prompts.jsonl",
         "--num-prompts",
         "4",
-        "--max-concurrency",
+        "--request-rate",
         "1",
         "--warmup-requests",
         "1",
@@ -297,18 +285,18 @@
           "max": 8000
         }
       },
-      "description": "Perf tripwire through the shared harness: 4 prompts from the committed t2i set, closed-loop c=1, warmup 1. Bound trips only if the path regresses to a known-slow regime. Healthy ~4.8-5.6s/image."
+      "description": "SenseNova T2I perf tripwire at arrival rate 1."
     },
-    "sensenova-i2t-perf": {
+    "perf/tripwire/sensenova/i2t": {
       "type": "perf",
-      "server": "sensenova-u1-perf",
+      "server": "gate/server/sensenova",
       "task": "i2t",
       "args": [
         "--dataset",
         "synthetic-images",
         "--num-prompts",
         "4",
-        "--max-concurrency",
+        "--request-rate",
         "1",
         "--warmup-requests",
         "1",
@@ -329,11 +317,11 @@
           "max": 9
         }
       },
-      "description": "Perf tripwire: 4 synthetic-image descriptions, greedy, 256 tokens. Floor trips on regression to eager per-token decode. Healthy ~160-170 tok/s, ITL ~5ms."
+      "description": "SenseNova I2T perf tripwire at arrival rate 1."
     },
-    "bagel-t2i-perf": {
+    "perf/tripwire/bagel/t2i": {
       "type": "perf",
-      "server": "bagel-single",
+      "server": "gate/server/bagel",
       "task": "t2i",
       "args": [
         "--dataset",
@@ -342,7 +330,7 @@
         "uniserve_eval/data/t2i_prompts.jsonl",
         "--num-prompts",
         "4",
-        "--max-concurrency",
+        "--request-rate",
         "1",
         "--warmup-requests",
         "1",
@@ -360,18 +348,18 @@
           "max": 10000
         }
       },
-      "description": "Perf tripwire through the shared harness: 4 prompts from the committed t2i set, closed-loop c=1, warmup 1. Bound trips only if the path regresses to a known-slow regime. Healthy ~6.6s/image (eager pre-unification path was 15.4s)."
+      "description": "BAGEL T2I perf tripwire at arrival rate 1."
     },
-    "bagel-i2t-perf": {
+    "perf/tripwire/bagel/i2t": {
       "type": "perf",
-      "server": "bagel-single",
+      "server": "gate/server/bagel",
       "task": "i2t",
       "args": [
         "--dataset",
         "synthetic-images",
         "--num-prompts",
         "4",
-        "--max-concurrency",
+        "--request-rate",
         "1",
         "--warmup-requests",
         "1",
@@ -392,407 +380,281 @@
           "max": 9
         }
       },
-      "description": "Perf tripwire: 4 synthetic-image descriptions, greedy, 256 tokens. Floor trips on regression to eager per-token decode. Healthy ~155-165 tok/s (eager path was 15.6 tok/s)."
-    },
-    "sensenova-t2i-perf-omni": {
-      "type": "perf",
-      "server": "sensenova-omni",
-      "task": "t2i",
-      "args": [
-        "--dataset",
-        "trace",
-        "--dataset-path",
-        "uniserve_eval/data/t2i_prompts.jsonl",
-        "--num-prompts",
-        "4",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--steps",
-        "50",
-        "--seed",
-        "42",
-        "--width",
-        "2048",
-        "--height",
-        "1152"
-      ],
-      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as sensenova-t2i-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
-    },
-    "sensenova-i2t-perf-omni": {
-      "type": "perf",
-      "server": "sensenova-omni",
-      "task": "i2t",
-      "args": [
-        "--dataset",
-        "synthetic-images",
-        "--num-prompts",
-        "4",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--max-tokens",
-        "256",
-        "--temperature",
-        "0",
-        "--seed",
-        "42",
-        "--i2t-wire",
-        "openai_chat"
-      ],
-      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as sensenova-i2t-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
-    },
-    "bagel-t2i-perf-omni": {
-      "type": "perf",
-      "server": "bagel-omni",
-      "task": "t2i",
-      "args": [
-        "--dataset",
-        "trace",
-        "--dataset-path",
-        "uniserve_eval/data/t2i_prompts.jsonl",
-        "--num-prompts",
-        "4",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--steps",
-        "50",
-        "--seed",
-        "42",
-        "--width",
-        "1024",
-        "--height",
-        "1024"
-      ],
-      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as bagel-t2i-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
-    },
-    "bagel-i2t-perf-omni": {
-      "type": "perf",
-      "server": "bagel-omni",
-      "task": "i2t",
-      "args": [
-        "--dataset",
-        "synthetic-images",
-        "--num-prompts",
-        "4",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--max-tokens",
-        "256",
-        "--temperature",
-        "0",
-        "--seed",
-        "42",
-        "--i2t-wire",
-        "openai_chat"
-      ],
-      "description": "vLLM-Omni comparison point: byte-for-byte the same workload as bagel-i2t-perf (same prompts/steps/sizes/seed/concurrency), measured through the same harness. No bounds \u2014 a measurement, not a gate."
-    },
-    "sensenova-t2i-mjhq-smoke": {
-      "type": "perf",
-      "server": "sensenova-u1-perf",
-      "task": "t2i",
-      "args": [
-        "--dataset",
-        "mjhq",
-        "--num-prompts",
-        "8",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--steps",
-        "50",
-        "--seed",
-        "42",
-        "--width",
-        "2048",
-        "--height",
-        "1152"
-      ],
-      "expect_metrics": {
-        "image_latency_ms.mean": {
-          "max": 8000
-        }
-      },
-      "description": "Real-dataset t2i point: 8 MJHQ-30K photography captions (auto-downloaded from HF) at 2048x1152, 50 steps, seed 42. Same bounds as the trace-based tripwire; exercises realistic prompt lengths/content instead of the committed prompt set. Smoke profile: small N for quick signal."
-    },
-    "bagel-t2i-mjhq-smoke": {
-      "type": "perf",
-      "server": "bagel-single",
-      "task": "t2i",
-      "args": [
-        "--dataset",
-        "mjhq",
-        "--num-prompts",
-        "8",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--steps",
-        "50",
-        "--seed",
-        "42",
-        "--width",
-        "1024",
-        "--height",
-        "1024"
-      ],
-      "expect_metrics": {
-        "image_latency_ms.mean": {
-          "max": 10000
-        }
-      },
-      "description": "Real-dataset t2i point for BAGEL: 8 MJHQ-30K captions at 1024x1024, 50 steps, seed 42. Smoke profile: small N for quick signal."
-    },
-    "sensenova-interleave-ueval-smoke": {
-      "type": "perf",
-      "server": "sensenova-u1-perf",
-      "task": "interleave",
-      "args": [
-        "--dataset",
-        "ueval",
-        "--num-prompts",
-        "3",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--max-tokens",
-        "2048",
-        "--max-images",
-        "2",
-        "--width",
-        "2048",
-        "--height",
-        "1152",
-        "--steps",
-        "50",
-        "--seed",
-        "42"
-      ],
-      "expect_metrics": {
-        "mean_itl_ms": {
-          "max": 9
-        }
-      },
-      "description": "Real-dataset interleave point: 3 UEval prompts (zlab-princeton/UEval \u2014 1000 real interleaved-generation tasks like 'show each step both visually and textually'), up to 2 images each at 2048x1152/50 steps. The model decides image count/placement per prompt, so image totals vary; stream metrics gate only text ITL (image spans are excluded from ITL by the harness). Complements the deterministic tour-guide gate with realistic prompt diversity. Smoke profile: small N for quick signal."
-    },
-    "sensenova-t2i-mjhq-full": {
-      "type": "perf",
-      "server": "sensenova-u1-perf",
-      "task": "t2i",
-      "args": [
-        "--dataset",
-        "mjhq",
-        "--num-prompts",
-        "100",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--steps",
-        "50",
-        "--seed",
-        "42",
-        "--width",
-        "2048",
-        "--height",
-        "1152"
-      ],
-      "expect_metrics": {
-        "image_latency_ms.mean": {
-          "max": 8000
-        }
-      },
-      "description": "Real-dataset t2i, full profile: 100 MJHQ-30K photography captions (auto-downloaded from HF) at 2048x1152, 50 steps, seed 42 \u2014 ~10 min at healthy speed, for stable percentiles. Use -smoke (8 prompts) for iteration."
-    },
-    "bagel-t2i-mjhq-full": {
-      "type": "perf",
-      "server": "bagel-single",
-      "task": "t2i",
-      "args": [
-        "--dataset",
-        "mjhq",
-        "--num-prompts",
-        "100",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--steps",
-        "50",
-        "--seed",
-        "42",
-        "--width",
-        "1024",
-        "--height",
-        "1024"
-      ],
-      "expect_metrics": {
-        "image_latency_ms.mean": {
-          "max": 10000
-        }
-      },
-      "description": "Real-dataset t2i for BAGEL, full profile: 100 MJHQ-30K captions at 1024x1024, 50 steps, seed 42 \u2014 ~12 min at healthy speed. Use -smoke for iteration."
-    },
-    "sensenova-interleave-ueval-full": {
-      "type": "perf",
-      "server": "sensenova-u1-perf",
-      "task": "interleave",
-      "args": [
-        "--dataset",
-        "ueval",
-        "--num-prompts",
-        "1000",
-        "--max-concurrency",
-        "1",
-        "--warmup-requests",
-        "1",
-        "--max-tokens",
-        "2048",
-        "--max-images",
-        "2",
-        "--width",
-        "2048",
-        "--height",
-        "1152",
-        "--steps",
-        "50",
-        "--seed",
-        "42"
-      ],
-      "expect_metrics": {
-        "mean_itl_ms": {
-          "max": 9
-        }
-      },
-      "description": "Real-dataset interleave, full profile: the complete 1,000-prompt UEval set (zlab-princeton/UEval), up to 2 images each at 2048x1152/50 steps \u2014 a serious run, ~6 h at ~21 s/request. The model decides image count/placement per prompt; gates only text ITL (image spans excluded by the harness). Use -smoke (3 prompts) for iteration."
+      "description": "BAGEL I2T perf tripwire at arrival rate 1."
     }
   },
   "suites": {
-    "qwen3-32b": [
-      "qwen3-sharegpt-stress"
+    "gate/sensenova": [
+      "gate/sensenova/t2i-seed42",
+      "gate/sensenova/i2t-house",
+      "gate/sensenova/interleave-travel"
     ],
-    "sensenova-u1-mode-a": [
-      "sensenova-travel-interleave-4x"
+    "gate/bagel": [
+      "gate/bagel/t2i-seed42",
+      "gate/bagel/i2t-house"
     ],
-    "sensenova-verify": [
-      "sensenova-t2i-seed42",
-      "sensenova-i2t-house",
-      "sensenova-travel-interleave-4x"
+    "gate/all": [
+      "gate/sensenova/t2i-seed42",
+      "gate/sensenova/i2t-house",
+      "gate/sensenova/interleave-travel",
+      "gate/bagel/t2i-seed42",
+      "gate/bagel/i2t-house"
     ],
-    "bagel-verify": [
-      "bagel-t2i-seed42",
-      "bagel-i2t-house"
-    ],
-    "sensenova-perf": [
-      "sensenova-t2i-perf",
-      "sensenova-i2t-perf"
-    ],
-    "bagel-perf": [
-      "bagel-t2i-perf",
-      "bagel-i2t-perf"
-    ],
-    "verify-all": [
-      "sensenova-t2i-seed42",
-      "sensenova-i2t-house",
-      "sensenova-travel-interleave-4x",
-      "bagel-t2i-seed42",
-      "bagel-i2t-house"
-    ],
-    "perf-all": [
-      "sensenova-t2i-perf",
-      "sensenova-i2t-perf",
-      "bagel-t2i-perf",
-      "bagel-i2t-perf"
-    ],
-    "sensenova-vs-omni": {
-      "workloads": [
-        "sensenova-t2i-perf",
-        "sensenova-i2t-perf",
-        "sensenova-t2i-perf-omni",
-        "sensenova-i2t-perf-omni"
-      ],
-      "compare": [
-        [
-          "sensenova-t2i-perf",
-          "sensenova-t2i-perf-omni"
-        ],
-        [
-          "sensenova-i2t-perf",
-          "sensenova-i2t-perf-omni"
+    "perf/tripwire": [
+      "perf/tripwire/sensenova/t2i",
+      "perf/tripwire/sensenova/i2t",
+      "perf/tripwire/bagel/t2i",
+      "perf/tripwire/bagel/i2t"
+    ]
+  },
+  "benchmarks": {
+    "main": {
+      "artifact_root": "artifacts/benchmarks",
+      "description": "Main benchmark matrix, expressed as open-loop arrival-rate points.",
+      "defaults": {
+        "warmup_requests": 1,
+        "seed": 42
+      },
+      "load_axes": {
+        "arrival_rate": [
+          "1",
+          "2",
+          "4",
+          "8",
+          "16"
         ]
-      ]
-    },
-    "bagel-vs-omni": {
-      "workloads": [
-        "bagel-t2i-perf",
-        "bagel-i2t-perf",
-        "bagel-t2i-perf-omni",
-        "bagel-i2t-perf-omni"
-      ],
-      "compare": [
-        [
-          "bagel-t2i-perf",
-          "bagel-t2i-perf-omni"
-        ],
-        [
-          "bagel-i2t-perf",
-          "bagel-i2t-perf-omni"
-        ]
-      ]
-    },
-    "matrix-vs-omni": {
-      "workloads": [
-        "sensenova-t2i-perf",
-        "sensenova-i2t-perf",
-        "sensenova-t2i-perf-omni",
-        "sensenova-i2t-perf-omni",
-        "bagel-t2i-perf",
-        "bagel-i2t-perf",
-        "bagel-t2i-perf-omni",
-        "bagel-i2t-perf-omni"
-      ],
-      "compare": [
-        [
-          "sensenova-t2i-perf",
-          "sensenova-t2i-perf-omni"
-        ],
-        [
-          "sensenova-i2t-perf",
-          "sensenova-i2t-perf-omni"
-        ],
-        [
-          "bagel-t2i-perf",
-          "bagel-t2i-perf-omni"
-        ],
-        [
-          "bagel-i2t-perf",
-          "bagel-i2t-perf-omni"
-        ]
-      ]
-    },
-    "realdata-smoke": {
-      "workloads": [
-        "sensenova-t2i-mjhq-smoke",
-        "sensenova-interleave-ueval-smoke",
-        "bagel-t2i-mjhq-smoke"
-      ]
-    },
-    "realdata-full": {
-      "workloads": [
-        "sensenova-t2i-mjhq-full",
-        "sensenova-interleave-ueval-full",
-        "bagel-t2i-mjhq-full"
-      ]
+      },
+      "datasets": {
+        "beans": {
+          "type": "hf_image_sample",
+          "name": "AI-Lab-Makerere/beans",
+          "split": "train",
+          "count": 200,
+          "seed": 42,
+          "output_dir": "datasets/i2t_beans",
+          "prefix": "beans"
+        }
+      },
+      "groups": {
+        "qwen-uniserve": {
+          "server": "benchmark/server/qwen-uniserve",
+          "points": [
+            "qwen3_sharegpt_uniserve"
+          ]
+        },
+        "qwen-sglang": {
+          "server": "benchmark/server/qwen-sglang",
+          "points": [
+            "qwen3_sharegpt_sglang"
+          ]
+        },
+        "sensenova-uniserve": {
+          "server": "benchmark/server/sensenova-uniserve",
+          "points": [
+            "sensenova_mjhq_t2i_uniserve",
+            "sensenova_beans_i2t_uniserve",
+            "sensenova_ueval_interleave_uniserve"
+          ]
+        },
+        "sensenova-omni": {
+          "server": "benchmark/server/sensenova-omni",
+          "points": [
+            "sensenova_mjhq_t2i_omni",
+            "sensenova_beans_i2t_omni"
+          ]
+        },
+        "bagel-uniserve": {
+          "server": "benchmark/server/bagel-uniserve",
+          "points": [
+            "bagel_mjhq_t2i_uniserve",
+            "bagel_beans_i2t_uniserve"
+          ]
+        },
+        "bagel-omni": {
+          "server": "benchmark/server/bagel-omni",
+          "points": [
+            "bagel_mjhq_t2i_omni",
+            "bagel_beans_i2t_omni"
+          ]
+        }
+      },
+      "points": {
+        "qwen3_sharegpt_uniserve": {
+          "axis": "arrival_rate",
+          "name": "qwen-uniserve-sharegpt-r{rate_tag}",
+          "output": "qwen3_sharegpt/uniserve_r{rate_tag}",
+          "harness": {
+            "task": "text",
+            "model": "Qwen3-32B",
+            "dataset": "sharegpt",
+            "dataset_path": "${UNISERVE_SHAREGPT_PATH}",
+            "tokenizer": "${UNISERVE_QWEN3_MODEL}",
+            "num_prompts": 200
+          }
+        },
+        "qwen3_sharegpt_sglang": {
+          "axis": "arrival_rate",
+          "name": "qwen-sglang-sharegpt-r{rate_tag}",
+          "output": "qwen3_sharegpt/sglang_r{rate_tag}",
+          "harness": {
+            "task": "text",
+            "model": "Qwen3-32B",
+            "dataset": "sharegpt",
+            "dataset_path": "${UNISERVE_SHAREGPT_PATH}",
+            "tokenizer": "${UNISERVE_QWEN3_MODEL}",
+            "num_prompts": 200
+          }
+        },
+        "sensenova_mjhq_t2i_uniserve": {
+          "axis": "arrival_rate",
+          "name": "sensenova-uniserve-t2i-r{rate_tag}",
+          "output": "sensenova_mjhq_t2i/uniserve_r{rate_tag}",
+          "harness": {
+            "task": "t2i",
+            "model": "SenseNova-U1",
+            "dataset": "mjhq",
+            "num_prompts": 200,
+            "steps": 50,
+            "width": 2048,
+            "height": 1152
+          }
+        },
+        "sensenova_mjhq_t2i_omni": {
+          "axis": "arrival_rate",
+          "name": "sensenova-omni-t2i-r{rate_tag}",
+          "output": "sensenova_mjhq_t2i/omni_r{rate_tag}",
+          "harness": {
+            "task": "t2i",
+            "model": "${UNISERVE_SENSENOVA_MODEL}",
+            "dataset": "mjhq",
+            "num_prompts": 200,
+            "steps": 50,
+            "width": 2048,
+            "height": 1152
+          }
+        },
+        "sensenova_beans_i2t_uniserve": {
+          "axis": "arrival_rate",
+          "name": "sensenova-uniserve-i2t-r{rate_tag}",
+          "output": "sensenova_beans_i2t/uniserve_r{rate_tag}",
+          "harness": {
+            "task": "i2t",
+            "model": "SenseNova-U1",
+            "dataset": "image-dir",
+            "dataset_ref": "beans",
+            "num_prompts": 200,
+            "max_tokens": 256,
+            "temperature": 0,
+            "i2t_wire": "native"
+          }
+        },
+        "sensenova_beans_i2t_omni": {
+          "axis": "arrival_rate",
+          "name": "sensenova-omni-i2t-r{rate_tag}",
+          "output": "sensenova_beans_i2t/omni_r{rate_tag}",
+          "harness": {
+            "task": "i2t",
+            "model": "${UNISERVE_SENSENOVA_MODEL}",
+            "dataset": "image-dir",
+            "dataset_ref": "beans",
+            "num_prompts": 200,
+            "max_tokens": 256,
+            "temperature": 0,
+            "i2t_wire": "openai_chat"
+          }
+        },
+        "sensenova_ueval_interleave_uniserve": {
+          "axis": "arrival_rate",
+          "name": "sensenova-uniserve-ueval-r{rate_tag}",
+          "output": "sensenova_ueval_interleave/uniserve_r{rate_tag}",
+          "harness": {
+            "task": "interleave",
+            "model": "SenseNova-U1",
+            "dataset": "ueval",
+            "num_prompts": 32,
+            "max_tokens": 8192,
+            "steps": 50,
+            "width": 2048,
+            "height": 1152
+          }
+        },
+        "bagel_mjhq_t2i_uniserve": {
+          "axis": "arrival_rate",
+          "name": "bagel-uniserve-t2i-r{rate_tag}",
+          "output": "bagel_mjhq_t2i/uniserve_r{rate_tag}",
+          "harness": {
+            "task": "t2i",
+            "model": "BAGEL",
+            "dataset": "mjhq",
+            "num_prompts": 200,
+            "steps": 50,
+            "width": 1024,
+            "height": 1024
+          }
+        },
+        "bagel_mjhq_t2i_omni": {
+          "axis": "arrival_rate",
+          "name": "bagel-omni-t2i-r{rate_tag}",
+          "output": "bagel_mjhq_t2i/omni_r{rate_tag}",
+          "harness": {
+            "task": "t2i",
+            "model": "${UNISERVE_BAGEL_MODEL}",
+            "dataset": "mjhq",
+            "num_prompts": 200,
+            "steps": 50,
+            "width": 1024,
+            "height": 1024
+          }
+        },
+        "bagel_beans_i2t_uniserve": {
+          "axis": "arrival_rate",
+          "name": "bagel-uniserve-i2t-r{rate_tag}",
+          "output": "bagel_beans_i2t/uniserve_r{rate_tag}",
+          "harness": {
+            "task": "i2t",
+            "model": "BAGEL",
+            "dataset": "image-dir",
+            "dataset_ref": "beans",
+            "num_prompts": 200,
+            "max_tokens": 256,
+            "temperature": 0,
+            "i2t_wire": "native"
+          }
+        },
+        "bagel_beans_i2t_omni": {
+          "axis": "arrival_rate",
+          "name": "bagel-omni-i2t-r{rate_tag}",
+          "output": "bagel_beans_i2t/omni_r{rate_tag}",
+          "harness": {
+            "task": "i2t",
+            "model": "${UNISERVE_BAGEL_MODEL}",
+            "dataset": "image-dir",
+            "dataset_ref": "beans",
+            "num_prompts": 200,
+            "max_tokens": 256,
+            "temperature": 0,
+            "i2t_wire": "openai_chat"
+          }
+        }
+      },
+      "investigations": {
+        "sensenova_ueval_ttft_jump": {
+          "status": "required",
+          "reason": "SenseNova UEval p90 TTFT at load points 4 and 8 requires request-level attribution.",
+          "minimum_artifacts": [
+            "scheduler admission trace",
+            "per-request TTFT decomposition",
+            "queue depth timeline",
+            "image-count distribution",
+            "GPU utilization timeline",
+            "server and worker logs"
+          ]
+        },
+        "uniserve_radix_cache": {
+          "status": "required",
+          "reason": "Qwen3 ShareGPT comparison requires cache-mode evidence for the declared SGLang and UniServe server profiles."
+        }
+      }
     }
   }
 }

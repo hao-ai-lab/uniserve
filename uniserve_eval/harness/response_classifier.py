@@ -101,6 +101,9 @@ def _openai_delta_text(event: dict[str, Any]) -> str:
             reasoning = delta.get("reasoning")
             if isinstance(reasoning, str):
                 parts.append(reasoning)
+            reasoning_content = delta.get("reasoning_content")
+            if isinstance(reasoning_content, str):
+                parts.append(reasoning_content)
         text = choice.get("text")
         if isinstance(text, str):
             parts.append(text)

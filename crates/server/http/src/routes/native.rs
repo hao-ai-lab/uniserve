@@ -60,10 +60,23 @@ pub(crate) async fn generate(
     };
 
     let sse = stream::unfold(
-        (native_stream, Detok::new(tokenizer), text_filter, false),
-        |(mut native_stream, mut detok, mut text_filter, done)| async move {
+        (
+            native_stream,
+            Detok::new(tokenizer),
+            text_filter,
+            false,
+            false,
+        ),
+        |(mut native_stream, mut detok, mut text_filter, done, flush_after_terminal)| async move {
             if done {
                 return None;
+            }
+            if flush_after_terminal {
+                let event = Event::default().comment("terminal");
+                return Some((
+                    Ok::<Event, Infallible>(event),
+                    (native_stream, detok, text_filter, true, false),
+                ));
             }
             let ev = native_stream.next().await?;
             let terminal = is_terminal(&ev);
@@ -76,7 +89,7 @@ pub(crate) async fn generate(
             let event = Event::default().data(payload.to_string());
             Some((
                 Ok::<Event, Infallible>(event),
-                (native_stream, detok, text_filter, terminal),
+                (native_stream, detok, text_filter, false, terminal),
             ))
         },
     );
@@ -205,6 +218,7 @@ fn trailing_marker_prefix_len(text: &str, marker: &str) -> usize {
 mod tests {
     use std::sync::Arc;
 
+    use uniserve_native_api::{NativeDelimitedText, NativeOutputFilter};
     use uniserve_text::tokenizer::{DynTokenizer, Tokenizer};
 
     use super::NativeTextOutputFilter;
@@ -247,7 +261,16 @@ mod tests {
 
     fn filter() -> NativeTextOutputFilter {
         NativeTextOutputFilter::new(
-            uniserve_native_api::NativeModelProfile::default().output_filter,
+            NativeOutputFilter {
+                reasoning: Some(NativeDelimitedText {
+                    start: "<think>".into(),
+                    end: "</think>".into(),
+                }),
+                visible_wrappers: vec![NativeDelimitedText {
+                    start: "<answer>".into(),
+                    end: "</answer>".into(),
+                }],
+            },
             tokenizer(),
             &[],
         )

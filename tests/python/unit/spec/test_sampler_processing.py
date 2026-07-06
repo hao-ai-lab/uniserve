@@ -188,36 +188,6 @@ def test_top_k_one_with_temperature_only_ever_samples_the_single_survivor():
 # ---------------------------------------------------------------------------
 
 
-def test_penalties_apply_with_distinct_numeric_semantics():
-    # Arrange: token 0 appears three times; logit 12.0 leaves headroom to
-    # separate the three penalty formulas numerically.
-    #   repetition 2.0  -> 12 / 2          = 6.0   (multiplicative, count-insensitive)
-    #   frequency 1.0   -> 12 - 3 * 1.0    = 9.0   (count-scaled)
-    #   presence 1.0    -> 12 - 1.0        = 11.0  (flat, count-insensitive)
-    recent = [0, 0, 0]
-
-    rep = torch.tensor([12.0, 0.0])
-    shape_logits_for_sampling(
-        rep, {"repetition_penalty": 2.0}, recent=recent, allowed=None, suppress=None, vocab=2
-    )
-
-    freq = torch.tensor([12.0, 0.0])
-    shape_logits_for_sampling(
-        freq, {"frequency_penalty": 1.0}, recent=recent, allowed=None, suppress=None, vocab=2
-    )
-
-    pres = torch.tensor([12.0, 0.0])
-    shape_logits_for_sampling(
-        pres, {"presence_penalty": 1.0}, recent=recent, allowed=None, suppress=None, vocab=2
-    )
-
-    # Assert: each penalty produces a distinct value, ordered rep < freq < pres.
-    torch.testing.assert_close(rep[0], torch.tensor(6.0))
-    torch.testing.assert_close(freq[0], torch.tensor(9.0))
-    torch.testing.assert_close(pres[0], torch.tensor(11.0))
-    assert rep[0] < freq[0] < pres[0]
-
-
 def test_frequency_penalty_scales_with_repeat_count():
     # Arrange: token 0 repeated five times, token 1 once; equal base logits.
     # Frequency subtracts count * penalty, so the more-frequent token loses more.

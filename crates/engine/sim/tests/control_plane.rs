@@ -1624,6 +1624,9 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
             op: ControlOp,
             targets: Option<&[u32]>,
         ) -> anyhow::Result<Vec<ControlAck>> {
+            if let ControlOp::DropRequest(id) = &op {
+                self.log.lock().unwrap().drops.push(*id);
+            }
             self.inner.control_wait(op, targets)
         }
         fn shutdown(&mut self) {

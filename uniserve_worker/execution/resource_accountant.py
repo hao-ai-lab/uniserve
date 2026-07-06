@@ -14,7 +14,7 @@ from ..contracts.resource_plan import LatentTokens, PerBranch, ResourcePlan
 from ..foundation.errors import WorkerError
 from ..foundation.sizing import ceil_div
 from ..runtime.image_params import required_image_height, required_image_width
-from ..runtime.request_state import RequestStateTable
+from ..runtime.request_state import RequestStateTable, append_new_block_ids
 from ..runtime.resources import ResourceRuntime
 
 if TYPE_CHECKING:
@@ -137,7 +137,7 @@ class ResourceAccountant:
     ) -> None:
         state = self.request_states.get(req_id)
         if append_to_state and block_ids:
-            state.extend_block_ids(tuple(int(block_id) for block_id in block_ids))
+            append_new_block_ids(state.block_ids, tuple(int(block_id) for block_id in block_ids))
         if "kv_block" not in self.resource_runtime.classes:
             return
         incoming = {int(block_id) for block_id in block_ids}

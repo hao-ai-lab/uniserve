@@ -18,7 +18,6 @@ from .cuda_graph_base import (
     _DEFAULT_METRIC_PREFIX,
     GraphEvent,
     _GraphRunnerBase,
-    _parse_positive_int_csv,
     _share_decode_graph_input_buffer,
     maybe_weak_ref_cuda_graph_tensor,
     record_graph_stats,

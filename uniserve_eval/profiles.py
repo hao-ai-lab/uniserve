@@ -19,16 +19,57 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.json"
+ENV_REF_RE = re.compile(r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))")
 
 
 def load_config(path: Path) -> dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def expand_profile_value(value: Any) -> Any:
+    """Expand environment-variable references in profile values.
+
+    Missing variables intentionally remain as ``${NAME}`` so dry-run/audit
+    commands can show the required environment without baking in local paths.
+    Launch paths call :func:`require_resolved_profile_value` before exec.
+    """
+
+    if isinstance(value, str):
+        return os.path.expandvars(value)
+    if isinstance(value, list):
+        return [expand_profile_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: expand_profile_value(item) for key, item in value.items()}
+    return value
+
+
+def unresolved_env_refs(value: Any) -> set[str]:
+    refs: set[str] = set()
+    if isinstance(value, str):
+        for match in ENV_REF_RE.finditer(value):
+            refs.add(match.group("braced") or match.group("plain") or "")
+    elif isinstance(value, list):
+        for item in value:
+            refs.update(unresolved_env_refs(item))
+    elif isinstance(value, dict):
+        for item in value.values():
+            refs.update(unresolved_env_refs(item))
+    refs.discard("")
+    return refs
+
+
+def require_resolved_profile_value(value: Any, *, context: str) -> None:
+    refs = sorted(unresolved_env_refs(value))
+    if refs:
+        names = ", ".join(refs)
+        raise SystemExit(f"{context} has unresolved environment variable(s): {names}")
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -86,11 +127,11 @@ def suite_spec(config: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def spec_env(spec: dict[str, Any]) -> dict[str, str]:
-    return {str(key): str(value) for key, value in dict(spec.get("env") or {}).items()}
+    return {str(key): str(value) for key, value in dict(expand_profile_value(spec.get("env") or {})).items()}
 
 
 def artifact_root(config: dict[str, Any]) -> Path:
-    return ROOT / config.get("artifact_root", "e2e-artifacts/current-verify")
+    return ROOT / str(expand_profile_value(config.get("artifact_root", "e2e-artifacts/current-verify")))
 
 
 def server_dir(config: dict[str, Any], name: str) -> Path:
@@ -119,7 +160,7 @@ def resolve_server_for_workload(
 
 
 def workload_env(workload: dict[str, Any]) -> dict[str, str]:
-    return {str(key): str(value) for key, value in dict(workload.get("env") or {}).items()}
+    return {str(key): str(value) for key, value in dict(expand_profile_value(workload.get("env") or {})).items()}
 
 
 def merged_env(workload: dict[str, Any]) -> dict[str, str]:

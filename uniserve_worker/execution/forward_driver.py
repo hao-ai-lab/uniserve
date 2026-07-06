@@ -1,4 +1,4 @@
-"""Runner-owned mixed text+denoise forward execution seam."""
+"""Runner-owned mixed forward execution seam."""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -12,7 +12,7 @@ __all__ = ["ForwardDriver"]
 
 
 class ForwardDriver:
-    """Dispatch one admitted mixed text+denoise group through the model seam.
+    """Dispatch one admitted mixed group through the model seam.
 
     Production interleaved generation models implement ``run_forward``.
     Once the admission router selects this path, a missing or malformed hook is a
@@ -24,9 +24,18 @@ class ForwardDriver:
         if not callable(hook):
             return False
         modes = tuple(getattr(fb, "op_modes", ()))
-        return bool(modes) and any(m is ForwardMode.DECODE for m in modes) and any(
-            m is ForwardMode.DENOISE for m in modes
-        )
+        if not modes:
+            return False
+        mode_set = set(modes)
+        has_text = bool(mode_set & {ForwardMode.EXTEND, ForwardMode.DECODE})
+        if not has_text:
+            return False
+        if mode_set & {ForwardMode.DENOISE, ForwardMode.COMMIT}:
+            return True
+        return {ForwardMode.EXTEND, ForwardMode.DECODE} <= mode_set <= {
+            ForwardMode.EXTEND,
+            ForwardMode.DECODE,
+        }
 
     def step(
         self,

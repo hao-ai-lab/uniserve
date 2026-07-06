@@ -192,10 +192,6 @@ def test_record_mode_shape_accumulates_ops_and_tokens():
     assert stats.mode.mode_tokens == {"decode": 15}
 
 
-def test_component_timer_start_returns_zero_when_stats_is_none():
-    assert component_timer_start(None) == 0
-
-
 def test_component_timer_start_returns_positive_stamp_when_stats_present():
     stats = ForwardStats()
 

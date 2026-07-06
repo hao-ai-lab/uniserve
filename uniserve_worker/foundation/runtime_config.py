@@ -124,7 +124,6 @@ class WorkerRuntimeConfig:
     prefill_cuda_graph_warmup_tokens: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     mixed_text_max_tokens: int = 8192
     varlen_prefill: bool = True
-    forward_max_memory_bound_tokens: int = 281
     green_contexts: bool = False
     logits_processor_chunk_size: int = 0
     torch_compile: TorchCompileRuntimeConfig = TorchCompileRuntimeConfig()
@@ -171,7 +170,6 @@ def worker_config_from_args(args: Any) -> WorkerRuntimeConfig:
         ),
         mixed_text_max_tokens=max(0, int(args.mixed_text_max_tokens)),
         varlen_prefill=bool(args.varlen_prefill),
-        forward_max_memory_bound_tokens=max(1, int(args.forward_max_memory_bound_tokens)),
         green_contexts=bool(args.green_contexts),
         logits_processor_chunk_size=max(0, int(args.logits_processor_chunk_size)),
         torch_compile=TorchCompileRuntimeConfig(

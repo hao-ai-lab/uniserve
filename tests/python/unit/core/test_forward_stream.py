@@ -52,8 +52,41 @@ def test_forward_stream_builds_causal_and_bidirectional_visible_end():
 
     assert stream.cu_seqlens_q.tolist() == [0, 3, 7]
     assert stream.visible_end.tolist() == [[5, 6, 7, 0], [13, 13, 13, 13]]
+    assert not stream.fully_visible
     torch.testing.assert_close(stream.indexes[:, :3], torch.tensor([[4, 5, 6], [0, 0, 0], [0, 0, 0]]))
     torch.testing.assert_close(stream.indexes[:, 3:], image_indexes)
+
+
+def test_forward_stream_marks_decode_and_denoise_rows_fully_visible():
+    builder = ForwardStreamBuilder()
+    builder.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=1,
+        prefix_len=4,
+        visible_policy="causal",
+    )
+    builder.add_segment(
+        op_index=1,
+        req_id=2,
+        kind="denoise_gen",
+        mode=ForwardMode.DENOISE,
+        modality="gen",
+        segment_class="denoise",
+        q_len=3,
+        prefix_len=9,
+        visible_policy="bidirectional",
+        indexes=torch.tensor([[10, 10, 10], [0, 0, 1], [0, 1, 0]]),
+    )
+
+    stream = builder.build()
+
+    assert stream.visible_end.tolist() == [[5, 0, 0], [12, 12, 12]]
+    assert stream.fully_visible
 
 
 def test_forward_stream_keeps_cfg_branches_structurally_distinct():
@@ -131,9 +164,11 @@ def test_forward_paged_kv_view_appends_ragged_segments_into_one_pool():
     assert view.block_table().tolist() == [[0, 1, 0], [2, 3, 4]]
     assert view.cache_seqlens_before().tolist() == [3, 7]
     assert view.cache_seqlens_after().tolist() == [5, 10]
+    assert view.cu_seqlens_after().tolist() == [0, 5, 15]
     assert view.persistent_cache_seqlens_after().tolist() == [5, 10]
     assert view.block_table() is view.block_table()
     assert view.cache_seqlens_after() is view.cache_seqlens_after()
+    assert view.cu_seqlens_after() is view.cu_seqlens_after()
 
     k = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
     v = -k

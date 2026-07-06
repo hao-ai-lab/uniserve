@@ -6,12 +6,10 @@ from enum import Enum
 from typing import Mapping, Sequence
 
 from ..contracts.forward_mode import ForwardMode, mode_for_op
-from ..foundation.runtime_config import get_worker_config
 
 __all__ = [
     'Route',
     'ForwardAdmissionDecision',
-    'ForwardAdmissionConfig',
     'ForwardAdmissionRouter',
 ]
 
@@ -31,13 +29,6 @@ class Route(str, Enum):
     def __str__(self) -> str:
         return self.value
 
-# Default memory-bound window for the decode+denoise route. Below this token
-# count the batch stays memory-bound (the forward kernel's precondition); above
-# it the batch tips compute-bound and is rejected. Hardware-tunable via
-# worker runtime config. The authoritative admission budget lives in the Rust
-# scheduler — this is only the worker-side narrowing gate.
-_DEFAULT_MAX_MEMORY_BOUND_TOKENS = 281
-
 
 @dataclass(frozen=True)
 class ForwardAdmissionDecision:
@@ -55,31 +46,10 @@ class ForwardAdmissionDecision:
 
 
 @dataclass(frozen=True)
-class ForwardAdmissionConfig:
-    """Runtime-config-derived admission tunables."""
-
-    max_memory_bound_decode_tokens: int = _DEFAULT_MAX_MEMORY_BOUND_TOKENS
-
-    @classmethod
-    def from_runtime_config(cls) -> "ForwardAdmissionConfig":
-        max_memory_bound = get_worker_config().forward_max_memory_bound_tokens
-        # A non-positive crossover would admit nothing; fall back to the default.
-        if max_memory_bound <= 0:
-            max_memory_bound = _DEFAULT_MAX_MEMORY_BOUND_TOKENS
-        return cls(max_memory_bound_decode_tokens=max_memory_bound)
-
-
-@dataclass(frozen=True)
 class ForwardAdmissionRouter:
-    config: ForwardAdmissionConfig = ForwardAdmissionConfig()
-
-    @property
-    def max_memory_bound_decode_tokens(self) -> int:
-        return self.config.max_memory_bound_decode_tokens
-
     @classmethod
     def from_runtime_config(cls) -> "ForwardAdmissionRouter":
-        return cls(config=ForwardAdmissionConfig.from_runtime_config())
+        return cls()
 
     def decide(self, ops: Sequence[Mapping[str, object]]) -> ForwardAdmissionDecision:
         modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
@@ -96,34 +66,19 @@ class ForwardAdmissionRouter:
             return ForwardAdmissionDecision(
                 Route.MODEL_CHECKED_FORWARD, "text extend+decode mixed forward", modes
             )
-        supported = {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE}
+        has_text = any(mode in text_modes for mode in modes)
+        gen_modes = {ForwardMode.DENOISE, ForwardMode.COMMIT}
+        has_gen = any(mode in gen_modes for mode in modes)
+        if has_text and has_gen:
+            return ForwardAdmissionDecision(Route.FORWARD, "und/gen mixed forward", modes)
+        supported = {ForwardMode.EXTEND, ForwardMode.DECODE, *gen_modes}
         if any(mode not in supported for mode in modes):
             return ForwardAdmissionDecision(
                 Route.PER_MODE,
-                "mixed forward supports only text and denoise ops",
+                "mixed forward supports only text and gen ops",
                 modes,
             )
-        has_decode = any(mode is ForwardMode.DECODE for mode in modes)
-        has_denoise = any(mode is ForwardMode.DENOISE for mode in modes)
-        if not (has_decode and has_denoise):
-            return ForwardAdmissionDecision(Route.PER_MODE, "requires concurrent decode and denoise", modes)
-        # The memory-bound precondition is about total text-token width, not just
-        # decode rows. EXTEND (prefill) chunks are compute-bound and the host
-        # budgets their full chunk width (op_token_cost), so count them against the
-        # same window -- otherwise a large prefill could ride into the forward kernel
-        # and make the batch compute-bound, violating the documented precondition.
-        text_tokens = sum(
-            len(op.get("token_ids") or [])
-            for op, mode in zip(ops, modes)
-            if mode in (ForwardMode.DECODE, ForwardMode.EXTEND)
-        )
-        if text_tokens > self.max_memory_bound_decode_tokens:
-            return ForwardAdmissionDecision(
-                Route.PER_MODE,
-                "text batch is beyond the memory-bound forward window",
-                modes,
-            )
-        return ForwardAdmissionDecision(Route.FORWARD, "decode+denoise forward window", modes)
+        return ForwardAdmissionDecision(Route.PER_MODE, "requires concurrent und and gen ops", modes)
 
 
 def _has_values(raw: object) -> bool:

@@ -33,11 +33,13 @@ class RecordingModel(ModelHooks):
     def __init__(self, policy: BatchPolicy) -> None:
         self._policy = policy
         self.calls: list[tuple[ForwardMode, list[int], list[str]]] = []
+        self.inference_modes: list[bool] = []
 
     def batch_policy(self) -> BatchPolicy:
         return self._policy
 
     def forward(self, batch: UniForwardBatch) -> list[dict[str, Any]]:
+        self.inference_modes.append(torch.is_inference_mode_enabled())
         kinds = [str(op["kind"]) for op in batch.ops]
         req_ids = [int(op["req_id"]) for op in batch.ops]
         self.calls.append((batch.mode, req_ids, kinds))
@@ -161,32 +163,25 @@ def test_strict_policy_preserves_contiguous_order_and_splits_by_max_batch():
     ]
 
 
-def test_mixed_policy_buckets_by_declared_mode_order_and_reassembles_results():
-    model = RecordingModel(
-        BatchPolicy(
-            max_batch_ops=2,
-            supports_mixed_modes=True,
-            mode_order=(
-                ForwardMode.ENCODE,
-                ForwardMode.EXTEND,
-                ForwardMode.DECODE,
-                ForwardMode.DENOISE,
-                ForwardMode.COMMIT,
-            ),
-        )
-    )
-    submitted = ops("decode_und", "commit_gen", "vae_encode", "denoise_gen", "prefill_und", "decode_und")
+def test_runner_executes_whole_batch_forward_under_inference_mode():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+
+    execute(model, ops("prefill_und"))
+
+    assert model.inference_modes == [True]
+
+
+def test_und_gen_mixed_policy_keeps_entire_batch_for_forward_hook():
+    model = ForwardHookModel(max_batch_ops=2)
+    submitted = ops("decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und")
 
     result = execute(model, submitted)
 
-    assert [r["req_id"] for r in result["per_seq"]] == [1, 2, 3, 4, 5, 6]
+    assert [r["req_id"] for r in result["per_seq"]] == [1, 2, 3, 4, 5]
     assert [r["kind"] for r in result["per_seq"]] == [op["kind"] for op in submitted]
-    assert model.calls == [
-        (ForwardMode.ENCODE, [3], ["vae_encode"]),
-        (ForwardMode.EXTEND, [5], ["prefill_und"]),
-        (ForwardMode.DECODE, [1, 6], ["decode_und", "decode_und"]),
-        (ForwardMode.DENOISE, [4], ["denoise_gen"]),
-        (ForwardMode.COMMIT, [2], ["commit_gen"]),
+    assert model.calls == []
+    assert model.forward_calls == [
+        ["decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und"]
     ]
 
 
@@ -204,6 +199,26 @@ def test_non_thin_text_extend_decode_splits_per_mode():
         (ForwardMode.EXTEND, [2], ["prefill_und"]),
         (ForwardMode.DECODE, [1], ["decode_und"]),
     ]
+
+
+def test_text_extend_decode_route_uses_forward_hook_when_available():
+    model = ForwardHookModel(max_batch_ops=8)
+    submitted = [
+        {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [4, 5]},
+        {"req_id": 2, "kind": "prefill_und", "token_ids": [11, 12], "pos_range": [0, 2]},
+    ]
+
+    result = ModelRunner(model).execute(
+        {
+            "step_id": 1,
+            "new_reqs": [{"req_id": 1, "block_ids": []}, {"req_id": 2, "block_ids": []}],
+            "ops": submitted,
+        }
+    )
+
+    assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
+    assert model.calls == []
+    assert model.forward_calls == [["decode_und", "prefill_und"]]
 
 
 def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
@@ -236,13 +251,15 @@ def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
     assert flat.positions.tolist() == [3, 0, 1]
 
 
-def test_forward_admission_rejects_commit_rows():
-    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
+def test_forward_admission_keeps_extra_rows_with_und_gen_mixed_batch():
+    model = ForwardHookModel(max_batch_ops=8)
     submitted = ops("decode_und", "denoise_gen", "commit_gen")
 
     result = execute(model, submitted)
 
-    assert [r["mode"] for r in result["per_seq"]] == ["decode", "denoise", "commit"]
+    assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed", "mixed"]
+    assert model.calls == []
+    assert model.forward_calls == [["decode_und", "denoise_gen", "commit_gen"]]
 
 
 def test_system_speculative_verify_runs_over_thin_model_forward():
@@ -543,13 +560,7 @@ def test_batch_policy_rejects_invalid_max_batch():
 
 def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
-    model = RecordingModel(
-        BatchPolicy(
-            max_batch_ops=4,
-            supports_mixed_modes=True,
-            mode_order=(ForwardMode.EXTEND, ForwardMode.DENOISE),
-        )
-    )
+    model = ForwardHookModel(max_batch_ops=4)
     runner = ModelRunner(model)
     result = runner.execute(
         {
@@ -570,7 +581,7 @@ def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     stats = result["forward_stats"]
     assert stats["mode_counts"] == {"extend": 1, "denoise": 1}
     assert stats["mode_tokens"] == {"extend": 3, "denoise": 12}
-    assert set(stats["mode_us"]) == {"extend", "denoise"}
+    assert set(stats["mode_us"]) == {"mixed"}
     assert stats["attention_launches"] == 0
 
 
@@ -588,22 +599,45 @@ class ForwardHookModel(RecordingModel):
         ]
 
 
-def test_decode_denoise_route_uses_forward_driver_by_default():
+@pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
+def test_text_denoise_route_uses_forward_driver_unconditionally(text_kind):
     model = ForwardHookModel(max_batch_ops=1)
-    submitted = ops("decode_und", "denoise_gen")
+    submitted = ops(text_kind, "denoise_gen")
 
-    result = execute(model, submitted)
+    req_ids = sorted({int(op["req_id"]) for op in submitted})
+    result = ModelRunner(model).execute(
+        {
+            "step_id": 1,
+            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
+            "ops": submitted,
+        }
+    )
 
     assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
     assert model.calls == []
-    assert model.forward_calls == [["decode_und", "denoise_gen"]]
+    assert model.forward_calls == [[text_kind, "denoise_gen"]]
 
 
-def test_decode_denoise_forward_route_fails_loudly_without_hook():
+@pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
+def test_text_denoise_forward_route_splits_without_hook(text_kind):
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
-    submitted = ops("decode_und", "denoise_gen")
+    submitted = ops(text_kind, "denoise_gen")
 
-    with pytest.raises(WorkerError, match="run_forward"):
-        execute(model, submitted)
+    req_ids = sorted({int(op["req_id"]) for op in submitted})
+    result = ModelRunner(model).execute(
+        {
+            "step_id": 1,
+            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
+            "ops": submitted,
+        }
+    )
 
-    assert model.calls == []
+    expected_text_mode = ForwardMode.DECODE if text_kind == "decode_und" else ForwardMode.EXTEND
+    assert [row["mode"] for row in result["per_seq"]] == [
+        expected_text_mode.value,
+        ForwardMode.DENOISE.value,
+    ]
+    assert model.calls == [
+        (expected_text_mode, [1], [text_kind]),
+        (ForwardMode.DENOISE, [2], ["denoise_gen"]),
+    ]

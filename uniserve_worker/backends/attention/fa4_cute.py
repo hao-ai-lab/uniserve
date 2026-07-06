@@ -7,6 +7,8 @@ the worker-owned paged cache before calling the FA4 paged forward.
 """
 from __future__ import annotations
 
+import inspect
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -38,6 +40,11 @@ _SUPPORTED_TRUNK_GEOMETRIES: frozenset[tuple[int, int, int]] = frozenset(
 # thread-count tuning lives in exactly one place.
 _FA4_TILE_MN = (128, 128)
 _FA4_NUM_THREADS = 384
+_PREFIX_BOUNDS_CACHE_LIMIT = 16
+_PREFIX_BOUNDS_CACHE: OrderedDict[
+    tuple[int, int | None, int, int | None, int],
+    tuple[torch.Tensor, torch.Tensor | None, torch.Tensor],
+] = OrderedDict()
 try:  # pragma: no cover - optional CUDA package.
     from uniserve_kernel import mm_attn_varlen
 
@@ -46,12 +53,18 @@ try:  # pragma: no cover - optional CUDA package.
     _compute_prefix_bounds_varlen = mm_attn_varlen.compute_prefix_bounds_varlen
     _hybrid_multimodal_mask = mm_attn_varlen.hybrid_multimodal_mask
     _IMPORT_ERROR = mm_attn_varlen.import_error()
+    _fa4_accepts_prefix_bounds = (
+        "prefix_bounds" in inspect.signature(_fa4_flash_attn_fwd).parameters
+        if _fa4_flash_attn_fwd is not None
+        else False
+    )
 except Exception as exc:  # pragma: no cover
     _IMPORT_ERROR = exc
     _fa4_flash_attn_fwd = None
     _compute_prefix_bounds = None
     _compute_prefix_bounds_varlen = None
     _hybrid_multimodal_mask = None
+    _fa4_accepts_prefix_bounds = False
 
 
 class Fa4CuteAttentionBackend:
@@ -60,11 +73,13 @@ class Fa4CuteAttentionBackend:
     name = "fa4_cute"
 
     def capabilities(self) -> AttentionCapabilities:
+        available = _fa4_flash_attn_fwd is not None
         return AttentionCapabilities(
+            available=available,
             segment_batched_cfg=True,
             mixed_mode=True,
-            paged_kv=_fa4_flash_attn_fwd is not None,
-            visible_end=_fa4_flash_attn_fwd is not None,
+            paged_kv=available,
+            visible_end=available,
             paged_block_size_multiple=1,
             trunk_geometries=_SUPPORTED_TRUNK_GEOMETRIES,
         )
@@ -85,14 +100,16 @@ class Fa4CuteAttentionBackend:
             raise ValueError("fa4_cute backend expects q/k/v in [B, H, L, D] layout")
         _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
         _require_fa4()
-        out, _ = _fa4_flash_attn_fwd(
-            q.transpose(1, 2).contiguous(),
-            k.transpose(1, 2).contiguous(),
-            v.transpose(1, 2).contiguous(),
-            softmax_scale=scale,
-            causal=causal,
-            tile_mn=_FA4_TILE_MN,
-            num_threads=_FA4_NUM_THREADS,
+        out = _fa4_output(
+            _fa4_flash_attn_fwd(
+                q.transpose(1, 2).contiguous(),
+                k.transpose(1, 2).contiguous(),
+                v.transpose(1, 2).contiguous(),
+                softmax_scale=scale,
+                causal=causal,
+                tile_mn=_FA4_TILE_MN,
+                num_threads=_FA4_NUM_THREADS,
+            )
         )
         return out.transpose(1, 2).contiguous()
 
@@ -130,18 +147,20 @@ class Fa4CuteAttentionBackend:
             _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k_blh, v_blh)
             live_seqlens += int(k_blh.shape[1])
 
-        out, _ = _fa4_flash_attn_fwd(
-            q_blh,
-            k_cache,
-            v_cache,
-            page_table=block_table,
-            seqused_k=live_seqlens,
-            max_seqlen_q=int(q_blh.shape[1]),
-            max_seqlen_k=int(live_seqlens.max().item()) if live_seqlens.numel() else 0,
-            softmax_scale=scale,
-            causal=causal,
-            tile_mn=_FA4_TILE_MN,
-            num_threads=_FA4_NUM_THREADS,
+        out = _fa4_output(
+            _fa4_flash_attn_fwd(
+                q_blh,
+                k_cache,
+                v_cache,
+                page_table=block_table,
+                seqused_k=live_seqlens,
+                max_seqlen_q=int(q_blh.shape[1]),
+                max_seqlen_k=int(live_seqlens.max().item()) if live_seqlens.numel() else 0,
+                softmax_scale=scale,
+                causal=causal,
+                tile_mn=_FA4_TILE_MN,
+                num_threads=_FA4_NUM_THREADS,
+            )
         )
         return restore.apply(out)
 
@@ -160,6 +179,7 @@ class Fa4CuteAttentionBackend:
         max_seqlen_k: int | None = None,
         scale: float | None = None,
         use_prefix_bounds: bool = False,
+        fully_visible: bool = False,
     ) -> torch.Tensor:
         """Run the hybrid ``visible_end`` mask path.
 
@@ -178,29 +198,27 @@ class Fa4CuteAttentionBackend:
             "max_seqlen_q": max_seqlen_q,
             "max_seqlen_k": max_seqlen_k,
             "softmax_scale": scale,
-            "aux_tensors": [visible_end],
             "tile_mn": _FA4_TILE_MN,
             "num_threads": _FA4_NUM_THREADS,
         }
-        if use_prefix_bounds:
+        if fully_visible:
+            return _fa4_output(_fa4_flash_attn_fwd(q, k, v, **kwargs))
+        kwargs["aux_tensors"] = [visible_end]
+        if use_prefix_bounds and _fa4_accepts_prefix_bounds:
             # FA4 query-tile width (kernel-ABI); unrelated to the paged block size.
             q_tile = 256
-            if cu_seqlens_q is None:
-                prefix_bounds = _compute_prefix_bounds(visible_end, q_tile_size=q_tile)
-            else:
-                seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
-                tiles = None if max_seqlen_q is None else ceil_div(max_seqlen_q, q_tile)
-                prefix_bounds = _compute_prefix_bounds_varlen(
-                    visible_end,
-                    seqlens_q,
-                    q_tile_size=q_tile,
-                    num_q_tiles=tiles,
-                )
+            qhead_per_kvhead = int(q.shape[-2]) // int(k.shape[-2])
+            prefix_bounds = _cached_prefix_bounds(
+                visible_end,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                qhead_per_kvhead=qhead_per_kvhead,
+                q_tile_size=q_tile,
+            )
             kwargs["prefix_bounds"] = prefix_bounds
         else:
             kwargs["mask_mod"] = _hybrid_multimodal_mask
-        out, _ = _fa4_flash_attn_fwd(q, k, v, **kwargs)
-        return out
+        return _fa4_output(_fa4_flash_attn_fwd(q, k, v, **kwargs))
 
 
 def _require_fa4() -> None:
@@ -211,6 +229,68 @@ def _require_fa4() -> None:
             "provider package with its CUTE runtime dependencies"
             f"{detail}"
         )
+
+
+def _fa4_output(result: Any) -> torch.Tensor:
+    if isinstance(result, tuple):
+        return result[0]
+    return result
+
+
+def _cached_prefix_bounds(
+    visible_end: torch.Tensor,
+    *,
+    cu_seqlens_q: torch.Tensor | None,
+    max_seqlen_q: int | None,
+    qhead_per_kvhead: int,
+    q_tile_size: int,
+) -> torch.Tensor:
+    key = (
+        id(visible_end),
+        None if cu_seqlens_q is None else id(cu_seqlens_q),
+        int(qhead_per_kvhead),
+        None if max_seqlen_q is None else int(max_seqlen_q),
+        int(q_tile_size),
+    )
+    cached = _PREFIX_BOUNDS_CACHE.get(key)
+    if cached is not None:
+        cached_visible, cached_cu_q, prefix_bounds = cached
+        if cached_visible is visible_end and cached_cu_q is cu_seqlens_q:
+            _PREFIX_BOUNDS_CACHE.move_to_end(key)
+            return prefix_bounds
+
+    bounds_visible_end = visible_end
+    bounds_max_seqlen_q = max_seqlen_q
+    if qhead_per_kvhead > 1:
+        # FA4's packed-GQA scheduler counts query tiles in head-expanded row
+        # space. Prefix bounds use that same tile space; prefix_visible_end
+        # remains indexed by logical q rows in the kernel mask.
+        bounds_visible_end = visible_end.repeat_interleave(
+            qhead_per_kvhead,
+            dim=1,
+        ).contiguous()
+        if bounds_max_seqlen_q is not None:
+            bounds_max_seqlen_q = int(bounds_max_seqlen_q) * int(qhead_per_kvhead)
+
+    if cu_seqlens_q is None:
+        prefix_bounds = _compute_prefix_bounds(bounds_visible_end, q_tile_size=q_tile_size)
+    else:
+        seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
+        if qhead_per_kvhead > 1:
+            seqlens_q = seqlens_q * int(qhead_per_kvhead)
+        tiles = None if bounds_max_seqlen_q is None else ceil_div(bounds_max_seqlen_q, q_tile_size)
+        prefix_bounds = _compute_prefix_bounds_varlen(
+            bounds_visible_end,
+            seqlens_q,
+            q_tile_size=q_tile_size,
+            num_q_tiles=tiles,
+        )
+
+    _PREFIX_BOUNDS_CACHE[key] = (visible_end, cu_seqlens_q, prefix_bounds)
+    _PREFIX_BOUNDS_CACHE.move_to_end(key)
+    while len(_PREFIX_BOUNDS_CACHE) > _PREFIX_BOUNDS_CACHE_LIMIT:
+        _PREFIX_BOUNDS_CACHE.popitem(last=False)
+    return prefix_bounds
 
 
 def _validate_unified_trunk_geometry(
@@ -276,5 +356,4 @@ def _write_paged_kv_cache(
     paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current)
 
 
-if _fa4_flash_attn_fwd is not None:  # pragma: no cover - availability-specific.
-    register_attention_backend("fa4_cute", Fa4CuteAttentionBackend())
+register_attention_backend("fa4_cute", Fa4CuteAttentionBackend())

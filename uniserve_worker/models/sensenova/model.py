@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import copy
 import logging
-from dataclasses import dataclass
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -18,7 +18,9 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 import uniserve_worker.ops as ops
+
 from ...contracts.batches import UniForwardBatch
+from ...contracts.forward_context import get_forward_context
 from ...contracts.forward_mode import ForwardMode
 from ...contracts.resource_plan import (
     CapsDescriptor,
@@ -28,29 +30,41 @@ from ...contracts.resource_plan import (
     ResourcePlan,
 )
 from ...execution.denoise_driver import (
+    DenoiseDriver,
     TextImageDenoiseStep,
     text_image_branches,
 )
+from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
+from ...execution.denoise_step_graph import release_denoise_step_graphs
 from ...execution.forward_stream import (
     ForwardPagedKVSegment,
     ForwardPagedKVView,
     ForwardStream,
     ForwardStreamBuilder,
 )
+from ...execution.input_image_ingest import InputImageIngestDriver
+from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
+from ...execution.interleaved_image_denoise import (
+    ImageState,
+    InterleavedImageRequestState,
+    TextImageDenoiseOps,
+)
+from ...execution.interleaved_text_stepper import (
+    InterleavedTextCacheDriver,
+    TextCache,
+)
 from ...execution.model_base import UniModelBase
 from ...execution.packed_mixed_forward import run_packed_mixed_forward
+from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
     ceil_div,
     derive_num_blocks,
 )
-from ...foundation.runtime_config import get_worker_config
-from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...loader.transformers import NativeLoadSpec
 from ...nn import (
     LinearBase,
-    MergedColumnParallelLinear,
     ParallelLMHead,
     QKVParallelLinear,
     RadixAttention,
@@ -58,15 +72,13 @@ from ...nn import (
     RowParallelLinear,
     VocabParallelEmbedding,
     WeightMode,
-    apply_rotary_pos_emb,
     get_current_mesh,
     get_rope,
     get_tower_coord,
     place_towers,
     set_tower_coord,
 )
-from ...nn.decoder import Qwen3MLP, Modality, route_by_modality, tower_modality_coords
-from ...nn.linear import local_kv_head_count as _local_kv_head_count
+from ...nn.decoder import Modality, Qwen3MLP, route_by_modality, tower_modality_coords
 from ...nn.diffusion import (
     ConvDecoder,
     FlowMatchingHead,
@@ -75,6 +87,7 @@ from ...nn.diffusion import (
     TimestepEmbedder,
 )
 from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
+from ...nn.linear import local_kv_head_count as _local_kv_head_count
 from ...nn.quant import (
     QuantizationConfig,
     get_current_kv_cache_dtype,
@@ -82,11 +95,11 @@ from ...nn.quant import (
     use_quantization_config,
 )
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
+from ...processors.registry import get_processor_for_model
 from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
-from ...runtime.paged_text_cache import PagedTextCache, stage_paged_text_cache_prefix
+from ...runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from ...runtime.request_state import RequestState as RunnerRequestState
-from ...processors.registry import get_processor_for_model
 from ...runtime.residency import (
     GenResidencySpec,
     KvCacheSpec,
@@ -101,19 +114,6 @@ from ...runtime.tower_handoff import (
     TowerHandoff,
 )
 from ...runtime.transfer import Locator
-from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
-from ...execution.denoise_step_graph import release_denoise_step_graphs
-from ...execution.input_image_ingest import InputImageIngestDriver
-from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
-from ...execution.interleaved_image_denoise import (
-    ImageState,
-    InterleavedImageRequestState,
-    TextImageDenoiseOps,
-)
-from ...execution.interleaved_text_stepper import (
-    InterleavedTextCacheDriver,
-    TextCache,
-)
 from .config import NeoChatConfig
 
 __all__ = [
@@ -160,6 +160,55 @@ _NOISE_DYNAMIC_SQRT_EXPONENT = 0.5
 _NOISE_RESOLUTION_MODES = frozenset({"resolution", "dynamic", "dynamic_sqrt"})
 
 logger = logging.getLogger(__name__)
+
+
+def _packed_mixed_has_und_and_gen(op_modes: Sequence[ForwardMode]) -> bool:
+    has_und = any(mode in {ForwardMode.EXTEND, ForwardMode.DECODE} for mode in op_modes)
+    has_gen = any(mode in {ForwardMode.DENOISE, ForwardMode.COMMIT} for mode in op_modes)
+    return has_und and has_gen
+
+
+def _output_value(output: Any, field: str) -> Any:
+    if isinstance(output, Mapping):
+        return output.get(field)
+    if hasattr(output, field):
+        return getattr(output, field)
+    to_seq_result = getattr(output, "to_seq_result", None)
+    if callable(to_seq_result):
+        return dict(to_seq_result()).get(field)
+    raise invalid_descriptor(f"packed mixed output does not expose {field!r}")
+
+
+def _output_int(output: Any, field: str) -> int:
+    value = _output_value(output, field)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise invalid_descriptor(f"packed mixed output field {field!r} must be an integer")
+    return int(value)
+
+
+def _output_bool(output: Any, field: str) -> bool:
+    value = _output_value(output, field)
+    if not isinstance(value, bool):
+        raise invalid_descriptor(f"packed mixed output field {field!r} must be a boolean")
+    return bool(value)
+
+
+def _sampled_token_id(output: Any) -> int:
+    token = _output_int(output, "sampled_token_id")
+    if token < 0:
+        raise invalid_descriptor("sampled_token_id must be non-negative")
+    return token
+
+
+def _decode_burst_result(op: Mapping[str, Any], tokens: Sequence[int]) -> dict[str, Any]:
+    if not tokens:
+        raise invalid_descriptor("decode burst did not produce a sampled token")
+    token_ids = [int(token) for token in tokens]
+    return {
+        "req_id": int(op["req_id"]),
+        "sampled_token_id": token_ids[-1],
+        "sampled_token_ids": token_ids,
+    }
 
 
 @dataclass(frozen=True)
@@ -252,6 +301,9 @@ class SenseNovaPackedRope:
 
     def select(self, mask: torch.Tensor) -> "SenseNovaPackedRope":
         positions = mask.nonzero(as_tuple=False).flatten()
+        return self.select_indices(positions)
+
+    def select_indices(self, positions: torch.Tensor) -> "SenseNovaPackedRope":
         return SenseNovaPackedRope(
             tuple(axis.index_select(0, positions) for axis in self.cos),
             tuple(axis.index_select(0, positions) for axis in self.sin),
@@ -705,6 +757,21 @@ class _SenseNovaAttention(nn.Module):
             (seg.base_len + seg.q_len for seg in kv_view.segments),
             default=0,
         )
+        if forward_stream.fully_visible:
+            out = ops.attention(
+                q,
+                k_cache,
+                v_cache,
+                regime=ops.AttentionRegime.EXTEND,
+                cu_seqlens_q=forward_stream.cu_seqlens_q,
+                cu_seqlens_k=kv_view.cu_seqlens_after(device=q.device),
+                max_seqlen_q=int(forward_stream.visible_end.shape[1]),
+                max_seqlen_k=int(max_seqlen_k),
+                causal=False,
+                scale=self.scaling,
+                block_table=kv_view.block_table(device=q.device),
+            )
+            return out.contiguous()
         # Route visible_end attention through RadixAttention (backend resolution + stats).
         out = self.attn.forward_visible_end(
             q,
@@ -717,7 +784,8 @@ class _SenseNovaAttention(nn.Module):
             max_seqlen_q=int(forward_stream.visible_end.shape[1]),
             max_seqlen_k=int(max_seqlen_k),
             scale=self.scaling,
-            use_prefix_bounds=False,
+            use_prefix_bounds=True,
+            fully_visible=forward_stream.fully_visible,
         )
         return out.contiguous()
 
@@ -730,14 +798,18 @@ class _SenseNovaAttention(nn.Module):
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         und: torch.Tensor,
+        und_indices: torch.Tensor | None = None,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         packed_rope: SenseNovaPackedRope | None = None,
+        dense_gen_route: bool = False,
     ) -> torch.Tensor:
         # gen mask (image_gen_indicators) and its complement (und) plus the exist
         # flags are precomputed once by the model; reuse them so the o_proj
         # routing avoids a per-layer device->host sync.
         gen = image_gen_indicators
+        ctx = get_forward_context()
+        qkv_start = ctx.component_timer_start()
         if exist_non_image_gen_tokens != exist_image_gen_tokens:
             gen_branch = bool(exist_image_gen_tokens)
             q_bhld, k_bhld, v_bhld = self._project_qkv(
@@ -749,6 +821,31 @@ class _SenseNovaAttention(nn.Module):
             q = q_bhld.squeeze(0).transpose(0, 1).contiguous()
             k = k_bhld.squeeze(0).transpose(0, 1).contiguous()
             v = v_bhld.squeeze(0).transpose(0, 1).contiguous()
+        elif dense_gen_route:
+            q_bhld, k_bhld, v_bhld = self._project_qkv(
+                hidden_states.unsqueeze(0),
+                indexes,
+                gen_branch=True,
+                packed_rope=packed_rope,
+            )
+            q = q_bhld.squeeze(0).transpose(0, 1).contiguous()
+            k = k_bhld.squeeze(0).transpose(0, 1).contiguous()
+            v = v_bhld.squeeze(0).transpose(0, 1).contiguous()
+            if exist_non_image_gen_tokens:
+                if und_indices is None:
+                    und_indices = und.nonzero(as_tuple=False).flatten()
+                text_hidden = hidden_states.index_select(0, und_indices)
+                text_indexes = indexes.index_select(1, und_indices)
+                text_rope = packed_rope.select_indices(und_indices) if packed_rope is not None else None
+                q_text, k_text, v_text = self._project_qkv(
+                    text_hidden.unsqueeze(0),
+                    text_indexes,
+                    gen_branch=False,
+                    packed_rope=text_rope,
+                )
+                q.index_copy_(0, und_indices, q_text.squeeze(0).transpose(0, 1).contiguous())
+                k.index_copy_(0, und_indices, k_text.squeeze(0).transpose(0, 1).contiguous())
+                v.index_copy_(0, und_indices, v_text.squeeze(0).transpose(0, 1).contiguous())
         else:
             q, k, v = self._project_qkv_flat_routed(
                 hidden_states,
@@ -759,13 +856,34 @@ class _SenseNovaAttention(nn.Module):
                 und=und,
                 packed_rope=packed_rope,
             )
-        out = self._attend_packed_visible(q, k, v, forward_stream=forward_stream, kv_view=kv_view)
+        ctx.record_component_elapsed("packed_decoder_qkv", qkv_start)
+        attn_start = ctx.component_timer_start()
+        out = self._attend_packed_visible(
+            q,
+            k,
+            v,
+            forward_stream=forward_stream,
+            kv_view=kv_view,
+        )
+        ctx.record_component_elapsed("packed_decoder_attention", attn_start)
         out = out.reshape(hidden_states.shape[0], -1).contiguous()
+        o_proj_start = ctx.component_timer_start()
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
-            return self.o_proj(out)
+            projected = self.o_proj(out)
+            ctx.record_component_elapsed("packed_decoder_o_proj", o_proj_start)
+            return projected
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
-            return self.o_proj_mot_gen(out)
-        return self._route_o_proj(
+            projected = self.o_proj_mot_gen(out)
+            ctx.record_component_elapsed("packed_decoder_o_proj", o_proj_start)
+            return projected
+        if dense_gen_route:
+            routed = self.o_proj_mot_gen(out)
+            if und_indices is None:
+                und_indices = und.nonzero(as_tuple=False).flatten()
+            routed.index_copy_(0, und_indices, self.o_proj(out.index_select(0, und_indices)))
+            ctx.record_component_elapsed("packed_decoder_o_proj", o_proj_start)
+            return routed
+        projected = self._route_o_proj(
             out,
             text_mask=und,
             gen_mask=gen,
@@ -773,6 +891,8 @@ class _SenseNovaAttention(nn.Module):
             exist_gen=exist_image_gen_tokens,
             out=out.new_empty((out.shape[0], self.config.hidden_size)),
         )
+        ctx.record_component_elapsed("packed_decoder_o_proj", o_proj_start)
+        return projected
 
     def _attend_paged_update(
         self,
@@ -1229,12 +1349,14 @@ class _SenseNovaDecoderLayer(nn.Module):
         *,
         gen: torch.Tensor,
         und: torch.Tensor,
+        und_indices: torch.Tensor | None = None,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         packed_rope: SenseNovaPackedRope | None = None,
+        dense_gen_route: bool = False,
     ) -> torch.Tensor:
         # gen/und masks and the exist flags are precomputed once by the model
         # and threaded down so each layer avoids per-layer device->host syncs.
@@ -1242,10 +1364,21 @@ class _SenseNovaDecoderLayer(nn.Module):
             raise ValueError("SenseNova packed layer expects hidden_states [N, C]")
 
         residual = hidden_states
+        ctx = get_forward_context()
+        norm_start = ctx.component_timer_start()
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             routed = self.input_layernorm(hidden_states)
         elif not exist_non_image_gen_tokens and exist_image_gen_tokens:
             routed = self.input_layernorm_mot_gen(hidden_states)
+        elif dense_gen_route:
+            routed = self.input_layernorm_mot_gen(hidden_states)
+            if und_indices is None:
+                und_indices = und.nonzero(as_tuple=False).flatten()
+            routed.index_copy_(
+                0,
+                und_indices,
+                self.input_layernorm(hidden_states.index_select(0, und_indices)),
+            )
         else:
             routed = route_by_modality(
                 hidden_states,
@@ -1257,7 +1390,9 @@ class _SenseNovaDecoderLayer(nn.Module):
                 transport=self._tower_transport,
                 coords=self._tower_coords,
             )
+        ctx.record_component_elapsed("packed_decoder_input_norm", norm_start)
 
+        attn_block_start = ctx.component_timer_start()
         attn_out = self.self_attn.forward_packed_visible(
             routed,
             gen,
@@ -1265,17 +1400,28 @@ class _SenseNovaDecoderLayer(nn.Module):
             exist_non_image_gen_tokens=exist_non_image_gen_tokens,
             exist_image_gen_tokens=exist_image_gen_tokens,
             und=und,
+            und_indices=und_indices,
             forward_stream=forward_stream,
             kv_view=kv_view,
             packed_rope=packed_rope,
+            dense_gen_route=dense_gen_route,
         )
+        ctx.record_component_elapsed("packed_decoder_attn_block", attn_block_start)
         hidden_states = residual + attn_out
         residual = hidden_states
 
+        mlp_start = ctx.component_timer_start()
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
         elif not exist_non_image_gen_tokens and exist_image_gen_tokens:
             mlp_out = self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states))
+        elif dense_gen_route:
+            mlp_out = self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states))
+            if und_indices is None:
+                und_indices = und.nonzero(as_tuple=False).flatten()
+            text_hidden = hidden_states.index_select(0, und_indices)
+            text_mlp = self.mlp(self.post_attention_layernorm(text_hidden))
+            mlp_out.index_copy_(0, und_indices, text_mlp)
         else:
 
             def _mlp(modality: Modality) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -1292,6 +1438,7 @@ class _SenseNovaDecoderLayer(nn.Module):
                 transport=self._tower_transport,
                 coords=self._tower_coords,
             )
+        ctx.record_component_elapsed("packed_decoder_mlp", mlp_start)
         return residual + mlp_out
 
 
@@ -1560,9 +1707,22 @@ class _SenseNovaDecoderModel(nn.Module):
             raise ValueError("SenseNova packed model expects indexes [3, N]")
         gen = image_gen_indicators.to(dtype=torch.bool)
         und = ~gen
-        exist_non_image_gen_tokens = bool(und.any())
-        exist_image_gen_tokens = bool(gen.any())
+        und_indices = forward_stream.und_indices
+        exist_non_image_gen_tokens = any(
+            seg.modality == "und" and int(seg.q_len) > 0 for seg in forward_stream.segments
+        )
+        exist_image_gen_tokens = any(
+            seg.modality == "gen" and int(seg.q_len) > 0 for seg in forward_stream.segments
+        )
         packed_rope = self.layers[0].self_attn._packed_rope(indexes) if self.layers else None
+        und_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "und")
+        gen_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "gen")
+        dense_gen_route = (
+            exist_non_image_gen_tokens
+            and exist_image_gen_tokens
+            and gen_tokens >= und_tokens
+            and self._tower_transport is None
+        )
 
         hidden_states = inputs_embeds
         # The und/gen split is constant for the whole packed batch, so compute
@@ -1574,17 +1734,29 @@ class _SenseNovaDecoderModel(nn.Module):
                 hidden_states,
                 gen=gen,
                 und=und,
+                und_indices=und_indices,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
                 forward_stream=forward_stream,
                 kv_view=kv_view,
                 packed_rope=packed_rope,
+                dense_gen_route=dense_gen_route,
             )
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             return self.norm(hidden_states)
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
             return self.norm_mot_gen(hidden_states)
+        if dense_gen_route:
+            out = self.norm_mot_gen(hidden_states)
+            if und_indices is None:
+                und_indices = und.nonzero(as_tuple=False).flatten()
+            out.index_copy_(
+                0,
+                und_indices,
+                self.norm(hidden_states.index_select(0, und_indices)),
+            )
+            return out
         return route_by_modality(
             hidden_states,
             {
@@ -2140,7 +2312,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                     rope.to(target)
 
     def _scratch_block_counts(self, gen_snapshot_kv_capacity: int | None) -> tuple[int, int | None]:
-        image_scratch_blocks = max(1, ceil_div(self.max_latent_size, self.block_size))
+        image_scratch_blocks = max(
+            1,
+            ceil_div(self._active_latent_capacity_tokens(self.kv_token_capacity), self.block_size),
+        )
         scratch_blocks = max(8, self.num_blocks + image_scratch_blocks * 4)
         gen_blocks: int | None = None
         if self._tower_coords is not None:
@@ -2148,6 +2323,15 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             if gen_snapshot_kv_capacity is not None:
                 gen_blocks = max(1, int(gen_snapshot_kv_capacity) // self.block_size)
         return scratch_blocks, gen_blocks
+
+    def _active_latent_capacity_tokens(self, kv_token_capacity: int | None) -> int:
+        """Total concurrently resident image-latent tokens this worker advertises."""
+        per_image = int(self.max_latent_size)
+        if per_image <= 0:
+            return 0
+        if kv_token_capacity is None:
+            return per_image
+        return max(per_image, int(kv_token_capacity))
 
     @classmethod
     def native_load_spec(cls) -> NativeLoadSpec:
@@ -2253,19 +2437,24 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     ) -> CapsDescriptor:
         block = int(block_size or self.block_size)
         token_capacity = kv_token_capacity if kv_token_capacity is not None else self.kv_token_capacity
-        num_blocks = max(1, int(token_capacity) // block) if token_capacity else int(self.num_blocks)
+        physical_blocks = max(1, int(token_capacity) // block) if token_capacity else int(self.num_blocks)
+        # Keep one worker-local KV block out of the scheduler's advertised pool.
+        # The interleaved decode CUDA-graph adapter uses it as a harmless padding
+        # target when replaying a larger graph bucket for a smaller live batch.
+        num_blocks = max(1, physical_blocks - 1)
         # Report scratch pool capacity in tokens; use a large sentinel when no pool exists.
         scratch_capacity_tokens = (
             int(self._scratch_blocks) * block if self._scratch_blocks > 0 else 1 << 24
         )
+        max_image_tokens = int(self.max_latent_size)
         return CapsDescriptor(
             block_size=block,
             num_blocks=num_blocks,
             num_layers=self.num_layers,
             scratch_capacity_tokens=scratch_capacity_tokens,
-            max_latent_size=int(self.max_latent_size),
+            max_latent_size=int(self._active_latent_capacity_tokens(token_capacity)),
             latent_downsample=int(self.latent_downsample),
-            max_vae_grid_tokens=int(self.max_latent_size),
+            max_vae_grid_tokens=max_image_tokens,
             max_vit_grid_tokens=MAX_VIT_GRID_TOKENS,
             commit_marker_tokens=COMMIT_MARKER_TOKENS,
             gen_rope_advance=GEN_ROPE_ADVANCE,
@@ -2550,6 +2739,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             if cache is None or cache_id in seen or cache_id in live_cache_ids:
                 continue
             seen.add(cache_id)
+            self._release_forward_staging_for_cache(cache)
             self.residency.release_scratch_cache(cache)
 
     def _text_driver(self) -> InterleavedTextCacheDriver:
@@ -2734,6 +2924,14 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self.model.language_model.model.layers[0].self_attn
         )
 
+    def interleaved_decode_graph_padding_block_id(self, pool: Any) -> int | None:
+        if pool is not self.kv_pool:
+            return None
+        num_blocks = int(getattr(pool, "num_blocks", 0) or 0)
+        if num_blocks <= 1:
+            return None
+        return num_blocks - 1
+
     def _text_indexes(self, start: int, seq_len: int, *, device: torch.device | str | None = None) -> torch.Tensor:
         target = device if device is not None else self.device
         return self._text_driver().text_indexes(int(start), int(seq_len)).to(target)
@@ -2830,9 +3028,21 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self.residency.encoder.pop(int(handle))
 
     def on_new_request(self, req_id: int, state: RunnerRequestState) -> None:
-        self.runner_states[int(req_id)] = state
+        req_id = int(req_id)
+        self.runner_states[req_id] = state
+        existing = self.reqs.get(req_id)
+        if isinstance(existing, InterleavedImageRequestState):
+            existing.sampling = dict(state.sampling or existing.sampling or {})
+            existing.image = dict(state.image or existing.image or {})
+            existing.neg_token_ids = list(state.neg_token_ids or existing.neg_token_ids or [])
+            if not existing.cond.block_ids and state.block_ids:
+                existing.cond.block_ids = list(state.block_ids)
+                set_blocks = getattr(existing.cond.past, "set_blocks", None)
+                if callable(set_blocks):
+                    set_blocks(existing.cond.block_ids)
+            return
         image_state = self._new_interleaved_image_state(state)
-        self.reqs[int(req_id)] = image_state
+        self.reqs[req_id] = image_state
 
     def _new_interleaved_image_state(self, state: RunnerRequestState) -> InterleavedImageRequestState:
         image_state = InterleavedImageRequestState(
@@ -2864,6 +3074,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         st = self.reqs.pop(req_id, None)
         if st is not None:
             self._release_image_state_caches(st.image_state)
+            self._release_forward_staging_for_cache(st.cond.past)
+            self._release_forward_staging_for_cache(st.tu.past)
+            self._release_forward_staging_for_cache(st.iu.past)
             self.residency.release_scratch_cache(st.tu.past)
             self.residency.release_scratch_cache(st.iu.past)
 
@@ -2924,13 +3137,92 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             target_pool,
             label="forward scratch KV pool",
         )
-        return stage_paged_text_cache_prefix(
-            source,
-            target_pool=target_pool,
-            allocate_blocks=allocator,
+        staged_by_pool = getattr(source, "_uniserve_forward_staging", None)
+        if not isinstance(staged_by_pool, dict):
+            staged_by_pool = {}
+            setattr(source, "_uniserve_forward_staging", staged_by_pool)
+        key = id(target_pool)
+        staged = staged_by_pool.get(key)
+        source_len = int(source.length)
+        source_prefix = self._forward_staging_source_prefix(source, source_len)
+        if (
+            staged is not None
+            and getattr(staged, "pool", None) is target_pool
+            and int(getattr(staged, "length", -1)) <= source_len
+            and getattr(staged, "_uniserve_forward_staging_source_prefix", ()) ==
+            self._forward_staging_source_prefix(source, int(getattr(staged, "length", 0)))
+        ):
+            staged.ensure_capacity(int(end_len))
+            copied_len = int(staged.length)
+            if copied_len < source_len:
+                copy_paged_text_cache_span(
+                    source,
+                    staged,
+                    start=copied_len,
+                    length=source_len - copied_len,
+                    num_layers=self.num_layers,
+                    missing_message="cannot extend mixed forward staging without a paged source cache",
+                )
+                staged.length = source_len
+            setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
+            return staged
+        if staged is not None:
+            self.residency.release_scratch_cache(staged)
+        staged = PagedTextCache(
+            target_pool,
+            [],
             num_layers=self.num_layers,
-            end_len=int(end_len),
+            length=0,
+            allocate_blocks=allocator,
         )
+        staged.ensure_capacity(int(end_len))
+        copy_paged_text_cache_span(
+            source,
+            staged,
+            start=0,
+            length=source_len,
+            num_layers=self.num_layers,
+            missing_message="cannot stage mixed forward prefix without a paged source cache",
+        )
+        staged.length = source_len
+        setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
+        staged_by_pool[key] = staged
+        return staged
+
+    def _mark_forward_staging_advanced(
+        self,
+        staged: PagedTextCache,
+        source: PagedTextCache,
+        new_len: int,
+    ) -> None:
+        staged.length = int(new_len)
+        setattr(
+            staged,
+            "_uniserve_forward_staging_source_prefix",
+            self._forward_staging_source_prefix(source, int(new_len)),
+        )
+
+    def _release_forward_staging_for_cache(self, cache: Any) -> None:
+        staged_by_pool = getattr(cache, "_uniserve_forward_staging", None)
+        if not isinstance(staged_by_pool, dict):
+            return
+        seen: set[int] = set()
+        for staged in staged_by_pool.values():
+            staged_id = id(staged)
+            if staged_id in seen:
+                continue
+            seen.add(staged_id)
+            self.residency.release_scratch_cache(staged)
+        staged_by_pool.clear()
+
+    @staticmethod
+    def _forward_staging_source_prefix(cache: PagedTextCache, length: int) -> tuple[int, ...]:
+        length = int(length)
+        if length <= 0:
+            return ()
+        block_size = int(getattr(cache.pool, "block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE)
+        block_count = ceil_div(length, block_size)
+        return tuple(int(block_id) for block_id in list(cache.block_ids)[:block_count])
 
     def _forward_target_pool(self, denoise_steps: list[tuple[int, TextImageDenoiseStep]]) -> PagedKVPool | None:
         target_pool = None
@@ -3027,12 +3319,15 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def run_forward(self, batch: UniForwardBatch, *, request_states: Any, group: Any) -> list[Any]:
         results: list[Any] = [None] * len(batch.ops)
         denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
+        commit_rows: list[tuple[int, int, dict[str, Any]]] = []
         for row_index, op in enumerate(batch.ops):
             mode = batch.op_modes[row_index]
             req_id = int(op["req_id"])
             if mode is ForwardMode.DENOISE:
                 step = self.prepare_denoise(request_states.get(req_id), dict(op))
                 denoise_steps.append((row_index, step))
+            elif mode is ForwardMode.COMMIT:
+                commit_rows.append((row_index, req_id, dict(op)))
             elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
                 raise RuntimeError(f"unsupported mixed SenseNova mode {mode.value!r}")
         # Packed-mixed denoise runs outside the residual-reuse policy's view:
@@ -3045,10 +3340,115 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             if residual_state is not None:
                 residual_state.invalidate()
         if run_packed_mixed_forward(self, batch, request_states, denoise_steps, results):
+            self._complete_packed_decode_bursts(batch, request_states, results)
+            self._complete_packed_denoise_bursts(batch, request_states, results)
+            for row_index, req_id, op in commit_rows:
+                state = request_states.get(req_id)
+                results[row_index] = self.decode_image(
+                    getattr(state, "latent", None),
+                    req_id=req_id,
+                    state=state,
+                    op=op,
+                )
             return results
         raise capability_mismatch(
             "admitted mixed SenseNova batch could not be packed; split-mode fallback is disabled"
         )
+
+    def _complete_packed_decode_bursts(
+        self,
+        batch: UniForwardBatch,
+        request_states: Any,
+        results: list[Any],
+    ) -> None:
+        active: list[dict[str, Any]] = []
+        for row_index, op in enumerate(batch.ops):
+            if batch.op_modes[row_index] is not ForwardMode.DECODE:
+                continue
+            requested = int(op.get("decode_token_count") or 1)
+            if requested <= 1:
+                continue
+            first_token = _sampled_token_id(results[row_index])
+            tokens = [first_token]
+            stop_ids = {int(token) for token in (op.get("decode_stop_token_ids") or [])}
+            if first_token in stop_ids:
+                results[row_index] = _decode_burst_result(op, tokens)
+                continue
+            pos = op.get("pos_range") or [0, 0]
+            if not isinstance(pos, Sequence) or len(pos) != 2:
+                raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
+            active.append(
+                {
+                    "row_index": row_index,
+                    "op": dict(op),
+                    "tokens": tokens,
+                    "remaining": requested - 1,
+                    "next_pos": int(pos[1]),
+                    "stop_ids": stop_ids,
+                }
+            )
+
+        while active:
+            iter_ops: list[dict[str, Any]] = []
+            iter_items: list[dict[str, Any]] = []
+            for item in active:
+                op = dict(item["op"])
+                op["new_block_ids"] = []
+                op["token_ids"] = [int(item["tokens"][-1])]
+                op["pos_range"] = [int(item["next_pos"]), int(item["next_pos"]) + 1]
+                op["decode_token_count"] = None
+                op["decode_stop_token_ids"] = []
+                iter_ops.append(op)
+                iter_items.append(item)
+
+            followup_batch = UniForwardBatch.from_ops(iter_ops)
+            followup_results: list[Any] = [None] * len(iter_ops)
+            if not run_packed_mixed_forward(self, followup_batch, request_states, [], followup_results):
+                raise capability_mismatch("packed decode burst follow-up could not run")
+
+            next_active: list[dict[str, Any]] = []
+            for item, output in zip(iter_items, followup_results, strict=True):
+                token = _sampled_token_id(output)
+                item["tokens"].append(token)
+                item["remaining"] = int(item["remaining"]) - 1
+                item["next_pos"] = int(item["next_pos"]) + 1
+                if token not in item["stop_ids"] and int(item["remaining"]) > 0:
+                    next_active.append(item)
+                else:
+                    results[int(item["row_index"])] = _decode_burst_result(
+                        item["op"],
+                        item["tokens"],
+                    )
+            active = next_active
+
+    def _complete_packed_denoise_bursts(
+        self,
+        batch: UniForwardBatch,
+        request_states: Any,
+        results: list[Any],
+    ) -> None:
+        items: list[tuple[int, Any, dict[str, Any]]] = []
+        row_indexes: list[int] = []
+        for row_index, op in enumerate(batch.ops):
+            if batch.op_modes[row_index] is not ForwardMode.DENOISE:
+                continue
+            requested = int(op.get("denoise_step_count") or 1)
+            if requested <= 1 or _output_bool(results[row_index], "denoise_done"):
+                continue
+            remaining = requested - 1
+            if remaining <= 0:
+                continue
+            req_id = int(op["req_id"])
+            followup = dict(op)
+            followup["timestep_idx"] = _output_int(results[row_index], "num_steps_done")
+            followup["denoise_step_count"] = remaining
+            row_indexes.append(row_index)
+            items.append((req_id, request_states.get(req_id), followup))
+        if not items:
+            return
+        outputs = DenoiseDriver().step_many(items, self)
+        for row_index, output in zip(row_indexes, outputs, strict=True):
+            results[row_index] = output
 
     def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
         self.apply_denoise_update(ctx, latent)

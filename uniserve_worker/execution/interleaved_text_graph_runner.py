@@ -54,6 +54,7 @@ from .decode_cuda_graph import (
     TextDecodeGraphState,
     resolve_paged_decode_graph_prepare,
 )
+from .interleaved_text_stepper import hydrate_cached_prefix_from_op
 
 if TYPE_CHECKING:
     from .interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
@@ -61,6 +62,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["InterleavedTextDecodeGraphRunner"]
+
+
+def _padding_block_id(owner: Any, pool: Any) -> int | None:
+    hook = getattr(owner, "interleaved_decode_graph_padding_block_id", None)
+    if not callable(hook):
+        return None
+    raw = hook(pool)
+    if raw is None:
+        return None
+    block_id = int(raw)
+    num_blocks = int(getattr(pool, "num_blocks", 0) or 0)
+    if block_id < 0 or block_id >= num_blocks:
+        raise invalid_descriptor("reserved interleaved decode graph padding block is out of range")
+    return block_id
 
 
 class _InterleavedDecodeGraphPast:
@@ -168,54 +183,47 @@ class InterleavedTextDecodeGraphRunner:
             return None
         rows, prepare_backend = prep
         batch = len(rows)
-        # Exact-batch only. Paged decode writes current K/V for every graph row,
-        # so replaying a larger captured bucket for a smaller batch would write a
-        # padded row into physical block 0 (no reserved padding block exists).
-        # Only run when the shared runner would use an exact-size graph; otherwise
-        # fall back to eager. The single-seq interleaved workload is always batch
-        # 1, so this never blocks it — it forecloses a latent hazard for batched
-        # interleaved models until the shared runner grows a reserved padding row.
-        if self._decode.resolve_bucket(batch) != batch:
-            return None
+        graph_batch = self._decode.resolve_bucket(batch)
         device = rows[0].past_cache.pool.k.device
         pool = rows[0].past_cache.pool
+        graph_rows = self._pad_rows(driver, rows, graph_batch, pool)
 
         slot = self._stager.next_slot()
         input_ids = self._staged_column(
-            [r.token_id if r.token_id is not None else 0 for r in rows],
+            [r.token_id if r.token_id is not None else 0 for r in graph_rows],
             device=device,
             slot=slot,
             name="interleaved_decode_input_ids",
         )
-        for row_idx, row in enumerate(rows):
+        for row_idx, row in enumerate(graph_rows):
             if row.token_tensor is not None:
                 input_ids[row_idx, 0:1].copy_(row.token_tensor.reshape(1))
         positions = self._staged_column(
-            [r.pos for r in rows],
+            [r.pos for r in graph_rows],
             device=device,
             slot=slot,
             name="interleaved_decode_positions",
         )
         source_cache = BatchedPagedRequestCache(
             pool,
-            [r.block_ids for r in rows],
-            [r.base_len for r in rows],
+            [r.block_ids for r in graph_rows],
+            [r.base_len for r in graph_rows],
         )
         source_metadata = TextAttentionMetadata(
             cache=source_cache,
             block_table=source_cache.block_table(device=device, stager=slot),
             cache_seqlens=source_cache.cache_seqlens(device=device, stager=slot),
-            cache_seqlens_cpu=tuple(r.base_len for r in rows),
-            query_lens=torch.ones(batch, dtype=torch.int32, device=device),
-            query_lens_cpu=tuple(1 for _ in rows),
-            kv_seqlens_cpu=tuple(r.base_len + 1 for r in rows),
+            cache_seqlens_cpu=tuple(r.base_len for r in graph_rows),
+            query_lens=torch.ones(len(graph_rows), dtype=torch.int32, device=device),
+            query_lens_cpu=tuple(1 for _ in graph_rows),
+            kv_seqlens_cpu=tuple(r.base_len + 1 for r in graph_rows),
             mode=ForwardMode.DECODE,
         )
 
         logits = self._decode.maybe_run(
             kv_pool=pool,
             num_blocks=int(pool.num_blocks),
-            batch_size=batch,
+            batch_size=len(graph_rows),
             input_ids=input_ids,
             positions=positions,
             attention_metadata=source_metadata,
@@ -232,6 +240,43 @@ class InterleavedTextDecodeGraphRunner:
                 sorted(self._decode.states),
             )
         return self._commit(rows, logits)
+
+    def _pad_rows(
+        self,
+        driver: "InterleavedTextCacheDriver",
+        rows: list[_Row],
+        graph_batch: int,
+        pool: Any,
+    ) -> list[_Row]:
+        graph_batch = int(graph_batch)
+        if graph_batch <= len(rows):
+            return rows
+        padding_block_id = _padding_block_id(driver.owner, pool)
+        if padding_block_id is None:
+            raise invalid_descriptor(
+                "interleaved decode graph padded replay requires a reserved KV padding block"
+            )
+        block_size = int(getattr(pool, "block_size", 0) or 0)
+        needed = graph_batch - len(rows)
+        if block_size <= 0 or needed > block_size:
+            raise invalid_descriptor(
+                "interleaved decode graph padding exceeds the reserved KV padding block"
+            )
+        base = rows[0]
+        padded = list(rows)
+        for offset in range(needed):
+            padded.append(
+                _Row(
+                    text_cache=base.text_cache,
+                    past_cache=base.past_cache,
+                    token_id=0,
+                    pos=offset,
+                    base_len=offset,
+                    block_ids=[padding_block_id],
+                    token_tensor=None,
+                )
+            )
+        return padded
 
     @staticmethod
     def _staged_column(
@@ -297,6 +342,7 @@ class InterleavedTextDecodeGraphRunner:
         # Validation phase: prove every row is a one-token host-KV decode before
         # mutating any cache block ids or lengths.
         validated: list[tuple[Mapping[str, Any], "TextCache", int | None, torch.Tensor | None]] = []
+        padding_block_id = _padding_block_id(owner, pool)
         for op in ops:
             tokens = list(op.get("token_ids") or [])
             if len(tokens) != 1:
@@ -338,8 +384,14 @@ class InterleavedTextDecodeGraphRunner:
             driver.ensure_host_cache(cache)
             if cache.past is None:
                 return None
+            hydrate_cached_prefix_from_op(cache, op)
             base_len = int(cache.past.length)
             cache.past.ensure_capacity(base_len + 1)
+            block_ids = list(cache.past.block_ids)
+            if padding_block_id is not None and padding_block_id in block_ids:
+                raise invalid_descriptor(
+                    "scheduler assigned the reserved interleaved decode graph padding block"
+                )
             rows.append(
                 _Row(
                     text_cache=cache,
@@ -347,7 +399,7 @@ class InterleavedTextDecodeGraphRunner:
                     token_id=token_id,
                     pos=int(cache.t_index) + 1,
                     base_len=base_len,
-                    block_ids=list(cache.past.block_ids),
+                    block_ids=block_ids,
                     token_tensor=token_tensor,
                 )
             )

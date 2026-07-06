@@ -210,14 +210,21 @@ class TextDriver:
                 )
         if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
             with profile_range("uniserve.text.decode_burst"):
-                return [
-                    self._decode_burst(
-                        dict(ops[0]),
-                        request_states,
-                        model,
-                        defer_cpu_results=defer_cpu_results,
-                    )
-                ]
+                if len(ops) == 1:
+                    return [
+                        self._decode_burst(
+                            dict(ops[0]),
+                            request_states,
+                            model,
+                            defer_cpu_results=defer_cpu_results,
+                        )
+                    ]
+                return self._decode_burst_many(
+                    ops,
+                    request_states,
+                    model,
+                    defer_cpu_results=defer_cpu_results,
+                )
         return self._step_once(
             text,
             ops,
@@ -339,6 +346,103 @@ class TextDriver:
         result["sampled_token_id"] = tokens[-1]
         result["sampled_token_ids"] = tokens
         return result
+
+    def _decode_burst_many(
+        self,
+        first_ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        defer_cpu_results: bool = False,
+    ) -> list[dict[str, Any]]:
+        from ..contracts.batches import UniForwardBatch
+
+        states: list[dict[str, Any]] = []
+        for op in first_ops:
+            op_dict = dict(op)
+            count = _positive_int(op_dict.get("decode_token_count") or 1, "decode_token_count")
+            first = dict(op_dict)
+            first["decode_token_count"] = 1
+            first["decode_stop_token_ids"] = []
+            states.append(
+                {
+                    "op": op_dict,
+                    "last_op": first,
+                    "requested": count,
+                    "launched": 0,
+                    "stop_ids": set(_int_list(op_dict.get("decode_stop_token_ids") or [])),
+                    "tokens": [],
+                    "last": None,
+                    "pending": None,
+                    "done": False,
+                }
+            )
+
+        while any(not state["done"] for state in states):
+            iter_ops: list[dict[str, Any]] = []
+            iter_indexes: list[int] = []
+            for index, state in enumerate(states):
+                if state["done"] or int(state["launched"]) >= int(state["requested"]):
+                    continue
+                if int(state["launched"]) == 0:
+                    op = dict(state["last_op"])
+                else:
+                    pos = _next_decode_position(state["last_op"])
+                    op = dict(state["op"])
+                    op["new_block_ids"] = []
+                    op["token_ids"] = [_RELAY_PLACEHOLDER_TOKEN_ID]
+                    op["token_source"] = "last_sampled"
+                    op["pos_range"] = [pos, pos + 1]
+                    op["decode_token_count"] = 1
+                    op["decode_stop_token_ids"] = []
+                state["last_op"] = op
+                iter_indexes.append(index)
+                iter_ops.append(op)
+            if not iter_ops:
+                break
+            iter_text = UniForwardBatch.from_ops(iter_ops).as_text()
+            iter_outputs = self._step_once(
+                iter_text,
+                iter_ops,
+                request_states,
+                model,
+                defer_cpu_results=True,
+                defer_sampling=False,
+                tensor_store=None,
+            )
+            for index, output in zip(iter_indexes, iter_outputs, strict=True):
+                state = states[index]
+                previous = state["pending"]
+                state["pending"] = output
+                state["launched"] = int(state["launched"]) + 1
+                if previous is None:
+                    continue
+                result = _seq_result_dict(previous)
+                token = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
+                state["tokens"].append(token)
+                state["last"] = result
+                if token in state["stop_ids"]:
+                    state["pending"] = None
+                    state["done"] = True
+
+        out: list[dict[str, Any]] = []
+        for state in states:
+            pending = state["pending"]
+            if pending is not None:
+                result = _seq_result_dict(pending)
+                token = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
+                state["tokens"].append(token)
+                state["last"] = result
+                state["pending"] = None
+            tokens = [int(token) for token in state["tokens"]]
+            last = dict(state["last"] or {})
+            if not tokens:
+                raise invalid_descriptor("decode burst did not produce a sampled token")
+            last["sampled_token_id"] = tokens[-1]
+            if int(state["requested"]) > 1:
+                last["sampled_token_ids"] = tokens
+            out.append(last)
+        return out
 
     # ---- forward ---------------------------------------------------------
 
@@ -809,12 +913,15 @@ def _coalesce_relay_rows(rows: list[torch.Tensor]) -> torch.Tensor:
 
 
 def _can_decode_burst(text: "TextBatch", ops: list[Mapping[str, Any]], *, defer_sampling: bool) -> bool:
-    if defer_sampling or text.mode != ForwardMode.DECODE or len(ops) != 1:
+    if defer_sampling or text.mode != ForwardMode.DECODE:
         return False
     if any(text.spec_token_ids):
         return False
     try:
-        return _positive_int(ops[0].get("decode_token_count") or 1, "decode_token_count") > 1
+        return any(
+            _positive_int(op.get("decode_token_count") or 1, "decode_token_count") > 1
+            for op in ops
+        )
     except Exception:
         raise
 

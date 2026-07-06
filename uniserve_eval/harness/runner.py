@@ -65,6 +65,7 @@ class BenchmarkRunner:
                 "started_at": time.time(),
             },
         )
+        (self.writer.output_dir / "requests.jsonl").write_text("", encoding="utf-8")
 
         # Deterministic Poisson arrivals (matches sglang's np.random.seed(seed)).
         np.random.seed(self.spec.seed)

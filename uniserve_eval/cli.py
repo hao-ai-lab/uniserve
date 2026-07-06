@@ -12,11 +12,10 @@ Concepts:
 
 Examples:
   uniserve-eval list
-  uniserve-eval launch sensenova-u1-single
-  uniserve-eval verify sensenova-travel-interleave-4x
-  uniserve-eval perf bagel-i2t-perf
-  uniserve-eval compare sensenova-t2i-perf sensenova-t2i-perf-omni
-  uniserve-eval run bagel-verify --manage-servers
+  uniserve-eval launch gate/server/sensenova
+  uniserve-eval verify gate/sensenova/interleave-travel
+  uniserve-eval perf perf/tripwire/bagel/i2t
+  uniserve-eval run gate/all --manage-servers
 """
 
 from __future__ import annotations
@@ -116,6 +115,8 @@ def list_items(args: argparse.Namespace) -> None:
         if section == "servers":
             for name, spec in sorted(config.get("servers", {}).items()):
                 resolved = server_spec(config, name)
+                if resolved.get("abstract"):
+                    continue
                 line = f"{name}\t{resolved.get('served_model_name', '')}\t{resolved.get('host', '')}:{resolved.get('port', '')}"
                 if resolved.get("description"):
                     line += f"\n\t{resolved['description']}"

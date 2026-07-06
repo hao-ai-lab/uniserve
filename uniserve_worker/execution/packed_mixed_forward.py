@@ -1,21 +1,42 @@
 """Packed mixed text/denoise forward driver."""
 from __future__ import annotations
 
+import json
+import logging
+import time
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import torch
 
+from ..backends.paged_kv_math import paged_kv_write
 from ..contracts.batches import UniForwardBatch
+from ..contracts.forward_context import get_forward_context, use_forward_context
 from ..contracts.forward_mode import ForwardMode
 from ..contracts.outputs import TextTokenOutput
+from ..foundation.env import env_flag
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..nn import Sampler
+from ..nn.sampler import apply_sampling_batched_with_device_tokens
+from ..runtime.forward_batch_builder import state_block_ids_for_op
 from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from .denoise_driver import TextImageDenoiseStep, combine_text_image_velocity, text_image_branches
-from .forward_stream import ForwardPagedKVSegment, ForwardPagedKVView, ForwardStreamBuilder
+from .forward_stream import (
+    ForwardPagedKVSegment,
+    ForwardPagedKVView,
+    ForwardStream,
+    ForwardStreamBuilder,
+)
+from .interleaved_text_stepper import hydrate_cached_prefix_from_op
 
 __all__ = ["run_packed_mixed_forward"]
+
+logger = logging.getLogger(__name__)
+
+_PACKED_MIXED_TIMING = env_flag("UNISERVE_PACKED_MIXED_TIMING")
+_PACKED_MIXED_TIMING_SYNC = env_flag("UNISERVE_PACKED_MIXED_TIMING_SYNC")
+_PACKED_MIXED_GRAPH = env_flag("UNISERVE_PACKED_MIXED_GRAPH")
+_PACKED_MIXED_GRAPH_RUNNER_ATTR = "_packed_mixed_decoder_graph_runner"
 
 
 def run_packed_mixed_forward(
@@ -25,7 +46,7 @@ def run_packed_mixed_forward(
     denoise_steps: list[tuple[int, TextImageDenoiseStep]],
     results: list[Any],
 ) -> bool:
-    if owner.model is None or not denoise_steps:
+    if owner.model is None:
         return False
     builder = ForwardStreamBuilder()
     kv_segments: list[ForwardPagedKVSegment] = []
@@ -34,13 +55,26 @@ def run_packed_mixed_forward(
     text_result_slots: list[tuple[int, int, int, PagedTextCache, PagedTextCache, int, int]] = []
     denoise_result_slots: list[tuple[int, TextImageDenoiseStep, int, int]] = []
     first_pool = owner._forward_target_pool(denoise_steps)
-    staged_text_caches: list[PagedTextCache] = []
     device = torch.device(str(owner.device))
+    current_context: dict[str, Any] | None = None
+    ctx = get_forward_context()
+    timing = _PackedMixedTiming(device)
+    total_start = timing.start()
 
     try:
+        build_stats_start = ctx.component_timer_start()
+        build_start = timing.start()
         for row_index, op in enumerate(batch.ops):
             mode = batch.op_modes[row_index]
             req_id = int(op["req_id"])
+            current_context = {
+                "row_index": row_index,
+                "req_id": req_id,
+                "kind": op.get("kind"),
+                "mode": mode.value,
+                "pos_range": op.get("pos_range"),
+                "new_block_ids_len": len(op.get("new_block_ids") or []),
+            }
             if mode in {ForwardMode.EXTEND, ForwardMode.DECODE}:
                 state = owner.interleaved_image_state(req_id)
                 cache = state.cond
@@ -48,6 +82,31 @@ def run_packed_mixed_forward(
                 owner._ensure_host_cache(cache)
                 if cache.past is None:
                     return False
+                current_context.update(
+                    {
+                        "cache_blocks_before_sync": len(getattr(cache, "block_ids", []) or []),
+                        "past_blocks_before_sync": len(getattr(cache.past, "block_ids", []) or []),
+                        "past_length_before_sync": int(getattr(cache.past, "length", 0)),
+                        "cache_t_index_before_sync": int(getattr(cache, "t_index", -1)),
+                    }
+                )
+                _sync_host_cache_blocks(owner, cache, request_states, req_id, dict(op))
+                current_context.update(
+                    {
+                        "cache_blocks_after_sync": len(getattr(cache, "block_ids", []) or []),
+                        "past_blocks_after_sync": len(getattr(cache.past, "block_ids", []) or []),
+                        "past_length_after_sync": int(getattr(cache.past, "length", 0)),
+                        "cache_t_index_after_sync": int(getattr(cache, "t_index", -1)),
+                    }
+                )
+                hydrate_cached_prefix_from_op(cache, op)
+                current_context.update(
+                    {
+                        "past_blocks_after_hydrate": len(getattr(cache.past, "block_ids", []) or []),
+                        "past_length_after_hydrate": int(getattr(cache.past, "length", 0)),
+                        "cache_t_index_after_hydrate": int(getattr(cache, "t_index", -1)),
+                    }
+                )
                 tokens = list(op.get("token_ids") or [])
                 if not tokens:
                     tokens = [int(owner.eos_id or 0)]
@@ -63,7 +122,6 @@ def run_packed_mixed_forward(
                         target_pool=first_pool,
                         end_len=persistent_cache.length + q_len,
                     )
-                    staged_text_caches.append(staged_cache)
                 pool = staged_cache.pool
                 if not owner._same_kv_pool(pool, first_pool):
                     return False
@@ -126,6 +184,9 @@ def run_packed_mixed_forward(
                         return False
                     first_pool = pool if first_pool is None else first_pool
                     q_len = int(step.extra["image_embeds"].shape[1])
+                    ensure_capacity = getattr(cache, "ensure_capacity", None)
+                    if callable(ensure_capacity):
+                        ensure_capacity(int(cache.length) + q_len)
                     if indexes is None or tuple(indexes.shape) != (3, q_len):
                         return False
                     segment_start = _append_packed_chunk(
@@ -148,19 +209,105 @@ def run_packed_mixed_forward(
                         device=device,
                     )
                     denoise_result_slots.append((row_index, step, segment_start, q_len))
+            elif mode is ForwardMode.COMMIT:
+                # Commit rows are part of the same admitted mixed batch, but they do
+                # not contribute hidden-state segments. The model hook decodes them
+                # after this packed text/denoise forward has updated latent state.
+                pass
             else:
                 return False
+            current_context = None
+        timing.stop("build_ms", build_start)
+        ctx.record_component_elapsed("packed_mixed_build", build_stats_start)
         if first_pool is None or not embed_chunks:
             return False
+        stream_stats_start = ctx.component_timer_start()
+        stream_start = timing.start()
         forward_stream = builder.build(device=device)
         kv_view = ForwardPagedKVView(first_pool, kv_segments)
-        hidden = owner.packed_decoder_forward(
-            torch.cat(embed_chunks, dim=0),
-            image_gen_indicators=torch.cat(indicators, dim=0),
+        timing.stop("stream_build_ms", stream_start)
+        ctx.record_component_elapsed("packed_mixed_stream_build", stream_stats_start)
+        decoder_stats_start = ctx.component_timer_start()
+        decoder_start = timing.start()
+        decoder_component_start = timing.component_snapshot(ctx)
+        packed_embeds = torch.cat(embed_chunks, dim=0)
+        packed_indicators = torch.cat(indicators, dim=0)
+        hidden = _maybe_run_packed_mixed_decoder_graph(
+            owner,
+            packed_embeds,
+            image_gen_indicators=packed_indicators,
             indexes=forward_stream.indexes,
             forward_stream=forward_stream,
             kv_view=kv_view,
+            ctx=ctx,
         )
+        if hidden is None:
+            hidden = owner.packed_decoder_forward(
+                packed_embeds,
+                image_gen_indicators=packed_indicators,
+                indexes=forward_stream.indexes,
+                forward_stream=forward_stream,
+                kv_view=kv_view,
+            )
+            timing.values["decoder_graph"] = 0.0
+        else:
+            timing.values["decoder_graph"] = 1.0
+        timing.add_component_deltas(
+            ctx,
+            decoder_component_start,
+            (
+                "packed_decoder_input_norm",
+                "packed_decoder_qkv",
+                "packed_decoder_attention",
+                "packed_decoder_o_proj",
+                "packed_decoder_attn_block",
+                "packed_decoder_mlp",
+            ),
+        )
+        timing.stop("decoder_ms", decoder_start)
+        ctx.record_component_elapsed("packed_mixed_decoder", decoder_stats_start)
+        text_stats_start = ctx.component_timer_start()
+        text_start = timing.start()
+        text_logits_by_row: dict[int, torch.Tensor] = {}
+        text_outputs_by_row: dict[int, TextTokenOutput] = {}
+        text_device_tokens_by_row: dict[int, torch.Tensor] = {}
+        if text_result_slots:
+            text_hidden = torch.cat(
+                [hidden[start:start + q_len] for row_index, start, q_len, *_ in text_result_slots],
+                dim=0,
+            )
+            text_logits = owner.packed_text_logits(text_hidden.unsqueeze(0)).squeeze(0)
+            offset = 0
+            for row_index, _start, q_len, *_rest in text_result_slots:
+                next_offset = offset + int(q_len)
+                text_logits_by_row[int(row_index)] = text_logits[offset:next_offset].unsqueeze(0)
+                offset = next_offset
+            sample_logits: list[torch.Tensor] = []
+            sampling_params: list[dict[str, Any]] = []
+            for row_index, *_rest in text_result_slots:
+                req_id = int(batch.ops[row_index]["req_id"])
+                state = request_states.get(req_id)
+                sampling_params.append(dict(state.sampling or {}))
+                sample_logits.append(text_logits_by_row[int(row_index)].reshape(-1, text_logits.shape[-1])[-1])
+            sampled = apply_sampling_batched_with_device_tokens(
+                torch.stack(sample_logits, dim=0),
+                sampling_params,
+                [[] for _ in sample_logits],
+                [None for _ in sample_logits],
+                [None for _ in sample_logits],
+            )
+            for sample_index, (row_index, *_rest) in enumerate(text_result_slots):
+                req_id = int(batch.ops[row_index]["req_id"])
+                sample = sampled.samples[sample_index]
+                text_outputs_by_row[int(row_index)] = TextTokenOutput(
+                    req_id=req_id,
+                    sampled_token_id=int(sample.token_id),
+                    sampled_logprob=sample.logprob,
+                    top_logprobs=sample.top_logprobs,
+                )
+                text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
+                    sample_index:sample_index + 1
+                ]
         for (
             row_index,
             start,
@@ -172,8 +319,8 @@ def run_packed_mixed_forward(
         ) in text_result_slots:
             op = batch.ops[row_index]
             req_id = int(op["req_id"])
-            logits = owner.packed_text_logits(hidden[start:start + q_len].unsqueeze(0))
-            results[row_index] = _sample_text_logits(req_id, logits, request_states)
+            logits = text_logits_by_row[int(row_index)]
+            results[row_index] = text_outputs_by_row[int(row_index)]
             if staged_cache is not persistent_cache:
                 copy_paged_text_cache_span(
                     staged_cache,
@@ -188,14 +335,21 @@ def run_packed_mixed_forward(
             state.cond.t_index = position_id - 1
             state.cond.last_logits = logits
             state.cond.last_token_id = int(last_input_token)
+            new_len = int(base_len) + int(q_len)
+            persistent_cache.length = new_len
+            if staged_cache is not persistent_cache:
+                owner._mark_forward_staging_advanced(staged_cache, persistent_cache, new_len)
             _store_forward_sampled_token_relay(
                 request_states.get(req_id),
                 token_id=int(results[row_index].sampled_token_id),
                 device=device,
                 position_id=position_id,
+                token_tensor=text_device_tokens_by_row.get(int(row_index)),
             )
-            if state.cond.past is not None:
-                state.cond.past.length += q_len
+        timing.stop("text_post_ms", text_start)
+        ctx.record_component_elapsed("packed_mixed_text_post", text_stats_start)
+        velocity_stats_start = ctx.component_timer_start()
+        velocity_start = timing.start()
         branch_velocities: dict[int, dict[str, torch.Tensor]] = {}
         for row_index, step, start, q_len in denoise_result_slots:
             img = step.extra["img"]
@@ -208,6 +362,10 @@ def run_packed_mixed_forward(
                 image_size=(img.width, img.height),
             )
             branch_velocities[row_index][branch] = velocity
+        timing.stop("velocity_ms", velocity_start)
+        ctx.record_component_elapsed("packed_mixed_velocity", velocity_stats_start)
+        update_stats_start = ctx.component_timer_start()
+        update_start = timing.start()
         for result_index, step in denoise_steps:
             velocities = branch_velocities.get(result_index)
             if not velocities:
@@ -222,12 +380,492 @@ def run_packed_mixed_forward(
                 "denoise_done": step.step_index + 1 >= step.total_steps,
                 "num_steps_done": step.step_index + 1,
             }
+        timing.stop("denoise_update_ms", update_start)
+        ctx.record_component_elapsed("packed_mixed_denoise_update", update_stats_start)
+        timing.stop("total_ms", total_start)
+        timing.log(
+            batch=batch,
+            forward_stream=forward_stream,
+            embed_chunks=embed_chunks,
+            text_result_slots=text_result_slots,
+            denoise_result_slots=denoise_result_slots,
+            kv_segments=kv_segments,
+        )
         return True
     except Exception as exc:
-        raise capability_mismatch("packed mixed forward failed for an admitted mixed batch") from exc
-    finally:
-        for staged in staged_text_caches:
-            owner.residency.release_scratch_cache(staged)
+        if current_context:
+            logger.exception(
+                "packed mixed forward failed for an admitted mixed batch: context=%s",
+                current_context,
+            )
+        else:
+            logger.exception("packed mixed forward failed for an admitted mixed batch")
+        raise capability_mismatch(
+            "packed mixed forward failed for an admitted mixed batch",
+            details={"cause_type": type(exc).__name__, "cause": str(exc)[:500]},
+        ) from exc
+
+
+def _maybe_run_packed_mixed_decoder_graph(
+    owner: Any,
+    inputs_embeds: torch.Tensor,
+    *,
+    image_gen_indicators: torch.Tensor,
+    indexes: torch.Tensor,
+    forward_stream: ForwardStream,
+    kv_view: ForwardPagedKVView,
+    ctx: Any,
+) -> torch.Tensor | None:
+    if not _PACKED_MIXED_GRAPH:
+        return None
+    if not torch.cuda.is_available() or inputs_embeds.device.type != "cuda":
+        return None
+    if not bool(getattr(forward_stream, "fully_visible", False)):
+        return None
+    has_und = any(seg.modality == "und" for seg in forward_stream.segments)
+    has_gen = any(seg.modality == "gen" for seg in forward_stream.segments)
+    if not (has_und and has_gen):
+        return None
+    if any(not bool(seg.write_kv) for seg in kv_view.segments):
+        return None
+    runner = getattr(owner, _PACKED_MIXED_GRAPH_RUNNER_ATTR, None)
+    if runner is None:
+        runner = _PackedMixedDecoderGraphRunner()
+        setattr(owner, _PACKED_MIXED_GRAPH_RUNNER_ATTR, runner)
+    return runner.maybe_run(
+        owner,
+        inputs_embeds,
+        image_gen_indicators=image_gen_indicators,
+        indexes=indexes,
+        forward_stream=forward_stream,
+        kv_view=kv_view,
+        ctx=ctx,
+    )
+
+
+@dataclass
+class _PackedMixedDecoderGraphState:
+    key: tuple[Any, ...]
+    graph: torch.cuda.CUDAGraph
+    input_embeds: torch.Tensor
+    image_gen_indicators: torch.Tensor
+    indexes: torch.Tensor
+    forward_stream: ForwardStream
+    kv_view: "_GraphForwardPagedKVView"
+    hidden: torch.Tensor | None = None
+
+    def copy_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        kv_view: ForwardPagedKVView,
+    ) -> bool:
+        if tuple(inputs_embeds.shape) != tuple(self.input_embeds.shape):
+            return False
+        if tuple(indexes.shape) != tuple(self.indexes.shape):
+            return False
+        self.input_embeds.copy_(inputs_embeds, non_blocking=True)
+        self.image_gen_indicators.copy_(image_gen_indicators, non_blocking=True)
+        self.indexes.copy_(indexes, non_blocking=True)
+        return self.kv_view.copy_from(kv_view)
+
+
+class _GraphForwardPagedKVView:
+    def __init__(
+        self,
+        source: ForwardPagedKVView,
+        *,
+        device: torch.device,
+    ) -> None:
+        self.pool = source.pool
+        self.block_size = int(source.pool.block_size)
+        self.q_lens = tuple(int(seg.q_len) for seg in source.segments)
+        self.block_cols = tuple(len(seg.block_ids) for seg in source.segments)
+        self.write_flags = tuple(bool(seg.write_kv) for seg in source.segments)
+        self.persist_flags = tuple(bool(seg.persist_kv) for seg in source.segments)
+        max_blocks = max(self.block_cols)
+        self._block_table = torch.zeros(
+            (len(self.q_lens), max_blocks),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._cache_after = torch.empty((len(self.q_lens),), dtype=torch.int32, device=device)
+        self._cu_after = torch.empty((len(self.q_lens) + 1,), dtype=torch.int32, device=device)
+        write_tokens = sum(
+            q_len for q_len, write in zip(self.q_lens, self.write_flags, strict=True) if write
+        )
+        self._page_ids = torch.empty((write_tokens,), dtype=torch.int64, device=device)
+        self._offsets = torch.empty((write_tokens,), dtype=torch.int64, device=device)
+        self.segments = tuple(
+            ForwardPagedKVSegment(
+                block_ids=tuple(0 for _ in range(blocks)),
+                base_len=max(0, int(blocks) * self.block_size - int(q_len)),
+                q_len=int(q_len),
+                write_kv=write,
+                persist_kv=persist,
+            )
+            for q_len, blocks, write, persist in zip(
+                self.q_lens,
+                self.block_cols,
+                self.write_flags,
+                self.persist_flags,
+                strict=True,
+            )
+        )
+
+    def copy_from(self, source: ForwardPagedKVView) -> bool:
+        if len(source.segments) != len(self.q_lens):
+            return False
+        block_rows: list[list[int]] = []
+        cache_after: list[int] = []
+        page_ids: list[int] = []
+        offsets: list[int] = []
+        for seg, q_len, blocks, write in zip(
+            source.segments,
+            self.q_lens,
+            self.block_cols,
+            self.write_flags,
+            strict=True,
+        ):
+            if int(seg.q_len) != q_len or bool(seg.write_kv) != write:
+                return False
+            seg_blocks = [int(block_id) for block_id in seg.block_ids]
+            if len(seg_blocks) != blocks:
+                return False
+            block_rows.append(seg_blocks)
+            cache_after.append(int(seg.base_len) + int(seg.q_len))
+            if write:
+                for local in range(int(seg.q_len)):
+                    position = int(seg.base_len) + local
+                    block_slot = position // self.block_size
+                    if block_slot >= len(seg_blocks):
+                        return False
+                    page_ids.append(seg_blocks[block_slot])
+                    offsets.append(position % self.block_size)
+
+        if len(page_ids) != int(self._page_ids.numel()):
+            return False
+        self._block_table.zero_()
+        for row, blocks in enumerate(block_rows):
+            if blocks:
+                self._block_table[row, : len(blocks)] = torch.tensor(
+                    blocks,
+                    dtype=torch.int32,
+                    device=self._block_table.device,
+                )
+        self._cache_after.copy_(
+            torch.tensor(cache_after, dtype=torch.int32, device=self._cache_after.device),
+            non_blocking=True,
+        )
+        cu = [0]
+        for length in cache_after:
+            cu.append(cu[-1] + int(length))
+        self._cu_after.copy_(
+            torch.tensor(cu, dtype=torch.int32, device=self._cu_after.device),
+            non_blocking=True,
+        )
+        self._page_ids.copy_(
+            torch.tensor(page_ids, dtype=torch.int64, device=self._page_ids.device),
+            non_blocking=True,
+        )
+        self._offsets.copy_(
+            torch.tensor(offsets, dtype=torch.int64, device=self._offsets.device),
+            non_blocking=True,
+        )
+        return True
+
+    def block_table(self, *, device: torch.device | str | None = None) -> torch.Tensor:
+        del device
+        return self._block_table
+
+    def cache_seqlens_after(self, *, device: torch.device | str | None = None) -> torch.Tensor:
+        del device
+        return self._cache_after
+
+    def cu_seqlens_after(self, *, device: torch.device | str | None = None) -> torch.Tensor:
+        del device
+        return self._cu_after
+
+    def append_packed(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        if k.shape != v.shape:
+            raise invalid_descriptor("graph packed KV key/value shapes must match")
+        if int(k.shape[0]) != int(self._page_ids.numel()):
+            raise invalid_descriptor("graph packed KV token count mismatch")
+        k_cache, v_cache = self.pool.layer_cache(layer)
+        paged_kv_write(
+            k_cache,
+            v_cache,
+            self._page_ids,
+            self._offsets,
+            k,
+            v,
+            cast=k.dtype != k_cache.dtype or v.dtype != v_cache.dtype,
+        )
+
+
+class _PackedMixedDecoderGraphRunner:
+    def __init__(self) -> None:
+        self.states: dict[tuple[Any, ...], _PackedMixedDecoderGraphState] = {}
+        self._captures = 0
+        self._replays = 0
+
+    def maybe_run(
+        self,
+        owner: Any,
+        inputs_embeds: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+        ctx: Any,
+    ) -> torch.Tensor | None:
+        key = self._key(owner, inputs_embeds, image_gen_indicators, forward_stream, kv_view)
+        if key is None:
+            return None
+        state = self.states.get(key)
+        if state is None:
+            state = self._capture(
+                key,
+                owner,
+                inputs_embeds,
+                image_gen_indicators=image_gen_indicators,
+                indexes=indexes,
+                forward_stream=forward_stream,
+                kv_view=kv_view,
+                ctx=ctx,
+            )
+            self.states[key] = state
+            self._captures += 1
+            logger.info("packed mixed decoder CUDA graph active: captured shape=%s", key)
+            return state.hidden
+        start = ctx.component_timer_start()
+        if not state.copy_inputs(inputs_embeds, image_gen_indicators, indexes, kv_view):
+            raise RuntimeError("packed mixed graph input copy failed before replay")
+        ctx.record_component_elapsed("packed_mixed_decoder_graph_input_copy", start)
+        start = ctx.component_timer_start()
+        state.graph.replay()
+        ctx.record_component_elapsed("packed_mixed_decoder_graph_replay", start)
+        self._replays += 1
+        return state.hidden
+
+    def _capture(
+        self,
+        key: tuple[Any, ...],
+        owner: Any,
+        inputs_embeds: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+        ctx: Any,
+    ) -> _PackedMixedDecoderGraphState:
+        device = inputs_embeds.device
+        graph_kv_view = _GraphForwardPagedKVView(kv_view, device=device)
+        state_indexes = torch.empty_like(indexes)
+        graph_stream = ForwardStream(
+            segments=forward_stream.segments,
+            cu_seqlens_q=forward_stream.cu_seqlens_q.detach().clone(),
+            visible_end=forward_stream.visible_end.detach().clone(),
+            indexes=state_indexes,
+            fully_visible=forward_stream.fully_visible,
+            und_indices=(
+                forward_stream.und_indices.detach().clone()
+                if forward_stream.und_indices is not None
+                else None
+            ),
+            gen_indices=(
+                forward_stream.gen_indices.detach().clone()
+                if forward_stream.gen_indices is not None
+                else None
+            ),
+        )
+        state = _PackedMixedDecoderGraphState(
+            key=key,
+            graph=torch.cuda.CUDAGraph(),
+            input_embeds=torch.empty_like(inputs_embeds),
+            image_gen_indicators=image_gen_indicators.detach().clone(),
+            indexes=state_indexes,
+            forward_stream=graph_stream,
+            kv_view=graph_kv_view,
+        )
+        if not state.copy_inputs(inputs_embeds, image_gen_indicators, indexes, kv_view):
+            raise RuntimeError("packed mixed graph input copy failed during capture")
+        graph_ctx = replace(ctx, stats=None)
+
+        def run() -> torch.Tensor:
+            with use_forward_context(graph_ctx):
+                return owner.packed_decoder_forward(
+                    state.input_embeds,
+                    image_gen_indicators=state.image_gen_indicators,
+                    indexes=state.indexes,
+                    forward_stream=state.forward_stream,
+                    kv_view=state.kv_view,
+                )
+
+        for _ in range(2):
+            state.hidden = run()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        with torch.cuda.graph(state.graph):
+            state.hidden = run()
+        return state
+
+    @staticmethod
+    def _key(
+        owner: Any,
+        inputs_embeds: torch.Tensor,
+        image_gen_indicators: torch.Tensor,
+        forward_stream: ForwardStream,
+        kv_view: ForwardPagedKVView,
+    ) -> tuple[Any, ...] | None:
+        del owner
+        if not kv_view.segments:
+            return None
+        if not forward_stream.fully_visible:
+            return None
+        if any(not bool(seg.write_kv) for seg in kv_view.segments):
+            return None
+        segment_shape = tuple(
+            (
+                str(seg.modality),
+                str(seg.segment_class),
+                int(seg.q_len),
+                str(seg.visible_policy),
+                int(seg.branch_id),
+            )
+            for seg in forward_stream.segments
+        )
+        kv_shape = tuple(
+            (
+                int(seg.q_len),
+                len(seg.block_ids),
+                bool(seg.write_kv),
+                bool(seg.persist_kv),
+            )
+            for seg in kv_view.segments
+        )
+        return (
+            str(inputs_embeds.device),
+            str(inputs_embeds.dtype),
+            tuple(inputs_embeds.shape),
+            tuple(image_gen_indicators.shape),
+            segment_shape,
+            kv_shape,
+            int(getattr(kv_view.pool, "block_size", 0)),
+            id(kv_view.pool),
+        )
+
+
+class _PackedMixedTiming:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.enabled = _PACKED_MIXED_TIMING
+        self.sync = _PACKED_MIXED_TIMING_SYNC
+        self.values: dict[str, float] = {}
+
+    def start(self) -> int:
+        if not self.enabled:
+            return 0
+        self._sync()
+        return time.perf_counter_ns()
+
+    def stop(self, key: str, start_ns: int) -> None:
+        if not self.enabled or not start_ns:
+            return
+        self._sync()
+        self.values[key] = (time.perf_counter_ns() - start_ns) / 1_000_000.0
+
+    def component_snapshot(self, ctx: Any) -> dict[str, int]:
+        if not self.enabled:
+            return {}
+        stats = getattr(ctx, "stats", None)
+        component_ns = getattr(stats, "component_ns", None)
+        return dict(component_ns) if isinstance(component_ns, dict) else {}
+
+    def add_component_deltas(
+        self,
+        ctx: Any,
+        start: Mapping[str, int],
+        keys: Sequence[str],
+    ) -> None:
+        if not self.enabled:
+            return
+        stats = getattr(ctx, "stats", None)
+        component_ns = getattr(stats, "component_ns", None)
+        if not isinstance(component_ns, dict):
+            return
+        for key in keys:
+            before = int(start.get(key, 0))
+            after = int(component_ns.get(key, 0))
+            if after > before:
+                self.values[f"{key}_ms"] = (after - before) / 1_000_000.0
+
+    def log(
+        self,
+        *,
+        batch: UniForwardBatch,
+        forward_stream: Any,
+        embed_chunks: Sequence[torch.Tensor],
+        text_result_slots: Sequence[tuple[Any, ...]],
+        denoise_result_slots: Sequence[tuple[Any, ...]],
+        kv_segments: Sequence[Any],
+    ) -> None:
+        if not self.enabled:
+            return
+        mode_counts: dict[str, int] = {}
+        for mode in batch.op_modes:
+            key = mode.value
+            mode_counts[key] = mode_counts.get(key, 0) + 1
+        text_tokens = sum(int(slot[2]) for slot in text_result_slots)
+        image_tokens = sum(int(slot[3]) for slot in denoise_result_slots)
+        payload = {
+            "rows": len(batch.ops),
+            "mode_counts": mode_counts,
+            "tokens": sum(int(chunk.shape[0]) for chunk in embed_chunks),
+            "text_tokens": text_tokens,
+            "image_tokens": image_tokens,
+            "text_rows": len(text_result_slots),
+            "denoise_rows": len({int(slot[0]) for slot in denoise_result_slots}),
+            "denoise_segments": len(denoise_result_slots),
+            "kv_segments": len(kv_segments),
+            "fully_visible": bool(getattr(forward_stream, "fully_visible", False)),
+            **self.values,
+        }
+        logger.info("packed_mixed_timing %s", json.dumps(payload, sort_keys=True))
+
+    def _sync(self) -> None:
+        if self.sync and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+
+def _sync_host_cache_blocks(
+    owner: Any,
+    cache: Any,
+    request_states: Any,
+    req_id: int,
+    op: Mapping[str, Any] | None = None,
+) -> None:
+    past = getattr(cache, "past", None)
+    if past is None or getattr(past, "pool", None) is not getattr(owner, "kv_pool", None):
+        return
+    get_state = getattr(request_states, "get", None)
+    if not callable(get_state):
+        return
+    state = get_state(int(req_id))
+    if op is not None:
+        block_ids = state_block_ids_for_op(op, state)
+    else:
+        block_ids = [int(block_id) for block_id in (getattr(state, "block_ids", []) or [])]
+    if not block_ids:
+        return
+    current = [int(block_id) for block_id in (getattr(cache, "block_ids", []) or [])]
+    if len(block_ids) < len(current):
+        return
+    cache.block_ids = block_ids
+    past.set_blocks(cache.block_ids)
 
 
 def _append_packed_chunk(
@@ -245,33 +883,21 @@ def _append_packed_chunk(
     return start
 
 
-def _sample_text_logits(req_id: int, logits: torch.Tensor, request_states: Any) -> TextTokenOutput:
-    state = request_states.get(int(req_id))
-    sampling = dict(state.sampling or {})
-    token, logprob, top_logprobs = Sampler().sample(
-        logits.reshape(-1, logits.shape[-1])[-1],
-        sampling,
-        n_logprobs=int(sampling.get("n_logprobs", 0) or 0),
-    )
-    return TextTokenOutput(
-        req_id=int(req_id),
-        sampled_token_id=int(token),
-        sampled_logprob=logprob,
-        top_logprobs=top_logprobs,
-    )
-
-
 def _store_forward_sampled_token_relay(
     state: Any,
     *,
     token_id: int,
     device: torch.device,
     position_id: int | None = None,
+    token_tensor: torch.Tensor | None = None,
 ) -> None:
     relay = getattr(state, "decode_relay", None)
     if relay is None:
         return
-    token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+    if token_tensor is None:
+        token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
+    else:
+        token_tensor = token_tensor.reshape(1).to(device=device, dtype=torch.long)
     if token_tensor.device.type == "cuda":
         token_tensor.record_stream(torch.cuda.current_stream(token_tensor.device))
     relay.token_id = int(token_id)

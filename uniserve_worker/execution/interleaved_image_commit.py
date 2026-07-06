@@ -129,7 +129,11 @@ class GeneratedImageCommitDriver:
         image_state = st.image_state
         if image_state is None:
             return {"req_id": op["req_id"]}
-        png_b64 = tensor_to_png_b64(image_state.x_t)
+        png_b64 = (
+            tensor_to_png_b64(image_state.x_t)
+            if _tp_rank(self.owner) == 0
+            else None
+        )
         if getattr(self.owner, "_dataplane_handoff", None) is not None:
             locator = self.owner.publish_generated_latent_for_commit(image_state)
             st.image_state = None
@@ -249,3 +253,11 @@ class GeneratedImageCommitDriver:
         if png_b64 is not None:
             out["image_png_b64"] = png_b64
         return out
+
+
+def _tp_rank(owner: Any) -> int:
+    mesh = getattr(owner, "mesh", None)
+    try:
+        return int(getattr(mesh, "tp_rank", 0))
+    except (TypeError, ValueError):
+        return 0

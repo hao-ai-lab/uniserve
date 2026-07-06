@@ -17,11 +17,19 @@ __all__ = [
 
 @dataclass(frozen=True)
 class AttentionCapabilities:
+    # Whether the provider's runtime dependency is currently usable. Optional
+    # provider modules may still register an unavailable backend so explicit
+    # selection and diagnostics can name it, but dispatch must not route generic
+    # dense/paged attention through a backend whose kernel import failed.
+    available: bool = True
     segment_batched_cfg: bool = False
     mixed_mode: bool = False
     paged_kv: bool = False
     varlen_attention: bool = False
     varlen_paged_kv: bool = False
+    # True when ``forward_varlen`` only supports paged KV cache inputs and must
+    # not be selected for contiguous q/k/v varlen prefill.
+    requires_paged_varlen: bool = False
     visible_end: bool = False
     tree_verify: bool = False
     paged_block_size_multiple: int = 1
@@ -172,5 +180,6 @@ class VisibleEndAttentionBackend(AttentionBackend, Protocol):
         max_seqlen_k: int | None = None,
         scale: float | None = None,
         use_prefix_bounds: bool = False,
+        fully_visible: bool = False,
     ) -> torch.Tensor:
         ...

@@ -14,8 +14,7 @@ segment API (no paged/scratch caches, no block tables), VAE patch-token
 latents held on the request state (no ``LatentPool``), scalar rope positions,
 and a VAE-decode commit. Such models already share the ``DenoiseDriver`` /
 ``nn.diffusion`` schedule and CFG machinery directly; adopting this engine
-would mean rewriting their cache substrate, not configuring it. See
-``docs/rfcs/interleaved-image-denoise-lift.md`` for the named analysis.
+would mean rewriting their cache substrate, not configuring it.
 """
 from __future__ import annotations
 
@@ -31,10 +30,12 @@ from ..nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
 from ..nn.vision import patchify_batch, unpatchify_batch
 from ..runtime.image_params import (
     TextImageGenerationParams as _ImageParams,
+)
+from ..runtime.image_params import (
     parse_text_image_generation_params,
 )
 from ..runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
-from .denoise_driver import TextImageDenoiseStep
+from .denoise_driver import TextImageDenoiseStep, text_image_cfg_branch_count
 from .denoise_residual_cache import (
     DenoiseResidualCacheAdapter,
     ImageResidualCacheState,
@@ -525,6 +526,7 @@ class TextImageDenoiseOps:
             cfg_interval=img.cfg_interval,
             cfg_renorm_type=img.cfg_norm,
             cfg_renorm_min=img.cfg_renorm_min,
+            cfg_branch_count=text_image_cfg_branch_count(op),
             image_scale_applies_to_text=self.denoise_cfg_recipe,
             extra={
                 "img": img,

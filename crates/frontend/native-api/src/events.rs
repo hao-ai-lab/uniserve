@@ -77,9 +77,11 @@ pub fn event_json(event: &GenEvent, detok: &mut Detok) -> Value {
             prompt_tokens,
             completion_tokens,
             images,
+            stop_reason,
             ..
         } => json!({"type":"finished","reason":finish_reason(event),
-                   "prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens,"images":images}),
+                   "prompt_tokens":prompt_tokens,"completion_tokens":completion_tokens,"images":images,
+                   "stop_reason": stop_reason}),
         GenEvent::Rejected { message } => json!({"type":"rejected","message":message}),
         GenEvent::Error { message } => json!({"type":"error","message":message}),
     }
