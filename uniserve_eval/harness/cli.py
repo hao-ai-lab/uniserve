@@ -59,7 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int)
-    parser.add_argument("--max-images", type=int, default=1)
+    parser.add_argument(
+        "--max-images",
+        type=int,
+        default=None,
+        help="interleave image cap; omit to leave image count uncapped",
+    )
     parser.add_argument("--i2i-mode", default="image")
     parser.add_argument(
         "--i2t-wire",

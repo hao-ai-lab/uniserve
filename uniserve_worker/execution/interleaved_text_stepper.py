@@ -4,7 +4,7 @@ The :class:`InterleavedTextCacheDriver` owns text forward orchestration for
 interleaved text+image models: it resolves the per-request paged text KV view
 over the **system** KV pool, builds position indexes and attention masks from
 system primitives (:func:`build_text_position_indexes`,
-:func:`create_block_causal_mask`/:func:`create_causal_mask`), invokes the
+:func:`create_causal_mask`), invokes the
 model's thin neural forward through the :class:`InterleavedModelOwner` contract,
 and hands logits back to the system sampler. The model contributes only compute;
 the system owns attention-metadata building and cache residency.
@@ -15,14 +15,13 @@ Model-neutral: touches the concrete model only through the duck-typed
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 import torch
 
 from ..foundation.errors import model_execution_error
 from ..nn.logits import forced_eos_logits
-from ..runtime.masks import create_block_causal_mask, create_causal_mask
+from ..runtime.masks import create_causal_mask
 from ..runtime.paged_text_cache import PagedTextCache
 from ..runtime.request_state import append_new_block_ids
 from .forward_stream import build_text_position_indexes
@@ -35,6 +34,7 @@ __all__ = [
     "InterleavedModelOwner",
     "InterleavedTextCacheDriver",
     "InterleavedTextStepper",
+    "hydrate_cached_prefix_from_op",
     "resolve_op_token_ids",
 ]
 
@@ -65,6 +65,31 @@ def resolve_op_token_ids(op: Mapping[str, Any]) -> list[int]:
             "a relay tensor nor a resolved token id"
         )
     return [int(tokens[0])]
+
+
+def hydrate_cached_prefix_from_op(cache: Any, op: Mapping[str, Any]) -> None:
+    """Adopt host prefix-cache hits into a fresh local paged text cache.
+
+    Prefix-cache reuse crosses the worker boundary as block IDs plus an op
+    ``pos_range``.  A newly-created model cache has the right block table but a
+    zero logical length, so its first suffix prefill/decode must advance the
+    local length to the cached prefix before writing new K/V.
+    """
+
+    past = getattr(cache, "past", None)
+    if past is None:
+        return
+    pos = op.get("pos_range")
+    if not isinstance(pos, Sequence) or len(pos) < 1:
+        return
+    start = int(pos[0])
+    if start <= 0 or start <= int(getattr(past, "length", 0)):
+        return
+    if int(getattr(past, "length", 0)) != 0 or int(getattr(cache, "t_index", -1)) >= 0:
+        return
+    past.ensure_capacity(start)
+    past.length = start
+    cache.t_index = start - 1
 
 
 class TextCache:
@@ -203,10 +228,13 @@ class InterleavedTextCacheDriver:
 
         if st.cond.past is None:
             self.ensure_host_cache(st.cond)
+            hydrate_cached_prefix_from_op(st.cond, op)
             self.prefix_forward_ids(st.cond, tokens, int(op["pos_range"][0]))
         elif len(tokens) == 1:
+            hydrate_cached_prefix_from_op(st.cond, op)
             self.append_one(st.cond, int(tokens[0]))
         else:
+            hydrate_cached_prefix_from_op(st.cond, op)
             self.append_ids(st.cond, tokens)
         return st.cond.last_logits[:, -1, :]
 
@@ -259,11 +287,15 @@ class InterleavedTextCacheDriver:
             raise model_execution_error("text prefix requires an initialized paged cache")
         input_ids = torch.tensor([tokens], dtype=torch.long, device=self.owner.device)
         indexes = self.text_indexes(start, len(tokens))
+        seq_len = input_ids.shape[1]
+        past_len = cache.past.get_seq_length()
+        mask = torch.zeros(1, 1, seq_len, past_len + seq_len, device=self.owner.device)
+        mask[:, :, :, past_len:] = create_causal_mask(seq_len, device=self.owner.device)
         outputs = self.owner.interleaved_text_forward(
             input_ids=input_ids,
             indexes=indexes,
             text_only_rope=True,
-            attention_mask={"full_attention": create_block_causal_mask(indexes[0])},
+            attention_mask={"full_attention": mask},
             past_key_values=cache.past,
             use_cache=True,
         )

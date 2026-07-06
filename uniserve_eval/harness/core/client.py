@@ -27,7 +27,7 @@ from ..response_classifier import (
     classify_native_events,
     classify_openai_events,
 )
-from ..sse import aiter_sse_events
+from ..sse import TERMINAL_EVENT_TYPES, aiter_sse_events, aiter_sse_events_from_text
 from ..tasks.base import TaskRequest
 
 
@@ -118,7 +118,14 @@ async def _send_chat_json(
     choices = data.get("choices") if isinstance(data, dict) else None
     content = ""
     if isinstance(choices, list) and choices:
-        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        choice0 = choices[0] if isinstance(choices[0], dict) else {}
+        finish_reason = choice0.get("finish_reason")
+        if isinstance(finish_reason, str):
+            record.finish_reason = finish_reason
+        stop_reason = choice0.get("stop_reason")
+        if isinstance(stop_reason, str):
+            record.stop_reason = stop_reason
+        message = choice0.get("message")
         raw = (message or {}).get("content")
         if isinstance(raw, str):
             content = raw
@@ -163,9 +170,19 @@ async def _send_sse(
             record.classifier = f"transport_status_{response.status_code}"
             record.error = body.decode("utf-8", errors="replace")[:500]
             return
-        events = await aiter_sse_events(
-            response.aiter_lines(), stamp_time=True, on_parse_error="record"
-        )
+        if protocol == "native":
+            events = await aiter_sse_events_from_text(
+                response.aiter_text(),
+                stamp_time=True,
+                on_parse_error="record",
+                stop_on=TERMINAL_EVENT_TYPES,
+            )
+        else:
+            events = await aiter_sse_events(
+                response.aiter_lines(),
+                stamp_time=True,
+                on_parse_error="record",
+            )
     record.latency = _last_event_time(events, record.start_time) - record.start_time
     if protocol == "openai":
         _parse_openai(events, record, output_len_fallback=output_len_fallback, prompt_len=prompt_len)
@@ -189,6 +206,17 @@ def _parse_openai(
     output_len = output_len_fallback
     prompt_tokens: int | None = None
     for event in events:
+        choices = event.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                finish_reason = choice.get("finish_reason")
+                if isinstance(finish_reason, str):
+                    record.finish_reason = finish_reason
+                stop_reason = choice.get("stop_reason")
+                if isinstance(stop_reason, str):
+                    record.stop_reason = stop_reason
         usage = event.get("usage")
         if isinstance(usage, dict):
             if isinstance(usage.get("completion_tokens"), int):
@@ -256,7 +284,10 @@ def _parse_native(
                 float(timestamp) if timestamp is not None else None,
                 int(steps) if steps is not None else None,
             )
+        elif kind == "image_step":
+            image_since_last_text = True
         elif kind == "image_done":
+            image_since_last_text = True
             image_done_events.append(event)
         elif kind == "finished":
             finished = event
@@ -279,6 +310,12 @@ def _parse_native(
     images = len(image_done_events)
     output_len = len(text_times)
     if finished is not None:
+        reason = finished.get("reason")
+        if isinstance(reason, str):
+            record.finish_reason = reason
+        stop_reason = finished.get("stop_reason")
+        if isinstance(stop_reason, str):
+            record.stop_reason = stop_reason
         if isinstance(finished.get("completion_tokens"), int):
             output_len = int(finished["completion_tokens"])
         if isinstance(finished.get("prompt_tokens"), int):

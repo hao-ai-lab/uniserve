@@ -44,3 +44,5 @@ artifacts/
 target/
 refs/
 specs/
+
+AGENTS.md

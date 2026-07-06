@@ -19,7 +19,7 @@ from ..nn.diffusion import (
     init_latent,
     x_pred_to_velocity,
 )
-from ..nn.diffusion.cfg import CfgPlan, CfgRecipe, build_text_image_cfg_plan
+from ..nn.diffusion.cfg import Branch, CfgPlan, CfgRecipe, build_text_image_cfg_plan
 from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.request_state import RequestState
 
@@ -31,6 +31,7 @@ __all__ = [
     "TextImageDenoiseStep",
     "combine_text_image_velocity",
     "text_image_branches",
+    "text_image_cfg_branch_count",
 ]
 
 # Fallback latent geometry for the model-neutral generic path, used only when an
@@ -56,6 +57,9 @@ class TextImageDenoiseStep:
     cfg_interval: tuple[float, float]
     cfg_renorm_type: str
     cfg_renorm_min: float
+    # Optional scheduler-provided branch bound. Pure T2I deliberately sends
+    # branch_count=1 even when model defaults have guidance scales > 1.
+    cfg_branch_count: int | None = None
     # Names the model's text/image CFG convention. Construction coerces bools
     # and strings to the enum so the execution path always consumes one type.
     image_scale_applies_to_text: CfgRecipe = CfgRecipe.ADDITIVE_DELTAS
@@ -65,6 +69,11 @@ class TextImageDenoiseStep:
         recipe = CfgRecipe.coerce(self.image_scale_applies_to_text)
         if recipe is not self.image_scale_applies_to_text:
             object.__setattr__(self, "image_scale_applies_to_text", recipe)
+        if self.cfg_branch_count is not None:
+            branch_count = int(self.cfg_branch_count)
+            if branch_count < 1:
+                raise ValueError("cfg_branch_count must be >= 1")
+            object.__setattr__(self, "cfg_branch_count", branch_count)
 
 
 class DenoiseDriver:
@@ -361,6 +370,8 @@ def _text_image_cfg_plan(step: TextImageDenoiseStep) -> CfgPlan:
     both which branches the model evaluates and how they are weighted, so the two
     cannot disagree.
     """
+    if step.cfg_branch_count == 1:
+        return CfgPlan(branches=(Branch.COND,))
     t_value = float(step.t.detach().float().item())
     lo, hi = step.cfg_interval
     use_cfg = lo <= t_value <= hi
@@ -376,6 +387,19 @@ def _text_image_cfg_plan(step: TextImageDenoiseStep) -> CfgPlan:
 
 def text_image_branches(step: TextImageDenoiseStep) -> tuple[str, ...]:
     return _text_image_cfg_plan(step).branches
+
+
+def text_image_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
+    cfg = op.get("cfg")
+    if not isinstance(cfg, Mapping) or cfg.get("branch_count") is None:
+        return None
+    try:
+        branch_count = int(cfg["branch_count"])
+    except (TypeError, ValueError) as exc:
+        raise invalid_descriptor("cfg.branch_count must be a positive integer") from exc
+    if branch_count < 1:
+        raise invalid_descriptor("cfg.branch_count must be a positive integer")
+    return branch_count
 
 
 def combine_text_image_velocity(

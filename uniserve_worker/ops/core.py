@@ -1,11 +1,10 @@
 """Backend/operator dispatch framework for worker compute ops."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar, runtime_checkable
 import os
 import time
-import torch
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Generic, Mapping, Protocol, TypeVar, runtime_checkable
 
 from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
 

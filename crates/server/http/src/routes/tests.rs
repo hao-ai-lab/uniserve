@@ -13,7 +13,6 @@ use std::{fmt, fs};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
-use futures::StreamExt as _;
 use serde_json::json;
 use serial_test::serial;
 use tower::{Service as _, ServiceExt as _};

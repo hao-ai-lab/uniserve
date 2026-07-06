@@ -36,6 +36,7 @@ from uniserve_worker.execution.decode_cuda_graph import (
     PrefillCudaGraphRunner,
     copy_text_decode_graph_inputs,
     make_text_decode_graph_state,
+    resolve_paged_decode_graph_backend,
 )
 from uniserve_worker.execution.text_graph_runner import TextGraphRunner
 from uniserve_worker.runtime.kv_pool import PagedKVPool
@@ -45,6 +46,11 @@ pytestmark = pytest.mark.integration
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="decode CUDA graph capture/replay requires a CUDA device"
+)
+
+requires_decode_graph_backend = pytest.mark.skipif(
+    resolve_paged_decode_graph_backend(None) is None,
+    reason="TextGraphRunner decode replay requires a graph-aware paged decode backend",
 )
 
 _VOCAB = 32
@@ -188,13 +194,27 @@ def test_share_input_buffer_slices_largest_captured_buffer_for_smaller_bucket():
 
 
 @requires_cuda
-def test_share_input_buffer_strict_rejects_a_larger_bucket_than_captured():
+def test_share_input_buffer_strict_grows_for_larger_late_bucket():
     pool: dict = {}
     device = torch.device("cuda")
-    _share_input_buffer(pool, "cache_seqlens", torch.empty(4, dtype=torch.int32, device=device), strict=True)
+    small = torch.empty(4, dtype=torch.int32, device=device)
+    shared_small = _share_input_buffer(pool, "cache_seqlens", small, strict=True)
 
-    with pytest.raises(AssertionError):
-        _share_input_buffer(pool, "cache_seqlens", torch.empty(8, dtype=torch.int32, device=device), strict=True)
+    large = torch.empty(8, dtype=torch.int32, device=device)
+    shared_large = _share_input_buffer(pool, "cache_seqlens", large, strict=True)
+
+    # Late larger lazy buckets get a new resident buffer. Existing graph states
+    # keep references to their original smaller tensors.
+    assert shared_small is small
+    assert shared_large is large
+    assert shared_large.data_ptr() != shared_small.data_ptr()
+
+    smaller_again = torch.empty(2, dtype=torch.int32, device=device)
+    shared_smaller_again = _share_input_buffer(
+        pool, "cache_seqlens", smaller_again, strict=True
+    )
+    assert tuple(shared_smaller_again.shape) == (2,)
+    assert shared_smaller_again.data_ptr() == shared_large.data_ptr()
 
 
 @requires_cuda
@@ -483,6 +503,7 @@ def test_decode_graph_state_buffers_are_bucket_sized_and_zero_padded():
 
 
 @requires_cuda
+@requires_decode_graph_backend
 @pytest.mark.gpu
 def test_text_graph_runner_decode_replay_matches_eager_forward():
     device = torch.device("cuda")

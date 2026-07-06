@@ -156,6 +156,8 @@ class TextBackendGate:
                 multiple = int(caps.get("paged_block_size_multiple", 1) or 1)
                 if self.block_size % max(1, multiple) != 0:
                     continue
+            elif bool(caps.get("requires_paged_varlen", False)):
+                continue
             if not self._head_dim_ok(caps):
                 continue
             return True

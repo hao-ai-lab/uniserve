@@ -29,8 +29,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from ..foundation.errors import invalid_descriptor
 from ..ops.core import Capabilities, Handoff
-from .transfer import Locator
 from .tower_kv import reshard_kv_snapshot, wait_kv_snapshot_ready
+from .transfer import Locator
 
 __all__ = [
     "TowerBinding",

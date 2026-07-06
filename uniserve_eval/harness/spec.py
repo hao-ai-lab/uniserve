@@ -68,7 +68,7 @@ class BenchmarkSpec:
     width: int | None = None
     height: int | None = None
     steps: int | None = None
-    max_images: int = 1
+    max_images: int | None = None
     i2i_mode: str = "image"
 
     # Image understanding (i2t). ``i2t_wire`` selects the request shape:

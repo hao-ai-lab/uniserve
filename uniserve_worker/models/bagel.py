@@ -26,7 +26,7 @@ from ..contracts.resource_plan import (
     PerBranch,
     ResourcePlan,
 )
-from ..execution.denoise_driver import TextImageDenoiseStep
+from ..execution.denoise_driver import TextImageDenoiseStep, text_image_cfg_branch_count
 from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
 from ..execution.model_base import UniModelBase
 from ..execution.paged_denoise import PagedDenoiseBranchSet, can_run_paged_denoise_attention
@@ -1223,6 +1223,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             cfg_interval=(float(gs.cfg_interval[0]), float(gs.cfg_interval[1])),
             cfg_renorm_type=str(gs.cfg_renorm_type),
             cfg_renorm_min=float(gs.cfg_renorm_min),
+            cfg_branch_count=text_image_cfg_branch_count(op),
             image_scale_applies_to_text=CfgRecipe.IMAGE_OVER_TEXT,
             extra={"gs": gs},
         )

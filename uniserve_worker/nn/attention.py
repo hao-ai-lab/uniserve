@@ -6,10 +6,10 @@ from typing import TypeVar
 
 import torch
 import torch.nn as nn
+
 import uniserve_worker.ops as ops
 
 from ..contracts.forward_context import get_forward_context
-from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
 
@@ -597,6 +597,7 @@ class RadixAttention(nn.Module):
         max_seqlen_k: int | None = None,
         scale: float | None = None,
         use_prefix_bounds: bool = False,
+        fully_visible: bool = False,
     ) -> torch.Tensor:
         """Run hybrid ``visible_end`` masked attention via the op dispatcher."""
         ctx = get_forward_context()
@@ -621,6 +622,7 @@ class RadixAttention(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
                 use_prefix_bounds=use_prefix_bounds,
+                fully_visible=fully_visible,
                 override=override,
             )
         except RuntimeError as exc:
@@ -975,5 +977,3 @@ class RadixAttention(nn.Module):
             "batched paged KV cache requires a supported paged attention backend; "
             "dense fallback is only available for single-request request-cache views"
         )
-
-

@@ -15,8 +15,10 @@ from typing import Any
 
 from .profiles import (
     ROOT,
+    expand_profile_value,
     load_config,
     merged_env,
+    require_resolved_profile_value,
     resolve_server_for_workload,
     workload_dir,
     workload_spec,
@@ -38,6 +40,8 @@ def perf(args: argparse.Namespace) -> None:
     workload = workload_spec(config, args.workload)
     if workload.get("type") != "perf":
         raise SystemExit(f"workload {args.workload!r} is not type=perf")
+    workload = expand_profile_value(workload)
+    require_resolved_profile_value(workload, context=f"workload {args.workload}")
     _, server = resolve_server_for_workload(config, workload, args.server)
     out_dir = workload_dir(config, args.workload)
     out_dir.mkdir(parents=True, exist_ok=True)

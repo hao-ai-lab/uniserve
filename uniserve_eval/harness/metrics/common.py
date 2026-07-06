@@ -56,6 +56,8 @@ class RequestRecord:
     image_steps: list[int] = field(default_factory=list)
 
     status_code: int | None = None
+    finish_reason: str | None = None
+    stop_reason: str | None = None
 
     def record_dict(self) -> dict[str, Any]:
         """Compact per-request row for ``requests.jsonl`` (no large blobs)."""
@@ -82,6 +84,8 @@ class RequestRecord:
             "image_latencies_ms": [value * 1000.0 for value in self.image_latencies],
             "image_generation_ms": [value * 1000.0 for value in self.image_gen_seconds],
             "status_code": self.status_code,
+            "finish_reason": self.finish_reason,
+            "stop_reason": self.stop_reason,
         }
 
 

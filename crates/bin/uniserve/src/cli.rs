@@ -543,8 +543,6 @@ pub(crate) struct WorkerLaunchArgs {
     pub mixed_text_max_tokens: u32,
     #[arg(long, action = ArgAction::Set, default_value_t = true)]
     pub varlen_prefill: bool,
-    #[arg(long, default_value_t = 281)]
-    pub forward_max_memory_bound_tokens: u32,
     #[arg(long)]
     pub green_contexts: bool,
     #[arg(long, default_value_t = 0)]
@@ -594,7 +592,6 @@ impl WorkerLaunchArgs {
             prefill_cuda_graph_warmup_tokens: self.prefill_cuda_graph_warmup_tokens.clone(),
             mixed_text_max_tokens: self.mixed_text_max_tokens,
             varlen_prefill: self.varlen_prefill,
-            forward_max_memory_bound_tokens: self.forward_max_memory_bound_tokens,
             green_contexts: self.green_contexts,
             logits_processor_chunk_size: self.logits_processor_chunk_size,
             flashinfer_workspace_size: self.flashinfer_workspace_size,
@@ -712,12 +709,6 @@ impl WorkerLaunchArgs {
             "--varlen-prefill",
             cfg.varlen_prefill,
             default.varlen_prefill,
-        );
-        push_u32_if_changed(
-            args,
-            "--forward-max-memory-bound-tokens",
-            cfg.forward_max_memory_bound_tokens,
-            default.forward_max_memory_bound_tokens,
         );
         if cfg.green_contexts {
             args.push("--green-contexts".to_string());

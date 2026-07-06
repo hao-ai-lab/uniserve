@@ -5,9 +5,9 @@ from .requests import (
     AddRmsNormReq,
     AttentionRegime,
     AttentionReq,
+    PackedRopeReq,
     QKNormReq,
     QKNormRopeReq,
-    PackedRopeReq,
     RmsNormReq,
     SiluAndMulReq,
     TpAllReduceReq,
@@ -123,6 +123,7 @@ def _attention_req(
     page_table=None,
     seqused_k=None,
     use_prefix_bounds: bool = False,
+    fully_visible: bool = False,
 ):
     return AttentionReq(
         q=q,
@@ -149,6 +150,7 @@ def _attention_req(
         page_table=page_table,
         seqused_k=seqused_k,
         use_prefix_bounds=use_prefix_bounds,
+        fully_visible=fully_visible,
     )
 
 
@@ -177,6 +179,7 @@ def attention(
     page_table=None,
     seqused_k=None,
     use_prefix_bounds: bool = False,
+    fully_visible: bool = False,
     override: str | None = None,
 ):
     from .providers import attention_dispatcher
@@ -205,6 +208,7 @@ def attention(
         page_table=page_table,
         seqused_k=seqused_k,
         use_prefix_bounds=use_prefix_bounds,
+        fully_visible=fully_visible,
     )
     return attention_dispatcher().run(req, override=override)
 
@@ -234,6 +238,7 @@ def can_run_attention(
     page_table=None,
     seqused_k=None,
     use_prefix_bounds: bool = False,
+    fully_visible: bool = False,
     override: str | None = None,
 ) -> bool:
     from .providers import attention_dispatcher
@@ -262,6 +267,7 @@ def can_run_attention(
         page_table=page_table,
         seqused_k=seqused_k,
         use_prefix_bounds=use_prefix_bounds,
+        fully_visible=fully_visible,
     )
     return any(provider.can_run(req) for provider in attention_dispatcher().ordered(override))
 

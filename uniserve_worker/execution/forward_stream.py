@@ -8,6 +8,7 @@ from typing import Literal
 
 import torch
 
+from ..backends.paged_kv_math import paged_kv_write
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
 from ..runtime.cache_protocols import KVCacheView
@@ -102,12 +103,17 @@ class ForwardStream:
 
     The paged visible-end path reads ``cu_seqlens_q``, ``visible_end``, and
     ``indexes``; K extents come from the paged kv_view, not this table.
+    ``fully_visible`` means every row can attend its whole effective K extent,
+    so the attention backend can skip visible-end masking entirely.
     """
 
     segments: tuple[ForwardSegmentSpec, ...]
     cu_seqlens_q: torch.Tensor
     visible_end: torch.Tensor
     indexes: torch.Tensor
+    fully_visible: bool = False
+    und_indices: torch.Tensor | None = None
+    gen_indices: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -163,7 +169,12 @@ class ForwardPagedKVView:
         self._block_table_cache: dict[torch.device, torch.Tensor] = {}
         self._cache_seqlens_before_cache: dict[torch.device, torch.Tensor] = {}
         self._cache_seqlens_after_cache: dict[torch.device, torch.Tensor] = {}
+        self._cu_seqlens_after_cache: dict[torch.device, torch.Tensor] = {}
         self._persistent_cache_seqlens_after_cache: dict[torch.device, torch.Tensor] = {}
+        self._write_plan_cache: dict[
+            torch.device,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+        ] = {}
 
     def _target_device(self, device: torch.device | str | None = None) -> torch.device:
         return torch.device(device if device is not None else self.pool.k.device)
@@ -202,6 +213,18 @@ class ForwardPagedKVView:
             (seg.base_len + seg.q_len for seg in self.segments),
             device=device,
         )
+
+    def cu_seqlens_after(self, *, device: torch.device | str | None = None) -> torch.Tensor:
+        target = self._target_device(device)
+        cached = self._cu_seqlens_after_cache.get(target)
+        if cached is not None:
+            return cached
+        lengths = self.cache_seqlens_after(device=target)
+        out = torch.empty((int(lengths.numel()) + 1,), dtype=torch.int32, device=target)
+        out[0] = 0
+        out[1:] = torch.cumsum(lengths, dim=0)
+        self._cu_seqlens_after_cache[target] = out
+        return out
 
     def persistent_cache_seqlens_after(
         self,
@@ -242,6 +265,21 @@ class ForwardPagedKVView:
             raise invalid_descriptor(
                 f"forward packed KV has {int(k.shape[0])} tokens, expected {expected}"
             )
+        if not getattr(self.pool, "is_quantized", False):
+            k_cache, v_cache = self.pool.layer_cache(layer)
+            page_ids, offsets, token_indices = self._write_plan(device=k.device)
+            k_src = k if token_indices is None else k.index_select(0, token_indices)
+            v_src = v if token_indices is None else v.index_select(0, token_indices)
+            paged_kv_write(
+                k_cache,
+                v_cache,
+                page_ids,
+                offsets,
+                k_src,
+                v_src,
+                cast=k_src.dtype != k_cache.dtype or v_src.dtype != v_cache.dtype,
+            )
+            return
         offset = 0
         for seg in self.segments:
             end = offset + seg.q_len
@@ -254,6 +292,47 @@ class ForwardPagedKVView:
                     v=v[offset:end],
                 )
             offset = end
+
+    def _write_plan(
+        self,
+        *,
+        device: torch.device | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        target = self._target_device(device)
+        cached = self._write_plan_cache.get(target)
+        if cached is not None:
+            return cached
+
+        page_ids: list[int] = []
+        offsets: list[int] = []
+        token_indices: list[int] = []
+        flat = 0
+        all_written = True
+        for seg in self.segments:
+            if not seg.write_kv:
+                all_written = False
+                flat += seg.q_len
+                continue
+            for local in range(seg.q_len):
+                position = int(seg.base_len) + local
+                block_slot = position // self.pool.block_size
+                if block_slot >= len(seg.block_ids):
+                    raise invalid_descriptor("forward paged segment blocks do not cover current append")
+                page_ids.append(int(seg.block_ids[block_slot]))
+                offsets.append(position % self.pool.block_size)
+                token_indices.append(flat + local)
+            flat += seg.q_len
+
+        page_tensor = torch.tensor(page_ids, dtype=torch.int64, device=target)
+        offset_tensor = torch.tensor(offsets, dtype=torch.int64, device=target)
+        index_tensor: torch.Tensor | None
+        if all_written and token_indices == list(range(flat)):
+            index_tensor = None
+        else:
+            index_tensor = torch.tensor(token_indices, dtype=torch.long, device=target)
+        cached = (page_tensor, offset_tensor, index_tensor)
+        self._write_plan_cache[target] = cached
+        return cached
 
     @classmethod
     def from_request_caches(
@@ -345,14 +424,21 @@ class ForwardStreamBuilder:
         cu_q = [0]
         visible_rows = []
         index_chunks = []
+        und_indices: list[int] = []
+        gen_indices: list[int] = []
+        fully_visible = True
         for seg in self._segments:
+            token_start = cu_q[-1]
             cu_q.append(cu_q[-1] + seg.q_len)
+            target_indices = gen_indices if seg.modality == "gen" else und_indices
+            target_indices.extend(range(token_start, token_start + seg.q_len))
             row = torch.zeros(max_q, dtype=torch.int32, device=target_device)
-            visible = VisiblePolicyKind(seg.visible_policy).visible_end(
-                seg.prefix_len, seg.q_len, target_device
-            )
+            policy = VisiblePolicyKind(seg.visible_policy)
+            visible = policy.visible_end(seg.prefix_len, seg.q_len, target_device)
             row[: seg.q_len] = visible
             visible_rows.append(row)
+            if not (policy is VisiblePolicyKind.bidirectional or seg.q_len == 1):
+                fully_visible = False
             if seg.indexes is None:
                 index_chunks.append(
                     build_text_position_indexes(seg.prefix_len, seg.q_len, target_device)
@@ -365,6 +451,9 @@ class ForwardStreamBuilder:
             cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=target_device),
             visible_end=torch.stack(visible_rows, dim=0),
             indexes=torch.cat(index_chunks, dim=1),
+            fully_visible=fully_visible,
+            und_indices=torch.tensor(und_indices, dtype=torch.long, device=target_device),
+            gen_indices=torch.tensor(gen_indices, dtype=torch.long, device=target_device),
         )
 
 

@@ -11,20 +11,19 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.op_kinds import (
+    COMMIT_GEN,
     DECODE_UND,
     DENOISE_GEN,
     OP_KIND_TABLE,
     PREFILL_UND,
-    VAE_ENCODE,
 )
 from uniserve_worker.execution.forward_admission import (
-    ForwardAdmissionConfig,
     ForwardAdmissionRouter,
     Route,
 )
 from uniserve_worker.execution.text_driver import DeferredTextSeqResult
 from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
-from uniserve_worker.runtime.request_state import RequestState
+from uniserve_worker.runtime.request_state import RequestState, RequestStateTable
 
 pytestmark = pytest.mark.unit
 
@@ -69,10 +68,8 @@ def test_decide_text_extend_plus_decode_with_spec_tokens_routes_per_mode():
     assert decision.use_forward is False
 
 
-def test_decide_decode_plus_denoise_within_window_routes_forward():
-    router = ForwardAdmissionRouter(
-        config=ForwardAdmissionConfig(max_memory_bound_decode_tokens=10)
-    )
+def test_decide_decode_plus_denoise_routes_forward():
+    router = ForwardAdmissionRouter()
     ops = [
         {"kind": DECODE_UND, "token_ids": list(range(10))},
         {"kind": DENOISE_GEN},
@@ -85,57 +82,35 @@ def test_decide_decode_plus_denoise_within_window_routes_forward():
     assert decision.requires_model_acceptance is False
 
 
-def test_decide_decode_plus_denoise_over_window_routes_per_mode():
-    router = ForwardAdmissionRouter(
-        config=ForwardAdmissionConfig(max_memory_bound_decode_tokens=10)
-    )
+def test_decide_prefill_plus_denoise_routes_forward():
+    router = ForwardAdmissionRouter()
     ops = [
-        {"kind": DECODE_UND, "token_ids": list(range(11))},
+        {"kind": PREFILL_UND, "token_ids": [1, 2, 3]},
         {"kind": DENOISE_GEN},
     ]
 
     decision = router.decide(ops)
 
-    assert decision.route is Route.PER_MODE
-    assert decision.use_forward is False
+    assert decision.route is Route.FORWARD
+    assert decision.use_forward is True
 
 
-def test_decide_window_counts_extend_chunk_against_text_tokens():
-    # The memory-bound window is total text width: an 8-token prefill chunk plus
-    # a 3-token decode is 11 tokens, which tips a window of 10 over to PER_MODE.
-    router = ForwardAdmissionRouter(
-        config=ForwardAdmissionConfig(max_memory_bound_decode_tokens=10)
-    )
+def test_decide_decode_plus_commit_routes_forward():
+    router = ForwardAdmissionRouter()
     ops = [
-        {"kind": PREFILL_UND, "token_ids": list(range(8))},
-        {"kind": DECODE_UND, "token_ids": [1, 2, 3]},
-        {"kind": DENOISE_GEN},
+        {"kind": DECODE_UND, "token_ids": [1]},
+        {"kind": COMMIT_GEN},
     ]
 
     decision = router.decide(ops)
 
-    assert decision.route is Route.PER_MODE
+    assert decision.route is Route.FORWARD
+    assert decision.use_forward is True
 
 
 def test_decide_denoise_without_decode_routes_per_mode():
     router = ForwardAdmissionRouter()
     ops = [{"kind": DENOISE_GEN}]
-
-    decision = router.decide(ops)
-
-    assert decision.route is Route.PER_MODE
-    assert decision.use_forward is False
-
-
-def test_decide_unsupported_op_in_generation_group_routes_per_mode():
-    # decode + denoise is the FORWARD window, but an encode op is not a supported
-    # mixed-forward mode, so the whole group falls back to PER_MODE.
-    router = ForwardAdmissionRouter()
-    ops = [
-        {"kind": DECODE_UND, "token_ids": [1]},
-        {"kind": DENOISE_GEN},
-        {"kind": VAE_ENCODE},
-    ]
 
     decision = router.decide(ops)
 
@@ -160,19 +135,27 @@ def test_decide_terminates_for_every_op_kind(kind):
     assert len(decision.modes) == 1
 
 
-def test_decide_from_runtime_config_uses_default_window():
-    # With the stock runtime config the window is the documented default crossover,
-    # which admits a small decode+denoise generation window as a single FORWARD.
-    router = ForwardAdmissionRouter.from_runtime_config()
-    ops = [
-        {"kind": DECODE_UND, "token_ids": [1, 2]},
-        {"kind": DENOISE_GEN},
-    ]
+# --- RequestStateTable block registration ----------------------------------
 
-    decision = router.decide(ops)
 
-    assert router.max_memory_bound_decode_tokens > 0
-    assert decision.route is Route.FORWARD
+def test_duplicate_new_request_with_empty_blocks_does_not_clear_live_chain():
+    states = RequestStateTable()
+    state = states.create_or_update(6, {"req_id": 6, "block_ids": [10, 11]})
+
+    same = states.create_or_update(6, {"req_id": 6, "block_ids": []})
+
+    assert same is state
+    assert same.block_ids == [10, 11]
+
+
+def test_duplicate_new_request_merges_longer_registered_chain():
+    states = RequestStateTable()
+    state = states.create_or_update(6, {"req_id": 6, "block_ids": [10, 11]})
+
+    same = states.create_or_update(6, {"req_id": 6, "block_ids": [10, 11, 12]})
+
+    assert same is state
+    assert same.block_ids == [10, 11, 12]
 
 
 # --- DeferredTextSeqResult.finalize ---------------------------------------

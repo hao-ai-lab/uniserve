@@ -606,6 +606,45 @@ def test_uniserve_kernel_is_standalone_provider_pack():
     assert "from ._fa4_runtime import flash_attn_fwd" in public
     assert "flash_attn.cute.interface" not in public
     assert "hybrid_mask_attn.mask" not in public
+    runtime_source = runtime_loader.read_text(encoding="utf-8")
+    assert "package_path.insert" not in runtime_source
+    assert "_append_package_path(package_path, overlay_path, prepend=True)" in runtime_source
+
+
+def test_fa4_runtime_path_helper_accepts_namespace_package_paths():
+    runtime_loader = ROOT / "uniserve_kernel" / "python" / "uniserve_kernel" / "_fa4_runtime.py"
+    tree = ast.parse(runtime_loader.read_text(encoding="utf-8"))
+    helper_defs = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_append_package_path"
+    ]
+    assert len(helper_defs) == 1
+    module = ast.Module(body=helper_defs, type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict[str, object] = {}
+    exec(compile(module, str(runtime_loader), "exec"), namespace)
+    append_path = namespace["_append_package_path"]
+
+    class AppendOnlyPath:
+        def __init__(self) -> None:
+            self.items: list[str] = []
+
+        def __contains__(self, item: object) -> bool:
+            return item in self.items
+
+        def append(self, item: str) -> None:
+            self.items.append(item)
+
+    namespace_path = AppendOnlyPath()
+    append_path(namespace_path, "/provider", prepend=True)
+    append_path(namespace_path, "/provider", prepend=True)
+    assert namespace_path.items == ["/provider"]
+
+    regular_path: list[str] = []
+    append_path(regular_path, "/overlay", prepend=True)
+    append_path(regular_path, "/provider")
+    assert regular_path == ["/overlay", "/provider"]
 
 
 def test_models_do_not_import_attention_backends_or_vendor_kernels():

@@ -147,7 +147,11 @@ def load_native_transformers_checkpoint(
         derived_filter = param_filter_from_model(model, tower_role)
         if param_filter is not None and derived_filter is not None:
             base_filter = param_filter
-            param_filter = lambda name: base_filter(name) and derived_filter(name)
+
+            def combined_param_filter(name: str) -> bool:
+                return base_filter(name) and derived_filter(name)
+
+            param_filter = combined_param_filter
         elif derived_filter is not None:
             param_filter = derived_filter
     _stream_checkpoint_weights(

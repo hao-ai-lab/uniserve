@@ -14,17 +14,6 @@ from .core import (
     Handoff,
     Provider,
 )
-from .requests import (
-    AddRmsNormReq,
-    AttentionRegime,
-    AttentionReq,
-    QKNormReq,
-    QKNormRopeReq,
-    PackedRopeReq,
-    RmsNormReq,
-    SiluAndMulReq,
-    TpAllReduceReq,
-)
 from .facade import (
     add_rms_norm,
     attention,
@@ -33,10 +22,21 @@ from .facade import (
     qk_norm,
     qk_norm_packed_rope,
     qk_norm_rope,
-    rope,
     rms_norm,
+    rope,
     silu_and_mul,
     tp_all_reduce,
+)
+from .requests import (
+    AddRmsNormReq,
+    AttentionRegime,
+    AttentionReq,
+    PackedRopeReq,
+    QKNormReq,
+    QKNormRopeReq,
+    RmsNormReq,
+    SiluAndMulReq,
+    TpAllReduceReq,
 )
 
 __all__ = [

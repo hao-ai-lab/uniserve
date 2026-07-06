@@ -134,7 +134,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prefill-cuda-graph-warmup-tokens", default=None)
     ap.add_argument("--mixed-text-max-tokens", type=int, default=8192)
     ap.add_argument("--varlen-prefill", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--forward-max-memory-bound-tokens", type=int, default=281)
     ap.add_argument("--green-contexts", action="store_true", default=False)
     ap.add_argument("--logits-processor-chunk-size", type=int, default=0)
     ap.add_argument("--flashinfer-workspace-size", type=int, default=512 * 1024 * 1024)

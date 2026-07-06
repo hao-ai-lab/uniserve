@@ -130,19 +130,16 @@ def _share_input_buffer(
 ) -> torch.Tensor:
     """Pool input buffers by (name, dtype, device), slicing into the largest.
 
-    Production runners use ``strict=True`` (buckets captured largest-first).
-    The module-level shim uses ``strict=False``.
+    Production runners usually capture buckets largest-first, but interleaved
+    decode captures lazily from live request batches. If a larger bucket arrives
+    after a smaller one, install the larger tensor for future captures; already
+    captured graph states keep their own tensor references, so their captured
+    input addresses remain valid.
     """
 
     key = (str(name), str(tensor.dtype), str(tensor.device))
     existing = pool.get(key)
     if existing is not None:
-        if strict:
-            assert int(existing.numel()) >= int(tensor.numel()), (
-                "graph input buffer reused for a larger bucket; "
-                "capture buckets must run largest-first"
-            )
-            return existing.as_strided(tuple(tensor.shape), tuple(tensor.stride()))
         if int(existing.numel()) >= int(tensor.numel()):
             return existing.as_strided(tuple(tensor.shape), tuple(tensor.stride()))
     pool[key] = tensor
@@ -198,10 +195,11 @@ class _GraphRunnerBase:
     def share_graph_input_buffer(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         """Reuse an already-allocated input buffer for a smaller bucket.
 
-        Buckets are captured largest-first (see ``warmup_capture_*``), so the
-        first allocation under a given name is the largest and later buckets
-        slice into it via ``as_strided``.  Assert the existing buffer is large
-        enough rather than silently overwriting a captured graph's buffer.
+        Warmed-up runners capture largest-first (see ``warmup_capture_*``), so
+        smaller buckets usually slice into the first allocation via
+        ``as_strided``. Lazy runners may discover larger exact batches later; in
+        that case the pool grows for subsequent captures without mutating
+        already-captured graph states.
         """
 
         return _share_input_buffer(self._graph_input_buffer_pool, name, tensor, strict=True)

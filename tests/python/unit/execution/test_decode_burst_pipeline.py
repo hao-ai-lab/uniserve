@@ -106,3 +106,32 @@ def test_burst_relay_ops_carry_device_relay_tensor():
         assert isinstance(tensor, torch.Tensor)
         assert tensor.dtype == torch.long
         assert int(tensor.numel()) == 1
+
+
+def test_multi_row_burst_returns_token_lists_for_each_row():
+    model = _ScriptedTextModel([5, 6, 7, 8])
+    runner = ModelRunner(model)
+    result = runner.execute(
+        {
+            "step_id": 1,
+            "new_reqs": [
+                {"req_id": 4, "sampling": {"temperature": 0.0}},
+                {"req_id": 5, "sampling": {"temperature": 0.0}},
+            ],
+            "ops": [
+                _burst_op(2, stop_ids=[]),
+                {
+                    "req_id": 5,
+                    "kind": "decode_und",
+                    "token_ids": [21],
+                    "pos_range": [3, 4],
+                    "decode_token_count": 2,
+                    "decode_stop_token_ids": [],
+                },
+            ],
+        }
+    )
+
+    assert result["per_seq"][0]["sampled_token_ids"] == [5, 7]
+    assert result["per_seq"][1]["sampled_token_ids"] == [6, 8]
+    assert model.seen_tokens == [[11], [21], [5], [6]]

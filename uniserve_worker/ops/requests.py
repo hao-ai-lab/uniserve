@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
 import torch
 
 
@@ -100,6 +101,7 @@ class AttentionReq:
     page_table: torch.Tensor | None = None
     seqused_k: torch.Tensor | None = None
     use_prefix_bounds: bool = False
+    fully_visible: bool = False
 
 
 @dataclass(frozen=True)

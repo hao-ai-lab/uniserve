@@ -20,9 +20,15 @@ from ..contracts.forward_batch import ForwardBatch
 from ..foundation.errors import invalid_descriptor
 from .host_staging import (
     canonical_device as _canonical_device,
+)
+from .host_staging import (
     copy_cpu_to_device,
     cpu_int_staging_buffer,
+)
+from .host_staging import (
     fill_cpu_ints as _fill_cpu_long,
+)
+from .host_staging import (
     is_pinned as _is_pinned,
 )
 

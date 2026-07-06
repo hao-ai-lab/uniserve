@@ -9,9 +9,10 @@ class InterleaveTask(BenchmarkTask):
     """Interleaved text+image generation via the native ``/generate`` SSE endpoint."""
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
-        image: dict[str, Any] = {
-            "max_images": item.get("max_images", self.spec.max_images),
-        }
+        image: dict[str, Any] = {}
+        max_images = item.get("max_images", self.spec.max_images)
+        if max_images is not None:
+            image["max_images"] = int(max_images)
         width = item.get("width", self.spec.width)
         height = item.get("height", self.spec.height)
         if width is not None and height is not None:
