@@ -24,7 +24,7 @@ impl Detok {
         }
     }
 
-    fn push(&mut self, id: u32) -> String {
+    pub fn push(&mut self, id: u32) -> String {
         self.ids.push(id);
         let full = self.tok.decode(&self.ids, true).unwrap_or_default();
         let delta = full

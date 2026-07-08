@@ -941,6 +941,7 @@ class _AttentionBackendProvider:
                 "paged_block_size_multiple": int(getattr(caps, "paged_block_size_multiple", 1) or 1),
                 "min_head_dim": int(getattr(caps, "min_head_dim", 1) or 1),
                 "paged_decode_only": bool(getattr(caps, "paged_decode_only", False)),
+                "paged_varlen_cuda_graph": bool(getattr(caps, "paged_varlen_cuda_graph", False)),
             },
         )
 

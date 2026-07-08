@@ -58,6 +58,7 @@ class TRTLLMMHAAttentionBackend:
             paged_block_size_multiple=1,
             min_head_dim=64,
             paged_decode_only=True,
+            paged_varlen_cuda_graph=available,
         )
 
     def forward(

@@ -69,7 +69,20 @@ mod stream;
 use uniserve_engine_client::EngineCoreClient;
 use uniserve_engine_client::protocol::ModelDtype;
 use uniserve_llm::Llm;
-use uniserve_text::{TextLlm, TextRequest};
+use uniserve_text::{PreparedTextRequest, TextLlm, TextRequest};
+
+/// One chat request after profile rendering, multimodal preprocessing, and
+/// text-runtime lowering have completed, but before scheduler admission.
+#[derive(Debug)]
+pub struct PreparedChatRequest {
+    /// Parser-adjusted semantic chat request used for output processing.
+    pub chat_request: ChatRequest,
+    /// Rendered prompt and multimodal placement produced by the profile
+    /// renderer.
+    pub rendered_prompt: RenderedPrompt,
+    /// Tokenized text request ready for the lower text runtime.
+    pub prepared_text_request: PreparedTextRequest,
+}
 
 /// Validate explicit parser override names without starting request processing.
 pub fn validate_parser_overrides(
@@ -241,6 +254,83 @@ impl ChatLlm {
         let structured_stream = output_processor.process(decoded_stream)?;
 
         Ok(ChatEventStream::new(request.request_id, structured_stream))
+    }
+
+    /// Compile one chat request through parser policy, profile rendering,
+    /// multimodal preprocessing, tokenization, and text-runtime lowering
+    /// without submitting it.
+    pub async fn compile(&self, mut request: ChatRequest) -> Result<PreparedChatRequest> {
+        request.validate()?;
+
+        let _output_processor = self.backend.new_chat_output_processor(
+            &mut request,
+            NewChatOutputProcessorOptions {
+                tool_call_parser: &self.tool_call_parser,
+                uniserve_reasoning_parser: &self.uniserve_reasoning_parser,
+            },
+        )?;
+        let chat_renderer = self.backend.chat_renderer();
+        let (request, rendered) =
+            tokio::task::spawn_blocking(move || -> Result<(ChatRequest, RenderedPrompt)> {
+                let rendered = chat_renderer.render(&request)?;
+                Ok((request, rendered))
+            })
+            .await
+            .map_err(|error| Error::ChatTemplate(format!("chat render task failed: {error}")))??;
+
+        let (prompt, mm_features) = multimodal::finalize_rendered_prompt(
+            &request,
+            rendered.clone(),
+            self.backend.multimodal_model_info(),
+            self.model_dtype,
+        )
+        .await?;
+
+        let text_request = TextRequest {
+            request_id: request.request_id.clone(),
+            prompt,
+            mm_features,
+            sampling_params: request.sampling_params.clone(),
+            decode_options: request.decode_options.clone(),
+            intermediate: request.intermediate,
+            priority: request.priority,
+            cache_salt: request.cache_salt.clone(),
+            add_special_tokens: request.add_special_tokens,
+            data_parallel_rank: request.data_parallel_rank,
+            lora_request: request.lora_request.clone(),
+        };
+        let prepared_text_request = self.text.compile(text_request)?;
+
+        Ok(PreparedChatRequest {
+            chat_request: request,
+            rendered_prompt: rendered,
+            prepared_text_request,
+        })
+    }
+
+    /// Submit a previously compiled chat request and stream structured chat
+    /// events.
+    pub async fn chat_prepared(
+        &self,
+        mut prepared: PreparedChatRequest,
+    ) -> Result<ChatEventStream> {
+        let output_processor = self.backend.new_chat_output_processor(
+            &mut prepared.chat_request,
+            NewChatOutputProcessorOptions {
+                tool_call_parser: &self.tool_call_parser,
+                uniserve_reasoning_parser: &self.uniserve_reasoning_parser,
+            },
+        )?;
+        let request_id = prepared.chat_request.request_id.clone();
+        let decoded_stream = self
+            .text
+            .generate_prepared(prepared.prepared_text_request)
+            .await?
+            .map_err(uniserve_chat_output::Error::from)
+            .boxed();
+        let structured_stream = output_processor.process(decoded_stream)?;
+
+        Ok(ChatEventStream::new(request_id, structured_stream))
     }
 
     /// Shut down the underlying LLM client and its background tasks.

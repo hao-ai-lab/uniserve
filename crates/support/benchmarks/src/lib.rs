@@ -7,5 +7,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub mod histograms;
 pub mod native_events;
+pub mod semantic;
 pub mod synthetic_payloads;
 pub mod traces;

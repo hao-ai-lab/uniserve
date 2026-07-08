@@ -1,0 +1,12 @@
+[package]
+name = "uniserve-model-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+uniserve-chat.workspace = true
+
+[lints]
+workspace = true

@@ -95,30 +95,20 @@ impl TextLlm {
     /// Tokenize if needed, lower to a generate request, and return the raw
     /// token stream.
     pub async fn generate_raw(&self, request: TextRequest) -> Result<GenerateOutputStream> {
-        let (_, raw_stream) = self.generate_inner(request).await?;
+        let raw_stream = self.generate_raw_prepared(self.compile(request)?).await?;
         Ok(raw_stream)
     }
 
     /// Tokenize if needed, lower to a generate request, and stream
     /// incrementally decoded text.
     pub async fn generate(&self, request: TextRequest) -> Result<impl TextOutputStream> {
-        let (text_request, raw_stream) = self.generate_inner(request).await?;
-        let tokenizer = self.backend.tokenizer();
-        let decoded_stream = output::decoded_text_event_stream(
-            text_request.request_id,
-            tokenizer,
-            raw_stream,
-            text_request.decode_options,
-            text_request.intermediate,
-        );
-
-        Ok(decoded_stream)
+        let prepared = self.compile(request)?;
+        self.generate_prepared(prepared).await
     }
 
-    async fn generate_inner(
-        &self,
-        mut request: TextRequest,
-    ) -> Result<(TextRequest, GenerateOutputStream)> {
+    /// Compile one text request into a tokenized, engine-ready request without
+    /// submitting it.
+    pub fn compile(&self, mut request: TextRequest) -> Result<PreparedTextRequest> {
         request.validate()?;
 
         let tokenizer = self.backend.tokenizer();
@@ -131,13 +121,36 @@ impl TextLlm {
 
         let mut sampling_hints = self.backend.sampling_hints()?;
         sampling_hints.max_model_len = Some(self.max_model_len);
-        let PreparedTextRequest {
-            text_request,
-            generate_request,
-        } = lower_text_request(request, prompt_token_ids, sampling_hints, &*tokenizer)?;
+        lower_text_request(request, prompt_token_ids, sampling_hints, &*tokenizer)
+    }
 
-        let raw_stream = self.llm.generate(generate_request).await?;
-        Ok((text_request, raw_stream))
+    /// Submit a previously compiled request and return the raw token stream.
+    pub async fn generate_raw_prepared(
+        &self,
+        prepared: PreparedTextRequest,
+    ) -> Result<GenerateOutputStream> {
+        let raw_stream = self.llm.generate(prepared.generate_request).await?;
+        Ok(raw_stream)
+    }
+
+    /// Submit a previously compiled request and stream incrementally decoded
+    /// text.
+    pub async fn generate_prepared(
+        &self,
+        prepared: PreparedTextRequest,
+    ) -> Result<impl TextOutputStream> {
+        let text_request = prepared.text_request.clone();
+        let raw_stream = self.generate_raw_prepared(prepared).await?;
+        let tokenizer = self.backend.tokenizer();
+        let decoded_stream = output::decoded_text_event_stream(
+            text_request.request_id,
+            tokenizer,
+            raw_stream,
+            text_request.decode_options,
+            text_request.intermediate,
+        );
+
+        Ok(decoded_stream)
     }
 
     /// Shut down the underlying LLM client and its background tasks.

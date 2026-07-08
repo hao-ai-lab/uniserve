@@ -38,6 +38,10 @@ class AttentionCapabilities:
     # token per row), so it must not be dispatched for multi-token paged prefill.
     # Backends whose paged kernel handles arbitrary query lengths leave this False.
     paged_decode_only: bool = False
+    # The backend's paged-varlen prefill path can be captured directly in a CUDA
+    # graph because it consumes live tensor inputs and does not bake mutable host
+    # wrapper plan state that another request can later overwrite.
+    paged_varlen_cuda_graph: bool = False
     # (q, k, v) head-dim geometries the backend's kernel can run. Empty means the
     # backend imposes no fixed-geometry restriction (the common case); a non-empty
     # set declares the exact tuples a geometry-restricted kernel (e.g. fa4_cute's

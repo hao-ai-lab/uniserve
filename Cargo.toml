@@ -46,11 +46,15 @@ uniserve-chat-output = { path = "crates/frontend/chat-output" }
 uniserve-chat-protocol = { path = "crates/frontend/chat-protocol" }
 uniserve-chat-template = { path = "crates/frontend/chat-template" }
 uniserve-engine-client = { path = "crates/frontend/engine-client" }
+uniserve-engine-gateway = { path = "crates/frontend/engine-gateway" }
 uniserve-llm = { path = "crates/frontend/llm" }
+uniserve-model-profile = { path = "crates/frontend/model-profile" }
 uniserve-model-assets = { path = "crates/frontend/model-assets" }
 uniserve-native-api = { path = "crates/frontend/native-api" }
 uniserve-openai-api = { path = "crates/frontend/openai-api" }
+uniserve-protocol-adapters = { path = "crates/frontend/protocol-adapters" }
 uniserve-reasoning-parser = { path = "crates/frontend/reasoning-parser" }
+uniserve-serving = { path = "crates/frontend/serving" }
 uniserve-text = { path = "crates/frontend/text" }
 uniserve-tokenizer = { path = "crates/frontend/tokenizer" }
 uniserve-tool-parser = { path = "crates/frontend/tool-parser" }

@@ -4,13 +4,14 @@ Covers the observable contract of ``uniserve_worker.execution.denoise_step_graph
 
 * replay is bitwise identical to the eager ``_predict_v_batched``-shaped forward
   on the *real* transient attention path (RadixAttention -> transient paged
-  varlen -> FlashInfer paged prefill with graph-scoped exclusive wrapper);
-* a foreign re-plan of the *shared* prefill wrapper between steps cannot corrupt
-  a captured graph (the plan-baking regression the exclusive wrapper exists for);
+  varlen -> the dispatcher-selected graph-capable paged-varlen backend);
+* a foreign re-plan of the *shared* FlashInfer prefill wrapper between steps
+  cannot corrupt a FlashInfer-backed captured graph (the plan-baking regression
+  the exclusive wrapper exists for);
 * returned velocity/hidden tensors never alias the graph's static output buffers
   (the next replay must not rewrite results a caller retained);
-* release frees the per-image graph states and the backend's graph-scoped
-  wrapper bindings, and a later step recaptures cleanly;
+* release frees the per-image graph states and any backend graph-scoped wrapper
+  bindings, and a later step recaptures cleanly;
 * the ``UNISERVE_DENOISE_STEP_GRAPH`` env gate defaults off;
 * capture failures fall back to eager and hard-disable after two strikes.
 
@@ -439,7 +440,12 @@ def test_denoise_step_graph_release_frees_states_and_backend_bindings():
     out, _ = _run(runner, owner, rows)
     assert out is not None
     assert len(runner.states) == 1
-    assert len(_scoped_prefill_keys(backend)) == len(scoped_before) + 1
+    state = next(iter(runner.states.values()))
+    owns_flashinfer_binding = state.release_backend is not None
+    if owns_flashinfer_binding:
+        assert len(_scoped_prefill_keys(backend)) == len(scoped_before) + 1
+    else:
+        assert set(_scoped_prefill_keys(backend)) == scoped_before
 
     image_state = SimpleNamespace(cond_cache=caches[0], tu_cache=caches[1], iu_cache=None)
     release_denoise_step_graphs(owner, image_state)

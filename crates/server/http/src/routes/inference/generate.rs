@@ -17,10 +17,8 @@ use futures::{Stream, StreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tracing::{error, info, trace};
 use tracing_futures::Instrument as _;
-use uniserve_engine_client::protocol::logprobs::{Logprobs, PositionLogprobs};
-use uniserve_llm::{
-    CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStreamExt as _,
-};
+use uniserve_serving::{FinishStatus, RequestMetadata, ServeError, ServeEvent, ServeRequest};
+use uniserve_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs};
 
 use self::convert::prepare_generate_request;
 use self::types::{
@@ -30,12 +28,12 @@ use self::types::{
 use crate::error::{ApiError, bail_server_error, server_error};
 use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::utils::resolve_request_context;
+use serde_json::Value;
 use uniserve_openai_api::logprobs::clamp_logprob;
 use uniserve_openai_types::{ChatLogProbs, ChatLogProbsContent, TopLogProb, Usage};
 use uniserve_server_app::AppState;
 
-/// Validate one token-in/token-out request and proxy it into the shared
-/// `text` stack.
+/// Validate one token-in/token-out request and run it through the serving runtime.
 pub(crate) async fn generate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -58,10 +56,22 @@ pub(crate) async fn generate(
     let include_prompt_logprobs = prepared.include_prompt_logprobs;
     let stream = prepared.stream;
 
-    let raw_stream = match state
-        .chat()
-        .text()
-        .generate_raw(prepared.text_request)
+    let mut serve_request = match ServeRequest::from_text_request(
+        prepared.text_request,
+        RequestMetadata {
+            protocol_adapter: Some("native_generate".to_string()),
+            route: Some("generate".to_string()),
+            ..RequestMetadata::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(error) => return serve_error_to_api(error).into_response(),
+    };
+    serve_request.generation.intermediate = stream;
+
+    let serve_stream = match state
+        .runtime()
+        .serve(serve_request)
         .instrument(request_span.clone())
         .await
     {
@@ -77,7 +87,7 @@ pub(crate) async fn generate(
 
     if stream {
         let chunk_stream = generate_chunk_stream(
-            raw_stream,
+            serve_stream,
             prepared.request_id,
             log_request,
             prepared.include_usage,
@@ -89,19 +99,12 @@ pub(crate) async fn generate(
         return Sse::new(sse_stream).into_response();
     }
 
-    let collected = match raw_stream
-        .collect_output()
+    let collected = match collect_generate_events(serve_stream)
         .instrument(request_span.clone())
         .await
     {
         Ok(collected) => collected,
-        Err(error) => {
-            return server_error!(
-                "failed to collect raw generate response: {}",
-                error.to_report_string()
-            )
-            .into_response();
-        }
+        Err(error) => return error.into_response(),
     };
 
     if log_request {
@@ -109,7 +112,7 @@ pub(crate) async fn generate(
             parent: &request_span,
             prompt_tokens = collected.prompt_token_ids.len(),
             output_tokens = collected.token_ids.len(),
-            finish_reason = collected.finish_reason.as_str(),
+            finish_reason = finish_status_as_str(&collected.finish_reason),
             "generate finished"
         );
     }
@@ -129,7 +132,7 @@ pub(crate) async fn generate(
 
 #[try_stream]
 async fn generate_chunk_stream(
-    stream: impl Stream<Item = uniserve_llm::Result<GenerateOutput>>,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>>,
     request_id: String,
     log_request: bool,
     include_usage: bool,
@@ -140,66 +143,130 @@ async fn generate_chunk_stream(
     pin_mut!(stream);
     let mut prompt_tokens: Option<u32> = None;
     let mut output_tokens = 0_u32;
+    let mut emitted_token_count = 0_usize;
+    let mut pending_chunk: Option<GenerateStreamResponse> = None;
 
     while let Some(next) = stream.next().await {
         match next {
-            Ok(output) => {
-                if prompt_tokens.is_none() {
-                    prompt_tokens = output
-                        .prompt_info
-                        .as_ref()
-                        .map(|info| info.prompt_token_ids.len() as u32);
+            Ok(ServeEvent::Accepted {
+                prompt_token_count, ..
+            }) => {
+                prompt_tokens = Some(prompt_token_count as u32);
+            }
+            Ok(ServeEvent::TextDelta {
+                token_ids,
+                logprobs,
+                ..
+            }) => {
+                if let Some(chunk) = pending_chunk.take() {
+                    y.yield_ok(chunk).await;
                 }
                 let usage_prompt_tokens = prompt_tokens.unwrap_or_default();
-
-                let token_ids = output.token_ids;
+                let suffix_start = if token_ids.len() > emitted_token_count {
+                    emitted_token_count
+                } else {
+                    0
+                };
+                let token_ids = token_ids[suffix_start..].to_vec();
+                let logprobs = logprobs
+                    .as_ref()
+                    .map(|logprobs| decoded_logprobs_suffix(logprobs, suffix_start));
                 output_tokens = output_tokens.saturating_add(token_ids.len() as u32);
-                let finish_reason = output.finish_reason;
+                emitted_token_count = emitted_token_count.saturating_add(token_ids.len());
 
-                if matches!(finish_reason.as_ref(), Some(FinishReason::Error)) {
-                    bail_server_error!("Internal server error");
-                }
-
-                if let Some(finish_reason) = finish_reason.as_ref()
-                    && log_request
-                {
-                    info!(
-                        stream = true,
-                        prompt_tokens = usage_prompt_tokens,
-                        output_tokens,
-                        finish_reason = finish_reason.as_str(),
-                        "generate finished"
-                    );
-                }
-
-                if token_ids.is_empty() && finish_reason.is_none() {
+                if token_ids.is_empty() {
+                    pending_chunk = Some(GenerateStreamResponse {
+                        request_id: request_id.clone(),
+                        choices: vec![GenerateResponseStreamChoice {
+                            index: 0,
+                            logprobs: None,
+                            finish_reason: None,
+                            token_ids,
+                        }],
+                        usage: include_continuous_usage
+                            .then(|| Usage::from_counts(usage_prompt_tokens, output_tokens)),
+                    });
                     continue;
                 }
 
                 let logprobs = if include_logprobs && !token_ids.is_empty() {
-                    let logprobs = output.logprobs.as_ref().ok_or_else(|| {
+                    let logprobs = logprobs.as_ref().ok_or_else(|| {
                         server_error!(
                             "raw generate stream requested logprobs but generation returned none"
                         )
                     })?;
-                    Some(raw_logprobs_to_openai_chat(logprobs)?)
+                    Some(decoded_logprobs_to_openai_chat(logprobs)?)
                 } else {
                     None
                 };
 
-                y.yield_ok(GenerateStreamResponse {
+                pending_chunk = Some(GenerateStreamResponse {
                     request_id: request_id.clone(),
                     choices: vec![GenerateResponseStreamChoice {
                         index: 0,
                         logprobs,
-                        finish_reason: finish_reason.map(|reason| reason.as_str().to_string()),
+                        finish_reason: None,
                         token_ids,
                     }],
                     usage: include_continuous_usage
                         .then(|| Usage::from_counts(usage_prompt_tokens, output_tokens)),
-                })
-                .await;
+                });
             }
+            Ok(ServeEvent::Usage {
+                prompt_tokens: prompt,
+                visible_output_tokens,
+                ..
+            }) => {
+                prompt_tokens = Some(prompt);
+                output_tokens = visible_output_tokens;
+                if include_continuous_usage && let Some(chunk) = pending_chunk.as_mut() {
+                    chunk.usage = Some(Usage::from_counts(
+                        prompt_tokens.unwrap_or_default(),
+                        output_tokens,
+                    ));
+                }
+            }
+            Ok(ServeEvent::Finished { reason, .. }) => {
+                if matches!(reason, FinishStatus::Error) {
+                    bail_server_error!("Internal server error");
+                }
+                if log_request {
+                    info!(
+                        stream = true,
+                        prompt_tokens = prompt_tokens.unwrap_or_default(),
+                        output_tokens,
+                        finish_reason = finish_status_as_str(&reason),
+                        "generate finished"
+                    );
+                }
+                if let Some(mut chunk) = pending_chunk.take() {
+                    if let Some(choice) = chunk.choices.first_mut() {
+                        choice.finish_reason = Some(finish_status_as_str(&reason).to_string());
+                    }
+                    if include_continuous_usage {
+                        chunk.usage = Some(Usage::from_counts(
+                            prompt_tokens.unwrap_or_default(),
+                            output_tokens,
+                        ));
+                    }
+                    y.yield_ok(chunk).await;
+                } else {
+                    y.yield_ok(GenerateStreamResponse {
+                        request_id: request_id.clone(),
+                        choices: vec![GenerateResponseStreamChoice {
+                            index: 0,
+                            logprobs: None,
+                            finish_reason: Some(finish_status_as_str(&reason).to_string()),
+                            token_ids: Vec::new(),
+                        }],
+                        usage: include_continuous_usage.then(|| {
+                            Usage::from_counts(prompt_tokens.unwrap_or_default(), output_tokens)
+                        }),
+                    })
+                    .await;
+                }
+            }
+            Ok(_) => {}
             Err(error) => {
                 error!(
                     error = %error.as_report(),
@@ -208,6 +275,10 @@ async fn generate_chunk_stream(
                 bail_server_error!("{}", error.to_report_string());
             }
         }
+    }
+
+    if let Some(chunk) = pending_chunk.take() {
+        y.yield_ok(chunk).await;
     }
 
     if include_usage {
@@ -237,7 +308,7 @@ fn collect_generate(
                 "raw generate response requested logprobs but generation returned none".to_string(),
             )
         })?;
-        Some(raw_logprobs_to_openai_chat(logprobs)?)
+        Some(decoded_logprobs_to_openai_chat(logprobs)?)
     } else {
         None
     };
@@ -248,7 +319,7 @@ fn collect_generate(
                     .to_string(),
             )
         })?;
-        Some(raw_prompt_logprobs_to_maps(prompt_logprobs))
+        Some(decoded_prompt_logprobs_to_maps(prompt_logprobs))
     } else {
         None
     };
@@ -258,7 +329,7 @@ fn collect_generate(
         choices: vec![GenerateResponseChoice {
             index: 0,
             logprobs,
-            finish_reason: Some(collected.finish_reason.as_str().to_string()),
+            finish_reason: Some(finish_status_as_str(&collected.finish_reason).to_string()),
             token_ids: collected.token_ids,
         }],
         prompt_logprobs,
@@ -266,7 +337,88 @@ fn collect_generate(
     })
 }
 
-fn raw_logprobs_to_openai_chat(logprobs: &Logprobs) -> Result<ChatLogProbs, ApiError> {
+#[derive(Debug, Clone, PartialEq)]
+struct CollectedGenerateOutput {
+    prompt_token_ids: Vec<u32>,
+    prompt_logprobs: Option<DecodedPromptLogprobs>,
+    token_ids: Vec<u32>,
+    logprobs: Option<DecodedLogprobs>,
+    finish_reason: FinishStatus,
+    kv_transfer_params: Option<Value>,
+}
+
+async fn collect_generate_events(
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
+) -> Result<CollectedGenerateOutput, ApiError> {
+    pin_mut!(stream);
+    let mut prompt_token_ids = Vec::new();
+    let mut prompt_logprobs = None;
+    let mut token_ids = Vec::new();
+    let mut logprobs: Option<DecodedLogprobs> = None;
+    let mut finish_reason = None;
+    let mut kv_transfer_params = None;
+
+    while let Some(next) = stream.next().await {
+        match next {
+            Ok(ServeEvent::Accepted {
+                prompt_token_ids: ids,
+                prompt_logprobs: accepted_prompt_logprobs,
+                ..
+            }) => {
+                prompt_token_ids = ids;
+                prompt_logprobs = accepted_prompt_logprobs;
+            }
+            Ok(ServeEvent::TextDelta {
+                token_ids: delta_token_ids,
+                logprobs: delta_logprobs,
+                ..
+            }) => {
+                token_ids.extend(delta_token_ids);
+                if let Some(mut delta_logprobs) = delta_logprobs {
+                    logprobs
+                        .get_or_insert_with(|| DecodedLogprobs {
+                            positions: Vec::new(),
+                        })
+                        .positions
+                        .append(&mut delta_logprobs.positions);
+                }
+            }
+            Ok(ServeEvent::Finished {
+                reason,
+                kv_transfer_params: params,
+                ..
+            }) => {
+                finish_reason = Some(reason);
+                kv_transfer_params = params;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(server_error!(
+                    "raw generate stream failed: {}",
+                    error.to_report_string()
+                ));
+            }
+        }
+    }
+
+    let Some(finish_reason) = finish_reason else {
+        return Err(server_error!(
+            "raw generate stream closed before terminal finish event"
+        ));
+    };
+
+    Ok(CollectedGenerateOutput {
+        prompt_token_ids,
+        prompt_logprobs,
+        token_ids,
+        logprobs,
+        finish_reason,
+        kv_transfer_params,
+    })
+}
+
+fn decoded_logprobs_to_openai_chat(logprobs: &DecodedLogprobs) -> Result<ChatLogProbs, ApiError> {
     let content = logprobs
         .positions
         .iter()
@@ -278,13 +430,19 @@ fn raw_logprobs_to_openai_chat(logprobs: &Logprobs) -> Result<ChatLogProbs, ApiE
     })
 }
 
-fn raw_prompt_logprobs_to_maps(
-    prompt_logprobs: &Logprobs,
+fn decoded_logprobs_suffix(logprobs: &DecodedLogprobs, start: usize) -> DecodedLogprobs {
+    DecodedLogprobs {
+        positions: logprobs.positions.iter().skip(start).cloned().collect(),
+    }
+}
+
+fn decoded_prompt_logprobs_to_maps(
+    prompt_logprobs: &DecodedPromptLogprobs,
 ) -> Vec<Option<HashMap<u32, GenerateLogprob>>> {
     std::iter::once(None)
         .chain(
             prompt_logprobs
-                .positions
+                .scored_positions
                 .iter()
                 .map(|position| Some(position_to_logprob_map(position))),
         )
@@ -292,7 +450,7 @@ fn raw_prompt_logprobs_to_maps(
 }
 
 fn position_to_chat_logprobs_content(
-    position: &PositionLogprobs,
+    position: &DecodedPositionLogprobs,
 ) -> Result<ChatLogProbsContent, ApiError> {
     let chosen = position.entries.first().ok_or_else(|| {
         ApiError::server_error(
@@ -320,7 +478,7 @@ fn position_to_chat_logprobs_content(
     })
 }
 
-fn position_to_logprob_map(position: &PositionLogprobs) -> HashMap<u32, GenerateLogprob> {
+fn position_to_logprob_map(position: &DecodedPositionLogprobs) -> HashMap<u32, GenerateLogprob> {
     position
         .entries
         .iter()
@@ -339,6 +497,38 @@ fn position_to_logprob_map(position: &PositionLogprobs) -> HashMap<u32, Generate
 
 fn format_token_id(token_id: u32) -> String {
     format!("token_id:{token_id}")
+}
+
+fn finish_status_as_str(status: &FinishStatus) -> &'static str {
+    match status {
+        FinishStatus::Stop { .. } => "stop",
+        FinishStatus::Length => "length",
+        FinishStatus::Abort => "abort",
+        FinishStatus::Error => "error",
+        FinishStatus::Repetition => "repetition",
+    }
+}
+
+fn serve_error_to_api(error: ServeError) -> ApiError {
+    match error {
+        ServeError::UnsupportedRuntimeExtension { key, .. } => ApiError::invalid_request(
+            format!("Unsupported runtime extension `{key}`."),
+            Some("uniserve_xargs"),
+        ),
+        ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
+            format!("Only one generate output is supported, got {requested}."),
+            Some("n"),
+        ),
+        ServeError::Text(error) => {
+            ApiError::server_error(format!("text runtime error: {}", error.to_report_string()))
+        }
+        ServeError::Chat(error) => {
+            ApiError::server_error(format!("chat runtime error: {}", error.to_report_string()))
+        }
+        ServeError::Engine(message) => {
+            ApiError::server_error(format!("engine runtime error: {message}"))
+        }
+    }
 }
 
 /// Convert one raw-generate chunk stream into SSE events.
@@ -392,33 +582,30 @@ fn done_sse_event() -> Event {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use futures::{TryStreamExt as _, stream};
-    use uniserve_llm::GeneratePromptInfo;
+    use uniserve_text::DecodedTokenLogprob;
 
     use super::*;
 
     #[tokio::test]
-    async fn generate_chunk_stream_captures_late_prompt_info() {
+    async fn generate_chunk_stream_uses_accepted_prompt_info_for_usage() {
         let stream = stream::iter(vec![
-            Ok(GenerateOutput {
-                request_id: String::new(),
-                prompt_info: None,
-                token_ids: Vec::new(),
-                logprobs: None,
-                finish_reason: None,
-                kv_transfer_params: None,
+            Ok(ServeEvent::Accepted {
+                request_id: "raw-stream".to_string(),
+                prompt_token_count: 2,
+                prompt_token_ids: vec![11, 22],
+                prompt_logprobs: None,
             }),
-            Ok(GenerateOutput {
-                request_id: String::new(),
-                prompt_info: Some(GeneratePromptInfo {
-                    prompt_token_ids: Arc::from([11_u32, 22_u32]),
-                    prompt_logprobs: None,
-                }),
+            Ok(ServeEvent::TextDelta {
+                candidate_id: 0,
+                text: String::new(),
                 token_ids: vec![33],
                 logprobs: None,
-                finish_reason: Some(FinishReason::stop_eos()),
+            }),
+            Ok(ServeEvent::Finished {
+                candidate_id: 0,
+                reason: FinishStatus::Stop { stop_reason: None },
+                finish_detail: None,
                 kv_transfer_params: None,
             }),
         ]);
@@ -434,9 +621,82 @@ mod tests {
             chunks[0].usage.as_ref().expect("chunk usage").prompt_tokens,
             2
         );
+        assert_eq!(chunks[0].choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(
             chunks[1].usage.as_ref().expect("final usage").prompt_tokens,
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_generate_events_aggregates_logprobs_and_finish_metadata() {
+        let stream = stream::iter(vec![
+            Ok(ServeEvent::Accepted {
+                request_id: "raw".to_string(),
+                prompt_token_count: 2,
+                prompt_token_ids: vec![11, 22],
+                prompt_logprobs: Some(DecodedPromptLogprobs {
+                    first_token_id: 11,
+                    first_token: "A".to_string(),
+                    scored_positions: vec![DecodedPositionLogprobs {
+                        entries: vec![DecodedTokenLogprob {
+                            token_id: 22,
+                            token: "B".to_string(),
+                            logprob: -0.5,
+                            rank: 1,
+                        }],
+                    }],
+                }),
+            }),
+            Ok(ServeEvent::TextDelta {
+                candidate_id: 0,
+                text: "C".to_string(),
+                token_ids: vec![33],
+                logprobs: Some(DecodedLogprobs {
+                    positions: vec![DecodedPositionLogprobs {
+                        entries: vec![DecodedTokenLogprob {
+                            token_id: 33,
+                            token: "C".to_string(),
+                            logprob: -0.25,
+                            rank: 1,
+                        }],
+                    }],
+                }),
+            }),
+            Ok(ServeEvent::Finished {
+                candidate_id: 0,
+                reason: FinishStatus::Length,
+                finish_detail: None,
+                kv_transfer_params: None,
+            }),
+        ]);
+
+        let collected = collect_generate_events(stream)
+            .await
+            .expect("collect generate events");
+
+        assert_eq!(collected.prompt_token_ids, vec![11, 22]);
+        assert_eq!(collected.token_ids, vec![33]);
+        assert_eq!(collected.finish_reason, FinishStatus::Length);
+        assert_eq!(
+            collected
+                .prompt_logprobs
+                .as_ref()
+                .expect("prompt logprobs")
+                .scored_positions[0]
+                .entries[0]
+                .token,
+            "B"
+        );
+        assert_eq!(
+            collected
+                .logprobs
+                .as_ref()
+                .expect("sample logprobs")
+                .positions[0]
+                .entries[0]
+                .token,
+            "C"
         );
     }
 }

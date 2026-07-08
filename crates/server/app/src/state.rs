@@ -7,6 +7,7 @@ use tracing::warn;
 use uniserve_chat::ChatLlm;
 use uniserve_engine_client::EngineCoreClient;
 use uniserve_engine_client::protocol::lora::LoraRequest;
+use uniserve_serving::ServingRuntime;
 
 use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
 use uniserve_native_api::NativeModelProfile;
@@ -20,8 +21,8 @@ pub struct AppState {
     /// All public model IDs served by this frontend. The first entry is the
     /// primary ID used in responses; all entries are valid in requests.
     served_model_names: Vec<String>,
-    /// Shared chat facade used by all requests.
-    chat: ChatLlm,
+    /// Canonical semantic serving runtime used by inference requests.
+    runtime: ServingRuntime,
     /// Whether to log a summary line for each completed request.
     enable_log_requests: bool,
     /// Whether to set X-Request-Id on every HTTP response.
@@ -52,7 +53,7 @@ impl AppState {
         );
         Self {
             served_model_names,
-            chat,
+            runtime: ServingRuntime::from_chat_runtime(chat),
             enable_log_requests: false,
             enable_request_id_headers: false,
             server_info: None,
@@ -89,7 +90,12 @@ impl AppState {
 
     /// Shared chat facade used by HTTP and gRPC requests.
     pub fn chat(&self) -> &ChatLlm {
-        &self.chat
+        self.runtime.chat()
+    }
+
+    /// Canonical semantic runtime used by migrated adapters.
+    pub fn runtime(&self) -> &ServingRuntime {
+        &self.runtime
     }
 
     /// Return the model-family profile for the native generation surface.
@@ -178,7 +184,7 @@ impl AppState {
     /// Return a reference to the underlying engine core client for utility
     /// calls.
     pub fn uniserve_engine_client(&self) -> &EngineCoreClient {
-        self.chat.uniserve_engine_client()
+        self.runtime.chat().uniserve_engine_client()
     }
 
     /// Return the current in-flight inference request count for the `/load`
@@ -209,7 +215,7 @@ impl AppState {
         loop {
             match Arc::try_unwrap(self) {
                 Ok(state) => {
-                    state.chat.shutdown().await?;
+                    state.runtime.shutdown().await?;
                     return Ok(());
                 }
                 Err(state) => self = state,

@@ -37,6 +37,7 @@ uniserve-openai-types.workspace = true
 uniserve-reasoning-parser.workspace = true
 uniserve-server-app.workspace = true
 uniserve-server-grpc.workspace = true
+uniserve-serving.workspace = true
 uniserve-text.workspace = true
 uuid.workspace = true
 validator.workspace = true
