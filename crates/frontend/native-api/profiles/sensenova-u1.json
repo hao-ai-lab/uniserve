@@ -18,14 +18,12 @@
     ],
     "image_start_text": null
   },
-  "default_mode": "interleave",
-  "supported_modes": [
-    "text",
-    "image",
-    "interleave",
-    "understand"
+  "supported_constraints": [
+    "default",
+    "und_only",
+    "gen_only"
   ],
-  "understanding": {
+  "context_images": {
     "markers_in_prompt": true
   },
   "image_defaults": {
@@ -122,31 +120,31 @@
       }
     ]
   },
-  "understanding_system_prompt": "",
+  "context_system_prompt": "",
   "prompts": {
-    "text": {
-      "kind": "chatml",
-      "default_system": null,
-      "default_assistant_prefix": ""
-    },
-    "image": {
-      "kind": "chatml",
-      "default_system": "You are an image generation and editing assistant that accurately understands and executes user intent.\n\nYou support two modes:\n\n1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. Put all reasoning inside the block using plain text. DO NOT include any image tags. Keep it reasonable and directly useful for producing the final image.\n\n2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\nTask Types:\n\nA. Text-to-Image Generation:\n- Generate a high-quality image based on the user's description.\n- Ensure visual clarity, semantic consistency, and completeness.\n- DO NOT introduce elements that contradict or override the user's intent.\n\nB. Image Editing:\n- Use the provided image(s) as input or reference for modification or transformation.\n- The result can be an edited image or a new image based on the reference(s).\n- Preserve all unspecified attributes unless explicitly changed.\n\nGeneral Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language.",
-      "default_assistant_prefix": "<think>\n\n</think>\n\n<img>"
-    },
-    "auto_interleave": {
+    "default": {
       "kind": "chatml",
       "default_system": "You are a multimodal assistant capable of reasoning with both text and images. You support two modes:\n\nThink Mode: When reasoning is needed, you MUST start with a <think></think> block and place all reasoning inside it. You MUST interleave text with generated images using tags like <image1>, <image2>. Images can ONLY be generated between <think> and </think>, and may be referenced in the final answer.\n\nNon-Think Mode: When no reasoning is needed, directly provide the answer without reasoning. Do not use tags like <image1>, <image2>; present any images naturally alongside the text.\n\nAfter the think block, always provide a concise, user-facing final answer. The answer may include text, images, or both. Match the user's language in both reasoning and the final answer.",
       "default_assistant_prefix": ""
     },
-    "understand": {
+    "und": {
       "kind": "chatml",
       "default_system": null,
       "default_assistant_prefix": ""
     },
+    "und_with_images": {
+      "kind": "chatml",
+      "default_system": null,
+      "default_assistant_prefix": ""
+    },
+    "gen": {
+      "kind": "chatml",
+      "default_system": "You are an image generation and editing assistant that accurately understands and executes user intent.\n\nYou support two response styles:\n\n1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. Put all reasoning inside the block using plain text. DO NOT include any image tags. Keep it reasonable and directly useful for producing the final image.\n\n2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\nTask Types:\n\nA. Text-to-Image Generation:\n- Generate a high-quality image based on the user's description.\n- Ensure visual clarity, semantic consistency, and completeness.\n- DO NOT introduce elements that contradict or override the user's intent.\n\nB. Image Editing:\n- Use the provided image(s) as input or reference for modification or transformation.\n- The result can be an edited image or a new image based on the reference(s).\n- Preserve all unspecified attributes unless explicitly changed.\n\nGeneral Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language.",
+      "default_assistant_prefix": "<think>\n\n</think>\n\n<img>"
+    },
     "negative": {
       "kind": "chatml",
-      "default_system": "You are an image generation and editing assistant that accurately understands and executes user intent.\n\nYou support two modes:\n\n1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. Put all reasoning inside the block using plain text. DO NOT include any image tags. Keep it reasonable and directly useful for producing the final image.\n\n2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\nTask Types:\n\nA. Text-to-Image Generation:\n- Generate a high-quality image based on the user's description.\n- Ensure visual clarity, semantic consistency, and completeness.\n- DO NOT introduce elements that contradict or override the user's intent.\n\nB. Image Editing:\n- Use the provided image(s) as input or reference for modification or transformation.\n- The result can be an edited image or a new image based on the reference(s).\n- Preserve all unspecified attributes unless explicitly changed.\n\nGeneral Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language.",
+      "default_system": "You are an image generation and editing assistant that accurately understands and executes user intent.\n\nYou support two response styles:\n\n1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. Put all reasoning inside the block using plain text. DO NOT include any image tags. Keep it reasonable and directly useful for producing the final image.\n\n2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\nTask Types:\n\nA. Text-to-Image Generation:\n- Generate a high-quality image based on the user's description.\n- Ensure visual clarity, semantic consistency, and completeness.\n- DO NOT introduce elements that contradict or override the user's intent.\n\nB. Image Editing:\n- Use the provided image(s) as input or reference for modification or transformation.\n- The result can be an edited image or a new image based on the reference(s).\n- Preserve all unspecified attributes unless explicitly changed.\n\nGeneral Rules:\n- For any visible text in the image, follow the language specified for the rendered text in the user's description, not the language of the prompt. If no language is specified, use the user's input language.",
       "default_assistant_prefix": "<img>"
     }
   }

@@ -17,7 +17,7 @@ This document is organized in two parts. **Part 1 (Design)** describes the archi
 │  ┌──────────────┐    ┌─────────────────────┐ │
 │  │  Scheduler    │───▶│    BlockManager      │ │
 │  │  (admission,  │    │  (logical blocks,    │ │
-│  │   FSM, ops)   │    │   ref-counting,      │ │
+│  │   cursor, ops) │    │   ref-counting,      │ │
 │  └──────┬───────┘    │   prefix-cache map,   │ │
 │         │            │   LRU free queue,      │ │
 │         │            │   sliding-window trim) │ │
@@ -170,14 +170,14 @@ Separate from the KV block cache, the engine maintains an `EncoderCacheManager` 
 
 SGLang has a `MultimodalCache` module for similar purposes, but it stores the encoder outputs directly in the process address space. UniServe's engine↔worker split means the engine holds only integer handles and the worker holds the physical tensors; evicted handles are reported to the worker via `ControlOp::FreeEncoder`.
 
-### Generation Modes
+### Generation Constraints
 
-| Mode | KV Behavior |
+| Constraint | KV Behavior |
 |---|---|
-| `Text` | Pure text. Paged KV with prefix caching. Preemptible. |
-| `Image` | Text prompt → image generation. Worst-case KV reserved at admission. Not preemptible. |
-| `AutoInterleave` | Interleaved text + generated images. Full worst-case envelope reserved at admission for deadlock freedom. Not preemptible. |
-| `InterleaveUnd` | Image-understanding interleave with dual-encode (VAE + ViT). Worst-case reserved at admission. Not preemptible. |
+| `UndOnly` without context images | Text output. Paged KV with prefix caching. Preemptible. |
+| `GenOnly` | Image output. Worst-case KV reserved at admission. Not preemptible. |
+| `Default` | Text and image output. Full worst-case envelope reserved at admission for deadlock freedom. Not preemptible. |
+| `UndOnly` with context images | Text output conditioned on staged images with dual-encode (VAE + ViT when available). Worst-case reserved at admission. Not preemptible. |
 
 ### Worker-Side Residency Architecture
 
@@ -193,9 +193,9 @@ The worker's `ResidencyManager` owns multiple physical pools:
 
 ### Three-Cache CFG Architecture
 
-For image generation with classifier-free guidance, the interleave pipeline maintains three parallel paged text caches per request: **cond** (conditional — the real context), **tu** (text-unconditional — negative-prompt KV), and **iu** (image-unconditional). The denoising forward runs all three branches in a single packed mixed forward. The `cond` cache is persistent; `tu` and `iu` are scratch workspace released after image commit.
+For image generation with classifier-free guidance, the generation path maintains three parallel paged text caches per request: **cond** (conditional — the real context), **tu** (text-unconditional — negative-prompt KV), and **iu** (image-unconditional). The denoising forward runs all three branches in a single packed mixed forward. The `cond` cache is persistent; `tu` and `iu` are scratch workspace released after image commit.
 
-### The InterleaveUnd Phase Machine
+### Context-Image Feedback Path
 
 ```
 Prefill (text) ──image position──▶ Encode (VaeEncode → VitEncode)
@@ -212,7 +212,7 @@ Prefill (text) ──image position──▶ Encode (VaeEncode → VitEncode)
                     └──────── continue reasoning ──────┘
 ```
 
-Two position spaces diverge in interleave: **`pos`** (RoPE) increments by 1 per text token and 1 per image block, while **`kvlen`** (KV write head) increments by the actual number of KV positions written. Image tokens use 3-axis `[t, h, w]` RoPE indexes (temporal + spatial grid); text tokens use `[t, 0, 0]`.
+Two position spaces diverge in the context-image path: **`pos`** (RoPE) increments by 1 per text token and 1 per image block, while **`kvlen`** (KV write head) increments by the actual number of KV positions written. Image tokens use 3-axis `[t, h, w]` RoPE indexes (temporal + spatial grid); text tokens use `[t, 0, 0]`.
 
 Vision tokens enter the KV cache as `inputs_embeds` (bypassing token embedding lookup) between `<img>` / `</img>` marker tokens. The `InputImageIngestDriver` builds bidirectional attention masks for intra-image attention and writes KV through the standard `PagedTextCache` path.
 
@@ -222,13 +222,13 @@ Multimodal requests are excluded from text prefix caching because placeholder to
 
 ## Preemption
 
-Text-mode requests are preemptible via recompute (no swap/CPU-offloading). Preempted requests have all blocks released and re-enter the queue for recomputation from `prompt ++ generated_ids`. Image, AutoInterleave, and InterleaveUnd requests are never preempted because committed image KV cannot be replayed.
+Plain `UndOnly` requests are preemptible via recompute (no swap/CPU-offloading). Preempted requests have all blocks released and re-enter the queue for recomputation from `prompt ++ generated_ids`. `GenOnly`, `Default`, and context-image `UndOnly` requests are never preempted because committed image KV cannot be replayed.
 
 SGLang does not implement swap/offload in its core scheduler either (though `HiCache` extends the radix cache to host/NVMe tiers for disaggregated setups). Both systems use recompute as the preemption strategy.
 
 ## Worst-Case Reservation and Deadlock Freedom
 
-Multimodal requests allocate their full worst-case KV at admission so they can always reach completion without contending for blocks. This is the deadlock-freedom invariant: once admitted, an interleave request can always generate its full text budget plus all image boundaries. The tradeoff is lower concurrency — fewer interleave requests can be admitted simultaneously.
+Multimodal requests allocate their full worst-case KV at admission so they can always reach completion without contending for blocks. This is the deadlock-freedom invariant: once admitted, a default request can always generate its full text budget plus all image boundaries. The tradeoff is lower concurrency — fewer default requests can be admitted simultaneously.
 
 ---
 
@@ -736,12 +736,12 @@ let cached_prefix_blocks = cached_prefix_blocks.min(n.div_ceil(bs));
 let cached_prefix_tokens = cached_prefix_blocks.saturating_mul(bs);
 ```
 
-### Interleave FSM: `next_op_iu`
+### Context-Image Path: `next_op_context_image`
 
-The interleave understanding path (`next_op_iu`) implements chunked prefill that yields to the encoder at image boundaries:
+The context-image path (`next_op_context_image`) implements chunked prefill that yields to the encoder at image boundaries:
 
 ```3271:3349:crates/engine/scheduler/src/scheduler.rs
-fn next_op_iu(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
+fn next_op_context_image(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
     // ...
     match phase {
         Phase::Prefill => {
@@ -751,9 +751,9 @@ fn next_op_iu(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
                 // at an unencoded image position -> switch to Encode
                 if let Some(s) = self.running.get_mut(&id) {
                     s.phase = Phase::Encode;
-                    s.iu_encode_step = 0;
+                    s.context_encode_step = 0;
                 }
-                return self.next_op_iu(id, budget);
+                return self.next_op_context_image(id, budget);
             }
             // chunk text to the next image boundary
             // ...
@@ -774,7 +774,7 @@ fn next_op_iu(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
 
 ### Encode Result Resolution
 
-When a VitEncode/VaeEncode result arrives, the scheduler caches the encoder handle and advances the FSM:
+When a VitEncode/VaeEncode result arrives, the scheduler caches the encoder handle and advances the request cursor:
 
 ```4159:4181:crates/engine/scheduler/src/scheduler.rs
 OpKind::VitEncode | OpKind::VaeEncode => {
@@ -798,7 +798,7 @@ OpKind::VitEncode | OpKind::VaeEncode => {
 }
 ```
 
-For InterleaveUnd, the dual-encode FSM is slightly different — VaeEncode advances `iu_encode_step` to 1 (ViT next), while VitEncode resets it to 0, advances `mm_cursor`, and returns to `Phase::Prefill`:
+For context-image requests, the dual-encode path is slightly different — VaeEncode advances `context_encode_step` to 1 (ViT next), while VitEncode resets it to 0, advances `mm_cursor`, and returns to `Phase::Prefill`:
 
 ```3443:3457:crates/engine/scheduler/src/scheduler.rs
 if kind == OpKind::VaeEncode {
@@ -806,10 +806,10 @@ if kind == OpKind::VaeEncode {
         st.gen_h = h;
         st.gen_w = w;
     }
-    st.iu_encode_step = 1; // ViT next
+    st.context_encode_step = 1; // ViT next
 } else {
     st.mm_cursor += 1;
-    st.iu_encode_step = 0;
+    st.context_encode_step = 0;
     st.phase = Phase::Prefill; // continue with the question
 }
 ```

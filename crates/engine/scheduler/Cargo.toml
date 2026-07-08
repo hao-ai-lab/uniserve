@@ -11,7 +11,6 @@ uniserve-engine-api.workspace = true
 uniserve-engine-wire.workspace = true
 uniserve-kv.workspace = true
 uniserve-executor.workspace = true
-uniserve-program.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 crossbeam-channel.workspace = true

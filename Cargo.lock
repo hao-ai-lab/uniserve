@@ -5976,15 +5976,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "uniserve-program"
-version = "0.2.0"
-dependencies = [
- "tokio",
- "uniserve-core",
- "uniserve-engine-api",
-]
-
-[[package]]
 name = "uniserve-reasoning-parser"
 version = "0.2.0"
 dependencies = [
@@ -6010,7 +6001,6 @@ dependencies = [
  "uniserve-engine-wire",
  "uniserve-executor",
  "uniserve-kv",
- "uniserve-program",
  "uniserve-worker-ipc",
  "uniserve-worker-wire",
 ]

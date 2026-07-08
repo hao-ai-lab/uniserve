@@ -66,8 +66,8 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .or(model_max_model_len)
         .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
 
-    // Resolve the model's image/interleave control tokens once from the
-    // tokenizer; they drive both the scheduler's image FSM and native-surface
+    // Resolve the model's image control tokens once from the
+    // tokenizer; they drive both the scheduler's image lifecycle decisions and native-surface
     // prompt ingest.
     let native_profile =
         resolve_native_profile_for_model(&config.model, &*text_backend.tokenizer());

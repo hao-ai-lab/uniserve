@@ -13,8 +13,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_engine_runtime::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MIXED_PREFILL_TOKENS, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS,
+    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
 };
 use uniserve_server_app::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,

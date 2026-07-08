@@ -1,10 +1,10 @@
 """Shared per-request record and percentile helpers for the perf harness.
 
 ``RequestRecord`` is the single raw measurement produced for every request,
-regardless of task. The streaming families (LLM serving / interleave) fill the
+regardless of task. The streaming families (LLM serving / default task) fill the
 token-timing fields (``ttft``/``itl``/``output_len``); the image families
 (t2i / i2i) fill the image fields (``image_latencies``/``image_gen_seconds``).
-A request can fill both (interleave emits text *and* images).
+A request can fill both when it emits text and images.
 
 Percentiles go through :func:`np.percentile` (linear interpolation) so the
 LLM-serving summary is numerically identical to ``refs/sglang``'s

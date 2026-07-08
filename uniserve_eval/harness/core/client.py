@@ -2,8 +2,8 @@
 
 Three wire shapes are supported, selected by ``TaskRequest.kind``:
 
-* ``openai_chat`` -- OpenAI ``/v1/chat/completions`` SSE (LLM serving and chat interleave). TTFT/ITL are measured per text chunk, ``delta.images`` drives image counts and image latency, and ``output_len`` comes from ``usage`` when the server emits it (``stream_options.include_usage``), else the requested length.
-* ``native_generate`` -- UniServe native ``/generate`` SSE (i2i + interleave).
+* ``openai_chat`` -- OpenAI ``/v1/chat/completions`` SSE (LLM serving and default mixed-output tasks). TTFT/ITL are measured per text chunk, ``delta.images`` drives image counts and image latency, and ``output_len`` comes from ``usage`` when the server emits it (``stream_options.include_usage``), else the requested length.
+* ``native_generate`` -- UniServe native ``/generate`` SSE.
   Text tokens drive TTFT/ITL; ``image_begin``/``image_step``/``image_done`` drive
   the image metrics; ``finished`` provides server-reported token/image counts.
 * ``images_generations`` -- OpenAI-style ``/v1/images/generations`` (t2i), a

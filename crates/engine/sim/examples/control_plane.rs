@@ -1,10 +1,10 @@
 //! GPU-free control-plane test in Rust: drive the Scheduler with
-//! SimEngine over concurrent text + image requests; check the FSM/events.
+//! SimEngine over concurrent text + image requests; check lifecycle events.
 use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{EngineHandle, GenEvent, GenerateRequest, Prompt};
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_sim::SimEngine;
@@ -22,7 +22,7 @@ fn main() {
     let mut rxs: HashMap<RequestId, (String, tokio::sync::mpsc::UnboundedReceiver<GenEvent>)> =
         HashMap::new();
     let mut next_id = 1u64;
-    let mut mk = |mode: GenMode, kind: &str, rxs: &mut HashMap<_, _>| {
+    let mut mk = |constraint: GenerationConstraint, kind: &str, rxs: &mut HashMap<_, _>| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let id = RequestId(next_id);
         next_id += 1;
@@ -34,7 +34,7 @@ fn main() {
                 steps: 6,
                 ..Default::default()
             },
-            mode,
+            constraint,
             20,
             tx,
         );
@@ -43,11 +43,13 @@ fn main() {
     };
 
     for _ in 0..3 {
-        handle.submit(mk(GenMode::Text, "text", &mut rxs)).unwrap();
+        handle
+            .submit(mk(GenerationConstraint::UndOnly, "text", &mut rxs))
+            .unwrap();
     }
     for _ in 0..2 {
         handle
-            .submit(mk(GenMode::Image, "image", &mut rxs))
+            .submit(mk(GenerationConstraint::GenOnly, "image", &mut rxs))
             .unwrap();
     }
 

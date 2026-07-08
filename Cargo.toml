@@ -36,7 +36,6 @@ uniserve-engine-runtime = { path = "crates/engine/runtime" }
 uniserve-engine-api = { path = "crates/protocol/engine-api" }
 uniserve-executor = { path = "crates/engine/executor" }
 uniserve-kv = { path = "crates/engine/kv" }
-uniserve-program = { path = "crates/engine/program" }
 uniserve-scheduler = { path = "crates/engine/scheduler" }
 uniserve-sim = { path = "crates/engine/sim" }
 uniserve-worker-ipc = { path = "crates/engine/worker-ipc" }

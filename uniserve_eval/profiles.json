@@ -5,7 +5,7 @@
   "shared": {
     "environment": {
       "UNISERVE_QWEN3_MODEL": "Path to Qwen3-32B",
-      "UNISERVE_SENSENOVA_MODEL": "Path to SenseNova-U1-8B-MoT-Interleaved-local",
+      "UNISERVE_SENSENOVA_MODEL": "Path to SenseNova-U1 model directory",
       "UNISERVE_BAGEL_MODEL": "Path to BAGEL-7B-MoT",
       "UNISERVE_SHAREGPT_PATH": "Path to ShareGPT_V3_unfiltered_cleaned_split.json",
       "UNISERVE_SGLANG_PYTHON": "Python executable for refs/sglang",
@@ -127,7 +127,7 @@
         "--worker-ranks",
         "2"
       ],
-      "description": "UniServe SenseNova benchmark server (TP2, GPU0/GPU1). KV capacity 262144 tokens (~22GB/GPU) with max-num-seqs 12: the scheduler reserves each interleave request's full worst case (prompt + max_tokens + retained-image envelope) at admission, so concurrency scales with KV capacity and cannot deadlock. UNISERVE_DENOISE_STEP_GRAPH is on (validated safe under concurrency); the packed-mixed decoder graph was removed (segfaulted). Text-decode and image-denoise are never co-batched (scheduler default), which is required for correct greedy interleave decode under load.",
+      "description": "UniServe SenseNova benchmark server (TP2, GPU0/GPU1). KV capacity 262144 tokens (~22GB/GPU) with max-num-seqs 12: the scheduler reserves each default request's full worst case (prompt + max_tokens + retained-image envelope) at admission, so concurrency scales with KV capacity and cannot deadlock. UNISERVE_DENOISE_STEP_GRAPH is on (validated safe under concurrency); the packed-mixed decoder graph was removed (segfaulted). Text-decode and image-denoise are never co-batched (scheduler default), which is required for correct mixed-output decode under load.",
       "extends": "benchmark/server/_uniserve-mixed-base",
       "abstract": false
     },
@@ -218,7 +218,7 @@
       "type": "verify",
       "server": "gate/server/sensenova",
       "payload": {
-        "mode": "image",
+        "constraint": "gen_only",
         "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
         "seed": 42,
         "image": {
@@ -237,7 +237,7 @@
       "type": "verify",
       "server": "gate/server/sensenova",
       "payload": {
-        "mode": "understand",
+        "constraint": "und_only",
         "prompt": "Describe this image in detail.",
         "max_tokens": 128,
         "temperature": 0
@@ -249,13 +249,13 @@
       },
       "expect_images": 0,
       "expect_min_text_tokens": 32,
-      "description": "SenseNova image-understanding correctness gate."
+      "description": "SenseNova image-to-text correctness gate."
     },
-    "gate/sensenova/interleave-travel": {
+    "gate/sensenova/default-travel": {
       "type": "verify",
       "server": "gate/server/sensenova",
       "payload": {
-        "mode": "interleave",
+        "constraint": "default",
         "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
         "max_tokens": 4096,
         "temperature": 0,
@@ -272,13 +272,13 @@
       "expect_image_height": 1152,
       "expect_image_steps": 50,
       "timeout_s": 900,
-      "description": "SenseNova interleave correctness gate."
+      "description": "SenseNova default correctness gate."
     },
     "gate/bagel/t2i-seed42": {
       "type": "verify",
       "server": "gate/server/bagel",
       "payload": {
-        "mode": "image",
+        "constraint": "gen_only",
         "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
         "seed": 42,
         "image": {
@@ -297,7 +297,7 @@
       "type": "verify",
       "server": "gate/server/bagel",
       "payload": {
-        "mode": "understand",
+        "constraint": "und_only",
         "prompt": "Describe this image in detail.",
         "max_tokens": 128,
         "temperature": 0
@@ -309,7 +309,7 @@
       },
       "expect_images": 0,
       "expect_min_text_tokens": 32,
-      "description": "BAGEL image-understanding correctness gate."
+      "description": "BAGEL image-to-text correctness gate."
     },
     "perf/tripwire/sensenova/t2i": {
       "type": "perf",
@@ -442,7 +442,7 @@
     "gate/sensenova": [
       "gate/sensenova/t2i-seed42",
       "gate/sensenova/i2t-house",
-      "gate/sensenova/interleave-travel"
+      "gate/sensenova/default-travel"
     ],
     "gate/bagel": [
       "gate/bagel/t2i-seed42",
@@ -451,7 +451,7 @@
     "gate/all": [
       "gate/sensenova/t2i-seed42",
       "gate/sensenova/i2t-house",
-      "gate/sensenova/interleave-travel",
+      "gate/sensenova/default-travel",
       "gate/bagel/t2i-seed42",
       "gate/bagel/i2t-house"
     ],
@@ -509,8 +509,8 @@
             "sensenova_mjhq_t2i_uniserve",
             "sensenova_beans_i2t_uniserve",
             "sensenova_beans_i2t_chat_uniserve",
-            "sensenova_ueval_interleave_uniserve",
-            "sensenova_ueval_interleave_chat_uniserve"
+            "sensenova_ueval_default_uniserve",
+            "sensenova_ueval_default_chat_uniserve"
           ]
         },
         "sensenova-omni": {
@@ -622,12 +622,12 @@
             "wire": "openai_chat_json"
           }
         },
-        "sensenova_ueval_interleave_uniserve": {
+        "sensenova_ueval_default_uniserve": {
           "axis": "arrival_rate",
           "name": "sensenova-uniserve-ueval-r{rate_tag}",
-          "output": "sensenova_ueval_interleave/uniserve_r{rate_tag}",
+          "output": "sensenova_ueval_default/uniserve_r{rate_tag}",
           "harness": {
-            "task": "interleave",
+            "task": "default",
             "model": "SenseNova-U1",
             "dataset": "ueval",
             "num_prompts": 32,
@@ -638,12 +638,12 @@
             "temperature": 0.7
           }
         },
-        "sensenova_ueval_interleave_chat_uniserve": {
+        "sensenova_ueval_default_chat_uniserve": {
           "axis": "arrival_rate",
           "name": "sensenova-uniserve-ueval-chat-r{rate_tag}",
-          "output": "sensenova_ueval_interleave/uniserve_chat_r{rate_tag}",
+          "output": "sensenova_ueval_default/uniserve_chat_r{rate_tag}",
           "harness": {
-            "task": "interleave",
+            "task": "default",
             "model": "SenseNova-U1",
             "dataset": "ueval",
             "num_prompts": 32,

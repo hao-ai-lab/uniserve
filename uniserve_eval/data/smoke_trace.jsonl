@@ -1,1 +1,1 @@
-{"id": "smoke-1", "task": "interleave", "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate."}
+{"id": "smoke-1", "task": "default", "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate."}

@@ -54,7 +54,7 @@ bench-smoke: build-debug
     {{python}} -m uniserve_eval.harness.cli \
         --base-url http://127.0.0.1:18080 \
         --model sim-model \
-        --task interleave \
+        --task default \
         --dataset trace \
         --dataset-path uniserve_eval/data/smoke_trace.jsonl \
         --output-dir results/benchmarks/smoke \

@@ -6,7 +6,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod generation;
 pub mod sampling;
+pub use generation::{
+    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+    GeneratedImageFeedbackRecipe, GenerationConstraint, GenerationConstraintParseError,
+    GenerationPolicyDescriptor, ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment,
+    SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction,
+    UndVisibility, VisibilityPolicyDescriptor,
+};
 pub use sampling::{SampleOutput, apply_sampling};
 
 /// A cloneable, thread-safe wake the command ingress fires after enqueuing a
@@ -92,10 +100,6 @@ pub struct RequestId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct TraceId(pub u64);
 
-/// Program id: the typed `InferenceProgram` compiled from a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-pub struct ProgramId(pub u64);
-
 /// Op id: a single op within a program/request. `(request, seq)`
 /// flattened to a u64 on the wire so the host correlates op result ↔ submitted op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -106,19 +110,6 @@ pub struct OpId(pub u64);
 pub enum Modality {
     Und, // understanding / text
     Gen, // generation / image latents
-}
-
-/// Generation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GenMode {
-    Text,           // pure text
-    Image,          // pure text->image
-    AutoInterleave, // interleaved text+image
-    /// Image-understanding interleave (ThinkMorph): an input image is
-    /// dual-encoded (VAE clean + ViT) into the prompt; the model reasons, emits a
-    /// reasoning image on the literal `<image_start>` text trigger (3-branch CFG),
-    /// dual-encodes it back, and continues until an answer.
-    InterleaveUnd,
 }
 
 /// Text sampling parameters.
@@ -194,8 +185,7 @@ impl Default for SamplingParams {
     }
 }
 
-/// Image (diffusion) parameters. `max_images` makes the
-/// admission budget finite for interleaved requests.
+/// Image (diffusion) parameters. `max_images` makes the admission budget finite for requests that can produce images.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageParams {
     pub steps: u16,
@@ -264,7 +254,7 @@ impl ImageParams {
     pub const DIM_MULTIPLE: u32 = 16;
     /// Upper bound on any single CFG scale.
     pub const MAX_CFG_SCALE: f32 = 100.0;
-    /// Upper bound on `max_images` per interleaved request.
+    /// Upper bound on `max_images` per request.
     pub const MAX_IMAGES: u16 = 256;
 
     /// Validate diffusion parameters before they reach the worker.

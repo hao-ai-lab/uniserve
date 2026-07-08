@@ -2,9 +2,11 @@
 //! of [`GenEvent`]s over a per-request channel. Supports text and image events.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 
-pub use uniserve_core::{GenMode as Mode, ImageParams as ImgParams, SamplingParams as SampParams};
+pub use uniserve_core::{
+    GenerationConstraint as Constraint, ImageParams as ImgParams, SamplingParams as SampParams,
+};
 
 /// A staged multimodal input item: an image (or audio/video) referenced by content
 /// hash that occupies `num_tokens` positions in the AR sequence once its encoder
@@ -24,14 +26,14 @@ pub struct MmItem {
     pub b64: String,
 }
 
-/// One part of an interleaved prompt, as the chat layer produces it.
+/// One prompt part, as the chat layer produces it.
 #[derive(Debug, Clone)]
 pub enum PromptPart {
     Text(String),
     Image { hash: u64, num_tokens: u32 },
 }
 
-/// Interleaved prompt: text plus staged input-image references.
+/// Prompt text plus staged input-image references.
 #[derive(Debug, Clone, Default)]
 pub struct Prompt {
     pub text: String,
@@ -126,7 +128,7 @@ pub struct GenerateRequest {
     pub neg_prompt_ids: Vec<u32>, // CFG text-unconditional prompt (may be empty)
     pub sampling: SamplingParams,
     pub image: ImageParams,
-    pub mode: GenMode,
+    pub constraint: GenerationConstraint,
     pub max_tokens: usize,
     /// Stop strings (matched on the detokenized suffix) and explicit stop token
     /// ids — the request terminates with `FinishReason::Stop` on a hit.
@@ -149,13 +151,41 @@ pub struct GenerateRequest {
 }
 
 impl GenerateRequest {
+    pub fn uses_default_generation(&self) -> bool {
+        self.constraint == GenerationConstraint::Default
+    }
+
+    pub fn is_gen_only(&self) -> bool {
+        self.constraint == GenerationConstraint::GenOnly
+    }
+
+    pub fn is_und_only(&self) -> bool {
+        self.constraint == GenerationConstraint::UndOnly
+    }
+
+    pub fn has_context_images(&self) -> bool {
+        !self.mm_items.is_empty()
+    }
+
+    pub fn uses_feedback_ingest(&self) -> bool {
+        self.is_und_only() && self.has_context_images()
+    }
+
+    pub fn is_plain_und(&self) -> bool {
+        self.is_und_only() && !self.has_context_images()
+    }
+
+    pub fn reserves_worstcase_kv(&self) -> bool {
+        self.is_gen_only() || self.uses_default_generation() || self.uses_feedback_ingest()
+    }
+
     /// A minimal request for tests / internal construction (no stops, default priority).
     pub fn new(
         request_id: RequestId,
         prompt_ids: Vec<u32>,
         sampling: SamplingParams,
         image: ImageParams,
-        mode: GenMode,
+        constraint: GenerationConstraint,
         max_tokens: usize,
         event_tx: EventTx,
     ) -> Self {
@@ -165,7 +195,7 @@ impl GenerateRequest {
             neg_prompt_ids: Vec::new(),
             sampling,
             image,
-            mode,
+            constraint,
             max_tokens,
             stop_strings: Vec::new(),
             stop_token_ids: Vec::new(),
@@ -308,7 +338,7 @@ impl EngineHandle {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+    use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 
     use super::*;
 
@@ -319,7 +349,7 @@ mod tests {
             vec![1, 2, 3],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             32,
             event_tx,
         )
@@ -334,7 +364,7 @@ mod tests {
         assert_eq!(request.request_id, RequestId(7));
         assert_eq!(request.prompt_ids, vec![1, 2, 3]);
         assert_eq!(request.max_tokens, 32);
-        assert_eq!(request.mode, GenMode::Text);
+        assert_eq!(request.constraint, GenerationConstraint::UndOnly);
         assert!(request.neg_prompt_ids.is_empty());
         assert!(request.stop_strings.is_empty());
         assert!(request.stop_token_ids.is_empty());

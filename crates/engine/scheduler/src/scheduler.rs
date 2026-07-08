@@ -1,8 +1,8 @@
 //! Scheduler control loop: one owner thread drives the whole loop (single-owner,
 //! no locks on engine state) — drain commands, advance each running request's
-//! interleave FSM, admit pending requests against the block and scratch budget,
+//! generation lifecycle, admit pending requests against the block and scratch budget,
 //! assemble a `ForwardBatch`, submit it asynchronously through the `Executor`,
-//! and resolve completed `ForwardResult`s into `GenEvent`s and FSM transitions.
+//! and resolve completed `ForwardResult`s into `GenEvent`s and cursor transitions.
 //! `ForwardBatch` assembly is lane-aware for text prefill/decode and may still
 //! mix compatible non-text ops; workers preserve one result per submitted op.
 //!
@@ -11,9 +11,9 @@
 //!   ordering) and admission consumes the queue head;
 //! - scheduling is bounded by the `max_num_batched_tokens` / `max_num_seqs`
 //!   pair with vLLM's clip rule (`min(num_new_tokens, token_budget)`);
-//! - worst-case reservation is a per-request admission attribute: image and
-//!   interleave requests allocate their worst-case KV at admission and are never
-//!   preempted; text requests are budgeted and preemptible.
+//! - worst-case reservation is a per-request admission attribute: default and
+//!   image-output requests allocate their worst-case KV at admission and are
+//!   never preempted; text requests are budgeted and preemptible.
 //!
 //! The worker contract is a stateful diff: a request's static state crosses once
 //! as [`NewRequestData`]; per-step ops carry only deltas (new block ids, new
@@ -22,11 +22,17 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+
+use crate::generation::{
+    CursorProjection, GenerationCursor, GenerationPhase as Phase, GenerationPlanner,
+    PlannedTransition, TransitionValidationError,
+};
 
 pub const MAX_SPEC_DECODE_POS_STATS: usize = 16;
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -170,10 +176,9 @@ pub struct SchedStats {
 
 use crossbeam_channel::Receiver;
 use uniserve_core::{BlockId, CfgParams, Modality};
-use uniserve_core::{GenMode, HashAlgo, RequestId};
+use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{Command, FinishReason, GenEvent, GenerateRequest};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
-use uniserve_program::InferenceProgram;
 use uniserve_worker_wire::{
     EngineCaps, ForwardBatch, ForwardOp, ForwardResult, NewRequestData, OpKind, ResourceClass,
     TokenSource, WorkerForwardStats,
@@ -319,95 +324,35 @@ impl Default for SchedulerConfig {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Phase {
-    /// Encode staged input images (VitEncode) before prefill.
-    Encode,
-    Prefill,
-    DecodeUnd,
-    DenoiseGen,
-    CommitGen,
-    CommitWriteback,
-}
-
 pub struct ReqState {
     pub req: GenerateRequest,
-    pub(crate) phase: Phase,
-    pub(crate) pos: u32,
-    pub(crate) next_token: u32,
-    pub(crate) n_generated: usize,
-    pub(crate) worstcase_blocks: usize,
-    /// Reservation as a per-request admission attribute: image-only and
-    /// image-understanding requests allocate their full worst-case KV at
-    /// admission; auto-interleave allocates its bounded retained-image envelope
-    /// up front and grows text KV incrementally. Reserving requests are exempt
-    /// from preemption.
-    pub(crate) reserve_worstcase: bool,
-    pub(crate) image_id: u32,
-    pub(crate) images_done: usize,
-    pub(crate) text_since_image: usize,
-    /// AutoInterleave sampled an image boundary but cannot reserve the image
-    /// span yet. The request stays resident and must not decode more text until
-    /// the reservation succeeds.
-    pub(crate) auto_image_pending: bool,
-    pub(crate) cond_pos: u32,
-    pub(crate) steps_done: u16,
+    pub(crate) cursor: GenerationCursor,
+    /// Worker stateful-diff registration has crossed the wire for this residency epoch.
+    pub(crate) worker_registered: bool,
+    /// Count of logical block ids already sent to the worker for this residency epoch.
+    pub(crate) blocks_sent: usize,
     pub queued_at: f64,
     pub(crate) cancelled: bool,
     /// The cancel was a server-side abort, not a client cancel.
     pub(crate) aborted: bool,
-    /// Chunked prefill: how many prompt tokens have been prefilled so far.
-    pub(crate) prompt_cursor: u32,
-    /// Preemption: this request was preempted and must recompute from `prompt_cursor`.
-    pub(crate) preempted: bool,
-    /// Per-full-prompt-block prefix hashes (computed at admission).
-    pub(crate) block_hashes: Vec<u64>,
-    /// How many leading prompt blocks were reused from the prefix cache.
-    pub(crate) prefix_cached_blocks: usize,
-    /// Whether this request's blocks have been cached after prefill.
-    pub(crate) blocks_cached: bool,
-    /// Text tokens emitted so far (needed to recompute KV after preemption
-    /// without re-streaming them to the client).
-    pub(crate) generated_ids: Vec<u32>,
-    /// Preemption-recompute: when set, prefill rebuilds KV over this
-    /// sequence (`prompt ++ generated`) instead of the bare prompt.
-    pub(crate) recompute_ids: Option<Vec<u32>>,
-    /// Index of the next staged image to encode.
-    pub(crate) mm_cursor: usize,
-    /// Encoder-cache hashes this request has pinned (released on finish).
-    pub(crate) mm_acquired: Vec<u64>,
     /// Structured-output matcher (compiled grammar and progress).
     pub(crate) grammar: Option<GrammarMatcher>,
-    // ---- stateful-diff contract ----
-    /// Whether the worker holds this request's control record (NewRequestData
-    /// delivered). Reset on preemption (`drop_request` clears the record).
-    pub(crate) worker_registered: bool,
-    /// How many of this request's blocks have crossed the wire; per-op deltas
-    /// are `blocks_for(id)[blocks_sent..]`.
-    pub(crate) blocks_sent: usize,
-    // ---- image-understanding interleave (ThinkMorph) ----
-    /// KV write head (= worker `self.lengths`), distinct from `pos` (rope) once
-    /// image blocks (N+2 KV positions, 1 rope position) are spliced in.
-    pub(crate) kvlen: u32,
-    /// Dual-encode sub-step for the current input image (0 = VAE next, 1 = ViT next).
-    pub(crate) iu_encode_step: u8,
-    /// Generated-image dimensions (the VAE-resized input dims), from the worker.
-    pub(crate) gen_h: u32,
-    pub(crate) gen_w: u32,
-    /// Tokens of the current text round (for the literal `<image_start>` trigger).
-    pub(crate) round_tokens: Vec<u32>,
-    /// True while feeding the closing `<|im_end|>` into KV before a round transition.
-    pub(crate) iu_closing: bool,
-    /// The typed op-graph compiled from this
-    /// request. Host-internal IR alongside the FSM; travels + drops with the
-    /// request, so no manual cleanup. The FSM stays authoritative for execution.
-    pub(crate) program: InferenceProgram,
     /// This request's lifecycle trace.
     pub(crate) trace: crate::trace::RequestTrace,
-    /// Worker-side image latent units currently resident for this request. This
-    /// mirrors the Python runner's ResourceRuntime, which acquires the latent on
-    /// the first denoise op and releases it at commit.
-    pub(crate) worker_image_latent_units: u64,
+}
+
+impl Deref for ReqState {
+    type Target = GenerationCursor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cursor
+    }
+}
+
+impl DerefMut for ReqState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cursor
+    }
 }
 
 pub struct Scheduler {
@@ -470,11 +415,11 @@ pub struct Scheduler {
     /// Explainable policy decisions and per-op latency history.
     decisions: crate::policy::DecisionLog,
     latency: crate::policy::LatencyHistory,
+    planner: GenerationPlanner,
     /// Submit timestamp per in-flight batch (for batch round-trip traces).
     batch_started: HashMap<u64, Instant>,
-    /// Monotonic op/program ids and archived lifecycle traces.
+    /// Monotonic op ids and archived lifecycle traces.
     next_op_id: u64,
-    next_program_id: u64,
     completed_traces: VecDeque<crate::trace::RequestTrace>,
     trace_sink: Option<crate::bench_trace::SchedulerTraceSink>,
     pub peak_ops_in_batch: usize,
@@ -558,6 +503,16 @@ fn opkind_str(k: OpKind) -> &'static str {
     }
 }
 
+fn transition_validation_error_str(error: &TransitionValidationError) -> &'static str {
+    match error {
+        TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
+        TransitionValidationError::MissingDenoiseStep => "missing_denoise_step",
+        TransitionValidationError::DenoiseStepRegression { .. } => "denoise_step_regression",
+        TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
+        TransitionValidationError::UnexpectedSampledToken { .. } => "unexpected_sampled_token",
+    }
+}
+
 fn phase_str(phase: Phase) -> &'static str {
     match phase {
         Phase::Encode => "encode",
@@ -569,12 +524,15 @@ fn phase_str(phase: Phase) -> &'static str {
     }
 }
 
-fn mode_str(mode: GenMode) -> &'static str {
-    match mode {
-        GenMode::Text => "text",
-        GenMode::Image => "image",
-        GenMode::AutoInterleave => "auto_interleave",
-        GenMode::InterleaveUnd => "interleave_und",
+fn generation_str(req: &GenerateRequest) -> &'static str {
+    if req.uses_default_generation() {
+        "default"
+    } else if req.is_gen_only() {
+        "gen_only"
+    } else if req.uses_feedback_ingest() {
+        "und_only_with_context"
+    } else {
+        "und_only"
     }
 }
 
@@ -602,6 +560,7 @@ fn policy_str(policy: SchedulingPolicy) -> &'static str {
 /// than by parallel FIFO queues.
 struct InflightOp {
     kind: OpKind,
+    transition: PlannedTransition,
     /// The op's wire `op_id`, echoed back on its result. `None` for transports
     /// that do not stamp it (then resolution falls back to FIFO order).
     op_id: Option<u64>,
@@ -771,9 +730,9 @@ impl Scheduler {
             ledger: crate::resources::ResourceLedger::new(),
             decisions: crate::policy::DecisionLog::default(),
             latency: crate::policy::LatencyHistory::new(),
+            planner: GenerationPlanner::new(),
             batch_started: HashMap::new(),
             next_op_id: 1,
-            next_program_id: 1,
             completed_traces: VecDeque::new(),
             trace_sink,
             peak_ops_in_batch: 0,
@@ -875,11 +834,6 @@ impl Scheduler {
     /// Round-trip latency EWMA for one op kind (microseconds), if observed.
     pub fn op_latency_us(&self, kind: &str) -> Option<u64> {
         self.latency.get(kind)
-    }
-
-    /// The typed program compiled for a running request.
-    pub fn program_for(&self, id: RequestId) -> Option<&InferenceProgram> {
-        self.running.get(&id).map(|st| &st.program)
     }
 
     /// The in-flight lifecycle trace of a running request.
@@ -1278,9 +1232,8 @@ impl Scheduler {
             "at_s": st.queued_at,
             "request_id": st.req.request_id.0,
             "trace_id": st.trace.trace_id.0,
-            "program_id": st.program.program_id.0,
             "queue": queue,
-            "mode": mode_str(st.req.mode),
+            "generation": generation_str(&st.req),
             "initial_phase": phase_str(st.phase),
             "prompt_tokens": st.req.prompt_ids.len(),
             "max_tokens": st.req.max_tokens,
@@ -1346,7 +1299,7 @@ impl Scheduler {
                 "reason": "queue_full",
                 "waiting": waiting,
                 "max_num_waiting": self.config.max_num_waiting,
-                "mode": mode_str(req.mode),
+                "generation": generation_str(&req),
                 "prompt_tokens": req.prompt_ids.len(),
             }));
             let _ = req.event_tx.send(GenEvent::Rejected {
@@ -1360,68 +1313,29 @@ impl Scheduler {
         // start producing image/text state. Reserve their configured bounded KV
         // envelope at admission so excess concurrency queues instead of
         // exhausting KV after all requests have become resident.
-        let reserve_worstcase = matches!(
-            req.mode,
-            GenMode::Image | GenMode::AutoInterleave | GenMode::InterleaveUnd
-        );
-        // a request with staged images encodes them before prefill.
-        // Understanding interleave prefills SYS first, then encodes the
-        // image at its in-prompt position, so it starts in Prefill.
-        let phase0 = if req.mm_items.is_empty() || req.mode == GenMode::InterleaveUnd {
+        let reserve_worstcase = req.reserves_worstcase_kv();
+        // A request with staged images usually encodes them before prefill.
+        // Context-image requests prefill the text before each image position,
+        // then encode the image into that marker gap.
+        let phase0 = if req.mm_items.is_empty() || req.uses_feedback_ingest() {
             Phase::Prefill
         } else {
             Phase::Encode
         };
-        // compile the request into its typed program (host-internal
-        // IR). The FSM stays authoritative; the program rides along for typed
-        // representation, lifecycle tracking, and policy hints.
-        let mut program = uniserve_program::compile(&req);
-        let program_id = uniserve_core::ProgramId(self.next_program_id);
-        self.next_program_id += 1;
-        program.program_id = program_id;
-        // a lifecycle trace keyed by trace/program/request ids.
+        // A lifecycle trace keyed by trace/request/op ids.
         let trace = crate::trace::RequestTrace::new(
             req.request_id,
             uniserve_core::TraceId(req.request_id.0),
-            program_id,
         );
         let st = ReqState {
-            phase: phase0,
-            pos: 0,
-            next_token: 0,
-            n_generated: 0,
-            worstcase_blocks: worst,
-            reserve_worstcase,
-            image_id: 0,
-            images_done: 0,
-            text_since_image: 0,
-            auto_image_pending: false,
-            cond_pos: 0,
-            steps_done: 0,
+            cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
+            worker_registered: false,
+            blocks_sent: 0,
             queued_at: now(),
             cancelled: false,
             aborted: false,
-            prompt_cursor: 0,
-            preempted: false,
-            block_hashes: Vec::new(),
-            prefix_cached_blocks: 0,
-            blocks_cached: false,
-            generated_ids: Vec::new(),
-            recompute_ids: None,
-            mm_cursor: 0,
-            mm_acquired: Vec::new(),
             grammar: None,
-            worker_registered: false,
-            blocks_sent: 0,
-            kvlen: 0,
-            iu_encode_step: 0,
-            gen_h: 0,
-            gen_w: 0,
-            round_tokens: Vec::new(),
-            iu_closing: false,
-            program,
             trace,
-            worker_image_latent_units: 0,
             req,
         };
         // Structured-output gate: a request with a grammar
@@ -1484,12 +1398,11 @@ impl Scheduler {
 
     fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
         let downsample = (self.caps.latent_downsample as u64).max(1);
-        let (height, width) =
-            if st.req.mode == GenMode::InterleaveUnd && st.gen_h > 0 && st.gen_w > 0 {
-                (st.gen_h, st.gen_w)
-            } else {
-                (st.req.image.height, st.req.image.width)
-            };
+        let (height, width) = if st.req.uses_feedback_ingest() && st.gen_h > 0 && st.gen_w > 0 {
+            (st.gen_h, st.gen_w)
+        } else {
+            (st.req.image.height, st.req.image.width)
+        };
         ceil_div_u64((height as u64).max(1), downsample)
             * ceil_div_u64((width as u64).max(1), downsample)
     }
@@ -1542,8 +1455,8 @@ impl Scheduler {
         }
     }
 
-    fn auto_interleave_remaining_image_span(&self, st: &ReqState) -> usize {
-        if st.req.mode != GenMode::AutoInterleave {
+    fn default_remaining_image_span(&self, st: &ReqState) -> usize {
+        if !st.req.uses_default_generation() {
             return 0;
         }
         let remaining_images = (st.req.image.max_images as usize).saturating_sub(st.images_done);
@@ -1562,49 +1475,45 @@ impl Scheduler {
         let slack = self
             .running
             .get(&id)
-            .map(|st| self.auto_interleave_remaining_image_span(st))
+            .map(|st| self.default_remaining_image_span(st))
             .unwrap_or(0);
         base.saturating_add(slack)
     }
 
     fn worstcase(&self, req: &GenerateRequest, prompt_len: usize) -> usize {
         let bs = self.caps.block_size as usize;
-        let toks = match req.mode {
-            GenMode::Text => prompt_len + req.max_tokens,
-            GenMode::Image => {
-                prompt_len + self.generated_image_span(&req.image) * req.image.max_images as usize
-            }
-            GenMode::AutoInterleave => {
-                // Deadlock-freedom invariant: the complete worst case (full
-                // text budget + retained-image envelope) is physically
-                // allocated at admission, so a resident interleave request can
-                // always reach EOS/max_tokens/its image boundaries without
-                // taking blocks from — or waiting on — any other resident.
-                // AutoInterleave is not preemptible (committed image KV cannot
-                // be replayed from generated_ids), so reserving less than this
-                // deadlocks the engine once concurrent residents exhaust the
-                // free pool mid-decode: every request needs one more block,
-                // none can be evicted, none can finish. Concurrency scales
-                // with --kv-token-capacity, not with optimistic admission.
-                prompt_len
-                    + req.max_tokens
-                    + self.generated_image_span(&req.image) * req.image.max_images as usize
-            }
+        let toks = if req.is_plain_und() {
+            prompt_len + req.max_tokens
+        } else if req.is_gen_only() {
+            prompt_len + self.generated_image_span(&req.image) * req.image.max_images as usize
+        } else if req.uses_default_generation() {
+            // Deadlock-freedom invariant: the complete worst case (full
+            // text budget + retained-image envelope) is physically
+            // allocated at admission, so a resident default request can
+            // always reach EOS/max_tokens/its image boundaries without
+            // taking blocks from — or waiting on — any other resident.
+            // default generation is not preemptible (committed image KV cannot
+            // be replayed from generated_ids), so reserving less than this
+            // deadlocks the engine once concurrent residents exhaust the
+            // free pool mid-decode: every request needs one more block,
+            // none can be evicted, none can finish. Concurrency scales
+            // with --kv-token-capacity, not with optimistic admission.
+            prompt_len
+                + req.max_tokens
+                + self.generated_image_span(&req.image) * req.image.max_images as usize
+        } else {
             // Exact image token counts come back from the worker's encode ops;
             // reserve generously up front for the input image + each generated
             // reasoning image. The VAE half of the dual-encode budgets only
             // when the worker implements it.
-            GenMode::InterleaveUnd => {
-                let vae_tokens = if self.supports_vae_encode() {
-                    self.cap_max_vae_grid_tokens()
-                } else {
-                    0
-                };
-                let per_image = vae_tokens
-                    + self.cap_max_vit_grid_tokens()
-                    + 2 * self.cap_commit_marker_tokens();
-                prompt_len + req.max_tokens + per_image * (1 + req.image.max_images as usize)
-            }
+            let vae_tokens = if self.supports_vae_encode() {
+                self.cap_max_vae_grid_tokens()
+            } else {
+                0
+            };
+            let per_image =
+                vae_tokens + self.cap_max_vit_grid_tokens() + 2 * self.cap_commit_marker_tokens();
+            prompt_len + req.max_tokens + per_image * (1 + req.image.max_images as usize)
         };
         toks.div_ceil(bs)
     }
@@ -1796,6 +1705,16 @@ impl Scheduler {
             .is_some_and(|items| items.iter().any(|op| op.decode_token_count > 1))
     }
 
+    fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
+        let st = self.running.get(&id)?;
+        let transitions = self
+            .inflight_ops
+            .get(&id)
+            .into_iter()
+            .flat_map(|items| items.iter().map(|op| &op.transition));
+        Some(st.cursor.project(transitions))
+    }
+
     /// Whether any in-flight op for `id` is something other than a plain decode
     /// (a prefill chunk, an image op, …). Used to gate decode-lookahead.
     fn inflight_has_non_decode(&self, id: RequestId) -> bool {
@@ -1805,11 +1724,13 @@ impl Scheduler {
     }
 
     fn register_inflight(&mut self, op: &ForwardOp, started: Instant) {
+        let transition = self.planner.plan(op);
         self.inflight_ops
             .entry(op.req_id)
             .or_default()
             .push_back(InflightOp {
                 kind: op.kind,
+                transition,
                 op_id: op.op_id,
                 spec_tokens: op.spec_token_ids.clone().unwrap_or_default(),
                 decode_token_count: op.decode_token_count.unwrap_or(1).max(1),
@@ -1823,7 +1744,7 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         op_id: Option<u64>,
-    ) -> (Option<OpKind>, Vec<u32>, Option<Instant>) {
+    ) -> (Option<PlannedTransition>, Vec<u32>, Option<Instant>) {
         let Some(queue) = self.inflight_ops.get_mut(&id) else {
             return (None, Vec::new(), None);
         };
@@ -1832,7 +1753,7 @@ impl Scheduler {
             self.inflight_ops.remove(&id);
         }
         match resolved {
-            Some(op) => (Some(op.kind), op.spec_tokens, Some(op.started)),
+            Some(op) => (Some(op.transition), op.spec_tokens, Some(op.started)),
             None => (None, Vec::new(), None),
         }
     }
@@ -1925,7 +1846,8 @@ impl Scheduler {
             let id = sr.req_id;
             // op_id-correlated completion: resolve the exact op the
             // worker echoed, not merely the FIFO-oldest one.
-            let (kind, draft_token_ids, started) = self.pop_inflight(id, sr.op_id);
+            let (transition, draft_token_ids, started) = self.pop_inflight(id, sr.op_id);
+            let kind = transition.as_ref().map(|transition| transition.kind);
             let draft_tokens = draft_token_ids.len();
             // fold this op's host-side round-trip latency into the history.
             let roundtrip_us = started
@@ -1942,10 +1864,38 @@ impl Scheduler {
                 .sampled_token_ids
                 .as_ref()
                 .and_then(|ids| ids.last().copied());
+            let transition_delta = transition
+                .as_ref()
+                .map(|transition| transition.delta.as_str());
+            let transition_new_blocks = transition
+                .as_ref()
+                .map(|transition| transition.resources.new_blocks);
+            let transition_kv_target = transition
+                .as_ref()
+                .and_then(|transition| transition.resources.kv_target_tokens);
+            let transition_scratch_units = transition
+                .as_ref()
+                .map(|transition| transition.resources.scratch_units);
+            let transition_latent_units = transition
+                .as_ref()
+                .map(|transition| transition.resources.latent_units);
+            let transition_encoder_pins = transition
+                .as_ref()
+                .map(|transition| transition.resources.encoder_pins.len());
+            let transition_replayability = transition
+                .as_ref()
+                .map(|transition| transition.resources.replayability_after_apply.as_str());
             resolved_ops.push(json!({
                 "request_id": id.0,
                 "op_id": op_id,
                 "op_kind": kind.map(opkind_str),
+                "transition_delta": transition_delta,
+                "transition_new_blocks": transition_new_blocks,
+                "transition_kv_target": transition_kv_target,
+                "transition_scratch_units": transition_scratch_units,
+                "transition_latent_units": transition_latent_units,
+                "transition_encoder_pins": transition_encoder_pins,
+                "transition_replayability": transition_replayability,
                 "roundtrip_us": roundtrip_us,
                 "sampled_token": sr.sampled_token_id.is_some(),
                 "sampled_token_ids_len": sampled_token_ids_len,
@@ -1971,18 +1921,33 @@ impl Scheduler {
                 ev.worker_us = worker_us;
                 st.trace.push(ev);
             }
-            if let Some(kind) = kind {
+            if let Some(transition) = transition {
+                if let Err(error) = transition.validate_result(&sr) {
+                    self.trace_record(json!({
+                        "event": "transition_validation_failed",
+                        "at_s": now(),
+                        "request_id": id.0,
+                        "op_id": transition.op_id,
+                        "op_kind": opkind_str(transition.kind),
+                        "error": transition_validation_error_str(&error),
+                    }));
+                    if self.running.contains_key(&id) {
+                        self.finish(id, FinishReason::Error);
+                    }
+                    continue;
+                }
+                let kind = transition.kind;
                 let priority = match kind {
                     OpKind::DenoiseGen | OpKind::CommitGen | OpKind::CommitWriteback => 0,
                     _ => 1,
                 };
-                to_resolve.push((priority, seq_index, id, kind, sr, draft_token_ids));
+                to_resolve.push((priority, seq_index, id, transition, sr, draft_token_ids));
             }
         }
         to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
-        for (_priority, _seq_index, id, kind, sr, draft_token_ids) in to_resolve {
+        for (_priority, _seq_index, id, transition, sr, draft_token_ids) in to_resolve {
             if self.running.contains_key(&id) {
-                self.resolve(id, kind, sr, draft_token_ids);
+                self.resolve(id, transition, sr, draft_token_ids);
             }
             if let Some(st) = self.running.get(&id) {
                 progress_ops.push(json!({
@@ -1996,8 +1961,8 @@ impl Scheduler {
                     "kvlen": st.kvlen,
                     "next_token": st.next_token,
                     "text_since_image": st.text_since_image,
-                    "auto_image_pending": st.auto_image_pending,
-                    "iu_closing": st.iu_closing,
+                    "default_image_pending": st.default_image_pending,
+                    "context_round_closing": st.context_round_closing,
                 }));
             }
         }
@@ -2210,14 +2175,15 @@ impl Scheduler {
 
             if head.reserve_worstcase {
                 let need = head.worstcase_blocks;
-                let scratch_ok = match head.req.mode {
-                    GenMode::Image | GenMode::AutoInterleave => self.bm.can_reserve_scratch(
+                let scratch_ok = if head.req.is_gen_only() || head.req.uses_default_generation() {
+                    self.bm.can_reserve_scratch(
                         self.num_vae(&head.req.image) * self.cap_max_cfg_branches(),
-                    ),
-                    GenMode::InterleaveUnd => self
-                        .bm
-                        .can_reserve_scratch(self.cap_max_vae_grid_tokens() as u64),
-                    GenMode::Text => true,
+                    )
+                } else if head.req.uses_feedback_ingest() {
+                    self.bm
+                        .can_reserve_scratch(self.cap_max_vae_grid_tokens() as u64)
+                } else {
+                    true
                 };
                 if need > self.usable_blocks {
                     let st = self.pending.pop_request().unwrap();
@@ -2233,7 +2199,7 @@ impl Scheduler {
                         "reason": "too_large",
                         "needed_blocks": need,
                         "usable_blocks": self.usable_blocks,
-                        "mode": mode_str(st.req.mode),
+                        "generation": generation_str(&st.req),
                         "prompt_tokens": st.req.prompt_ids.len(),
                     }));
                     let _ = st.req.event_tx.send(GenEvent::Rejected {
@@ -2283,7 +2249,7 @@ impl Scheduler {
                         "reason": "too_large",
                         "needed_blocks": first_chunk_blocks,
                         "usable_blocks": text_usable_blocks,
-                        "mode": mode_str(st.req.mode),
+                        "generation": generation_str(&st.req),
                         "prompt_tokens": st.req.prompt_ids.len(),
                     }));
                     let _ = st.req.event_tx.send(GenEvent::Rejected {
@@ -2344,7 +2310,7 @@ impl Scheduler {
         // Capacity is counted in blocks, not tokens multiplied by `block_size`.
         // `resources.rs` (ResourceLease::capacity) is the unit authority: KvBlock is blocks.
         let kv_capacity = st.worstcase_blocks as u64;
-        let mode = mode_str(st.req.mode);
+        let generation = generation_str(&st.req);
         let phase = phase_str(st.phase);
         let prompt_tokens = st.req.prompt_ids.len();
         let max_tokens = st.req.max_tokens;
@@ -2369,7 +2335,7 @@ impl Scheduler {
             "request_id": id.0,
             "queued_at_s": q,
             "queue_wait_s": scheduled_at - q,
-            "mode": mode,
+            "generation": generation,
             "phase": phase,
             "prompt_tokens": prompt_tokens,
             "max_tokens": max_tokens,
@@ -2444,6 +2410,9 @@ impl Scheduler {
             if budget == 0 {
                 break;
             }
+            if !self.has_inflight(id) {
+                self.resolve_cached_input_images(id);
+            }
             if self.has_inflight(id)
                 && !self.can_decode_lookahead(id)
                 && !self.can_prefill_decode_lookahead(id)
@@ -2473,7 +2442,7 @@ impl Scheduler {
                     && self
                         .running
                         .get(&id)
-                        .is_some_and(|st| st.req.mode == GenMode::Text);
+                        .is_some_and(|st| st.req.is_plain_und());
                 if !mixed_prefill {
                     continue;
                 }
@@ -2537,7 +2506,7 @@ impl Scheduler {
                         if self
                             .running
                             .get(&id)
-                            .map(|st| st.auto_image_pending)
+                            .map(|st| st.default_image_pending)
                             .unwrap_or(false)
                         {
                             break;
@@ -2559,6 +2528,33 @@ impl Scheduler {
         }
         ops.extend(mixed_ops);
         (new_reqs, ops)
+    }
+
+    fn resolve_cached_input_images(&mut self, id: RequestId) {
+        let Some(st) = self.running.get(&id) else {
+            return;
+        };
+        if st.phase != Phase::Encode || st.req.uses_feedback_ingest() {
+            return;
+        }
+        let (mm_items, mut cursor) = (st.req.mm_items.clone(), st.mm_cursor);
+        while cursor < mm_items.len() {
+            let hash = mm_items[cursor].hash;
+            if self.enc_cache.lookup(hash).is_none() {
+                break;
+            }
+            self.enc_cache.acquire(hash);
+            if let Some(st) = self.running.get_mut(&id) {
+                st.mm_acquired.push(hash);
+                st.mm_cursor = cursor + 1;
+            }
+            cursor += 1;
+        }
+        if cursor >= mm_items.len()
+            && let Some(st) = self.running.get_mut(&id)
+        {
+            st.phase = Phase::Prefill;
+        }
     }
 
     fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
@@ -2629,7 +2625,7 @@ impl Scheduler {
             ) => 1,
             Some(OpKind::DenoiseGen) => 2,
             // Sample/EncodeFrame are StageRouter-injected stage ops, never produced
-            // by this scheduler's per-request FSM; group them with "no op".
+            // by this scheduler's per-request planner; group them with "no op".
             Some(OpKind::Sample | OpKind::EncodeFrame) | None => 3,
         }
     }
@@ -2642,7 +2638,7 @@ impl Scheduler {
             return false;
         };
         if st.cancelled
-            || st.req.mode != GenMode::Text
+            || !st.req.is_plain_und()
             || st.phase != Phase::DecodeUnd
             || st.grammar.is_some()
         {
@@ -2686,15 +2682,18 @@ impl Scheduler {
             return false;
         };
         if st.cancelled
-            || st.req.mode != GenMode::Text
+            || !st.req.is_plain_und()
             || st.phase != Phase::Prefill
             || st.grammar.is_some()
         {
             return false;
         }
-        // The whole prompt must already be cursored into the in-flight chunk
-        // (cursor advances at build time), i.e. the final prefill is running.
-        if (st.prompt_cursor as usize) < Self::effective_prompt(st).len() {
+        // The whole prompt must already be covered by the in-flight prefill
+        // transition, i.e. the final prefill is running.
+        if self
+            .projected_cursor(id)
+            .is_none_or(|cursor| (cursor.prompt_cursor as usize) < Self::effective_prompt(st).len())
+        {
             return false;
         }
         let Some(items) = self.inflight_ops.get(&id) else {
@@ -2726,8 +2725,8 @@ impl Scheduler {
             .any(|kind| kind == opkind_str(OpKind::TargetVerifyUnd))
     }
 
-    /// Whether the worker implements the VAE half of the understanding
-    /// dual-encode. Models without a VAE (e.g. patch-space denoisers) declare
+    /// Whether the worker implements the VAE half of context-image dual-encode.
+    /// Models without a VAE (e.g. patch-space denoisers) declare
     /// only `vit_encode`; their input images single-encode and budget no VAE
     /// grid tokens.
     fn supports_vae_encode(&self) -> bool {
@@ -2752,7 +2751,7 @@ impl Scheduler {
             || use_last_sampled
             || budget <= 1
             || st.phase != Phase::DecodeUnd
-            || st.req.mode == GenMode::InterleaveUnd
+            || st.req.uses_feedback_ingest()
             || st.grammar.is_some()
             || allowed.is_some()
         {
@@ -2791,9 +2790,7 @@ impl Scheduler {
             stop_ids.extend(self.ctrl.eos.iter().copied());
         }
         stop_ids.extend(st.req.stop_token_ids.iter().copied());
-        if st.req.mode == GenMode::AutoInterleave
-            && st.images_done < st.req.image.max_images as usize
-        {
+        if st.req.uses_default_generation() && st.images_done < st.req.image.max_images as usize {
             if self.ctrl.start_of_image != 0 {
                 stop_ids.push(self.ctrl.start_of_image);
             }
@@ -2812,20 +2809,20 @@ impl Scheduler {
         let Some(st) = self.running.get(&id) else {
             return 1;
         };
-        if st.req.mode != GenMode::AutoInterleave {
+        if !st.req.uses_default_generation() {
             return usize::MAX;
         }
         let bs = self.caps.block_size as usize;
-        let image_slack = self.auto_interleave_remaining_image_span(st);
+        let image_slack = self.default_remaining_image_span(st);
         let allocated_token_cap = self.bm.blocks_for(id).len().saturating_mul(bs);
         let in_allocated = allocated_token_cap.saturating_sub(pos.saturating_add(image_slack));
         let decode_waiters = self
             .running
             .values()
             .filter(|candidate| {
-                candidate.req.mode == GenMode::AutoInterleave
+                candidate.req.uses_default_generation()
                     && candidate.phase == Phase::DecodeUnd
-                    && !candidate.auto_image_pending
+                    && !candidate.default_image_pending
                     && !candidate.cancelled
             })
             .count()
@@ -2836,13 +2833,28 @@ impl Scheduler {
 
     fn peek_next_kind(&self, id: RequestId) -> Option<OpKind> {
         let st = self.running.get(&id)?;
-        if st.auto_image_pending {
+        if st.default_image_pending {
             return None;
+        }
+        if st.req.uses_feedback_ingest()
+            && st.phase == Phase::Prefill
+            && self.projected_cursor(id).is_some_and(|cursor| {
+                st.req
+                    .mm_items
+                    .get(st.mm_cursor)
+                    .is_some_and(|item| item.position as usize == cursor.prompt_cursor as usize)
+            })
+        {
+            return if st.context_encode_step == 0 && self.supports_vae_encode() {
+                Some(OpKind::VaeEncode)
+            } else {
+                Some(OpKind::VitEncode)
+            };
         }
         Some(match st.phase {
             Phase::Encode
-                if st.req.mode == GenMode::InterleaveUnd
-                    && st.iu_encode_step == 0
+                if st.req.uses_feedback_ingest()
+                    && st.context_encode_step == 0
                     && self.supports_vae_encode() =>
             {
                 OpKind::VaeEncode
@@ -2862,10 +2874,10 @@ impl Scheduler {
             if st.reserve_worstcase {
                 return false;
             }
-            // AutoInterleave replay is too expensive under high concurrency: even
+            // default generation replay is too expensive under high concurrency: even
             // prompt-only victims can quickly become prompt++generated victims and
             // churn the same long prefix forever. Keep these requests resident.
-            if st.req.mode == GenMode::AutoInterleave {
+            if st.req.uses_default_generation() {
                 return false;
             }
             true
@@ -3013,23 +3025,6 @@ impl Scheduler {
             self.register_inflight(op, submit_at);
             let opk = opkind_str(op.kind);
             if let Some(st) = self.running.get_mut(&op.req_id) {
-                // the FSM may only emit op kinds
-                // the request's typed program declares (proven across the sim suite).
-                // A violation indicates a program/FSM drift bug; surface it in all
-                // builds (release included) rather than silently no-op'ing, while
-                // still failing hard under test via the debug_assert.
-                if !st.program.wire_kinds().contains(opk) {
-                    tracing::warn!(
-                        "program/FSM drift: FSM emitted op {opk} not declared by the \
-                         typed program for {:?}",
-                        op.req_id,
-                    );
-                    debug_assert!(
-                        false,
-                        "FSM emitted op {opk} not declared by the program for {:?}",
-                        op.req_id,
-                    );
-                }
                 let mut ev =
                     crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpSubmitted);
                 ev.op_id = Some(oid);
@@ -3171,11 +3166,11 @@ impl Scheduler {
         st.recompute_ids.as_deref().unwrap_or(&st.req.prompt_ids)
     }
 
-    fn prefilled_auto_image_start(&self, id: RequestId) -> bool {
+    fn prefilled_default_image_start(&self, id: RequestId) -> bool {
         let Some(st) = self.running.get(&id) else {
             return false;
         };
-        st.req.mode == GenMode::AutoInterleave
+        st.req.uses_default_generation()
             && self.ctrl.start_of_image != 0
             && st.images_done < st.req.image.max_images as usize
             && Self::effective_prompt(st).last().copied() == Some(self.ctrl.start_of_image)
@@ -3211,18 +3206,18 @@ impl Scheduler {
         if !self.stage_ready(id) {
             return None;
         }
-        if self.running.get(&id)?.req.mode == GenMode::InterleaveUnd {
-            return self.next_op_iu(id, budget);
+        if self.running.get(&id)?.req.uses_feedback_ingest() {
+            return self.next_op_context_image(id, budget);
         }
-        if self.running.get(&id)?.auto_image_pending {
+        if self.running.get(&id)?.default_image_pending {
             self.begin_image(id);
-            if self.running.get(&id)?.auto_image_pending {
+            if self.running.get(&id)?.default_image_pending {
                 return None;
             }
         }
         let phase = self.running.get(&id)?.phase;
         // Final-prefill-in-flight requests build their first decode op early
-        // (cross-boundary lookahead); the FSM phase itself advances at resolve.
+        // (cross-boundary lookahead); the committed phase advances at resolve.
         let phase = if phase == Phase::Prefill && self.can_prefill_decode_lookahead(id) {
             Phase::DecodeUnd
         } else {
@@ -3230,32 +3225,15 @@ impl Scheduler {
         };
         match phase {
             Phase::Encode => {
-                // skip any images already in the encoder cache (pinning them),
-                // then emit a VitEncode for the first uncached image. The embedding
-                // never crosses the wire — the op carries the content hash + a
-                // staged-image handle, the result returns an encoder handle.
-                let (mm_items, mut cursor) = {
+                // Emit a VitEncode for the first uncached image. The embedding
+                // never crosses the wire: the op carries the content hash and a
+                // staged-image handle, and the result returns an encoder handle.
+                let (mm_items, cursor) = {
                     let st = self.running.get(&id)?;
                     (st.req.mm_items.clone(), st.mm_cursor)
                 };
-                while cursor < mm_items.len() {
-                    let hash = mm_items[cursor].hash;
-                    if self.enc_cache.lookup(hash).is_some() {
-                        self.enc_cache.acquire(hash);
-                        if let Some(st) = self.running.get_mut(&id) {
-                            st.mm_acquired.push(hash);
-                            st.mm_cursor = cursor + 1;
-                        }
-                        cursor += 1;
-                    } else {
-                        break;
-                    }
-                }
                 if cursor >= mm_items.len() {
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.phase = Phase::Prefill;
-                    }
-                    return self.next_op(id, budget);
+                    return None;
                 }
                 let item = mm_items[cursor].clone();
                 let staged = ((id.0) << 20) | (cursor as u64); // StagedImageId
@@ -3274,7 +3252,7 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let prompt = Self::effective_prompt(st).to_vec();
                 let n = prompt.len();
-                let cursor = st.prompt_cursor as usize;
+                let cursor = self.projected_cursor(id)?.prompt_cursor as usize;
                 // Chunked prefill with the clip rule: the chunk is bounded by
                 // the remaining step budget and the long-prefill threshold.
                 let chunk_cap = (n - cursor)
@@ -3287,13 +3265,6 @@ impl Scheduler {
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                // Advance the cursor at build time: a request with an op in flight
-                // is never re-scheduled, so this is the authoritative chunk end and
-                // `resolve` simply checks cursor vs prompt length (no re-derivation).
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.prompt_cursor = end as u32;
-                    st.pos = end as u32;
-                }
                 Some(ForwardOp {
                     req_id: id,
                     kind: OpKind::PrefillUnd,
@@ -3318,7 +3289,7 @@ impl Scheduler {
                 {
                     return None;
                 }
-                let pos = st.pos + lookahead_depth as u32;
+                let pos = self.projected_cursor(id)?.logical_pos;
                 let tok = if use_last_sampled { 0 } else { st.next_token };
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
@@ -3444,22 +3415,22 @@ impl Scheduler {
         }
     }
 
-    // ====================== image-understanding FSM ======================
-    // ThinkMorph interleave: prefill [SYS], dual-encode the input image (VAE clean
+    // ====================== context-image feedback path ======================
+    // ThinkMorph-style context path: prefill [SYS], dual-encode the input image (VAE clean
     // ⊕ ViT) at its in-prompt position, prefill [question], decode text; on the
     // literal `<image_start>` in a finished round, 3-branch-CFG denoise a reasoning
     // image, dual re-encode it back, and continue. KV length (`kvlen`) and rope
     // (`pos`) diverge once an image block (N+2 KV positions, 1 rope position) is
     // spliced in.
 
-    /// Build the next op for an InterleaveUnd request. Block addressing uses the
+    /// Build the next op for a context-image request. Block addressing uses the
     /// full worst-case mapping (exact image token counts come from the worker),
     /// which the reservation allocated at admission.
-    /// Burst plan for understanding-mode text decode. Rounds always close on
+    /// Burst plan for context-image text decode. Rounds always close on
     /// <|im_end|>, so eos is unconditionally a burst stop; the KV capacity is
     /// pre-reserved worst-case at admission, so no per-token block gating is
     /// needed beyond the step budget.
-    fn iu_decode_burst_plan(&self, id: RequestId, budget: usize) -> (u16, Option<Vec<u32>>) {
+    fn context_decode_burst_plan(&self, id: RequestId, budget: usize) -> (u16, Option<Vec<u32>>) {
         let Some(st) = self.running.get(&id) else {
             return (1, None);
         };
@@ -3469,7 +3440,7 @@ impl Scheduler {
             || sp.presence_penalty != 0.0;
         if self.decode_token_burst <= 1
             || budget <= 1
-            || st.iu_closing
+            || st.context_round_closing
             || st.grammar.is_some()
             || sp.temperature > 0.0
             || sp.n_logprobs != 0
@@ -3495,32 +3466,41 @@ impl Scheduler {
         (count, Some(stop_ids))
     }
 
-    fn next_op_iu(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
+    fn next_op_context_image(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
+        let projection = self.projected_cursor(id)?;
         let (phase, wc) = {
             let st = self.running.get(&id)?;
             (st.phase, st.worstcase_blocks)
         };
         self.bm
             .ensure_capacity(id, wc * self.caps.block_size as usize);
+        let phase = if phase == Phase::Prefill {
+            let st = self.running.get(&id)?;
+            let cursor = projection.prompt_cursor as usize;
+            let next_img = st
+                .req
+                .mm_items
+                .get(st.mm_cursor)
+                .map(|m| m.position as usize);
+            if next_img == Some(cursor) {
+                Phase::Encode
+            } else {
+                phase
+            }
+        } else {
+            phase
+        };
         match phase {
             Phase::Prefill => {
                 let st = self.running.get(&id)?;
                 let prompt = st.req.prompt_ids.clone();
                 let n = prompt.len();
-                let cursor = st.prompt_cursor as usize;
+                let cursor = projection.prompt_cursor as usize;
                 let next_img = st
                     .req
                     .mm_items
                     .get(st.mm_cursor)
                     .map(|m| m.position as usize);
-                // at an unencoded image position -> switch to Encode
-                if next_img == Some(cursor) {
-                    if let Some(s) = self.running.get_mut(&id) {
-                        s.phase = Phase::Encode;
-                        s.iu_encode_step = 0;
-                    }
-                    return self.next_op_iu(id, budget);
-                }
                 // chunk to the next image boundary, clipped by the step budget.
                 let boundary = match next_img {
                     Some(p) if p > cursor => p,
@@ -3532,13 +3512,8 @@ impl Scheduler {
                     .max(cursor + 1)
                     .min(n);
                 let chunk = prompt[cursor..end].to_vec();
-                let pos = st.pos;
+                let pos = projection.logical_pos;
                 let dn = (end - cursor) as u32;
-                if let Some(s) = self.running.get_mut(&id) {
-                    s.prompt_cursor = end as u32;
-                    s.pos += dn;
-                    s.kvlen += dn;
-                }
                 Some(ForwardOp {
                     req_id: id,
                     kind: OpKind::PrefillUnd,
@@ -3552,16 +3527,13 @@ impl Scheduler {
             Phase::Encode => {
                 let st = self.running.get(&id)?;
                 let item = st.req.mm_items.get(st.mm_cursor)?.clone();
-                let pos = st.pos;
-                let step = st.iu_encode_step;
+                let pos = projection.logical_pos;
+                let step = st.context_encode_step;
                 let (kind, modality) = if step == 0 && self.supports_vae_encode() {
                     (OpKind::VaeEncode, Modality::Gen)
                 } else {
                     (OpKind::VitEncode, Modality::Und)
                 };
-                if let Some(s) = self.running.get_mut(&id) {
-                    s.pos += 1;
-                } // one rope per block
                 Some(ForwardOp {
                     req_id: id,
                     kind,
@@ -3576,12 +3548,8 @@ impl Scheduler {
             }
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
-                let (pos, tok) = (st.pos, st.next_token);
-                let (burst_count, burst_stop_ids) = self.iu_decode_burst_plan(id, budget);
-                if let Some(s) = self.running.get_mut(&id) {
-                    s.pos += 1;
-                    s.kvlen += 1;
-                }
+                let (pos, tok) = (projection.logical_pos, st.next_token);
+                let (burst_count, burst_stop_ids) = self.context_decode_burst_plan(id, budget);
                 Some(ForwardOp {
                     req_id: id,
                     kind: OpKind::DecodeUnd,
@@ -3646,10 +3614,26 @@ impl Scheduler {
         }
     }
 
-    fn resolve_iu(&mut self, id: RequestId, kind: OpKind, sr: uniserve_worker_wire::SeqResult) {
+    fn resolve_context_image(
+        &mut self,
+        id: RequestId,
+        transition: PlannedTransition,
+        sr: uniserve_worker_wire::SeqResult,
+    ) {
+        let kind = transition.kind;
         match kind {
             OpKind::PrefillUnd => {
                 self.bm.activate(id);
+                if let crate::generation::TransitionDelta::IngestText { start, end } =
+                    transition.delta
+                {
+                    let dn = end.saturating_sub(start);
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.prompt_cursor = end;
+                        st.pos = transition.op.pos_range.1;
+                        st.kvlen = st.kvlen.saturating_add(dn);
+                    }
+                }
                 let (cursor, n) = {
                     let st = self.running.get(&id).unwrap();
                     (st.prompt_cursor as usize, st.req.prompt_ids.len())
@@ -3667,6 +3651,7 @@ impl Scheduler {
             OpKind::VaeEncode | OpKind::VitEncode => {
                 let added = sr.num_tokens.unwrap_or(0);
                 if let Some(st) = self.running.get_mut(&id) {
+                    st.pos = transition.op.pos_range.1;
                     st.kvlen += added;
                     if kind == OpKind::VaeEncode {
                         if let Some((h, w)) = sr.image_hw {
@@ -3675,40 +3660,49 @@ impl Scheduler {
                             st.req.image.height = h;
                             st.req.image.width = w;
                         }
-                        st.iu_encode_step = 1; // ViT next
+                        st.context_encode_step = 1; // ViT next
                     } else {
                         st.mm_cursor += 1;
-                        st.iu_encode_step = 0;
+                        st.context_encode_step = 0;
                         st.phase = Phase::Prefill; // continue with the question
                     }
                 }
             }
             OpKind::DecodeUnd => {
                 self.bm.activate(id);
-                let closing = self.running.get(&id).map(|s| s.iu_closing).unwrap_or(false);
+                let closing = self
+                    .running
+                    .get(&id)
+                    .map(|s| s.context_round_closing)
+                    .unwrap_or(false);
                 if closing {
                     // the <|im_end|> is now committed; decide image vs finish.
                     if let Some(s) = self.running.get_mut(&id) {
-                        s.iu_closing = false;
+                        s.pos = transition.op.pos_range.1;
+                        s.kvlen = s.kvlen.saturating_add(1);
+                        s.context_round_closing = false;
                     }
-                    return self.close_iu_round(id);
+                    return self.close_context_round(id);
                 }
                 if let Some(tokens) = sr.sampled_token_ids.as_ref().filter(|t| !t.is_empty()) {
                     // Worker-side decode burst: every committed token arrives at
                     // once, and when the burst stopped on <|im_end|> the worker's
                     // speculative stop-token forward already fed it into KV — the
-                    // round closes here directly instead of via an iu_closing op.
+                    // round closes here directly instead of via a context_round_closing op.
                     let tokens = tokens.clone();
                     let count = tokens.len() as u32;
                     let stopped_on_eos =
                         tokens.last().is_some_and(|tok| self.ctrl.eos.contains(tok));
-                    // The op's build advanced pos/kvlen by 1; the worker appended
-                    // one KV row per launched forward (`count` without a stop,
+                    // The worker appended one KV row per launched forward (`count` without a stop,
                     // `count + 1` including the speculative stop-token feed).
-                    let extra = if stopped_on_eos { count } else { count - 1 };
+                    let advance = if stopped_on_eos {
+                        count.saturating_add(1)
+                    } else {
+                        count
+                    };
                     if let Some(s) = self.running.get_mut(&id) {
-                        s.pos += extra;
-                        s.kvlen += extra;
+                        s.pos += advance;
+                        s.kvlen += advance;
                     }
                     for &tok in &tokens {
                         if self.ctrl.eos.contains(&tok) {
@@ -3727,16 +3721,20 @@ impl Scheduler {
                         }
                     }
                     if stopped_on_eos {
-                        return self.close_iu_round(id);
+                        return self.close_context_round(id);
                     }
                     return;
                 }
                 let tok = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
+                if let Some(s) = self.running.get_mut(&id) {
+                    s.pos = transition.op.pos_range.1;
+                    s.kvlen = s.kvlen.saturating_add(1);
+                }
                 if self.ctrl.eos.contains(&tok) {
                     // close the round: feed <|im_end|> into KV, transition on its resolve.
                     if let Some(s) = self.running.get_mut(&id) {
                         s.next_token = self.ctrl.eos[0];
-                        s.iu_closing = true;
+                        s.context_round_closing = true;
                     }
                     return;
                 }
@@ -3823,10 +3821,10 @@ impl Scheduler {
         }
     }
 
-    /// Decide image-vs-finish once a round's <|im_end|> KV is committed —
-    /// shared by the legacy iu_closing op resolve and the burst path (whose
-    /// speculative stop-token forward already fed <|im_end|>).
-    fn close_iu_round(&mut self, id: RequestId) {
+    /// Decide image-vs-finish once a round's <|im_end|> KV is committed.
+    /// The burst path may already have fed <|im_end|> through a speculative
+    /// stop-token forward.
+    fn close_context_round(&mut self, id: RequestId) {
         let (triggered, images_done, max_images, n_gen, max_tokens) = {
             let Some(st) = self.running.get(&id) else {
                 return;
@@ -3913,13 +3911,13 @@ impl Scheduler {
             sampling: &st.req.sampling,
         };
         let (mut allowed, mut suppress) = crate::logits::run_pipeline(&self.logits_pipeline, &ctx);
-        // Image-budget enforcement (host-side mask): once an interleave
+        // Image-budget enforcement (host-side mask): once a default-generation
         // request has drawn its max_images, the image-start token is
         // suppressed, so an eager or positively-biased model must return to
         // text/EOS instead of emitting un-actionable image triggers into its
         // own context forever. Suppression beats logit bias (bias skips
         // -inf'd logits on the worker).
-        if st.req.mode == GenMode::AutoInterleave
+        if st.req.uses_default_generation()
             && st.images_done >= st.req.image.max_images as usize
             && self.ctrl.start_of_image != 0
         {
@@ -4039,13 +4037,20 @@ impl Scheduler {
         for (idx, tok) in tokens.iter().copied().enumerate() {
             let is_last = idx + 1 == tokens.len();
             let logprob = is_last.then_some(sr.sampled_logprob).flatten();
-            let (mode, max_tokens, ignore_eos, min_tokens, images_done, max_images) = {
+            let (
+                uses_default_generation,
+                max_tokens,
+                ignore_eos,
+                min_tokens,
+                images_done,
+                max_images,
+            ) = {
                 let Some(st) = self.running.get_mut(&id) else {
                     return;
                 };
                 st.n_generated += 1;
                 (
-                    st.req.mode,
+                    st.req.uses_default_generation(),
                     st.req.max_tokens,
                     st.req.sampling.ignore_eos,
                     st.req.sampling.min_tokens,
@@ -4054,7 +4059,7 @@ impl Scheduler {
                 )
             };
             if tok == self.ctrl.start_of_image
-                && mode == GenMode::AutoInterleave
+                && uses_default_generation
                 && images_done < max_images
             {
                 self.begin_image(id);
@@ -4100,7 +4105,7 @@ impl Scheduler {
                     matcher.advance(tok);
                 }
             }
-            if mode == GenMode::AutoInterleave
+            if uses_default_generation
                 && images_done < max_images
                 && !self.ctrl.image_start_ids.is_empty()
             {
@@ -4120,12 +4125,17 @@ impl Scheduler {
     fn resolve(
         &mut self,
         id: RequestId,
-        kind: OpKind,
+        transition: PlannedTransition,
         sr: uniserve_worker_wire::SeqResult,
         draft_token_ids: Vec<u32>,
     ) {
-        if self.running.get(&id).map(|s| s.req.mode) == Some(GenMode::InterleaveUnd) {
-            return self.resolve_iu(id, kind, sr);
+        let kind = transition.kind;
+        if self
+            .running
+            .get(&id)
+            .is_some_and(|s| s.req.uses_feedback_ingest())
+        {
+            return self.resolve_context_image(id, transition, sr);
         }
         if kind == OpKind::DecodeUnd && !draft_token_ids.is_empty() {
             return self.resolve_spec_decode_text(id, sr, draft_token_ids);
@@ -4139,8 +4149,14 @@ impl Scheduler {
                 // chunked prefill: a prefill op may only have consumed part of
                 // the prompt; if so, advance the cursor and stay in Prefill.
                 if kind == OpKind::PrefillUnd {
-                    // The cursor was advanced to the chunk end at build time; if it
-                    // hasn't reached the (effective) prompt end, more chunks remain.
+                    if let crate::generation::TransitionDelta::IngestText { end, .. } =
+                        transition.delta
+                    {
+                        if let Some(st) = self.running.get_mut(&id) {
+                            st.prompt_cursor = end;
+                            st.pos = end;
+                        }
+                    }
                     let (cursor, prompt_len) = {
                         let st = self.running.get(&id).unwrap();
                         (st.prompt_cursor as usize, Self::effective_prompt(st).len())
@@ -4149,7 +4165,7 @@ impl Scheduler {
                         return; // still prefilling; ignore the (partial) sampled token
                     }
                 }
-                let (mode, max_tokens, ignore_eos, min_tokens) = {
+                let (is_gen_only, uses_default_generation, max_tokens, ignore_eos, min_tokens) = {
                     let st = self.running.get_mut(&id).unwrap();
                     if kind == OpKind::PrefillUnd {
                         // prompt (possibly prompt++generated on recompute) is done.
@@ -4162,7 +4178,8 @@ impl Scheduler {
                         st.n_generated += 1;
                     }
                     (
-                        st.req.mode,
+                        st.req.is_gen_only(),
+                        st.req.uses_default_generation(),
                         st.req.max_tokens,
                         st.req.sampling.ignore_eos,
                         st.req.sampling.min_tokens,
@@ -4179,14 +4196,14 @@ impl Scheduler {
                 // Native callers may deliberately force the first image by
                 // ending an assistant prefix with the model's image-start
                 // control token. Treat that prefilled boundary the same as a
-                // sampled boundary so AutoInterleave is not left to sampling
+                // sampled boundary so default generation is not left to sampling
                 // luck after an explicit prefix.
-                if kind == OpKind::PrefillUnd && self.prefilled_auto_image_start(id) {
+                if kind == OpKind::PrefillUnd && self.prefilled_default_image_start(id) {
                     self.begin_image(id);
                     return;
                 }
                 // pure t2i: ignore the sampled token, jump straight to denoise
-                if mode == GenMode::Image && kind == OpKind::PrefillUnd {
+                if is_gen_only && kind == OpKind::PrefillUnd {
                     self.begin_image(id);
                     return;
                 }
@@ -4199,7 +4216,7 @@ impl Scheduler {
                 // the model requested an image inline; honor it while the
                 // request is still under its image budget.
                 if tok == self.ctrl.start_of_image
-                    && mode == GenMode::AutoInterleave
+                    && uses_default_generation
                     && images_done < max_images
                 {
                     self.begin_image(id);
@@ -4250,9 +4267,9 @@ impl Scheduler {
                 // mode: the fine-tune may signal the next image with the
                 // literal "<image_start>" text instead of BAGEL's
                 // <|vision_start|> token. Honor it the moment the trigger core
-                // completes (the understanding FSM matches the same ids at
+                // completes (the context-image path matches the same ids at
                 // round close).
-                if mode == GenMode::AutoInterleave
+                if uses_default_generation
                     && images_done < max_images
                     && !self.ctrl.image_start_ids.is_empty()
                 {
@@ -4320,9 +4337,9 @@ impl Scheduler {
                     .release_class(id, uniserve_worker_wire::ResourceClass::ImageLatent);
                 self.ledger
                     .release_class(id, uniserve_worker_wire::ResourceClass::Scratch);
-                let (image_id, mode, cond_pos) = {
+                let (image_id, uses_default_generation, cond_pos) = {
                     let st = self.running.get(&id).unwrap();
-                    (st.image_id, st.req.mode, st.cond_pos)
+                    (st.image_id, st.req.uses_default_generation(), st.cond_pos)
                 };
                 if let Some(b64) = sr.image_png_b64 {
                     self.emit(id, image_done_event(image_id, b64));
@@ -4340,11 +4357,11 @@ impl Scheduler {
                     st.text_since_image = 0;
                     st.pos = cond_pos + span;
                 }
-                // pure t2i finishes after one image; AutoInterleave round-trips
+                // pure t2i finishes after one image; default generation round-trips
                 // back to text (text → image → text → image …). Termination then
                 // happens in DecodeUnd on a genuine terminal condition (EOS or
                 // max_tokens) or from a commit-side EOS reported by the worker.
-                if mode == GenMode::AutoInterleave {
+                if uses_default_generation {
                     if let Some(tok) = sr.sampled_token_id {
                         let (images_done, max_images, n_gen, max_tokens, hit_eos, start_image) = {
                             let st = self.running.get(&id).unwrap();
@@ -4411,13 +4428,13 @@ impl Scheduler {
         }
     }
 
-    fn record_auto_image_trigger_for_replay(&mut self, id: RequestId) {
+    fn record_default_image_trigger_for_replay(&mut self, id: RequestId) {
         let start = self.ctrl.start_of_image;
         if start == 0 {
             return;
         }
         if let Some(st) = self.running.get_mut(&id)
-            && st.req.mode == GenMode::AutoInterleave
+            && st.req.uses_default_generation()
             && st.n_generated > st.generated_ids.len()
             && st.generated_ids.last().copied() != Some(start)
         {
@@ -4425,17 +4442,17 @@ impl Scheduler {
         }
     }
 
-    fn promote_auto_interleave_reservation(&mut self, id: RequestId) -> bool {
-        let Some((is_auto, pos, remaining_image_span)) = self.running.get(&id).map(|st| {
+    fn promote_default_image_reservation(&mut self, id: RequestId) -> bool {
+        let Some((is_default, pos, remaining_image_span)) = self.running.get(&id).map(|st| {
             (
-                st.req.mode == GenMode::AutoInterleave,
+                st.req.uses_default_generation(),
                 st.pos as usize,
-                self.auto_interleave_remaining_image_span(st),
+                self.default_remaining_image_span(st),
             )
         }) else {
             return false;
         };
-        if !is_auto {
+        if !is_default {
             return true;
         }
         let bs = self.caps.block_size as usize;
@@ -4443,7 +4460,7 @@ impl Scheduler {
         let need_blocks = target_tokens.div_ceil(bs);
         if need_blocks > self.usable_blocks {
             self.trace_record(json!({
-                "event": "auto_interleave_reservation_rejected",
+                "event": "default_generation_reservation_rejected",
                 "at_s": now(),
                 "request_id": id.0,
                 "needed_blocks": need_blocks,
@@ -4455,7 +4472,7 @@ impl Scheduler {
 
         if !self.bm.ensure_capacity(id, target_tokens) {
             self.trace_record(json!({
-                "event": "auto_interleave_reservation_deferred",
+                "event": "default_generation_reservation_deferred",
                 "at_s": now(),
                 "request_id": id.0,
                 "needed_blocks": need_blocks,
@@ -4464,16 +4481,16 @@ impl Scheduler {
                 "pending": self.pending.len(),
             }));
             if let Some(st) = self.running.get_mut(&id) {
-                st.auto_image_pending = true;
+                st.default_image_pending = true;
             }
             return false;
         }
 
         if let Some(st) = self.running.get_mut(&id) {
-            st.auto_image_pending = false;
+            st.default_image_pending = false;
         }
         self.trace_record(json!({
-            "event": "auto_interleave_image_capacity_ready",
+            "event": "default_generation_image_capacity_ready",
             "at_s": now(),
             "request_id": id.0,
             "needed_blocks": need_blocks,
@@ -4486,12 +4503,12 @@ impl Scheduler {
 
     fn begin_image(&mut self, id: RequestId) {
         if let Some(st) = self.running.get_mut(&id)
-            && st.req.mode == GenMode::AutoInterleave
+            && st.req.uses_default_generation()
         {
-            st.auto_image_pending = true;
+            st.default_image_pending = true;
         }
-        self.record_auto_image_trigger_for_replay(id);
-        if !self.promote_auto_interleave_reservation(id) {
+        self.record_default_image_trigger_for_replay(id);
+        if !self.promote_default_image_reservation(id) {
             return;
         }
         let nvae = {
@@ -4671,7 +4688,7 @@ fn contains_subseq(hay: &[u32], needle: &[u32]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Does `hay` end with `needle`? (The auto-interleave literal trigger fires on
+/// Does `hay` end with `needle`? (The literal image trigger fires on
 /// the token that completes the trigger core.) Empty needle never matches.
 fn ends_with(hay: &[u32], needle: &[u32]) -> bool {
     !needle.is_empty() && hay.len() >= needle.len() && hay[hay.len() - needle.len()..] == *needle
@@ -4760,8 +4777,14 @@ mod tests {
     use super::*;
 
     fn inflight(kind: OpKind, op_id: Option<u64>) -> InflightOp {
+        let op = ForwardOp {
+            kind,
+            op_id,
+            ..Default::default()
+        };
         InflightOp {
             kind,
+            transition: PlannedTransition::from_forward_op(&op),
             op_id,
             spec_tokens: Vec::new(),
             decode_token_count: 1,
@@ -4945,7 +4968,7 @@ mod tests {
             vec![1u32; prompt_len],
             uniserve_core::SamplingParams::default(),
             uniserve_core::ImageParams::default(),
-            GenMode::Text,
+            uniserve_core::GenerationConstraint::UndOnly,
             16,
             tx,
         )
@@ -4957,6 +4980,75 @@ mod tests {
             ControlTokens::default(),
             DEFAULT_MAX_BATCH,
         )
+    }
+
+    #[test]
+    fn planning_text_prefill_does_not_advance_committed_cursor() {
+        let mut sched = test_scheduler();
+        let req = test_request(1, 5);
+        sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+
+        let op = sched.next_op(id, 3).expect("prefill op");
+
+        assert_eq!(op.kind, OpKind::PrefillUnd);
+        assert_eq!(op.pos_range, (0, 3));
+        let st = sched.running.get(&id).expect("request running");
+        assert_eq!(st.prompt_cursor, 0);
+        assert_eq!(st.pos, 0);
+
+        let transition = PlannedTransition::from_forward_op(&op);
+        sched.resolve(
+            id,
+            transition,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let st = sched.running.get(&id).expect("request running");
+        assert_eq!(st.prompt_cursor, 3);
+        assert_eq!(st.pos, 3);
+    }
+
+    #[test]
+    fn planning_context_prefill_does_not_advance_committed_cursor() {
+        let mut sched = test_scheduler();
+        let mut req = test_request(1, 5);
+        req.mm_items = vec![uniserve_engine_api::MmItem {
+            hash: 7,
+            position: 2,
+            num_tokens: 0,
+            b64: "aGVsbG8=".into(),
+        }];
+        sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+
+        let op = sched.next_op(id, 64).expect("context prefill op");
+
+        assert_eq!(op.kind, OpKind::PrefillUnd);
+        assert_eq!(op.pos_range, (0, 2));
+        let st = sched.running.get(&id).expect("request running");
+        assert_eq!(st.prompt_cursor, 0);
+        assert_eq!(st.pos, 0);
+        assert_eq!(st.kvlen, 0);
+
+        let transition = PlannedTransition::from_forward_op(&op);
+        sched.resolve_context_image(
+            id,
+            transition,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                ..Default::default()
+            },
+        );
+        let st = sched.running.get(&id).expect("request running");
+        assert_eq!(st.prompt_cursor, 2);
+        assert_eq!(st.pos, 2);
+        assert_eq!(st.kvlen, 2);
     }
 
     #[test]
@@ -4976,7 +5068,7 @@ mod tests {
     }
 
     #[test]
-    fn vae_grid_cap_falls_back_to_legacy_latent_size() {
+    fn vae_grid_cap_uses_latent_size_when_unspecified() {
         let caps = EngineCaps {
             max_latent_size: 65_536,
             max_vae_grid_tokens: 0,
@@ -5092,9 +5184,10 @@ mod tests {
             vec![OpKind::PrefillUnd, OpKind::PrefillUnd]
         );
         for op in prefill_ops {
+            let transition = PlannedTransition::from_forward_op(&op);
             sched.resolve(
                 op.req_id,
-                op.kind,
+                transition,
                 uniserve_worker_wire::SeqResult {
                     req_id: op.req_id,
                     sampled_token_id: Some(11 + op.req_id.0 as u32),
@@ -5165,7 +5258,9 @@ mod tests {
         sched.admit();
         let (_new_reqs, ops2) = sched.assemble();
         assert_eq!(
-            ops2.iter().map(|op| (op.kind, op.req_id)).collect::<Vec<_>>(),
+            ops2.iter()
+                .map(|op| (op.kind, op.req_id))
+                .collect::<Vec<_>>(),
             vec![(OpKind::DecodeUnd, RequestId(1))]
         );
         sched.register_inflight(&ops2[0], Instant::now());
@@ -5174,7 +5269,9 @@ mod tests {
         // a prefill batch is still in flight (never idle the pipeline).
         let (_new_reqs, ops3) = sched.assemble();
         assert_eq!(
-            ops3.iter().map(|op| (op.kind, op.req_id)).collect::<Vec<_>>(),
+            ops3.iter()
+                .map(|op| (op.kind, op.req_id))
+                .collect::<Vec<_>>(),
             vec![(OpKind::PrefillUnd, RequestId(2))]
         );
     }
@@ -5262,9 +5359,10 @@ mod tests {
         let (_new_reqs, prefill_ops) = sched.assemble();
         assert_eq!(prefill_ops.len(), 2);
         for op in prefill_ops {
+            let transition = PlannedTransition::from_forward_op(&op);
             sched.resolve(
                 op.req_id,
-                op.kind,
+                transition,
                 uniserve_worker_wire::SeqResult {
                     req_id: op.req_id,
                     sampled_token_id: Some(11 + op.req_id.0 as u32),
@@ -5293,11 +5391,15 @@ mod tests {
         );
         let rider = ops.last().unwrap();
         assert_eq!(rider.req_id, RequestId(3));
-        assert_eq!(op_token_cost(rider), 2, "rider chunk must clip to the mixed budget");
+        assert_eq!(
+            op_token_cost(rider),
+            2,
+            "rider chunk must clip to the mixed budget"
+        );
     }
 
     #[test]
-    fn auto_interleave_ensures_current_image_capacity_before_first_image() {
+    fn default_generation_ensures_current_image_capacity_before_first_image() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -5317,7 +5419,7 @@ mod tests {
         );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
-        req.mode = GenMode::AutoInterleave;
+        req.constraint = uniserve_core::GenerationConstraint::Default;
         req.max_tokens = 8;
         req.image = uniserve_core::ImageParams {
             height: 64,
@@ -5341,7 +5443,7 @@ mod tests {
 
         let (
             reserve_worstcase,
-            auto_image_pending,
+            default_image_pending,
             phase,
             generated_ids,
             reserved_blocks,
@@ -5355,7 +5457,7 @@ mod tests {
             .div_ceil(sched.caps.block_size as usize);
             (
                 st.reserve_worstcase,
-                st.auto_image_pending,
+                st.default_image_pending,
                 st.phase,
                 st.generated_ids.clone(),
                 sched.reserved_blocks,
@@ -5365,7 +5467,7 @@ mod tests {
             )
         };
         assert!(reserve_worstcase);
-        assert!(!auto_image_pending);
+        assert!(!default_image_pending);
         assert_eq!(reserved_blocks, worstcase_blocks);
         assert_eq!(allocated_blocks, worstcase_blocks);
         assert!(allocated_blocks >= image_boundary_blocks);
@@ -5374,8 +5476,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_interleave_admission_reserves_full_worstcase_and_never_deadlocks() {
-        // Deadlock regression (2026-07-07 benchmark stall): AutoInterleave is
+    fn default_generation_admission_reserves_full_worstcase_and_never_deadlocks() {
+        // Deadlock regression (2026-07-07 benchmark stall): default generation is
         // not preemptible, so admitting it with less than its complete KV worst
         // case (prompt + max_tokens + retained-image envelope) lets concurrent
         // requests exhaust the free pool mid-decode where none can grow, none
@@ -5405,7 +5507,7 @@ mod tests {
         let make_request = |id| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut req = test_request(id, 10);
-            req.mode = GenMode::AutoInterleave;
+            req.constraint = uniserve_core::GenerationConstraint::Default;
             req.max_tokens = 16;
             req.image = uniserve_core::ImageParams {
                 height: 32,
@@ -5459,7 +5561,7 @@ mod tests {
         let st = sched.running.get(&id).unwrap();
         let target = st.pos as usize
             + op.decode_token_count.unwrap_or(1) as usize
-            + sched.auto_interleave_remaining_image_span(st);
+            + sched.default_remaining_image_span(st);
         assert!(sched.bm.blocks_for(id).len() * sched.caps.block_size as usize >= target);
 
         // Finishing the resident request frees its envelope and unblocks the
@@ -5498,10 +5600,10 @@ mod tests {
             },
         );
 
-        // Request 1: an AutoInterleave request at an image boundary -> DenoiseGen.
+        // Request 1: an default generation request at an image boundary -> DenoiseGen.
         let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let mut gen_req = test_request(1, 4);
-        gen_req.mode = GenMode::AutoInterleave;
+        gen_req.constraint = uniserve_core::GenerationConstraint::Default;
         gen_req.max_tokens = 64;
         gen_req.image = uniserve_core::ImageParams {
             height: 64,
@@ -5652,16 +5754,16 @@ mod tests {
         );
     }
 
-    // An understanding-mode decode burst commits every returned token; a burst
+    // A context-image decode burst commits every returned token; a burst
     // that stopped on <|im_end|> closes the round directly (its KV was already
-    // fed by the worker's speculative stop-token forward — no iu_closing op).
+    // fed by the worker's speculative stop-token forward; no context_round_closing op).
     #[test]
-    fn understanding_decode_burst_commits_tokens_and_closes_round_on_eos() {
+    fn context_decode_burst_commits_tokens_and_closes_round_on_eos() {
         let mut sched = test_scheduler();
         sched.ctrl.eos = vec![99];
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
-        req.mode = GenMode::InterleaveUnd;
+        req.constraint = uniserve_core::GenerationConstraint::UndOnly;
         req.max_tokens = 64;
         req.event_tx = tx;
         sched.submit_for_test(req);
@@ -5673,11 +5775,20 @@ mod tests {
             st.kvlen = 10;
         }
 
-        // Full burst, no stop: every token commits, pos/kvlen advance by k-1
-        // beyond the op build's +1 (which this direct resolve call skips).
-        sched.resolve_iu(
+        let decode_transition = PlannedTransition::from_forward_op(&ForwardOp {
+            req_id: id,
+            kind: OpKind::DecodeUnd,
+            modality: Modality::Und,
+            pos_range: (10, 11),
+            decode_token_count: Some(2),
+            ..Default::default()
+        });
+
+        // Full burst, no stop: every token commits and resolution applies the
+        // full position/KV advance.
+        sched.resolve_context_image(
             id,
-            OpKind::DecodeUnd,
+            decode_transition,
             uniserve_worker_wire::SeqResult {
                 req_id: id,
                 sampled_token_id: Some(6),
@@ -5690,16 +5801,24 @@ mod tests {
             assert_eq!(st.n_generated, 2);
             assert_eq!(st.round_tokens, vec![5, 6]);
             assert_eq!(st.next_token, 6);
-            assert_eq!(st.pos, 11);
-            assert_eq!(st.kvlen, 11);
+            assert_eq!(st.pos, 12);
+            assert_eq!(st.kvlen, 12);
         }
         assert_eq!(drain_text_tokens(&mut rx), vec![5, 6]);
 
         // Burst tail hits eos: the committed tokens emit, the round closes
-        // without an iu_closing hop, and (no image trigger) the request ends.
-        sched.resolve_iu(
+        // without a context_round_closing hop, and (no image trigger) the request ends.
+        let decode_transition = PlannedTransition::from_forward_op(&ForwardOp {
+            req_id: id,
+            kind: OpKind::DecodeUnd,
+            modality: Modality::Und,
+            pos_range: (12, 13),
+            decode_token_count: Some(2),
+            ..Default::default()
+        });
+        sched.resolve_context_image(
             id,
-            OpKind::DecodeUnd,
+            decode_transition,
             uniserve_worker_wire::SeqResult {
                 req_id: id,
                 sampled_token_id: Some(99),
@@ -5714,18 +5833,18 @@ mod tests {
         assert_eq!(drain_text_tokens(&mut rx), vec![7]);
     }
 
-    // Understanding-interleave input images dual-encode (VAE then ViT) only
+    // Context images dual-encode (VAE then ViT) only
     // when the worker declares `vae_encode`; a VAE-less model single-encodes
     // straight through ViT at the image's in-prompt position.
     #[test]
-    fn understanding_encode_respects_vae_capability() {
+    fn context_encode_respects_vae_capability() {
         for (has_vae, expected_first) in [(false, OpKind::VitEncode), (true, OpKind::VaeEncode)] {
             let mut sched = test_scheduler();
             if has_vae {
                 sched.caps.supported_ops.push("vae_encode".into());
             }
             let mut req = test_request(1, 5);
-            req.mode = GenMode::InterleaveUnd;
+            req.constraint = uniserve_core::GenerationConstraint::UndOnly;
             req.mm_items = vec![uniserve_engine_api::MmItem {
                 hash: 7,
                 position: 2,
@@ -5740,6 +5859,15 @@ mod tests {
             let op = sched.next_op(id, 64).expect("prefill op");
             assert_eq!(op.kind, OpKind::PrefillUnd);
             assert_eq!(op.pos_range, (0, 2));
+            let transition = PlannedTransition::from_forward_op(&op);
+            sched.resolve_context_image(
+                id,
+                transition,
+                uniserve_worker_wire::SeqResult {
+                    req_id: id,
+                    ..Default::default()
+                },
+            );
             // ...then the encode fires at the in-prompt marker gap.
             let op = sched.next_op(id, 64).expect("encode op");
             assert_eq!(op.kind, expected_first, "has_vae={has_vae}");
@@ -5748,23 +5876,23 @@ mod tests {
         }
     }
 
-    // AutoInterleave stays resident. Replaying prompt++generated under load is a
+    // default generation stays resident. Replaying prompt++generated under load is a
     // performance cliff.
     #[test]
-    fn auto_interleave_is_not_preemptible() {
+    fn default_generation_is_not_preemptible() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 4);
-        req.mode = GenMode::AutoInterleave;
+        req.constraint = uniserve_core::GenerationConstraint::Default;
         sched.submit_for_test(req);
         sched.admit();
         assert!(!sched.preemptible(RequestId(1)));
     }
 
     #[test]
-    fn auto_interleave_with_generated_output_is_not_preemptible() {
+    fn default_generation_with_generated_output_is_not_preemptible() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 4);
-        req.mode = GenMode::AutoInterleave;
+        req.constraint = uniserve_core::GenerationConstraint::Default;
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);
@@ -5775,10 +5903,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_interleave_with_committed_image_is_not_preemptible() {
+    fn default_generation_with_committed_image_is_not_preemptible() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 4);
-        req.mode = GenMode::AutoInterleave;
+        req.constraint = uniserve_core::GenerationConstraint::Default;
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);

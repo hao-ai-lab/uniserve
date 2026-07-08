@@ -60,8 +60,8 @@ pub struct HandshakeInitMessage {
     pub addresses: HandshakeAddresses,
     pub parallel_config: BTreeMap<String, OpaqueValue>,
     /// UniServe extension: model control-token ids resolved by the frontend's
-    /// tokenizer (the engine process has no tokenizer but its scheduler FSM
-    /// needs them). Absent on the upstream wire.
+    /// tokenizer (the engine process has no tokenizer but its scheduler lifecycle
+    /// decisions need them). Absent on the upstream wire.
     #[serde(default)]
     pub native_controls: Option<crate::native::NativeControlTokens>,
 }

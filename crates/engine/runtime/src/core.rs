@@ -98,7 +98,7 @@ pub struct EngineCoreConfig {
     pub req_slot_cap: usize,
     /// Response-ring slot capacity in bytes.
     pub resp_slot_cap: usize,
-    /// Control-token ids resolved from the tokenizer (drive EOS / image FSM).
+    /// Control-token ids resolved from the tokenizer (drive EOS / image lifecycle decisions).
     pub bos: u32,
     pub eos: Vec<u32>,
     pub start_of_image: u32,

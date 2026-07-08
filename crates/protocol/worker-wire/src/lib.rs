@@ -130,7 +130,7 @@ pub struct ForwardOp {
     /// is a small descriptor string; the worker tokenizes it into a temporary
     /// branch KV cache and does not ship hidden states over the wire.
     pub image_prompt: Option<String>,
-    // ---- image-understanding interleave. All descriptors/small-input. ----
+    // ---- context-image encode input. All descriptors/small-input. ----
     /// Input-image bytes (base64 PNG/JPEG) for a Vit/Vae encode op. Mirror of the
     /// output `image_png_b64` "small result" — bytes in, not KV.
     pub image_b64: Option<String>,

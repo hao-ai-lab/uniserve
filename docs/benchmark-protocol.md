@@ -17,7 +17,7 @@ Set these before launching the benchmark runner:
 | variable | meaning |
 |---|---|
 | `UNISERVE_QWEN3_MODEL` | Qwen3-32B model path |
-| `UNISERVE_SENSENOVA_MODEL` | SenseNova-U1-8B-MoT-Interleaved-local model path |
+| `UNISERVE_SENSENOVA_MODEL` | SenseNova-U1 model path |
 | `UNISERVE_BAGEL_MODEL` | BAGEL-7B-MoT model path |
 | `UNISERVE_SHAREGPT_PATH` | ShareGPT JSON dataset path |
 | `UNISERVE_SGLANG_PYTHON` | Python executable for `refs/sglang` |
@@ -73,7 +73,7 @@ SGLang runs through the declared benchmark server profile. Cache-mode evidence f
 | vllm-omni wire | openai_chat_json (non-streamed chat JSON) | openai_chat_json (non-streamed chat JSON) |
 | metrics | request throughput, output tokens/s, TTFT, TPOT, E2E | same |
 
-### SenseNova UEval Interleave
+### SenseNova UEval Default
 
 | field | value |
 |---|---|

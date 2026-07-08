@@ -70,7 +70,7 @@ def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any], *, strict_env:
     # otherwise — a runner invoked under `taskset -c 0` would silently starve
     # the host scheduler, both TP worker processes, and every CUDA driver
     # thread on a single core (measured: ~30% throughput loss under 12-way
-    # interleave load).
+    # default mixed-output load).
     numa_node = spec.get("numa_node", 0)
     if numa_node is not None and shutil.which("numactl"):
         cmd.extend(

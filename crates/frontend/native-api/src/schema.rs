@@ -1,11 +1,13 @@
 use serde::Deserialize;
+use uniserve_engine_client::GenerationConstraint;
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NativeGenerateBody {
     #[serde(default)]
     pub prompt: String,
     #[serde(default)]
-    pub mode: Option<String>,
+    pub constraint: Option<GenerationConstraint>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
@@ -78,10 +80,6 @@ pub struct NativeInputImage {
 }
 
 impl NativeGenerateBody {
-    pub fn mode_name(&self) -> &str {
-        self.mode.as_deref().unwrap_or("text")
-    }
-
     pub fn image(&self) -> NativeImageBody {
         self.image.clone().unwrap_or_default()
     }
@@ -109,5 +107,20 @@ impl NativeGenerateBody {
             });
         }
         images
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn body_rejects_unknown_generation_selector() {
+        let error = serde_json::from_str::<NativeGenerateBody>(
+            r#"{"prompt":"draw a city","mode":"image"}"#,
+        )
+        .expect_err("unknown generation selectors must be rejected");
+
+        assert!(error.to_string().contains("unknown field `mode`"));
     }
 }

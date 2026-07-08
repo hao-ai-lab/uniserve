@@ -1,4 +1,4 @@
-"""Family A metrics: streaming token metrics (LLM serving + interleave).
+"""Family A metrics: streaming token metrics (LLM serving + default task).
 
 This summarizer is intentionally a faithful re-implementation of
 ``refs/sglang/python/sglang/benchmark/serving.py`` ``calculate_metrics`` so the
@@ -115,9 +115,9 @@ def summarize_stream(
         summary["output_throughput_retokenized"] = total_output_retokenized / dur_s
         summary["total_throughput_retokenized"] = (total_input + total_output_retokenized) / dur_s
 
-    # Interleave emits images alongside text; attach an image block so the same
+    # Default generation can emit images alongside text; attach an image block so the same
     # run reports per-image latency without polluting the token metrics.
-    image_block = _interleave_image_block(successful, dur_s)
+    image_block = _default_image_block(successful, dur_s)
     if image_block is not None:
         summary["images"] = image_block
     timing_block = _timing_attribution_block(successful)
@@ -158,7 +158,7 @@ def _peak_per_second(successful: list[RequestRecord]) -> tuple[float, int]:
     return float(np.max(tokens_per_second)), int(np.max(concurrent_requests_per_second))
 
 
-def _interleave_image_block(successful: list[RequestRecord], dur_s: float) -> dict[str, Any] | None:
+def _default_image_block(successful: list[RequestRecord], dur_s: float) -> dict[str, Any] | None:
     image_latencies = [value for r in successful for value in r.image_latencies]
     total_images = sum(r.images for r in successful)
     if total_images == 0 and not image_latencies:

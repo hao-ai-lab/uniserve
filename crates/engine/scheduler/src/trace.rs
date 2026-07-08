@@ -2,10 +2,9 @@
 //!
 //! A compact, reconstructable event log per request: admitted → op submitted →
 //! op resolved (with host round-trip + worker compute time) → finished. Carries
-//! the trace/program/request/op ids the plan requires so a full lifecycle can be
-//! reconstructed after the fact. Bounded; completed traces move to a ring.
+//! the trace/request/op ids the runtime requires so a full lifecycle can be reconstructed after the fact. Bounded; completed traces move to a ring.
 
-use uniserve_core::{ProgramId, RequestId, TraceId};
+use uniserve_core::{RequestId, TraceId};
 
 const MAX_EVENTS: usize = 512;
 
@@ -50,16 +49,14 @@ impl TraceEvent {
 pub struct RequestTrace {
     pub request_id: RequestId,
     pub trace_id: TraceId,
-    pub program_id: ProgramId,
     pub events: Vec<TraceEvent>,
 }
 
 impl RequestTrace {
-    pub fn new(request_id: RequestId, trace_id: TraceId, program_id: ProgramId) -> Self {
+    pub fn new(request_id: RequestId, trace_id: TraceId) -> Self {
         Self {
             request_id,
             trace_id,
-            program_id,
             events: Vec::new(),
         }
     }
@@ -97,7 +94,7 @@ mod tests {
 
     #[test]
     fn trace_records_a_reconstructable_lifecycle() {
-        let mut t = RequestTrace::new(RequestId(1), TraceId(1), ProgramId(7));
+        let mut t = RequestTrace::new(RequestId(1), TraceId(1));
         t.push(TraceEvent::at(TraceEventKind::Admitted));
         let mut sub = TraceEvent::at(TraceEventKind::OpSubmitted);
         sub.op_id = Some(10);
@@ -116,7 +113,7 @@ mod tests {
         assert!(t.was_admitted() && t.is_finished());
         assert_eq!(t.resolved_ops(), 1);
         // ids are present for correlation.
-        assert_eq!(t.program_id, ProgramId(7));
+        assert_eq!(t.trace_id, TraceId(1));
         let submitted = t
             .events
             .iter()

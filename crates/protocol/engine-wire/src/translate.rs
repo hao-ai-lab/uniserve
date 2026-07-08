@@ -4,7 +4,7 @@
 //! Northbound, a per-request `GenEvent` stream is adapted into
 //! [`EngineCoreOutput`]s: text tokens (with the sampled/top-k logprob fusion),
 //! `Scheduled` timestamps as `EngineCoreEvent`s, and — for native
-//! image/interleave requests — typed image events and finish statistics on the
+//! generation requests — typed image events and finish statistics on the
 //! UniServe `native` extension. Southbound, an [`EngineCoreRequest`] (plus its
 //! optional `native` extension) becomes an `uniserve_engine_api::GenerateRequest`.
 
@@ -15,7 +15,7 @@ use crate::{
     EngineCoreRequest, EngineCoreSamplingParams, StopReason,
 };
 use tokio::sync::mpsc;
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams as USampling};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams as USampling};
 use uniserve_engine_api::{EventTx, FinishReason, GenEvent, GenerateRequest, MmItem};
 
 /// Translate the wire sampling DTO into UniServe sampling params.
@@ -77,7 +77,7 @@ pub fn stop_token_ids(sp: Option<&EngineCoreSamplingParams>) -> Vec<u32> {
     sp.map(|s| s.stop_token_ids.clone()).unwrap_or_default()
 }
 
-/// Translate one wire request (text or native image/interleave) into an
+/// Translate one wire request (text or native generation) into an
 /// `uniserve_engine_api::GenerateRequest` bound to the scheduler id `rid`.
 pub fn to_generate_request(
     req: &EngineCoreRequest,
@@ -93,12 +93,10 @@ pub fn to_generate_request(
     let stop = stop_token_ids(req.sampling_params.as_ref());
     let prompt_ids = req.prompt_token_ids.clone().unwrap_or_default();
 
-    let (mode, image, neg_prompt_ids, mm_items) = match &req.native {
-        Some(ext) => (
-            ext.mode,
-            ext.image.clone(),
-            ext.neg_prompt_ids.clone(),
-            ext.mm_items
+    let (constraint, image, neg_prompt_ids, mm_items) = match &req.native {
+        Some(ext) => {
+            let mm_items = ext
+                .mm_items
                 .iter()
                 .map(|m| MmItem {
                     hash: m.hash,
@@ -106,18 +104,24 @@ pub fn to_generate_request(
                     num_tokens: m.num_tokens,
                     b64: m.b64.clone(),
                 })
-                .collect(),
-        ),
+                .collect();
+            (
+                ext.constraint,
+                ext.image.clone(),
+                ext.neg_prompt_ids.clone(),
+                mm_items,
+            )
+        }
         None => (
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             ImageParams::default(),
             Vec::new(),
             Vec::new(),
         ),
     };
-
-    let mut generate =
-        GenerateRequest::new(rid, prompt_ids, sampling, image, mode, max_tokens, event_tx);
+    let mut generate = GenerateRequest::new(
+        rid, prompt_ids, sampling, image, constraint, max_tokens, event_tx,
+    );
     generate.stop_token_ids = stop;
     generate.neg_prompt_ids = neg_prompt_ids;
     generate.mm_items = mm_items;
@@ -226,7 +230,7 @@ pub struct AdapterParams {
     pub request_id: String,
     /// Emit per-token logprobs (`sampling_params.logprobs > 0`).
     pub want_logprobs: bool,
-    /// The request is a native image/interleave request: image events and
+    /// The request is a native generation request: image events and
     /// finish statistics ride the wire `native` extension, and `Scheduled`
     /// timestamps are surfaced as `EngineCoreEvent`s.
     pub native: bool,
@@ -323,7 +327,7 @@ pub async fn run_event_adapter(
                 steps,
             } if native => {
                 // Flush the held text token first: image events must not
-                // overtake the text that preceded them in interleaved streams.
+                // overtake the text that preceded them in a mixed-output stream.
                 flush_pending!();
                 let output = native_image_output(
                     &request_id,
@@ -616,7 +620,7 @@ mod tests {
         assert_eq!(g.request_id, RequestId(7));
         assert_eq!(g.prompt_ids, vec![1, 2, 3]);
         assert_eq!(g.max_tokens, 16);
-        assert_eq!(g.mode, GenMode::Text);
+        assert_eq!(g.constraint, GenerationConstraint::UndOnly);
         assert_eq!(g.stop_token_ids, vec![42]);
     }
 
@@ -668,13 +672,13 @@ mod tests {
     }
 
     #[test]
-    fn native_request_translates_mode_and_items() {
+    fn native_request_translates_constraint_and_items() {
         let req = EngineCoreRequest {
             request_id: "r2".into(),
             prompt_token_ids: Some(vec![5]),
             sampling_params: Some(EngineCoreSamplingParams::for_test()),
             native: Some(NativeRequestExt {
-                mode: GenMode::AutoInterleave,
+                constraint: GenerationConstraint::Default,
                 image: ImageParams {
                     steps: 7,
                     ..Default::default()
@@ -686,7 +690,8 @@ mod tests {
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let g = to_generate_request(&req, RequestId(1), tx);
-        assert_eq!(g.mode, GenMode::AutoInterleave);
+        assert_eq!(g.constraint, GenerationConstraint::Default);
+        assert_eq!(g.constraint, GenerationConstraint::Default);
         assert_eq!(g.image.steps, 7);
         assert_eq!(g.neg_prompt_ids, vec![9]);
     }

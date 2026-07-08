@@ -9,14 +9,7 @@ class I2ITask(BenchmarkTask):
     """Image-to-image (editing) via the native ``/generate`` SSE endpoint.
 
     The source image is sent as base64 under ``input_image_b64`` and the edit
-    instruction as ``prompt``. ``mode`` defaults to ``"image"`` to match the
-    documented API contract.
-
-    NOTE: this assumes only the API endpoint, not the model. The current server
-    ``build()`` path drops input images for ``mode:"image"`` (only
-    ``mode:"understand"`` consumes them); ``spec.i2i_mode`` lets a caller switch
-    to ``"understand"`` if the server is changed to condition image generation on
-    the input there. Either way the harness sends a well-formed i2i request.
+    instruction as ``prompt``. The native request uses ``constraint:"gen_only"``.
     """
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
@@ -30,7 +23,7 @@ class I2ITask(BenchmarkTask):
             image["steps"] = int(self.spec.steps)
         payload: dict[str, Any] = {
             "prompt": item["prompt"],
-            "mode": self.spec.i2i_mode,
+            "constraint": "gen_only",
             "input_image_b64": item.get("input_image_b64"),
             "image": image,
         }

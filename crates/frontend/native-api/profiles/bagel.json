@@ -20,12 +20,10 @@
     ],
     "image_start_text": "image_start"
   },
-  "default_mode": "text",
-  "supported_modes": [
-    "text",
-    "image",
-    "interleave",
-    "understand"
+  "supported_constraints": [
+    "default",
+    "und_only",
+    "gen_only"
   ],
   "image_defaults": {
     "resolution": "1:1",
@@ -58,20 +56,20 @@
     "reasoning": null,
     "visible_wrappers": []
   },
-  "understanding_system_prompt": "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n",
+  "context_system_prompt": "\nLet's think step by step to answer the question. For text-based thinking, enclose the process within <think> </think>, e.g. <think> thinking process here </think>. For visual thinking, enclose the content within <image_start> </image_end>, e.g. <image_start> thinking image here </image_end>. Finally conclude with the final answer wrapped in <answer></answer> tags, i.e.<answer> answer here </answer>.\n",
   "prompts": {
-    "text": {
-      "kind": "bagel_text"
-    },
-    "image": {
-      "kind": "bagel_image"
-    },
-    "auto_interleave": {
-      "kind": "bagel_auto_interleave",
+    "default": {
+      "kind": "bagel_default",
       "default_system": "You should first think about the planning process in the mind and then generate the image. \n     The planning process is enclosed within <think> </think> tags, i.e. <think> planning process here </think> image here"
     },
-    "understand": {
+    "und": {
+      "kind": "bagel_text"
+    },
+    "und_with_images": {
       "kind": "raw"
+    },
+    "gen": {
+      "kind": "bagel_image"
     },
     "negative": {
       "kind": "bagel_image"

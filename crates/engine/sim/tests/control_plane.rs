@@ -1,14 +1,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! Full-stack GPU-free control-plane integration tests: drive the
-//! real `Scheduler` over a `LocalExecutor`+`SimEngine` and assert the FSM/event
+//! real `Scheduler` over a `LocalExecutor`+`SimEngine` and assert the lifecycle/event
 //! contract. This is the regression harness every workstream relies on.
 
 use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent, GenerateRequest, MmItem};
 use uniserve_executor::{ControlAck, ControlOp, Executor};
 use uniserve_scheduler::{ControlTokens, Scheduler, SchedulerConfig, SchedulingPolicy};
@@ -27,12 +27,12 @@ struct Collected {
     reason: Option<FinishReason>,
 }
 
-/// Run the given (mode, count) requests through a fresh scheduler at `depth`,
+/// Run the given (constraint, count) requests through a fresh scheduler at `depth`,
 /// returning per-request collected counts.
 fn run_requests(
     depth: u32,
     policy: SchedulingPolicy,
-    specs: &[(GenMode, usize)],
+    specs: &[(GenerationConstraint, usize)],
 ) -> HashMap<RequestId, Collected> {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(depth);
@@ -45,7 +45,7 @@ fn run_requests(
     let mut rxs: HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>> =
         HashMap::new();
     let mut id = 1u64;
-    for (mode, n) in specs {
+    for (constraint, n) in specs {
         for _ in 0..*n {
             let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
             let req = GenerateRequest::new(
@@ -56,7 +56,7 @@ fn run_requests(
                     steps: 4,
                     ..Default::default()
                 },
-                *mode,
+                *constraint,
                 16,
                 etx,
             );
@@ -103,7 +103,10 @@ fn text_and_image_requests_complete() {
     let out = run_requests(
         2,
         SchedulingPolicy::Fcfs,
-        &[(GenMode::Text, 3), (GenMode::Image, 2)],
+        &[
+            (GenerationConstraint::UndOnly, 3),
+            (GenerationConstraint::GenOnly, 2),
+        ],
     );
     assert_eq!(out.len(), 5);
     for (id, c) in &out {
@@ -187,7 +190,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
             vec![1, 2, 3],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             64,
             text_tx,
         ))
@@ -202,7 +205,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
                 steps: 1,
                 ..Default::default()
             },
-            GenMode::Image,
+            GenerationConstraint::GenOnly,
             0,
             image_tx,
         ))
@@ -326,7 +329,7 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
             vec![1, 2, 3],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             64,
             tx1,
         ));
@@ -336,7 +339,7 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
             vec![4, 5, 6],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             64,
             tx2,
         ));
@@ -364,7 +367,7 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
             vec![7, 8, 9],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             64,
             tx3,
         ));
@@ -478,7 +481,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
                     steps: 1,
                     ..Default::default()
                 },
-                GenMode::Image,
+                GenerationConstraint::GenOnly,
                 0,
                 image_tx,
             ))
@@ -597,7 +600,7 @@ fn decode_lookahead_uses_last_sampled_token_source_for_safe_text() {
         vec![1, 2, 3],
         sampling,
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         4,
         etx,
     ));
@@ -627,8 +630,16 @@ fn decode_lookahead_uses_last_sampled_token_source_for_safe_text() {
 /// the same prompts produce the same per-request token counts at depth 1 and 2.
 #[test]
 fn pipeline_depth_is_token_identical() {
-    let d1 = run_requests(1, SchedulingPolicy::Fcfs, &[(GenMode::Text, 4)]);
-    let d2 = run_requests(2, SchedulingPolicy::Fcfs, &[(GenMode::Text, 4)]);
+    let d1 = run_requests(
+        1,
+        SchedulingPolicy::Fcfs,
+        &[(GenerationConstraint::UndOnly, 4)],
+    );
+    let d2 = run_requests(
+        2,
+        SchedulingPolicy::Fcfs,
+        &[(GenerationConstraint::UndOnly, 4)],
+    );
     for id in d1.keys() {
         assert_eq!(
             d1[id].text, d2[id].text,
@@ -657,7 +668,7 @@ fn stop_token_terminates_with_stop() {
         vec![1, 2, 3],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         64,
         etx,
     );
@@ -703,7 +714,7 @@ fn run_until_control(abort: bool) -> FinishReason {
         vec![1, 2, 3],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         1_000_000,
         etx,
     );
@@ -783,7 +794,7 @@ fn hybrid_groups_handshake_runs() {
             vec![1, 2, 3],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             16,
             etx,
         ))
@@ -832,7 +843,7 @@ fn prefix_cache_reuses_shared_prompt() {
                 prompt.clone(),
                 SamplingParams::default(),
                 ImageParams::default(),
-                GenMode::Text,
+                GenerationConstraint::UndOnly,
                 8,
                 etx,
             ))
@@ -878,7 +889,7 @@ fn prefix_cache_reuses_shared_prompt() {
 /// long prompt is prefilled in budget-sized chunks while a concurrent request's
 /// decodes proceed in the same steps — both complete correctly.
 #[test]
-fn chunked_prefill_interleaves_with_decode() {
+fn chunked_prefill_progresses_with_decode() {
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -898,7 +909,7 @@ fn chunked_prefill_interleaves_with_decode() {
             long_prompt,
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             8,
             etx1,
         ))
@@ -910,7 +921,7 @@ fn chunked_prefill_interleaves_with_decode() {
             vec![1, 2, 3],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             8,
             etx2,
         ))
@@ -956,7 +967,7 @@ fn priority_preemption_and_recompute() {
         vec![1, 2, 3],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         6,
         atx,
     );
@@ -974,7 +985,7 @@ fn priority_preemption_and_recompute() {
         vec![4, 5, 6],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         6,
         btx,
     );
@@ -1033,7 +1044,7 @@ fn run_sampling(
         vec![1, 2, 3],
         sampling,
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         max_tokens,
         etx,
     );
@@ -1148,7 +1159,7 @@ fn multimodal_encode_then_cache_hit() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let run_img = |rid: u64, handle: &EngineHandle| -> bool {
+    let run_img = |rid: u64, handle: &EngineHandle| -> (bool, Vec<String>) {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
         // prompt_ids include placeholder positions for the image span [3, 7).
         let mut req = GenerateRequest::new(
@@ -1156,7 +1167,7 @@ fn multimodal_encode_then_cache_hit() {
             vec![1, 2, 3, 0, 0, 0, 0, 9],
             SamplingParams::default(),
             ImageParams::default(),
-            GenMode::Text,
+            GenerationConstraint::GenOnly,
             8,
             etx,
         );
@@ -1168,34 +1179,51 @@ fn multimodal_encode_then_cache_hit() {
         }];
         handle.submit(req).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut text = 0;
+        let mut images = 0;
         let mut done = false;
+        let mut seen = Vec::new();
         while !done && Instant::now() < deadline {
             match erx.try_recv() {
-                Ok(GenEvent::TextToken { .. }) => text += 1,
-                Ok(GenEvent::Finished { .. }) => done = true,
-                Ok(_) => {}
+                Ok(GenEvent::ImageDone { .. }) => {
+                    seen.push("image_done".to_string());
+                    images += 1;
+                }
+                Ok(GenEvent::Finished { reason, .. }) => {
+                    seen.push(format!("finished:{reason:?}"));
+                    done = true;
+                }
+                Ok(event) => seen.push(format!("{event:?}")),
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
         }
-        done && text > 0
+        (done && images > 0, seen)
     };
 
+    let (ok, seen) = run_img(1, &handle);
     assert!(
-        run_img(1, &handle),
-        "image-in-prompt request 1 must produce text"
+        ok,
+        "context-image request 1 must produce an image, saw {seen:?}"
     );
     assert_eq!(
         stats.encoder.cache_hits.load(Ordering::Relaxed),
         0,
         "first image is a cache miss"
     );
+    let cache_deadline = Instant::now() + Duration::from_secs(2);
+    while stats.encoder.cached.load(Ordering::Relaxed) == 0 && Instant::now() < cache_deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
     assert!(
         stats.encoder.cached.load(Ordering::Relaxed) >= 1,
         "encoder output should be cached"
     );
 
-    assert!(run_img(2, &handle), "request 2 must produce text");
+    let (ok, seen) = run_img(2, &handle);
+    assert!(ok, "request 2 must produce an image, saw {seen:?}");
+    let hit_deadline = Instant::now() + Duration::from_secs(2);
+    while stats.encoder.cache_hits.load(Ordering::Relaxed) == 0 && Instant::now() < hit_deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
     assert!(
         stats.encoder.cache_hits.load(Ordering::Relaxed) >= 1,
         "repeated image must hit the encoder cache"
@@ -1207,10 +1235,10 @@ fn multimodal_encode_then_cache_hit() {
     let _ = jh.join();
 }
 
-/// a single AutoInterleave request emits at least two images separated by
+/// a single default generation request emits at least two images separated by
 /// text in one stream, and finishes only on a terminal condition.
 #[test]
-fn interleave_round_trip_text_image_text_image() {
+fn default_generation_round_trip_text_image_text_image() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     sim.set_pipeline_depth(2);
@@ -1237,7 +1265,7 @@ fn interleave_round_trip_text_image_text_image() {
             max_images: 2,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         200,
         etx,
     );
@@ -1259,7 +1287,7 @@ fn interleave_round_trip_text_image_text_image() {
     handle.shutdown();
     let _ = jh.join();
 
-    assert!(finished, "interleave request did not finish");
+    assert!(finished, "default generation request did not finish");
     let images = seq.iter().filter(|&&c| c == 'I').count();
     assert!(
         images >= 2,
@@ -1276,7 +1304,7 @@ fn interleave_round_trip_text_image_text_image() {
 /// Native multi-image passages can be requested intentionally through max_images;
 /// image starts must come from the model, not a scheduler-forced cadence.
 #[test]
-fn auto_interleave_waits_for_model_image_starts() {
+fn default_generation_waits_for_model_image_starts() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1295,7 +1323,7 @@ fn auto_interleave_waits_for_model_image_starts() {
             max_images: 3,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         40,
         etx,
     );
@@ -1329,7 +1357,7 @@ fn auto_interleave_waits_for_model_image_starts() {
 }
 
 #[test]
-fn auto_interleave_model_image_starts_spend_budget() {
+fn default_generation_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1355,7 +1383,7 @@ fn auto_interleave_model_image_starts_spend_budget() {
             max_images: 3,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         40,
         etx,
     );
@@ -1398,7 +1426,7 @@ fn auto_interleave_model_image_starts_spend_budget() {
 }
 
 #[test]
-fn auto_interleave_long_token_budget_is_not_rejected_up_front() {
+fn default_generation_rejects_oversized_worstcase_at_admission() {
     let mut sim = SimEngine::new();
     sim.set_text_len(8);
     sim.set_num_blocks(128);
@@ -1420,7 +1448,7 @@ fn auto_interleave_long_token_budget_is_not_rejected_up_front() {
             retain_images: true,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         32_768,
         etx,
     );
@@ -1441,10 +1469,10 @@ fn auto_interleave_long_token_budget_is_not_rejected_up_front() {
     let _ = jh.join();
 
     assert!(
-        !rejected,
-        "auto-interleave should not reserve 32768 tokens up front"
+        rejected,
+        "oversized default-generation request must be rejected"
     );
-    assert_eq!(finished, Some(FinishReason::Eos));
+    assert_eq!(finished, None);
 }
 
 #[test]
@@ -1475,7 +1503,7 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
             max_images: 3,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         40,
         etx,
     );
@@ -1532,7 +1560,7 @@ fn multiworker_executor_drives_scheduler_unchanged() {
                 vec![1, 2, 3],
                 SamplingParams::default(),
                 ImageParams::default(),
-                GenMode::Text,
+                GenerationConstraint::UndOnly,
                 16,
                 etx,
             ))
@@ -1562,7 +1590,11 @@ fn multiworker_executor_drives_scheduler_unchanged() {
 
 #[test]
 fn fcfs_policy_completes_text() {
-    let out = run_requests(2, SchedulingPolicy::Fcfs, &[(GenMode::Text, 3)]);
+    let out = run_requests(
+        2,
+        SchedulingPolicy::Fcfs,
+        &[(GenerationConstraint::UndOnly, 3)],
+    );
     assert_eq!(out.len(), 3);
     for c in out.values() {
         assert!(c.finished);
@@ -1653,7 +1685,7 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
         vec![1, 2, 3],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         6,
         atx,
     );
@@ -1669,7 +1701,7 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
         vec![4, 5, 6],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         6,
         btx,
     );
@@ -1736,7 +1768,7 @@ fn guided_choice_constrains_output() {
         vec![1, 2, 3],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         64,
         etx,
     );
@@ -1771,13 +1803,13 @@ fn guided_choice_constrains_output() {
     );
 }
 
-/// The auto-interleave literal trigger (ThinkMorph's textual visual-thinking
+/// The literal image trigger (ThinkMorph's textual visual-thinking
 /// signal): when the generated round text completes `image_start_ids`, the
 /// next image begins immediately — without waiting for EOS or BAGEL's
 /// <|vision_start|> token. The sim never emits EOS here (huge text_len), so
 /// images can only come from the literal trigger.
 #[test]
-fn auto_interleave_literal_trigger_starts_images() {
+fn default_generation_literal_trigger_starts_images() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     sim.set_pipeline_depth(2);
@@ -1803,7 +1835,7 @@ fn auto_interleave_literal_trigger_starts_images() {
             max_images: 2,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         40,
         etx,
     );
@@ -1839,12 +1871,12 @@ fn auto_interleave_literal_trigger_starts_images() {
 }
 
 /// The image-likelihood knob: a logit bias on the image-start token steers
-/// when interleave requests draw. A huge positive bias makes the very first
+/// when default-generation requests draw. A huge positive bias makes the very first
 /// sampled token the image trigger (image before any text); a huge negative
 /// bias keeps the pathway shut (the sim never EOSes here, so no image can
 /// appear any other way).
 #[test]
-fn image_start_logit_bias_steers_interleave() {
+fn image_start_logit_bias_steers_default_generation() {
     let run = |bias: f32| -> (usize, usize, bool) {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000); // never EOS on its own
@@ -1872,7 +1904,7 @@ fn image_start_logit_bias_steers_interleave() {
                 max_images: 1,
                 ..Default::default()
             },
-            GenMode::AutoInterleave,
+            GenerationConstraint::Default,
             12,
             etx,
         );
@@ -1909,11 +1941,11 @@ fn image_start_logit_bias_steers_interleave() {
     assert_eq!(images, 0, "negative bias must suppress the image pathway");
 }
 
-/// Native assistant prefixes can end at the image boundary. AutoInterleave must
+/// Native assistant prefixes can end at the image boundary. Default generation must
 /// honor that prefilled control token immediately after prefill instead of
 /// waiting for the model to sample another image-start token.
 #[test]
-fn auto_interleave_prefilled_image_start_begins_without_text() {
+fn default_generation_prefilled_image_start_begins_without_text() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1936,7 +1968,7 @@ fn auto_interleave_prefilled_image_start_begins_without_text() {
             max_images: 1,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         8,
         etx,
     );
@@ -1967,7 +1999,7 @@ fn auto_interleave_prefilled_image_start_begins_without_text() {
 }
 
 #[test]
-fn understanding_interleave_commits_existing_image_context_at_round_close() {
+fn context_image_request_commits_existing_image_context_at_round_close() {
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1990,7 +2022,7 @@ fn understanding_interleave_commits_existing_image_context_at_round_close() {
             max_images: 1,
             ..Default::default()
         },
-        GenMode::InterleaveUnd,
+        GenerationConstraint::UndOnly,
         40,
         etx,
     );
@@ -2060,7 +2092,7 @@ fn image_budget_suppresses_biased_image_start() {
             max_images: 2,
             ..Default::default()
         },
-        GenMode::AutoInterleave,
+        GenerationConstraint::Default,
         24,
         etx,
     );
@@ -2115,10 +2147,10 @@ fn resource_leases_drain_to_zero_after_completion() {
     // Keep receivers alive — a dropped receiver is treated as a cancellation.
     let mut keep_alive = Vec::new();
     let specs = [
-        GenMode::Text,
-        GenMode::Image,
-        GenMode::AutoInterleave,
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
+        GenerationConstraint::GenOnly,
+        GenerationConstraint::Default,
+        GenerationConstraint::UndOnly,
     ];
     for (i, mode) in specs.iter().enumerate() {
         let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
@@ -2196,7 +2228,7 @@ fn policy_facts_and_decisions_are_recorded() {
                 steps: 4,
                 ..Default::default()
             },
-            GenMode::Text,
+            GenerationConstraint::UndOnly,
             16,
             etx,
         ));
@@ -2256,7 +2288,7 @@ fn lifecycle_trace_and_health_snapshot() {
             steps: 4,
             ..Default::default()
         },
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         8,
         etx,
     ));
@@ -2289,7 +2321,8 @@ fn lifecycle_trace_and_health_snapshot() {
         "trace must span admit→finish"
     );
     assert!(t.resolved_ops() > 0, "ops must resolve");
-    assert!(t.program_id.0 >= 1, "program id assigned");
+    assert_eq!(t.request_id, RequestId(1), "trace is tied to the request");
+    assert_eq!(t.trace_id.0, 1, "trace id is assigned");
     let submitted: Vec<_> = t
         .events
         .iter()

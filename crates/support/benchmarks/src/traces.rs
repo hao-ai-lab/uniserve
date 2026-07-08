@@ -6,7 +6,7 @@ pub enum TraceTask {
     Text,
     T2i,
     I2i,
-    Interleave,
+    Default,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,10 +54,10 @@ mod tests {
     #[test]
     fn parses_trace_jsonl_rows() {
         let rows = parse_jsonl(
-            r#"{"id":"r1","task":"interleave","prompt":"travel","width":2048,"height":1152}"#,
+            r#"{"id":"r1","task":"default","prompt":"travel","width":2048,"height":1152}"#,
         )
         .expect("trace rows");
-        assert_eq!(rows[0].task, TraceTask::Interleave);
+        assert_eq!(rows[0].task, TraceTask::Default);
         validate_dimensions(&rows[0]).expect("dimensions");
     }
 }

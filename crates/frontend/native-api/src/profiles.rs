@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::Value;
-use uniserve_engine_client::GenMode;
+use uniserve_engine_client::GenerationConstraint;
 use uniserve_text::tokenizer::DynTokenizer;
 
 use super::resolution::{ResolutionBucket, ResolutionPolicy};
@@ -60,7 +60,7 @@ enum PromptRecipe {
     },
     BagelText,
     BagelImage,
-    BagelAutoInterleave {
+    BagelDefault {
         default_system: String,
     },
     Raw,
@@ -68,11 +68,19 @@ enum PromptRecipe {
 
 #[derive(Debug, Clone)]
 struct NativePromptRecipes {
-    text: PromptRecipe,
-    image: PromptRecipe,
-    auto_interleave: PromptRecipe,
-    understand: PromptRecipe,
+    default: PromptRecipe,
+    und: PromptRecipe,
+    und_with_images: PromptRecipe,
+    r#gen: PromptRecipe,
     negative: PromptRecipe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePromptKind {
+    Default,
+    Und,
+    UndWithImages,
+    Gen,
 }
 
 #[derive(Debug, Clone)]
@@ -82,11 +90,10 @@ pub struct NativeModelProfile {
     pub image_defaults: NativeImageDefaults,
     pub resolution_policy: ResolutionPolicy,
     pub output_filter: NativeOutputFilter,
-    default_mode: GenMode,
-    supported_modes: Vec<GenMode>,
+    supported_constraints: Vec<GenerationConstraint>,
     prompts: NativePromptRecipes,
-    understanding_system_prompt: String,
-    understanding_markers_in_prompt: bool,
+    context_system_prompt: String,
+    context_markers_in_prompt: bool,
 }
 
 impl Default for NativeModelProfile {
@@ -99,55 +106,42 @@ impl Default for NativeModelProfile {
 }
 
 impl NativeModelProfile {
-    pub fn default_mode_name(&self) -> &'static str {
-        mode_name(self.default_mode)
+    pub fn supports_constraint(&self, constraint: GenerationConstraint) -> bool {
+        self.supported_constraints.contains(&constraint)
     }
 
-    pub fn supports_mode(&self, mode: GenMode) -> bool {
-        self.supported_modes.contains(&mode)
+    pub fn context_system_prompt(&self) -> &str {
+        &self.context_system_prompt
     }
 
-    pub fn understanding_system_prompt(&self) -> &str {
-        &self.understanding_system_prompt
-    }
-
-    /// Whether understanding-mode input images ride as markers inside the
-    /// prompt token stream (the encode op fills the gap between them).
-    pub fn understanding_markers_in_prompt(&self) -> bool {
-        self.understanding_markers_in_prompt
-    }
-
-    /// Render the understanding-mode prompt through the profile's `understand`
-    /// recipe (used by marker-in-prompt profiles; the legacy path wraps text
-    /// with bos/eos directly).
-    pub fn build_understanding_prompt_ids(
-        &self,
-        tok: &DynTokenizer,
-        body: &NativeGenerateBody,
-        user_text: &str,
-    ) -> Vec<u32> {
-        render_prompt(
-            tok,
-            &self.controls,
-            &self.prompts.understand,
-            body,
-            user_text,
-        )
+    /// Whether input images ride as markers inside the prompt token stream.
+    pub fn context_markers_in_prompt(&self) -> bool {
+        self.context_markers_in_prompt
     }
 
     pub fn build_prompt_ids(
         &self,
         tok: &DynTokenizer,
         body: &NativeGenerateBody,
-        mode: GenMode,
+        kind: NativePromptKind,
     ) -> Vec<u32> {
-        let recipe = match mode {
-            GenMode::Text => &self.prompts.text,
-            GenMode::Image => &self.prompts.image,
-            GenMode::AutoInterleave => &self.prompts.auto_interleave,
-            GenMode::InterleaveUnd => &self.prompts.understand,
+        self.build_prompt_ids_with_text(tok, body, kind, &body.prompt)
+    }
+
+    pub fn build_prompt_ids_with_text(
+        &self,
+        tok: &DynTokenizer,
+        body: &NativeGenerateBody,
+        kind: NativePromptKind,
+        text: &str,
+    ) -> Vec<u32> {
+        let recipe = match kind {
+            NativePromptKind::Default => &self.prompts.default,
+            NativePromptKind::Und => &self.prompts.und,
+            NativePromptKind::UndWithImages => &self.prompts.und_with_images,
+            NativePromptKind::Gen => &self.prompts.r#gen,
         };
-        render_prompt(tok, &self.controls, recipe, body, &body.prompt)
+        render_prompt(tok, &self.controls, recipe, body, text)
     }
 
     pub fn build_negative_prompt_ids(&self, tok: &DynTokenizer, negative_prompt: &str) -> Vec<u32> {
@@ -167,7 +161,7 @@ impl NativeModelProfile {
         )
     }
 
-    pub fn wrap_understanding_text(&self, tok: &DynTokenizer, text: &str) -> Vec<u32> {
+    pub fn wrap_context_text(&self, tok: &DynTokenizer, text: &str) -> Vec<u32> {
         let mut ids = vec![self.controls.bos];
         ids.extend(encode(tok, text));
         ids.push(self.controls.eos);
@@ -233,15 +227,14 @@ fn profile_from_manifest(
         image_defaults: manifest.image_defaults.into(),
         resolution_policy: manifest.resolution.into(),
         output_filter: manifest.output_filter.into(),
-        default_mode: parse_profile_mode(&manifest.default_mode),
-        supported_modes: manifest
-            .supported_modes
+        supported_constraints: manifest
+            .supported_constraints
             .iter()
-            .map(|mode| parse_profile_mode(mode))
+            .map(|constraint| parse_profile_constraint(constraint))
             .collect(),
         prompts: manifest.prompts.into(),
-        understanding_system_prompt: manifest.understanding_system_prompt,
-        understanding_markers_in_prompt: manifest.understanding.markers_in_prompt,
+        context_system_prompt: manifest.context_system_prompt,
+        context_markers_in_prompt: manifest.context_images.markers_in_prompt,
     }
 }
 
@@ -368,7 +361,7 @@ fn render_prompt(
             ids.push(controls.eos);
             ids
         }
-        PromptRecipe::BagelAutoInterleave { default_system } => encode(
+        PromptRecipe::BagelDefault { default_system } => encode(
             tok,
             &format!(
                 "<|im_start|>{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
@@ -399,23 +392,12 @@ fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -> String {
     out
 }
 
-/// Canonical wire name for one native generation mode.
-pub fn mode_name(mode: GenMode) -> &'static str {
-    match mode {
-        GenMode::Text => "text",
-        GenMode::Image => "image",
-        GenMode::AutoInterleave => "interleave",
-        GenMode::InterleaveUnd => "understand",
-    }
-}
-
-fn parse_profile_mode(value: &str) -> GenMode {
+fn parse_profile_constraint(value: &str) -> GenerationConstraint {
     match value {
-        "text" => GenMode::Text,
-        "image" => GenMode::Image,
-        "auto" | "auto_interleave" | "interleave" => GenMode::AutoInterleave,
-        "understand" | "interleave_und" | "understanding" => GenMode::InterleaveUnd,
-        other => panic!("unknown native profile mode {other:?}"),
+        "default" => GenerationConstraint::Default,
+        "und_only" => GenerationConstraint::UndOnly,
+        "gen_only" => GenerationConstraint::GenOnly,
+        other => panic!("unknown native profile constraint {other:?}"),
     }
 }
 
@@ -423,24 +405,22 @@ fn parse_profile_mode(value: &str) -> GenMode {
 struct ProfileManifest {
     id: String,
     control_tokens: ControlTokenManifest,
-    default_mode: String,
-    supported_modes: Vec<String>,
+    supported_constraints: Vec<String>,
     image_defaults: ImageDefaultsManifest,
     resolution: ResolutionManifest,
     output_filter: OutputFilterManifest,
     prompts: PromptManifestSet,
-    understanding_system_prompt: String,
+    context_system_prompt: String,
     #[serde(default)]
-    understanding: UnderstandingManifest,
+    context_images: ContextImageManifest,
 }
 
-/// Understanding-mode (i2t) request-construction policy.
+/// Input-image request-construction policy.
 #[derive(Debug, Deserialize, Default)]
-struct UnderstandingManifest {
+struct ContextImageManifest {
     /// When true the image begin/end markers are ordinary prompt tokens and
     /// the encode op fills the gap between them (one shared temporal RoPE
-    /// index per image). When false (legacy default) the worker emits the
-    /// markers itself during the encode op.
+    /// index per image). When false the worker emits the markers during encode.
     #[serde(default)]
     markers_in_prompt: bool,
 }
@@ -566,20 +546,20 @@ impl From<OutputFilterManifest> for NativeOutputFilter {
 
 #[derive(Debug, Deserialize)]
 struct PromptManifestSet {
-    text: PromptRecipeManifest,
-    image: PromptRecipeManifest,
-    auto_interleave: PromptRecipeManifest,
-    understand: PromptRecipeManifest,
+    default: PromptRecipeManifest,
+    und: PromptRecipeManifest,
+    und_with_images: PromptRecipeManifest,
+    r#gen: PromptRecipeManifest,
     negative: PromptRecipeManifest,
 }
 
 impl From<PromptManifestSet> for NativePromptRecipes {
     fn from(value: PromptManifestSet) -> Self {
         Self {
-            text: value.text.into(),
-            image: value.image.into(),
-            auto_interleave: value.auto_interleave.into(),
-            understand: value.understand.into(),
+            default: value.default.into(),
+            und: value.und.into(),
+            und_with_images: value.und_with_images.into(),
+            r#gen: value.r#gen.into(),
             negative: value.negative.into(),
         }
     }
@@ -603,10 +583,10 @@ impl From<PromptRecipeManifest> for PromptRecipe {
             },
             "bagel_text" => PromptRecipe::BagelText,
             "bagel_image" => PromptRecipe::BagelImage,
-            "bagel_auto_interleave" => PromptRecipe::BagelAutoInterleave {
+            "bagel_default" => PromptRecipe::BagelDefault {
                 default_system: value
                     .default_system
-                    .expect("bagel_auto_interleave prompt requires default_system"),
+                    .expect("bagel_default prompt requires default_system"),
             },
             "raw" => PromptRecipe::Raw,
             other => panic!("unknown native prompt recipe {other:?}"),
@@ -695,7 +675,7 @@ mod tests {
 
         let profile = resolve_native_profile_for_model(dir.to_str().unwrap(), &tok);
         assert_eq!(profile.id, "custom-profile");
-        assert_eq!(profile.default_mode_name(), "text");
+        assert!(profile.supports_constraint(GenerationConstraint::UndOnly));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -705,10 +685,10 @@ mod tests {
         let profile = profile_from_key("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint a lake".into(),
-            mode: Some("image".into()),
+            constraint: Some(GenerationConstraint::GenOnly),
             ..Default::default()
         };
-        let ids = profile.build_prompt_ids(&tok, &body, GenMode::Image);
+        let ids = profile.build_prompt_ids(&tok, &body, NativePromptKind::Gen);
         let text = tok.decode(&ids, false).unwrap();
         assert!(text.contains("image generation and editing assistant"));
         assert!(text.ends_with("<think>\n\n</think>\n\n<img>"));

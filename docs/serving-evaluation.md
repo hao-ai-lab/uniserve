@@ -14,7 +14,7 @@ tracked profile values.
 ```bash
 uniserve-eval list
 uniserve-eval launch gate/server/sensenova
-uniserve-eval verify gate/sensenova/interleave-travel
+uniserve-eval verify gate/sensenova/default-travel
 uniserve-eval perf perf/tripwire/bagel/i2t
 uniserve-eval run gate/all --manage-servers
 uniserve-eval clean --all
@@ -70,7 +70,7 @@ Generic repo-local Python escape hatch with an optional expected output file.
 
 | suite | contents |
 |---|---|
-| `gate/sensenova` | SenseNova T2I, I2T, and interleave correctness gates. |
+| `gate/sensenova` | SenseNova T2I, I2T, and default-generation correctness gates. |
 | `gate/bagel` | BAGEL T2I and I2T correctness gates. |
 | `gate/all` | All correctness gates. |
 | `perf/tripwire` | UniServe SenseNova/BAGEL T2I/I2T regression sentinels. |

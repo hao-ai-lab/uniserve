@@ -345,7 +345,7 @@ impl ZmqEngineCoreClient {
         ))
     }
 
-    /// Submit a native image/interleave request over the wire and adapt the
+    /// Submit a native generation request over the wire and adapt the
     /// per-request output stream back into typed text+image [`GenEvent`]s.
     pub async fn generate_native(&self, req: NativeGenerateRequest) -> Result<NativeEventStream> {
         let seq = self.native_seq.fetch_add(1, Ordering::Relaxed);

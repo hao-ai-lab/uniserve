@@ -126,7 +126,7 @@ impl EngineCoreClient {
         }
     }
 
-    /// Submit a native image/interleave-capable request and return its typed
+    /// Submit a native generation request and return its typed
     /// text+image event stream.
     pub async fn generate_native(&self, req: NativeGenerateRequest) -> Result<NativeEventStream> {
         match self {
