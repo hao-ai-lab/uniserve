@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -93,6 +94,16 @@ def test_native_generation_submission_is_owned_by_serving_runtime():
     assert ".serve_native(" in chat_route
     assert ".uniserve_engine_client().generate_native" not in native_route
     assert ".uniserve_engine_client().generate_native" not in chat_route
+
+
+def test_public_multimodal_generation_surface_is_chat_completions():
+    routes = read(CRATES / "server" / "http" / "src" / "routes" / "mod.rs")
+    spec = read(ROOT / "uniserve_eval" / "harness" / "spec.py")
+    profiles = json.loads(read(ROOT / "uniserve_eval" / "profiles.json"))
+
+    assert '.route("/generate"' not in routes
+    assert '"/generate"' not in spec
+    assert '"wire": "native"' not in json.dumps(profiles)
 
 
 def test_grpc_generate_uses_semantic_runtime_path():

@@ -18,7 +18,7 @@ use uniserve_executor::Executor;
 
 /// Current unix timestamp in fractional seconds, matching the wire timestamps
 /// the metrics layer expects.
-
+///
 /// routes through the single shared epoch helper so it matches the
 /// frontend/scheduler wall-clock timestamps.
 fn now_secs() -> f64 {

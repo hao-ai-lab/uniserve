@@ -44,9 +44,7 @@ class RequestRecord:
     ttft: float = 0.0
     itl: list[float] = field(default_factory=list)
 
-    # Server-side scheduling timestamps from native UniServe ``scheduled`` SSE
-    # events. They are wall-clock seconds from the server process; only the
-    # duration between them is mixed with client-side durations.
+    # Server-side scheduling timestamps when a stream exposes them. They are wall-clock seconds from the server process; only the duration between them is mixed with client-side durations.
     server_queued_at: float | None = None
     server_scheduled_at: float | None = None
 
@@ -58,10 +56,7 @@ class RequestRecord:
     # retokenized-ITL cross-check that mirrors sglang.
     text_chunks: list[str] = field(default_factory=list)
 
-    # Image accounting. ``image_latencies`` is per-image E2E (image_done - start);
-    # ``first_image_latency`` is time to the first ``image_begin``;
-    # ``image_gen_seconds`` is per-image (image_done - image_begin);
-    # ``image_steps`` is the diffusion step count reported per image.
+    # Image accounting. ``image_latencies`` is per-image E2E from request start to image availability; ``first_image_latency`` is time to the first image signal; ``image_gen_seconds`` is populated only when a backend exposes a per-image generation span; ``image_steps`` is populated only when a backend reports per-image diffusion steps.
     images: int = 0
     image_latencies: list[float] = field(default_factory=list)
     first_image_latency: float | None = None

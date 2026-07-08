@@ -69,7 +69,7 @@ SGLang runs through the declared benchmark server profile. Cache-mode evidence f
 | load axis | arrival rate 1,2,4,8,16 | arrival rate 1,2,4,8,16 |
 | max tokens | 256 | 256 |
 | temperature | 0 | 0 |
-| UniServe wires | native, openai_chat (streamed) | native, openai_chat (streamed) |
+| UniServe wire | openai_chat (streamed) | openai_chat (streamed) |
 | vllm-omni wire | openai_chat_json (non-streamed chat JSON) | openai_chat_json (non-streamed chat JSON) |
 | metrics | request throughput, output tokens/s, TTFT, TPOT, E2E | same |
 
@@ -85,10 +85,10 @@ SGLang runs through the declared benchmark server profile. Cache-mode evidence f
 | image cap | none |
 | image size | 2048x1152 |
 | steps | 50 |
-| wires | native (/generate SSE), openai_chat (/v1/chat/completions SSE with modalities ["text","image"] + image_config) |
+| wire | openai_chat (/v1/chat/completions SSE with modalities ["text","image"] + image_config) |
 | metrics | request throughput, output tokens/s, images/s, TTFT, TPOT, time-to-first-image |
 
-Text ITL excludes generated-image spans on both wires: the inter-token gap that straddles an image delta is dropped so image generation time never inflates text ITL.
+Text ITL excludes generated-image spans: the inter-token gap that straddles an image delta is dropped so image generation time never inflates text ITL.
 
 ## Runner Contract
 
@@ -121,7 +121,7 @@ Profiles use namespace-style keys:
 
 - `benchmark/server/...` for servers used by the official benchmark matrix.
 - `gate/server/...` for correctness and small tripwire runs.
-- `gate/...` for native correctness workloads.
+- `gate/...` for chat-completions correctness workloads.
 - `perf/tripwire/...` for small regression sentinels.
 - `benchmarks.main` for the official benchmark matrix.
 

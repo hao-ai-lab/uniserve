@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -34,7 +35,7 @@ pub enum EngineBackendKind {
 }
 
 /// How the server reaches its engine core(s).
-
+///
 /// `InProcess` is the deliberate single-node default: the engine
 /// runs on a thread inside the server with no serialized hop. The socket
 /// variants give UniServe vLLM's process topology — engines in separate
@@ -168,6 +169,9 @@ pub struct Config {
     pub uniserve_reasoning_parser: ParserSelection,
     /// Chat renderer selection.
     pub renderer: RendererSelection,
+    /// Tokenizer implementation mode. The current frontend resolves tokenizers
+    /// automatically from model metadata.
+    pub tokenizer_mode: TokenizerMode,
     /// Disable frontend-side multimodal preprocessing and render the model as
     /// language-only.
     pub language_model_only: bool,
@@ -185,6 +189,25 @@ pub struct Config {
     /// When `true`, suppress periodic stats logging (throughput, queue depth,
     /// cache usage).
     pub disable_log_stats: bool,
+    /// Bearer token accepted by the public serving API. Omitted from serialized
+    /// config snapshots because it is a secret.
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+    /// Bearer token accepted by sensitive management routes. Omitted from
+    /// serialized config snapshots because it is a secret.
+    #[serde(skip_serializing)]
+    pub admin_api_key: Option<String>,
+    /// Optional per-request wall-clock timeout.
+    pub request_timeout: Option<Duration>,
+    /// Optional front-door HTTP admission limit for in-flight inference
+    /// requests.
+    pub max_concurrent_requests: Option<u64>,
+    /// Mount development-only management routes.
+    pub server_dev_mode: bool,
+    /// Mount runtime LoRA management routes.
+    pub enable_lora: bool,
+    /// Absolute path prefixes allowed for runtime LoRA adapter loading.
+    pub lora_allowed_path_prefixes: Vec<PathBuf>,
     /// TCP port for the gRPC Generate service. When `None`, no gRPC server is
     /// started.
     pub grpc_port: Option<u16>,
@@ -205,6 +228,7 @@ impl Default for Config {
             tool_call_parser: ParserSelection::default(),
             uniserve_reasoning_parser: ParserSelection::default(),
             renderer: RendererSelection::default(),
+            tokenizer_mode: TokenizerMode::default(),
             language_model_only: false,
             chat_template: None,
             default_chat_template_kwargs: None,
@@ -212,10 +236,25 @@ impl Default for Config {
             enable_log_requests: false,
             enable_request_id_headers: false,
             disable_log_stats: false,
+            api_key: None,
+            admin_api_key: None,
+            request_timeout: None,
+            max_concurrent_requests: None,
+            server_dev_mode: false,
+            enable_lora: false,
+            lora_allowed_path_prefixes: Vec::new(),
             grpc_port: None,
             shutdown_timeout: Duration::from_secs(0),
         }
     }
+}
+
+/// Tokenizer loading mode exposed for reference-compatible serving CLI
+/// parsing. UniServe currently supports the automatic tokenizer path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub enum TokenizerMode {
+    #[default]
+    Auto,
 }
 
 impl Config {
@@ -332,29 +371,35 @@ mod tests {
 
     #[test]
     fn ephemeral_tcp_port_is_allowed() {
-        let mut config = Config::default();
-        config.listener_mode = HttpListenerMode::BindTcp {
-            host: "127.0.0.1".to_string(),
-            port: 0,
+        let config = Config {
+            listener_mode: HttpListenerMode::BindTcp {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+            },
+            ..Config::default()
         };
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn empty_listener_host_is_rejected() {
-        let mut config = Config::default();
-        config.listener_mode = HttpListenerMode::BindTcp {
-            host: String::new(),
-            port: 8000,
+        let config = Config {
+            listener_mode: HttpListenerMode::BindTcp {
+                host: String::new(),
+                port: 8000,
+            },
+            ..Config::default()
         };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn empty_unix_path_is_rejected() {
-        let mut config = Config::default();
-        config.listener_mode = HttpListenerMode::BindUnix {
-            path: String::new(),
+        let config = Config {
+            listener_mode: HttpListenerMode::BindUnix {
+                path: String::new(),
+            },
+            ..Config::default()
         };
         assert!(config.validate().is_err());
     }

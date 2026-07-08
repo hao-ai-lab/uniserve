@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,6 +28,21 @@ pub struct AppState {
     enable_log_requests: bool,
     /// Whether to set X-Request-Id on every HTTP response.
     enable_request_id_headers: bool,
+    /// Bearer token accepted by public serving routes.
+    api_key: Option<String>,
+    /// Bearer token accepted by sensitive management routes.
+    admin_api_key: Option<String>,
+    /// Optional per-request wall-clock timeout.
+    request_timeout: Option<Duration>,
+    /// Optional front-door HTTP admission limit for in-flight inference
+    /// requests.
+    max_concurrent_requests: Option<u64>,
+    /// Whether development-only management routes are mounted.
+    server_dev_mode: bool,
+    /// Whether runtime LoRA management routes are mounted.
+    runtime_lora_updating: bool,
+    /// Absolute path prefixes allowed for runtime LoRA adapter loading.
+    runtime_lora_allowed_path_prefixes: Vec<PathBuf>,
     /// Runtime server information returned by `/server_info`, when available.
     server_info: Option<ServerInfoSnapshot>,
     /// Number of in-flight inference requests currently owned by this frontend.
@@ -39,12 +55,12 @@ pub struct AppState {
 
 impl AppState {
     /// Construct one application state instance.
-
+    ///
     /// `served_model_names` must be non-empty; the first entry is the primary
     /// model ID returned in API responses.
-
+    ///
     /// # Panics
-
+    ///
     /// Panics if `served_model_names` is empty.
     pub fn new(served_model_names: Vec<String>, chat: ChatLlm) -> Self {
         assert!(
@@ -56,6 +72,13 @@ impl AppState {
             runtime: ServingRuntime::from_chat_runtime(chat),
             enable_log_requests: false,
             enable_request_id_headers: false,
+            api_key: None,
+            admin_api_key: None,
+            request_timeout: None,
+            max_concurrent_requests: None,
+            server_dev_mode: false,
+            runtime_lora_updating: false,
+            runtime_lora_allowed_path_prefixes: Vec::new(),
             server_info: None,
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
@@ -79,6 +102,48 @@ impl AppState {
     /// Enable X-Request-Id response headers.
     pub fn with_request_id_headers(mut self, enabled: bool) -> Self {
         self.enable_request_id_headers = enabled;
+        self
+    }
+
+    /// Configure the public serving API bearer token.
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
+    }
+
+    /// Configure the sensitive management route bearer token.
+    pub fn with_admin_api_key(mut self, admin_api_key: Option<String>) -> Self {
+        self.admin_api_key = admin_api_key;
+        self
+    }
+
+    /// Configure the per-request wall-clock timeout.
+    pub fn with_request_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
+    /// Configure the front-door HTTP admission limit.
+    pub fn with_max_concurrent_requests(mut self, limit: Option<u64>) -> Self {
+        self.max_concurrent_requests = limit;
+        self
+    }
+
+    /// Configure development-only management route mounting.
+    pub fn with_server_dev_mode(mut self, enabled: bool) -> Self {
+        self.server_dev_mode = enabled;
+        self
+    }
+
+    /// Configure runtime LoRA management route mounting.
+    pub fn with_runtime_lora_updating(mut self, enabled: bool) -> Self {
+        self.runtime_lora_updating = enabled;
+        self
+    }
+
+    /// Configure allowed local path prefixes for runtime LoRA adapter loading.
+    pub fn with_runtime_lora_allowed_path_prefixes(mut self, prefixes: Vec<PathBuf>) -> Self {
+        self.runtime_lora_allowed_path_prefixes = prefixes;
         self
     }
 
@@ -111,6 +176,41 @@ impl AppState {
     /// Whether HTTP responses should include X-Request-Id.
     pub fn enable_request_id_headers(&self) -> bool {
         self.enable_request_id_headers
+    }
+
+    /// Public serving API bearer token, when configured.
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// Sensitive management route bearer token, when configured.
+    pub fn admin_api_key(&self) -> Option<&str> {
+        self.admin_api_key.as_deref()
+    }
+
+    /// Per-request wall-clock timeout, when configured.
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
+    }
+
+    /// Front-door HTTP admission limit, when configured.
+    pub fn max_concurrent_requests(&self) -> Option<u64> {
+        self.max_concurrent_requests
+    }
+
+    /// Whether development-only management routes are mounted.
+    pub fn server_dev_mode(&self) -> bool {
+        self.server_dev_mode
+    }
+
+    /// Whether runtime LoRA management routes are mounted.
+    pub fn runtime_lora_updating_enabled(&self) -> bool {
+        self.runtime_lora_updating
+    }
+
+    /// Allowed local path prefixes for runtime LoRA adapter loading.
+    pub fn runtime_lora_allowed_path_prefixes(&self) -> &[PathBuf] {
+        &self.runtime_lora_allowed_path_prefixes
     }
 
     /// Build a `/server_info` response payload.
@@ -207,7 +307,7 @@ impl AppState {
 
     /// Wait until all request-owned references are dropped, then shut down the
     /// engine client.
-
+    ///
     /// If the deadline elapses while request/connection tasks still hold state
     /// references, skip the clean engine-client shutdown and let process
     /// teardown reclaim the remaining resources.

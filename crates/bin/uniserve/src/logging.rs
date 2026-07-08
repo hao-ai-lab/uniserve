@@ -20,15 +20,17 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const WHITE: &str = "\x1b[37m";
 const RESET: &str = "\x1b[0m";
-const UNISERVE_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
+const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[month]-[day] [hour]:[minute]:[second]");
 
 const PROCESS_LABEL: &str = "RustFrontend";
+const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "uniserve_server_http"];
 
 /// Install the process-wide tracing subscriber for the CLI binary.
-pub(crate) fn init_tracing() {
+pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>) {
     let filter = build_targets_filter(
-        env::var("UNISERVE_LOGGING_LEVEL").ok().as_deref(),
+        log_level,
+        log_level_http,
         env::var("RUST_LOG").ok().as_deref(),
     );
     let formatter = UniserveEventFormatter::new();
@@ -48,19 +50,20 @@ pub(crate) fn init_tracing() {
     }
 }
 
-/// Build the CLI log filter by merging the default level with
-/// Rust-style target overrides.
+/// Build the CLI log filter by merging the default level with Rust-style
+/// target overrides.
 
 /// Precedence:
-/// - Start from `UNISERVE_LOGGING_LEVEL` as the default level for all targets.
-/// - If `RUST_LOG` contains a global default level such as `warn`, it overrides
-/// `UNISERVE_LOGGING_LEVEL`.
-/// - Any explicit target directives in `RUST_LOG`, such as `hyper=info`, override whichever default
-/// level is active for those targets only.
-fn build_targets_filter(uniserve_logging_level: Option<&str>, rust_log: Option<&str>) -> Targets {
-    let mut filter = Targets::new().with_default(map_python_log_level(
-        uniserve_logging_level.unwrap_or("INFO"),
-    ));
+/// - Start from `--log-level` as the default level for all targets.
+/// - If `RUST_LOG` contains a global default level such as `warn`, it overrides the CLI default.
+/// - Any explicit target directives in `RUST_LOG`, such as `hyper=info`, override whichever default level is active for those targets only.
+/// - `--log-level-http` applies to the HTTP server targets.
+fn build_targets_filter(
+    log_level: Option<&str>,
+    log_level_http: Option<&str>,
+    rust_log: Option<&str>,
+) -> Targets {
+    let mut filter = Targets::new().with_default(map_python_log_level(log_level.unwrap_or("INFO")));
 
     if let Some(rust_log) = rust_log
         && !rust_log.is_empty()
@@ -70,6 +73,11 @@ fn build_targets_filter(uniserve_logging_level: Option<&str>, rust_log: Option<&
             filter = filter.with_default(default_level);
         }
         filter = filter.with_targets(rust_log_targets);
+    }
+
+    if let Some(http_level) = log_level_http {
+        let level = map_python_log_level(http_level);
+        filter = filter.with_targets(HTTP_LOG_TARGETS.iter().map(|target| (*target, level)));
     }
 
     filter
@@ -90,7 +98,7 @@ impl Default for UniserveLocalTimer {
 impl FormatTime for UniserveLocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> fmt::Result {
         let now = time::OffsetDateTime::now_utc().to_offset(self.local_offset);
-        let formatted = now.format(UNISERVE_TIME_FORMAT).map_err(|_| fmt::Error)?;
+        let formatted = now.format(LOCAL_TIME_FORMAT).map_err(|_| fmt::Error)?;
         w.write_str(&formatted)
     }
 }
@@ -300,15 +308,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rust_log_default_level_overrides_uniserve_default_level() {
-        let filter = build_targets_filter(Some("DEBUG"), Some("warn,hyper=info"));
+    fn rust_log_default_level_overrides_cli_default_level() {
+        let filter = build_targets_filter(Some("DEBUG"), None, Some("warn,hyper=info"));
 
         assert_eq!(filter.to_string(), "hyper=info,warn");
     }
 
     #[test]
-    fn invalid_uniserve_level_falls_back_to_info() {
-        let filter = build_targets_filter(Some("bogus"), None);
+    fn http_log_level_applies_to_http_targets() {
+        let filter = build_targets_filter(Some("ERROR"), Some("debug"), None);
+
+        assert!(filter.to_string().contains("axum=debug"));
+        assert!(filter.to_string().contains("hyper=debug"));
+        assert!(filter.to_string().contains("tower_http=debug"));
+        assert!(filter.to_string().contains("uniserve_server_http=debug"));
+        assert!(filter.to_string().ends_with(",error"));
+    }
+
+    #[test]
+    fn invalid_cli_level_falls_back_to_info() {
+        let filter = build_targets_filter(Some("bogus"), None, None);
 
         assert_eq!(filter.to_string(), "info");
     }

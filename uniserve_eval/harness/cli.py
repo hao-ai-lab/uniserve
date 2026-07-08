@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "request/response shape for the task (default: task's first wire): "
-            "native | openai_chat | openai_chat_json | images_generations"
+            "openai_chat | openai_chat_json | images_generations"
         ),
     )
     parser.add_argument("--i2t-question", default="Describe this image in detail.")

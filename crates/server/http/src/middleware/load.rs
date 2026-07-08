@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use axum::Json;
@@ -11,12 +11,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http_body::{Frame, SizeHint};
 use serde_json::json;
-use tracing::warn;
 
 use uniserve_server_app::AppState;
 
 /// Endpoints that will be tracked for server load.
-
+///
 /// Derived from the Python frontend's actual `@load_aware_call` coverage. This
 /// includes alias paths that delegate into decorated handlers, such as
 /// `/v1/rerank` and `/v2/rerank`.
@@ -41,48 +40,8 @@ const TRACKED_HANDLERS: &[&str] = &[
     "/inference/v1/generate",
 ];
 
-/// Environment variable controlling the global in-flight admission limit.
-
-/// When set to a positive integer, the frontend sheds load by rejecting new
-/// requests once this many tracked inference requests are already in flight.
-/// Unset, empty, `0`, or unparseable values disable admission control (the
-/// server accepts requests without bound, preserving unbounded admission).
-const MAX_CONCURRENT_REQUESTS_ENV: &str = "UNISERVE_MAX_CONCURRENT_REQUESTS";
-
 /// `Retry-After` hint (in seconds) advertised when shedding load.
 const RETRY_AFTER_SECONDS: &str = "1";
-
-/// Parsed admission limit, resolved once from [`MAX_CONCURRENT_REQUESTS_ENV`].
-
-/// `None` means admission control is disabled.
-static MAX_CONCURRENT_REQUESTS: LazyLock<Option<u64>> = LazyLock::new(|| {
-    parse_max_concurrent_requests(std::env::var(MAX_CONCURRENT_REQUESTS_ENV).ok())
-});
-
-/// Parse the configured admission limit from a raw environment value.
-
-/// Returns `None` (admission control disabled) for an absent, empty, `0`, or
-/// unparseable value; an unparseable value is logged as a warning so the
-/// misconfiguration is visible rather than silently ignored.
-fn parse_max_concurrent_requests(raw: Option<String>) -> Option<u64> {
-    let raw = raw?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed.parse::<u64>() {
-        Ok(0) => None,
-        Ok(limit) => Some(limit),
-        Err(_) => {
-            warn!(
-                env = MAX_CONCURRENT_REQUESTS_ENV,
-                value = trimmed,
-                "ignoring invalid admission limit; expected a non-negative integer"
-            );
-            None
-        }
-    }
-}
 
 /// Build the 503 load-shedding response returned when the in-flight limit is
 /// reached.
@@ -106,12 +65,11 @@ fn overloaded_response(limit: u64) -> Response {
 }
 
 /// Track frontend-local in-flight inference requests for the `/load` endpoint.
-
-/// When the `UNISERVE_MAX_CONCURRENT_REQUESTS` admission limit is configured,
-/// tracked requests are shed with `503 Service Unavailable` (plus a
-/// `Retry-After` hint) once that many requests are already in flight, so a
-/// fixed-capacity engine browns out gracefully instead of accepting unbounded
-/// work.
+///
+/// When an admission limit is configured, tracked requests are shed with `503
+/// Service Unavailable` (plus a `Retry-After` hint) once that many requests are
+/// already in flight, so a fixed-capacity engine browns out gracefully instead
+/// of accepting unbounded work.
 pub(crate) async fn track_server_load(
     State(state): State<Arc<AppState>>,
     req: Request,
@@ -131,10 +89,10 @@ pub(crate) async fn track_server_load(
     // intentionally not a single atomic compare-and-set; a brief overshoot of a
     // request or two under contention is acceptable for load shedding and keeps
     // the shared `AppState` counter API unchanged.
-    if let Some(limit) = *MAX_CONCURRENT_REQUESTS {
-        if state.server_load() >= limit {
-            return overloaded_response(limit);
-        }
+    if let Some(limit) = state.max_concurrent_requests()
+        && state.server_load() >= limit
+    {
+        return overloaded_response(limit);
     }
 
     state.increment_server_load();
@@ -198,35 +156,6 @@ impl HttpBody for LoadTrackedBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_max_concurrent_requests_disabled_for_absent_or_zero() {
-        assert_eq!(parse_max_concurrent_requests(None), None);
-        assert_eq!(parse_max_concurrent_requests(Some(String::new())), None);
-        assert_eq!(parse_max_concurrent_requests(Some("   ".to_string())), None);
-        assert_eq!(parse_max_concurrent_requests(Some("0".to_string())), None);
-    }
-
-    #[test]
-    fn parse_max_concurrent_requests_accepts_positive_limit() {
-        assert_eq!(
-            parse_max_concurrent_requests(Some("128".to_string())),
-            Some(128)
-        );
-        assert_eq!(
-            parse_max_concurrent_requests(Some("  64 ".to_string())),
-            Some(64)
-        );
-    }
-
-    #[test]
-    fn parse_max_concurrent_requests_ignores_invalid() {
-        assert_eq!(parse_max_concurrent_requests(Some("-1".to_string())), None);
-        assert_eq!(
-            parse_max_concurrent_requests(Some("not-a-number".to_string())),
-            None
-        );
-    }
 
     #[test]
     fn overloaded_response_is_503_with_retry_after() {

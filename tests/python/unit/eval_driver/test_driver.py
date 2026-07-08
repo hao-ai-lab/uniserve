@@ -111,7 +111,7 @@ def test_sensenova_uniserve_profiles_use_tp2_graph_execution():
         cmd = uniserve_eval.backends.build_serve_cmd(config, spec)
         assert spec["cuda_visible_devices"] == "0,1"
         assert spec["env"]["UNISERVE_DECODE_TOKEN_BURST"] == "8"
-        assert cmd[cmd.index("--worker-ranks") + 1] == "2"
+        assert cmd[cmd.index("--tp-size") + 1] == "2"
     # The denoise-step CUDA graph is on for both profiles (validated safe under
     # concurrency). The packed-mixed decoder graph was removed entirely (replay
     # against re-planned shared attention state segfaulted under concurrency),
