@@ -14,6 +14,7 @@ from .flashinfer_plan import (
     _fast_decode_plan_with_cpu_metadata,
     _PrefillPlanWorkspace,
 )
+from .paged_attention_plan_pool import PagedAttentionPlanPool
 
 _DEFAULT_WORKSPACE_SIZE = 512 * 1024 * 1024
 
@@ -70,7 +71,7 @@ class _DecodePlanOptions(NamedTuple):
     signature: tuple[Any, ...]
 
 
-class _WrapperPool:
+class _WrapperPool(PagedAttentionPlanPool):
     """Owns the flashinfer wrapper, workspace, and plan-workspace caches.
 
     Wrapper construction is performed by the backend (which reads the optional
@@ -80,7 +81,7 @@ class _WrapperPool:
     """
 
     def __init__(self) -> None:
-        self._workspace_buffers: dict[tuple[str, int], torch.Tensor] = {}
+        super().__init__()
         self._decode_wrappers: dict[WrapperKey, Any] = {}
         self._prefill_wrappers: dict[WrapperKey, Any] = {}
         self._decode_graph_buffers: dict[WrapperKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
@@ -109,14 +110,18 @@ class _WrapperPool:
         key = WrapperKey("decode", device_key, backend, use_tensor_cores)
         wrapper = self._decode_wrappers.get(key)
         if wrapper is None:
+            wrapper_cls = _fi._BatchDecodeWithPagedKVCacheWrapper
+            if wrapper_cls is None:
+                raise RuntimeError("flashinfer paged decode wrapper is not available")
             workspace = self._workspace(device)
-            wrapper = _fi._BatchDecodeWithPagedKVCacheWrapper(
+            wrapper = wrapper_cls(
                 workspace,
                 "NHD",
                 backend=backend,
                 use_tensor_cores=use_tensor_cores,
             )
             self._decode_wrappers[key] = wrapper
+        self.plan_decode(tuple(key), workspace=self._workspace(device), wrapper=wrapper)
         return key, wrapper
 
     def _decode_cuda_graph_wrapper(
@@ -148,11 +153,14 @@ class _WrapperPool:
         )
         wrapper = self._decode_wrappers.get(key)
         if wrapper is None:
+            wrapper_cls = _fi._BatchDecodeWithPagedKVCacheWrapper
+            if wrapper_cls is None:
+                raise RuntimeError("flashinfer paged decode wrapper is not available")
             workspace = self._workspace(device)
             indptr = _empty_mutable((int(batch_size) + 1,), dtype=torch.int32, device=device)
             indices = _empty_mutable((max(1, int(max_indices)),), dtype=torch.int32, device=device)
             last_page_len = _empty_mutable((int(batch_size),), dtype=torch.int32, device=device)
-            wrapper = _fi._BatchDecodeWithPagedKVCacheWrapper(
+            wrapper = wrapper_cls(
                 workspace,
                 "NHD",
                 backend=backend,
@@ -164,6 +172,8 @@ class _WrapperPool:
             )
             self._decode_wrappers[key] = wrapper
             self._decode_graph_buffers[key] = (indptr, indices, last_page_len)
+        self.plan_decode(tuple(key), workspace=self._workspace(device), wrapper=wrapper)
+        self.bind_graph(tuple(key), wrapper)
         return key, wrapper
 
     def _prefill_wrapper(self, device: torch.device) -> tuple[WrapperKey, Any]:
@@ -174,13 +184,17 @@ class _WrapperPool:
         key = WrapperKey("prefill", device_key, backend)
         wrapper = self._prefill_wrappers.get(key)
         if wrapper is None:
+            wrapper_cls = _fi._BatchPrefillWithPagedKVCacheWrapper
+            if wrapper_cls is None:
+                raise RuntimeError("flashinfer paged prefill wrapper is not available")
             workspace = self._workspace(device)
-            wrapper = _fi._BatchPrefillWithPagedKVCacheWrapper(
+            wrapper = wrapper_cls(
                 workspace,
                 "NHD",
                 backend=backend,
             )
             self._prefill_wrappers[key] = wrapper
+        self.plan_prefill(tuple(key), workspace=self._workspace(device), wrapper=wrapper)
         return key, wrapper
 
     def _prefill_graph_wrapper(self, device: torch.device, *, scope: int) -> tuple[WrapperKey, Any]:
@@ -198,13 +212,18 @@ class _WrapperPool:
         key = WrapperKey("prefill", device_key, backend, scope=int(scope))
         wrapper = self._prefill_wrappers.get(key)
         if wrapper is None:
+            wrapper_cls = _fi._BatchPrefillWithPagedKVCacheWrapper
+            if wrapper_cls is None:
+                raise RuntimeError("flashinfer paged prefill wrapper is not available")
             workspace = self._workspace(device)
-            wrapper = _fi._BatchPrefillWithPagedKVCacheWrapper(
+            wrapper = wrapper_cls(
                 workspace,
                 "NHD",
                 backend=backend,
             )
             self._prefill_wrappers[key] = wrapper
+        self.plan_prefill(tuple(key), workspace=self._workspace(device), wrapper=wrapper)
+        self.bind_graph(tuple(key), wrapper)
         return key, wrapper
 
     def _prefill_graph_wrapper_for_metadata(self, metadata: Any) -> tuple[WrapperKey, Any] | None:
@@ -254,6 +273,18 @@ class _WrapperPool:
             pos_encoding_mode=pos_encoding_mode,
             q_data_type=q_data_type,
             kv_data_type=kv_data_type,
+        )
+        self.plan_decode(
+            (
+                tuple(wrapper_key),
+                options.signature,
+                int(indptr.numel()),
+                int(indices.numel()),
+                int(last_page_len.numel()),
+                None if sm_scale is None else float(sm_scale),
+            ),
+            workspace=self._workspace(indptr.device),
+            wrapper=wrapper,
         )
         if self._maybe_plan_decode_fast(
             wrapper_key,
@@ -515,13 +546,7 @@ class _WrapperPool:
         return wrapper_key, wrapper
 
     def _workspace(self, device: torch.device) -> torch.Tensor:
-        size = _workspace_size()
-        key = (_device_key(device), size)
-        workspace = self._workspace_buffers.get(key)
-        if workspace is None:
-            workspace = _empty_mutable(size, dtype=torch.uint8, device=device)
-            self._workspace_buffers[key] = workspace
-        return workspace
+        return self.workspace(device, _workspace_size(), dtype=torch.uint8)
 
     def _decode_plan_workspace(
         self,

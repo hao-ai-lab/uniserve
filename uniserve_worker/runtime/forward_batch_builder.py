@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
-from ..backends.paged_kv_math import decode_write_locations
 from ..contracts.forward_batch import ForwardBatch
 from ..contracts.forward_context import TextAttentionMetadata
 from ..contracts.forward_mode import ForwardMode
 from .kv_pool import PagedKVPool
 from .paged_text_cache import BatchedPagedRequestCache
-from .tensor_staging import TextTensorStager, stage_text_forward_batch
+from .text_forward_assembler import TextForwardAssembler
+from .text_kv import TextAttentionPlan, TextKvResidency
 
 if TYPE_CHECKING:
     from ..contracts.batches import TextBatch
@@ -69,55 +69,14 @@ def build_text_attention_metadata(
 
     device = batch.input_ids.device
     query_lens_values = tuple(len(op.get("token_ids") or []) for op in batch.ops)
-    cache_seqlens_cpu = tuple(int(length) for length in cache.base_lens)
-    cache_seqlens = cache.cache_seqlens(device=device, stager=stager)
-    block_table = cache.block_table(device=device, stager=stager)
-    kv_lens_values = tuple(
-        int(base_len) + int(query_len)
-        for base_len, query_len in zip(cache.base_lens, query_lens_values)
-    )
-    if batch.mode == ForwardMode.DECODE:
-        decode_page_ids, decode_page_offsets = decode_write_locations(
-            block_table,
-            cache_seqlens,
-            cache.pool.block_size,
-        )
-        return TextAttentionMetadata(
-            cache=cache,
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            cache_seqlens_cpu=cache_seqlens_cpu,
-            query_lens_cpu=query_lens_values,
-            kv_seqlens_cpu=kv_lens_values,
-            decode_page_ids=decode_page_ids,
-            decode_page_offsets=decode_page_offsets,
-            max_seqlen_q=max(query_lens_values, default=0),
-            max_seqlen_k=max(kv_lens_values, default=0),
-            max_context_len=int(max_context_len),
-            mode=batch.mode,
-        )
-
-    query_lens = batch.extend_seq_lens.to(dtype=torch.int32).contiguous()
-    kv_seqlens = batch.seq_lens.to(dtype=torch.int32).contiguous()
-    zero = torch.zeros(1, dtype=torch.int32, device=device)
-    cu_seqlens_q = torch.cat([zero, torch.cumsum(query_lens, dim=0).to(torch.int32)])
-    cu_seqlens_k = torch.cat([zero, torch.cumsum(kv_seqlens, dim=0).to(torch.int32)])
-    return TextAttentionMetadata(
-        cache=cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        cache_seqlens_cpu=cache_seqlens_cpu,
-        query_lens=query_lens,
-        query_lens_cpu=query_lens_values,
-        kv_seqlens=kv_seqlens,
-        kv_seqlens_cpu=kv_lens_values,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max(query_lens_values, default=0),
-        max_seqlen_k=max(kv_lens_values, default=0),
-        max_context_len=int(max_context_len),
+    return TextAttentionPlan.from_cache(
+        cache,
         mode=batch.mode,
-    )
+        device=device,
+        query_lens_cpu=query_lens_values,
+        stager=stager,
+        max_context_len=max_context_len,
+    ).to_metadata()
 
 
 class ForwardBatchBuilder:
@@ -131,8 +90,12 @@ class ForwardBatchBuilder:
     """
 
     def __init__(self, *, ring_depth: int = 3, max_context_len: int = 0) -> None:
-        self._stager = TextTensorStager(ring_depth=ring_depth)
         self.max_context_len = max(0, int(max_context_len))
+        self._assembler = TextForwardAssembler(
+            ring_depth=ring_depth,
+            max_context_len=self.max_context_len,
+        )
+        self._stager = self._assembler.stager
 
     def build_text(
         self,
@@ -150,26 +113,18 @@ class ForwardBatchBuilder:
     ) -> ForwardBatch:
         """Stage one text group and attach its system-built attention plan."""
 
-        device = torch.device(device)
-        stager = self._stager if device.type == "cuda" else None
-        if stage_slot is None and stager is not None:
-            stage_slot = stager.next_slot()
-        fb = stage_text_forward_batch(
+        return self._assembler.build(
             text,
-            device,
-            stager=stager,
-            stage_slot=stage_slot,
+            device=device,
+            kv_pool=kv_pool,
+            request_states=request_states,
             input_ids_override=input_ids_override,
             positions_override=positions_override,
             input_ids_replacements=input_ids_replacements,
             padded_num_tokens=padded_num_tokens,
+            with_metadata=with_metadata,
+            stage_slot=stage_slot,
         )
-        fb.device = device
-        if with_metadata:
-            self.attach_text_metadata(
-                fb, kv_pool=kv_pool, request_states=request_states, stager=stage_slot
-            )
-        return fb
 
     def build_text_op(
         self,
@@ -193,45 +148,16 @@ class ForwardBatchBuilder:
         attention plan is the minimal metadata the dense path consumes.
         """
 
-        device = torch.device(device)
-        state = request_states.get(int(req_id))
-        block_ids = state_block_ids_for_op(op, state)
-        base_len = int(pos_range[0])
-        query_len = len(token_ids)
-        cache = kv_pool.view(block_ids, base_len)
-        if input_ids_override is not None:
-            input_ids = input_ids_override.reshape(-1)
-        else:
-            input_ids = torch.tensor([int(t) for t in token_ids], dtype=torch.long, device=device)
-        positions = torch.arange(base_len, base_len + query_len, dtype=torch.long, device=device)
-        block_table = cache.block_table(device=device)
-        cache_seqlens = torch.tensor([base_len], dtype=torch.int32, device=device)
-        metadata = TextAttentionMetadata(
-            cache=cache,
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            cache_seqlens_cpu=(base_len,),
-            query_lens_cpu=(query_len,),
-            kv_seqlens_cpu=(base_len + query_len,),
-            max_seqlen_q=query_len,
-            max_seqlen_k=base_len + query_len,
-            max_context_len=self.max_context_len,
+        return self._assembler.build_op(
+            op=op,
+            token_ids=token_ids,
+            pos_range=pos_range,
+            req_id=req_id,
             mode=mode,
-        )
-        last_token = torch.tensor([query_len - 1], dtype=torch.long, device=device)
-        return ForwardBatch(
-            forward_mode=mode,
-            req_ids=(int(req_id),),
-            ops=(op,),
             device=device,
-            input_ids=input_ids,
-            positions=positions,
-            last_token_indices=last_token,
-            num_token_non_padded=query_len,
-            padded_num_tokens=query_len,
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            attn_metadata=metadata,
+            kv_pool=kv_pool,
+            request_states=request_states,
+            input_ids_override=input_ids_override,
         )
 
     def attach_text_metadata(
@@ -244,16 +170,12 @@ class ForwardBatchBuilder:
     ) -> ForwardBatch:
         """Resolve the paged request-cache view + attention plan onto ``fb``."""
 
-        cache = self._batched_cache(fb, kv_pool=kv_pool, request_states=request_states)
-        metadata = build_text_attention_metadata(
+        self._assembler.attach_metadata(
             fb,
-            cache,
+            kv_pool=kv_pool,
+            request_states=request_states,
             stager=stager,
-            max_context_len=self.max_context_len,
         )
-        fb.attn_metadata = metadata
-        fb.block_table = metadata.block_table
-        fb.cache_seqlens = metadata.cache_seqlens
         return fb
 
     @staticmethod
@@ -278,6 +200,4 @@ class ForwardBatchBuilder:
     ) -> BatchedPagedRequestCache:
         """Build a batched paged cache directly (graph warmup / verify paths)."""
 
-        return BatchedPagedRequestCache(
-            kv_pool, [list(ids) for ids in block_ids_by_row], [int(x) for x in base_lens]
-        )
+        return TextKvResidency(kv_pool).cache_from_block_ids(block_ids_by_row, base_lens)

@@ -30,6 +30,7 @@ from ..execution.denoise_driver import TextImageDenoiseStep, text_image_cfg_bran
 from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
 from ..execution.model_base import UniModelBase
 from ..execution.paged_denoise import PagedDenoiseBranchSet, can_run_paged_denoise_attention
+from ..execution.text_image_generation_session import TextImageGenerationSession
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import get_worker_config
 from ..foundation.sizing import (
@@ -629,9 +630,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.resource_plan = self._build_resource_plan()
         self.image_processor = image_processor or (BagelImageProcessor() if model is not None else None)
         self.states: dict[int, RequestState] = {}
-        # Per-request generation side tables, keyed by req_id; cleared in drop_request.
-        self._gen_records: dict[int, dict] = {}
-        self._gen_states: dict[int, GenState] = {}
+        self.generation_session = TextImageGenerationSession(self)
         # Interleaved-text-driver owner surface: per-request driver states plus
         # the marker/eos ids the driver reads as configuration. BAGEL has no
         # worker-side tokenizer (the host tokenizes). The scratch pool holds
@@ -782,22 +781,19 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.states[r] = state
         self.reqs.pop(r, None)
         self.interleaved_image_state(r)
-        self._gen_records[r] = {
-            "sampling": dict(state.sampling or {}),
-            "image": dict(state.image or {}),
-            "neg_token_ids": list(state.neg_token_ids or []),
-            "lora_id": state.lora_id,
-            "dims": None,
-        }
+        self.generation_session.begin_request(
+            r,
+            sampling=state.sampling,
+            image=state.image,
+            neg_token_ids=state.neg_token_ids,
+            lora_id=state.lora_id,
+        )
 
     def drop_request(self, req_id: int) -> None:
         r = int(req_id)
         state = self.states.pop(r, None)
         self.reqs.pop(r, None)
-        self._pop_gen_state(r)
-        self._gen_records.pop(r, None)
-        if state is not None:
-            state.kv_lengths.pop("default", None)
+        self.generation_session.release_request(r, request_state=state)
 
     def free_encoder(self, handles) -> None:
         # Encoder-output residency is system-owned: the handle→embedding store lives
@@ -821,7 +817,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             logger.info("unmerged LoRA adapter %s", lora_id)
 
     def _record(self, req_id: int) -> dict:
-        return self._gen_records.setdefault(int(req_id), {})
+        return self.generation_session.record(int(req_id))
 
     def _state(self, req_id: int) -> RequestState:
         req_id = int(req_id)
@@ -840,23 +836,16 @@ class BagelForUnifiedGeneration(UniModelBase):
         self._state(req_id).set_kv_length(value)
 
     def _gen_state(self, req_id: int) -> GenState | None:
-        return self._gen_states.get(int(req_id))
+        return self.generation_session.generation_state(int(req_id))
 
     def _set_gen_state(self, req_id: int, value: GenState) -> None:
-        self._gen_states[int(req_id)] = value
+        self.generation_session.set_generation_state(int(req_id), value)
 
     def _pop_gen_state(self, req_id: int) -> GenState | None:
-        gs = self._gen_states.pop(int(req_id), None)
-        if gs is not None:
-            self._release_paged_denoise_branches(gs)
-        return gs
+        return self.generation_session.release_generated_state(int(req_id))
 
     def _release_paged_denoise_branches(self, gs: GenState) -> None:
-        branches = gs.paged_branches
-        if branches is None:
-            return
-        branches.release(self.residency)
-        gs.paged_branches = None
+        self.generation_session.release_paged_branches(gs)
 
     def _extend_blocks(self, op) -> list[int]:
         state = self._state(int(op["req_id"]))

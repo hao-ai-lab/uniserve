@@ -7,6 +7,7 @@ from typing import Any, Callable
 import torch
 from torch import nn
 
+from ..contracts.model_family import ModelFamilyDescriptor
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.runtime_config import get_worker_config
 from ..nn.placement import get_shard_plan
@@ -24,6 +25,7 @@ from ..nn.quant.load_state import (
     skip_serving_cast,
 )
 from .base import BaseModelLoader, LoadResult
+from .checkpoint_layout import CheckpointLayout
 from .registry import register_loader
 from .weight_utils import StackedParamMapping, iter_weights, load_parameter, resolve_weight_files
 
@@ -105,6 +107,7 @@ def load_native_transformers_checkpoint(
     param_filter_from_model: ParamFilterFromModel | None = None,
     tower_role: str | None = None,
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = (),
+    checkpoint_layout: CheckpointLayout | None = None,
 ) -> tuple[nn.Module, Any, str]:
     """Instantiate a native ``nn.Module`` model and stream HF-format weights.
 
@@ -154,6 +157,21 @@ def load_native_transformers_checkpoint(
             param_filter = combined_param_filter
         elif derived_filter is not None:
             param_filter = derived_filter
+    if checkpoint_layout is not None:
+        layout_filter = checkpoint_layout.tower_filter(tower_role)
+        if param_filter is not None and layout_filter is not None:
+            base_filter = param_filter
+
+            def combined_layout_filter(name: str) -> bool:
+                return base_filter(name) and layout_filter(name)
+
+            param_filter = combined_layout_filter
+        elif layout_filter is not None:
+            param_filter = layout_filter
+        stacked_params_mapping = (
+            *stacked_params_mapping,
+            *checkpoint_layout.stacked_params(),
+        )
     _stream_checkpoint_weights(
         model,
         model_dir,
@@ -162,6 +180,7 @@ def load_native_transformers_checkpoint(
         set_module_tensor_to_device=set_module_tensor_to_device,
         param_filter=param_filter,
         stacked_params_mapping=stacked_params_mapping,
+        checkpoint_layout=checkpoint_layout,
     )
     process_quantized_modules(model.modules())
     model.eval()
@@ -265,6 +284,7 @@ def _stream_checkpoint_weights(
     set_module_tensor_to_device: Callable[..., Any],
     param_filter: Callable[[str], bool] | None = None,
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = (),
+    checkpoint_layout: CheckpointLayout | None = None,
 ) -> None:
     """Stream HF-format weights into ``model`` one tensor at a time.
 
@@ -284,6 +304,10 @@ def _stream_checkpoint_weights(
         for name, param in model.named_parameters()
         if is_optional_checkpoint(param)
     }
+    if checkpoint_layout is not None:
+        optional.update(
+            name for name in expected if checkpoint_layout.optional_tensor(name)
+        )
     loaded: set[str] = set()
     unexpected: list[str] = []
     params = dict(model.named_parameters())
@@ -292,7 +316,9 @@ def _stream_checkpoint_weights(
         for item in stacked_params_mapping
     ]
     for name, tensor in iter_weights(resolve_weight_files(model_dir)):
-        target_name = name
+        if checkpoint_layout is not None and checkpoint_layout.ignored_tensor(name):
+            continue
+        target_name = checkpoint_layout.map_name(name) if checkpoint_layout is not None else name
         shard_id: str | int | None = None
         matched_stacked = False
         for item in stacked:
@@ -470,6 +496,7 @@ class NativeLoadSpec:
     extra_special_tokens: dict[str, Any] | None = None
     param_filter_from_model: ParamFilterFromModel | None = None
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = ()
+    checkpoint_layout: CheckpointLayout | None = None
 
 
 class NativeTransformersLoader(BaseModelLoader):
@@ -495,6 +522,10 @@ class NativeTransformersLoader(BaseModelLoader):
         if model_path is None:
             raise ValueError("NativeTransformersLoader requires model_path")
         spec: NativeLoadSpec = model_cls.native_load_spec()
+        descriptor = ModelFamilyDescriptor.from_model_class(model_cls)
+        checkpoint_layout = kwargs.get("checkpoint_layout")
+        if checkpoint_layout is None:
+            checkpoint_layout = spec.checkpoint_layout or descriptor.checkpoint_layout
         # Tower partial load: a tower model declares which checkpoint params belong
         # to a ``tower_role`` so an und/gen worker materializes only its tower.
         # Whole-model kinds pass ``tower_role=None`` (no filter).
@@ -519,6 +550,7 @@ class NativeTransformersLoader(BaseModelLoader):
             param_filter_from_model=spec.param_filter_from_model,
             tower_role=tower_role,
             stacked_params_mapping=spec.stacked_params_mapping,
+            checkpoint_layout=checkpoint_layout,
         )
         model = model_cls.from_native(inner, tokenizer=tokenizer, device=real_device, **kwargs)
         return LoadResult(model=model, tokenizer=tokenizer, device=real_device)

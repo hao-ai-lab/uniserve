@@ -542,7 +542,7 @@ class _TritonQKNormRopeProvider:
         if req.position_ids is not None or req.unsqueeze_dim != 1:
             return False
         try:
-            _EagerQKNormRopeProvider._validate_multi_axis(req)
+            plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(req)
         except RuntimeError:
             return False
         if req.q.ndim not in (3, 4) or req.k.ndim not in (3, 4):
@@ -558,23 +558,20 @@ class _TritonQKNormRopeProvider:
             return False
         if not self._qk_common_eligible(req, norm_mod):
             return False
-        axis = 0
-        while axis < len(req.axis_dims):
-            group_end = _EagerQKNormRopeProvider._shared_norm_group_end(req, axis)
-            group_dim = sum(int(dim) for dim in req.axis_dims[axis:group_end])
-            if group_end == axis + 1:
-                cos = req.cos[axis]
-                sin = req.sin[axis]
+        for group in plan.groups:
+            if group.single_axis:
+                cos = plan.cos_tables[group.start]
+                sin = plan.sin_tables[group.start]
                 if not self._can_repeat_rope(cos, tokens):
                     return False
-                if not self._rope_table_shape_matches(cos, sin, tokens, group_dim):
+                if not self._rope_table_shape_matches(cos, sin, tokens, group.dim):
                     return False
                 if not self._qk_norm_rope_group_eligible(
                     req,
                     norm_mod,
-                    group_dim,
-                    req.q_weight[axis],
-                    req.k_weight[axis],
+                    group.dim,
+                    plan.q_weights[group.start],
+                    plan.k_weights[group.start],
                     cos,
                     sin,
                 ):
@@ -583,22 +580,21 @@ class _TritonQKNormRopeProvider:
                 if not self._qk_norm_group_eligible(
                     req,
                     norm_mod,
-                    group_dim,
-                    req.q_weight[axis],
-                    req.k_weight[axis],
+                    group.dim,
+                    plan.q_weights[group.start],
+                    plan.k_weights[group.start],
                 ):
                     return False
-            for local_axis in range(axis, group_end):
-                cos = req.cos[local_axis]
-                sin = req.sin[local_axis]
-                axis_dim = int(req.axis_dims[local_axis])
+            for local_axis in range(group.start, group.end):
+                cos = plan.cos_tables[local_axis]
+                sin = plan.sin_tables[local_axis]
+                axis_dim = int(plan.axis_dims[local_axis])
                 if not self._can_repeat_rope(cos, tokens):
                     return False
                 if not self._rope_table_shape_matches(cos, sin, tokens, axis_dim):
                     return False
                 if not self._packed_rope_axis_eligible(req, rope_mod, axis_dim, cos, sin):
                     return False
-            axis = group_end
         return True
 
     @staticmethod
@@ -712,28 +708,27 @@ class _TritonQKNormRopeProvider:
             return fused
         out_q = []
         out_k = []
+        plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(req)
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
         try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
         packed_rope = import_module("uniserve_worker.nn.rope")._TritonPackedRope()
-        axis = 0
-        while axis < len(req.axis_dims):
-            group_end = _EagerQKNormRopeProvider._shared_norm_group_end(req, axis)
+        for group in plan.groups:
             q_group, q_shape, q_was_flattened = self._flatten_axis_group(
-                req.q, req.axis_dims, axis, group_end
+                req.q, plan.axis_dims, group.start, group.end
             )
             k_group, k_shape, k_was_flattened = self._flatten_axis_group(
-                req.k, req.axis_dims, axis, group_end
+                req.k, plan.axis_dims, group.start, group.end
             )
-            if group_end == axis + 1:
-                cos = req.cos[axis]
-                sin = req.sin[axis]
+            if group.single_axis:
+                cos = plan.cos_tables[group.start]
+                sin = plan.sin_tables[group.start]
                 cos_flat = self._align_rope_table(cos, int(q_group.shape[0]))
                 sin_flat = self._align_rope_table(sin, int(q_group.shape[0]))
                 out = try_triton_qk_rms_norm_rope(
                     q_group,
                     k_group,
-                    req.q_weight[axis],
-                    req.k_weight[axis],
+                    plan.q_weights[group.start],
+                    plan.k_weights[group.start],
                     cos_flat,
                     sin_flat,
                     req.eps,
@@ -748,31 +743,31 @@ class _TritonQKNormRopeProvider:
                 out = try_triton_qk_rms_norm(
                     q_group,
                     k_group,
-                    req.q_weight[axis],
-                    req.k_weight[axis],
+                    plan.q_weights[group.start],
+                    plan.k_weights[group.start],
                     req.eps,
                     req.eps,
                 )
                 if out is None:
                     raise RuntimeError("triton multi-axis qk_norm became ineligible")
                 q_normed, k_normed = out
-                q_normed_parts = q_normed.split(req.axis_dims[axis:group_end], dim=-1)
-                k_normed_parts = k_normed.split(req.axis_dims[axis:group_end], dim=-1)
+                q_normed_parts = q_normed.split(plan.axis_dims[group.start:group.end], dim=-1)
+                k_normed_parts = k_normed.split(plan.axis_dims[group.start:group.end], dim=-1)
                 for local, (q_normed_part, k_normed_part) in enumerate(zip(q_normed_parts, k_normed_parts, strict=True)):
-                    cos = req.cos[axis + local]
-                    sin = req.sin[axis + local]
+                    axis = group.start + local
+                    cos = plan.cos_tables[axis]
+                    sin = plan.sin_tables[axis]
                     q_normed_part = q_normed_part.contiguous()
                     k_normed_part = k_normed_part.contiguous()
                     cos_flat = self._align_rope_table(cos, int(q_normed_part.shape[0]))
                     sin_flat = self._align_rope_table(sin, int(q_normed_part.shape[0]))
                     q_rot = packed_rope.run(q_normed_part, cos_flat, sin_flat)
                     k_rot = packed_rope.run(k_normed_part, cos_flat, sin_flat)
-                    axis_dim = int(req.axis_dims[axis + local])
+                    axis_dim = int(plan.axis_dims[axis])
                     q_part_shape = (*q_shape[:-1], axis_dim)
                     k_part_shape = (*k_shape[:-1], axis_dim)
                     out_q.append(self._unflatten_heads(q_rot, q_part_shape, q_was_flattened))
                     out_k.append(self._unflatten_heads(k_rot, k_part_shape, k_was_flattened))
-            axis = group_end
         return torch.cat(out_q, dim=-1), torch.cat(out_k, dim=-1)
 
 
@@ -788,30 +783,11 @@ class _EagerQKNormRopeProvider:
 
     @staticmethod
     def _validate_multi_axis(req: QKNormRopeReq) -> None:
-        if not isinstance(req.q_weight, tuple) or not isinstance(req.k_weight, tuple):
-            raise RuntimeError("multi-axis qk_norm_rope requires tuple weights")
-        if not isinstance(req.cos, tuple) or not isinstance(req.sin, tuple):
-            raise RuntimeError("multi-axis qk_norm_rope requires tuple cos/sin")
-        if len(req.axis_dims) != len(req.cos) or len(req.cos) != len(req.sin):
-            raise RuntimeError("multi-axis qk_norm_rope axis/cos/sin mismatch")
-        if len(req.q_weight) != len(req.axis_dims) or len(req.k_weight) != len(req.axis_dims):
-            raise RuntimeError("multi-axis qk_norm_rope weight/axis mismatch")
+        import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.validate_multi_axis(req)
 
     @staticmethod
     def _shared_norm_group_end(req: QKNormRopeReq, start: int) -> int:
-        q_weight = req.q_weight[start]
-        k_weight = req.k_weight[start]
-        group_end = start + 1
-        group_dim = int(req.axis_dims[start])
-        while (
-            group_end < len(req.axis_dims)
-            and req.q_weight[group_end] is q_weight
-            and req.k_weight[group_end] is k_weight
-            and group_dim < int(q_weight.shape[-1])
-        ):
-            group_dim += int(req.axis_dims[group_end])
-            group_end += 1
-        return group_end if group_dim == int(q_weight.shape[-1]) else start + 1
+        return import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.shared_norm_group_end(req, start)
 
     @staticmethod
     def _apply_rope_axis(q_normed, k_normed, cos, sin, *, apply_rotary_pos_emb, apply_rotary_emb, unsqueeze_dim):
@@ -860,35 +836,39 @@ class _EagerQKNormRopeProvider:
         return apply_rotary_emb(q_normed, cos, sin), apply_rotary_emb(k_normed, cos, sin)
 
     def _run_multi_axis(self, req: QKNormRopeReq, *, apply_rotary_pos_emb, apply_rotary_emb):
-        self._validate_multi_axis(req)
-        q_parts = req.q.split(req.axis_dims, dim=-1)
-        k_parts = req.k.split(req.axis_dims, dim=-1)
+        plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(req)
+        q_parts = req.q.split(plan.axis_dims, dim=-1)
+        k_parts = req.k.split(plan.axis_dims, dim=-1)
         out_q = []
         out_k = []
         eager_norm = _EagerQKNormProvider()
-        axis = 0
-        while axis < len(req.axis_dims):
-            group_end = self._shared_norm_group_end(req, axis)
-            q_group = torch.cat(q_parts[axis:group_end], dim=-1)
-            k_group = torch.cat(k_parts[axis:group_end], dim=-1)
+        for group in plan.groups:
+            q_group = torch.cat(q_parts[group.start:group.end], dim=-1)
+            k_group = torch.cat(k_parts[group.start:group.end], dim=-1)
             q_normed_group, k_normed_group = eager_norm.run(
-                QKNormReq(q_group, k_group, req.q_weight[axis], req.k_weight[axis], req.eps)
+                QKNormReq(
+                    q_group,
+                    k_group,
+                    plan.q_weights[group.start],
+                    plan.k_weights[group.start],
+                    req.eps,
+                )
             )
-            q_normed_parts = q_normed_group.split(req.axis_dims[axis:group_end], dim=-1)
-            k_normed_parts = k_normed_group.split(req.axis_dims[axis:group_end], dim=-1)
+            q_normed_parts = q_normed_group.split(plan.axis_dims[group.start:group.end], dim=-1)
+            k_normed_parts = k_normed_group.split(plan.axis_dims[group.start:group.end], dim=-1)
             for local, (q_normed, k_normed) in enumerate(zip(q_normed_parts, k_normed_parts, strict=True)):
+                axis = group.start + local
                 q_rot, k_rot = self._apply_rope_axis(
                     q_normed,
                     k_normed,
-                    req.cos[axis + local],
-                    req.sin[axis + local],
+                    plan.cos_tables[axis],
+                    plan.sin_tables[axis],
                     apply_rotary_pos_emb=apply_rotary_pos_emb,
                     apply_rotary_emb=apply_rotary_emb,
                     unsqueeze_dim=req.unsqueeze_dim,
                 )
                 out_q.append(q_rot)
                 out_k.append(k_rot)
-            axis = group_end
         return torch.cat(out_q, dim=-1), torch.cat(out_k, dim=-1)
 
     def run(self, req: QKNormRopeReq):

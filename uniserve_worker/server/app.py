@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import time
-from collections import deque
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from ..contracts.caps import CONTROL_KINDS, Caps, validate_caps, validate_forward_result
@@ -19,9 +17,9 @@ from ..foundation.errors import (
     classify,
     scheduler_bug,
     should_capture_trace,
-    unsupported_control,
 )
-from .controls import CONTROL_SPECS
+from .control_plane import ControlPlane
+from .execution_pipeline import ExecutionPipeline, PendingResult
 from .metrics import MetricsService
 from .profiler import WorkerProfiler
 from .worker_kind import FULL as WORKER_KIND_FULL
@@ -99,7 +97,7 @@ def _complete_result(raw: dict) -> dict:
 
 
 def _complete_metrics(raw: dict) -> dict:
-    out = {
+    out: dict[str, Any] = {
         "executes": int(raw.get("executes") or 0),
         "ops_total": int(raw.get("ops_total") or 0),
         "exec_us_total": int(raw.get("exec_us_total") or 0),
@@ -216,12 +214,7 @@ def _dispatch_control(
     kind: str,
     req: Mapping[str, Any],
 ) -> dict:
-    if kind not in supported_controls:
-        raise unsupported_control(kind)
-    spec = CONTROL_SPECS[kind]
-    fn = getattr(driver, spec.method)
-    fn(**spec.build_kwargs(kind, req))
-    return {"kind": "ok"}
+    return ControlPlane(driver, supported_controls).handle(kind, req)
 
 
 def dispatch(
@@ -239,7 +232,7 @@ def dispatch(
     handler = HANDLERS.get(kind) if isinstance(kind, str) else None
     if handler is not None:
         return handler(driver, supported_controls, req, metrics)
-    if kind in CONTROL_KINDS:
+    if isinstance(kind, str) and kind in CONTROL_KINDS:
         return _dispatch_control(driver, supported_controls, kind, req)
     raise scheduler_bug(f"unknown request kind: {kind!r}")
 
@@ -288,20 +281,9 @@ def _result_has_deferred(result: dict | None) -> bool:
     return isinstance(per_seq, list) and any(isinstance(item, FinalizableSeqResult) for item in per_seq)
 
 
-def _result_ready(resp: dict) -> bool:
-    result = resp.get("result")
-    if not isinstance(result, dict):
-        return True
-    per_seq = result.get("per_seq")
-    if not isinstance(per_seq, list):
-        return True
-    for item in per_seq:
-        if not isinstance(item, FinalizableSeqResult):
-            continue
-        ready = getattr(item, "ready", None)
-        if callable(ready) and not bool(ready()):
-            return False
-    return True
+def _result_ready(resp: dict | PendingResult) -> bool:
+    pending = resp if isinstance(resp, PendingResult) else PendingResult(response=resp)
+    return pending.ready()
 
 
 def _add_forward_component_us(resp: dict, component: str, dur_ns: int) -> None:
@@ -413,6 +395,7 @@ class WorkerRuntime:
         else:
             self.allowed_ops = frozenset(declared_ops)
         self.supported_controls = set(self.caps.get("supported_controls") or [])
+        self.control_plane = ControlPlane(self.driver, self.supported_controls)
         self._driver_accepts_deferred_text_cpu_results = _driver_accepts_deferred_text_cpu_results(
             driver
         )
@@ -422,21 +405,30 @@ class WorkerRuntime:
         # the und worker runs text results synchronously.
         self._defer_text_results = worker_kind != WORKER_KIND_UND
         self.profiler = WorkerProfiler.from_env()
+        self.execution_pipeline = ExecutionPipeline()
 
     def handle(self, req, *, allow_deferred: bool = False) -> dict:
         """Dispatch one decoded request, classifying failures and recording
         metrics. Returns the response dict (the ring write stays in `serve`)."""
+
+        return self.pending(req, allow_deferred=allow_deferred).response
+
+    def pending(self, req, *, allow_deferred: bool = False) -> PendingResult:
+        """Dispatch one decoded request and retain pending-finalization state."""
+
         kind = req.get("kind")
         try:
             if kind == "execute":
                 return self._execute_pipeline(req, allow_deferred=allow_deferred)
             if kind == "get_caps":
                 resp = {"kind": "caps", "caps": dict(self.caps)}
+            elif kind in CONTROL_KINDS:
+                resp = self.control_plane.handle(kind, req)
             else:
                 resp = dispatch(self.driver, self.supported_controls, req, self.metrics)
             if kind in CONTROL_KINDS:
                 self.metrics.record_control(kind, True)
-            return resp
+            return self.execution_pipeline.immediate(resp)
         except WorkerError as err:
             if kind in CONTROL_KINDS:
                 self.metrics.record_control(kind, False)
@@ -447,21 +439,20 @@ class WorkerRuntime:
                 "worker request %r failed: %s [code=%s req_id=%s op_id=%s op_kind=%s details=%s]",
                 kind, err.message, err.code, err.req_id, err.op_id, err.op_kind, err.details,
             )
-            return err.to_wire()
+            return self.execution_pipeline.immediate(err.to_wire())
         except Exception as exc:  # noqa: BLE001 — classify everything else
             logger.exception("worker request %r raised an unclassified error", kind)
             werr = classify(exc, context=kind)
             self.metrics.record_error(werr.code)
-            return werr.to_wire()
+            return self.execution_pipeline.immediate(werr.to_wire())
 
-    def _execute_pipeline(self, req: dict, *, allow_deferred: bool) -> dict:
+    def _execute_pipeline(self, req: dict, *, allow_deferred: bool) -> PendingResult:
         """Run one execute batch: time -> execute -> validate -> annotate -> record.
 
-        Returns the ``{"kind": "result", ...}`` response. A deferred (CPU-finalize)
-        result skips eager validation here and carries its source batch on
-        ``_deferred_batch`` so the response path validates/annotates it after the
-        late CPU copy completes (see ``_prepare_response_for_send``). Driver
-        exceptions propagate to ``handle``'s classifier unchanged.
+        Returns a pending response. A deferred result skips eager validation here;
+        the pending object retains the source batch so send-time finalization can
+        validate after the late CPU copy completes. Driver exceptions propagate to
+        ``pending``'s classifier unchanged.
         """
         batch = req.get("batch") or {}
         ops = batch.get("ops") or []
@@ -477,7 +468,12 @@ class WorkerRuntime:
                     )
         t0 = self.metrics.now_ns()
         result = self._run_execute(req, allow_deferred=allow_deferred)
-        resp = {"kind": "result", "result": result}
+        wait_start = self.metrics.now_ns()
+        pending = self.execution_pipeline.pending(
+            result=result,
+            batch=batch,
+            wait_start_ns=wait_start,
+        )
         has_deferred = _result_has_deferred(result)
         if isinstance(result, dict) and not has_deferred:
             validate_forward_result(result, batch, owner=self.driver.__class__.__name__)
@@ -485,10 +481,7 @@ class WorkerRuntime:
         self._record_execute_metrics(dur, op_kinds, result)
         if isinstance(result, dict):
             self._annotate_execute_result(result, dur, ops)
-            if has_deferred:
-                resp["_deferred_batch"] = batch
-                resp["_deferred_wait_start_ns"] = self.metrics.now_ns()
-        return resp
+        return pending
 
     def _run_execute(self, req: dict, *, allow_deferred: bool) -> dict:
         with self.profiler.step("uniserve.worker.execute"):
@@ -514,26 +507,28 @@ class WorkerRuntime:
             if oid is not None and isinstance(sr, dict):
                 sr["op_id"] = oid
 
-    def _prepare_response_for_send(self, resp: dict) -> dict:
+    def _prepare_response_for_send(self, pending: PendingResult) -> dict:
+        resp = pending.response
         result = resp.get("result")
         if isinstance(result, dict):
             _finalize_result_inplace(result)
-            batch = resp.pop("_deferred_batch", None)
-            if isinstance(batch, dict):
+            if isinstance(pending.batch, dict):
                 validate_forward_result(
                     result,
-                    batch,
+                    pending.batch,
                     owner=self.driver.__class__.__name__,
                 )
-                for op, sr in zip(batch.get("ops") or [], result.get("per_seq") or []):
+                for op, sr in zip(pending.batch.get("ops") or [], result.get("per_seq") or []):
                     oid = op.get("op_id")
                     if oid is not None and isinstance(sr, dict):
                         sr["op_id"] = oid
         return resp
 
-    def _respond(self, resp: dict) -> None:
+    def _respond(self, pending: dict | PendingResult) -> None:
+        pending = pending if isinstance(pending, PendingResult) else PendingResult(response=pending)
+        resp = pending.response
         call_id = resp.get("call_id")
-        wait_start = resp.pop("_deferred_wait_start_ns", None)
+        wait_start = pending.wait_start_ns
         if isinstance(wait_start, int):
             wait_ns = self.metrics.now_ns() - wait_start
             _add_forward_component_us(resp, "worker_deferred_wait", wait_ns)
@@ -541,7 +536,7 @@ class WorkerRuntime:
             _add_deferred_cuda_ready_component(resp)
         t0 = self.metrics.now_ns()
         try:
-            resp = self._prepare_response_for_send(resp)
+            resp = self._prepare_response_for_send(pending)
         except Exception as exc:  # noqa: BLE001 - late CPU-copy/validation failures.
             logger.exception("worker response finalization failed")
             werr = classify(exc, context="respond")
@@ -559,130 +554,12 @@ class WorkerRuntime:
     def serve(self) -> None:
         """Run the depth-D pipelined request loop."""
 
-        _PipelineServeLoop(self).run()
+        from .process import WorkerProcess
 
+        WorkerProcess(self, self.server).run()
 
-class _PipelineServeLoop:
-    """Pipelined receive/dispatch/finalize loop for ``WorkerRuntime``.
+    def result_ready(self, resp: dict | PendingResult) -> bool:
+        return _result_ready(resp)
 
-    The runtime owns dispatch/classification/metrics; this helper owns only the
-    transport scheduling policy: non-blocking refill while in-flight work exists,
-    ready-response finalization, and blocking receive when idle.
-    """
-
-    def __init__(self, runtime: WorkerRuntime) -> None:
-        self.runtime = runtime
-        self.inflight: deque[tuple[int | None, dict]] = deque()
-        self.shutdown_resp: dict | None = None
-        self.draining = False
-
-    def run(self) -> None:
-        try:
-            while True:
-                self._refill_nonblocking()
-                if self._finalize_ready():
-                    continue
-                if self._finish_shutdown_if_drained():
-                    break
-                if self._wait_for_ready_inflight():
-                    continue
-                if self._receive_idle_request():
-                    break
-        finally:
-            self.runtime.profiler.close()
-
-    def _refill_nonblocking(self) -> None:
-        while not self.draining and len(self.inflight) < self.runtime.pipeline_depth:
-            req = self._recv_nonblocking()
-            if req is None:
-                return
-            if self._capture_shutdown(req):
-                return
-            self.inflight.append(self._dispatch(req))
-
-    def _finalize_ready(self) -> bool:
-        if not self.inflight:
-            return False
-        for idx, item in enumerate(self.inflight):
-            if _result_ready(item[1]):
-                ready = self.inflight[idx]
-                del self.inflight[idx]
-                self._finalize_and_send(ready)
-                return True
-        return False
-
-    def _wait_for_ready_inflight(self) -> bool:
-        if not self.inflight:
-            return False
-        while self.inflight:
-            self._refill_nonblocking()
-            if self._finalize_ready():
-                return True
-            time.sleep(0.0005)
-        return True
-
-    def _finish_shutdown_if_drained(self) -> bool:
-        if not self.draining or self.inflight:
-            return False
-        self.runtime._respond(self.shutdown_resp or {"kind": "ok"})
-        return True
-
-    def _receive_idle_request(self) -> bool:
-        req = self._recv_blocking()
-        if self._capture_shutdown(req):
-            self.runtime._respond(self.shutdown_resp or {"kind": "ok"})
-            return True
-        self.inflight.append(self._dispatch(req))
-        return False
-
-    def _capture_shutdown(self, req: dict) -> bool:
-        if req.get("kind") != "shutdown":
-            return False
-        self.shutdown_resp = self._shutdown_response(req)
-        self.draining = True
-        return True
-
-    def _recv_nonblocking(self) -> dict | None:
-        """Non-blocking receive; ``None`` when no request is queued.
-
-        Falls back to ``None`` for transports without ``try_recv`` (the loop then
-        degrades to depth-1 blocking recv, still correct, just unpipelined)."""
-        try_recv = getattr(self.runtime.server, "try_recv", None)
-        if not callable(try_recv):
-            return None
-        t0 = self.runtime.metrics.now_ns()
-        req = try_recv()
-        self.runtime.metrics.record_pipeline("recv", self.runtime.metrics.now_ns() - t0)
-        return req
-
-    def _recv_blocking(self) -> dict:
-        """Block until a request arrives. Only called with the pipeline drained."""
-        t0 = self.runtime.metrics.now_ns()
-        req = self.runtime.server.recv()
-        self.runtime.metrics.record_pipeline("idle", self.runtime.metrics.now_ns() - t0)
-        return req
-
-    def _dispatch(self, req: dict) -> tuple[int | None, dict]:
-        """Decode + launch one request, returning its (call_id, response).
-
-        For an execute this launches the GPU forward (CUDA-async) and returns a
-        response that may carry deferred per-seq results; for a control it runs
-        the control inline. Finalize/send happens when the response is ready."""
-        call_id = req.get("call_id")
-        t0 = self.runtime.metrics.now_ns()
-        resp = self.runtime.handle(req, allow_deferred=self.runtime._defer_text_results)
-        self.runtime.metrics.record_pipeline("dispatch", self.runtime.metrics.now_ns() - t0)
-        if call_id is not None:
-            resp["call_id"] = call_id
-        return call_id, resp
-
-    def _finalize_and_send(self, item: tuple[int | None, dict]) -> None:
-        self.runtime._respond(item[1])
-
-    @staticmethod
-    def _shutdown_response(req: dict) -> dict:
-        resp: dict[str, Any] = {"kind": "ok"}
-        call_id = req.get("call_id")
-        if call_id is not None:
-            resp["call_id"] = call_id
-        return resp
+    def respond_pending(self, resp: dict | PendingResult) -> None:
+        self._respond(resp)

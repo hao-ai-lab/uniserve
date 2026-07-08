@@ -56,6 +56,7 @@ from ...execution.interleaved_text_stepper import (
 from ...execution.model_base import UniModelBase
 from ...execution.packed_mixed_forward import run_packed_mixed_forward
 from ...execution.text_driver import sample_logits_result
+from ...execution.tower_execution_session import TowerExecutionSession
 from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
@@ -63,6 +64,7 @@ from ...foundation.sizing import (
     ceil_div,
     derive_num_blocks,
 )
+from ...loader.checkpoint_layout import CheckpointLayout
 from ...loader.transformers import NativeLoadSpec
 from ...nn import (
     LinearBase,
@@ -87,7 +89,7 @@ from ...nn.diffusion import (
     ScheduleShiftDomain,
     TimestepEmbedder,
 )
-from ...nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
+from ...nn.diffusion.cfg import CfgRecipe
 from ...nn.linear import local_kv_head_count as _local_kv_head_count
 from ...nn.quant import (
     QuantizationConfig,
@@ -114,7 +116,6 @@ from ...runtime.tower_handoff import (
     TowerBinding,
     TowerHandoff,
 )
-from ...runtime.transfer import Locator
 from .config import NeoChatConfig
 
 __all__ = [
@@ -261,6 +262,16 @@ class _SenseNovaTowerLayout:
 
 
 _TOWER_LAYOUT = _SenseNovaTowerLayout()
+_SENSENOVA_STACKED_PARAMS = (
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
+    ("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
+    ("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
+    ("gate_up_proj", "gate_proj", 0),
+    ("gate_up_proj", "up_proj", 1),
+)
 
 
 def _config_int(config: Any | None, key: str, default: int) -> int:
@@ -2121,6 +2132,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         image_latent=LatentTokens(downsample=16),
         scratch=PerBranch(),
     )
+    checkpoint_layout = CheckpointLayout(stacked=_SENSENOVA_STACKED_PARAMS)
     velocity_parameterization = "velocity"
     # Denoise configuration consumed by the system TextImageDenoiseOps engine.
     denoise_schedule_direction = ScheduleDirection.ASCENDING
@@ -2183,6 +2195,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # driver (``bind_data_plane_handoff``). ``None`` in Mode C / single-device,
         # where the per-branch staging above is the whole crossing.
         self._dataplane_handoff: DataPlaneTowerHandoff | None = None
+        self.tower_session = TowerExecutionSession(self)
         self._img_start_token = IMG_START_TOKEN
 
     def _init_tower_profile(self) -> None:
@@ -2353,16 +2366,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             config_patch=None,
             compatibility_check=check_checkpoint_compatibility,
             param_filter_from_model=cls.tower_role_param_filter_from_model,
-            stacked_params_mapping=(
-                ("qkv_proj", "q_proj", "q"),
-                ("qkv_proj", "k_proj", "k"),
-                ("qkv_proj", "v_proj", "v"),
-                ("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
-                ("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
-                ("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
-                ("gate_up_proj", "gate_proj", 0),
-                ("gate_up_proj", "up_proj", 1),
-            ),
+            checkpoint_layout=cls.checkpoint_layout,
         )
 
     @classmethod
@@ -2505,40 +2509,21 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
 
     def _wait_gen_cache_ready(self, cache: Any) -> None:
         """Gen tower waits until the staged snapshot is fully written."""
-        self._tower_handoff.await_ready(cache)
+        self.tower_session.wait_gen_cache_ready(cache)
 
     def _prepare_generated_image_for_commit(self, image_state: ImageState) -> torch.Tensor:
         """Bring the finished latent back to the understanding device for commit."""
-        if self._dataplane_handoff is not None:
-            return image_state.x_t[0].unsqueeze(0).to(
-                device=self.device, dtype=torch.bfloat16, non_blocking=True
-            )
-        return self._tower_handoff.writeback_commit(
-            image_state.x_t[0].unsqueeze(0),
-            device=self.device,
-            dtype=torch.bfloat16,
-        )
+        return self.tower_session.prepare_commit_latent(image_state)
 
     def publish_generated_latent_for_commit(self, image_state: ImageState) -> Any:
-        if self._dataplane_handoff is None:
-            return self._prepare_generated_image_for_commit(image_state)
-        return self._dataplane_handoff.publish_commit_latent(image_state.x_t[0].unsqueeze(0))
+        return self.tower_session.publish_commit_latent(image_state)
 
     def fetch_commit_latent(self, locator: Any) -> torch.Tensor:
-        if self._dataplane_handoff is None:
-            raise RuntimeError("commit_writeback requires a data-plane handoff")
-        if isinstance(locator, str):
-            locator = Locator.from_wire_json(locator)
-        if not isinstance(locator, Locator):
-            raise invalid_descriptor("commit_writeback locator must be a typed data-plane Locator")
-        latent = self._dataplane_handoff.data_plane.fetch(locator)
-        return latent.to(device=self.device, dtype=torch.bfloat16, non_blocking=True)
+        return self.tower_session.fetch_commit_latent(locator)
 
     @staticmethod
     def encode_commit_locator(locator: Any) -> str:
-        if not isinstance(locator, Locator):
-            raise invalid_descriptor("commit locator must be a typed data-plane Locator")
-        return locator.to_wire_json()
+        return TowerExecutionSession.encode_commit_locator(locator)
 
     def _resolve_tower_binding(self) -> TowerBinding:
         """Resolve the live destination residency + coordinates for a crossing.
@@ -2581,7 +2566,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         """Snapshot the cond-KV into a writable replica for denoising.
 
         The whole und->gen KV crossing is owned by :class:`TowerHandoff`."""
-        return self._tower_handoff.stage_conditioning(cache)
+        return self.tower_session.denoise_cache(cache)
 
     def bind_data_plane_handoff(self, transport: Any) -> None:
         """Bind the Mode-A cross-process und<->gen handoff to a data-plane transport.
@@ -2590,9 +2575,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         per-branch :attr:`_tower_handoff` (local, same-device) is unchanged; this
         adds the cross-process publish (und) / fetch (gen) of the conditioning KV
         over the registered ``cuda_ipc`` / ``mooncake`` transport."""
-        self._dataplane_handoff = DataPlaneTowerHandoff(
-            data_plane=transport, bind=self._resolve_tower_binding
-        )
+        self.tower_session.bind_data_plane_handoff(transport)
 
     def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
         """und side: when text decode emits ``img_start``, publish ``st.cond``.
@@ -2600,46 +2583,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         Returns the wire locator (for ``SeqResult.locator``) the gen pool will fetch
         and rebuild ``st.cond`` from, or ``None`` outside Mode A / a non-image token.
         A no-op unless a data-plane handoff is bound (Mode A)."""
-        if self._dataplane_handoff is None:
-            return None
-        if int(sampled_token_id) != int(self.img_start_id):
-            return None
-        st = self.reqs.get(int(req_id))
-        if st is None or st.cond.past is None:
-            return None
-        # Guarantee the conditioning ends with img_start (idempotent text append) so
-        # the gen side's img-start guard is satisfied without an und text forward.
-        self._ensure_img_start(st.cond)
-        params = self._parse_image_params(st.image or {})
-        cfg_plan = build_text_image_cfg_plan(
-            cfg_text_scale=params.cfg_text,
-            cfg_img_scale=params.cfg_img,
-            recipe=CfgRecipe.ADDITIVE_DELTAS,
-            renorm=params.cfg_norm,
-            renorm_min=params.cfg_renorm_min,
-        )
-        needs_text_uncond = Branch.TEXT_UNCOND in cfg_plan.branches
-        if needs_text_uncond:
-            if st.tu.past is None:
-                st.tu = self._empty_img_start_prefix()
-            else:
-                self._ensure_img_start(st.tu)
-        needs_img_uncond = Branch.IMG_UNCOND in cfg_plan.branches
-        if needs_img_uncond:
-            if st.iu.past is None:
-                st.iu = self._empty_img_start_prefix()
-            else:
-                self._ensure_img_start(st.iu)
-        snapshot = self._dataplane_handoff.publish_conditioning(
-            st.cond.past, t_index=int(st.cond.t_index), last_token_id=st.cond.last_token_id,
-            tu_cache=st.tu.past if needs_text_uncond else None,
-            tu_t_index=int(st.tu.t_index),
-            tu_last_token_id=st.tu.last_token_id,
-            iu_cache=st.iu.past if needs_img_uncond else None,
-            iu_t_index=int(st.iu.t_index),
-            iu_last_token_id=st.iu.last_token_id,
-        )
-        return snapshot.to_wire() if snapshot is not None else None
+        return self.tower_session.publish_conditioning(req_id, sampled_token_id)
 
     def _stage_text_cache_from_snapshot(
         self,
@@ -2651,24 +2595,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         t_index: int,
         last_token_id: int | None,
     ) -> None:
-        if self._dataplane_handoff is None or not locators:
-            return
-        branch = ConditioningSnapshot(
-            locators=tuple(locators),
-            length=int(length),
-            num_layers=int(snapshot.num_layers),
-            t_index=int(t_index),
+        self.tower_session.stage_text_cache_from_snapshot(
+            target,
+            snapshot,
+            locators=locators,
+            length=length,
+            t_index=t_index,
             last_token_id=last_token_id,
-        )
-        replica = self._dataplane_handoff.stage_conditioning(branch)
-        if replica is None:
-            return
-        target.past = replica
-        target.past.allocate_blocks = self.residency.allocator_for_cache(replica)
-        target.block_ids = list(replica.block_ids)
-        target.t_index = int(t_index)
-        target.last_token_id = (
-            int(last_token_id) if last_token_id is not None else int(self.img_start_id)
         )
 
     def _maybe_stage_conditioning_from_op(self, st: Any, op: dict[str, Any]) -> None:
@@ -2678,48 +2611,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         this request has no local ``st.cond`` (the gen pool never ran the und text),
         fetch the published KV into the gen replica and populate the decode-state
         scalars the denoise setup reads. A no-op in Mode C / single-device."""
-        if self._dataplane_handoff is None:
-            return
-        locator = op.get("locator") if isinstance(op, dict) else None
-        if not locator:
-            return
-        snapshot = ConditioningSnapshot.from_wire(locator)
-        for cache in (st.cond, st.tu, st.iu):
-            self.residency.release_scratch_cache(getattr(cache, "past", None))
-        st.cond = TextCache()
-        st.tu = TextCache()
-        st.iu = TextCache()
-        replica = self._dataplane_handoff.stage_conditioning(snapshot)
-        if replica is None:
-            return
-        st.cond.past = replica
-        st.cond.past.allocate_blocks = self.residency.allocator_for_cache(replica)
-        st.cond.block_ids = list(replica.block_ids)
-        st.cond.t_index = int(snapshot.t_index)
-        st.cond.last_token_id = (
-            int(snapshot.last_token_id) if snapshot.last_token_id is not None else int(self.img_start_id)
-        )
-        # ``last_logits`` is consumed only for its dtype (latent init); a 1-element
-        # carrier of the model's compute dtype suffices on the gen side.
-        st.cond.last_logits = torch.zeros(
-            1, dtype=next(self.model.parameters()).dtype, device=self.gen_device
-        )
-        self._stage_text_cache_from_snapshot(
-            st.tu,
-            snapshot,
-            locators=snapshot.tu_locators,
-            length=snapshot.tu_length,
-            t_index=snapshot.tu_t_index,
-            last_token_id=snapshot.tu_last_token_id,
-        )
-        self._stage_text_cache_from_snapshot(
-            st.iu,
-            snapshot,
-            locators=snapshot.iu_locators,
-            length=snapshot.iu_length,
-            t_index=snapshot.iu_t_index,
-            last_token_id=snapshot.iu_last_token_id,
-        )
+        self.tower_session.stage_conditioning_from_op(st, op)
 
     def _release_image_state_caches(self, image_state: ImageState | None) -> None:
         if image_state is None:

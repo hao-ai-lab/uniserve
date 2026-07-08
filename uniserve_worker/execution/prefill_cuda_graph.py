@@ -775,7 +775,11 @@ def _resolve_graph_prefill_backend(ctx: Any) -> Any:
     if backend is not None:
         return backend
     try:
-        from ..backends.attention import get_attention_backend, has_attention_backend, normalize_attention_backend_name
+        from ..backends.attention import (
+            get_attention_backend,
+            has_attention_backend,
+            normalize_attention_backend_name,
+        )
 
         name = normalize_attention_backend_name(getattr(ctx, "attention_backend_name", None))
         if name == "auto" and has_attention_backend("trtllm_mha"):

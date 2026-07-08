@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import enum
-from typing import TypeVar
+from typing import NoReturn, TypeVar
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ import uniserve_worker.ops as ops
 from ..contracts.forward_context import get_forward_context
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
+from .attention_plan import AttentionExecutionPlan
 
 __all__ = [
     'AttentionPath',
@@ -77,6 +78,7 @@ class RadixAttention(nn.Module):
         self.layer_id = layer_id
         self.scale = head_dim**-0.5
         self.backend_name = backend_name
+        self.execution_plan = AttentionExecutionPlan(AttentionPath)
 
     def forward(
         self,
@@ -105,9 +107,18 @@ class RadixAttention(nn.Module):
                 kv_cache = getattr(metadata, "cache", None)
         update = save_kv_cache if update_cache is None else update_cache
 
-        path = self._resolve_attention_path(
-            ctx, preferred, q, k, v, kv_cache=kv_cache, update_cache=update, attn_mask=attn_mask
+        run = self.execution_plan.plan(
+            self,
+            ctx,
+            preferred,
+            q,
+            k,
+            v,
+            kv_cache=kv_cache,
+            update_cache=update,
+            attn_mask=attn_mask,
         )
+        path = run.path
         if path is AttentionPath.CONTIGUOUS_VARLEN:
             return self._forward_contiguous_varlen(
                 ctx, preferred, q, k, v, causal=causal, scale=effective_scale
@@ -144,52 +155,6 @@ class RadixAttention(nn.Module):
             scale=effective_scale,
             attn_mask=attn_mask,
         )
-
-    def _resolve_attention_path(
-        self,
-        ctx,
-        preferred: str,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        kv_cache,
-        update_cache: bool,
-        attn_mask: torch.Tensor | None,
-    ) -> AttentionPath:
-        """Select the forward path and resolved backends for this call.
-
-        Short-circuits in load-bearing order: contiguous varlen, paged varlen,
-        paged decode, empty paged prefill, then dense. The probes ask the
-        attention dispatcher whether a typed request has an eligible provider;
-        the actual forward calls still go through ``ops.attention``.
-        """
-        if kv_cache is None:
-            return AttentionPath.DENSE
-        # Shared gate for all paged/varlen branches.
-        paged_eligible = update_cache and hasattr(kv_cache, "pool")
-        if paged_eligible:
-            if self._can_run_paged_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
-                return AttentionPath.PAGED_VARLEN
-            if self._can_run_contiguous_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
-                return AttentionPath.CONTIGUOUS_VARLEN
-            if self._can_run_transient_paged_varlen(ctx, preferred, kv_cache, q, k, v):
-                return AttentionPath.TRANSIENT_PAGED_VARLEN
-            # Self-managing segment decoders pass a single-request paged view
-            # directly with token-major [L, H, D] q/k/v and no system-built
-            # per-forward plan. A multi-token append+attend on such a view is a
-            # one-sequence EXTEND whose plan the view itself supplies; without
-            # this branch it would fall through to the paged-decode path, which
-            # reads a 3-D q as one-token *rows* and corrupts the write.
-            if attn_mask is None and self._can_run_paged_extend(ctx, preferred, kv_cache, q, k, v):
-                return AttentionPath.PAGED_EXTEND
-
-        if paged_eligible:
-            if self.can_run_paged_attention(q, attn_mask, kv_cache=kv_cache, preferred=preferred, ctx=ctx):
-                return AttentionPath.PAGED_DECODE
-            if self._can_run_empty_paged_prefill(ctx, kv_cache, q, k, v):
-                return AttentionPath.EMPTY_PAGED_PREFILL
-        return AttentionPath.DENSE
 
     @staticmethod
     def _attention_override(ctx, preferred: str) -> str:
@@ -963,7 +928,7 @@ class RadixAttention(nn.Module):
         return tensor.transpose(1, 2).reshape(int(batch) * int(tokens), int(heads), int(dim)).contiguous()
 
     @staticmethod
-    def _raise_unsupported_paged_fallback(kv_cache) -> None:
+    def _raise_unsupported_paged_fallback(kv_cache) -> NoReturn:
         pool = getattr(kv_cache, "pool", None)
         if pool is not None and not bool(getattr(pool, "supports_paged_attention_storage", True)):
             raise capability_mismatch(

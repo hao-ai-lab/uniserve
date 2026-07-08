@@ -52,8 +52,8 @@ from uniserve_eval.harness.sse import (
     aiter_sse_events_from_text,
     iter_sse_events,
 )
-from uniserve_eval.harness.tasks.i2t import I2TTask
 from uniserve_eval.harness.tasks.default import DefaultTask
+from uniserve_eval.harness.tasks.i2t import I2TTask
 from uniserve_eval.harness.tasks.t2i import T2ITask
 
 pytestmark = [pytest.mark.unit]
