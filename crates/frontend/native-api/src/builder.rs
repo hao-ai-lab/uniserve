@@ -380,9 +380,9 @@ fn validate_prompt(body: &NativeGenerateBody, mode: GenMode) -> Result<(), Build
 
 fn validate_cfg_interval(value: (f32, f32)) -> Result<(), BuildError> {
     let (lo, hi) = value;
-    if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi > 1.0 || lo > hi {
+    if !lo.is_finite() || !hi.is_finite() || lo > hi {
         return Err(BuildError::new(
-            "image.cfg_interval must satisfy 0 <= lo <= hi <= 1",
+            "image.cfg_interval must be a finite ordered pair",
         ));
     }
     Ok(())
@@ -668,5 +668,25 @@ mod tests {
                 .build(&body)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cfg_interval_can_cover_the_full_timestep_domain() {
+        let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
+        let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
+        let body = NativeGenerateBody {
+            prompt: "paint".into(),
+            mode: Some("image".into()),
+            image: Some(super::super::schema::NativeImageBody {
+                cfg_interval: Some([-1.0, 2.0]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = NativeRequestBuilder::new(tok, &profile)
+            .build(&body)
+            .unwrap();
+
+        assert_eq!(request.image.cfg_interval, (-1.0, 2.0));
     }
 }

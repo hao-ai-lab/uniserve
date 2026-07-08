@@ -511,6 +511,10 @@ pub(crate) struct WorkerLaunchArgs {
     pub disable_model_arch: Vec<String>,
     #[arg(long)]
     pub strict_model_imports: bool,
+    /// Parallelism mesh forwarded to the Python worker, e.g.
+    /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
+    #[arg(long)]
+    pub worker_mesh: Option<String>,
     #[arg(long)]
     pub tp_backend: Option<String>,
     #[arg(long, default_value = "")]
@@ -576,6 +580,7 @@ impl WorkerLaunchArgs {
             transformers_attn_implementation: self.transformers_attn_implementation.clone(),
             disable_model_arch: self.disable_model_arch.clone(),
             strict_model_imports: self.strict_model_imports,
+            mesh: self.worker_mesh.clone(),
             tp_backend: self.tp_backend.clone(),
             mooncake_device: self.mooncake_device.clone(),
             mooncake_protocol: self.mooncake_protocol.clone(),
@@ -640,6 +645,7 @@ impl WorkerLaunchArgs {
         if cfg.strict_model_imports {
             args.push("--strict-model-imports".to_string());
         }
+        push_option(args, "--worker-mesh", cfg.mesh.as_ref());
         push_option(args, "--tp-backend", cfg.tp_backend.as_ref());
         push_if_changed(
             args,
@@ -1171,6 +1177,22 @@ mod tests {
         assert_eq!(
             forwarded_value(&runtime.engine_cli_args(), "--model-dtype"),
             Some("float16"),
+        );
+    }
+
+    #[test]
+    fn worker_mesh_forwards_to_managed_engine_args() {
+        let runtime = parse_serve(&[
+            "--worker-mesh",
+            "tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536",
+        ]);
+        assert_eq!(
+            forwarded_value(&runtime.engine_cli_args(), "--worker-mesh"),
+            Some("tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536"),
+        );
+        assert_eq!(
+            runtime.engine_settings().worker_launch.mesh.as_deref(),
+            Some("tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536"),
         );
     }
 

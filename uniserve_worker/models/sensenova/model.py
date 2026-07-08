@@ -55,6 +55,7 @@ from ...execution.interleaved_text_stepper import (
 )
 from ...execution.model_base import UniModelBase
 from ...execution.packed_mixed_forward import run_packed_mixed_forward
+from ...execution.text_driver import sample_logits_result
 from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
@@ -152,6 +153,7 @@ _DENOISE_RESIDUAL_RESCALE_COEFFS = (
     7.61309272e-01,
 )
 MAX_CFG_BRANCHES = 3
+INTERLEAVE_T_EPS = 0.02
 
 # Resolution-aware modes apply sqrt sequence-length scaling; the others leave the
 # base noise scale unchanged. Unknown string modes are treated like fixed scale.
@@ -2142,6 +2144,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.model = model
         self.tokenizer = tokenizer
         self.device = str(device)
+        if self.config is not None and hasattr(self.config, "t_eps"):
+            self.config.t_eps = INTERLEAVE_T_EPS
         # Tower device profile: when set ("und"/"gen"), only this tower's modules
         # were materialized by the loader; the other tower's params stay on
         # ``meta`` (no memory, never read by this worker's ops).
@@ -3344,12 +3348,24 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self._complete_packed_denoise_bursts(batch, request_states, results)
             for row_index, req_id, op in commit_rows:
                 state = request_states.get(req_id)
-                results[row_index] = self.decode_image(
+                decoded = self.decode_image(
                     getattr(state, "latent", None),
                     req_id=req_id,
                     state=state,
                     op=op,
                 )
+                out = dict(decoded)
+                logits = out.pop("logits", None)
+                if logits is not None:
+                    sampled = sample_logits_result(
+                        req_id=req_id,
+                        state=state,
+                        logits=logits,
+                        op=op,
+                    )
+                    sampled.pop("req_id", None)
+                    out.update(sampled)
+                results[row_index] = out
             return results
         raise capability_mismatch(
             "admitted mixed SenseNova batch could not be packed; split-mode fallback is disabled"

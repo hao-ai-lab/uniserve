@@ -28,6 +28,7 @@ class RequestRecord:
     success: bool = False
     classifier: str = ""
     error: str | None = None
+    endpoint: str = ""
 
     # Timing (seconds). ``start_time`` is a ``perf_counter()`` taken right before
     # the request is sent; ``latency`` is the request E2E; ``ttft`` is time to the
@@ -67,6 +68,7 @@ class RequestRecord:
             "success": self.success,
             "classifier": self.classifier,
             "error": self.error,
+            "endpoint": self.endpoint,
             "e2e_ms": self.latency * 1000.0,
             "ttft_ms": self.ttft * 1000.0 if self.ttft else None,
             "tpot_ms": (
