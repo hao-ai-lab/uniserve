@@ -29,7 +29,7 @@ import pytest
 
 import uniserve_eval.harness.core.client as client_module
 from uniserve_eval.harness import cli
-from uniserve_eval.harness.core.client import _parse_native, _send_sse
+from uniserve_eval.harness.core.client import _parse_native, _parse_openai, _send_sse
 from uniserve_eval.harness.datasets import (
     load_dataset_rows,
     load_sharegpt,
@@ -52,7 +52,9 @@ from uniserve_eval.harness.sse import (
     aiter_sse_events_from_text,
     iter_sse_events,
 )
+from uniserve_eval.harness.tasks.i2t import I2TTask
 from uniserve_eval.harness.tasks.interleave import InterleaveTask
+from uniserve_eval.harness.tasks.t2i import T2ITask
 
 pytestmark = [pytest.mark.unit]
 
@@ -170,6 +172,16 @@ def test_classify_openai_events_counts_reasoning_content_as_text() -> None:
     assert classify_openai_events(events) == (True, "ok")
 
 
+def test_classify_openai_events_counts_delta_images_as_output() -> None:
+    events = [
+        {"choices": [{"delta": {"images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        {"type": "sse_done"},
+    ]
+
+    assert classify_openai_events(events) == (True, "ok")
+
+
 def test_classify_json_image_response_routes_payloads() -> None:
     assert classify_json_image_response({"data": [{"b64_json": "AAAA"}]}) == (True, "ok")
     assert classify_json_image_response({}) == (False, "protocol_empty_image_data")
@@ -231,6 +243,47 @@ def test_native_parser_excludes_image_step_gaps_from_text_itl() -> None:
     assert row["client_dispatch_wait_ms"] == pytest.approx(50.0)
 
 
+def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
+    record = RequestRecord(request_id="openai-interleave", task="interleave")
+    record.start_time = 10.0
+    events = [
+        {"choices": [{"delta": {"content": "a"}}], "_client_t": 11.0},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "images": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            }
+                        ]
+                    }
+                }
+            ],
+            "_client_t": 13.0,
+        },
+        {"choices": [{"delta": {"content": "b"}}], "_client_t": 14.0},
+        {"choices": [{"delta": {"content": "c"}}], "_client_t": 14.25},
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        {"usage": {"prompt_tokens": 7, "completion_tokens": 3}},
+        {"type": "sse_done"},
+    ]
+
+    _parse_openai(events, record, output_len_fallback=0, prompt_len=5)
+
+    assert record.success is True
+    assert record.generated_text == "abc"
+    assert record.ttft == pytest.approx(1.0)
+    assert record.itl == pytest.approx([0.25])
+    assert record.images == 1
+    assert record.first_image_latency == pytest.approx(3.0)
+    assert record.image_latencies == pytest.approx([3.0])
+    assert record.prompt_len == 7
+    assert record.output_len == 3
+    assert record.finish_reason == "stop"
+
+
 def test_interleave_task_omits_image_cap_unless_explicit() -> None:
     uncapped = InterleaveTask(
         BenchmarkSpec(
@@ -258,6 +311,133 @@ def test_interleave_task_omits_image_cap_unless_explicit() -> None:
     ).build_request({"prompt": "show each step visually and textually"})
 
     assert capped.payload["image"]["max_images"] == 8
+
+
+def test_interleave_task_can_emit_openai_chat_wire() -> None:
+    request = InterleaveTask(
+        BenchmarkSpec(
+            task=TaskName.INTERLEAVE,
+            model="SenseNova-U1",
+            max_tokens=8192,
+            max_images=4,
+            width=2048,
+            height=1152,
+            steps=50,
+            wire="openai_chat",
+        )
+    ).build_request({"prompt": "show each step visually and textually"})
+
+    assert request.endpoint == "/v1/chat/completions"
+    assert request.kind == "openai_chat"
+    assert request.payload["modalities"] == ["text", "image"]
+    assert request.payload["stream"] is True
+    assert request.payload["stream_options"] == {"include_usage": True}
+    assert request.payload["max_completion_tokens"] == 8192
+    assert request.payload["messages"] == [{"role": "user", "content": "show each step visually and textually"}]
+    assert request.payload["image_config"] == {"max_images": 4, "width": 2048, "height": 1152, "steps": 50}
+
+
+def test_spec_rejects_unsupported_wire_for_task() -> None:
+    with pytest.raises(ValueError, match="does not support wire"):
+        BenchmarkSpec(task=TaskName.TEXT, model="m", wire="native")
+
+
+def test_i2t_task_streams_openai_chat_wire() -> None:
+    request = I2TTask(
+        BenchmarkSpec(
+            task=TaskName.I2T,
+            model="SenseNova-U1",
+            max_tokens=256,
+            wire="openai_chat",
+        )
+    ).build_request({"prompt": "Describe this image.", "input_image_b64": "QUJD"})
+
+    assert request.endpoint == "/v1/chat/completions"
+    assert request.kind == "openai_chat"
+    assert request.payload["stream"] is True
+    assert request.payload["stream_options"] == {"include_usage": True}
+    assert request.payload["modalities"] == ["text"]
+    parts = request.payload["messages"][0]["content"]
+    assert parts[1]["image_url"]["url"] == "data:image/png;base64,QUJD"
+
+
+def test_i2t_task_openai_chat_json_wire_is_not_streamed() -> None:
+    request = I2TTask(
+        BenchmarkSpec(
+            task=TaskName.I2T,
+            model="SenseNova-U1",
+            max_tokens=256,
+            wire="openai_chat_json",
+        )
+    ).build_request({"prompt": "Describe this image.", "input_image_b64": "QUJD"})
+
+    assert request.endpoint == "/v1/chat/completions"
+    assert request.kind == "openai_chat_json"
+    assert "stream" not in request.payload
+
+
+def test_t2i_task_can_emit_image_only_chat_wire() -> None:
+    request = T2ITask(
+        BenchmarkSpec(
+            task=TaskName.T2I,
+            model="BAGEL",
+            width=1024,
+            height=1024,
+            steps=50,
+            wire="openai_chat_json",
+        )
+    ).build_request({"prompt": "a red bicycle"})
+
+    assert request.endpoint == "/v1/chat/completions"
+    assert request.kind == "openai_chat_json"
+    assert request.payload["modalities"] == ["image"]
+    assert request.payload["image_config"] == {
+        "width": 1024,
+        "height": 1024,
+        "steps": 50,
+        "seed": 42,
+    }
+
+
+def test_chat_json_counts_message_images() -> None:
+    record = RequestRecord(request_id="x", task="t2i")
+    record.start_time = 0.0
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "images": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0},
+            }
+
+    class _Client:
+        @staticmethod
+        async def post(url, json):
+            return _Resp()
+
+    asyncio.run(
+        client_module._send_chat_json(_Client(), "http://x/v1/chat/completions", {}, record)
+    )
+    assert record.success
+    assert record.classifier == "ok"
+    assert record.images == 1
+    assert len(record.image_latencies) == 1
 
 
 # --- SSE framing --------------------------------------------------------------
@@ -586,6 +766,7 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
         "task",
         "dataset",
         "endpoint",
+        "wire",
         "model",
         "base_url",
         "server_info",
@@ -612,6 +793,25 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
     assert summary["load"]["mode"] == "saturation"
     assert summary["load"]["request_rate"] == "inf"
     assert summary["metrics"]["completed_images"] == 1
+
+
+def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
+    spec = BenchmarkSpec(task=TaskName.INTERLEAVE, model="M", num_prompts=1)
+    records = [
+        RequestRecord(
+            request_id="a",
+            task="interleave",
+            success=True,
+            latency=1.0,
+            classifier="ok",
+            endpoint="/v1/chat/completions",
+        )
+    ]
+
+    summary = build_summary(spec, "http://x", records, dur_s=1.0)
+
+    assert summary["endpoint"] == "/v1/chat/completions"
+    assert summary["spec"]["endpoint"] == "/generate"
 
 
 def test_build_summary_selects_stream_family_for_text_task() -> None:

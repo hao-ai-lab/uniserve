@@ -7,9 +7,9 @@ use serde_with::SerializeDisplay;
 use validator::Validate;
 
 use crate::common::{
-    ChatLogProbs, ChatMessage, MessageContent, Normalizable, ReasoningEffort, StreamOptions,
-    StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-    UNKNOWN_MODEL_ID, Usage, default_true, validate_stop, validate_top_p_value,
+    ChatLogProbs, ChatMessage, ContentPart, MessageContent, Normalizable, ReasoningEffort,
+    StreamOptions, StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue,
+    ToolReference, UNKNOWN_MODEL_ID, Usage, default_true, validate_stop, validate_top_p_value,
 };
 use crate::structured_outputs::ResponseFormat;
 
@@ -81,6 +81,13 @@ pub struct ChatCompletionRequest {
 
     /// Options for streaming response
     pub stream_options: Option<StreamOptions>,
+
+    /// Output modalities requested by multimodal chat clients.
+    #[serde(default = "default_modalities")]
+    pub modalities: Vec<ChatModality>,
+
+    /// Image generation controls used when `modalities` includes `image`.
+    pub image_config: Option<ChatImageConfig>,
 
     /// What sampling temperature to use, between 0 and 2
     #[validate(range(min = 0.0, max = 2.0))]
@@ -255,6 +262,8 @@ impl Default for ChatCompletionRequest {
             stop: None,
             stream: false,
             stream_options: None,
+            modalities: default_modalities(),
+            image_config: None,
             temperature: None,
             top_p: None,
             tools: None,
@@ -300,6 +309,45 @@ impl Default for ChatCompletionRequest {
             other: Map::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatModality {
+    Text,
+    Image,
+    Audio,
+}
+
+fn default_modalities() -> Vec<ChatModality> {
+    vec![ChatModality::Text]
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ChatImageConfig {
+    pub aspect_ratio: Option<String>,
+    pub image_size: Option<String>,
+    pub image_type: Option<ChatImageType>,
+    pub height: Option<i32>,
+    pub width: Option<i32>,
+    pub steps: Option<u16>,
+    pub guidance_scale: Option<f32>,
+    pub image_guidance_scale: Option<f32>,
+    pub seed: Option<u64>,
+    pub num_images: Option<u16>,
+    pub cfg_norm: Option<String>,
+    pub cfg_interval: Option<[f32; 2]>,
+    pub timestep_shift: Option<f32>,
+    pub dynamic_resolution: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatImageType {
+    Png,
+    Jpeg,
+    Webp,
 }
 
 impl Normalizable for ChatCompletionRequest {
@@ -374,6 +422,7 @@ pub struct ChatCompletionMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(rename = "reasoning_content")]
     pub reasoning: Option<String>,
+    pub images: Option<Vec<ContentPart>>,
 }
 
 /// Mirrors the `ChatCompletionStreamResponse` class.
@@ -425,6 +474,7 @@ pub struct ChatMessageDelta {
     pub tool_calls: Option<Vec<ToolCallDelta>>,
     #[serde(rename = "reasoning_content")]
     pub reasoning: Option<String>,
+    pub images: Option<Vec<ContentPart>>,
 }
 
 fn default_model() -> String {
@@ -499,6 +549,54 @@ fn validate_chat_cross_parameters(
     {
         let mut e = validator::ValidationError::new("json_schema_name_empty");
         e.message = Some("JSON schema name cannot be empty".into());
+        return Err(e);
+    }
+
+    if req.modalities.is_empty() {
+        let mut e = validator::ValidationError::new("modalities_empty");
+        e.message = Some("modalities cannot be empty".into());
+        return Err(e);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for modality in &req.modalities {
+        if !seen.insert(*modality) {
+            let mut e = validator::ValidationError::new("modalities_duplicate");
+            e.message = Some("modalities must be unique".into());
+            return Err(e);
+        }
+    }
+    let has_text = req.modalities.contains(&ChatModality::Text);
+    let has_image = req.modalities.contains(&ChatModality::Image);
+    if req.modalities.contains(&ChatModality::Audio) {
+        let mut e = validator::ValidationError::new("modalities_unsupported");
+        e.message = Some("audio modality is not supported".into());
+        return Err(e);
+    }
+    if !has_text && req.modalities.as_slice() != [ChatModality::Image] {
+        let mut e = validator::ValidationError::new("modalities_require_text");
+        e.message = Some("modalities must include text unless the request is image-only".into());
+        return Err(e);
+    }
+    if has_image {
+        if let Some(config) = &req.image_config {
+            let has_positive_height = config.height.is_some_and(|height| height > 0);
+            let has_positive_width = config.width.is_some_and(|width| width > 0);
+            let has_custom_height = config.height.is_some_and(|height| height != -1);
+            let has_custom_width = config.width.is_some_and(|width| width != -1);
+            if (has_custom_height || has_custom_width)
+                && (!has_positive_height || !has_positive_width)
+            {
+                let mut e = validator::ValidationError::new("image_config_dimensions");
+                e.message = Some(
+                    "image_config height and width must both be positive when either is provided"
+                        .into(),
+                );
+                return Err(e);
+            }
+        }
+    } else if req.image_config.is_some() {
+        let mut e = validator::ValidationError::new("image_config_without_image");
+        e.message = Some("image_config is only valid when modalities includes image".into());
         return Err(e);
     }
 

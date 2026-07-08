@@ -179,6 +179,13 @@ impl ChatLlm {
         self.text.uniserve_engine_client()
     }
 
+    /// Whether the chat backend carries a generic multimodal (VLM) input
+    /// path. When absent, image inputs can only be served through a native
+    /// model profile.
+    pub fn has_multimodal_backend(&self) -> bool {
+        self.backend.multimodal_model_info().is_some()
+    }
+
     /// Render, tokenize, and submit one chat request.
     pub async fn chat(&self, mut request: ChatRequest) -> Result<ChatEventStream> {
         request.validate()?;

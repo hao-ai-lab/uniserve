@@ -18,19 +18,28 @@ use uniserve_chat::{
     CollectedAssistantMessage, FinishReason,
 };
 use uniserve_engine_client::protocol::StopReason;
-use uniserve_openai_api::chat_completions::prepare_chat_request;
+use uniserve_engine_client::{GenEvent, GenMode};
+use uniserve_native_api::events::{Detok, event_json};
+use uniserve_native_api::schema::NativeInputImage;
+use uniserve_native_api::{NativeGenerateBody, NativeImageBody, NativeRequestBuilder, mode_name};
+use uniserve_openai_api::chat_completions::{prepare_chat_request, validate_request_compat};
 use uniserve_openai_api::logprobs::{
     decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps,
 };
 use uniserve_openai_types::{
     AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
-    ChatMessageDelta, FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta, Usage,
+    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
+    ChatImageType, ChatLogProbs, ChatMessage, ChatMessageDelta, ChatModality, ContentPart,
+    FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, ToolCall, ToolCallDelta,
+    Usage,
 };
 
 use crate::error::{ApiError, bail_server_error, server_error};
+use crate::routes::native::NativeTextOutputFilter;
 use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::utils::{resolve_request_context, unix_timestamp};
+use uniserve_openai_api::lora::LoraModelResolution;
+use uniserve_openai_api::utils::ResolvedRequestContext;
 use uniserve_server_app::AppState;
 
 /// Validate one chat completion request and proxy it into the shared
@@ -43,6 +52,17 @@ pub(crate) async fn chat_completions(
     let stream = body.stream;
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
+
+    if let Some(native_mode) = native_chat_mode(&state, &body) {
+        return native_chat_completions(
+            state,
+            body,
+            &lora_resolution,
+            request_context,
+            native_mode,
+        )
+        .await;
+    }
 
     let prepared = match prepare_chat_request(body, &lora_resolution, request_context) {
         Ok(prepared) => prepared,
@@ -217,6 +237,7 @@ async fn collect_chat_completion(
                 },
                 tool_calls: Some(tool_calls).filter(|calls| !calls.is_empty()),
                 reasoning: if include_reasoning { reasoning } else { None },
+                images: None,
             },
             logprobs,
             finish_reason: Some(finish_reason),
@@ -228,6 +249,261 @@ async fn collect_chat_completion(
         prompt_logprobs,
         prompt_token_ids: return_token_ids.then(|| prompt_token_ids.to_vec()),
         kv_transfer_params,
+    })
+}
+
+async fn native_chat_completions(
+    state: Arc<AppState>,
+    body: ChatCompletionRequest,
+    lora_resolution: &LoraModelResolution,
+    ctx: ResolvedRequestContext,
+    native_mode: GenMode,
+) -> Response {
+    if let Err(error) = validate_request_compat(&body, &lora_resolution.model_names) {
+        return ApiError::from(error).into_response();
+    }
+    if let Err(error) = validate_native_chat_request(&body, native_mode) {
+        return error.into_response();
+    }
+
+    let stream = body.stream;
+    let include_usage = (body.stream_options.as_ref())
+        .and_then(|options| options.include_usage)
+        .unwrap_or(false);
+    let request_id = format!("chatcmpl-{}", ctx.request_id);
+    let response_model = lora_resolution
+        .lora_request
+        .as_ref()
+        .map(|request| request.lora_name.clone())
+        .unwrap_or_else(|| {
+            lora_resolution
+                .model_names
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        });
+    let created = unix_timestamp();
+    let native_body = match native_chat_body(&body, native_mode) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
+
+    let tokenizer = state.chat().text().tokenizer();
+    let native_request =
+        match NativeRequestBuilder::new(Arc::clone(&tokenizer), state.native_profile())
+            .build(&native_body)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return ApiError::invalid_request(error.message().to_string(), None)
+                    .into_response();
+            }
+        };
+    let prompt_ids = native_request.prompt_ids.clone();
+    let text_filter = match NativeTextOutputFilter::new(
+        state.native_profile().output_filter.clone(),
+        Arc::clone(&tokenizer),
+        &prompt_ids,
+    ) {
+        Ok(filter) => filter,
+        Err(error) => return ApiError::server_error(error.to_string()).into_response(),
+    };
+
+    let native_stream = match state
+        .chat()
+        .uniserve_engine_client()
+        .generate_native(native_request)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => return ApiError::server_error(error.to_string()).into_response(),
+    };
+
+    if stream {
+        let chunk_stream = native_chat_completion_chunk_stream(
+            native_stream,
+            request_id,
+            response_model,
+            created,
+            include_usage,
+            tokenizer,
+            text_filter,
+        );
+        let sse_stream = chat_completion_sse_stream(chunk_stream);
+        Sse::new(sse_stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        match collect_native_chat_completion(
+            native_stream,
+            request_id,
+            response_model,
+            created,
+            tokenizer,
+            text_filter,
+        )
+        .await
+        {
+            Ok(response) => Json(response).into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+}
+
+#[try_stream]
+async fn native_chat_completion_chunk_stream(
+    mut stream: uniserve_engine_client::NativeEventStream,
+    request_id: String,
+    response_model: String,
+    created: u64,
+    include_usage: bool,
+    tokenizer: uniserve_text::tokenizer::DynTokenizer,
+    mut text_filter: NativeTextOutputFilter,
+    mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
+) -> Result<(), ApiError> {
+    y.yield_ok(start_chunk(&request_id, &response_model, created))
+        .await;
+
+    let mut detok = Detok::new(tokenizer);
+    while let Some(event) = stream.next().await {
+        match event {
+            GenEvent::TextToken { .. } => {
+                let payload = event_json(&event, &mut detok);
+                let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
+                let text = text_filter.push(text);
+                if !text.is_empty() {
+                    y.yield_ok(block_delta_chunk(
+                        &request_id,
+                        &response_model,
+                        created,
+                        AssistantBlockKind::Text,
+                        text,
+                    ))
+                    .await;
+                }
+            }
+            GenEvent::ImageDone { pixels_png_b64, .. } => {
+                y.yield_ok(image_delta_chunk(
+                    &request_id,
+                    &response_model,
+                    created,
+                    pixels_png_b64,
+                ))
+                .await;
+            }
+            GenEvent::Finished {
+                reason,
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                y.yield_ok(native_final_chunk(
+                    &request_id,
+                    &response_model,
+                    created,
+                    &reason,
+                )?)
+                .await;
+                if include_usage {
+                    y.yield_ok(usage_chunk(
+                        &request_id,
+                        &response_model,
+                        created,
+                        Usage::from_counts(prompt_tokens as u32, completion_tokens as u32),
+                    ))
+                    .await;
+                }
+                return Ok(());
+            }
+            GenEvent::Rejected { message } => {
+                return Err(ApiError::invalid_request(message, None));
+            }
+            GenEvent::Error { message } => {
+                bail_server_error!("{}", message);
+            }
+            GenEvent::Scheduled { .. }
+            | GenEvent::TokenLogprobs { .. }
+            | GenEvent::ImageBegin { .. }
+            | GenEvent::ImageStep { .. } => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn collect_native_chat_completion(
+    mut stream: uniserve_engine_client::NativeEventStream,
+    request_id: String,
+    response_model: String,
+    created: u64,
+    tokenizer: uniserve_text::tokenizer::DynTokenizer,
+    mut text_filter: NativeTextOutputFilter,
+) -> Result<ChatCompletionResponse, ApiError> {
+    let mut detok = Detok::new(tokenizer);
+    let mut text = String::new();
+    let mut images = Vec::new();
+    let mut prompt_tokens = 0_u32;
+    let mut completion_tokens = 0_u32;
+    let mut finish_reason = "stop".to_string();
+
+    while let Some(event) = stream.next().await {
+        match event {
+            GenEvent::TextToken { .. } => {
+                let payload = event_json(&event, &mut detok);
+                let delta = payload.get("text").and_then(Value::as_str).unwrap_or("");
+                text.push_str(&text_filter.push(delta));
+            }
+            GenEvent::ImageDone { pixels_png_b64, .. } => {
+                images.push(image_content_part(pixels_png_b64));
+            }
+            GenEvent::Finished {
+                reason,
+                prompt_tokens: p,
+                completion_tokens: c,
+                ..
+            } => {
+                prompt_tokens = p as u32;
+                completion_tokens = c as u32;
+                finish_reason = native_finish_reason_to_openai(&reason)?.to_string();
+                break;
+            }
+            GenEvent::Rejected { message } => {
+                return Err(ApiError::invalid_request(message, None));
+            }
+            GenEvent::Error { message } => {
+                bail_server_error!("{}", message);
+            }
+            GenEvent::Scheduled { .. }
+            | GenEvent::TokenLogprobs { .. }
+            | GenEvent::ImageBegin { .. }
+            | GenEvent::ImageStep { .. } => {}
+        }
+    }
+
+    Ok(ChatCompletionResponse {
+        id: request_id,
+        object: "chat.completion".to_string(),
+        created,
+        model: response_model,
+        choices: vec![ChatCompletionChoice {
+            index: 0,
+            message: ChatCompletionMessage {
+                role: AssistantRole,
+                content: Some(text).filter(|text| !text.is_empty()),
+                tool_calls: None,
+                reasoning: None,
+                images: Some(images).filter(|images| !images.is_empty()),
+            },
+            logprobs: None,
+            finish_reason: Some(finish_reason),
+            stop_reason: None,
+            token_ids: None,
+        }],
+        usage: Some(Usage::from_counts(prompt_tokens, completion_tokens)),
+        system_fingerprint: None,
+        prompt_logprobs: None,
+        prompt_token_ids: None,
+        kv_transfer_params: None,
     })
 }
 
@@ -469,6 +745,302 @@ fn usage_chunk(
     chunk
 }
 
+/// Derive the native generation mode for one chat request, if the request
+/// belongs on the native engine path at all.
+
+/// Explicit `image` output modality always selects a native mode; the
+/// builder's profile check turns unsupported modes into clean 400s. Image
+/// *inputs* with text-only output select native understanding only when the
+/// model has no generic multimodal chat backend and the native profile
+/// declares understanding support — otherwise the request stays on the
+/// generic chat stack.
+fn native_chat_mode(state: &AppState, request: &ChatCompletionRequest) -> Option<GenMode> {
+    let has_image = request.modalities.contains(&ChatModality::Image);
+    let has_text = request.modalities.contains(&ChatModality::Text);
+    match (has_text, has_image) {
+        (true, true) => Some(GenMode::AutoInterleave),
+        (false, true) => Some(GenMode::Image),
+        (true, false) => {
+            let has_image_input = request.messages.iter().any(|message| {
+                matches!(message, ChatMessage::User { content, .. } if content_has_image_parts(content))
+            });
+            (has_image_input
+                && !state.chat().has_multimodal_backend()
+                && state.native_profile().supports_mode(GenMode::InterleaveUnd))
+            .then_some(GenMode::InterleaveUnd)
+        }
+        (false, false) => None,
+    }
+}
+
+fn content_has_image_parts(content: &MessageContent) -> bool {
+    matches!(
+        content,
+        MessageContent::Parts(parts)
+            if parts.iter().any(|part| matches!(part, ContentPart::ImageUrl { .. }))
+    )
+}
+
+fn validate_native_chat_request(
+    request: &ChatCompletionRequest,
+    native_mode: GenMode,
+) -> Result<(), ApiError> {
+    if request.logprobs
+        || request.prompt_logprobs.is_some()
+        || request.return_token_ids == Some(true)
+    {
+        return Err(ApiError::invalid_request(
+            "token logprobs and token ids are not available for native chat completions"
+                .to_string(),
+            None,
+        ));
+    }
+    if request.tools.is_some() || request.tool_choice.is_some() {
+        return Err(ApiError::invalid_request(
+            "tools are not supported for native chat completions".to_string(),
+            None,
+        ));
+    }
+    if request.stop.is_some() {
+        return Err(ApiError::invalid_request(
+            "stop strings are not supported for native chat completions; use stop_token_ids"
+                .to_string(),
+            None,
+        ));
+    }
+    if native_mode == GenMode::AutoInterleave && !request.stream {
+        return Err(ApiError::invalid_request(
+            "text+image chat completions require stream=true".to_string(),
+            None,
+        ));
+    }
+    if let Some(seed) = request.seed
+        && seed < 0
+    {
+        return Err(ApiError::invalid_request(
+            "seed must be non-negative for native chat completions".to_string(),
+            Some("seed"),
+        ));
+    }
+    if let Some(config) = &request.image_config {
+        if let Some(image_type) = config.image_type
+            && image_type != ChatImageType::Png
+        {
+            return Err(ApiError::invalid_request(
+                "image_type must be png for image chat completions".to_string(),
+                Some("image_config"),
+            ));
+        }
+        // Both fields alias the profile's resolution-bucket table; the
+        // builder resolves whichever is present and rejects unknown names.
+        if config.aspect_ratio.is_some() && config.image_size.is_some() {
+            return Err(ApiError::invalid_request(
+                "aspect_ratio and image_size are mutually exclusive".to_string(),
+                Some("image_config"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn native_chat_body(
+    request: &ChatCompletionRequest,
+    native_mode: GenMode,
+) -> Result<NativeGenerateBody, ApiError> {
+    let mut system_parts = Vec::new();
+    let mut prompt_parts = Vec::new();
+    let mut input_images = Vec::new();
+
+    for message in &request.messages {
+        match message {
+            ChatMessage::System { content, .. } | ChatMessage::Developer { content, .. } => {
+                let (text, images) = message_content_text_and_images(content)?;
+                if !images.is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "system and developer messages cannot contain image_url parts for image chat completions".to_string(),
+                        None,
+                    ));
+                }
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            }
+            ChatMessage::User { content, .. } => {
+                let (text, images) = message_content_text_and_images(content)?;
+                if !text.is_empty() {
+                    prompt_parts.push(text);
+                }
+                input_images.extend(images);
+            }
+            ChatMessage::Assistant { .. }
+            | ChatMessage::Tool { .. }
+            | ChatMessage::Function { .. } => {
+                return Err(ApiError::invalid_request(
+                    "image chat completions accept system/developer/user messages only".to_string(),
+                    None,
+                ));
+            }
+        }
+    }
+
+    let max_tokens = request
+        .max_completion_tokens
+        .or(request.max_tokens)
+        .map(|tokens| tokens as usize);
+    let seed = request.seed.map(|seed| seed as u64);
+
+    Ok(NativeGenerateBody {
+        prompt: prompt_parts.join("\n"),
+        mode: Some(mode_name(native_mode).to_string()),
+        system_prompt: (!system_parts.is_empty()).then(|| system_parts.join("\n")),
+        assistant_prefix: None,
+        negative_prompt: None,
+        max_tokens,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        seed,
+        stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
+        image_bias: None,
+        image: Some(native_image_body(request.image_config.as_ref())),
+        input_images,
+        input_image_b64: None,
+    })
+}
+
+fn message_content_text_and_images(
+    content: &MessageContent,
+) -> Result<(String, Vec<NativeInputImage>), ApiError> {
+    match content {
+        MessageContent::Text(text) => Ok((text.clone(), Vec::new())),
+        MessageContent::Parts(parts) => {
+            let mut text_parts = Vec::new();
+            let mut images = Vec::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => text_parts.push(text.clone()),
+                    ContentPart::ImageUrl { image_url, .. } => {
+                        images.push(NativeInputImage {
+                            b64: data_url_image_b64(&image_url.url)?,
+                            position: None,
+                            num_tokens: None,
+                        });
+                    }
+                    ContentPart::VideoUrl { .. } => {
+                        return Err(ApiError::invalid_request(
+                            "video_url content parts are not supported for image chat completions"
+                                .to_string(),
+                            None,
+                        ));
+                    }
+                }
+            }
+            Ok((text_parts.join("\n"), images))
+        }
+    }
+}
+
+fn data_url_image_b64(url: &str) -> Result<String, ApiError> {
+    let (meta, payload) = url.split_once(',').ok_or_else(|| {
+        ApiError::invalid_request(
+            "image_url must be a data:image/*;base64 URL".to_string(),
+            None,
+        )
+    })?;
+    if !meta.starts_with("data:image/") || !meta.ends_with(";base64") || payload.is_empty() {
+        return Err(ApiError::invalid_request(
+            "image_url must be a data:image/*;base64 URL".to_string(),
+            None,
+        ));
+    }
+    Ok(payload.to_string())
+}
+
+fn native_image_body(config: Option<&uniserve_openai_types::ChatImageConfig>) -> NativeImageBody {
+    let mut image = NativeImageBody::default();
+    if let Some(config) = config {
+        // `aspect_ratio` and `image_size` are aliases into the profile's
+        // resolution-bucket table (validated as mutually exclusive).
+        image.resolution = config
+            .aspect_ratio
+            .clone()
+            .or_else(|| config.image_size.clone());
+        image.width = positive_dimension(config.width);
+        image.height = positive_dimension(config.height);
+        image.steps = config.steps;
+        image.cfg_text_scale = config.guidance_scale;
+        image.cfg_img_scale = config.image_guidance_scale;
+        image.cfg_renorm_type = config.cfg_norm.clone();
+        image.cfg_interval = config.cfg_interval;
+        image.cfg_renorm_min = None;
+        image.timestep_shift = config.timestep_shift;
+        image.seed = config.seed;
+        image.max_images = config.num_images;
+    }
+    image
+}
+
+fn positive_dimension(value: Option<i32>) -> Option<u32> {
+    value.and_then(|value| (value > 0).then_some(value as u32))
+}
+
+fn image_delta_chunk(
+    request_id: &str,
+    response_model: &str,
+    created: u64,
+    png_b64: String,
+) -> ChatCompletionStreamResponse {
+    let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
+    chunk.choices.push(ChatCompletionStreamChoice {
+        delta: ChatMessageDelta {
+            images: Some(vec![image_content_part(png_b64)]),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    chunk
+}
+
+fn image_content_part(png_b64: String) -> ContentPart {
+    ContentPart::ImageUrl {
+        image_url: ImageUrl {
+            url: format!("data:image/png;base64,{png_b64}"),
+            detail: None,
+        },
+        uuid: None,
+    }
+}
+
+fn native_final_chunk(
+    request_id: &str,
+    response_model: &str,
+    created: u64,
+    reason: &uniserve_engine_client::NativeFinishReason,
+) -> Result<ChatCompletionStreamResponse, ApiError> {
+    let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
+    chunk.choices.push(ChatCompletionStreamChoice {
+        finish_reason: Some(native_finish_reason_to_openai(reason)?.to_string()),
+        ..Default::default()
+    });
+    Ok(chunk)
+}
+
+fn native_finish_reason_to_openai(
+    reason: &uniserve_engine_client::NativeFinishReason,
+) -> Result<&'static str, ApiError> {
+    match reason {
+        uniserve_engine_client::NativeFinishReason::Eos
+        | uniserve_engine_client::NativeFinishReason::Stop
+        | uniserve_engine_client::NativeFinishReason::ImageDone => Ok("stop"),
+        uniserve_engine_client::NativeFinishReason::MaxTokens => Ok("length"),
+        uniserve_engine_client::NativeFinishReason::Cancelled
+        | uniserve_engine_client::NativeFinishReason::Aborted => Ok("abort"),
+        uniserve_engine_client::NativeFinishReason::Error => {
+            bail_server_error!("Internal server error");
+        }
+    }
+}
+
 /// One in-flight chat-completions SSE chunk being assembled at the route layer.
 
 /// `chat` emits semantic chat events first and `LogprobsDelta` separately,
@@ -583,6 +1155,7 @@ impl PendingChatChunk {
             content: self.delta.content.take(),
             tool_calls: self.delta.tool_calls.take(),
             reasoning: self.delta.reasoning.take(),
+            images: self.delta.images.take(),
         }
     }
 }

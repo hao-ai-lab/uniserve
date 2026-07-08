@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import signal
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -61,33 +64,82 @@ def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any], *, strict_env:
         require_resolved_profile_value(config.get("server_bin", ""), context="config server_bin")
     if spec.get("command"):
         return [str(part) for part in spec["command"]]
-    cmd = [
-        _repo_path(config, "server_bin", "target/debug/uniserve"),
-        "serve",
-        spec["model"],
-        "--served-model-name",
-        spec["served_model_name"],
-        "--host",
-        str(spec.get("host", "127.0.0.1")),
-        "--port",
-        str(spec["port"]),
-        "--worker-python",
-        _repo_path(config, "python", ".venv/bin/python"),
-    ]
+    cmd = []
+    # Pin the server (and the workers it spawns, which inherit affinity) to one
+    # NUMA node's full core set. Servers inherit the parent's CPU mask
+    # otherwise — a runner invoked under `taskset -c 0` would silently starve
+    # the host scheduler, both TP worker processes, and every CUDA driver
+    # thread on a single core (measured: ~30% throughput loss under 12-way
+    # interleave load).
+    numa_node = spec.get("numa_node", 0)
+    if numa_node is not None and shutil.which("numactl"):
+        cmd.extend(
+            [
+                "numactl",
+                f"--cpunodebind={int(numa_node)}",
+                f"--membind={int(numa_node)}",
+            ]
+        )
+    cmd.extend(
+        [
+            _repo_path(config, "server_bin", "target/debug/uniserve"),
+            "serve",
+            spec["model"],
+            "--served-model-name",
+            spec["served_model_name"],
+            "--host",
+            str(spec.get("host", "127.0.0.1")),
+            "--port",
+            str(spec["port"]),
+            "--worker-python",
+            _repo_path(config, "python", ".venv/bin/python"),
+        ]
+    )
     cmd.extend(str(part) for part in spec.get("serve_args", []))
     return cmd
 
 
 def wait_for_port(host: str, port: int, timeout_s: float) -> None:
+    """Wait until the server is inference-ready, not merely listening.
+
+    The Rust HTTP server binds its port and starts accepting connections while
+    the (tensor-parallel) workers are still loading the model; during that
+    window ``/health`` returns 503 and any generate request fails with a 500.
+    Poll ``/health`` for a 200 so callers never race the worker load. Fall back
+    to a bare socket connect only if ``/health`` is unavailable on this backend.
+    """
     deadline = time.time() + timeout_s
     last_error: Exception | None = None
+    health_url = f"http://{host}:{int(port)}/health"
+    saw_socket = False
     while time.time() < deadline:
         try:
             with socket.create_connection((host, int(port)), timeout=1):
-                return
+                saw_socket = True
         except OSError as exc:
             last_error = exc
             time.sleep(0.5)
+            continue
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as resp:  # noqa: S310 - local health probe.
+                if resp.status == 200:
+                    return
+            last_error = RuntimeError("/health returned non-200")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 503:
+                # Model still loading; keep waiting for readiness.
+                last_error = exc
+            else:
+                # No /health endpoint on this backend (e.g. 404): the open
+                # socket is the only readiness signal available.
+                return
+        except OSError as exc:
+            last_error = exc
+        time.sleep(0.5)
+    if saw_socket:
+        raise SystemExit(
+            f"server opened {host}:{port} but was not inference-ready within {timeout_s}s: {last_error}"
+        )
     raise SystemExit(f"server did not open {host}:{port} within {timeout_s}s: {last_error}")
 
 

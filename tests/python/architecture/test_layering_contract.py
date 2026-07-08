@@ -284,6 +284,29 @@ def test_models_tree_matches_target_file_set():
     assert sensenova == {"__init__.py", "model.py", "config.py"}
 
 
+def test_openai_chat_protocol_stays_out_of_worker_runtime_layers():
+    """Worker execution/model code consumes engine-native contracts, not HTTP DTOs."""
+
+    roots = [
+        WORKER / "backends",
+        WORKER / "contracts",
+        WORKER / "execution",
+        WORKER / "models",
+        WORKER / "nn",
+        WORKER / "ops",
+        WORKER / "runtime",
+        WORKER / "spec",
+    ]
+    forbidden = ("ChatCompletion", "image_config", "image_url", "delta.images", "OpenAI", "openai")
+    offenders: list[str] = []
+    for path in _py_files(*roots):
+        source = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in source:
+                offenders.append(f"{_rel(path)} contains {needle}")
+    assert offenders == []
+
+
 def test_interleaved_text_stepper_is_system_owned():
     """The interleaved text-decode orchestration is a system component.
 
