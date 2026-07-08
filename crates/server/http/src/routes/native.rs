@@ -7,17 +7,18 @@ use axum::Json;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use futures::stream;
+use futures::{StreamExt as _, stream};
 use serde_json::{Value, json};
 
 use uniserve_engine_client::GenerationConstraint;
-use uniserve_native_api::events::{Detok, event_json, is_terminal};
+use uniserve_native_api::events::Detok;
 use uniserve_native_api::{
     NativeDelimitedText, NativeGenerateBody, NativeImageBody, NativeOutputFilter,
     NativeRequestBuilder,
 };
 use uniserve_reasoning_parser::DelimitedReasoningParser;
 use uniserve_server_app::AppState;
+use uniserve_serving::{FinishStatus, ServeError, ServeEvent};
 use uniserve_text::tokenizer::DynTokenizer;
 
 use crate::error::ApiError;
@@ -48,27 +49,27 @@ pub(crate) async fn generate(
         }
     };
 
-    let native_stream = match st
-        .chat()
-        .uniserve_engine_client()
-        .generate_native(request)
+    let serve_stream = match st
+        .runtime()
+        .serve_native("native-generate".to_string(), request)
         .await
     {
         Ok(stream) => stream,
         Err(error) => {
-            return ApiError::server_error(error.to_string()).into_response();
+            return serve_error_to_api(error).into_response();
         }
     };
 
     let sse = stream::unfold(
         (
-            native_stream,
+            serve_stream,
             Detok::new(tokenizer),
             text_filter,
+            NativeTerminalUsage::default(),
             false,
             false,
         ),
-        |(mut native_stream, mut detok, mut text_filter, done, flush_after_terminal)| async move {
+        |(mut serve_stream, mut detok, mut text_filter, mut usage, done, flush_after_terminal)| async move {
             if done {
                 return None;
             }
@@ -76,28 +77,188 @@ pub(crate) async fn generate(
                 let event = Event::default().comment("terminal");
                 return Some((
                     Ok::<Event, Infallible>(event),
-                    (native_stream, detok, text_filter, true, false),
+                    (serve_stream, detok, text_filter, usage, true, false),
                 ));
             }
-            let ev = native_stream.next().await?;
-            let terminal = is_terminal(&ev);
-            let mut payload = event_json(&ev, &mut detok);
-            if payload.get("type").and_then(Value::as_str) == Some("text")
-                && let Some(text) = payload.get("text").and_then(Value::as_str)
-            {
-                payload["text"] = Value::String(text_filter.push(text));
+            loop {
+                let ev = serve_stream.next().await?;
+                match ev {
+                    Ok(ev) => {
+                        let terminal = serve_event_is_terminal(&ev);
+                        let Some(payload) =
+                            native_event_json(ev, &mut detok, &mut text_filter, &mut usage)
+                        else {
+                            continue;
+                        };
+                        let event = Event::default().data(payload.to_string());
+                        return Some((
+                            Ok::<Event, Infallible>(event),
+                            (serve_stream, detok, text_filter, usage, false, terminal),
+                        ));
+                    }
+                    Err(error) => {
+                        let payload = json!({"type":"error","message":serve_error_message(error)});
+                        let event = Event::default().data(payload.to_string());
+                        return Some((
+                            Ok::<Event, Infallible>(event),
+                            (serve_stream, detok, text_filter, usage, false, true),
+                        ));
+                    }
+                }
             }
-            let event = Event::default().data(payload.to_string());
-            Some((
-                Ok::<Event, Infallible>(event),
-                (native_stream, detok, text_filter, false, terminal),
-            ))
         },
     );
 
     Sse::new(sse)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NativeTerminalUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    images: u32,
+}
+
+fn native_event_json(
+    event: ServeEvent,
+    detok: &mut Detok,
+    text_filter: &mut NativeTextOutputFilter,
+    usage: &mut NativeTerminalUsage,
+) -> Option<Value> {
+    match event {
+        ServeEvent::Scheduled {
+            queued_at,
+            scheduled_at,
+            ..
+        } => Some(json!({
+            "type":"scheduled",
+            "queued_at":queued_at.unwrap_or_default(),
+            "scheduled_at":scheduled_at.unwrap_or_default()
+        })),
+        ServeEvent::TextDelta {
+            text, token_ids, ..
+        } => {
+            let id = token_ids.first().copied().unwrap_or_default();
+            let mut delta = text;
+            for token_id in token_ids {
+                delta.push_str(&detok.push(token_id));
+            }
+            Some(json!({"type":"text","id":id,"text":text_filter.push(&delta)}))
+        }
+        ServeEvent::TokenLogprobs { token_id, top, .. } => {
+            Some(json!({"type":"logprobs","id":token_id,"top":top}))
+        }
+        ServeEvent::ImageBegin {
+            image_id,
+            height,
+            width,
+            steps,
+            ..
+        } => Some(json!({
+            "type":"image_begin",
+            "image_id":parse_image_id(&image_id),
+            "height":height.unwrap_or_default(),
+            "width":width.unwrap_or_default(),
+            "steps":steps.unwrap_or_default()
+        })),
+        ServeEvent::ImageStep { image_id, step, .. } => {
+            Some(json!({"type":"image_step","image_id":parse_image_id(&image_id),"step":step}))
+        }
+        ServeEvent::ImageDone {
+            image_id,
+            height,
+            width,
+            bytes,
+            sha256,
+            pixels_png_b64,
+            ..
+        } => Some(json!({
+            "type":"image_done",
+            "image_id":parse_image_id(&image_id),
+            "height":height.unwrap_or_default(),
+            "width":width.unwrap_or_default(),
+            "bytes":bytes.unwrap_or_default(),
+            "sha256":sha256.unwrap_or_default(),
+            "pixels_png_b64":pixels_png_b64.unwrap_or_default()
+        })),
+        ServeEvent::Usage {
+            prompt_tokens,
+            visible_output_tokens,
+            image_count,
+            ..
+        } => {
+            usage.prompt_tokens = prompt_tokens;
+            usage.completion_tokens = visible_output_tokens;
+            usage.images = image_count;
+            None
+        }
+        ServeEvent::Finished {
+            reason,
+            finish_detail,
+            ..
+        } => Some(json!({
+            "type":"finished",
+            "reason":finish_detail.unwrap_or_else(|| native_finish_status_as_str(&reason).to_string()),
+            "prompt_tokens":usage.prompt_tokens,
+            "completion_tokens":usage.completion_tokens,
+            "images":usage.images,
+            "stop_reason":finish_status_stop_reason(&reason)
+        })),
+        ServeEvent::Rejected { message, .. } => Some(json!({"type":"rejected","message":message})),
+        ServeEvent::Failed { message, .. } => Some(json!({"type":"error","message":message})),
+        _ => None,
+    }
+}
+
+fn serve_event_is_terminal(event: &ServeEvent) -> bool {
+    matches!(
+        event,
+        ServeEvent::Finished { .. } | ServeEvent::Rejected { .. } | ServeEvent::Failed { .. }
+    )
+}
+
+fn parse_image_id(image_id: &str) -> u32 {
+    image_id.parse().unwrap_or_default()
+}
+
+fn native_finish_status_as_str(status: &FinishStatus) -> &'static str {
+    match status {
+        FinishStatus::Stop { .. } => "stop",
+        FinishStatus::Length => "max_tokens",
+        FinishStatus::Abort => "aborted",
+        FinishStatus::Error => "error",
+        FinishStatus::Repetition => "stop",
+    }
+}
+
+fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
+    match status {
+        FinishStatus::Stop { stop_reason } => stop_reason.clone(),
+        FinishStatus::Length
+        | FinishStatus::Abort
+        | FinishStatus::Error
+        | FinishStatus::Repetition => None,
+    }
+}
+
+fn serve_error_to_api(error: ServeError) -> ApiError {
+    ApiError::server_error(serve_error_message(error))
+}
+
+fn serve_error_message(error: ServeError) -> String {
+    match error {
+        ServeError::UnsupportedRuntimeExtension { key, .. } => {
+            format!("unsupported runtime extension `{key}`")
+        }
+        ServeError::UnsupportedOutputCount { requested, .. } => {
+            format!("only one output is supported, got {requested}")
+        }
+        ServeError::Text(error) => format!("text runtime error: {error}"),
+        ServeError::Chat(error) => format!("chat runtime error: {error}"),
+        ServeError::Engine(message) => format!("engine runtime error: {message}"),
+    }
 }
 
 pub(crate) struct NativeTextOutputFilter {
@@ -374,36 +535,36 @@ pub(crate) async fn images_generations(
         }
     };
 
-    let mut native_stream = match st
-        .chat()
-        .uniserve_engine_client()
-        .generate_native(request)
+    let mut serve_stream = match st
+        .runtime()
+        .serve_native("images-generations".to_string(), request)
         .await
     {
         Ok(stream) => stream,
         Err(error) => {
-            return ApiError::server_error(error.to_string()).into_response();
+            return serve_error_to_api(error).into_response();
         }
     };
 
     let mut data = Vec::new();
-    while let Some(ev) = native_stream.next().await {
+    while let Some(ev) = serve_stream.next().await {
         match ev {
-            uniserve_engine_client::GenEvent::ImageDone {
+            Ok(ServeEvent::ImageDone {
                 height,
                 width,
                 bytes,
                 sha256,
                 pixels_png_b64,
                 ..
-            } => data.push(json!({
-                "b64_json": pixels_png_b64,
-                "height": height,
-                "width": width,
-                "bytes": bytes,
-                "sha256": sha256
+            }) => data.push(json!({
+                "b64_json": pixels_png_b64.unwrap_or_default(),
+                "height": height.unwrap_or_default(),
+                "width": width.unwrap_or_default(),
+                "bytes": bytes.unwrap_or_default(),
+                "sha256": sha256.unwrap_or_default()
             })),
-            ref event if is_terminal(event) => break,
+            Ok(event) if serve_event_is_terminal(&event) => break,
+            Err(error) => return serve_error_to_api(error).into_response(),
             _ => {}
         }
     }

@@ -22,7 +22,8 @@ use uniserve_openai_types::{
     CompletionChoice, CompletionRequest, CompletionResponse, CompletionSseChunk,
     CompletionStreamChoice, CompletionStreamResponse, LogProbs, Usage,
 };
-use uniserve_text::{DecodedTextEvent, FinishReason, TextOutputStream, TextOutputStreamExt as _};
+use uniserve_serving::{FinishStatus, RequestMetadata, ServeError, ServeEvent, ServeRequest};
+use uniserve_text::{CollectedTextOutput, DecodedLogprobs, FinishReason};
 
 use crate::error::{ApiError, bail_server_error, server_error};
 use crate::routes::openai::utils::validated_json::ValidatedJson;
@@ -59,10 +60,21 @@ pub(crate) async fn completions(
         .is_some();
     let log_request = state.enable_log_requests();
 
-    let text_stream = match state
-        .chat()
-        .text()
-        .generate(prepared.text_request)
+    let serve_request = match ServeRequest::from_text_request(
+        prepared.text_request,
+        RequestMetadata {
+            protocol_adapter: Some("openai_completions".to_string()),
+            route: Some("v1.completions".to_string()),
+            ..RequestMetadata::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(error) => return serve_error_to_api(error).into_response(),
+    };
+
+    let serve_stream = match state
+        .runtime()
+        .serve(serve_request)
         .instrument(request_span.clone())
         .await
     {
@@ -78,7 +90,7 @@ pub(crate) async fn completions(
 
     if stream {
         let chunk_stream = completion_chunk_stream(
-            text_stream,
+            serve_stream,
             prepared.request_id,
             prepared.response_model,
             created,
@@ -94,7 +106,7 @@ pub(crate) async fn completions(
         Sse::new(sse_stream).into_response()
     } else {
         let response = match collect_completion(
-            text_stream,
+            serve_stream,
             prepared.request_id,
             prepared.response_model,
             created,
@@ -128,7 +140,7 @@ pub(crate) async fn completions(
 }
 
 async fn collect_completion(
-    stream: impl TextOutputStream,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -138,14 +150,8 @@ async fn collect_completion(
     return_token_ids: bool,
     return_tokens_as_token_ids: bool,
 ) -> Result<CompletionResponse, ApiError> {
-    let collected = stream
-        .collect_output()
-        .await
-        .map_err(|error| server_error!("completion stream failed: {}", error.to_report_string()))?;
-    let finish_reason = collected.finish_reason.clone();
-    let stop_reason = finish_reason
-        .as_stop_reason()
-        .map(|sr| serde_json::to_value(sr).unwrap_or_else(|_| Value::String(format!("{sr:?}"))));
+    let (collected, finish_status) = collect_serve_text_output(stream).await?;
+    let stop_reason = finish_status_stop_reason(&finish_status);
 
     let prompt_char_count = echo
         .as_ref()
@@ -187,7 +193,7 @@ async fn collect_completion(
             index: 0,
             text,
             logprobs,
-            finish_reason: Some(completion_finish_reason_to_openai(finish_reason)?.into()),
+            finish_reason: Some(completion_finish_reason_to_openai(&finish_status)?.into()),
             stop_reason,
             prompt_logprobs,
             token_ids: return_token_ids.then(|| collected.token_ids.clone()),
@@ -205,7 +211,7 @@ async fn collect_completion(
 /// Convert one internal decoded-text stream into OpenAI completions chunks.
 #[try_stream]
 async fn completion_chunk_stream(
-    stream: impl TextOutputStream,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -220,13 +226,16 @@ async fn completion_chunk_stream(
     pin_mut!(stream);
     let mut visible_text_len = 0_u32;
     let mut first_chunk = true;
+    let mut prompt_tokens = 0_usize;
+    let mut output_tokens = 0_usize;
 
     while let Some(next) = stream.next().await {
         match next {
-            Ok(DecodedTextEvent::Start {
+            Ok(ServeEvent::Accepted {
                 prompt_token_ids, ..
             }) => {
                 debug!("completion stream started");
+                prompt_tokens = prompt_token_ids.len();
                 if let Some(prompt) = echo.as_ref() {
                     visible_text_len = text_len(prompt);
                     let mut chunk =
@@ -249,13 +258,16 @@ async fn completion_chunk_stream(
                     y.yield_ok(CompletionSseChunk::Chunk(chunk)).await;
                 }
             }
-            Ok(DecodedTextEvent::TextDelta {
-                delta,
+            Ok(ServeEvent::TextDelta {
+                text,
                 token_ids,
                 logprobs,
-                finished,
+                ..
             }) => {
-                let delta_text_len = text_len(&delta);
+                if text.is_empty() && token_ids.is_empty() && logprobs.is_none() {
+                    continue;
+                }
+                let delta_text_len = text_len(&text);
                 let logprobs = if requested_logprobs.is_some() {
                     let decoded_logprobs = logprobs.as_ref().ok_or_else(|| {
                         server_error!(
@@ -270,46 +282,52 @@ async fn completion_chunk_stream(
                 } else {
                     None
                 };
-                let mut chunk = delta_chunk(&request_id, &response_model, created, delta, logprobs);
+                let mut chunk = delta_chunk(&request_id, &response_model, created, text, logprobs);
                 if return_token_ids && let Some(choice) = chunk.choices.first_mut() {
-                    choice.token_ids = Some(token_ids);
+                    choice.token_ids = Some(token_ids.clone());
                 }
                 y.yield_ok(CompletionSseChunk::Chunk(chunk)).await;
                 visible_text_len = visible_text_len.saturating_add(delta_text_len);
+                output_tokens = output_tokens.saturating_add(token_ids.len());
+            }
+            Ok(ServeEvent::Usage {
+                prompt_tokens: prompt,
+                visible_output_tokens,
+                ..
+            }) => {
+                prompt_tokens = prompt as usize;
+                output_tokens = visible_output_tokens as usize;
+            }
+            Ok(ServeEvent::Finished { reason, .. }) => {
+                if log_request {
+                    info!(
+                        stream = true,
+                        model = %response_model,
+                        prompt_tokens,
+                        output_tokens,
+                        finish_reason = finish_status_as_str(&reason),
+                        "completion finished"
+                    );
+                }
+                y.yield_ok(CompletionSseChunk::Chunk(final_chunk(
+                    &request_id,
+                    &response_model,
+                    created,
+                    &reason,
+                )?))
+                .await;
 
-                if let Some(finished) = finished {
-                    if log_request {
-                        info!(
-                            stream = true,
-                            model = %response_model,
-                            prompt_tokens = finished.prompt_token_count,
-                            output_tokens = finished.output_token_count,
-                            finish_reason = finished.finish_reason.as_str(),
-                            "completion finished"
-                        );
-                    }
-                    y.yield_ok(CompletionSseChunk::Chunk(final_chunk(
+                if include_usage {
+                    y.yield_ok(CompletionSseChunk::Usage(usage_chunk(
                         &request_id,
                         &response_model,
                         created,
-                        finished.finish_reason,
-                    )?))
+                        Usage::from_counts(prompt_tokens as u32, output_tokens as u32),
+                    )))
                     .await;
-
-                    if include_usage {
-                        y.yield_ok(CompletionSseChunk::Usage(usage_chunk(
-                            &request_id,
-                            &response_model,
-                            created,
-                            Usage::from_counts(
-                                finished.prompt_token_count as u32,
-                                finished.output_token_count as u32,
-                            ),
-                        )))
-                        .await;
-                    }
                 }
             }
+            Ok(_) => {}
             Err(error) => {
                 error!(
                     error = %error.as_report(),
@@ -342,7 +360,7 @@ fn final_chunk(
     request_id: &str,
     response_model: &str,
     created: u64,
-    finish_reason: FinishReason,
+    finish_reason: &FinishStatus,
 ) -> Result<CompletionStreamResponse, ApiError> {
     let finish_reason = completion_finish_reason_to_openai(finish_reason)?;
 
@@ -355,14 +373,145 @@ fn final_chunk(
 }
 
 fn completion_finish_reason_to_openai(
-    finish_reason: FinishReason,
+    finish_reason: &FinishStatus,
 ) -> Result<&'static str, ApiError> {
     match finish_reason {
-        FinishReason::Stop(_) | FinishReason::Repetition => Ok("stop"),
-        FinishReason::Length => Ok("length"),
-        FinishReason::Abort => Ok("abort"),
-        FinishReason::Error => {
+        FinishStatus::Stop { .. } | FinishStatus::Repetition => Ok("stop"),
+        FinishStatus::Length => Ok("length"),
+        FinishStatus::Abort => Ok("abort"),
+        FinishStatus::Error => {
             bail_server_error!("Internal server error");
+        }
+    }
+}
+
+async fn collect_serve_text_output(
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
+) -> Result<(CollectedTextOutput, FinishStatus), ApiError> {
+    pin_mut!(stream);
+    let mut prompt_token_ids: Arc<[u32]> = Arc::from([]);
+    let mut prompt_logprobs = None;
+    let mut text = String::new();
+    let mut token_ids = Vec::new();
+    let mut logprobs: Option<DecodedLogprobs> = None;
+    let mut finish_status = None;
+    let mut kv_transfer_params = None;
+
+    while let Some(next) = stream.next().await {
+        match next {
+            Ok(ServeEvent::Accepted {
+                prompt_token_ids: ids,
+                prompt_logprobs: start_prompt_logprobs,
+                ..
+            }) => {
+                prompt_token_ids = ids.into();
+                prompt_logprobs = start_prompt_logprobs;
+            }
+            Ok(ServeEvent::TextDelta {
+                text: delta,
+                token_ids: delta_token_ids,
+                logprobs: delta_logprobs,
+                ..
+            }) => {
+                text.push_str(&delta);
+                token_ids.extend(delta_token_ids);
+                if let Some(mut delta_logprobs) = delta_logprobs {
+                    logprobs
+                        .get_or_insert_with(|| DecodedLogprobs {
+                            positions: Vec::new(),
+                        })
+                        .positions
+                        .append(&mut delta_logprobs.positions);
+                }
+            }
+            Ok(ServeEvent::Finished {
+                reason,
+                kv_transfer_params: params,
+                ..
+            }) => {
+                kv_transfer_params = params;
+                finish_status = Some(reason);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(server_error!(
+                    "completion stream failed: {}",
+                    error.to_report_string()
+                ));
+            }
+        }
+    }
+
+    let Some(finish_status) = finish_status else {
+        return Err(server_error!(
+            "completion stream closed before terminal finish event"
+        ));
+    };
+    let finish_reason = finish_status_to_text_reason(&finish_status);
+
+    Ok((
+        CollectedTextOutput {
+            text,
+            prompt_token_ids,
+            prompt_logprobs,
+            logprobs,
+            token_ids,
+            finish_reason,
+            kv_transfer_params,
+        },
+        finish_status,
+    ))
+}
+
+fn finish_status_to_text_reason(status: &FinishStatus) -> FinishReason {
+    match status {
+        FinishStatus::Stop { .. } => FinishReason::Stop(None),
+        FinishStatus::Length => FinishReason::Length,
+        FinishStatus::Abort => FinishReason::Abort,
+        FinishStatus::Error => FinishReason::Error,
+        FinishStatus::Repetition => FinishReason::Repetition,
+    }
+}
+
+fn finish_status_as_str(status: &FinishStatus) -> &'static str {
+    match status {
+        FinishStatus::Stop { .. } => "stop",
+        FinishStatus::Length => "length",
+        FinishStatus::Abort => "abort",
+        FinishStatus::Error => "error",
+        FinishStatus::Repetition => "repetition",
+    }
+}
+
+fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
+    match status {
+        FinishStatus::Stop { stop_reason } => stop_reason.clone(),
+        FinishStatus::Length
+        | FinishStatus::Abort
+        | FinishStatus::Error
+        | FinishStatus::Repetition => None,
+    }
+}
+
+fn serve_error_to_api(error: ServeError) -> ApiError {
+    match error {
+        ServeError::UnsupportedRuntimeExtension { key, .. } => ApiError::invalid_request(
+            format!("Unsupported runtime extension `{key}`."),
+            Some("uniserve_xargs"),
+        ),
+        ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
+            format!("Only one completion output is supported, got {requested}."),
+            Some("n"),
+        ),
+        ServeError::Text(error) => {
+            ApiError::server_error(format!("text runtime error: {}", error.to_report_string()))
+        }
+        ServeError::Chat(error) => {
+            ApiError::server_error(format!("chat runtime error: {}", error.to_report_string()))
+        }
+        ServeError::Engine(message) => {
+            ApiError::server_error(format!("engine runtime error: {message}"))
         }
     }
 }
@@ -434,17 +583,20 @@ fn done_sse_event() -> Event {
 mod tests {
     use futures::{StreamExt as _, stream};
     use itertools::Itertools as _;
-    use uniserve_text::{
-        DecodedLogprobs, DecodedPositionLogprobs, DecodedTextEvent, DecodedTokenLogprob,
-        FinishReason, Finished,
-    };
+    use uniserve_serving::{FinishStatus, ServeEvent};
+    use uniserve_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
 
     use super::{CompletionSseChunk, completion_chunk_stream, final_chunk};
 
     #[test]
     fn final_chunk_maps_stop_finish_reason() {
-        let chunk = final_chunk("cmpl-1", "model", 1, FinishReason::stop_eos())
-            .expect("finish reason valid");
+        let chunk = final_chunk(
+            "cmpl-1",
+            "model",
+            1,
+            &FinishStatus::Stop { stop_reason: None },
+        )
+        .expect("finish reason valid");
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(chunk.choices[0].text, "");
     }
@@ -452,31 +604,34 @@ mod tests {
     #[test]
     fn final_chunk_maps_length_finish_reason() {
         let chunk =
-            final_chunk("cmpl-1", "model", 1, FinishReason::Length).expect("finish reason valid");
+            final_chunk("cmpl-1", "model", 1, &FinishStatus::Length).expect("finish reason valid");
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
     }
 
     #[test]
     fn final_chunk_maps_abort_finish_reason() {
         let chunk =
-            final_chunk("cmpl-1", "model", 1, FinishReason::Abort).expect("finish reason valid");
+            final_chunk("cmpl-1", "model", 1, &FinishStatus::Abort).expect("finish reason valid");
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("abort"));
     }
 
     #[test]
     fn final_chunk_rejects_error_finish_reason() {
-        assert!(final_chunk("cmpl-1", "model", 1, FinishReason::Error).is_err());
+        assert!(final_chunk("cmpl-1", "model", 1, &FinishStatus::Error).is_err());
     }
 
     #[tokio::test]
     async fn completion_chunk_stream_maps_streaming_logprobs() {
         let stream = stream::iter(vec![
-            Ok(DecodedTextEvent::Start {
-                prompt_token_ids: vec![1, 2, 3, 4, 5].into(),
+            Ok(ServeEvent::Accepted {
+                request_id: "cmpl-1".to_string(),
+                prompt_token_count: 5,
+                prompt_token_ids: vec![1, 2, 3, 4, 5],
                 prompt_logprobs: None,
             }),
-            Ok(DecodedTextEvent::TextDelta {
-                delta: "h".to_string(),
+            Ok(ServeEvent::TextDelta {
+                candidate_id: 0,
+                text: "h".to_string(),
                 token_ids: vec![b'h' as u32],
                 logprobs: Some(DecodedLogprobs {
                     positions: vec![DecodedPositionLogprobs {
@@ -496,10 +651,10 @@ mod tests {
                         ],
                     }],
                 }),
-                finished: None,
             }),
-            Ok(DecodedTextEvent::TextDelta {
-                delta: String::new(),
+            Ok(ServeEvent::TextDelta {
+                candidate_id: 0,
+                text: String::new(),
                 token_ids: vec![b'!' as u32],
                 logprobs: Some(DecodedLogprobs {
                     positions: vec![DecodedPositionLogprobs {
@@ -519,12 +674,19 @@ mod tests {
                         ],
                     }],
                 }),
-                finished: Some(Finished {
-                    prompt_token_count: 5,
-                    output_token_count: 2,
-                    finish_reason: FinishReason::stop_eos(),
-                    kv_transfer_params: None,
-                }),
+            }),
+            Ok(ServeEvent::Usage {
+                prompt_tokens: 5,
+                visible_output_tokens: 2,
+                internal_tokens: 0,
+                image_count: 0,
+                image_steps: 0,
+            }),
+            Ok(ServeEvent::Finished {
+                candidate_id: 0,
+                reason: FinishStatus::Stop { stop_reason: None },
+                finish_detail: None,
+                kv_transfer_params: None,
             }),
         ]);
 

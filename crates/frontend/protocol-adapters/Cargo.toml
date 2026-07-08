@@ -1,13 +1,12 @@
 [package]
-name = "uniserve-examples"
+name = "uniserve-protocol-adapters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
 
 [dependencies]
-serde_json.workspace = true
-uniserve-server-app.workspace = true
+uniserve-native-api.workspace = true
+uniserve-openai-api.workspace = true
 uniserve-serving.workspace = true
 
 [lints]

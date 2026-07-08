@@ -1,0 +1,16 @@
+[package]
+name = "uniserve-engine-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-util = ["uniserve-engine-client/test-util"]
+
+[dependencies]
+async-trait.workspace = true
+uniserve-engine-client.workspace = true
+uniserve-llm.workspace = true
+
+[lints]
+workspace = true

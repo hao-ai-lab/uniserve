@@ -14,12 +14,10 @@ use thiserror_ext::AsReport as _;
 use tracing::{debug, error, info, trace};
 use tracing_futures::Instrument as _;
 use uniserve_chat::{
-    AssistantBlockKind, AssistantMessageExt as _, ChatEvent, ChatEventStream, ChatEventStreamTrait,
-    CollectedAssistantMessage, FinishReason,
+    AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantMessageExt as _,
 };
-use uniserve_engine_client::protocol::StopReason;
-use uniserve_engine_client::{GenEvent, GenerationConstraint};
-use uniserve_native_api::events::{Detok, event_json};
+use uniserve_engine_client::GenerationConstraint;
+use uniserve_native_api::events::Detok;
 use uniserve_native_api::schema::NativeInputImage;
 use uniserve_native_api::{NativeGenerateBody, NativeImageBody, NativeRequestBuilder};
 use uniserve_openai_api::chat_completions::{prepare_chat_request, validate_request_compat};
@@ -33,6 +31,8 @@ use uniserve_openai_types::{
     FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, ToolCall, ToolCallDelta,
     Usage,
 };
+use uniserve_serving::{FinishStatus, RequestMetadata, ServeError, ServeEvent, ServeRequest};
+use uniserve_text::DecodedLogprobs;
 
 use crate::error::{ApiError, bail_server_error, server_error};
 use crate::routes::native::NativeTextOutputFilter;
@@ -42,8 +42,7 @@ use uniserve_openai_api::lora::LoraModelResolution;
 use uniserve_openai_api::utils::ResolvedRequestContext;
 use uniserve_server_app::AppState;
 
-/// Validate one chat completion request and proxy it into the shared
-/// `chat` stack.
+/// Validate one chat completion request and run it through the serving runtime.
 pub(crate) async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -77,9 +76,21 @@ pub(crate) async fn chat_completions(
     let created = unix_timestamp();
     let log_request = state.enable_log_requests();
 
-    let chat_stream = match state
-        .chat()
-        .chat(prepared.chat_request)
+    let serve_request = match ServeRequest::from_chat_request(
+        prepared.chat_request,
+        RequestMetadata {
+            protocol_adapter: Some("openai_chat_completions".to_string()),
+            route: Some("v1.chat.completions".to_string()),
+            ..RequestMetadata::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(error) => return serve_error_to_api(error).into_response(),
+    };
+
+    let serve_stream = match state
+        .runtime()
+        .serve(serve_request)
         .instrument(request_span.clone())
         .await
     {
@@ -95,7 +106,7 @@ pub(crate) async fn chat_completions(
 
     if stream {
         let chunk_stream = chat_completion_chunk_stream(
-            chat_stream,
+            serve_stream,
             prepared.request_id,
             prepared.response_model,
             created,
@@ -116,7 +127,7 @@ pub(crate) async fn chat_completions(
             .into_response()
     } else {
         let response = match collect_chat_completion(
-            chat_stream,
+            serve_stream,
             prepared.request_id,
             prepared.response_model,
             created,
@@ -151,7 +162,7 @@ pub(crate) async fn chat_completions(
 }
 
 async fn collect_chat_completion(
-    stream: ChatEventStream,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -162,13 +173,8 @@ async fn collect_chat_completion(
     return_token_ids: bool,
     return_tokens_as_token_ids: bool,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let collected = stream.collect_message().await.map_err(|error| {
-        server_error!(
-            "failed to collect chat completion response: {}",
-            error.to_report_string()
-        )
-    })?;
-    let CollectedAssistantMessage {
+    let collected = collect_chat_events(stream).await?;
+    let CollectedChatOutput {
         message,
         prompt_token_count,
         prompt_token_ids,
@@ -176,17 +182,17 @@ async fn collect_chat_completion(
         logprobs,
         token_ids,
         output_token_count,
-        finish_reason,
+        finish_status,
         kv_transfer_params,
     } = collected;
-    let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
+    let stop_reason = finish_status_stop_reason(&finish_status);
     let saw_tool_calls = message.tool_calls().next().is_some();
     let reasoning = message.reasoning();
     // Output logprobs and token IDs cover the complete generated token stream.
     // When reasoning is hidden, omit them rather than leaking hidden reasoning
     // tokens through per-token metadata.
     let include_output_metadata = include_reasoning || reasoning.is_none();
-    let finish_reason = chat_finish_reason_to_openai(&finish_reason, saw_tool_calls)?.to_string();
+    let finish_reason = chat_finish_status_to_openai(&finish_status, saw_tool_calls)?.to_string();
     let tool_calls = message
         .tool_calls()
         .map(|call| ToolCall {
@@ -252,6 +258,127 @@ async fn collect_chat_completion(
     })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct CollectedChatOutput {
+    message: AssistantMessage,
+    prompt_token_count: usize,
+    prompt_token_ids: Vec<u32>,
+    prompt_logprobs: Option<uniserve_text::DecodedPromptLogprobs>,
+    logprobs: Option<DecodedLogprobs>,
+    token_ids: Vec<u32>,
+    output_token_count: usize,
+    finish_status: FinishStatus,
+    kv_transfer_params: Option<Value>,
+}
+
+async fn collect_chat_events(
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
+) -> Result<CollectedChatOutput, ApiError> {
+    pin_mut!(stream);
+    let mut message = AssistantMessage::default();
+    let mut prompt_token_count = 0_usize;
+    let mut prompt_token_ids = Vec::new();
+    let mut prompt_logprobs = None;
+    let mut logprobs: Option<DecodedLogprobs> = None;
+    let mut token_ids = Vec::new();
+    let mut output_token_count = 0_usize;
+    let mut finish_status = None;
+    let mut kv_transfer_params = None;
+
+    while let Some(next) = stream.next().await {
+        match next {
+            Ok(ServeEvent::Accepted {
+                prompt_token_count: accepted_prompt_token_count,
+                prompt_token_ids: accepted_prompt_token_ids,
+                prompt_logprobs: accepted_prompt_logprobs,
+                ..
+            }) => {
+                prompt_token_count = accepted_prompt_token_count;
+                prompt_token_ids = accepted_prompt_token_ids;
+                prompt_logprobs = accepted_prompt_logprobs;
+            }
+            Ok(ServeEvent::TextDelta {
+                token_ids: delta_token_ids,
+                logprobs: delta_logprobs,
+                ..
+            }) => {
+                token_ids.extend(delta_token_ids);
+                if let Some(mut delta_logprobs) = delta_logprobs {
+                    logprobs
+                        .get_or_insert_with(|| DecodedLogprobs {
+                            positions: Vec::new(),
+                        })
+                        .positions
+                        .append(&mut delta_logprobs.positions);
+                }
+            }
+            Ok(ServeEvent::OutputBlockEnd { block, .. }) => message.push_block(block),
+            Ok(ServeEvent::ToolCallEnd {
+                id,
+                name,
+                arguments,
+                ..
+            }) => {
+                message.push_block(AssistantContentBlock::ToolCall(
+                    uniserve_chat::AssistantToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+                ));
+            }
+            Ok(ServeEvent::Usage {
+                prompt_tokens,
+                visible_output_tokens,
+                ..
+            }) => {
+                prompt_token_count = prompt_tokens as usize;
+                output_token_count = visible_output_tokens as usize;
+            }
+            Ok(ServeEvent::Finished {
+                reason,
+                kv_transfer_params: params,
+                ..
+            }) => {
+                finish_status = Some(reason);
+                kv_transfer_params = params;
+                break;
+            }
+            Ok(ServeEvent::Rejected { message, .. }) => {
+                return Err(ApiError::invalid_request(message, None));
+            }
+            Ok(ServeEvent::Failed { message, .. }) => {
+                bail_server_error!("{}", message);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(server_error!(
+                    "chat completion stream failed: {}",
+                    error.to_report_string()
+                ));
+            }
+        }
+    }
+
+    let Some(finish_status) = finish_status else {
+        return Err(server_error!(
+            "chat completion stream closed before terminal finish event"
+        ));
+    };
+
+    Ok(CollectedChatOutput {
+        message,
+        prompt_token_count,
+        prompt_token_ids,
+        prompt_logprobs,
+        logprobs,
+        token_ids,
+        output_token_count,
+        finish_status,
+        kv_transfer_params,
+    })
+}
+
 async fn native_chat_completions(
     state: Arc<AppState>,
     body: ChatCompletionRequest,
@@ -310,13 +437,12 @@ async fn native_chat_completions(
     };
 
     let native_stream = match state
-        .chat()
-        .uniserve_engine_client()
-        .generate_native(native_request)
+        .runtime()
+        .serve_native(request_id.clone(), native_request)
         .await
     {
         Ok(stream) => stream,
-        Err(error) => return ApiError::server_error(error.to_string()).into_response(),
+        Err(error) => return serve_error_to_api(error).into_response(),
     };
 
     if stream {
@@ -352,7 +478,7 @@ async fn native_chat_completions(
 
 #[try_stream]
 async fn native_chat_completion_chunk_stream(
-    mut stream: uniserve_engine_client::NativeEventStream,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -361,16 +487,23 @@ async fn native_chat_completion_chunk_stream(
     mut text_filter: NativeTextOutputFilter,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
+    pin_mut!(stream);
     y.yield_ok(start_chunk(&request_id, &response_model, created))
         .await;
 
     let mut detok = Detok::new(tokenizer);
+    let mut prompt_tokens = 0_u32;
+    let mut completion_tokens = 0_u32;
     while let Some(event) = stream.next().await {
         match event {
-            GenEvent::TextToken { .. } => {
-                let payload = event_json(&event, &mut detok);
-                let text = payload.get("text").and_then(Value::as_str).unwrap_or("");
-                let text = text_filter.push(text);
+            Ok(ServeEvent::TextDelta {
+                text, token_ids, ..
+            }) => {
+                let mut delta = text;
+                for token_id in token_ids {
+                    delta.push_str(&detok.push(token_id));
+                }
+                let text = text_filter.push(&delta);
                 if !text.is_empty() {
                     y.yield_ok(block_delta_chunk(
                         &request_id,
@@ -382,26 +515,34 @@ async fn native_chat_completion_chunk_stream(
                     .await;
                 }
             }
-            GenEvent::ImageDone { pixels_png_b64, .. } => {
+            Ok(ServeEvent::ImageDone { pixels_png_b64, .. }) => {
                 y.yield_ok(image_delta_chunk(
                     &request_id,
                     &response_model,
                     created,
-                    pixels_png_b64,
+                    pixels_png_b64.unwrap_or_default(),
                 ))
                 .await;
             }
-            GenEvent::Finished {
-                reason,
-                prompt_tokens,
-                completion_tokens,
+            Ok(ServeEvent::Usage {
+                prompt_tokens: p,
+                visible_output_tokens: c,
                 ..
-            } => {
+            }) => {
+                prompt_tokens = p;
+                completion_tokens = c;
+            }
+            Ok(ServeEvent::Finished {
+                reason,
+                finish_detail,
+                ..
+            }) => {
                 y.yield_ok(native_final_chunk(
                     &request_id,
                     &response_model,
                     created,
                     &reason,
+                    finish_detail.as_deref(),
                 )?)
                 .await;
                 if include_usage {
@@ -415,16 +556,14 @@ async fn native_chat_completion_chunk_stream(
                 }
                 return Ok(());
             }
-            GenEvent::Rejected { message } => {
+            Ok(ServeEvent::Rejected { message, .. }) => {
                 return Err(ApiError::invalid_request(message, None));
             }
-            GenEvent::Error { message } => {
+            Ok(ServeEvent::Failed { message, .. }) => {
                 bail_server_error!("{}", message);
             }
-            GenEvent::Scheduled { .. }
-            | GenEvent::TokenLogprobs { .. }
-            | GenEvent::ImageBegin { .. }
-            | GenEvent::ImageStep { .. } => {}
+            Ok(_) => {}
+            Err(error) => return Err(serve_error_to_api(error)),
         }
     }
 
@@ -432,13 +571,14 @@ async fn native_chat_completion_chunk_stream(
 }
 
 async fn collect_native_chat_completion(
-    mut stream: uniserve_engine_client::NativeEventStream,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
     tokenizer: uniserve_text::tokenizer::DynTokenizer,
     mut text_filter: NativeTextOutputFilter,
 ) -> Result<ChatCompletionResponse, ApiError> {
+    pin_mut!(stream);
     let mut detok = Detok::new(tokenizer);
     let mut text = String::new();
     let mut images = Vec::new();
@@ -448,35 +588,45 @@ async fn collect_native_chat_completion(
 
     while let Some(event) = stream.next().await {
         match event {
-            GenEvent::TextToken { .. } => {
-                let payload = event_json(&event, &mut detok);
-                let delta = payload.get("text").and_then(Value::as_str).unwrap_or("");
-                text.push_str(&text_filter.push(delta));
-            }
-            GenEvent::ImageDone { pixels_png_b64, .. } => {
-                images.push(image_content_part(pixels_png_b64));
-            }
-            GenEvent::Finished {
-                reason,
-                prompt_tokens: p,
-                completion_tokens: c,
+            Ok(ServeEvent::TextDelta {
+                text: delta,
+                token_ids,
                 ..
-            } => {
-                prompt_tokens = p as u32;
-                completion_tokens = c as u32;
-                finish_reason = native_finish_reason_to_openai(&reason)?.to_string();
+            }) => {
+                let mut visible = delta;
+                for token_id in token_ids {
+                    visible.push_str(&detok.push(token_id));
+                }
+                text.push_str(&text_filter.push(&visible));
+            }
+            Ok(ServeEvent::ImageDone { pixels_png_b64, .. }) => {
+                images.push(image_content_part(pixels_png_b64.unwrap_or_default()));
+            }
+            Ok(ServeEvent::Usage {
+                prompt_tokens: p,
+                visible_output_tokens: c,
+                ..
+            }) => {
+                prompt_tokens = p;
+                completion_tokens = c;
+            }
+            Ok(ServeEvent::Finished {
+                reason,
+                finish_detail,
+                ..
+            }) => {
+                finish_reason =
+                    native_finish_status_to_openai(&reason, finish_detail.as_deref())?.to_string();
                 break;
             }
-            GenEvent::Rejected { message } => {
+            Ok(ServeEvent::Rejected { message, .. }) => {
                 return Err(ApiError::invalid_request(message, None));
             }
-            GenEvent::Error { message } => {
+            Ok(ServeEvent::Failed { message, .. }) => {
                 bail_server_error!("{}", message);
             }
-            GenEvent::Scheduled { .. }
-            | GenEvent::TokenLogprobs { .. }
-            | GenEvent::ImageBegin { .. }
-            | GenEvent::ImageStep { .. } => {}
+            Ok(_) => {}
+            Err(error) => return Err(serve_error_to_api(error)),
         }
     }
 
@@ -507,10 +657,10 @@ async fn collect_native_chat_completion(
     })
 }
 
-/// Convert one internal chat event stream into OpenAI chat-completion chunks.
+/// Convert one serving event stream into OpenAI chat-completion chunks.
 #[try_stream]
 async fn chat_completion_chunk_stream(
-    mut stream: impl ChatEventStreamTrait + Unpin,
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
     request_id: String,
     response_model: String,
     created: u64,
@@ -523,8 +673,11 @@ async fn chat_completion_chunk_stream(
     return_tokens_as_token_ids: bool,
     mut y: TryYielder<ChatCompletionStreamResponse, ApiError>,
 ) -> Result<(), ApiError> {
+    pin_mut!(stream);
     let mut saw_tool_calls = false;
-    // `LogprobsDelta` is emitted after all chat events for one decoded update.
+    let mut prompt_token_count = 0_usize;
+    let mut output_token_count = 0_usize;
+    // Token metadata is emitted after all semantic deltas for one decoded update.
     // If that update contains hidden reasoning, including delimiter-only block
     // starts or ends, omit its token metadata as well as its visible delta.
     let mut inside_hidden_reasoning = false;
@@ -538,12 +691,15 @@ async fn chat_completion_chunk_stream(
 
     while let Some(next) = stream.next().await {
         match next {
-            Ok(ChatEvent::Start {
-                prompt_token_ids, ..
+            Ok(ServeEvent::Accepted {
+                prompt_token_count: accepted_prompt_token_count,
+                prompt_token_ids,
+                ..
             }) => {
+                prompt_token_count = accepted_prompt_token_count;
                 let mut chunk = start_chunk(&request_id, &response_model, created);
                 if return_token_ids {
-                    chunk.prompt_token_ids = Some(prompt_token_ids.to_vec());
+                    chunk.prompt_token_ids = Some(prompt_token_ids);
                 }
                 y.yield_ok(chunk).await;
                 // When echo=true, emit the last assistant message content as a delta chunk.
@@ -558,7 +714,66 @@ async fn chat_completion_chunk_stream(
                     .await;
                 }
             }
-            Ok(ChatEvent::BlockDelta { kind, delta, .. }) => {
+            Ok(ServeEvent::TextDelta {
+                text,
+                token_ids,
+                logprobs,
+                ..
+            }) => {
+                if !text.is_empty() {
+                    let kind = AssistantBlockKind::Text;
+                    if let Some(pending_chunk) = pending_chunk.as_mut() {
+                        pending_chunk.push_block_delta(kind, text);
+                    } else {
+                        y.yield_ok(block_delta_chunk(
+                            &request_id,
+                            &response_model,
+                            created,
+                            kind,
+                            text,
+                        ))
+                        .await;
+                    }
+                }
+                if !token_ids.is_empty() || logprobs.is_some() {
+                    let include_metadata =
+                        !suppress_current_update_metadata && !inside_hidden_reasoning;
+                    suppress_current_update_metadata = false;
+                    let openai_logprobs = if include_metadata {
+                        logprobs
+                            .as_ref()
+                            .map(|lp| {
+                                decoded_logprobs_to_openai_chat(lp, return_tokens_as_token_ids)
+                            })
+                            .transpose()?
+                    } else {
+                        None
+                    };
+                    let openai_token_ids = include_metadata
+                        .then_some(token_ids)
+                        .and_then(|token_ids| return_token_ids.then_some(token_ids))
+                        .filter(|t| !t.is_empty());
+                    if let Some(pending_chunk) = pending_chunk.as_mut() {
+                        pending_chunk.logprobs = openai_logprobs;
+                        pending_chunk.token_ids = openai_token_ids;
+                        if let Some(chunk) =
+                            pending_chunk.take_chunk(&request_id, &response_model, created)
+                        {
+                            y.yield_ok(chunk).await;
+                        }
+                    } else if let Some(logprobs) = openai_logprobs {
+                        y.yield_ok(logprobs_only_chunk(
+                            &request_id,
+                            &response_model,
+                            created,
+                            logprobs,
+                        ))
+                        .await;
+                    }
+                }
+            }
+            Ok(ServeEvent::ReasoningDelta { text: delta, .. }) => {
+                let kind = AssistantBlockKind::Reasoning;
                 let include_delta =
                     include_reasoning || !matches!(kind, AssistantBlockKind::Reasoning);
                 if include_delta {
@@ -578,58 +793,24 @@ async fn chat_completion_chunk_stream(
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(ChatEvent::LogprobsDelta {
-                logprobs,
-                token_ids,
-            }) => {
-                let include_metadata =
-                    !suppress_current_update_metadata && !inside_hidden_reasoning;
-                suppress_current_update_metadata = false;
-                let openai_logprobs = if include_metadata {
-                    logprobs
-                        .as_ref()
-                        .map(|lp| decoded_logprobs_to_openai_chat(lp, return_tokens_as_token_ids))
-                        .transpose()?
-                } else {
-                    None
-                };
-                let openai_token_ids = include_metadata
-                    .then_some(token_ids)
-                    .and_then(|token_ids| return_token_ids.then_some(token_ids))
-                    .filter(|t| !t.is_empty());
-                if let Some(pending_chunk) = pending_chunk.as_mut() {
-                    pending_chunk.logprobs = openai_logprobs;
-                    pending_chunk.token_ids = openai_token_ids;
-                    if let Some(chunk) =
-                        pending_chunk.take_chunk(&request_id, &response_model, created)
-                    {
-                        y.yield_ok(chunk).await;
-                    }
-                } else if let Some(logprobs) = openai_logprobs {
-                    y.yield_ok(logprobs_only_chunk(
-                        &request_id,
-                        &response_model,
-                        created,
-                        logprobs,
-                    ))
-                    .await;
-                }
-            }
-            Ok(ChatEvent::BlockStart { kind, .. }) => {
+            Ok(ServeEvent::OutputBlockStart { kind, .. }) => {
                 debug!(?kind, "starting new block");
                 if !include_reasoning && matches!(kind, AssistantBlockKind::Reasoning) {
                     inside_hidden_reasoning = true;
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(ChatEvent::BlockEnd { .. }) => {
+            Ok(ServeEvent::OutputBlockEnd { block, .. }) => {
                 debug!("ending current block");
-                if inside_hidden_reasoning {
+                if inside_hidden_reasoning || matches!(block.kind(), AssistantBlockKind::Reasoning)
+                {
                     inside_hidden_reasoning = false;
                     suppress_current_update_metadata = true;
                 }
             }
-            Ok(ChatEvent::ToolCallStart { index, id, name }) => {
+            Ok(ServeEvent::ToolCallStart {
+                index, id, name, ..
+            }) => {
                 let tool_index = index as u32;
                 saw_tool_calls = true;
                 debug!(
@@ -651,7 +832,7 @@ async fn chat_completion_chunk_stream(
                     .await;
                 }
             }
-            Ok(ChatEvent::ToolCallArgumentsDelta { index, delta }) => {
+            Ok(ServeEvent::ToolCallArgumentsDelta { index, delta, .. }) => {
                 let tool_index = index as u32;
                 if let Some(pending_chunk) = pending_chunk.as_mut() {
                     pending_chunk.push_tool_call_arguments(tool_index, delta);
@@ -666,22 +847,25 @@ async fn chat_completion_chunk_stream(
                     .await;
                 }
             }
-            Ok(ChatEvent::ToolCallEnd { .. }) => {
+            Ok(ServeEvent::ToolCallEnd { .. }) => {
                 debug!("ending current tool call");
             }
-            Ok(ChatEvent::Done {
-                prompt_token_count,
-                finish_reason,
-                output_token_count,
+            Ok(ServeEvent::Usage {
+                prompt_tokens,
+                visible_output_tokens,
                 ..
             }) => {
+                prompt_token_count = prompt_tokens as usize;
+                output_token_count = visible_output_tokens as usize;
+            }
+            Ok(ServeEvent::Finished { reason, .. }) => {
                 if log_request {
                     info!(
                         stream = true,
                         model = %response_model,
                         prompt_tokens = prompt_token_count,
                         output_tokens = output_token_count,
-                        finish_reason = finish_reason.as_str(),
+                        finish_reason = finish_status_as_str(&reason),
                         "chat completion finished"
                     );
                 }
@@ -697,7 +881,7 @@ async fn chat_completion_chunk_stream(
                     &request_id,
                     &response_model,
                     created,
-                    finish_reason,
+                    &reason,
                     saw_tool_calls,
                 ) {
                     Ok(chunk) => y.yield_ok(chunk).await,
@@ -722,6 +906,13 @@ async fn chat_completion_chunk_stream(
 
                 return Ok(());
             }
+            Ok(ServeEvent::Rejected { message, .. }) => {
+                return Err(ApiError::invalid_request(message, None));
+            }
+            Ok(ServeEvent::Failed { message, .. }) => {
+                bail_server_error!("{}", message);
+            }
+            Ok(_) => {}
             Err(error) => {
                 error!(
                     error = %error.as_report(),
@@ -1011,27 +1202,36 @@ fn native_final_chunk(
     request_id: &str,
     response_model: &str,
     created: u64,
-    reason: &uniserve_engine_client::NativeFinishReason,
+    reason: &FinishStatus,
+    finish_detail: Option<&str>,
 ) -> Result<ChatCompletionStreamResponse, ApiError> {
     let mut chunk = ChatCompletionStreamResponse::new(request_id, response_model, created);
     chunk.choices.push(ChatCompletionStreamChoice {
-        finish_reason: Some(native_finish_reason_to_openai(reason)?.to_string()),
+        finish_reason: Some(native_finish_status_to_openai(reason, finish_detail)?.to_string()),
         ..Default::default()
     });
     Ok(chunk)
 }
 
-fn native_finish_reason_to_openai(
-    reason: &uniserve_engine_client::NativeFinishReason,
+fn native_finish_status_to_openai(
+    reason: &FinishStatus,
+    finish_detail: Option<&str>,
 ) -> Result<&'static str, ApiError> {
+    match finish_detail {
+        Some("eos" | "stop" | "image_done") => return Ok("stop"),
+        Some("max_tokens") => return Ok("length"),
+        Some("cancelled" | "aborted") => return Ok("abort"),
+        Some("error") => {
+            bail_server_error!("Internal server error");
+        }
+        Some(_) | None => {}
+    }
+
     match reason {
-        uniserve_engine_client::NativeFinishReason::Eos
-        | uniserve_engine_client::NativeFinishReason::Stop
-        | uniserve_engine_client::NativeFinishReason::ImageDone => Ok("stop"),
-        uniserve_engine_client::NativeFinishReason::MaxTokens => Ok("length"),
-        uniserve_engine_client::NativeFinishReason::Cancelled
-        | uniserve_engine_client::NativeFinishReason::Aborted => Ok("abort"),
-        uniserve_engine_client::NativeFinishReason::Error => {
+        FinishStatus::Stop { .. } | FinishStatus::Repetition => Ok("stop"),
+        FinishStatus::Length => Ok("length"),
+        FinishStatus::Abort => Ok("abort"),
+        FinishStatus::Error => {
             bail_server_error!("Internal server error");
         }
     }
@@ -1344,11 +1544,11 @@ fn final_chunk(
     request_id: &str,
     response_model: &str,
     created: u64,
-    finish_reason: FinishReason,
+    finish_status: &FinishStatus,
     saw_tool_calls: bool,
 ) -> Result<ChatCompletionStreamResponse, ApiError> {
-    let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
-    let finish_reason = chat_finish_reason_to_openai(&finish_reason, saw_tool_calls)?;
+    let stop_reason = finish_status_stop_reason(finish_status);
+    let finish_reason = chat_finish_status_to_openai(finish_status, saw_tool_calls)?;
 
     debug!(
         finish_reason = %finish_reason,
@@ -1365,26 +1565,62 @@ fn final_chunk(
     Ok(chunk)
 }
 
-fn chat_finish_reason_to_openai(
-    finish_reason: &FinishReason,
+fn chat_finish_status_to_openai(
+    finish_status: &FinishStatus,
     saw_tool_calls: bool,
 ) -> Result<&'static str, ApiError> {
-    match finish_reason {
-        FinishReason::Stop(_) if saw_tool_calls => Ok("tool_calls"),
-        FinishReason::Stop(_) => Ok("stop"),
-        FinishReason::Length => Ok("length"),
-        FinishReason::Abort => Ok("abort"),
-        FinishReason::Repetition => Ok("stop"),
-        FinishReason::Error => {
+    match finish_status {
+        FinishStatus::Stop { .. } if saw_tool_calls => Ok("tool_calls"),
+        FinishStatus::Stop { .. } => Ok("stop"),
+        FinishStatus::Length => Ok("length"),
+        FinishStatus::Abort => Ok("abort"),
+        FinishStatus::Repetition => Ok("stop"),
+        FinishStatus::Error => {
             bail_server_error!("Internal server error");
         }
     }
 }
 
-/// Convert one internal stop reason into the OpenAI-compatible `stop_reason`
-/// JSON shape.
-fn stop_reason_to_json(stop_reason: &StopReason) -> Value {
-    serde_json::to_value(stop_reason).unwrap_or_else(|_| Value::String(format!("{stop_reason:?}")))
+fn finish_status_as_str(status: &FinishStatus) -> &'static str {
+    match status {
+        FinishStatus::Stop { .. } => "stop",
+        FinishStatus::Length => "length",
+        FinishStatus::Abort => "abort",
+        FinishStatus::Error => "error",
+        FinishStatus::Repetition => "repetition",
+    }
+}
+
+fn finish_status_stop_reason(status: &FinishStatus) -> Option<Value> {
+    match status {
+        FinishStatus::Stop { stop_reason } => stop_reason.clone(),
+        FinishStatus::Length
+        | FinishStatus::Abort
+        | FinishStatus::Error
+        | FinishStatus::Repetition => None,
+    }
+}
+
+fn serve_error_to_api(error: ServeError) -> ApiError {
+    match error {
+        ServeError::UnsupportedRuntimeExtension { key, .. } => ApiError::invalid_request(
+            format!("Unsupported runtime extension `{key}`."),
+            Some("uniserve_xargs"),
+        ),
+        ServeError::UnsupportedOutputCount { requested, .. } => ApiError::invalid_request(
+            format!("Only one chat completion output is supported, got {requested}."),
+            Some("n"),
+        ),
+        ServeError::Text(error) => {
+            ApiError::server_error(format!("text runtime error: {}", error.to_report_string()))
+        }
+        ServeError::Chat(error) => {
+            ApiError::server_error(format!("chat runtime error: {}", error.to_report_string()))
+        }
+        ServeError::Engine(message) => {
+            ApiError::server_error(format!("engine runtime error: {message}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1394,7 +1630,7 @@ mod tests {
     use uniserve_chat::{
         AssistantBlockKind, AssistantContentBlock, AssistantToolCall, ChatEvent, FinishReason,
     };
-    use uniserve_engine_client::protocol::StopReason;
+    use uniserve_serving::{FinishStatus, ServeError, ServeEvent};
     use uniserve_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
 
     use super::{block_delta_chunk, chat_completion_chunk_stream, final_chunk};
@@ -1436,7 +1672,9 @@ mod tests {
             "chatcmpl-1",
             "model",
             1,
-            FinishReason::Stop(Some(StopReason::Text("stop".to_string()))),
+            &FinishStatus::Stop {
+                stop_reason: Some(json!("stop")),
+            },
             false,
         )
         .expect("finish reason is valid");
@@ -1447,7 +1685,7 @@ mod tests {
 
     #[test]
     fn final_chunk_maps_length_finish_reason() {
-        let chunk = final_chunk("chatcmpl-1", "model", 1, FinishReason::Length, false)
+        let chunk = final_chunk("chatcmpl-1", "model", 1, &FinishStatus::Length, false)
             .expect("finish reason is valid");
 
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
@@ -1456,7 +1694,7 @@ mod tests {
 
     #[test]
     fn final_chunk_maps_abort_finish_reason() {
-        let chunk = final_chunk("chatcmpl-1", "model", 1, FinishReason::Abort, false)
+        let chunk = final_chunk("chatcmpl-1", "model", 1, &FinishStatus::Abort, false)
             .expect("abort is a valid finish reason");
 
         assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("abort"));
@@ -1465,13 +1703,19 @@ mod tests {
 
     #[test]
     fn final_chunk_rejects_error_finish_reason() {
-        assert!(final_chunk("chatcmpl-1", "model", 1, FinishReason::Error, false).is_err());
+        assert!(final_chunk("chatcmpl-1", "model", 1, &FinishStatus::Error, false).is_err());
     }
 
     #[test]
     fn final_chunk_maps_stop_to_tool_calls_when_tool_calls_were_streamed() {
-        let chunk = final_chunk("chatcmpl-1", "model", 1, FinishReason::stop_eos(), true)
-            .expect("finish reason is valid");
+        let chunk = final_chunk(
+            "chatcmpl-1",
+            "model",
+            1,
+            &FinishStatus::Stop { stop_reason: None },
+            true,
+        )
+        .expect("finish reason is valid");
 
         assert_eq!(
             chunk.choices[0].finish_reason.as_deref(),
@@ -1479,9 +1723,116 @@ mod tests {
         );
     }
 
+    fn serve_stream(
+        events: Vec<uniserve_chat::Result<ChatEvent>>,
+    ) -> impl futures::Stream<Item = uniserve_serving::Result<ServeEvent>> {
+        stream::iter(events.into_iter().flat_map(|event| {
+            match event {
+                Ok(event) => chat_event_to_serve_events(event)
+                    .into_iter()
+                    .map(Ok)
+                    .collect(),
+                Err(error) => vec![Err(ServeError::Chat(error))],
+            }
+        }))
+    }
+
+    fn chat_event_to_serve_events(event: ChatEvent) -> Vec<ServeEvent> {
+        match event {
+            ChatEvent::Start {
+                prompt_token_ids,
+                prompt_logprobs,
+            } => {
+                let prompt_token_ids = prompt_token_ids.to_vec();
+                vec![ServeEvent::Accepted {
+                    request_id: "chatcmpl-test".to_string(),
+                    prompt_token_count: prompt_token_ids.len(),
+                    prompt_token_ids,
+                    prompt_logprobs,
+                }]
+            }
+            ChatEvent::BlockStart { index, kind } => vec![ServeEvent::OutputBlockStart {
+                candidate_id: 0,
+                index,
+                kind,
+            }],
+            ChatEvent::BlockDelta { kind, delta, .. } => match kind {
+                AssistantBlockKind::Text => vec![ServeEvent::TextDelta {
+                    candidate_id: 0,
+                    text: delta,
+                    token_ids: Vec::new(),
+                    logprobs: None,
+                }],
+                AssistantBlockKind::Reasoning => vec![ServeEvent::ReasoningDelta {
+                    candidate_id: 0,
+                    text: delta,
+                }],
+                AssistantBlockKind::ToolCall => vec![ServeEvent::InternalTextDelta {
+                    candidate_id: 0,
+                    text: delta,
+                }],
+            },
+            ChatEvent::LogprobsDelta {
+                logprobs,
+                token_ids,
+            } => vec![ServeEvent::TextDelta {
+                candidate_id: 0,
+                text: String::new(),
+                token_ids,
+                logprobs,
+            }],
+            ChatEvent::BlockEnd { index, block } => vec![ServeEvent::OutputBlockEnd {
+                candidate_id: 0,
+                index,
+                block,
+            }],
+            ChatEvent::ToolCallStart { index, id, name } => vec![ServeEvent::ToolCallStart {
+                candidate_id: 0,
+                index,
+                id,
+                name,
+            }],
+            ChatEvent::ToolCallArgumentsDelta { index, delta } => {
+                vec![ServeEvent::ToolCallArgumentsDelta {
+                    candidate_id: 0,
+                    index,
+                    delta,
+                }]
+            }
+            ChatEvent::ToolCallEnd { index, call } => vec![ServeEvent::ToolCallEnd {
+                candidate_id: 0,
+                index,
+                id: call.id,
+                name: call.name,
+                arguments: call.arguments,
+            }],
+            ChatEvent::Done {
+                prompt_token_count,
+                output_token_count,
+                finish_reason,
+                kv_transfer_params,
+                ..
+            } => vec![
+                ServeEvent::Usage {
+                    prompt_tokens: prompt_token_count as u32,
+                    visible_output_tokens: output_token_count as u32,
+                    internal_tokens: 0,
+                    image_count: 0,
+                    image_steps: 0,
+                },
+                ServeEvent::Finished {
+                    candidate_id: 0,
+                    reason: FinishStatus::from(&finish_reason),
+                    finish_detail: None,
+                    kv_transfer_params,
+                },
+            ],
+        }
+    }
+
     #[tokio::test]
     async fn chunk_stream_coalesces_text_delta_with_logprobs() {
-        let stream = stream::iter(vec![
+        let stream = serve_stream(vec![
             Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,
@@ -1545,7 +1896,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_stream_coalesces_reasoning_delta_with_logprobs() {
-        let stream = stream::iter(vec![
+        let stream = serve_stream(vec![
             Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,
@@ -1610,7 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_stream_omits_reasoning_delta_when_disabled() {
-        let stream = stream::iter(vec![
+        let stream = serve_stream(vec![
             Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,
@@ -1668,7 +2019,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_stream_omits_logprobs_for_suppressed_reasoning() {
-        let stream = stream::iter(vec![
+        let stream = serve_stream(vec![
             Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,
@@ -1759,7 +2110,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_stream_omits_logprobs_for_hidden_reasoning_delimiters() {
-        let stream = stream::iter(vec![
+        let stream = serve_stream(vec![
             Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,
@@ -1897,7 +2248,7 @@ mod tests {
 
     #[tokio::test]
     async fn chunk_stream_preserves_tool_call_index_and_omits_id_from_arguments_delta() {
-        let stream = stream::iter(vec![
+        let stream = serve_stream(vec![
             Ok(ChatEvent::Start {
                 prompt_token_ids: vec![].into(),
                 prompt_logprobs: None,

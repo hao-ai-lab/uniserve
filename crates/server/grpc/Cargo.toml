@@ -16,6 +16,7 @@ tracing.workspace = true
 uniserve-engine-client.workspace = true
 uniserve-grpc-proto.workspace = true
 uniserve-server-app.workspace = true
+uniserve-serving.workspace = true
 uniserve-text.workspace = true
 uuid.workspace = true
 

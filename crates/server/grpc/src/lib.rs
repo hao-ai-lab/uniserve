@@ -6,13 +6,14 @@ mod convert;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use futures::{Stream, StreamExt as _};
+use futures::{Stream, StreamExt as _, pin_mut};
 use thiserror_ext::AsReport as _;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::info;
-use uniserve_text::{DecodedTextEvent, TextOutputStreamExt as _};
+use uniserve_serving::{FinishStatus, RequestMetadata, ServeEvent, ServeRequest};
+use uniserve_text::{CollectedTextOutput, DecodedLogprobs, Finished};
 
 use self::convert::ResponseOpts;
 use uniserve_server_app::AppState;
@@ -64,13 +65,14 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (unary)");
 
-        let stream = self.state.chat().text().generate(text_request).await;
-        let stream = stream.map_err(|e| Status::internal(e.to_report_string()))?;
-
-        let collected = stream
-            .collect_output()
+        let serve_request = serve_request_from_text(text_request)?;
+        let stream = self
+            .state
+            .runtime()
+            .serve(serve_request)
             .await
             .map_err(|e| Status::internal(e.to_report_string()))?;
+        let (collected, finish_status) = collect_text_events(stream).await?;
 
         // Build the single aggregated response.
         let prompt_info = convert::to_prompt_info(
@@ -82,7 +84,7 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let finish_info = uniserve_text::Finished {
             prompt_token_count: collected.prompt_token_ids.len(),
             output_token_count: collected.token_ids.len(),
-            finish_reason: collected.finish_reason,
+            finish_reason: finish_status_to_text_reason(&finish_status),
             kv_transfer_params: collected.kv_transfer_params,
         };
 
@@ -125,20 +127,29 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
         let request_id = text_request.request_id.clone();
         info!(%request_id, "grpc generate (stream)");
 
-        let stream = self.state.chat().text().generate(text_request).await;
-        let stream = stream.map_err(|e| Status::internal(e.to_report_string()))?;
+        let serve_request = serve_request_from_text(text_request)?;
+        let stream = self
+            .state
+            .runtime()
+            .serve(serve_request)
+            .await
+            .map_err(|e| Status::internal(e.to_report_string()))?;
 
         let (tx, rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
             futures::pin_mut!(stream);
+            let mut prompt_tokens = 0_usize;
+            let mut output_tokens = 0_usize;
             while let Some(event) = stream.next().await {
                 let response = match event {
                     Err(e) => Err(Status::internal(e.to_report_string())),
-                    Ok(DecodedTextEvent::Start {
+                    Ok(ServeEvent::Accepted {
                         prompt_token_ids,
                         prompt_logprobs,
+                        ..
                     }) => {
+                        prompt_tokens = prompt_token_ids.len();
                         let prompt_info = convert::to_prompt_info(
                             &prompt_token_ids,
                             prompt_logprobs.as_ref(),
@@ -149,21 +160,53 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
                             outputs: None,
                         })
                     }
-                    Ok(DecodedTextEvent::TextDelta {
-                        delta,
+                    Ok(ServeEvent::TextDelta {
+                        text,
                         token_ids,
                         logprobs,
-                        finished,
+                        ..
                     }) => Ok(pb::GenerateResponse {
                         prompt_info: None,
                         outputs: Some(convert::to_sequence_output(
-                            &delta,
+                            &text,
                             &token_ids,
                             logprobs.as_ref(),
-                            finished.as_ref(),
+                            None,
                             &response_opts,
                         )),
                     }),
+                    Ok(ServeEvent::Usage {
+                        prompt_tokens: prompt,
+                        visible_output_tokens,
+                        ..
+                    }) => {
+                        prompt_tokens = prompt as usize;
+                        output_tokens = visible_output_tokens as usize;
+                        continue;
+                    }
+                    Ok(ServeEvent::Finished {
+                        reason,
+                        kv_transfer_params,
+                        ..
+                    }) => {
+                        let finished = Finished {
+                            prompt_token_count: prompt_tokens,
+                            output_token_count: output_tokens,
+                            finish_reason: finish_status_to_text_reason(&reason),
+                            kv_transfer_params,
+                        };
+                        Ok(pb::GenerateResponse {
+                            prompt_info: None,
+                            outputs: Some(convert::to_sequence_output(
+                                "",
+                                &[],
+                                None,
+                                Some(&finished),
+                                &response_opts,
+                            )),
+                        })
+                    }
+                    Ok(_) => continue,
                 };
 
                 if tx.send(response).await.is_err() {
@@ -175,5 +218,110 @@ impl pb::generate_server::Generate for GenerateServiceImpl {
 
         let response_stream = ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(response_stream)))
+    }
+}
+
+fn serve_request_from_text(
+    text_request: uniserve_text::TextRequest,
+) -> Result<ServeRequest, Status> {
+    ServeRequest::from_text_request(
+        text_request,
+        RequestMetadata {
+            protocol_adapter: Some("grpc_generate".to_string()),
+            route: Some("grpc.Generate".to_string()),
+            ..RequestMetadata::default()
+        },
+    )
+    .map_err(|error| match error {
+        uniserve_serving::ServeError::UnsupportedRuntimeExtension { key, .. } => {
+            Status::invalid_argument(format!("unsupported runtime extension `{key}`"))
+        }
+        uniserve_serving::ServeError::UnsupportedOutputCount { requested, .. } => {
+            Status::invalid_argument(format!("only one sequence is supported, got {requested}"))
+        }
+        other => Status::internal(other.to_report_string()),
+    })
+}
+
+async fn collect_text_events(
+    stream: impl Stream<Item = uniserve_serving::Result<ServeEvent>> + Send,
+) -> Result<(CollectedTextOutput, FinishStatus), Status> {
+    pin_mut!(stream);
+    let mut prompt_token_ids = std::sync::Arc::<[u32]>::from([]);
+    let mut prompt_logprobs = None;
+    let mut text = String::new();
+    let mut token_ids = Vec::new();
+    let mut logprobs: Option<DecodedLogprobs> = None;
+    let mut finish_status = None;
+    let mut kv_transfer_params = None;
+
+    while let Some(event) = stream.next().await {
+        match event.map_err(|e| Status::internal(e.to_report_string()))? {
+            ServeEvent::Accepted {
+                prompt_token_ids: ids,
+                prompt_logprobs: start_prompt_logprobs,
+                ..
+            } => {
+                prompt_token_ids = ids.into();
+                prompt_logprobs = start_prompt_logprobs;
+            }
+            ServeEvent::TextDelta {
+                text: delta,
+                token_ids: delta_token_ids,
+                logprobs: delta_logprobs,
+                ..
+            } => {
+                text.push_str(&delta);
+                token_ids.extend(delta_token_ids);
+                if let Some(mut delta_logprobs) = delta_logprobs {
+                    logprobs
+                        .get_or_insert_with(|| DecodedLogprobs {
+                            positions: Vec::new(),
+                        })
+                        .positions
+                        .append(&mut delta_logprobs.positions);
+                }
+            }
+            ServeEvent::Finished {
+                reason,
+                kv_transfer_params: params,
+                ..
+            } => {
+                finish_status = Some(reason);
+                kv_transfer_params = params;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let Some(finish_status) = finish_status else {
+        return Err(Status::internal(
+            "stream closed before terminal finish event",
+        ));
+    };
+    let finish_reason = finish_status_to_text_reason(&finish_status);
+
+    Ok((
+        CollectedTextOutput {
+            text,
+            prompt_token_ids,
+            prompt_logprobs,
+            logprobs,
+            token_ids,
+            finish_reason,
+            kv_transfer_params,
+        },
+        finish_status,
+    ))
+}
+
+fn finish_status_to_text_reason(status: &FinishStatus) -> uniserve_text::FinishReason {
+    match status {
+        FinishStatus::Stop { .. } => uniserve_text::FinishReason::Stop(None),
+        FinishStatus::Length => uniserve_text::FinishReason::Length,
+        FinishStatus::Abort => uniserve_text::FinishReason::Abort,
+        FinishStatus::Error => uniserve_text::FinishReason::Error,
+        FinishStatus::Repetition => uniserve_text::FinishReason::Repetition,
     }
 }

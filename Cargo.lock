@@ -5551,6 +5551,7 @@ dependencies = [
  "base64 0.22.1",
  "serde",
  "serde_json",
+ "uniserve-serving",
  "uniserve-testkit",
 ]
 
@@ -5752,6 +5753,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniserve-engine-gateway"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "uniserve-engine-client",
+ "uniserve-llm",
+]
+
+[[package]]
 name = "uniserve-engine-process"
 version = "0.2.0"
 dependencies = [
@@ -5829,6 +5839,7 @@ version = "0.2.0"
 dependencies = [
  "serde_json",
  "uniserve-server-app",
+ "uniserve-serving",
 ]
 
 [[package]]
@@ -5924,6 +5935,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "uniserve-model-profile"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "uniserve-chat",
+]
+
+[[package]]
 name = "uniserve-native-api"
 version = "0.2.0"
 dependencies = [
@@ -5973,6 +5992,15 @@ dependencies = [
  "serde_json",
  "serde_with",
  "validator",
+]
+
+[[package]]
+name = "uniserve-protocol-adapters"
+version = "0.2.0"
+dependencies = [
+ "uniserve-native-api",
+ "uniserve-openai-api",
+ "uniserve-serving",
 ]
 
 [[package]]
@@ -6028,6 +6056,7 @@ dependencies = [
  "uniserve-observability",
  "uniserve-openai-api",
  "uniserve-scheduler",
+ "uniserve-serving",
  "uniserve-sim",
  "uniserve-text",
  "uniserve-worker-ipc",
@@ -6053,6 +6082,7 @@ dependencies = [
  "uniserve-grpc-proto",
  "uniserve-llm",
  "uniserve-server-app",
+ "uniserve-serving",
  "uniserve-text",
  "uuid",
 ]
@@ -6099,9 +6129,28 @@ dependencies = [
  "uniserve-reasoning-parser",
  "uniserve-server-app",
  "uniserve-server-grpc",
+ "uniserve-serving",
  "uniserve-text",
  "uuid",
  "validator",
+]
+
+[[package]]
+name = "uniserve-serving"
+version = "0.2.0"
+dependencies = [
+ "asynk-strim-attr",
+ "expect-test",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "uniserve-chat",
+ "uniserve-engine-client",
+ "uniserve-llm",
+ "uniserve-model-profile",
+ "uniserve-text",
 ]
 
 [[package]]

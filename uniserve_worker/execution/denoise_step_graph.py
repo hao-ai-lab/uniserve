@@ -17,11 +17,11 @@ Correctness rests on three pillars:
   *same block-id contents* (``request_cache_for_transient`` reuses stable
   scratch blocks per image, so the captured page writes stay valid). Any drift
   changes the key and the step falls back to eager (or captures anew).
-* **Exclusive attention plan.** The captured FlashInfer prefill ``wrapper.run``
-  bakes its plan; the runner binds a graph-scoped exclusive wrapper (see
-  ``bind_paged_prefill_graph_wrapper``) to a per-graph metadata sentinel so no
-  other request can re-plan the captured wrapper. The dispatcher-winner probe
-  guarantees capture never swaps in a backend the eager path would not use.
+* **Graph-capable attention backend.** The dispatcher-winner probe guarantees
+  capture never swaps in a backend the eager path would not use. Backends with
+  mutable wrapper plans bind a graph-scoped exclusive wrapper (see
+  ``bind_paged_prefill_graph_wrapper``); direct paged-varlen kernels declare
+  graph safety through their attention capabilities.
 * **Private capture pool.** Per-image graphs are freed independently at image
   commit; sharing one ``graph_pool_handle`` across graphs aborts with a
   ``use_count > 0`` internal assert (CUDACachingAllocator.cpp:2291) once the
@@ -175,8 +175,8 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             backend = self._resolve_graph_backend(ctx, rows)
             if backend is None:
                 # Dispatcher-winner probe failed: the backend eager would pick
-                # cannot host a baked-plan graph. Config-wide, so disable the
-                # runner rather than accumulate per-image miss keys.
+                # cannot host the captured graph path. Config-wide, so disable
+                # the runner rather than accumulate per-image miss keys.
                 self._backend_ineligible = True
                 if self.logger is not None:
                     self.logger.info(
@@ -411,15 +411,25 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
                 backend = getattr(provider, "backend", None)
                 if backend is None:
                     backend = getattr(req, "backend", None) or getattr(ctx, "attention_backend", None)
-                if backend is not None and callable(
-                    getattr(backend, "bind_paged_prefill_graph_wrapper", None)
-                ):
+                if backend is not None and self._backend_can_host_graph(backend):
                     return backend
                 return None
         except Exception:
             if self.logger is not None:
                 self.logger.debug("%s graph backend probe failed", self.name, exc_info=True)
         return None
+
+    @staticmethod
+    def _backend_can_host_graph(backend: Any) -> bool:
+        bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
+        release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
+        if callable(bind) and callable(release):
+            return True
+        try:
+            caps = backend.capabilities()
+        except Exception:
+            return False
+        return bool(getattr(caps, "paged_varlen_cuda_graph", False))
 
     # -- capture / replay ------------------------------------------------------
 
@@ -451,8 +461,11 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             image_token_num=int(img.token_h) * int(img.token_w),
             image_size=(int(img.width), int(img.height)),
         )
-        backend.bind_paged_prefill_graph_wrapper(metadata, device=device)
-        state.release_backend = lambda: backend.release_paged_prefill_graph_wrapper(metadata)
+        bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
+        release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
+        if callable(bind) and callable(release):
+            bind(metadata, device=device)
+            state.release_backend = lambda: release(metadata)
 
         # Capture under a context whose ``attention_metadata`` is this graph's
         # sentinel (routes FlashInfer to the exclusive wrapper) and with stats

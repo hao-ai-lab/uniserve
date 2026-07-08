@@ -23,6 +23,7 @@ uniserve-native-api.workspace = true
 uniserve-observability.workspace = true
 uniserve-openai-api.workspace = true
 uniserve-scheduler.workspace = true
+uniserve-serving.workspace = true
 uniserve-sim.workspace = true
 uniserve-text.workspace = true
 uniserve-worker-ipc.workspace = true
