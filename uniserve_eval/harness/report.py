@@ -46,12 +46,14 @@ def build_summary(
     else:
         family = "image"
         metrics = summarize_image(records, dur_s)
+    endpoint = _observed_endpoint(records) or spec.endpoint
 
     return {
         "harness_status": "completed",
         "task": spec.task.value,
         "dataset": spec.dataset,
-        "endpoint": spec.endpoint,
+        "endpoint": endpoint,
+        "wire": spec.wire,
         "model": spec.model,
         "base_url": base_url,
         "server_info": server_info,
@@ -72,6 +74,11 @@ def build_summary(
         "metric_family": family,
         "metrics": metrics,
     }
+
+
+def _observed_endpoint(records: list[RequestRecord]) -> str | None:
+    endpoints = {record.endpoint for record in records if record.endpoint}
+    return next(iter(endpoints)) if len(endpoints) == 1 else None
 
 
 def render_markdown(summary: dict[str, Any]) -> str:

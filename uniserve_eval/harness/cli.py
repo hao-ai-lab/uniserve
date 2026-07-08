@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from .runner import BenchmarkRunner
-from .spec import DEFAULT_DATASETS, DEFAULT_ENDPOINTS, BenchmarkSpec, TaskName
+from .spec import DEFAULT_DATASETS, BenchmarkSpec, TaskName
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,10 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--i2i-mode", default="image")
     parser.add_argument(
-        "--i2t-wire",
-        default="native",
-        choices=["native", "openai_chat"],
-        help="i2t request shape: UniServe native /generate vs OpenAI chat with image_url",
+        "--wire",
+        default=None,
+        help=(
+            "request/response shape for the task (default: task's first wire): "
+            "native | openai_chat | openai_chat_json | images_generations"
+        ),
     )
     parser.add_argument("--i2t-question", default="Describe this image in detail.")
     parser.add_argument(
@@ -107,7 +109,7 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
     return BenchmarkSpec(
         task=task,
         model=args.model,
-        endpoint=args.endpoint or DEFAULT_ENDPOINTS[task],
+        endpoint=args.endpoint or "",
         dataset=args.dataset or DEFAULT_DATASETS[task],
         num_prompts=1 if args.smoke else args.num_prompts,
         request_rate=rate,
@@ -123,7 +125,7 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         steps=args.steps,
         max_images=args.max_images,
         i2i_mode=args.i2i_mode,
-        i2t_wire=args.i2t_wire,
+        wire=args.wire or "",
         i2t_question=args.i2t_question,
         sample_gpu_memory=not args.no_gpu_memory,
         tokenizer=args.tokenizer,

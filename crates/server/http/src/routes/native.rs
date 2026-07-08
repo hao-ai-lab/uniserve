@@ -99,13 +99,13 @@ pub(crate) async fn generate(
         .into_response()
 }
 
-struct NativeTextOutputFilter {
+pub(crate) struct NativeTextOutputFilter {
     reasoning: Option<DelimitedReasoningParser>,
     visible_wrappers: NativeVisibleWrapperFilter,
 }
 
 impl NativeTextOutputFilter {
-    fn new(
+    pub(crate) fn new(
         spec: NativeOutputFilter,
         tokenizer: DynTokenizer,
         prompt_token_ids: &[u32],
@@ -124,7 +124,7 @@ impl NativeTextOutputFilter {
         })
     }
 
-    fn push(&mut self, text: &str) -> String {
+    pub(crate) fn push(&mut self, text: &str) -> String {
         let content = if let Some(reasoning) = self.reasoning.as_mut() {
             reasoning.push(text).content.unwrap_or_default()
         } else {

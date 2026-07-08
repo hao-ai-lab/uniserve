@@ -399,7 +399,8 @@ fn chatml(system: Option<&str>, user: &str, assistant_suffix: &str) -> String {
     out
 }
 
-fn mode_name(mode: GenMode) -> &'static str {
+/// Canonical wire name for one native generation mode.
+pub fn mode_name(mode: GenMode) -> &'static str {
     match mode {
         GenMode::Text => "text",
         GenMode::Image => "image",

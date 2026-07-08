@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..loader import ModelBringUp, get_loader
 from ..loader.paths import read_config, resolve_model_path
 from ..models.registry import detect_model_architectures, resolve_model_cls
+from ..nn.mesh import get_current_mesh
 from ..nn.quant.base import process_quantized_modules
 from ..processors import get_processor_for_model
 from ..runtime.resources import ResourceRuntime
@@ -75,7 +77,9 @@ class RunnerDriver(BaseWorkerDriver):
         self.worker_kind = worker_kind
         self.block_size = self._adjust_block_size(self.block_size)
         self.kv_token_capacity = kv_token_capacity
-        self._caps = validate_caps(self._build_caps(), owner=f"{type(model).__name__}.RunnerDriver")
+        self._caps = self._caps_with_current_rank(
+            validate_caps(self._build_caps(), owner=f"{type(model).__name__}.RunnerDriver")
+        )
         self._validate_declared_controls()
         self.model.configure_runtime(
             block_size=self.block_size,
@@ -164,6 +168,11 @@ class RunnerDriver(BaseWorkerDriver):
         if isinstance(caps, Caps):
             return caps
         raise capability_mismatch(f"{type(self.model).__name__}.caps() must return Caps")
+
+    @staticmethod
+    def _caps_with_current_rank(caps: Caps) -> Caps:
+        mesh = get_current_mesh()
+        return replace(caps, tp_rank=int(mesh.tp_rank), tp_size=int(mesh.tp_size))
 
     def execute(
         self,

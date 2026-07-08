@@ -132,10 +132,12 @@ impl EngineCoreClient {
         match self {
             Self::InProcess(c) => c.generate_native(req),
             Self::Zmq(c) => c.generate_native(req).await,
-            Self::Mock(_) => Err(Error::ClientClosed {
-                message: "native image/interleave generation requires the UniServe engine"
-                    .to_string(),
-            }),
+            Self::Mock(c) => {
+                let request_id = format!("native-mock-{}", native_mock_seq());
+                let wire = crate::native::native_request_to_wire(req, request_id);
+                let stream = c.call(wire)?;
+                Ok(crate::native::native_stream_from_wire_stream(stream))
+            }
         }
     }
 
@@ -342,4 +344,9 @@ impl EngineCoreClient {
             Self::Mock(_) => Ok(()),
         }
     }
+}
+
+fn native_mock_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }

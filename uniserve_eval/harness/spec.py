@@ -23,12 +23,30 @@ class TaskName(StrEnum):
 STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.INTERLEAVE, TaskName.I2T})
 IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 
-DEFAULT_ENDPOINTS = {
-    TaskName.TEXT: "/v1/chat/completions",
-    TaskName.T2I: "/v1/images/generations",
-    TaskName.I2I: "/generate",
-    TaskName.I2T: "/generate",
-    TaskName.INTERLEAVE: "/generate",
+# Wire = request/response shape used to exercise one task over one endpoint.
+#
+# * "native"            -> UniServe /generate SSE (mode from the task)
+# * "openai_chat"       -> OpenAI chat completions SSE, streamed; per-chunk
+#                          timing (TTFT/ITL) and delta.images image counting
+# * "openai_chat_json"  -> OpenAI chat completions, one non-streamed JSON
+#                          response; E2E + counts only (diffusion-pipeline
+#                          backends such as vLLM-Omni, and image-only chat)
+# * "images_generations"-> OpenAI-style /v1/images/generations JSON
+#
+# Endpoint is derived from (task, wire) unless --endpoint overrides it.
+TASK_WIRES = {
+    TaskName.TEXT: ("openai_chat",),
+    TaskName.T2I: ("images_generations", "openai_chat_json"),
+    TaskName.I2I: ("native",),
+    TaskName.I2T: ("native", "openai_chat", "openai_chat_json"),
+    TaskName.INTERLEAVE: ("native", "openai_chat"),
+}
+
+WIRE_ENDPOINTS = {
+    "native": "/generate",
+    "openai_chat": "/v1/chat/completions",
+    "openai_chat_json": "/v1/chat/completions",
+    "images_generations": "/v1/images/generations",
 }
 
 # Default real dataset backing each task. i2t defaults to deterministic
@@ -71,11 +89,10 @@ class BenchmarkSpec:
     max_images: int | None = None
     i2i_mode: str = "image"
 
-    # Image understanding (i2t). ``i2t_wire`` selects the request shape:
-    # "native"      -> UniServe /generate mode:"understand" SSE
-    # "openai_chat" -> OpenAI chat completions with image_url content
-    #                  (vLLM-Omni style, modalities:["text"])
-    i2t_wire: str = "native"
+    # Request/response shape for this task; see TASK_WIRES. Empty selects the
+    # task's first (default) wire.
+    wire: str = ""
+
     i2t_question: str = "Describe this image in detail."
 
     # Harness-side GPU memory sampling (nvidia-smi poll) during the timed
@@ -97,8 +114,15 @@ class BenchmarkSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task", TaskName(self.task))
+        if not self.wire:
+            object.__setattr__(self, "wire", TASK_WIRES[self.task][0])
+        if self.wire not in TASK_WIRES[self.task]:
+            supported = ", ".join(TASK_WIRES[self.task])
+            raise ValueError(
+                f"task {self.task.value} does not support wire {self.wire!r}; expected one of: {supported}"
+            )
         if not self.endpoint:
-            object.__setattr__(self, "endpoint", DEFAULT_ENDPOINTS[self.task])
+            object.__setattr__(self, "endpoint", WIRE_ENDPOINTS[self.wire])
         if not self.dataset:
             object.__setattr__(self, "dataset", DEFAULT_DATASETS[self.task])
         if not self.name:
