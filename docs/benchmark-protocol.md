@@ -27,6 +27,7 @@ Set these before launching the benchmark runner:
 | `UNISERVE_SHAREGPT_PATH` | ShareGPT JSON dataset path |
 | `UNISERVE_SGLANG_PYTHON` | Python executable for `refs/sglang` |
 | `UNISERVE_OMNI_VLLM` | `vllm` executable for vllm-omni |
+| `UNISERVE_BENCH_CUDA_VISIBLE_DEVICES` | optional: overrides every profile's `cuda_visible_devices` for this run |
 
 If any variable is missing, launch paths must fail before starting a server.
 Dry-run output may keep `${VAR}` placeholders for audit.
@@ -91,6 +92,7 @@ for the Qwen3 text-serving comparison is tracked in `specs/tasks.md`.
 | image cap | none |
 | image size | 2048x1152 |
 | steps | 50 |
+| wire | native, and an `openai_chat` variant (`sensenova_ueval_interleave_chat_uniserve`) |
 | metrics | request throughput, output tokens/s, images/s, TTFT, TPOT, time-to-first-image |
 
 ## Runner Contract

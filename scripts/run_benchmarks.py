@@ -18,13 +18,18 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from uniserve_eval.backends import build_serve_cmd
+SCRIPT_ROOT = Path(__file__).resolve().parents[1]
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+from uniserve_eval.backends import build_serve_cmd, resolve_cuda_visible_devices
 from uniserve_eval.profiles import (
     DEFAULT_CONFIG,
     ROOT,
@@ -54,11 +59,13 @@ HARNESS_FLAGS = {
     "steps": "--steps",
     "max_images": "--max-images",
     "i2i_mode": "--i2i-mode",
+    "interleave_wire": "--interleave-wire",
     "i2t_wire": "--i2t-wire",
     "i2t_question": "--i2t-question",
     "sharegpt_output_len": "--sharegpt-output-len",
     "sharegpt_context_len": "--sharegpt-context-len",
 }
+
 
 
 @dataclass(frozen=True)
@@ -358,8 +365,14 @@ def build_servers(
         spec = expand_profile_value(raw)
         command = tuple(build_serve_cmd(config, raw, strict_env=strict_env))
         env = spec_env(spec)
-        if spec.get("cuda_visible_devices") is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(spec["cuda_visible_devices"])
+        profile_value = (
+            str(spec["cuda_visible_devices"])
+            if spec.get("cuda_visible_devices") is not None
+            else None
+        )
+        cuda_visible_devices = resolve_cuda_visible_devices(profile_value)
+        if cuda_visible_devices is not None:
+            env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
         if strict_env:
             require_resolved_profile_value(command, context=f"server {profile_name}")
             require_resolved_profile_value(env, context=f"server env {profile_name}")
@@ -525,6 +538,14 @@ def parse_name_filter(value: str | None, all_names: set[str], *, flag: str) -> s
     return selected
 
 
+def filter_benchmark_groups(benchmark: dict[str, Any], selected: set[str]) -> dict[str, Any]:
+    filtered = dict(benchmark)
+    filtered["groups"] = {
+        name: group for name, group in dict(benchmark["groups"]).items() if name in selected
+    }
+    return filtered
+
+
 def run_group(
     group_name: str,
     server: ServerRunSpec,
@@ -590,6 +611,8 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     benchmark = benchmark_spec(config, args.benchmark)
     output_root = repo_path(args.output_root or str(benchmark.get("artifact_root", "artifacts/benchmarks")))
+    selected = parse_only(args.only, list(dict(benchmark["groups"])))
+    benchmark = filter_benchmark_groups(benchmark, selected)
 
     active = active_benchmark_processes()
     if active != "(none)":
@@ -612,7 +635,6 @@ def main(argv: list[str] | None = None) -> int:
     groups = build_benches(config, benchmark, output_root, datasets, strict_env=not args.dry_run)
     write_runbook(output_root, args.benchmark, servers, groups, benchmark)
 
-    selected = parse_only(args.only, list(groups))
     all_bench_names = {bench.name for benches in groups.values() for bench in benches}
     only_benches = parse_name_filter(args.only_bench, all_bench_names, flag="--only-bench")
     skipped_benches = parse_name_filter(args.skip_bench, all_bench_names, flag="--skip-bench")

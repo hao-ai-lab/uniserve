@@ -63,6 +63,16 @@ _MIXED_PROOF_LOG = logging.getLogger("uniserve.mixed_proof")
 _MIXED_PROOF_ENABLED = env_flag("UNISERVE_MIXED_PROOF_LOG")
 
 
+def _model_max_context_len(model: Any) -> int:
+    config = getattr(model, "config", None)
+    value = getattr(config, "max_position_embeddings", None)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, parsed)
+
+
 def _overrides_model_hook(model: Any, name: str) -> bool:
     hook = getattr(type(model), name, None)
     default = getattr(ModelHooks, name, None)
@@ -315,6 +325,7 @@ class ModelRunner:
         from ..backends.attention.text_dispatch import TextBackendGate
 
         device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
+        max_context_len = _model_max_context_len(model)
         gate = TextBackendGate(
             head_dim=int(getattr(model, "head_dim", residency.kv.head_dim)),
             block_size=int(residency.kv.block_size),
@@ -331,12 +342,17 @@ class ModelRunner:
                 block_size=int(residency.kv.block_size),
                 device=device,
                 attention_backend_name=self.attention_backend_name,
+                max_context_len=max_context_len,
             )
             try:
                 graph_runner.warmup(model)
             except Exception:  # noqa: BLE001 - a warmup failure must never block serving.
                 logger.warning("text CUDA-graph warmup failed; falling back to eager", exc_info=True)
-        return _TextExecutionStack(ForwardBatchBuilder(), gate, graph_runner)
+        return _TextExecutionStack(
+            ForwardBatchBuilder(max_context_len=max_context_len),
+            gate,
+            graph_runner,
+        )
 
     @staticmethod
     def _model_kv_cache_spec(model: UniModel) -> Any | None:

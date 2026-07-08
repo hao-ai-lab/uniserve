@@ -66,7 +66,13 @@ class TextBackendGate:
         if text.mode == ForwardMode.EXTEND:
             initial_extend = self._is_initial_extend(text)
             if len(set(lengths)) != 1:
-                return self._varlen_available(attention_backend_name, needs_paged_kv=not initial_extend)
+                return self._varlen_available(
+                    attention_backend_name,
+                    needs_paged_kv=True,
+                ) or self._varlen_available(
+                    attention_backend_name,
+                    needs_paged_kv=not initial_extend,
+                )
             if not initial_extend and lengths[0] != 1:
                 return self._multi_token_paged_available(attention_backend_name)
         return self._paged_available(attention_backend_name)

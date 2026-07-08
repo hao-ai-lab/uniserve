@@ -67,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--i2i-mode", default="image")
     parser.add_argument(
+        "--interleave-wire",
+        default="native",
+        choices=["native", "openai_chat"],
+        help="interleave request shape: UniServe native /generate vs OpenAI chat with image_config",
+    )
+    parser.add_argument(
         "--i2t-wire",
         default="native",
         choices=["native", "openai_chat"],
@@ -123,6 +129,7 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         steps=args.steps,
         max_images=args.max_images,
         i2i_mode=args.i2i_mode,
+        interleave_wire=args.interleave_wire,
         i2t_wire=args.i2t_wire,
         i2t_question=args.i2t_question,
         sample_gpu_memory=not args.no_gpu_memory,

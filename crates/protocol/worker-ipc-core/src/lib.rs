@@ -19,8 +19,8 @@ use uniserve_worker_wire::{WorkerRequest, WorkerResponse};
 mod events;
 use events::{ClientEvents, ServerEvents};
 pub use events::{
-    EVENT_DRIVEN_ENV, EVENT_WAIT_SAFETY_NET, EVT_COMMAND, EVT_DEATH, EVT_REQUEST, EVT_RESULT,
-    WakeEvents, WakeSender, event_driven_enabled,
+    EVENT_DRIVEN_ENV, EVENT_WAIT_SAFETY_NET, EVT_COMMAND, EVT_DEATH, EVT_RESULT, WakeEvents,
+    WakeSender, event_driven_enabled,
 };
 
 pub mod transfer_agent;
@@ -275,11 +275,6 @@ impl ClientEndpoint {
         *request.user_header_mut() = header;
         let request = request.write_from_slice(payload);
         let pending = request.send().context("sending iceoryx2 request")?;
-        // Wake the worker the instant the request is queued, so its `recv`
-        // returns from the event listener rather than the safety-net poll.
-        if let Some(events) = &self.events {
-            events.notify_request();
-        }
         Ok(pending)
     }
 
@@ -323,7 +318,7 @@ impl ClientEndpoint {
 pub struct ServerEndpoint {
     _node: Node<IxService>,
     server: IxServer,
-    active: VecDeque<IxActive>,
+    active: VecDeque<(u64, IxActive)>,
     /// Companion event ports for the event-driven boundary (None when polling).
     events: Option<ServerEvents>,
 }
@@ -401,7 +396,7 @@ impl ServerEndpoint {
         let header = *active.user_header();
         let payload = active.payload().to_vec();
         verify_header_len(header, payload.len())?;
-        self.active.push_back(active);
+        self.active.push_back((header.call_id, active));
         Ok(Some(Frame { header, payload }))
     }
 
@@ -410,13 +405,7 @@ impl ServerEndpoint {
             if let Some(frame) = self.try_recv()? {
                 return Ok(frame);
             }
-            // Event-driven: park on the request listener (returns when the host
-            // notifies after a send, falls back to the safety-net slice). Polling:
-            // sleep the slice.
-            match &self.events {
-                Some(events) => events.wait_request(EVENT_WAIT_SAFETY_NET)?,
-                None => std::thread::sleep(EVENT_WAIT_SAFETY_NET),
-            }
+            std::thread::sleep(EVENT_WAIT_SAFETY_NET);
         }
     }
 
@@ -428,10 +417,21 @@ impl ServerEndpoint {
     }
 
     pub fn respond_raw(&mut self, header: Header, payload: &[u8]) -> anyhow::Result<()> {
+        let pos = self
+            .active
+            .iter()
+            .position(|(call_id, _)| *call_id == header.call_id)
+            .with_context(|| {
+                format!(
+                    "respond called for unknown active request call_id {}",
+                    header.call_id
+                )
+            })?;
         let active = self
             .active
-            .pop_front()
-            .context("respond called without an active request")?;
+            .remove(pos)
+            .map(|(_, active)| active)
+            .context("active request position disappeared")?;
         let mut response = active
             .loan_slice_uninit(payload.len())
             .context("loaning iceoryx2 response slice")?;

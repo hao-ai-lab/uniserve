@@ -1,6 +1,6 @@
 """System-owned CUDA-graph runner for the text forward.
 
-Owns decode and initial-prefill CUDA graphs keyed on the system KV pool. The
+Owns decode and text-prefill CUDA graphs keyed on the system KV pool. The
 graph-unaware model is captured/replayed around: the runner builds a static
 :class:`ForwardBatch` wrapping the captured graph state's attention plan and calls
 the same thin ``model.forward(input_ids, positions, forward_batch)`` the eager path
@@ -11,6 +11,7 @@ Graph settings are model-neutral and come from the worker runtime config.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace as _dc_replace
 from typing import TYPE_CHECKING, Any
 
 from ..contracts.forward_batch import ForwardBatch
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["TextGraphRunner"]
 
 class TextGraphRunner:
-    """Owns the decode + initial-prefill text CUDA graphs, keyed on the system pool."""
+    """Owns the decode + text-prefill CUDA graphs, keyed on the system pool."""
 
     def __init__(
         self,
@@ -45,11 +46,13 @@ class TextGraphRunner:
         block_size: int,
         device: "torch.device",
         attention_backend_name: str | None = None,
+        max_context_len: int = 0,
     ) -> None:
         self.kv_pool = kv_pool
         self.num_blocks = int(num_blocks)
         self.block_size = int(block_size)
         self.device = device
+        self.max_context_len = max(0, int(max_context_len))
         # Startup (warmup) has no forward context to read the backend name from;
         # per-forward calls prefer the context's resolved name.
         self.attention_backend_name = attention_backend_name
@@ -90,7 +93,10 @@ class TextGraphRunner:
             return None
         if fb.forward_mode == ForwardMode.DECODE:
             return self._maybe_decode(model, input_ids, positions, fb, metadata, ctx)
-        if fb.forward_mode == ForwardMode.EXTEND:
+        if fb.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            # A mixed extend+decode group is shape-identical to a cached-prefix
+            # extend group (flat varlen rows, per-row context lengths, per-row
+            # last-token sampling), so it replays the same prefill buckets.
             return self._maybe_prefill(model, input_ids, positions, fb, metadata, ctx)
         return None
 
@@ -143,20 +149,32 @@ class TextGraphRunner:
         batch_size = int(fb.batch_size)
         if batch_size <= 0 or fb.last_token_indices is None:
             return None
-        if any(int(base) != 0 for base in cache.base_lens):
-            return None  # initial-prefill graphs only (no KV history)
         if any(fb.spec_token_ids):
             return None
         raw_tokens = int(fb.num_token_non_padded)
         padded_tokens = int(input_ids.numel())
         if raw_tokens <= 0 or padded_tokens < raw_tokens:
             return None
-        if not self._prefill.can_use(padded_tokens, batch_size=batch_size):
+        max_kv_tokens = self._prefill.bucket_kv_tokens(
+            _padded_prefill_max_kv_tokens(
+                metadata,
+                padded_tokens=padded_tokens,
+                raw_tokens=raw_tokens,
+                batch_size=batch_size,
+            ),
+            max_context_len=self.max_context_len,
+        )
+        if not self._prefill.can_use(
+            padded_tokens,
+            batch_size=batch_size,
+            max_kv_tokens=max_kv_tokens,
+        ):
             return None
         return self._prefill.maybe_run(
             kv_pool=self.kv_pool,
             num_blocks=self.num_blocks,
             num_tokens=padded_tokens,
+            max_kv_tokens=max_kv_tokens,
             batch_size=batch_size,
             input_ids=input_ids,
             positions=positions,
@@ -192,17 +210,64 @@ class TextGraphRunner:
 
     # ---- prefill bucket padding + warmup ------------------------------------
 
+    def reorder_mixed_for_padding(self, text: Any) -> Any:
+        """Reorder a MIXED group so bucket padding can extend its final row.
+
+        Token-bucket padding grows the last row's query span, which is only
+        legal while the pad stays inside that row's current KV block. When the
+        natural last row sits at (or too near) a block boundary, swap in any
+        row with enough tail room; row order is otherwise semantically free
+        (results are keyed per op).
+        """
+
+        if getattr(text, "mode", None) != ForwardMode.MIXED or not self._prefill.enabled():
+            return text
+        if any(text.spec_token_ids):
+            return text
+        lengths = [len(tokens) for tokens in text.token_ids]
+        if not lengths or any(length <= 0 for length in lengths):
+            return text
+        raw_tokens = sum(lengths)
+        pad = self._prefill.bucket_num_tokens(raw_tokens) - raw_tokens
+        if pad <= 0:
+            return text
+
+        def room_ok(row: int) -> bool:
+            end = int(text.pos_ranges[row][1])
+            return _blocks_for_tokens(end + pad, self.block_size) <= _blocks_for_tokens(
+                end, self.block_size
+            )
+
+        count = len(lengths)
+        if room_ok(count - 1):
+            return text
+        swap = next((row for row in range(count - 1) if room_ok(row)), None)
+        if swap is None:
+            return text
+        order = list(range(count))
+        order[swap], order[-1] = order[-1], order[swap]
+
+        def pick(seq: Any) -> tuple:
+            return tuple(seq[row] for row in order)
+
+        return _dc_replace(
+            text,
+            req_ids=pick(text.req_ids),
+            token_ids=pick(text.token_ids),
+            spec_token_ids=pick(text.spec_token_ids),
+            pos_ranges=pick(text.pos_ranges),
+            ops=pick(text.ops),
+        )
+
     def padded_num_tokens(self, text: Any, *, attention_backend_name: str | None) -> int | None:
-        """Pad an initial-extend group up to a captured prefill bucket, else ``None``."""
+        """Pad an extend group up to a captured prefill bucket, else ``None``."""
 
         del attention_backend_name
         if not self._prefill.enabled():
             return None
-        if text.mode != ForwardMode.EXTEND:
+        if text.mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
             return None
         if any(text.spec_token_ids):
-            return None
-        if not all(int(pos[0]) == 0 for pos in text.pos_ranges):
             return None
         lengths = [len(tokens) for tokens in text.token_ids]
         if not lengths or any(length <= 0 for length in lengths):
@@ -210,6 +275,12 @@ class TextGraphRunner:
         raw_tokens = sum(int(length) for length in lengths)
         bucket = self._prefill.bucket_num_tokens(raw_tokens)
         if bucket <= raw_tokens:
+            return None
+        pad = int(bucket) - int(raw_tokens)
+        base, end = text.pos_ranges[-1]
+        raw_last = int(end) - int(base)
+        padded_last = raw_last + pad
+        if _blocks_for_tokens(int(base) + padded_last, self.block_size) > _blocks_for_tokens(int(end), self.block_size):
             return None
         return bucket
 
@@ -230,6 +301,7 @@ class TextGraphRunner:
                     kv_pool=self.kv_pool,
                     num_blocks=self.num_blocks,
                     device=self.device,
+                    max_context_len=self.max_context_len,
                     forward_fn=lambda state: self._decode_forward(model, state),
                     prepare_backend=prepare_backend,
                 )
@@ -239,5 +311,34 @@ class TextGraphRunner:
                 num_blocks=self.num_blocks,
                 block_size=self.block_size,
                 device=self.device,
+                max_context_len=self.max_context_len,
                 forward_fn=lambda state: self._prefill_forward(model, state),
             )
+
+
+def _blocks_for_tokens(tokens: int, block_size: int) -> int:
+    tokens = max(0, int(tokens))
+    block_size = max(1, int(block_size))
+    return (tokens + block_size - 1) // block_size
+
+
+def _padded_prefill_max_kv_tokens(
+    metadata: Any,
+    *,
+    padded_tokens: int,
+    raw_tokens: int,
+    batch_size: int,
+) -> int:
+    pad = max(0, int(padded_tokens) - int(raw_tokens))
+    fallback = int(getattr(metadata, "max_seqlen_k", 0) or 0) + pad
+    cache_lens = tuple(int(length) for length in getattr(metadata, "cache_seqlens_cpu", ()) or ())
+    query_lens = tuple(int(length) for length in getattr(metadata, "query_lens_cpu", ()) or ())
+    if len(cache_lens) != int(batch_size) or len(query_lens) != int(batch_size) or not query_lens:
+        return max(1, fallback)
+    graph_lens = list(query_lens)
+    graph_lens[-1] += pad
+    padded_max = max(
+        (int(base) + int(query) for base, query in zip(cache_lens, graph_lens, strict=True)),
+        default=fallback,
+    )
+    return max(1, padded_max)

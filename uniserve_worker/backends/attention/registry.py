@@ -37,6 +37,8 @@ _ALIASES = MappingProxyType({
     "flashattention4": "fa4_cute",
     "flash": "flash_attn",
     "flashattention": "flash_attn",
+    "trtllm": "trtllm_mha",
+    "tensorrt_llm_mha": "trtllm_mha",
 })
 
 

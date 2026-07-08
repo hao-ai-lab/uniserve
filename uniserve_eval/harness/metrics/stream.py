@@ -120,6 +120,9 @@ def summarize_stream(
     image_block = _interleave_image_block(successful, dur_s)
     if image_block is not None:
         summary["images"] = image_block
+    timing_block = _timing_attribution_block(successful)
+    if timing_block is not None:
+        summary["timing_attribution"] = timing_block
 
     return summary
 
@@ -171,4 +174,66 @@ def _interleave_image_block(successful: list[RequestRecord], dur_s: float) -> di
         block["time_to_first_image_ms"] = distribution(ttfi, scale=1000)
     if gen:
         block["image_generation_ms"] = distribution(gen, scale=1000)
+    steps = [float(step) for r in successful for step in r.image_steps]
+    if steps:
+        block["image_steps"] = distribution(steps)
     return block
+
+
+def _timing_attribution_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
+    def collect_seconds(fn: Any) -> list[float]:
+        values: list[float] = []
+        for record in successful:
+            value = fn(record)
+            if value is not None:
+                values.append(float(value))
+        return values
+
+    client_dispatch_wait = collect_seconds(
+        lambda r: r.start_time - r.scheduled_time if r.scheduled_time is not None else None
+    )
+    http_response = collect_seconds(
+        lambda r: r.http_response_time - r.start_time if r.http_response_time is not None else None
+    )
+    stream_first_text_wait = collect_seconds(
+        lambda r: (
+            r.first_text_time - r.http_response_time
+            if r.first_text_time is not None and r.http_response_time is not None
+            else None
+        )
+    )
+    server_queue_wait = collect_seconds(
+        lambda r: (
+            r.server_scheduled_at - r.server_queued_at
+            if r.server_scheduled_at is not None and r.server_queued_at is not None
+            else None
+        )
+    )
+    residual_after_server_queue = collect_seconds(
+        lambda r: (
+            max(
+                0.0,
+                r.ttft - (r.server_scheduled_at - r.server_queued_at),
+            )
+            if r.ttft
+            and r.server_scheduled_at is not None
+            and r.server_queued_at is not None
+            else None
+        )
+    )
+
+    block: dict[str, Any] = {}
+    if client_dispatch_wait:
+        block["client_dispatch_wait_ms"] = distribution(client_dispatch_wait, scale=1000)
+    if http_response:
+        block["http_response_ms"] = distribution(http_response, scale=1000)
+    if stream_first_text_wait:
+        block["stream_first_text_wait_ms"] = distribution(stream_first_text_wait, scale=1000)
+    if server_queue_wait:
+        block["server_queue_wait_ms"] = distribution(server_queue_wait, scale=1000)
+    if residual_after_server_queue:
+        block["ttft_residual_after_server_queue_ms"] = distribution(
+            residual_after_server_queue,
+            scale=1000,
+        )
+    return block or None

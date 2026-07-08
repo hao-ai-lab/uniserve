@@ -20,7 +20,8 @@ pub use queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 pub use resources::{LedgerStats, ResourceLedger};
 pub use scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, HealthSnapshot,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
+    HealthSnapshot,
     MAX_SPEC_DECODE_POS_STATS, SchedStats, Scheduler, SchedulerConfig, SchedulingPolicy,
 };
 pub use stats_report::SchedStatsReporter;
