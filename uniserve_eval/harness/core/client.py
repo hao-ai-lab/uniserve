@@ -2,9 +2,7 @@
 
 Three wire shapes are supported, selected by ``TaskRequest.kind``:
 
-* ``openai_chat`` -- OpenAI ``/v1/chat/completions`` SSE (LLM serving). TTFT/ITL
-  are measured per content chunk; ``output_len`` comes from ``usage`` when the
-  server emits it (``stream_options.include_usage``), else the requested length.
+* ``openai_chat`` -- OpenAI ``/v1/chat/completions`` SSE (LLM serving and chat interleave). TTFT/ITL are measured per text chunk, ``delta.images`` drives image counts and image latency, and ``output_len`` comes from ``usage`` when the server emits it (``stream_options.include_usage``), else the requested length.
 * ``native_generate`` -- UniServe native ``/generate`` SSE (i2i + interleave).
   Text tokens drive TTFT/ITL; ``image_begin``/``image_step``/``image_done`` drive
   the image metrics; ``finished`` provides server-reported token/image counts.
@@ -26,6 +24,10 @@ from ..response_classifier import (
     classify_json_image_response,
     classify_native_events,
     classify_openai_events,
+    openai_delta_images,
+    openai_delta_text,
+    openai_message_images,
+    openai_message_text,
 )
 from ..sse import TERMINAL_EVENT_TYPES, aiter_sse_events, aiter_sse_events_from_text
 from ..tasks.base import TaskRequest
@@ -44,6 +46,7 @@ async def send_request(
     payload = {key: value for key, value in request.payload.items() if value is not None}
     url = base_url.rstrip("/") + request.endpoint
     record = RequestRecord(request_id=request_id, task=task)
+    record.endpoint = request.endpoint
     record.start_time = time.perf_counter()
     try:
         if request.kind == "images_generations":
@@ -104,7 +107,8 @@ async def _send_chat_json(
     payload: dict[str, Any],
     record: RequestRecord,
 ) -> None:
-    """One non-streamed chat completion (diffusion-pipeline chat backends)."""
+    """One non-streamed chat completion (diffusion-pipeline backends and
+    image-only chat). Success requires text or images."""
     response = await client.post(url, json=payload)
     record.latency = time.perf_counter() - record.start_time
     record.status_code = response.status_code
@@ -117,6 +121,7 @@ async def _send_chat_json(
         return
     choices = data.get("choices") if isinstance(data, dict) else None
     content = ""
+    images: list[dict[str, Any]] = []
     if isinstance(choices, list) and choices:
         choice0 = choices[0] if isinstance(choices[0], dict) else {}
         finish_reason = choice0.get("finish_reason")
@@ -126,16 +131,13 @@ async def _send_chat_json(
         if isinstance(stop_reason, str):
             record.stop_reason = stop_reason
         message = choice0.get("message")
-        raw = (message or {}).get("content")
-        if isinstance(raw, str):
-            content = raw
-        elif isinstance(raw, list):
-            content = "".join(
-                part.get("text", "")
-                for part in raw
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
+        content = openai_message_text(message)
+        images = openai_message_images(message)
     record.generated_text = content
+    if images:
+        record.images = len(images)
+        # Non-streaming: every returned image shares the request E2E latency.
+        record.image_latencies = [record.latency] * len(images)
     usage = data.get("usage") if isinstance(data, dict) else None
     if isinstance(usage, dict):
         if isinstance(usage.get("completion_tokens"), int):
@@ -143,7 +145,7 @@ async def _send_chat_json(
         if isinstance(usage.get("prompt_tokens"), int):
             record.prompt_len = int(usage["prompt_tokens"])
     transport_ok = response.status_code < 400
-    record.success = transport_ok and bool(content)
+    record.success = transport_ok and bool(content or images)
     record.classifier = "ok" if record.success else (
         f"transport_status_{response.status_code}" if not transport_ok else "empty_completion"
     )
@@ -202,7 +204,9 @@ def _parse_openai(
     record.classifier = classifier
     record.prompt_len = prompt_len
 
-    content_times: list[float] = []
+    itl: list[float] = []
+    last_text_time: float | None = None
+    image_since_last_text = False
     output_len = output_len_fallback
     prompt_tokens: int | None = None
     for event in events:
@@ -223,20 +227,33 @@ def _parse_openai(
                 output_len = int(usage["completion_tokens"])
             if isinstance(usage.get("prompt_tokens"), int):
                 prompt_tokens = int(usage["prompt_tokens"])
-        content = _openai_delta_text(event)
+        content = openai_delta_text(event)
+        images = openai_delta_images(event)
+        timestamp = event.get("_client_t")
         if content:
             record.text_chunks.append(content)
             record.generated_text += content
-            timestamp = event.get("_client_t")
             if timestamp is not None:
-                content_times.append(float(timestamp))
+                timestamp_f = float(timestamp)
+                if last_text_time is None:
+                    record.ttft = timestamp_f - record.start_time
+                elif not image_since_last_text:
+                    itl.append(timestamp_f - last_text_time)
+                last_text_time = timestamp_f
+                image_since_last_text = False
+        if images:
+            record.images += len(images)
+            image_since_last_text = True
+            if timestamp is not None:
+                timestamp_f = float(timestamp)
+                if record.first_image_latency is None:
+                    record.first_image_latency = timestamp_f - record.start_time
+                record.image_latencies.extend([timestamp_f - record.start_time] * len(images))
 
     if prompt_tokens is not None:
         record.prompt_len = prompt_tokens
     record.output_len = output_len
-    if content_times:
-        record.ttft = content_times[0] - record.start_time
-        record.itl = [content_times[i] - content_times[i - 1] for i in range(1, len(content_times))]
+    record.itl = itl
 
 
 def _parse_native(
@@ -329,28 +346,3 @@ def _parse_native(
 def _last_event_time(events: list[dict[str, Any]], default_start: float) -> float:
     times = [float(event["_client_t"]) for event in events if event.get("_client_t") is not None]
     return max(times) if times else time.perf_counter()
-
-
-def _openai_delta_text(event: dict[str, Any]) -> str:
-    choices = event.get("choices")
-    if not isinstance(choices, list):
-        return ""
-    parts: list[str] = []
-    for choice in choices:
-        if not isinstance(choice, dict):
-            continue
-        delta = choice.get("delta")
-        if isinstance(delta, dict):
-            content = delta.get("content")
-            if isinstance(content, str):
-                parts.append(content)
-            reasoning = delta.get("reasoning")
-            if isinstance(reasoning, str):
-                parts.append(reasoning)
-            reasoning_content = delta.get("reasoning_content")
-            if isinstance(reasoning_content, str):
-                parts.append(reasoning_content)
-        text = choice.get("text")
-        if isinstance(text, str):
-            parts.append(text)
-    return "".join(parts)

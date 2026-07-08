@@ -161,6 +161,8 @@ def _build_tower_axis(tower_devices: Sequence[str] | None, tower_primary: int) -
     if tower_devices is None:
         return None
     devices = tuple(torch.device(d) for d in tower_devices)
+    for device in devices:
+        _validate_cuda_device_index(device)
     if len(devices) <= 1:
         return None
     primary = int(tower_primary)
@@ -206,7 +208,18 @@ def _set_cuda_device(device: torch.device, tp_rank: int) -> None:
     if not torch.cuda.is_available():
         raise distributed_setup_error("tp_size > 1 on cuda requires torch.cuda.is_available()")
     index = device.index if device.index is not None else int(tp_rank)
+    _validate_cuda_device_index(torch.device(f"cuda:{index}"))
     torch.cuda.set_device(index)
+
+
+def _validate_cuda_device_index(device: torch.device) -> None:
+    if device.type != "cuda" or device.index is None:
+        return
+    if not torch.cuda.is_available():
+        raise distributed_setup_error(f"cuda device {device} requires torch.cuda.is_available()")
+    visible = int(torch.cuda.device_count())
+    if int(device.index) < 0 or int(device.index) >= visible:
+        raise distributed_setup_error(f"cuda device {device} is outside the {visible} visible CUDA device(s)")
 
 
 def _distributed_backend(device: torch.device, *, backend_override: str | None = None) -> str:
