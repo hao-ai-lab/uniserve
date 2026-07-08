@@ -108,6 +108,7 @@ class TextAttentionMetadata:
     cu_seqlens_k: "torch.Tensor | None" = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
+    max_context_len: int = 0
     mode: "ForwardMode | None" = None
 
     @classmethod
@@ -121,6 +122,7 @@ class TextAttentionMetadata:
         query_lens: "torch.Tensor",
         decode_page_ids: "torch.Tensor",
         decode_page_offsets: "torch.Tensor",
+        max_context_len: int = 0,
     ) -> "TextAttentionMetadata":
         """Build a fully-initialized decode-graph metadata in one step.
 
@@ -145,6 +147,7 @@ class TextAttentionMetadata:
             kv_seqlens_cpu=tuple(1 for _ in range(batch_size)),
             decode_page_ids=decode_page_ids,
             decode_page_offsets=decode_page_offsets,
+            max_context_len=int(max_context_len),
             mode=ForwardMode.DECODE,
         )
 
@@ -168,6 +171,7 @@ class TextAttentionMetadataBuilder:
         "cu_seqlens_k",
         "max_seqlen_q",
         "max_seqlen_k",
+        "max_context_len",
         "mode",
     )
 

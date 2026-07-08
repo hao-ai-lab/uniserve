@@ -7,7 +7,7 @@ use serde_json::Value;
 use uniserve_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
 use uniserve_engine_runtime::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_NUM_SEQS, SchedulingPolicy,
+    DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy,
 };
 use uniserve_worker_ipc::WorkerLaunchConfig;
 
@@ -92,6 +92,9 @@ pub struct EngineSettings {
     pub max_num_seqs: usize,
     /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
     pub long_prefill_threshold: usize,
+    /// Per-step budget of text prefill tokens allowed to join a decode batch
+    /// as one mixed extend+decode forward. `0` disables mixing.
+    pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend. `None` means
@@ -126,12 +129,13 @@ impl Default for EngineSettings {
             backend: EngineBackendKind::Worker,
             device: "cuda".to_string(),
             attention_backend: "auto".to_string(),
-            block_size: 256,
+            block_size: 64,
             pipeline_depth: 2,
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: None,
             kv_token_capacity: None,

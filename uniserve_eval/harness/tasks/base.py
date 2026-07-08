@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from ..spec import BenchmarkSpec
 
-RequestKind = Literal["openai_chat", "native_generate", "images_generations"]
+RequestKind = Literal["openai_chat", "openai_chat_json", "native_generate", "images_generations"]
 
 
 @dataclass(frozen=True)

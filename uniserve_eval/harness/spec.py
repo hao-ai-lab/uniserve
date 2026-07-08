@@ -71,6 +71,11 @@ class BenchmarkSpec:
     max_images: int | None = None
     i2i_mode: str = "image"
 
+    # Interleaved text+image generation. ``interleave_wire`` selects the request shape:
+    # "native"      -> UniServe /generate mode:"interleave" SSE
+    # "openai_chat" -> OpenAI chat completions with modalities:["text","image"] and image_config
+    interleave_wire: str = "native"
+
     # Image understanding (i2t). ``i2t_wire`` selects the request shape:
     # "native"      -> UniServe /generate mode:"understand" SSE
     # "openai_chat" -> OpenAI chat completions with image_url content

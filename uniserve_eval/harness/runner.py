@@ -66,6 +66,7 @@ class BenchmarkRunner:
             },
         )
         (self.writer.output_dir / "requests.jsonl").write_text("", encoding="utf-8")
+        (self.writer.output_dir / "gpu_samples.jsonl").write_text("", encoding="utf-8")
 
         # Deterministic Poisson arrivals (matches sglang's np.random.seed(seed)).
         np.random.seed(self.spec.seed)
@@ -107,6 +108,8 @@ class BenchmarkRunner:
         )
         if sampler is not None:
             summary["gpu_memory"] = sampler.summary()
+            for sample in sampler.sample_records:
+                self.writer.append_jsonl("gpu_samples.jsonl", sample)
 
         self.writer.write_json("summary.json", summary)
         for record in records:
@@ -125,6 +128,11 @@ class BenchmarkRunner:
             task=self.spec.task.value,
             prompt_len=int(row.get("prompt_len") or 0),
             output_len_fallback=output_len_fallback,
+            scheduled_time=(
+                float(row["_harness_scheduled_time"])
+                if row.get("_harness_scheduled_time") is not None
+                else None
+            ),
         )
 
     def _load_tokenizer(self) -> Any | None:

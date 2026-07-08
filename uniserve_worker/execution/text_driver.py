@@ -131,6 +131,19 @@ class DeferredTextSeqResult(ForwardOutputBase):
             object.__setattr__(self, "_finalized", result)
         return dict(self._finalized)
 
+    def ready(self) -> bool:
+        if self._finalized is not None:
+            return True
+        ready = getattr(self._sampling_result, "ready", None)
+        return bool(ready()) if callable(ready) else True
+
+    def cuda_ready_group_key(self) -> int:
+        return id(self._sampling_result)
+
+    def cuda_ready_elapsed_us(self) -> int | None:
+        elapsed = getattr(self._sampling_result, "cuda_ready_elapsed_us", None)
+        return elapsed() if callable(elapsed) else None
+
 
 def sample_logits_result(
     *,
@@ -225,6 +238,23 @@ class TextDriver:
                     model,
                     defer_cpu_results=defer_cpu_results,
                 )
+        if text.mode == ForwardMode.MIXED and self.graph_runner is not None:
+            # Compute in an order that keeps graph token-bucket padding legal
+            # for the final row, but return results in the wire op order (the
+            # response finalizer matches per-seq results to ops positionally).
+            reordered = self.graph_runner.reorder_mixed_for_padding(text)
+            if reordered is not text:
+                row_by_op = {id(op): row for row, op in enumerate(reordered.ops)}
+                results = self._step_once(
+                    reordered,
+                    list(reordered.ops),
+                    request_states,
+                    model,
+                    defer_cpu_results=defer_cpu_results,
+                    defer_sampling=defer_sampling,
+                    tensor_store=tensor_store,
+                )
+                return [results[row_by_op[id(op)]] for op in ops]
         return self._step_once(
             text,
             ops,
@@ -246,6 +276,12 @@ class TextDriver:
         defer_sampling: bool = False,
         tensor_store: Any | None = None,
     ) -> list[Any]:
+        stats = get_forward_context().stats
+        cuda_ready_start_event = _record_cuda_ready_start_event(
+            self.kv_pool,
+            stats=stats,
+            defer_cpu_results=defer_cpu_results,
+        )
         with profile_range("uniserve.text.forward"):
             logits_batch, req_ids = self._forward(model, text, request_states)
         # KV-length advance is system-owned now (derived from seq_lens), not the
@@ -254,7 +290,6 @@ class TextDriver:
         if defer_sampling and tensor_store is not None:
             with profile_range("uniserve.text.publish_logits"):
                 return self._publish_logits(ops, req_ids, logits_batch, tensor_store)
-        stats = get_forward_context().stats
         start = component_timer_start(stats)
         with profile_range("uniserve.text.sample"):
             return self._sample_logits_batch(
@@ -265,6 +300,7 @@ class TextDriver:
                 stats,
                 start,
                 defer_cpu_results=defer_cpu_results,
+                cuda_ready_start_event=cuda_ready_start_event,
             )
 
     def _decode_burst(
@@ -628,15 +664,7 @@ class TextDriver:
         if mode == ForwardMode.DECODE:
             return fb.input_ids.reshape(fb.batch_size, 1), fb.positions.reshape(fb.batch_size, 1)
         if mode == ForwardMode.EXTEND:
-            lengths = [len(tokens) for tokens in text.token_ids]
-            ragged = len(set(lengths)) != 1
-            if ragged or fb.has_padding:
-                return fb.input_ids, fb.positions
-            length = lengths[0]
-            return (
-                fb.input_ids.reshape(fb.batch_size, length),
-                fb.positions.reshape(fb.batch_size, length),
-            )
+            return fb.input_ids, fb.positions
         return fb.input_ids, fb.positions
 
     def _graph_padded_num_tokens(self, text: "TextBatch", ctx: Any) -> int | None:
@@ -683,6 +711,7 @@ class TextDriver:
         start: int,
         *,
         defer_cpu_results: bool = False,
+        cuda_ready_start_event: torch.cuda.Event | None = None,
     ) -> list[TextTokenOutput | DeferredTextSeqResult]:
         if logits_batch.ndim != 2:
             raise invalid_descriptor("batched text logits rows must form a [batch, vocab] tensor")
@@ -706,8 +735,10 @@ class TextDriver:
                 allowed,
                 suppress,
                 defer_cpu=defer_cpu_results,
+                enable_cuda_timing=cuda_ready_start_event is not None,
             )
         if isinstance(sampling_result, DeferredBatchedSamplingResult):
+            sampling_result.set_ready_start_event(cuda_ready_start_event)
             out: list[TextTokenOutput | DeferredTextSeqResult] = []
             for row, req_id in enumerate(req_ids):
                 state = request_states.get(req_id)
@@ -960,6 +991,23 @@ def _next_decode_position(op: Mapping[str, Any]) -> int:
     if not isinstance(pos, (list, tuple)) or len(pos) != 2:
         raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
     return _positive_int(pos[1], "decode burst op.pos_range[1]", minimum=0)
+
+
+def _record_cuda_ready_start_event(
+    kv_pool: "PagedKVPool | None",
+    *,
+    stats: ForwardStats | None,
+    defer_cpu_results: bool,
+) -> torch.cuda.Event | None:
+    if stats is None or not defer_cpu_results:
+        return None
+    tensor = getattr(kv_pool, "k", None)
+    device = getattr(tensor, "device", None)
+    if not isinstance(device, torch.device) or device.type != "cuda":
+        return None
+    event = torch.cuda.Event(enable_timing=True)
+    event.record(torch.cuda.current_stream(device))
+    return event
 
 
 def _same_tensor(lhs: Any, rhs: torch.Tensor) -> bool:

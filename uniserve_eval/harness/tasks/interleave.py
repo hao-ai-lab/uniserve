@@ -6,7 +6,7 @@ from .base import BenchmarkTask, TaskRequest
 
 
 class InterleaveTask(BenchmarkTask):
-    """Interleaved text+image generation via the native ``/generate`` SSE endpoint."""
+    """Interleaved text+image generation."""
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
         image: dict[str, Any] = {}
@@ -21,6 +21,35 @@ class InterleaveTask(BenchmarkTask):
         if self.spec.steps is not None:
             image["steps"] = int(self.spec.steps)
         max_tokens = item.get("max_tokens", self.spec.max_tokens or 512)
+        if self.spec.interleave_wire == "openai_chat":
+            image_config = dict(image)
+            if item.get("aspect_ratio") is not None:
+                image_config["aspect_ratio"] = str(item["aspect_ratio"])
+            payload: dict[str, Any] = {
+                "model": self.spec.model,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "modalities": ["text", "image"],
+                "messages": [{"role": "user", "content": item["prompt"]}],
+                "max_completion_tokens": int(max_tokens),
+                "temperature": self.spec.temperature,
+                "top_p": self.spec.top_p,
+                "image_config": image_config,
+            }
+            endpoint = (
+                "/v1/chat/completions"
+                if self.spec.endpoint == "/generate"
+                else self.spec.endpoint
+            )
+            if self.spec.extra_request_body:
+                extra = dict(self.spec.extra_request_body)
+                extra_image = extra.pop("image_config", None)
+                if isinstance(extra_image, dict):
+                    image_config.update(extra_image)
+                payload.update(extra)
+            return TaskRequest(endpoint=endpoint, payload=payload, kind="openai_chat")
+        if self.spec.interleave_wire != "native":
+            raise ValueError(f"unsupported interleave_wire: {self.spec.interleave_wire}")
         payload: dict[str, Any] = {
             "prompt": item["prompt"],
             "mode": "interleave",

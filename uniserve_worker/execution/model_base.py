@@ -42,8 +42,7 @@ class UniModelBase(ModelHooks):
     * the KV store-dtype helpers ``_kv_store_dtype_for`` / ``_kv_dtype_name_for``
       (require an instance ``kv_cache_dtype`` attribute);
     * a single ``batch_policy()`` and ``caps()`` driven by ``_caps_descriptor``,
-      both reading ``max_batch_ops`` from the same descriptor so the two never
-      drift (mixed-mode grouping is unconditional).
+      both reading ``max_batch_ops`` from the same descriptor so the two stay aligned.
 
     The model-specific ``__init__`` bodies (cuda-graph runners, LoRA/enc_store,
     dual-device pools) stay in the subclasses; only the caps/batch_policy/

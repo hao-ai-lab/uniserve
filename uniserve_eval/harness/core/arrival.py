@@ -60,10 +60,12 @@ async def run_load(
         warmup_outputs = await asyncio.gather(*warmup_tasks)
         if not any(getattr(output, "success", False) for output in warmup_outputs):
             first = warmup_outputs[0] if warmup_outputs else None
+            classifier = getattr(first, "classifier", None)
+            status = getattr(first, "status_code", None)
             error = getattr(first, "error", None)
             raise RuntimeError(
                 "Warmup failed -- check the benchmark arguments and server. "
-                f"First error: {error}"
+                f"First classifier: {classifier}; status: {status}; error: {error}"
             )
 
     await asyncio.sleep(1.0)
@@ -79,7 +81,9 @@ async def run_load(
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task[Any]] = []
     async for row in get_request(rows, request_rate):
-        tasks.append(asyncio.create_task(limited(row)))
+        scheduled = dict(row)
+        scheduled["_harness_scheduled_time"] = time.perf_counter()
+        tasks.append(asyncio.create_task(limited(scheduled)))
     outputs = await asyncio.gather(*tasks)
     dur_s = time.perf_counter() - benchmark_start_time
     return list(outputs), dur_s

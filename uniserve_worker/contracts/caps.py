@@ -67,9 +67,8 @@ _REQUIRED_CAP_KEYS = (
 class ExecutionConstraints:
     """Scheduler-facing batch limits advertised in worker caps."""
 
-    # und/gen mixed-batch single-forward is unconditional; there is deliberately
-    # no ``supports_mixed_op_kinds`` flag, since the existence of such a flag
-    # would imply mixing could be disabled.
+    # The scheduler owns lane formation; workers advertise only scalar limits,
+    # not a separate mixed-op capability flag.
     max_batch_ops: int
 
 

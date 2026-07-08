@@ -32,10 +32,22 @@ class RequestRecord:
     # Timing (seconds). ``start_time`` is a ``perf_counter()`` taken right before
     # the request is sent; ``latency`` is the request E2E; ``ttft`` is time to the
     # first text token; ``itl`` is the per-token inter-token-latency list.
+    scheduled_time: float | None = None
     start_time: float = 0.0
+    http_response_time: float | None = None
+    first_text_time: float | None = None
+    first_image_begin_time: float | None = None
+    first_image_done_time: float | None = None
+    final_event_time: float | None = None
     latency: float = 0.0
     ttft: float = 0.0
     itl: list[float] = field(default_factory=list)
+
+    # Server-side scheduling timestamps from native UniServe ``scheduled`` SSE
+    # events. They are wall-clock seconds from the server process; only the
+    # duration between them is mixed with client-side durations.
+    server_queued_at: float | None = None
+    server_scheduled_at: float | None = None
 
     # Token accounting (server-reported where available).
     prompt_len: int = 0
@@ -54,6 +66,7 @@ class RequestRecord:
     first_image_latency: float | None = None
     image_gen_seconds: list[float] = field(default_factory=list)
     image_steps: list[int] = field(default_factory=list)
+    image_spans: list[dict[str, Any]] = field(default_factory=list)
 
     status_code: int | None = None
     finish_reason: str | None = None
@@ -61,12 +74,63 @@ class RequestRecord:
 
     def record_dict(self) -> dict[str, Any]:
         """Compact per-request row for ``requests.jsonl`` (no large blobs)."""
+        server_queue_wait = (
+            self.server_scheduled_at - self.server_queued_at
+            if self.server_queued_at is not None and self.server_scheduled_at is not None
+            else None
+        )
+        http_response = (
+            self.http_response_time - self.start_time
+            if self.http_response_time is not None
+            else None
+        )
+        dispatch_wait = (
+            self.start_time - self.scheduled_time
+            if self.scheduled_time is not None
+            else None
+        )
+        stream_first_text_wait = (
+            self.first_text_time - self.http_response_time
+            if self.first_text_time is not None and self.http_response_time is not None
+            else None
+        )
+        ttft_residual = (
+            max(0.0, self.ttft - server_queue_wait)
+            if self.ttft and server_queue_wait is not None
+            else None
+        )
         return {
             "request_id": self.request_id,
             "task": self.task,
             "success": self.success,
             "classifier": self.classifier,
             "error": self.error,
+            "scheduled_time": self.scheduled_time,
+            "client_send_time": self.start_time,
+            "http_response_time": self.http_response_time,
+            "first_text_time": self.first_text_time,
+            "first_image_begin_time": self.first_image_begin_time,
+            "first_image_done_time": self.first_image_done_time,
+            "final_event_time": self.final_event_time,
+            "server_queued_at": self.server_queued_at,
+            "server_scheduled_at": self.server_scheduled_at,
+            "client_dispatch_wait_ms": (
+                dispatch_wait * 1000.0 if dispatch_wait is not None else None
+            ),
+            "http_response_ms": (
+                http_response * 1000.0 if http_response is not None else None
+            ),
+            "stream_first_text_wait_ms": (
+                stream_first_text_wait * 1000.0
+                if stream_first_text_wait is not None
+                else None
+            ),
+            "server_queue_wait_ms": (
+                server_queue_wait * 1000.0 if server_queue_wait is not None else None
+            ),
+            "ttft_residual_after_server_queue_ms": (
+                ttft_residual * 1000.0 if ttft_residual is not None else None
+            ),
             "e2e_ms": self.latency * 1000.0,
             "ttft_ms": self.ttft * 1000.0 if self.ttft else None,
             "tpot_ms": (
@@ -83,6 +147,8 @@ class RequestRecord:
             ),
             "image_latencies_ms": [value * 1000.0 for value in self.image_latencies],
             "image_generation_ms": [value * 1000.0 for value in self.image_gen_seconds],
+            "image_steps": list(self.image_steps),
+            "image_spans": list(self.image_spans),
             "status_code": self.status_code,
             "finish_reason": self.finish_reason,
             "stop_reason": self.stop_reason,
