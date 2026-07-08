@@ -63,8 +63,8 @@ def classify_openai_events(events: list[dict[str, Any]]) -> tuple[bool, str]:
         _has_finish_reason(event) for event in events
     ):
         return False, "protocol_missing_terminal"
-    if not any(_openai_delta_text(event) for event in events):
-        return False, "protocol_empty_text"
+    if not any(_openai_delta_text(event) or _openai_delta_images(event) for event in events):
+        return False, "protocol_empty_output"
     return True, "ok"
 
 
@@ -108,3 +108,27 @@ def _openai_delta_text(event: dict[str, Any]) -> str:
         if isinstance(text, str):
             parts.append(text)
     return "".join(parts)
+
+
+def _openai_delta_images(event: dict[str, Any]) -> list[dict[str, Any]]:
+    choices = event.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return []
+    images: list[dict[str, Any]] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        delta_images = delta.get("images")
+        if isinstance(delta_images, list):
+            images.extend(part for part in delta_images if isinstance(part, dict))
+        content = delta.get("content")
+        if isinstance(content, list):
+            images.extend(
+                part
+                for part in content
+                if isinstance(part, dict) and (part.get("type") == "image_url" or "image_url" in part)
+            )
+    return images

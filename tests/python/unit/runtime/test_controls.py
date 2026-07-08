@@ -264,12 +264,7 @@ def test_worker_error_wire_shape():
 
 
 class _FifoServer:
-    """Single-FIFO request source mirroring the iceoryx2 transport.
-
-    ``recv``/``try_recv`` pop from one ordered queue (``recv`` would block in
-    production but the tests pre-load it); responses are recorded in send order
-    so the depth-D pipeline's FIFO-by-call_id guarantee is directly checkable.
-    """
+    """Single-FIFO request source mirroring the iceoryx2 receive side."""
 
     def __init__(self, requests):
         from collections import deque
@@ -333,10 +328,17 @@ def test_worker_runtime_responds_in_receive_order():
 
 
 class _DeferredSeq:
-    def __init__(self, events: list[str], req_id: int, token: int) -> None:
+    def __init__(self, events: list[str], req_id: int, token: int, *, ready_after: int = 0) -> None:
         self.events = events
         self.req_id = req_id
         self.token = token
+        self.ready_after = ready_after
+        self.ready_checks = 0
+
+    def ready(self) -> bool:
+        self.ready_checks += 1
+        self.events.append(f"ready:{self.req_id}:{self.ready_checks}")
+        return self.ready_checks > self.ready_after
 
     def finalize(self) -> dict:
         self.events.append(f"finalize:{self.req_id}")
@@ -344,10 +346,17 @@ class _DeferredSeq:
 
 
 class _DeferredOverlapEngine(StubEngine):
-    def __init__(self, events: list[str], *, defer_steps: set[int] | None = None) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        defer_steps: set[int] | None = None,
+        ready_after: dict[int, int] | None = None,
+    ) -> None:
         super().__init__(block_size=256)
         self.events = events
         self.defer_steps = defer_steps or {1}
+        self.ready_after = ready_after or {}
 
     def execute(self, batch, *, defer_text_cpu_results=False):
         req_id = int(batch["ops"][0]["req_id"])
@@ -356,7 +365,15 @@ class _DeferredOverlapEngine(StubEngine):
         if step_id in self.defer_steps and defer_text_cpu_results:
             return {
                 "step_id": step_id,
-                "per_seq": [_DeferredSeq(self.events, req_id, 101)],
+                "per_seq": [
+                    _DeferredSeq(
+                        self.events,
+                        req_id,
+                        101,
+                        ready_after=int(self.ready_after.get(step_id, 0)),
+                    )
+                ],
+                "forward_stats": {"component_us": {}},
             }
         return super().execute(batch)
 
@@ -378,11 +395,14 @@ def test_worker_runtime_depth1_finalizes_each_before_next_dispatch():
     assert events.index("finalize:1") < events.index("execute_step:2:defer=True")
     assert [resp["call_id"] for resp in server.responses] == [1, 2, 3]
     assert server.responses[0]["result"]["per_seq"][0]["sampled_token_id"] == 101
+    component_us = server.responses[0]["result"]["forward_stats"]["component_us"]
+    assert "worker_deferred_wait" in component_us
+    assert "worker_result_finalize" in component_us
 
 
 def test_worker_runtime_depth3_overlaps_multiple_deferred_finalizes():
     # At depth 3 the third forward launches before either earlier deferred D2H
-    # finalizes, and all responses still leave in receive order.
+    # finalizes; immediately-ready deferred results still leave in dispatch order.
     events: list[str] = []
     server = _FifoServer(
         [
@@ -402,10 +422,7 @@ def test_worker_runtime_depth3_overlaps_multiple_deferred_finalizes():
     assert [resp["call_id"] for resp in server.responses] == [1, 2, 3, 4]
 
 
-def test_worker_runtime_preserves_order_with_control_between_deferred_executes():
-    # A control interleaved between a deferred execute and a later execute must
-    # still respond in strict receive order: the deferred result, then the
-    # control ack, then the later execute, then shutdown.
+def test_worker_runtime_sends_ready_work_before_blocked_deferred_execute():
     events: list[str] = []
     server = _FifoServer(
         [
@@ -417,9 +434,11 @@ def test_worker_runtime_preserves_order_with_control_between_deferred_executes()
     )
 
     WorkerRuntime(
-        _DeferredOverlapEngine(events, defer_steps={1}), server, pipeline_depth=4
+        _DeferredOverlapEngine(events, defer_steps={1}, ready_after={1: 3}),
+        server,
+        pipeline_depth=4,
     ).serve()
 
-    assert [resp["call_id"] for resp in server.responses] == [1, 2, 3, 4]
-    assert [resp["kind"] for resp in server.responses] == ["result", "metrics", "result", "ok"]
-    assert server.responses[0]["result"]["per_seq"][0]["sampled_token_id"] == 101
+    assert [resp["call_id"] for resp in server.responses] == [2, 3, 1, 4]
+    assert [resp["kind"] for resp in server.responses] == ["metrics", "result", "result", "ok"]
+    assert server.responses[2]["result"]["per_seq"][0]["sampled_token_id"] == 101

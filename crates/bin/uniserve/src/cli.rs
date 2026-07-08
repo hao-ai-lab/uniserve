@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
 use uniserve_engine_runtime::{
-    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MIXED_PREFILL_TOKENS, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS,
 };
 use uniserve_server_app::{
@@ -98,7 +98,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value = "auto")]
     pub attention_backend: String,
     /// KV block size in tokens (the page size).
-    #[arg(long, default_value_t = 256, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long, default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
     /// How many op-batches the scheduler keeps in flight against the worker.
     #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
@@ -115,6 +115,10 @@ pub(crate) struct EngineArgs {
     /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
     #[arg(long, default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: usize,
+    /// Per-step budget of text prefill tokens allowed to join a decode batch
+    /// as one mixed extend+decode forward (0 disables mixing).
+    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS)]
+    pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
     #[arg(long, value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
@@ -166,6 +170,7 @@ impl EngineArgs {
         core.max_num_batched_tokens = self.max_num_batched_tokens;
         core.max_num_seqs = self.max_num_seqs;
         core.long_prefill_threshold = self.long_prefill_threshold;
+        core.mixed_prefill_tokens = self.mixed_prefill_tokens;
         core.scheduler_policy = self.scheduler_policy.into();
         // The engine subprocess does not load the frontend model backend, so it
         // cannot derive the model's real context length here; an explicit
@@ -296,7 +301,7 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long)]
     pub transfer: Option<String>,
     /// KV block size in tokens (the page size).
-    #[arg(long, default_value_t = 256, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long, default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
@@ -316,6 +321,10 @@ pub(crate) struct SharedRuntimeArgs {
     /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
     #[arg(long, default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: usize,
+    /// Per-step budget of text prefill tokens allowed to join a decode batch
+    /// as one mixed extend+decode forward (0 disables mixing).
+    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS)]
+    pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
     #[arg(long, value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
@@ -401,6 +410,7 @@ impl SharedRuntimeArgs {
             max_num_batched_tokens: self.max_num_batched_tokens,
             max_num_seqs: self.max_num_seqs,
             long_prefill_threshold: self.long_prefill_threshold,
+            mixed_prefill_tokens: self.mixed_prefill_tokens,
             scheduler_policy: self.scheduler_policy.into(),
             // `None` lets `build_state` derive the model's real context length;
             // an explicit `--max-model-len` overrides it.
@@ -533,9 +543,9 @@ pub(crate) struct WorkerLaunchArgs {
     pub cuda_graph_warmup: bool,
     #[arg(long)]
     pub cuda_graph_warmup_batches: Option<String>,
-    #[arg(long)]
+    #[arg(long, action = ArgAction::Set, default_value_t = false)]
     pub prefill_cuda_graph: bool,
-    #[arg(long)]
+    #[arg(long, action = ArgAction::Set, default_value_t = false)]
     pub prefill_cuda_graph_warmup: bool,
     #[arg(long)]
     pub prefill_cuda_graph_warmup_tokens: Option<String>,
@@ -687,12 +697,18 @@ impl WorkerLaunchArgs {
             "--cuda-graph-warmup-batches",
             cfg.cuda_graph_warmup_batches.as_ref(),
         );
-        if cfg.prefill_cuda_graph {
-            args.push("--prefill-cuda-graph".to_string());
-        }
-        if cfg.prefill_cuda_graph_warmup {
-            args.push("--prefill-cuda-graph-warmup".to_string());
-        }
+        push_bool_value(
+            args,
+            "--prefill-cuda-graph",
+            cfg.prefill_cuda_graph,
+            default.prefill_cuda_graph,
+        );
+        push_bool_value(
+            args,
+            "--prefill-cuda-graph-warmup",
+            cfg.prefill_cuda_graph_warmup,
+            default.prefill_cuda_graph_warmup,
+        );
         push_option(
             args,
             "--prefill-cuda-graph-warmup-tokens",
@@ -849,7 +865,7 @@ mod tests {
         };
         // Graceful drain is enabled by default (non-zero), not disabled.
         assert_eq!(args.runtime.shutdown_timeout, 30);
-        assert_eq!(args.runtime.block_size, 256);
+        assert_eq!(args.runtime.block_size, 64);
     }
 
     #[test]
@@ -902,6 +918,10 @@ mod tests {
             "model",
             "--cuda-graph",
             "false",
+            "--prefill-cuda-graph",
+            "true",
+            "--prefill-cuda-graph-warmup",
+            "true",
             "--varlen-prefill",
             "false",
             "--flashinfer-fast-decode-plan",
@@ -913,6 +933,8 @@ mod tests {
         };
         let settings = args.runtime.engine_settings();
         assert!(!settings.worker_launch.cuda_graph);
+        assert!(settings.worker_launch.prefill_cuda_graph);
+        assert!(settings.worker_launch.prefill_cuda_graph_warmup);
         assert!(!settings.worker_launch.varlen_prefill);
         assert!(!settings.worker_launch.flashinfer_fast_decode_plan);
 
@@ -921,6 +943,16 @@ mod tests {
             engine_args
                 .windows(2)
                 .any(|pair| pair[0] == "--cuda-graph" && pair[1] == "false")
+        );
+        assert!(
+            engine_args
+                .windows(2)
+                .any(|pair| pair[0] == "--prefill-cuda-graph" && pair[1] == "true")
+        );
+        assert!(
+            engine_args
+                .windows(2)
+                .any(|pair| pair[0] == "--prefill-cuda-graph-warmup" && pair[1] == "true")
         );
         assert!(
             engine_args

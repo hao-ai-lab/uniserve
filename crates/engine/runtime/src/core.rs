@@ -13,7 +13,8 @@ use uniserve_engine_api::{EngineHandle, GenerateRequest};
 use uniserve_executor::{Executor, TransferSpec, WorkerKind, WorkersSpec};
 use uniserve_scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, SchedStats, Scheduler, SchedulingPolicy,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats,
+    Scheduler, SchedulingPolicy,
 };
 use uniserve_worker_ipc::{MultiprocExecutor, StageRouter, UniprocExecutor, WorkerLaunchConfig};
 use uniserve_worker_wire::EngineCaps;
@@ -65,6 +66,9 @@ pub struct EngineCoreConfig {
     pub max_num_seqs: usize,
     /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
     pub long_prefill_threshold: usize,
+    /// Per-step budget of text prefill tokens allowed to join a decode batch
+    /// as one mixed extend+decode forward. `0` disables mixing.
+    pub mixed_prefill_tokens: usize,
     /// Waiting queue policy for admitting/scheduling requests.
     pub scheduler_policy: SchedulingPolicy,
     /// Maximum model context length reported to the frontend.
@@ -112,12 +116,13 @@ impl EngineCoreConfig {
             model: model.into(),
             device: "cpu".into(),
             backend: EngineBackend::Sim,
-            block_size: 256,
+            block_size: 64,
             pipeline_depth: 2,
             max_batch: DEFAULT_MAX_BATCH,
             max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
+            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
             scheduler_policy: SchedulingPolicy::Fcfs,
             max_model_len: 8192,
             kv_token_capacity: None,
@@ -343,6 +348,7 @@ impl EngineCore {
                 max_num_batched_tokens: config.max_num_batched_tokens.max(1),
                 max_num_seqs: config.max_num_seqs.max(1),
                 long_prefill_threshold: config.long_prefill_threshold.max(1),
+                mixed_prefill_tokens: config.mixed_prefill_tokens,
                 policy: config.scheduler_policy,
                 ..Default::default()
             },
