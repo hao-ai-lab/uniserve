@@ -1,6 +1,6 @@
+from .default import DefaultTask
 from .i2i import I2ITask
 from .i2t import I2TTask
-from .default import DefaultTask
 from .t2i import T2ITask
 from .text import TextTask
 

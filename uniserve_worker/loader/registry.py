@@ -1,11 +1,13 @@
 """Model loader registry."""
 from __future__ import annotations
 
+from ..contracts.model_family import ModelFamilyDescriptor
 from .base import BaseModelLoader
 
 __all__ = [
     'register_loader',
     'get_loader',
+    'get_loader_for_descriptor',
 ]
 
 _LOADERS: dict[str, BaseModelLoader] = {}
@@ -25,3 +27,11 @@ def get_loader(name: str = "default") -> BaseModelLoader:
     except KeyError as exc:
         known = ", ".join(sorted(_LOADERS)) or "<none>"
         raise ValueError(f"unknown model loader {name!r}; known loaders: {known}") from exc
+
+
+def get_loader_for_descriptor(
+    descriptor: ModelFamilyDescriptor,
+    *,
+    override: str | None = None,
+) -> BaseModelLoader:
+    return get_loader(override or descriptor.loader_name)

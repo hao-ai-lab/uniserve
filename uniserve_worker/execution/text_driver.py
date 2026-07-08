@@ -34,6 +34,8 @@ from ..nn.sampler import (
     sample_one_from_logits,
 )
 from ..runtime.request_state import RequestState, RequestStateTable
+from .decode_burst import DecodeBurstExecutor
+from .text_decode_relay import TextDecodeRelay
 
 if TYPE_CHECKING:
     from ..backends.attention.text_dispatch import TextBackendGate
@@ -55,6 +57,7 @@ _KV_LANE = "text"
 # still lives only in the device relay tensor. Deliberately invalid: any path
 # that embeds the wire token instead of consuming the relay fails loudly.
 _RELAY_PLACEHOLDER_TOKEN_ID = -1
+_DECODE_RELAY = TextDecodeRelay()
 
 
 def text_input_id_replacements_from_relays(
@@ -69,26 +72,7 @@ def text_input_id_replacements_from_relays(
     tokens by flat index (the contiguous-relay override is the pure-decode case).
     """
 
-    replacements: dict[int, torch.Tensor] = {}
-    flat_idx = 0
-    for req_id, tokens, op in zip(text.req_ids, text.token_ids, text.ops):
-        source = str(op.get("token_source") or "wire")
-        if source not in {"wire", "last_sampled"}:
-            raise invalid_descriptor(f"unsupported text token_source {source!r}")
-        if source == "last_sampled":
-            if len(tokens) != 1:
-                raise invalid_descriptor(
-                    "decode op requested token_source='last_sampled' but does not have exactly one token"
-                )
-            state = request_states.get(int(req_id))
-            relay = state.decode_relay.token_tensor
-            if not isinstance(relay, torch.Tensor) or relay.dtype != torch.long or relay.device != device:
-                raise invalid_descriptor(
-                    "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
-                )
-            replacements[flat_idx] = relay.reshape(1)
-        flat_idx += len(tokens)
-    return replacements or None
+    return _DECODE_RELAY.replace_inputs(text, request_states, device)
 
 
 class DeferredTextSeqResult(ForwardOutputBase):
@@ -117,9 +101,11 @@ class DeferredTextSeqResult(ForwardOutputBase):
         if self._finalized is None:
             sample = self._sampling_result.finalize().samples[self._row]
             tok, lp, top = sample
-            current = self._state.decode_relay.token_tensor
-            if _same_tensor(current, self._relay_token_tensor):
-                self._state.decode_relay.token_id = int(tok)
+            _DECODE_RELAY.publish_deferred_sample_id_if_current(
+                self._state,
+                token_id=int(tok),
+                relay_token_tensor=self._relay_token_tensor,
+            )
             result: dict[str, Any] = {
                 "req_id": self.req_id,
                 "sampled_token_id": int(tok),
@@ -223,16 +209,10 @@ class TextDriver:
                 )
         if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
             with profile_range("uniserve.text.decode_burst"):
-                if len(ops) == 1:
-                    return [
-                        self._decode_burst(
-                            dict(ops[0]),
-                            request_states,
-                            model,
-                            defer_cpu_results=defer_cpu_results,
-                        )
-                    ]
-                return self._decode_burst_many(
+                return DecodeBurstExecutor(
+                    self._step_once,
+                    relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
+                ).run(
                     ops,
                     request_states,
                     model,
@@ -311,77 +291,15 @@ class TextDriver:
         *,
         defer_cpu_results: bool = False,
     ) -> dict[str, Any]:
-        from ..contracts.batches import UniForwardBatch
-
-        count = _positive_int(first_op.get("decode_token_count") or 1, "decode_token_count")
-        stop_ids = set(_int_list(first_op.get("decode_stop_token_ids") or []))
-        tokens: list[int] = []
-        last: dict[str, Any] = {}
-        op = dict(first_op)
-        op["decode_token_count"] = 1
-        op["decode_stop_token_ids"] = []
-
-        def resolve(out: Any) -> dict[str, Any]:
-            result = _seq_result_dict(out)
-            tok = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
-            tokens.append(tok)
-            return result
-
-        # Pipelined one-token decode: step k+1's forward is launched from the
-        # device-resident sampled-token relay (``token_source='last_sampled'``)
-        # BEFORE step k's CPU token id is read, so the GPU->CPU token
-        # synchronize overlaps the next step's GPU work instead of serializing
-        # the loop on it. ``pending`` holds the one not-yet-finalized step.
-        #
-        # When the resolved token is a stop token, one forward has already been
-        # launched speculatively with that stop token as its input. Its output
-        # is discarded without sampling a result token, and its cache append is
-        # the same append the non-burst flow performs next when it conditions
-        # on the stop token (e.g. the interleaved driver's
-        # ``append_img_start_if_needed``), so request state stays equivalent to
-        # the sequential loop.
-        pending: Any = None
-        launched = 0
-        while launched < count:
-            fb = UniForwardBatch.from_ops([op])
-            text = fb.as_text()
-            out = self._step_once(
-                text,
-                [op],
-                request_states,
-                model,
-                defer_cpu_results=True,
-                defer_sampling=False,
-                tensor_store=None,
-            )[0]
-            launched += 1
-            if pending is not None:
-                last = resolve(pending)
-                pending = None
-                if tokens[-1] in stop_ids:
-                    out = None
-                    break
-            pending = out
-            if launched >= count:
-                break
-            next_pos = _next_decode_position(op)
-            op = dict(first_op)
-            op["new_block_ids"] = []
-            # Placeholder id: every decode path consumes the device relay for
-            # ``last_sampled`` ops; an invalid id here fails loudly if one ever
-            # reads the wire tokens instead.
-            op["token_ids"] = [_RELAY_PLACEHOLDER_TOKEN_ID]
-            op["token_source"] = "last_sampled"
-            op["pos_range"] = [next_pos, next_pos + 1]
-            op["decode_token_count"] = 1
-            op["decode_stop_token_ids"] = []
-        if pending is not None:
-            last = resolve(pending)
-
-        result = dict(last)
-        result["sampled_token_id"] = tokens[-1]
-        result["sampled_token_ids"] = tokens
-        return result
+        return DecodeBurstExecutor(
+            self._step_once,
+            relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
+        ).run(
+            [first_op],
+            request_states,
+            model,
+            defer_cpu_results=defer_cpu_results,
+        )[0]
 
     def _decode_burst_many(
         self,
@@ -391,94 +309,15 @@ class TextDriver:
         *,
         defer_cpu_results: bool = False,
     ) -> list[dict[str, Any]]:
-        from ..contracts.batches import UniForwardBatch
-
-        states: list[dict[str, Any]] = []
-        for op in first_ops:
-            op_dict = dict(op)
-            count = _positive_int(op_dict.get("decode_token_count") or 1, "decode_token_count")
-            first = dict(op_dict)
-            first["decode_token_count"] = 1
-            first["decode_stop_token_ids"] = []
-            states.append(
-                {
-                    "op": op_dict,
-                    "last_op": first,
-                    "requested": count,
-                    "launched": 0,
-                    "stop_ids": set(_int_list(op_dict.get("decode_stop_token_ids") or [])),
-                    "tokens": [],
-                    "last": None,
-                    "pending": None,
-                    "done": False,
-                }
-            )
-
-        while any(not state["done"] for state in states):
-            iter_ops: list[dict[str, Any]] = []
-            iter_indexes: list[int] = []
-            for index, state in enumerate(states):
-                if state["done"] or int(state["launched"]) >= int(state["requested"]):
-                    continue
-                if int(state["launched"]) == 0:
-                    op = dict(state["last_op"])
-                else:
-                    pos = _next_decode_position(state["last_op"])
-                    op = dict(state["op"])
-                    op["new_block_ids"] = []
-                    op["token_ids"] = [_RELAY_PLACEHOLDER_TOKEN_ID]
-                    op["token_source"] = "last_sampled"
-                    op["pos_range"] = [pos, pos + 1]
-                    op["decode_token_count"] = 1
-                    op["decode_stop_token_ids"] = []
-                state["last_op"] = op
-                iter_indexes.append(index)
-                iter_ops.append(op)
-            if not iter_ops:
-                break
-            iter_text = UniForwardBatch.from_ops(iter_ops).as_text()
-            iter_outputs = self._step_once(
-                iter_text,
-                iter_ops,
-                request_states,
-                model,
-                defer_cpu_results=True,
-                defer_sampling=False,
-                tensor_store=None,
-            )
-            for index, output in zip(iter_indexes, iter_outputs, strict=True):
-                state = states[index]
-                previous = state["pending"]
-                state["pending"] = output
-                state["launched"] = int(state["launched"]) + 1
-                if previous is None:
-                    continue
-                result = _seq_result_dict(previous)
-                token = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
-                state["tokens"].append(token)
-                state["last"] = result
-                if token in state["stop_ids"]:
-                    state["pending"] = None
-                    state["done"] = True
-
-        out: list[dict[str, Any]] = []
-        for state in states:
-            pending = state["pending"]
-            if pending is not None:
-                result = _seq_result_dict(pending)
-                token = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
-                state["tokens"].append(token)
-                state["last"] = result
-                state["pending"] = None
-            tokens = [int(token) for token in state["tokens"]]
-            last = dict(state["last"] or {})
-            if not tokens:
-                raise invalid_descriptor("decode burst did not produce a sampled token")
-            last["sampled_token_id"] = tokens[-1]
-            if int(state["requested"]) > 1:
-                last["sampled_token_ids"] = tokens
-            out.append(last)
-        return out
+        return DecodeBurstExecutor(
+            self._step_once,
+            relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
+        ).run(
+            list(first_ops),
+            request_states,
+            model,
+            defer_cpu_results=defer_cpu_results,
+        )
 
     # ---- forward ---------------------------------------------------------
 
@@ -527,15 +366,7 @@ class TextDriver:
         for op in ops:
             if str(op.get("token_source") or "wire") != "last_sampled":
                 continue
-            relay = request_states.get(int(op["req_id"])).decode_relay
-            tensor = relay.token_tensor
-            if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.long:
-                raise invalid_descriptor(
-                    "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
-                )
-            op["token_tensor"] = tensor
-            if relay.token_id is not None:
-                op["token_ids"] = [int(relay.token_id)]
+            _DECODE_RELAY.attach_last_sampled_to_op(op, request_states.get(int(op["req_id"])))
         outputs = list(model.run_text_logits_batch(ops))
         rows = [self._coerce_logits_row(out) for out in outputs]
         return torch.stack(rows, dim=0), [int(op["req_id"]) for op in ops]
@@ -793,12 +624,13 @@ class TextDriver:
             raise invalid_descriptor(
                 "decode op requested token_source='last_sampled' but does not have exactly one token"
             )
-        relay = state.decode_relay.token_tensor
-        if not isinstance(relay, torch.Tensor) or relay.dtype != torch.long or relay.device != device:
-            raise invalid_descriptor(
-                "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
-            )
-        return relay.reshape(1)
+        return _DECODE_RELAY.consume_token(
+            state,
+            expected_token_id=None,
+            device=device,
+            token_source=source,
+            require=True,
+        )
 
     def _decode_relay_tensors(
         self,
@@ -808,70 +640,12 @@ class TextDriver:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if text.mode != ForwardMode.DECODE:
             return None, None
-        stats = get_forward_context().stats
-        relay_rows: list[torch.Tensor] = []
-        position_rows: list[torch.Tensor] = []
-        position_complete = True
-        for req_id, tokens, pos_range, op in zip(
-            text.req_ids,
-            text.token_ids,
-            text.pos_ranges,
-            text.ops,
-        ):
-            if len(tokens) != 1:
-                _bump_stat(stats, "text_decode_token_relay_misses")
-                return None, None
-            state = request_states.get(int(req_id))
-            expected = int(tokens[0])
-            source = str(op.get("token_source") or "wire")
-            from_last_sampled = source == "last_sampled"
-            if source not in {"wire", "last_sampled"}:
-                raise invalid_descriptor(f"unsupported text token_source {source!r}")
-            relay_token_id = state.decode_relay.token_id
-            relay_token_tensor = state.decode_relay.token_tensor
-            if relay_token_id is None and not from_last_sampled:
-                _bump_stat(stats, "text_decode_token_relay_misses")
-                return None, None
-            if not from_last_sampled and int(relay_token_id) != expected:
-                _bump_stat(stats, "text_decode_token_relay_misses")
-                return None, None
-            if not isinstance(relay_token_tensor, torch.Tensor):
-                _bump_stat(stats, "text_decode_token_relay_misses")
-                if from_last_sampled:
-                    raise invalid_descriptor(
-                        "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
-                    )
-                return None, None
-            if relay_token_tensor.dtype != torch.long or relay_token_tensor.device != device:
-                _bump_stat(stats, "text_decode_token_relay_misses")
-                if from_last_sampled:
-                    raise invalid_descriptor(
-                        "decode op requested token_source='last_sampled' but the relay tensor is on the wrong device"
-                    )
-                return None, None
-            relay_rows.append(relay_token_tensor.reshape(1))
-            expected_position = int(pos_range[0])
-            relay_position_id = state.decode_relay.position_id
-            relay_position_tensor = state.decode_relay.position_tensor
-            if (
-                relay_position_id is None
-                or int(relay_position_id) != expected_position
-                or not isinstance(relay_position_tensor, torch.Tensor)
-                or relay_position_tensor.dtype != torch.long
-                or relay_position_tensor.device != device
-            ):
-                position_complete = False
-                continue
-            position_rows.append(relay_position_tensor.reshape(1))
-        _bump_stat(stats, "text_decode_token_relay_hits", len(relay_rows))
-        if position_complete and len(position_rows) == len(relay_rows):
-            _bump_stat(stats, "text_decode_position_relay_hits", len(position_rows))
-            relay_positions = _coalesce_relay_rows(position_rows)
-        else:
-            _bump_stat(stats, "text_decode_position_relay_misses")
-            relay_positions = None
-        relay_input_ids = _coalesce_relay_rows(relay_rows)
-        return relay_input_ids, relay_positions
+        return _DECODE_RELAY.resolve_decode_batch(
+            text,
+            request_states,
+            device,
+            stats=get_forward_context().stats,
+        )
 
     def _store_decode_position_relays(
         self,
@@ -898,11 +672,7 @@ class TextDriver:
         token_id: int | None,
         token_tensor: torch.Tensor,
     ) -> None:
-        device_token = token_tensor.detach().reshape(1)
-        if device_token.device.type == "cuda":
-            device_token.record_stream(torch.cuda.current_stream(device_token.device))
-        state.decode_relay.token_id = None if token_id is None else int(token_id)
-        state.decode_relay.token_tensor = device_token
+        _DECODE_RELAY.publish_sample(state, token_id=token_id, token_tensor=token_tensor)
 
     @staticmethod
     def _store_position_relay(
@@ -911,11 +681,11 @@ class TextDriver:
         position_id: int,
         position_tensor: torch.Tensor,
     ) -> None:
-        device_position = position_tensor.detach().reshape(1)
-        if device_position.device.type == "cuda":
-            device_position.record_stream(torch.cuda.current_stream(device_position.device))
-        state.decode_relay.position_id = int(position_id)
-        state.decode_relay.position_tensor = device_position
+        _DECODE_RELAY.publish_position(
+            state,
+            position_id=position_id,
+            position_tensor=position_tensor,
+        )
 
 
 def _coalesce_relay_rows(rows: list[torch.Tensor]) -> torch.Tensor:

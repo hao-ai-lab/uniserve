@@ -5,13 +5,17 @@ import importlib
 import threading
 from functools import lru_cache
 
+from ..contracts.model_family import ModelFamilyDescriptor
 from ..foundation.plugins import discover_package_plugins
 from .base import MultimodalProcessor
 
 __all__ = [
     'register_processor',
     'import_processors',
+    'get_processor_for_descriptor',
     'get_processor_for_model',
+    'get_image_pipeline_for_descriptor',
+    'get_image_pipeline_for_model',
 ]
 
 class _ProcessorRegistry:
@@ -55,11 +59,44 @@ def import_processors() -> None:
     _PROCESSOR_REGISTRY.freeze()
 
 
-def get_processor_for_model(model_cls: type) -> MultimodalProcessor | None:
+def _processor_factory_for_descriptor(
+    descriptor: ModelFamilyDescriptor,
+) -> type[MultimodalProcessor] | None:
     import_processors()
-    model_names = {model_cls.__name__, *[str(v) for v in getattr(model_cls, "architectures", ())]}
+    model_names = set(descriptor.names)
+    model_names.add(descriptor.model_class.__name__)
     for processor_cls in _PROCESSOR_REGISTRY.snapshot():
         processor_names = set(getattr(processor_cls, "model_architectures", ()) or ())
         if model_names & processor_names:
-            return processor_cls()
+            return processor_cls
     return None
+
+
+def get_processor_for_descriptor(descriptor: ModelFamilyDescriptor) -> MultimodalProcessor | None:
+    processor = descriptor.processor()
+    if processor is not None:
+        return processor
+    processor_cls = _processor_factory_for_descriptor(descriptor)
+    if processor_cls is None:
+        return None
+    return processor_cls()
+
+
+def get_processor_for_model(model_cls: type) -> MultimodalProcessor | None:
+    return get_processor_for_descriptor(ModelFamilyDescriptor.from_model_class(model_cls))
+
+
+def get_image_pipeline_for_descriptor(descriptor: ModelFamilyDescriptor):
+    processor = get_processor_for_descriptor(descriptor)
+    if processor is None:
+        return None
+    pipeline = descriptor.image_pipeline(processor)
+    if pipeline is not None:
+        return pipeline
+    from .image_pipeline import ImageInputPipeline
+
+    return ImageInputPipeline(processor)
+
+
+def get_image_pipeline_for_model(model_cls: type):
+    return get_image_pipeline_for_descriptor(ModelFamilyDescriptor.from_model_class(model_cls))

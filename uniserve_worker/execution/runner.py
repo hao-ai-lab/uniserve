@@ -33,14 +33,14 @@ from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.profiling import profile_range
 from ..foundation.runtime_config import get_worker_config
 from ..runtime.forward_batch_builder import ForwardBatchBuilder
-from ..runtime.request_state import RequestStateTable
+from ..runtime.request_session import RequestSessionTable
+from ..runtime.residency_manager import ResidencyLeaseManager
 from ..runtime.resources import ResourceRuntime
 from .denoise_driver import DenoiseDriver
 from .encode_driver import EncodeDriver
-from .forward_admission import ForwardAdmissionRouter
 from .forward_driver import ForwardDriver
+from .forward_step import ForwardGroupPlanner, ForwardStepExecutor, ForwardStepOptions
 from .image_decode_driver import ImageDecodeDriver
-from .resource_accountant import ResourceAccountant
 from .text_driver import TextDriver
 
 if TYPE_CHECKING:
@@ -66,6 +66,8 @@ _MIXED_PROOF_ENABLED = env_flag("UNISERVE_MIXED_PROOF_LOG")
 def _model_max_context_len(model: Any) -> int:
     config = getattr(model, "config", None)
     value = getattr(config, "max_position_embeddings", None)
+    if value is None:
+        return 0
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -136,7 +138,7 @@ class ModelRunner:
     def __init__(
         self,
         model: UniModel,
-        request_states: RequestStateTable | None = None,
+        request_states: RequestSessionTable | None = None,
         *,
         drivers: RunnerDrivers | None = None,
         config: RunnerConfig | None = None,
@@ -170,7 +172,7 @@ class ModelRunner:
 
         self.model = model
         self.residency = residency
-        self.request_states = request_states or RequestStateTable()
+        self.request_states = request_states or RequestSessionTable()
         # Deferred sampling: text decode/extend ops publish logits to
         # ``tensor_store`` and return handles — a separate Sampler worker samples.
         # Off = sample inline (default).
@@ -192,6 +194,12 @@ class ModelRunner:
         # CUDA Green Context SM partitioning. ``None`` unless runtime config
         # enables it and the model runs on a CUDA device.
         self.stream_manager = self._maybe_build_stream_manager()
+        self._group_planner = ForwardGroupPlanner(
+            self.batch_policy,
+            accepts_forward_batch=self._accepts_forward_batch,
+            log_text_mixed_split=self._log_text_mixed_split,
+        )
+        self._step_executor = ForwardStepExecutor(self, group_planner=self._group_planner)
 
     def _init_text_execution(
         self,
@@ -238,7 +246,7 @@ class ModelRunner:
         # The accountant holds ``resource_plan`` as the single source of truth;
         # ``ModelRunner.resource_plan`` forwards to it so a runtime reassignment
         # is seen by both.
-        self._accountant = ResourceAccountant(
+        self._accountant = ResidencyLeaseManager(
             self.resource_runtime,
             self.request_states,
             resource_plan,
@@ -405,7 +413,7 @@ class ModelRunner:
 
     def drop_request(self, req_id: int) -> None:
         self.model.drop_request(req_id)
-        self.resource_runtime.release_request(int(req_id))
+        self._accountant.release_request(int(req_id))
         self.request_states.drop(req_id)
 
     def execute(
@@ -415,27 +423,10 @@ class ModelRunner:
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
         parsed = ExecuteBatch.from_wire(batch)
-        forward_stats = ForwardStats() if _forward_metrics_enabled() else None
-        self._register_new_reqs(parsed.new_reqs)
-
-        ops = parsed.ops
-        results: list[dict[str, Any] | None] = [None] * len(ops)
-        with profile_range("uniserve.runner.group_ops"):
-            groups = self._groups(ops)
-        for group in groups:
-            self._run_group(
-                group,
-                results,
-                forward_stats=forward_stats,
-                defer_text_cpu_results=defer_text_cpu_results,
-            )
-
-        if any(result is None for result in results):
-            raise invalid_descriptor("runner missed at least one op result")
-        out = {"step_id": parsed.step_id, "per_seq": results}
-        if forward_stats is not None:
-            out["forward_stats"] = forward_stats.to_wire()
-        return out
+        return self._step_executor.execute(
+            parsed,
+            ForwardStepOptions(defer_text_cpu_results=defer_text_cpu_results),
+        )
 
     def _register_new_reqs(self, new_reqs: tuple[Mapping[str, Any], ...]) -> None:
         """Create/refresh request state and account resident blocks for new reqs.
@@ -451,7 +442,7 @@ class ModelRunner:
                 self._accountant.account_blocks(req_id, state.block_ids, append_to_state=False)
             except Exception:
                 if not existed:
-                    self.resource_runtime.release_request(int(req_id))
+                    self._accountant.release_request(int(req_id))
                     self.request_states.drop(req_id)
                 raise
             self.model.on_new_request(req_id, state)
@@ -685,12 +676,8 @@ class ModelRunner:
         ``TextBackendGate`` and otherwise split per-mode.
         """
         if self.batch_policy.supports_mixed_modes:
-            decision = ForwardAdmissionRouter.from_runtime_config().decide(ops)
-            if decision.use_forward and self._accepts_forward_batch(ops, decision):
-                return [list(enumerate(ops))]
-            self._log_text_mixed_split(ops, decision)
-            return self._mode_ordered_groups(ops)
-        return self._contiguous_groups(ops)
+            return self._group_planner.groups(ops)
+        return self._group_planner.groups(ops)
 
     def _accepts_forward_batch(self, ops: list[Mapping[str, Any]], decision: Any) -> bool:
         """Whether the admitted mixed window can actually run as one forward.
@@ -826,7 +813,9 @@ class ModelRunner:
         if "image_latent" in totals:
             totals["image_latent"] = int(caps.max_latent_size if caps is not None else 0)
         if "encoder_output" in totals:
-            totals["encoder_output"] = int(caps.encoder_cache_budget if caps is not None else 0)
+            totals["encoder_output"] = int(
+                caps.encoder_cache_budget if caps is not None and caps.encoder_cache_budget is not None else 0
+            )
         if "adapter" in totals:
             totals["adapter"] = 0
         return totals
@@ -851,10 +840,7 @@ class ModelRunner:
             )
         elif mode == ForwardMode.COMMIT:
             req_id = int(result["req_id"])
-            self._accountant.release_class_if_managed("image_latent", req_id)
-            self._accountant.release_class_if_managed("scratch", req_id)
-            # commit() clears the residency flags (image_latent_active/scratch_active).
-            self.request_states.commit(req_id)
+            self._accountant.release_generation(req_id, committed=True)
 
     def _record_group_shape(self, stats: ForwardStats, fb: UniForwardBatch) -> None:
         if fb.mode is ForwardMode.MIXED:

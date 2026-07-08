@@ -9,6 +9,7 @@ from types import ModuleType
 from typing import Type
 
 from ..contracts.forward_mode import ForwardMode, mode_for_op
+from ..contracts.model_family import ModelFamilyDescriptor, ModelOperationSet
 from ..contracts.model_protocols import UniModel
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
 from ..foundation.plugins import discover_package_plugins
@@ -19,6 +20,7 @@ __all__ = [
     'MODEL_REGISTRY',
     'import_model_classes',
     'resolve_model_cls',
+    'resolve_model_descriptor',
     'detect_model_architectures',
 ]
 
@@ -30,11 +32,13 @@ class ModelRegistry:
 
     def __init__(self) -> None:
         self._classes: dict[str, Type[UniModel]] = {}
+        self._descriptors: dict[str, ModelFamilyDescriptor] = {}
         self._fallback_cls: Type[UniModel] | None = None
 
     def register(self, model_cls: Type[UniModel], *, names: list[str] | tuple[str, ...] | None = None) -> None:
         _validate_model_contract(model_cls)
         keys = tuple(names or (model_cls.__name__,))
+        descriptor = ModelFamilyDescriptor.from_model_class(model_cls, names=tuple(str(key) for key in keys))
         if bool(getattr(model_cls, "fallback", False)):
             if self._fallback_cls is not None and self._fallback_cls is not model_cls:
                 raise invalid_descriptor("only one fallback model class can be registered")
@@ -45,14 +49,21 @@ class ModelRegistry:
                     continue
                 raise invalid_descriptor(f"model architecture {key!r} already registered")
             self._classes[key] = model_cls
+            self._descriptors[key] = descriptor
 
     def resolve(self, architectures: list[str] | tuple[str, ...]) -> Type[UniModel]:
+        return self.resolve_descriptor(architectures).model_class
+
+    def resolve_descriptor(
+        self,
+        architectures: list[str] | tuple[str, ...],
+    ) -> ModelFamilyDescriptor:
         disabled = set(get_worker_config().disabled_model_archs)
         for arch in architectures:
             if arch in disabled:
                 continue
-            if arch in self._classes:
-                return self._classes[arch]
+            if arch in self._descriptors:
+                return self._descriptors[arch]
         config = get_worker_config()
         if self._fallback_cls is not None and bool(config.allow_transformers_fallback):
             fallback_names = tuple(getattr(self._fallback_cls, "architectures", (self._fallback_cls.__name__,)))
@@ -64,7 +75,7 @@ class ModelRegistry:
                         "fallback_model_class": getattr(self._fallback_cls, "__name__", repr(self._fallback_cls)),
                     },
                 )
-                return self._fallback_cls
+                return ModelFamilyDescriptor.from_model_class(self._fallback_cls, names=fallback_names)
         known = ", ".join(sorted(self._classes)) or "<none>"
         message = f"no UniModel registered for architectures {architectures!r}; known architectures: {known}"
         if self._fallback_cls is not None and not bool(config.allow_transformers_fallback):
@@ -118,6 +129,13 @@ def resolve_model_cls(architectures: list[str] | tuple[str, ...]) -> Type[UniMod
     return MODEL_REGISTRY.resolve(tuple(architectures))
 
 
+def resolve_model_descriptor(
+    architectures: list[str] | tuple[str, ...],
+) -> ModelFamilyDescriptor:
+    import_model_classes()
+    return MODEL_REGISTRY.resolve_descriptor(tuple(architectures))
+
+
 def detect_model_architectures(model_path: str | Path) -> list[str]:
     """Ask registered model classes whether they recognize a checkpoint path."""
 
@@ -132,21 +150,7 @@ def detect_model_architectures(model_path: str | Path) -> list[str]:
 
 
 def _validate_model_contract(model_cls: Type[UniModel]) -> None:
-    supported_ops = tuple(getattr(model_cls, "supported_ops", ()) or ())
-    if not supported_ops:
-        return
-    if bool(getattr(model_cls, "whole_batch_forward", False)):
-        if not callable(getattr(model_cls, "forward", None)):
-            raise capability_mismatch(
-                f"{model_cls.__name__} declares a whole-batch forward but has no forward()"
-            )
-        return
-    for op in supported_ops:
-        missing = _missing_capability(model_cls, str(op))
-        if missing is not None:
-            raise capability_mismatch(
-                f"{model_cls.__name__} declares op {op!r} but does not implement {missing}"
-            )
+    ModelOperationSet.from_model_class(model_cls).validate(model_cls)
 
 
 def _missing_capability(model_cls: Type[UniModel], op: str) -> str | None:

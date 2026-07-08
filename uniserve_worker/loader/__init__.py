@@ -2,7 +2,7 @@
 from .base import BaseModelLoader, LoadResult, ModelBringUp
 from .default import DefaultModelLoader
 from .dummy import DummyModelLoader
-from .registry import get_loader, register_loader
+from .registry import get_loader, get_loader_for_descriptor, register_loader
 from .transformers import NativeLoadSpec, NativeTransformersLoader
 
 __all__ = [
@@ -14,5 +14,6 @@ __all__ = [
     "NativeLoadSpec",
     "NativeTransformersLoader",
     "get_loader",
+    "get_loader_for_descriptor",
     "register_loader",
 ]

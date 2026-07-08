@@ -22,6 +22,7 @@ from ..nn.diffusion import (
 from ..nn.diffusion.cfg import Branch, CfgPlan, CfgRecipe, build_text_image_cfg_plan
 from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.request_state import RequestState
+from .text_image_denoise_session import TextImageDenoiseSession
 
 if TYPE_CHECKING:
     from ..contracts.model_protocols import DenoiseCapable
@@ -268,17 +269,13 @@ class DenoiseDriver:
             branch_outputs = _validate_batched_text_image_outputs(steps, branches_by_step, predicted)
         outputs = []
         for step, velocities in zip(steps, branch_outputs):
-            velocity = combine_text_image_velocity(step, velocities)
-            updated = euler_step(step.latent, velocity, step.t, step.t_next)
-            _accept_denoise_update(model, step, updated)
-            done = step.step_index + 1 >= step.total_steps
-            outputs.append(
-                DenoiseOutput(
-                    req_id=step.req_id,
-                    denoise_done=done,
-                    num_steps_done=step.step_index + 1,
-                )
+            session = TextImageDenoiseSession(
+                model,
+                step,
+                combine_velocity=combine_text_image_velocity,
+                accept_update=_accept_denoise_update,
             )
+            outputs.append(session.apply_update(velocities))
         return outputs
 
     def _predict_text_image_branch(self, predict: Any, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
@@ -15,7 +16,7 @@ from ..contracts.forward_mode import ForwardMode
 from ..contracts.outputs import TextTokenOutput
 from ..foundation.env import env_flag
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..nn.sampler import apply_sampling_batched_with_device_tokens
+from ..nn.sampler import BatchedSamplingResult, apply_sampling_batched_with_device_tokens
 from ..runtime.forward_batch_builder import state_block_ids_for_op
 from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from .denoise_driver import TextImageDenoiseStep, combine_text_image_velocity, text_image_branches
@@ -25,13 +26,99 @@ from .forward_stream import (
     ForwardStreamBuilder,
 )
 from .interleaved_text_stepper import hydrate_cached_prefix_from_op
+from .text_decode_relay import TextDecodeRelay
 
-__all__ = ["run_packed_mixed_forward"]
+__all__ = ["PackedForwardPlan", "PackedMixedForward", "run_packed_mixed_forward"]
 
 logger = logging.getLogger(__name__)
+_DECODE_RELAY = TextDecodeRelay()
 
 _PACKED_MIXED_TIMING = env_flag("UNISERVE_PACKED_MIXED_TIMING")
 _PACKED_MIXED_TIMING_SYNC = env_flag("UNISERVE_PACKED_MIXED_TIMING_SYNC")
+
+TextResultSlot = tuple[int, int, int, PagedTextCache, PagedTextCache, int, int]
+DenoiseResultSlot = tuple[int, TextImageDenoiseStep, int, int]
+
+
+@dataclass
+class PackedForwardPlan:
+    batch: UniForwardBatch
+    denoise_steps: list[tuple[int, TextImageDenoiseStep]]
+    results: list[Any]
+    text_result_slots: list[TextResultSlot] = field(default_factory=list)
+    denoise_result_slots: list[DenoiseResultSlot] = field(default_factory=list)
+
+    def denoise_step_for_row(self, row_index: int) -> TextImageDenoiseStep:
+        for result_index, step in self.denoise_steps:
+            if int(result_index) == int(row_index):
+                return step
+        raise invalid_descriptor(f"no denoise step prepared for mixed row {int(row_index)}")
+
+    def add_text_slot(
+        self,
+        *,
+        row_index: int,
+        segment_start: int,
+        q_len: int,
+        persistent_cache: PagedTextCache,
+        staged_cache: PagedTextCache,
+        base_len: int,
+        last_input_token: int,
+    ) -> None:
+        self.text_result_slots.append(
+            (
+                int(row_index),
+                int(segment_start),
+                int(q_len),
+                persistent_cache,
+                staged_cache,
+                int(base_len),
+                int(last_input_token),
+            )
+        )
+
+    def add_denoise_slot(
+        self,
+        *,
+        row_index: int,
+        step: TextImageDenoiseStep,
+        segment_start: int,
+        q_len: int,
+    ) -> None:
+        self.denoise_result_slots.append(
+            (int(row_index), step, int(segment_start), int(q_len))
+        )
+
+    def set_text_result(self, row_index: int, output: Any) -> None:
+        self.results[int(row_index)] = output
+
+    def set_denoise_result(self, row_index: int, step: TextImageDenoiseStep) -> None:
+        self.results[int(row_index)] = {
+            "req_id": step.req_id,
+            "denoise_done": step.step_index + 1 >= step.total_steps,
+            "num_steps_done": step.step_index + 1,
+        }
+
+
+class PackedMixedForward:
+    """Owns packed mixed-forward row slots, cache writeback, and output order."""
+
+    def __init__(self, owner: Any) -> None:
+        self.owner = owner
+
+    def execute(
+        self,
+        batch: UniForwardBatch,
+        request_states: Any,
+        denoise_steps: list[tuple[int, TextImageDenoiseStep]],
+        results: list[Any],
+    ) -> bool:
+        plan = PackedForwardPlan(batch=batch, denoise_steps=denoise_steps, results=results)
+        return _run_packed_mixed_forward_impl(
+            self.owner,
+            plan,
+            request_states,
+        )
 
 
 def run_packed_mixed_forward(
@@ -41,15 +128,22 @@ def run_packed_mixed_forward(
     denoise_steps: list[tuple[int, TextImageDenoiseStep]],
     results: list[Any],
 ) -> bool:
+    return PackedMixedForward(owner).execute(batch, request_states, denoise_steps, results)
+
+
+def _run_packed_mixed_forward_impl(
+    owner,
+    plan: PackedForwardPlan,
+    request_states: Any,
+) -> bool:
     if owner.model is None:
         return False
+    batch = plan.batch
     builder = ForwardStreamBuilder()
     kv_segments: list[ForwardPagedKVSegment] = []
     embed_chunks: list[torch.Tensor] = []
     indicators: list[torch.Tensor] = []
-    text_result_slots: list[tuple[int, int, int, PagedTextCache, PagedTextCache, int, int]] = []
-    denoise_result_slots: list[tuple[int, TextImageDenoiseStep, int, int]] = []
-    first_pool = owner._forward_target_pool(denoise_steps)
+    first_pool = owner._forward_target_pool(plan.denoise_steps)
     device = torch.device(str(owner.device))
     current_context: dict[str, Any] | None = None
     ctx = get_forward_context()
@@ -154,19 +248,17 @@ def run_packed_mixed_forward(
                     start_pos=start,
                     device=device,
                 )
-                text_result_slots.append(
-                    (
-                        row_index,
-                        segment_start,
-                        q_len,
-                        persistent_cache,
-                        staged_cache,
-                        int(persistent_cache.length),
-                        last_input_token,
-                    )
+                plan.add_text_slot(
+                    row_index=row_index,
+                    segment_start=segment_start,
+                    q_len=q_len,
+                    persistent_cache=persistent_cache,
+                    staged_cache=staged_cache,
+                    base_len=int(persistent_cache.length),
+                    last_input_token=last_input_token,
                 )
             elif mode is ForwardMode.DENOISE:
-                step = next(step for result_index, step in denoise_steps if result_index == row_index)
+                step = plan.denoise_step_for_row(row_index)
                 branches = text_image_branches(step)
                 for branch_index, branch in enumerate(branches):
                     img = step.extra["img"]
@@ -203,7 +295,12 @@ def run_packed_mixed_forward(
                         branch_index=branch_index,
                         device=device,
                     )
-                    denoise_result_slots.append((row_index, step, segment_start, q_len))
+                    plan.add_denoise_slot(
+                        row_index=row_index,
+                        step=step,
+                        segment_start=segment_start,
+                        q_len=q_len,
+                    )
             elif mode is ForwardMode.COMMIT:
                 # Commit rows are part of the same admitted mixed batch, but they do
                 # not contribute hidden-state segments. The model hook decodes them
@@ -260,20 +357,20 @@ def run_packed_mixed_forward(
         text_logits_by_row: dict[int, torch.Tensor] = {}
         text_outputs_by_row: dict[int, TextTokenOutput] = {}
         text_device_tokens_by_row: dict[int, torch.Tensor] = {}
-        if text_result_slots:
+        if plan.text_result_slots:
             text_hidden = torch.cat(
-                [hidden[start:start + q_len] for row_index, start, q_len, *_ in text_result_slots],
+                [hidden[start:start + q_len] for row_index, start, q_len, *_ in plan.text_result_slots],
                 dim=0,
             )
             text_logits = owner.packed_text_logits(text_hidden.unsqueeze(0)).squeeze(0)
             offset = 0
-            for row_index, _start, q_len, *_rest in text_result_slots:
+            for row_index, _start, q_len, *_rest in plan.text_result_slots:
                 next_offset = offset + int(q_len)
                 text_logits_by_row[int(row_index)] = text_logits[offset:next_offset].unsqueeze(0)
                 offset = next_offset
             sample_logits: list[torch.Tensor] = []
             sampling_params: list[dict[str, Any]] = []
-            for row_index, *_rest in text_result_slots:
+            for row_index, *_rest in plan.text_result_slots:
                 req_id = int(batch.ops[row_index]["req_id"])
                 state = request_states.get(req_id)
                 sampling_params.append(dict(state.sampling or {}))
@@ -285,14 +382,21 @@ def run_packed_mixed_forward(
                 [None for _ in sample_logits],
                 [None for _ in sample_logits],
             )
-            for sample_index, (row_index, *_rest) in enumerate(text_result_slots):
+            if not isinstance(sampled, BatchedSamplingResult):
+                sampled = sampled.finalize()
+            for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
                 req_id = int(batch.ops[row_index]["req_id"])
                 sample = sampled.samples[sample_index]
+                top_logprobs = (
+                    [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
+                    if sample.top_logprobs is not None
+                    else None
+                )
                 text_outputs_by_row[int(row_index)] = TextTokenOutput(
                     req_id=req_id,
                     sampled_token_id=int(sample.token_id),
                     sampled_logprob=sample.logprob,
-                    top_logprobs=sample.top_logprobs,
+                    top_logprobs=top_logprobs,
                 )
                 text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
                     sample_index:sample_index + 1
@@ -305,11 +409,11 @@ def run_packed_mixed_forward(
             staged_cache,
             base_len,
             last_input_token,
-        ) in text_result_slots:
+        ) in plan.text_result_slots:
             op = batch.ops[row_index]
             req_id = int(op["req_id"])
             logits = text_logits_by_row[int(row_index)]
-            results[row_index] = text_outputs_by_row[int(row_index)]
+            plan.set_text_result(row_index, text_outputs_by_row[int(row_index)])
             if staged_cache is not persistent_cache:
                 copy_paged_text_cache_span(
                     staged_cache,
@@ -330,7 +434,7 @@ def run_packed_mixed_forward(
                 owner._mark_forward_staging_advanced(staged_cache, persistent_cache, new_len)
             _store_forward_sampled_token_relay(
                 request_states.get(req_id),
-                token_id=int(results[row_index].sampled_token_id),
+                token_id=int(plan.results[row_index].sampled_token_id),
                 device=device,
                 position_id=position_id,
                 token_tensor=text_device_tokens_by_row.get(int(row_index)),
@@ -340,7 +444,7 @@ def run_packed_mixed_forward(
         velocity_stats_start = ctx.component_timer_start()
         velocity_start = timing.start()
         branch_velocities: dict[int, dict[str, torch.Tensor]] = {}
-        for row_index, step, start, q_len in denoise_result_slots:
+        for row_index, step, start, q_len in plan.denoise_result_slots:
             img = step.extra["img"]
             branch = text_image_branches(step)[len(branch_velocities.setdefault(row_index, {}))]
             velocity = owner.packed_hidden_to_velocity(
@@ -355,7 +459,7 @@ def run_packed_mixed_forward(
         ctx.record_component_elapsed("packed_mixed_velocity", velocity_stats_start)
         update_stats_start = ctx.component_timer_start()
         update_start = timing.start()
-        for result_index, step in denoise_steps:
+        for result_index, step in plan.denoise_steps:
             velocities = branch_velocities.get(result_index)
             if not velocities:
                 return False
@@ -364,11 +468,7 @@ def run_packed_mixed_forward(
 
             updated = euler_step(step.latent, velocity, step.t, step.t_next)
             owner.accept_denoise_update(step, updated)
-            results[result_index] = {
-                "req_id": step.req_id,
-                "denoise_done": step.step_index + 1 >= step.total_steps,
-                "num_steps_done": step.step_index + 1,
-            }
+            plan.set_denoise_result(result_index, step)
         timing.stop("denoise_update_ms", update_start)
         ctx.record_component_elapsed("packed_mixed_denoise_update", update_stats_start)
         timing.stop("total_ms", total_start)
@@ -376,8 +476,8 @@ def run_packed_mixed_forward(
             batch=batch,
             forward_stream=forward_stream,
             embed_chunks=embed_chunks,
-            text_result_slots=text_result_slots,
-            denoise_result_slots=denoise_result_slots,
+            text_result_slots=plan.text_result_slots,
+            denoise_result_slots=plan.denoise_result_slots,
             kv_segments=kv_segments,
         )
         return True
@@ -535,16 +635,14 @@ def _store_forward_sampled_token_relay(
         token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
     else:
         token_tensor = token_tensor.reshape(1).to(device=device, dtype=torch.long)
-    if token_tensor.device.type == "cuda":
-        token_tensor.record_stream(torch.cuda.current_stream(token_tensor.device))
-    relay.token_id = int(token_id)
-    relay.token_tensor = token_tensor
+    _DECODE_RELAY.publish_sample(state, token_id=int(token_id), token_tensor=token_tensor)
     if position_id is not None:
         position_tensor = torch.tensor([int(position_id)], dtype=torch.long, device=device)
-        if position_tensor.device.type == "cuda":
-            position_tensor.record_stream(torch.cuda.current_stream(position_tensor.device))
-        relay.position_id = int(position_id)
-        relay.position_tensor = position_tensor
+        _DECODE_RELAY.publish_position(
+            state,
+            position_id=int(position_id),
+            position_tensor=position_tensor,
+        )
 
 
 def _forward_text_input_ids(
@@ -565,9 +663,12 @@ def _forward_text_input_ids(
             "decode op requested token_source='last_sampled' but does not have exactly one token"
         )
     state = request_states.get(int(req_id))
-    relay = getattr(getattr(state, "decode_relay", None), "token_tensor", None)
-    if not isinstance(relay, torch.Tensor) or relay.dtype != torch.long or relay.device != device:
-        raise invalid_descriptor(
-            "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
-        )
-    return relay.reshape(1)
+    token = _DECODE_RELAY.consume_token(
+        state,
+        expected_token_id=None,
+        device=device,
+        token_source=source,
+        require=True,
+    )
+    assert token is not None
+    return token.reshape(1)

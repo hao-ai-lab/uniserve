@@ -442,6 +442,23 @@ class FlashInferAttentionBackend(_WrapperPool):
             kv_seqlens,
             int(k.shape[1]),
         )
+        self.plan_prefill(
+            (
+                tuple(wrapper_key),
+                int(q.shape[1]),
+                int(k.shape[2]),
+                int(q.shape[2]),
+                int(k.shape[1]),
+                bool(causal),
+                float(scale),
+                int(plan.qo_indptr.numel()),
+                int(plan.indices.numel()),
+                get_worker_config().flashinfer.prefill_split_tile_size,
+                get_worker_config().flashinfer.disable_split_kv,
+            ),
+            workspace=self._workspace(q.device),
+            wrapper=wrapper,
+        )
         wrapper.plan(
             plan.qo_indptr,
             plan.kv_indptr,
@@ -532,6 +549,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         )
         self._decode_plan_cache.remember(inputs.wrapper_key, plan_key, metadata)
         self._metadata_graph_wrappers[id(metadata)] = (inputs.wrapper_key, _weakref_or_none(metadata))
+        self.bind_graph((id(metadata), "decode"), inputs.wrapper_key)
 
     def bind_paged_prefill_graph_wrapper(self, metadata: Any, *, device: torch.device | str) -> None:
         """Bind ``metadata`` to a graph-scoped *exclusive* prefill wrapper.
@@ -557,6 +575,7 @@ class FlashInferAttentionBackend(_WrapperPool):
         scope = next(_PREFILL_GRAPH_SCOPES)
         key, _wrapper = self._prefill_graph_wrapper(torch.device(device), scope=scope)
         self._metadata_prefill_graph_wrappers[id(metadata)] = (key, _weakref_or_none(metadata))
+        self.bind_graph((id(metadata), "prefill"), key)
 
     def paged_prefill_graph_wrapper_planned(self, metadata: Any) -> bool:
         """Whether the wrapper bound to ``metadata`` has been planned.

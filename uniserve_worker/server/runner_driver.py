@@ -14,17 +14,18 @@ from ..backends.attention import (
     normalize_attention_backend_name,
 )
 from ..contracts.caps import Caps, validate_caps
+from ..contracts.model_family import ModelFamilyDescriptor
 from ..contracts.model_protocols import UniModel, verify_model_conformance
 from ..execution.runner import ModelRunner
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
-from ..loader import ModelBringUp, get_loader
+from ..loader import ModelBringUp, get_loader_for_descriptor
 from ..loader.paths import read_config, resolve_model_path
-from ..models.registry import detect_model_architectures, resolve_model_cls
+from ..models.registry import detect_model_architectures, resolve_model_descriptor
 from ..nn.mesh import get_current_mesh
 from ..nn.quant.base import process_quantized_modules
-from ..processors import get_processor_for_model
+from ..processors import get_processor_for_descriptor
 from ..runtime.resources import ResourceRuntime
 from .base_driver import BaseWorkerDriver
 from .worker_kind import GEN, UND, tower_role_for_kind
@@ -68,6 +69,7 @@ class RunnerDriver(BaseWorkerDriver):
         defer_sampling: bool = False,
         transfer_backend: str = "local",
         worker_kind: str | None = None,
+        family_descriptor: ModelFamilyDescriptor | None = None,
     ) -> None:
         super().__init__(block_size=block_size)
         self.model = model
@@ -75,6 +77,8 @@ class RunnerDriver(BaseWorkerDriver):
         self.defer_sampling = bool(defer_sampling)
         self.transfer_backend = transfer_backend
         self.worker_kind = worker_kind
+        self.family_descriptor = family_descriptor or ModelFamilyDescriptor.from_model_class(type(model))
+        self.block_size = int(self.block_size)
         self.block_size = self._adjust_block_size(self.block_size)
         self.kv_token_capacity = kv_token_capacity
         self._caps = self._caps_with_current_rank(
@@ -100,7 +104,7 @@ class RunnerDriver(BaseWorkerDriver):
             model,
             attention_backend=self.attention_backend,
             resource_runtime=ledger,
-            multimodal_processor=get_processor_for_model(type(model)),
+            multimodal_processor=get_processor_for_descriptor(self.family_descriptor),
             defer_sampling=self.defer_sampling,
             tensor_store=tensor_store,
             residency=residency,
@@ -262,7 +266,8 @@ def load_runner_engine(
     **kwargs: Any,
 ) -> RunnerDriver:
     model_path = resolve_model_path(model_path)
-    model_cls = resolve_model_cls(_architectures(model_path))
+    descriptor = resolve_model_descriptor(_architectures(model_path))
+    model_cls = descriptor.model_class
     # An und/gen worker materializes only its tower's modules (partial weight load).
     # Whole-model kinds map to ``tower_role=None`` and load everything.
     tower_role = tower_role_for_kind(worker_kind) if worker_kind is not None else None
@@ -281,11 +286,13 @@ def load_runner_engine(
         )
     else:
         # Registry loaders return LoadResult; tokenizer is configured below.
-        model = get_loader(load_format).load_model(
+        loader_override = None if str(load_format).lower() == "default" else load_format
+        model = get_loader_for_descriptor(descriptor, override=loader_override).load_model(
             model_cls,
             read_config(model_path),
             device=device,
             model_path=model_path,
+            checkpoint_layout=descriptor.checkpoint_layout,
         ).model
     _configure_model_tokenizer(model, model_path)
     _check_model_conformance(model)
@@ -297,6 +304,7 @@ def load_runner_engine(
         defer_sampling=defer_sampling,
         transfer_backend=transfer_backend,
         worker_kind=worker_kind,
+        family_descriptor=descriptor,
     )
 
 

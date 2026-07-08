@@ -145,7 +145,6 @@ class TextGraphRunner:
     def _maybe_prefill(self, model, input_ids, positions, fb, metadata, ctx):
         if not self._prefill.enabled():
             return None
-        cache = metadata.cache
         batch_size = int(fb.batch_size)
         if batch_size <= 0 or fb.last_token_indices is None:
             return None
