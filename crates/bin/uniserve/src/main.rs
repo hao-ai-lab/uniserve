@@ -89,8 +89,8 @@ fn shutdown_signal() -> CancellationToken {
 }
 
 fn main() -> Result<()> {
-    logging::init_tracing();
     let cli = Cli::parse();
+    logging::init_tracing(cli.log_level.as_deref(), cli.log_level_http.as_deref());
 
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all();
@@ -178,7 +178,7 @@ async fn serve_with_engines(args: ServeArgs) -> Result<()> {
     for engine_index in 0..local_count {
         let config = ManagedEngineConfig {
             binary: binary.clone(),
-            model: args.runtime.model.clone(),
+            model: args.runtime.resolved_model(),
             handshake_host: handshake_host.clone(),
             handshake_port,
             engine_index: engine_index as u32,

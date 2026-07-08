@@ -35,7 +35,7 @@ use uniserve_serving::{FinishStatus, RequestMetadata, ServeError, ServeEvent, Se
 use uniserve_text::DecodedLogprobs;
 
 use crate::error::{ApiError, bail_server_error, server_error};
-use crate::routes::native::NativeTextOutputFilter;
+use crate::routes::native_output::NativeTextOutputFilter;
 use crate::routes::openai::utils::validated_json::ValidatedJson;
 use crate::utils::{resolve_request_context, unix_timestamp};
 use uniserve_openai_api::lora::LoraModelResolution;

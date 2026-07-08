@@ -144,7 +144,6 @@ mod tests {
 
     #[test]
     fn server_info_env_filter_includes_public_uniserve_keys() {
-        assert!(is_public_uniserve_env_key("UNISERVE_LOGGING_LEVEL"));
         assert!(is_public_uniserve_env_key("UNISERVE_USE_MODELSCOPE"));
         assert!(!is_public_uniserve_env_key("OTHER_ENV"));
     }

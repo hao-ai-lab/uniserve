@@ -2,57 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-# --- Native SSE event vocabulary (single source of truth) ---------------------
-#
-# The canonical event "type" strings and the terminal-event set are produced by
-# the production emitter in `crates/frontend/native-api/src/events.rs`
-# (`event_json` for the type strings, `is_terminal` for which are terminal).
-# These constants mirror that vocabulary so the benchmark classifier here and
-# the Rust benchmark classifier in
-# `crates/support/benchmarks/src/native_events.rs` agree on exactly one
-# contract. If the production vocabulary changes (e.g. a type is renamed), both
-# copies must be updated together; the parity test in native_events.rs and the
-# assertions below guard the most load-bearing strings.
-NATIVE_EVENT_TYPES = frozenset(
-    {
-        "scheduled",
-        "text",
-        "logprobs",
-        "image_begin",
-        "image_step",
-        "image_done",
-        "finished",
-        "rejected",
-        "error",
-    }
-)
-
-# Terminal events (mirror of native-api `is_terminal`): a native stream is
-# terminated by exactly one of these. Only "finished" is a success terminal;
-# "rejected" and "error" are failure terminals.
-NATIVE_FINISHED = "finished"
-NATIVE_REJECTED = "rejected"
-NATIVE_ERROR = "error"
-NATIVE_TERMINAL_TYPES = frozenset({NATIVE_FINISHED, NATIVE_REJECTED, NATIVE_ERROR})
-
-
-def classify_native_events(events: list[dict[str, Any]]) -> tuple[bool, str]:
-    if not events:
-        return False, "protocol_empty_response"
-    if any(event.get("type") == NATIVE_ERROR for event in events):
-        return False, "model_error"
-    if any(event.get("type") == NATIVE_REJECTED for event in events):
-        return False, "unsupported_contract"
-    finished = sum(1 for event in events if event.get("type") == NATIVE_FINISHED)
-    if finished == 0:
-        return False, "protocol_missing_terminal"
-    # Production emits exactly one terminal `finished` per stream; more than one
-    # is a protocol violation. This matches the Rust classifier's `finished == 1`
-    # rule in crates/support/benchmarks/src/native_events.rs.
-    if finished > 1:
-        return False, "protocol_duplicate_terminal"
-    return True, "ok"
-
 
 def classify_openai_events(events: list[dict[str, Any]]) -> tuple[bool, str]:
     if not events:
@@ -95,8 +44,7 @@ def openai_message_text(message: dict[str, Any] | None) -> str:
 def openai_message_images(message: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Image parts of one non-streamed chat.completion message.
 
-    Images arrive either under ``message.images`` (UniServe native chat,
-    LightLLM V2) or as image-typed content parts.
+    Images arrive either under ``message.images`` or as image-typed content parts.
     """
     images: list[dict[str, Any]] = []
     if not isinstance(message, dict):

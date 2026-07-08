@@ -24,6 +24,47 @@ pytestmark = [pytest.mark.e2e]
 MODEL = Path("/home/hal-ysun/models/SenseNova-U1-8B-MoT-Default-local")
 
 
+def chat_sse_text(events: list[dict[str, object]]) -> str:
+    chunks: list[str] = []
+    for event in events:
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                chunks.append(str(delta["content"]))
+    return "".join(chunks)
+
+
+def chat_sse_finish(events: list[dict[str, object]]) -> str | None:
+    for event in events:
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if isinstance(choice, dict) and isinstance(choice.get("finish_reason"), str):
+                return str(choice["finish_reason"])
+    return None
+
+
+def chat_sse_images(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    images: list[dict[str, object]] = []
+    for event in events:
+        choices = event.get("choices")
+        if not isinstance(choices, list):
+            continue
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("images"), list):
+                images.extend(image for image in delta["images"] if isinstance(image, dict))
+    return images
+
+
 @contextmanager
 def sim_server(tmp_path: Path):
     try:
@@ -37,6 +78,7 @@ def sim_server(tmp_path: Path):
     args = [
         str(binary),
         "serve",
+        "--model-path",
         str(MODEL),
         "--host",
         "127.0.0.1",
@@ -49,15 +91,14 @@ def sim_server(tmp_path: Path):
         "cpu",
         "--max-model-len",
         "4096",
-        "--max-num-seqs",
-        "8",
-        "--max-batch",
+        "--max-running-requests",
         "8",
         "--max-num-batched-tokens",
         "4096",
         "--pipeline-depth",
         "1",
-        "--disable-log-stats",
+        "--log-stats",
+        "false",
     ]
     with server_process(args, base_url, tmp_path / "uniserve-sim.log", timeout_s=180) as _:
         yield base_url
@@ -78,11 +119,19 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
         # terminating on the max_tokens length cap.
         text_events = post_sse(
             base_url,
-            "/generate",
-            {"prompt": "Say hello from the sim backend.", "constraint": "und_only", "max_tokens": 16},
+            "/v1/chat/completions",
+            {
+                "model": "SenseNova-U1",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": "Say hello from the sim backend."}],
+                "modalities": ["text"],
+                "max_completion_tokens": 16,
+            },
         )
-        assert any(event["type"] == "text" for event in text_events)
-        assert text_events[-1]["type"] == "finished"
+        assert chat_sse_text(text_events)
+        assert chat_sse_finish(text_events) == "stop"
+        assert text_events[-1]["type"] == "sse_done"
 
         image_response = httpx.post(
             f"{base_url}/v1/images/generations",
@@ -98,32 +147,57 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
 
         default_events = post_sse(
             base_url,
-            "/generate",
+            "/v1/chat/completions",
             {
-                "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
-                "max_tokens": 8,
-                "image": {"max_images": 1},
+                "model": "SenseNova-U1",
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "modalities": ["text", "image"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
+                    }
+                ],
+                "max_completion_tokens": 8,
+                "image_config": {"num_images": 1},
             },
             timeout_s=300,
         )
-        assert any(event["type"] == "text" for event in default_events)
-        image_begin = next(event for event in default_events if event["type"] == "image_begin")
-        image_done = next(event for event in default_events if event["type"] == "image_done")
-        assert (image_begin["width"], image_begin["height"]) == (2048, 1152)
-        assert (image_done["width"], image_done["height"]) == (2048, 1152)
-        assert png_size_from_b64(image_done["pixels_png_b64"]) == (2048, 1152)
+        assert chat_sse_text(default_events)
+        images = chat_sse_images(default_events)
+        assert images
+        image_b64 = str(images[0]["image_url"]["url"]).split(",", 1)[1]
+        assert png_size_from_b64(image_b64) == (2048, 1152)
+        assert not any(event.get("type") == "image_begin" for event in default_events)
 
-        i2i_events = post_sse(
-            base_url,
-            "/generate",
-            {
-                "prompt": "Use the input image as a color reference for a California travel image.",
-                "constraint": "gen_only",
-                "input_image_b64": tiny_input_png_b64(),
+        i2i_response = httpx.post(
+            f"{base_url}/v1/chat/completions",
+            json={
+                "model": "SenseNova-U1",
+                "modalities": ["image"],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Use the input image as a color reference for a California travel image.",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{tiny_input_png_b64()}"
+                                },
+                            },
+                        ],
+                    }
+                ],
             },
-            timeout_s=300,
+            timeout=300,
         )
-        assert any(event["type"] == "image_done" for event in i2i_events)
+        i2i_response.raise_for_status()
+        assert i2i_response.json()["choices"][0]["message"]["images"]
 
         trace_path = tmp_path / "trace.jsonl"
         trace_path.write_text(
@@ -140,7 +214,6 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
         spec = BenchmarkSpec(
             name="sim_default_smoke",
             task=TaskName.DEFAULT,
-            endpoint="/generate",
             model="SenseNova-U1",
             dataset="trace",
             dataset_path=str(trace_path),

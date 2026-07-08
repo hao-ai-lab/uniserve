@@ -3,7 +3,7 @@
 Concepts:
   server   = how to launch one serving backend topology
   workload = what to run against a compatible launched server
-             (verify = correctness gates over the native SSE stream,
+             (verify = correctness gates over public chat completions,
               perf = a measurement point through the shared harness with
               optional metric floors/ceilings,
               script = a generic repo-script escape hatch)

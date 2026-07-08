@@ -12,7 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-pub use config::{Config, EngineBackendKind, EngineConnection, EngineSettings, HttpListenerMode};
+pub use config::{
+    Config, EngineBackendKind, EngineConnection, EngineSettings, HttpListenerMode, TokenizerMode,
+};
 use tracing::info;
 use uniserve_chat::{ChatLlm, LoadModelBackendsOptions, load_model_backends};
 pub use uniserve_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
@@ -222,6 +224,13 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         AppState::new(served_model_names, chat)
             .with_log_requests(config.enable_log_requests)
             .with_request_id_headers(config.enable_request_id_headers)
+            .with_api_key(config.api_key.clone())
+            .with_admin_api_key(config.admin_api_key.clone())
+            .with_request_timeout(config.request_timeout)
+            .with_max_concurrent_requests(config.max_concurrent_requests)
+            .with_server_dev_mode(config.server_dev_mode)
+            .with_runtime_lora_updating(config.enable_lora)
+            .with_runtime_lora_allowed_path_prefixes(config.lora_allowed_path_prefixes.clone())
             .with_native_profile(native_profile)
             .with_server_info(ServerInfoSnapshot::from_config(config)),
     ))

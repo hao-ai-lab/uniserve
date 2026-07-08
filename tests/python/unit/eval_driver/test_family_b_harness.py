@@ -3,9 +3,8 @@
 These cover the self-contained, server-free pieces of the UniServe serving
 benchmark harness that Family B (t2i / i2i) relies on:
 
-* ``summarize_image`` aggregate fields for the non-streaming t2i case and the
-  i2i native-stream extras (time-to-first-image / generation time / steps-per-s);
-* the three response classifiers (native SSE / OpenAI SSE / JSON image) routing
+* ``summarize_image`` aggregate fields for the non-streaming image cases;
+* the response classifiers (OpenAI SSE / JSON image) routing
   sample payloads to the right ``(ok, classifier)`` verdict;
 * ``iter_sse_events`` framing across record/line boundaries, including an event
   whose JSON payload is split across two ``data:`` lines that flush as one event;
@@ -23,13 +22,12 @@ import asyncio
 import json
 from pathlib import Path
 
-import httpx
 import numpy as np
 import pytest
 
 import uniserve_eval.harness.core.client as client_module
 from uniserve_eval.harness import cli
-from uniserve_eval.harness.core.client import _parse_native, _parse_openai, _send_sse
+from uniserve_eval.harness.core.client import _parse_openai
 from uniserve_eval.harness.datasets import (
     load_dataset_rows,
     load_sharegpt,
@@ -41,13 +39,11 @@ from uniserve_eval.harness.metrics.common import RequestRecord
 from uniserve_eval.harness.report import build_summary
 from uniserve_eval.harness.response_classifier import (
     classify_json_image_response,
-    classify_native_events,
     classify_openai_events,
 )
 from uniserve_eval.harness.runner import RunResult
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 from uniserve_eval.harness.sse import (
-    TERMINAL_EVENT_TYPES,
     aiter_sse_events,
     aiter_sse_events_from_text,
     iter_sse_events,
@@ -57,6 +53,7 @@ from uniserve_eval.harness.tasks.i2t import I2TTask
 from uniserve_eval.harness.tasks.t2i import T2ITask
 
 pytestmark = [pytest.mark.unit]
+TERMINAL_TYPES = frozenset({"finished"})
 
 
 class _WhitespaceTokenizer:
@@ -92,14 +89,14 @@ def test_summarize_image_nonstreaming_aggregates() -> None:
     assert lat["min"] == pytest.approx(2000.0)
     assert lat["max"] == pytest.approx(4000.0)
     assert lat["p50"] == pytest.approx(float(np.percentile([2.0, 4.0], 50)) * 1000)
-    # The native-stream-only extras must be absent for the non-streaming case.
+    # Stream-only extras must be absent for the non-streaming case.
     assert "time_to_first_image_ms" not in summary
     assert "image_generation_ms" not in summary
     assert "steps_per_second" not in summary
 
 
 def test_summarize_image_i2i_stream_extras() -> None:
-    # One i2i request whose native stream exposed image events: first image at
+    # One request whose stream exposed image events: first image at
     # 1s, generation 2s, 10 diffusion steps -> steps/s = 5.
     record = RequestRecord(
         request_id="x",
@@ -123,21 +120,6 @@ def test_summarize_image_i2i_stream_extras() -> None:
 
 
 # --- response classifiers -----------------------------------------------------
-
-
-def test_classify_native_events_routes_payloads() -> None:
-    assert classify_native_events([{"type": "text"}, {"type": "finished"}]) == (True, "ok")
-    assert classify_native_events([]) == (False, "protocol_empty_response")
-    assert classify_native_events([{"type": "error"}, {"type": "finished"}]) == (
-        False,
-        "model_error",
-    )
-    assert classify_native_events([{"type": "rejected"}]) == (False, "unsupported_contract")
-    assert classify_native_events([{"type": "text"}]) == (False, "protocol_missing_terminal")
-    assert classify_native_events([{"type": "finished"}, {"type": "finished"}]) == (
-        False,
-        "protocol_duplicate_terminal",
-    )
 
 
 def test_classify_openai_events_routes_payloads() -> None:
@@ -190,57 +172,6 @@ def test_classify_json_image_response_routes_payloads() -> None:
         False,
         "protocol_missing_image_payload",
     )
-
-
-def test_native_parser_excludes_image_step_gaps_from_text_itl() -> None:
-    record = RequestRecord(request_id="default", task="default")
-    record.start_time = 10.0
-    record.scheduled_time = 9.95
-    events = [
-        {"type": "scheduled", "queued_at": 100.0, "scheduled_at": 101.25, "_client_t": 10.5},
-        {"type": "text", "text": "a", "_client_t": 11.0},
-        {"type": "image_begin", "image_id": 1, "steps": 2, "_client_t": 11.5},
-        {"type": "text", "text": "b", "_client_t": 12.0},
-        {"type": "image_step", "image_id": 1, "step": 1, "_client_t": 13.0},
-        {"type": "text", "text": "c", "_client_t": 14.0},
-        {"type": "image_done", "image_id": 1, "_client_t": 15.0},
-        {"type": "text", "text": "d", "_client_t": 16.0},
-        {"type": "text", "text": "e", "_client_t": 16.25},
-        {
-            "type": "finished",
-            "reason": "max_tokens",
-            "stop_reason": "token:42",
-            "completion_tokens": 5,
-            "images": 1,
-        },
-    ]
-
-    _parse_native(events, record, prompt_len_fallback=3)
-
-    assert record.generated_text == "abcde"
-    assert record.ttft == pytest.approx(1.0)
-    assert record.itl == pytest.approx([0.25])
-    assert record.server_queued_at == pytest.approx(100.0)
-    assert record.server_scheduled_at == pytest.approx(101.25)
-    assert record.output_len == 5
-    assert record.images == 1
-    assert record.image_gen_seconds == pytest.approx([3.5])
-    assert record.image_spans == [
-        {
-            "image_id": 1,
-            "begin_ms": pytest.approx(1500.0),
-            "done_ms": pytest.approx(5000.0),
-            "generation_ms": pytest.approx(3500.0),
-            "steps": 2,
-            "step_events": 1,
-        }
-    ]
-    assert record.finish_reason == "max_tokens"
-    assert record.stop_reason == "token:42"
-    row = record.record_dict()
-    assert row["finish_reason"] == "max_tokens"
-    assert row["server_queue_wait_ms"] == pytest.approx(1250.0)
-    assert row["client_dispatch_wait_ms"] == pytest.approx(50.0)
 
 
 def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
@@ -296,7 +227,7 @@ def test_default_task_omits_image_cap_unless_explicit() -> None:
         )
     ).build_request({"prompt": "show each step visually and textually"})
 
-    assert uncapped.payload["image"] == {"width": 2048, "height": 1152, "steps": 50}
+    assert uncapped.payload["image_config"] == {"width": 2048, "height": 1152, "steps": 50}
 
     capped = DefaultTask(
         BenchmarkSpec(
@@ -310,7 +241,7 @@ def test_default_task_omits_image_cap_unless_explicit() -> None:
         )
     ).build_request({"prompt": "show each step visually and textually"})
 
-    assert capped.payload["image"]["max_images"] == 8
+    assert capped.payload["image_config"]["num_images"] == 8
 
 
 def test_default_task_can_emit_openai_chat_wire() -> None:
@@ -334,7 +265,7 @@ def test_default_task_can_emit_openai_chat_wire() -> None:
     assert request.payload["stream_options"] == {"include_usage": True}
     assert request.payload["max_completion_tokens"] == 8192
     assert request.payload["messages"] == [{"role": "user", "content": "show each step visually and textually"}]
-    assert request.payload["image_config"] == {"max_images": 4, "width": 2048, "height": 1152, "steps": 50}
+    assert request.payload["image_config"] == {"num_images": 4, "width": 2048, "height": 1152, "steps": 50}
 
 
 def test_spec_rejects_unsupported_wire_for_task() -> None:
@@ -357,6 +288,7 @@ def test_i2t_task_streams_openai_chat_wire() -> None:
     assert request.payload["stream"] is True
     assert request.payload["stream_options"] == {"include_usage": True}
     assert request.payload["modalities"] == ["text"]
+    assert request.payload["max_completion_tokens"] == 256
     parts = request.payload["messages"][0]["content"]
     assert parts[1]["image_url"]["url"] == "data:image/png;base64,QUJD"
 
@@ -374,6 +306,7 @@ def test_i2t_task_openai_chat_json_wire_is_not_streamed() -> None:
     assert request.endpoint == "/v1/chat/completions"
     assert request.kind == "openai_chat_json"
     assert "stream" not in request.payload
+    assert request.payload["max_completion_tokens"] == 256
 
 
 def test_t2i_task_can_emit_image_only_chat_wire() -> None:
@@ -510,7 +443,7 @@ def test_iter_sse_events_stop_on_terminal_halts_after_first_terminal() -> None:
         "",
     ]
 
-    events = list(iter_sse_events(lines, stop_on=TERMINAL_EVENT_TYPES))
+    events = list(iter_sse_events(lines, stop_on=TERMINAL_TYPES))
 
     assert events == [{"type": "text"}, {"type": "finished"}]
 
@@ -524,7 +457,7 @@ def test_iter_sse_events_stop_on_terminal_without_trailing_blank_line() -> None:
         "",
     ]
 
-    events = list(iter_sse_events(lines, stop_on=TERMINAL_EVENT_TYPES))
+    events = list(iter_sse_events(lines, stop_on=TERMINAL_TYPES))
 
     assert events == [{"type": "text"}, {"type": "finished"}]
 
@@ -539,7 +472,7 @@ def test_aiter_sse_events_stop_on_terminal_without_waiting_for_eof() -> None:
 
     async def run_once() -> list[dict[str, object]]:
         return await asyncio.wait_for(
-            aiter_sse_events(lines(), stop_on=TERMINAL_EVENT_TYPES),
+            aiter_sse_events(lines(), stop_on=TERMINAL_TYPES),
             timeout=0.25,
         )
 
@@ -558,44 +491,13 @@ def test_aiter_sse_events_from_text_stops_on_terminal_without_newline_or_eof() -
 
     async def run_once() -> list[dict[str, object]]:
         return await asyncio.wait_for(
-            aiter_sse_events_from_text(chunks(), stop_on=TERMINAL_EVENT_TYPES),
+            aiter_sse_events_from_text(chunks(), stop_on=TERMINAL_TYPES),
             timeout=0.25,
         )
 
     events = asyncio.run(run_once())
 
     assert events == [{"type": "text"}, {"type": "finished"}]
-
-
-def test_native_send_sse_stops_on_terminal_event(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: list[object] = []
-
-    async def fake_aiter_sse_events(_lines: object, **kwargs: object) -> list[dict[str, object]]:
-        captured.append(kwargs.get("stop_on"))
-        return [{"type": "text", "text": "x", "_client_t": 2.0}, {"type": "finished", "_client_t": 3.0}]
-
-    monkeypatch.setattr(client_module, "aiter_sse_events_from_text", fake_aiter_sse_events)
-
-    async def run_once() -> None:
-        transport = httpx.MockTransport(lambda _request: httpx.Response(200, text=""))
-        async with httpx.AsyncClient(transport=transport) as async_client:
-            record = RequestRecord(request_id="native", task="default")
-            record.start_time = 1.0
-            await _send_sse(
-                async_client,
-                "http://test/generate",
-                {},
-                record,
-                protocol="native",
-                prompt_len=0,
-                output_len_fallback=0,
-            )
-            assert record.success is True
-            assert record.latency == pytest.approx(2.0)
-
-    asyncio.run(run_once())
-
-    assert captured == [TERMINAL_EVENT_TYPES]
 
 
 def test_iter_sse_events_records_malformed_payload_when_policy_is_record() -> None:
@@ -811,7 +713,7 @@ def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
     summary = build_summary(spec, "http://x", records, dur_s=1.0)
 
     assert summary["endpoint"] == "/v1/chat/completions"
-    assert summary["spec"]["endpoint"] == "/generate"
+    assert summary["spec"]["endpoint"] == "/v1/chat/completions"
 
 
 def test_build_summary_selects_stream_family_for_text_task() -> None:

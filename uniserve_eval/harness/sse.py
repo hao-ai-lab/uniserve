@@ -31,11 +31,6 @@ from collections.abc import AsyncIterable, Iterable, Iterator
 from json import JSONDecodeError
 from typing import Any, Callable, Literal
 
-# Event types that terminate a native UniServe ``/generate`` stream. Readers
-# that want to stop reading as soon as the request is done (rather than relying
-# on the server to close the connection) can pass ``stop_on=TERMINAL_EVENT_TYPES``.
-TERMINAL_EVENT_TYPES: frozenset[str] = frozenset({"finished", "error", "rejected"})
-
 ParseErrorPolicy = Literal["raise", "record"]
 _INCOMPLETE = object()
 

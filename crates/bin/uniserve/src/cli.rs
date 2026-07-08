@@ -1,10 +1,11 @@
 //! CLI argument definitions for the `uniserve` (UniServe) binary.
 //!
-//! UniServe owns the engine and scheduler in Rust; Python (or `--sim`) only runs
-//! the model forward pass. There is a single `serve` command — there is no
-//! separate Python engine process to bootstrap or supervise.
+//! UniServe owns the engine and scheduler in Rust; Python only runs the model
+//! forward pass. There is a single `serve` command.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -18,9 +19,11 @@ use uniserve_engine_runtime::{
 };
 use uniserve_server_app::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
-    ParserSelection, RendererSelection, SchedulingPolicy,
+    ParserSelection, RendererSelection, SchedulingPolicy, TokenizerMode,
 };
 use uniserve_worker_ipc::WorkerLaunchConfig;
+
+const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
@@ -29,6 +32,12 @@ use uniserve_worker_ipc::WorkerLaunchConfig;
     about = "UniServe OpenAI-compatible server: Rust engine + scheduler, Python forwards only."
 )]
 pub(crate) struct Cli {
+    /// Default log level for UniServe components.
+    #[arg(long, global = true)]
+    pub log_level: Option<String>,
+    /// Log level for HTTP server components.
+    #[arg(long, global = true)]
+    pub log_level_http: Option<String>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -43,7 +52,7 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Run the UniServe OpenAI server: the Rust engine + scheduler run
-    /// in-process by default, driving a forward-only worker (or `--sim`).
+    /// in-process by default, driving a forward-only worker.
     Serve(Box<ServeArgs>),
     /// Run one headless engine process: dial a frontend's handshake
     /// endpoint, host the Rust scheduler + forward-only worker behind the
@@ -55,6 +64,28 @@ pub(crate) enum Command {
 pub(crate) enum SchedulerPolicyArg {
     Fcfs,
     Priority,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub(crate) enum TokenizerModeArg {
+    #[default]
+    Auto,
+}
+
+impl From<TokenizerModeArg> for TokenizerMode {
+    fn from(value: TokenizerModeArg) -> Self {
+        match value {
+            TokenizerModeArg::Auto => TokenizerMode::Auto,
+        }
+    }
+}
+
+impl fmt::Display for TokenizerModeArg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenizerModeArg::Auto => f.write_str("auto"),
+        }
+    }
 }
 
 impl From<SchedulerPolicyArg> for SchedulingPolicy {
@@ -73,7 +104,11 @@ impl From<SchedulerPolicyArg> for SchedulingPolicy {
 pub(crate) struct EngineArgs {
     /// Model identifier or local model directory loaded by the forward-only
     /// worker.
-    pub model: String,
+    #[arg(value_name = "MODEL", required_unless_present = "model_path")]
+    pub model: Option<String>,
+    /// Model identifier or local model directory.
+    #[arg(long = "model-path", alias = "model", conflicts_with = "model")]
+    pub model_path: Option<String>,
 
     /// Frontend handshake endpoint to dial (e.g. `tcp://127.0.0.1:5557` or
     /// `ipc:///tmp/uniserve-handshake`).
@@ -98,7 +133,7 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value = "auto")]
     pub attention_backend: String,
     /// KV block size in tokens (the page size).
-    #[arg(long, default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long = "page-size", alias = "block-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
     /// How many op-batches the scheduler keeps in flight against the worker.
     #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
@@ -107,33 +142,33 @@ pub(crate) struct EngineArgs {
     #[arg(long, default_value_t = DEFAULT_MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_batch: usize,
     /// Per-step scheduling token budget (vLLM's max_num_batched_tokens).
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long, alias = "max-prefill-tokens", default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently running requests (vLLM's max_num_seqs).
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long = "max-running-requests", alias = "max-num-seqs", default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_seqs: usize,
     /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
-    #[arg(long, default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long = "chunked-prefill-size", alias = "long-prefill-threshold", default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward (0 disables mixing).
     #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS)]
     pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
-    #[arg(long, value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
+    #[arg(long = "schedule-policy", alias = "scheduler-policy", value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
     /// Maximum model context length reported to the frontend.
-    #[arg(long)]
+    #[arg(long = "max-model-len", alias = "context-length")]
     pub max_model_len: Option<u32>,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long)]
+    #[arg(long = "max-total-tokens", alias = "kv-token-capacity")]
     pub kv_token_capacity: Option<u64>,
     /// Python interpreter used to launch the worker.
     #[arg(long, default_value_t = default_worker_python())]
     pub worker_python: String,
     /// Number of worker rank processes behind this engine (1 = single ring;
     /// >1 spawns the MultiprocExecutor with one ring per rank).
-    #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long = "tp-size", alias = "tensor-parallel-size", alias = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// Unset = single Full pool.
@@ -152,11 +187,18 @@ pub(crate) struct EngineArgs {
 }
 
 impl EngineArgs {
+    fn resolved_model(&self) -> String {
+        self.model_path
+            .clone()
+            .or_else(|| self.model.clone())
+            .expect("clap requires either MODEL or --model-path")
+    }
+
     /// Build the engine-proc configuration. Control tokens default to the
     /// sim-compatible values and are overridden by the frontend's INIT
     /// `native_controls` extension during the handshake.
     pub(crate) fn to_proc_config(&self) -> uniserve_engine_process::EngineProcConfig {
-        let mut core = uniserve_engine_runtime::EngineCoreConfig::sim(self.model.clone());
+        let mut core = uniserve_engine_runtime::EngineCoreConfig::sim(self.resolved_model());
         core.backend = if self.sim {
             uniserve_engine_runtime::EngineBackend::Sim
         } else {
@@ -199,7 +241,7 @@ impl EngineArgs {
 /// Arguments for the `serve` command.
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
-#[command(override_usage = "uniserve serve <MODEL> [OPTIONS]")]
+#[command(override_usage = "uniserve serve --model-path <MODEL_PATH> [OPTIONS]")]
 pub(crate) struct ServeArgs {
     /// HTTP bind host for the OpenAI-compatible server.
     #[arg(long, default_value = "127.0.0.1")]
@@ -217,8 +259,8 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
-    /// Build the UniServe-native server config (in-process Rust engine +
-    /// forward-only worker or `--sim`), binding the HTTP listener directly.
+    /// Build the UniServe-native server config, binding the HTTP listener
+    /// directly.
     pub(crate) fn to_uniserve_config(&self) -> Config {
         let listener_mode = match &self.uds {
             Some(path) => HttpListenerMode::BindUnix { path: path.clone() },
@@ -248,7 +290,11 @@ impl ServeArgs {
 pub(crate) struct SharedRuntimeArgs {
     /// Model identifier or local model directory used for backend loading and
     /// public model ID.
-    pub model: String,
+    #[arg(value_name = "MODEL", required_unless_present = "model_path")]
+    pub model: Option<String>,
+    /// Model identifier or local model directory.
+    #[arg(long = "model-path", alias = "model", conflicts_with = "model")]
+    pub model_path: Option<String>,
 
     /// Select the tool call parser depending on the model that you're using.
     /// Use `auto` to infer from the model or `none` to disable parsing.
@@ -256,28 +302,35 @@ pub(crate) struct SharedRuntimeArgs {
     pub tool_call_parser: ParserSelection,
     /// Select the reasoning parser depending on the model that you're using.
     /// Use `auto` to infer from the model or `none` to disable parsing.
-    #[arg(long, default_value_t)]
+    #[arg(
+        long = "reasoning-parser",
+        alias = "uniserve-reasoning-parser",
+        default_value_t
+    )]
     pub uniserve_reasoning_parser: ParserSelection,
     /// Select the chat renderer implementation.
-    #[arg(long = "tokenizer-mode", default_value_t)]
+    #[arg(long = "chat-renderer", default_value_t)]
     pub renderer: RendererSelection,
+    /// Select tokenizer loading behavior.
+    #[arg(long = "tokenizer-mode", default_value_t)]
+    pub tokenizer_mode: TokenizerModeArg,
     /// Disable multimodal inputs and treat the model as language-only.
-    #[arg(long)]
+    #[arg(long = "language-only", alias = "language-model-only")]
     pub language_model_only: bool,
     /// Override the maximum model context length. When unset, the model's real
     /// context length (`max_position_embeddings`) is used.
-    #[arg(long)]
+    #[arg(long = "max-model-len", alias = "context-length")]
     pub max_model_len: Option<u32>,
     /// Optional explicit KV token capacity override for the worker.
-    #[arg(long)]
+    #[arg(long = "max-total-tokens", alias = "kv-token-capacity")]
     pub kv_token_capacity: Option<u64>,
     /// Response-ring slot capacity in bytes for the worker IPC transport.
-    #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long, default_value_t = EngineSettings::DEFAULT_RESP_SLOT_CAP, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub resp_slot_cap: usize,
 
     /// Run the GPU-free CPU simulation engine instead of spawning the real
     /// forward-only worker. No Python and no GPU are required.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub sim: bool,
     /// Compute device for the forward-only worker.
     #[arg(long, default_value = "cuda")]
@@ -286,51 +339,51 @@ pub(crate) struct SharedRuntimeArgs {
     #[arg(long, default_value = "auto")]
     pub attention_backend: String,
     /// Python interpreter used to launch the forward-only worker.
-    #[arg(long, default_value_t = default_worker_python())]
+    #[arg(long, default_value_t = default_worker_python(), hide = true)]
     pub worker_python: String,
     /// Number of tensor-parallel worker rank processes behind each engine.
-    #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long = "tp-size", alias = "tensor-parallel-size", alias = "worker-ranks", default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub worker_ranks: usize,
     /// Staged-worker topology, e.g. `encoder:2,prefill:1:tp=4,decode:1:tp=4`.
     /// Unset = a single Full pool (the non-disaggregated default); a multi-stage
     /// spec composes pools behind a StageRouter.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub workers: Option<String>,
     /// Per-edge data-plane transfer backend, e.g.
     /// `encoder->prefill=cuda_ipc,prefill->decode=mooncake,decode->sampler=shm`.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub transfer: Option<String>,
     /// KV block size in tokens (the page size).
-    #[arg(long, default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
+    #[arg(long = "page-size", alias = "block-size", default_value_t = 64, value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..))]
     pub block_size: u32,
     /// Explicit Python worker launch/runtime arguments.
     #[command(flatten)]
     pub worker_launch: WorkerLaunchArgs,
     /// How many op-batches the scheduler keeps in flight against the worker.
-    #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long, default_value_t = 2, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub pipeline_depth: usize,
     /// Maximum number of ops assembled into one forward batch.
-    #[arg(long, default_value_t = DEFAULT_MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long, default_value_t = DEFAULT_MAX_BATCH, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..), hide = true)]
     pub max_batch: usize,
     /// Per-step scheduling token budget (vLLM's max_num_batched_tokens).
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long, alias = "max-prefill-tokens", default_value_t = DEFAULT_MAX_NUM_BATCHED_TOKENS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_batched_tokens: usize,
     /// Maximum concurrently running requests (vLLM's max_num_seqs).
-    #[arg(long, default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long = "max-running-requests", alias = "max-num-seqs", default_value_t = DEFAULT_MAX_NUM_SEQS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub max_num_seqs: usize,
     /// Per-request ceiling for one prefill chunk (SGLang's chunked prefill size).
-    #[arg(long, default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    #[arg(long = "chunked-prefill-size", alias = "long-prefill-threshold", default_value_t = DEFAULT_LONG_PREFILL_THRESHOLD, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
     pub long_prefill_threshold: usize,
     /// Per-step budget of text prefill tokens allowed to join a decode batch
     /// as one mixed extend+decode forward (0 disables mixing).
-    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS)]
+    #[arg(long, default_value_t = DEFAULT_MIXED_PREFILL_TOKENS, hide = true)]
     pub mixed_prefill_tokens: usize,
     /// Waiting queue policy used by the scheduler.
-    #[arg(long, value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
+    #[arg(long = "schedule-policy", alias = "scheduler-policy", value_enum, default_value_t = SchedulerPolicyArg::Fcfs)]
     pub scheduler_policy: SchedulerPolicyArg,
     /// TCP port for the gRPC Generate service. When not set, no gRPC server is
     /// started.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub grpc_port: Option<u16>,
     /// Maximum seconds to wait for active requests to drain during shutdown.
     /// `0` disables graceful drain (terminate immediately).
@@ -340,23 +393,23 @@ pub(crate) struct SharedRuntimeArgs {
     /// Run the engine out-of-process: expect this many engine cores behind the
     /// wire protocol (vLLM's process topology). `0` (the default) keeps the
     /// in-process engine — the deliberate single-node zero-hop path.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, hide = true)]
     pub engine_count: usize,
     /// Of `--engine-count`, how many engines this process spawns and
     /// supervises locally (managed mode). Defaults to all of them; `0` runs
     /// frontend-only — externally started `uniserve engine` processes dial in.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub local_engine_count: Option<usize>,
     /// Engine handshake endpoint (`tcp://host:port`). Auto-allocated on
     /// 127.0.0.1 when unset (managed mode); set it explicitly for
     /// frontend-only mode so external engines know where to dial.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub handshake_address: Option<String>,
     /// Host engines use to connect back to this frontend's data-plane sockets.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1", hide = true)]
     pub advertised_host: String,
     /// Seconds to wait for engines to become ready (must cover model load).
-    #[arg(long, default_value_t = 1800)]
+    #[arg(long, default_value_t = 1800, hide = true)]
     pub engine_ready_timeout: u64,
 
     /// The file path to the chat template, or the template in single-line form
@@ -375,24 +428,79 @@ pub(crate) struct SharedRuntimeArgs {
     pub chat_template_content_format: ChatTemplateContentFormatOption,
 
     /// Log a summary line for each completed request.
-    #[arg(long)]
+    #[arg(long = "log-requests", alias = "enable-log-requests")]
     pub enable_log_requests: bool,
 
     /// If specified, API server will add an X-Request-Id header to responses.
     #[arg(long, default_missing_value = "true", num_args = 0..=1)]
     pub enable_request_id_headers: bool,
 
+    /// Bearer token accepted by public serving API routes.
+    #[arg(long = "api-key")]
+    pub api_key: Option<String>,
+    /// Bearer token accepted by sensitive management routes.
+    #[arg(long = "admin-api-key")]
+    pub admin_api_key: Option<String>,
+    /// Per-request wall-clock timeout, in seconds.
+    #[arg(long = "request-timeout", alias = "request-timeout-seconds", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
+    pub request_timeout: Option<u64>,
+    /// Front-door HTTP admission limit for in-flight inference requests.
+    #[arg(long = "max-concurrent-requests", value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(1..))]
+    pub max_concurrent_requests: Option<u64>,
+    /// Mount development-only management routes.
+    #[arg(long = "server-dev-mode", hide = true)]
+    pub server_dev_mode: bool,
+    /// Mount runtime LoRA management routes.
+    #[arg(long = "enable-lora")]
+    pub enable_lora: bool,
+    /// Absolute path prefixes allowed for runtime LoRA adapter loading.
+    #[arg(long = "lora-allowed-path-prefixes", value_delimiter = ',')]
+    pub lora_allowed_path_prefixes: Vec<PathBuf>,
+
     /// Disable periodic logging of engine statistics.
     #[arg(long)]
     pub disable_log_stats: bool,
+    /// Enable or disable periodic logging of engine statistics.
+    #[arg(long = "log-stats", action = ArgAction::Set)]
+    pub log_stats: Option<bool>,
 
     /// The model name(s) used in the API. The first is the primary ID returned
-    /// in responses; all are accepted in requests. Defaults to `--model`.
+    /// in responses; all are accepted in requests. Defaults to the selected
+    /// model path.
     #[arg(long, num_args = 0..)]
     pub served_model_name: Vec<String>,
 }
 
 impl SharedRuntimeArgs {
+    pub(crate) fn resolved_model(&self) -> String {
+        self.model_path
+            .clone()
+            .or_else(|| self.model.clone())
+            .expect("clap requires either MODEL or --model-path")
+    }
+
+    fn grpc_port(&self) -> Option<u16> {
+        self.grpc_port.or_else(grpc_port_from_sglang_env)
+    }
+
+    fn disable_log_stats(&self) -> bool {
+        self.log_stats
+            .map(|enabled| !enabled)
+            .unwrap_or(self.disable_log_stats)
+    }
+
+    fn configured_api_key(&self) -> Option<String> {
+        non_empty_secret(self.api_key.as_deref()).or_else(|| {
+            std::env::var(API_KEY_ENV)
+                .ok()
+                .and_then(|value| non_empty_secret(Some(&value)))
+        })
+    }
+
+    fn configured_admin_api_key(&self) -> Option<String> {
+        non_empty_secret(self.admin_api_key.as_deref())
+    }
+
     /// Build the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
         EngineSettings {
@@ -433,11 +541,11 @@ impl SharedRuntimeArgs {
             self.device.clone(),
             "--worker-python".to_string(),
             self.worker_python.clone(),
-            "--worker-ranks".to_string(),
+            "--tp-size".to_string(),
             self.worker_ranks.to_string(),
             "--attention-backend".to_string(),
             self.attention_backend.clone(),
-            "--block-size".to_string(),
+            "--page-size".to_string(),
             self.block_size.to_string(),
             "--pipeline-depth".to_string(),
             self.pipeline_depth.to_string(),
@@ -445,11 +553,11 @@ impl SharedRuntimeArgs {
             self.max_batch.to_string(),
             "--max-num-batched-tokens".to_string(),
             self.max_num_batched_tokens.to_string(),
-            "--max-num-seqs".to_string(),
+            "--max-running-requests".to_string(),
             self.max_num_seqs.to_string(),
-            "--long-prefill-threshold".to_string(),
+            "--chunked-prefill-size".to_string(),
             self.long_prefill_threshold.to_string(),
-            "--scheduler-policy".to_string(),
+            "--schedule-policy".to_string(),
             format!("{:?}", self.scheduler_policy).to_ascii_lowercase(),
             "--resp-slot-cap".to_string(),
             self.resp_slot_cap.to_string(),
@@ -459,7 +567,7 @@ impl SharedRuntimeArgs {
             args.push(len.to_string());
         }
         if let Some(capacity) = self.kv_token_capacity {
-            args.push("--kv-token-capacity".to_string());
+            args.push("--max-total-tokens".to_string());
             args.push(capacity.to_string());
         }
         if let Some(workers) = &self.workers {
@@ -480,22 +588,36 @@ impl SharedRuntimeArgs {
     /// Build the OpenAI-server config for the in-process UniServe engine.
     fn into_config(self, listener_mode: HttpListenerMode) -> Config {
         let engine = self.engine_settings();
+        let model = self.resolved_model();
+        let disable_log_stats = self.disable_log_stats();
+        let api_key = self.configured_api_key();
+        let admin_api_key = self.configured_admin_api_key();
+        let grpc_port = self.grpc_port();
+        let request_timeout = self.request_timeout.map(Duration::from_secs);
         Config {
             engine,
-            model: self.model,
+            model,
             served_model_name: self.served_model_name,
             listener_mode,
             tool_call_parser: self.tool_call_parser,
             uniserve_reasoning_parser: self.uniserve_reasoning_parser,
             renderer: self.renderer,
+            tokenizer_mode: self.tokenizer_mode.into(),
             language_model_only: self.language_model_only,
             chat_template: self.chat_template,
             default_chat_template_kwargs: self.default_chat_template_kwargs,
             chat_template_content_format: self.chat_template_content_format,
             enable_log_requests: self.enable_log_requests,
             enable_request_id_headers: self.enable_request_id_headers,
-            disable_log_stats: self.disable_log_stats,
-            grpc_port: self.grpc_port,
+            disable_log_stats,
+            api_key,
+            admin_api_key,
+            request_timeout,
+            max_concurrent_requests: self.max_concurrent_requests,
+            server_dev_mode: self.server_dev_mode,
+            enable_lora: self.enable_lora,
+            lora_allowed_path_prefixes: self.lora_allowed_path_prefixes,
+            grpc_port,
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout),
         }
     }
@@ -505,77 +627,81 @@ impl SharedRuntimeArgs {
 #[derive(Educe, Clone, Args)]
 #[educe(Debug)]
 pub(crate) struct WorkerLaunchArgs {
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub worker_stub: bool,
-    #[arg(long, default_value = "bfloat16")]
+    #[arg(long = "dtype", alias = "model-dtype", default_value = "bfloat16")]
     pub model_dtype: String,
     #[arg(long)]
     pub kv_cache_dtype: Option<String>,
-    #[arg(long, default_value = "0.70")]
+    #[arg(
+        long = "mem-fraction-static",
+        alias = "kv-memory-fraction",
+        default_value = "0.70"
+    )]
     pub kv_memory_fraction: String,
-    #[arg(long)]
+    #[arg(long = "trust-remote-code", alias = "transformers-trust-remote-code")]
     pub transformers_trust_remote_code: bool,
-    #[arg(long, default_value = "uniserve")]
+    #[arg(long, default_value = "uniserve", hide = true)]
     pub transformers_attn_implementation: String,
-    #[arg(long = "disable-model-arch")]
+    #[arg(long = "disable-model-arch", hide = true)]
     pub disable_model_arch: Vec<String>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub strict_model_imports: bool,
     /// Parallelism mesh forwarded to the Python worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub worker_mesh: Option<String>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub tp_backend: Option<String>,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", hide = true)]
     pub mooncake_device: String,
-    #[arg(long, default_value = "rdma")]
+    #[arg(long, default_value = "rdma", hide = true)]
     pub mooncake_protocol: String,
-    #[arg(long)]
+    #[arg(long = "enable-torch-compile", alias = "torch-compile")]
     pub torch_compile: bool,
-    #[arg(long, default_value = "inductor")]
+    #[arg(long, default_value = "inductor", hide = true)]
     pub torch_compile_backend: String,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub torch_compile_mode: Option<String>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub torch_compile_fullgraph: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub torch_compile_dynamic: Option<String>,
-    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub cuda_graph: bool,
-    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub cuda_graph_warmup: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub cuda_graph_warmup_batches: Option<String>,
-    #[arg(long, action = ArgAction::Set, default_value_t = false)]
+    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
     pub prefill_cuda_graph: bool,
-    #[arg(long, action = ArgAction::Set, default_value_t = false)]
+    #[arg(long, action = ArgAction::Set, default_value_t = false, hide = true)]
     pub prefill_cuda_graph_warmup: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub prefill_cuda_graph_warmup_tokens: Option<String>,
-    #[arg(long, default_value_t = 8192)]
+    #[arg(long, default_value_t = 8192, hide = true)]
     pub mixed_text_max_tokens: u32,
-    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub varlen_prefill: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub green_contexts: bool,
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, hide = true)]
     pub logits_processor_chunk_size: u32,
-    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    #[arg(long, default_value_t = 512 * 1024 * 1024, hide = true)]
     pub flashinfer_workspace_size: u64,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub flashinfer_use_tensor_core: Option<String>,
-    #[arg(long, default_value = "fa2")]
+    #[arg(long, default_value = "fa2", hide = true)]
     pub flashinfer_decode_backend: String,
-    #[arg(long, default_value = "auto")]
+    #[arg(long, default_value = "auto", hide = true)]
     pub flashinfer_prefill_backend: String,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub flashinfer_decode_split_tile_size: Option<u32>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub flashinfer_prefill_split_tile_size: Option<u32>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub flashinfer_disable_split_kv: bool,
-    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = true, hide = true)]
     pub flashinfer_fast_decode_plan: bool,
 }
 
@@ -626,21 +752,16 @@ impl WorkerLaunchArgs {
         if cfg.stub {
             args.push("--worker-stub".to_string());
         }
-        push_if_changed(
-            args,
-            "--model-dtype",
-            &cfg.model_dtype,
-            &default.model_dtype,
-        );
+        push_if_changed(args, "--dtype", &cfg.model_dtype, &default.model_dtype);
         push_option(args, "--kv-cache-dtype", cfg.kv_cache_dtype.as_ref());
         push_if_changed(
             args,
-            "--kv-memory-fraction",
+            "--mem-fraction-static",
             &cfg.kv_memory_fraction,
             &default.kv_memory_fraction,
         );
         if cfg.transformers_trust_remote_code {
-            args.push("--transformers-trust-remote-code".to_string());
+            args.push("--trust-remote-code".to_string());
         }
         push_if_changed(
             args,
@@ -670,7 +791,7 @@ impl WorkerLaunchArgs {
             &default.mooncake_protocol,
         );
         if cfg.torch_compile {
-            args.push("--torch-compile".to_string());
+            args.push("--enable-torch-compile".to_string());
         }
         push_if_changed(
             args,
@@ -823,6 +944,24 @@ fn parse_json<T: DeserializeOwned>(value: &str) -> Result<T, String> {
     serde_json::from_str(value).map_err(|e| format!("invalid JSON object: {}", e.as_report()))
 }
 
+fn non_empty_secret(value: Option<&str>) -> Option<String> {
+    let trimmed = value?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn grpc_port_from_sglang_env() -> Option<u16> {
+    let enabled = std::env::var("SGLANG_ENABLE_GRPC").ok()?;
+    if matches!(
+        enabled.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    ) {
+        return None;
+    }
+    std::env::var("SGLANG_GRPC_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+}
+
 /// Default worker interpreter: a `python3`/`python` next to the running binary
 /// (the env `bin/` for a `pip install`), then `$VIRTUAL_ENV`, then `python3`.
 fn default_worker_python() -> String {
@@ -856,7 +995,7 @@ mod tests {
             "uniserve",
             "serve",
             "model",
-            "--block-size",
+            "--page-size",
             "0",
         ]);
         assert!(res.is_err(), "block-size 0 must be rejected by clap range");
@@ -1011,14 +1150,14 @@ mod tests {
                 "--worker-python",
                 "/usr/bin/py",
             ),
-            ("--worker-ranks", "4", "--worker-ranks", "4"),
+            ("--tp-size", "4", "--tp-size", "4"),
             (
                 "--attention-backend",
                 "flashinfer",
                 "--attention-backend",
                 "flashinfer",
             ),
-            ("--block-size", "512", "--block-size", "512"),
+            ("--page-size", "512", "--page-size", "512"),
             ("--pipeline-depth", "3", "--pipeline-depth", "3"),
             ("--max-batch", "7", "--max-batch", "7"),
             (
@@ -1027,17 +1166,22 @@ mod tests {
                 "--max-num-batched-tokens",
                 "4096",
             ),
-            ("--max-num-seqs", "33", "--max-num-seqs", "33"),
             (
-                "--long-prefill-threshold",
+                "--max-running-requests",
+                "33",
+                "--max-running-requests",
+                "33",
+            ),
+            (
+                "--chunked-prefill-size",
                 "1234",
-                "--long-prefill-threshold",
+                "--chunked-prefill-size",
                 "1234",
             ),
             (
-                "--scheduler-policy",
+                "--schedule-policy",
                 "priority",
-                "--scheduler-policy",
+                "--schedule-policy",
                 "priority",
             ),
             ("--resp-slot-cap", "1048576", "--resp-slot-cap", "1048576"),
@@ -1088,12 +1232,12 @@ mod tests {
 
     #[test]
     fn forwarded_scheduler_policy_value_round_trips_into_engine_mode() {
-        // `--scheduler-policy` is forwarded as a lowercased Debug string; the
+        // `--schedule-policy` is forwarded as a lowercased Debug string; the
         // engine subcommand must accept that exact spelling.
-        let runtime = parse_serve(&["--scheduler-policy", "priority"]);
+        let runtime = parse_serve(&["--schedule-policy", "priority"]);
         let engine_args = runtime.engine_cli_args();
         assert_eq!(
-            forwarded_value(&engine_args, "--scheduler-policy"),
+            forwarded_value(&engine_args, "--schedule-policy"),
             Some("priority"),
         );
 
@@ -1103,7 +1247,7 @@ mod tests {
             "model",
             "--handshake-address",
             "tcp://127.0.0.1:5557",
-            "--scheduler-policy",
+            "--schedule-policy",
             "priority",
         ])
         .expect("engine must accept forwarded scheduler-policy spelling");
@@ -1140,13 +1284,13 @@ mod tests {
     fn optional_kv_token_capacity_is_forwarded_only_when_set() {
         let default_runtime = parse_serve(&[]);
         assert_eq!(
-            forwarded_value(&default_runtime.engine_cli_args(), "--kv-token-capacity"),
+            forwarded_value(&default_runtime.engine_cli_args(), "--max-total-tokens"),
             None,
         );
 
-        let set_runtime = parse_serve(&["--kv-token-capacity", "100000"]);
+        let set_runtime = parse_serve(&["--max-total-tokens", "100000"]);
         assert_eq!(
-            forwarded_value(&set_runtime.engine_cli_args(), "--kv-token-capacity"),
+            forwarded_value(&set_runtime.engine_cli_args(), "--max-total-tokens"),
             Some("100000"),
         );
     }
@@ -1194,20 +1338,20 @@ mod tests {
 
     #[test]
     fn worker_launch_flag_kept_at_default_is_not_forwarded() {
-        // `--model-dtype` defaults to "bfloat16"; an unchanged value is omitted.
+        // `--dtype` defaults to "bfloat16"; an unchanged value is omitted.
         let runtime = parse_serve(&[]);
         assert_eq!(
-            forwarded_value(&runtime.engine_cli_args(), "--model-dtype"),
+            forwarded_value(&runtime.engine_cli_args(), "--dtype"),
             None,
-            "default --model-dtype must be omitted from forwarded args",
+            "default --dtype must be omitted from forwarded args",
         );
     }
 
     #[test]
     fn worker_launch_flag_changed_from_default_forwards_identical_value() {
-        let runtime = parse_serve(&["--model-dtype", "float16"]);
+        let runtime = parse_serve(&["--dtype", "float16"]);
         assert_eq!(
-            forwarded_value(&runtime.engine_cli_args(), "--model-dtype"),
+            forwarded_value(&runtime.engine_cli_args(), "--dtype"),
             Some("float16"),
         );
     }
@@ -1229,13 +1373,138 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_serve_aliases_parse_to_target_fields() {
+        let runtime = parse_serve(&[
+            "--worker-ranks",
+            "2",
+            "--block-size",
+            "128",
+            "--kv-token-capacity",
+            "4096",
+            "--long-prefill-threshold",
+            "2048",
+            "--scheduler-policy",
+            "priority",
+            "--language-model-only",
+            "--uniserve-reasoning-parser",
+            "none",
+            "--model-dtype",
+            "float16",
+            "--kv-memory-fraction",
+            "0.5",
+            "--transformers-trust-remote-code",
+            "--torch-compile",
+        ]);
+
+        assert_eq!(runtime.worker_ranks, 2);
+        assert_eq!(runtime.block_size, 128);
+        assert_eq!(runtime.kv_token_capacity, Some(4096));
+        assert_eq!(runtime.long_prefill_threshold, 2048);
+        assert!(matches!(
+            runtime.scheduler_policy,
+            SchedulerPolicyArg::Priority
+        ));
+        assert!(runtime.language_model_only);
+        assert_eq!(runtime.uniserve_reasoning_parser, ParserSelection::None);
+        assert_eq!(runtime.worker_launch.model_dtype, "float16");
+        assert_eq!(runtime.worker_launch.kv_memory_fraction, "0.5");
+        assert!(runtime.worker_launch.transformers_trust_remote_code);
+        assert!(runtime.worker_launch.torch_compile);
+    }
+
+    #[test]
+    fn serve_accepts_model_path_without_positional_model() {
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "--model-path", "model-a"])
+                .expect("serve invocation with --model-path must parse");
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(args.runtime.resolved_model(), "model-a");
+    }
+
+    #[test]
+    fn serve_accepts_model_alias_without_positional_model() {
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["uniserve", "serve", "--model", "model-a"])
+                .expect("serve invocation with --model must parse");
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(args.runtime.resolved_model(), "model-a");
+    }
+
+    #[test]
+    fn serve_rejects_positional_model_with_model_path_alias() {
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model-a",
+            "--model-path",
+            "model-b",
+        ]);
+
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn serve_configures_public_server_controls() {
+        let runtime = parse_serve(&[
+            "--api-key",
+            "public-key",
+            "--admin-api-key",
+            "admin-key",
+            "--request-timeout",
+            "9",
+            "--max-concurrent-requests",
+            "11",
+            "--server-dev-mode",
+            "--enable-lora",
+            "--lora-allowed-path-prefixes",
+            "/srv/lora,/opt/lora",
+        ]);
+        let config = runtime.into_config(HttpListenerMode::BindTcp {
+            host: "127.0.0.1".to_string(),
+            port: 8000,
+        });
+
+        assert_eq!(config.api_key.as_deref(), Some("public-key"));
+        assert_eq!(config.admin_api_key.as_deref(), Some("admin-key"));
+        assert_eq!(config.request_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(config.max_concurrent_requests, Some(11));
+        assert!(config.server_dev_mode);
+        assert!(config.enable_lora);
+        assert_eq!(
+            config.lora_allowed_path_prefixes,
+            vec![PathBuf::from("/srv/lora"), PathBuf::from("/opt/lora")]
+        );
+    }
+
+    #[test]
+    fn tokenizer_mode_accepts_only_supported_reference_value() {
+        let runtime = parse_serve(&["--tokenizer-mode", "auto"]);
+        assert!(matches!(runtime.tokenizer_mode, TokenizerModeArg::Auto));
+
+        let parsed = <Cli as clap::Parser>::try_parse_from([
+            "uniserve",
+            "serve",
+            "model",
+            "--tokenizer-mode",
+            "native",
+        ]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
     fn forwarded_args_are_well_formed_flag_value_pairs() {
         // Every forwarded token that introduces a value must be a recognized
         // engine flag (no orphaned positionals leaking into the passthrough).
         let runtime = parse_serve(&[
             "--device",
             "cpu",
-            "--block-size",
+            "--page-size",
             "512",
             "--workers",
             "encoder:1",

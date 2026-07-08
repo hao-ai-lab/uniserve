@@ -12,7 +12,7 @@ use crate::routes::openai::utils::validated_json::ValidatedJson;
 use uniserve_server_app::AppState;
 use uniserve_server_app::{LoadLoraError, UnloadLoraError};
 
-const RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV: &str = "UNISERVE_RUNTIME_LORA_ALLOWED_PATH_PREFIXES";
+const LORA_ALLOWED_PATH_PREFIXES_FIELD: &str = "--lora-allowed-path-prefixes";
 
 #[derive(Debug, Deserialize, Validate)]
 pub(crate) struct LoadLoraAdapterRequest {
@@ -34,10 +34,6 @@ pub(crate) struct UnloadLoraAdapterRequest {
 }
 
 impl Normalizable for UnloadLoraAdapterRequest {}
-
-fn runtime_lora_allowed_path_prefixes() -> Option<Vec<PathBuf>> {
-    uniserve_config::env_paths(RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV)
-}
 
 fn looks_like_local_lora_path(lora_path: &str) -> bool {
     let path = Path::new(lora_path);
@@ -61,7 +57,7 @@ fn validate_lora_path_access(
     let Some(allowed_prefixes) = allowed_prefixes else {
         return Err(ApiError::invalid_request(
             format!(
-                "Local LoRA adapter paths require {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV} to be configured."
+                "Local LoRA adapter paths require {LORA_ALLOWED_PATH_PREFIXES_FIELD} to be configured."
             ),
             Some("lora_path"),
         ));
@@ -70,7 +66,7 @@ fn validate_lora_path_access(
     if !path.is_absolute() {
         return Err(ApiError::invalid_request(
             format!(
-                "Local LoRA adapter paths must be absolute and under one of the prefixes configured by {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV}."
+                "Local LoRA adapter paths must be absolute and under one of the prefixes configured by {LORA_ALLOWED_PATH_PREFIXES_FIELD}."
             ),
             Some("lora_path"),
         ));
@@ -87,7 +83,7 @@ fn validate_lora_path_access(
         .map(|prefix| {
             prefix.canonicalize().map_err(|_| {
                 ApiError::server_error(format!(
-                    "configured {RUNTIME_LORA_ALLOWED_PATH_PREFIXES_ENV} path prefix must exist and be accessible"
+                    "configured {LORA_ALLOWED_PATH_PREFIXES_FIELD} path prefix must exist and be accessible"
                 ))
             })
         })
@@ -129,9 +125,12 @@ pub(super) async fn load_lora_adapter(
             Some("is_3d_lora_weight"),
         ));
     }
-    let allowed_prefixes = runtime_lora_allowed_path_prefixes();
-    let lora_path = validate_lora_path_access(&request.lora_path, allowed_prefixes.as_deref())?
-        .unwrap_or(request.lora_path);
+    let allowed_prefixes = state.runtime_lora_allowed_path_prefixes();
+    let lora_path = validate_lora_path_access(
+        &request.lora_path,
+        (!allowed_prefixes.is_empty()).then_some(allowed_prefixes),
+    )?
+    .unwrap_or(request.lora_path);
 
     let lora_name = request.lora_name;
     state

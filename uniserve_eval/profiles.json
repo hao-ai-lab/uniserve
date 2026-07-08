@@ -20,11 +20,9 @@
         "UNISERVE_DECODE_TOKEN_BURST": "8"
       },
       "serve_args": [
-        "--kv-token-capacity",
+        "--max-total-tokens",
         "65536",
-        "--max-num-seqs",
-        "128",
-        "--max-batch",
+        "--max-running-requests",
         "128",
         "--max-num-batched-tokens",
         "8192"
@@ -39,12 +37,10 @@
         "UNISERVE_DECODE_TOKEN_BURST": "8"
       },
       "serve_args": [
-        "--kv-token-capacity",
+        "--max-total-tokens",
         "65536",
-        "--max-num-seqs",
+        "--max-running-requests",
         "1",
-        "--max-batch",
-        "4",
         "--max-num-batched-tokens",
         "4096"
       ],
@@ -58,15 +54,13 @@
       "port": 18081,
       "cuda_visible_devices": "0",
       "serve_args": [
-        "--kv-token-capacity",
+        "--max-total-tokens",
         "131072",
-        "--max-num-seqs",
-        "128",
-        "--max-batch",
+        "--max-running-requests",
         "128",
         "--max-num-batched-tokens",
         "16384",
-        "--long-prefill-threshold",
+        "--chunked-prefill-size",
         "16384",
         "--prefill-cuda-graph",
         "true",
@@ -116,18 +110,16 @@
         "UNISERVE_DENOISE_STEP_GRAPH": "1"
       },
       "serve_args": [
-        "--kv-token-capacity",
+        "--max-total-tokens",
         "262144",
-        "--max-num-seqs",
+        "--max-running-requests",
         "12",
-        "--max-batch",
-        "128",
         "--max-num-batched-tokens",
         "8192",
-        "--worker-ranks",
+        "--tp-size",
         "2"
       ],
-      "description": "UniServe SenseNova benchmark server (TP2, GPU0/GPU1). KV capacity 262144 tokens (~22GB/GPU) with max-num-seqs 12: the scheduler reserves each default request's full worst case (prompt + max_tokens + retained-image envelope) at admission, so concurrency scales with KV capacity and cannot deadlock. UNISERVE_DENOISE_STEP_GRAPH is on (validated safe under concurrency); the packed-mixed decoder graph was removed (segfaulted). Text-decode and image-denoise are never co-batched (scheduler default), which is required for correct mixed-output decode under load.",
+      "description": "UniServe SenseNova benchmark server with tensor parallel size 2, a 262144-token KV pool, and 12 running requests.",
       "extends": "benchmark/server/_uniserve-mixed-base",
       "abstract": false
     },
@@ -189,18 +181,16 @@
         "UNISERVE_DENOISE_STEP_GRAPH": "1"
       },
       "serve_args": [
-        "--kv-token-capacity",
+        "--max-total-tokens",
         "65536",
-        "--max-num-seqs",
+        "--max-running-requests",
         "1",
-        "--max-batch",
-        "4",
         "--max-num-batched-tokens",
         "4096",
-        "--worker-ranks",
+        "--tp-size",
         "2"
       ],
-      "description": "UniServe SenseNova correctness/perf-tripwire server (single-user). UNISERVE_DENOISE_STEP_GRAPH stays on here where it is validated.",
+      "description": "UniServe SenseNova correctness and perf-tripwire server with tensor parallel size 2.",
       "extends": "gate/server/_uniserve-base",
       "abstract": false
     },
@@ -218,28 +208,47 @@
       "type": "verify",
       "server": "gate/server/sensenova",
       "payload": {
-        "constraint": "gen_only",
-        "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
-        "seed": 42,
-        "image": {
+        "model": "SenseNova-U1",
+        "modalities": [
+          "image"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "A red bicycle leaning against a weathered brick wall, golden hour light"
+          }
+        ],
+        "image_config": {
           "width": 2048,
           "height": 1152,
-          "steps": 50
+          "steps": 50,
+          "seed": 42
         }
       },
       "expect_images": 1,
-      "expect_image_steps": 50,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
-      "description": "SenseNova native image correctness gate."
+      "description": "SenseNova chat image correctness gate."
     },
     "gate/sensenova/i2t-house": {
       "type": "verify",
       "server": "gate/server/sensenova",
       "payload": {
-        "constraint": "und_only",
-        "prompt": "Describe this image in detail.",
-        "max_tokens": 128,
+        "model": "SenseNova-U1",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "modalities": [
+          "text"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Describe this image in detail."
+          }
+        ],
+        "max_completion_tokens": 128,
         "temperature": 0
       },
       "input_image_synthetic": {
@@ -255,22 +264,33 @@
       "type": "verify",
       "server": "gate/server/sensenova",
       "payload": {
-        "constraint": "default",
-        "prompt": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate.",
-        "max_tokens": 4096,
+        "model": "SenseNova-U1",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Generate a travel guide covering Sonoma, Sequoia, Tahoe, and the Golden Gate."
+          }
+        ],
+        "max_completion_tokens": 4096,
         "temperature": 0,
-        "image": {
+        "image_config": {
           "width": 2048,
           "height": 1152,
           "steps": 50,
-          "max_images": 4,
-          "retain_images": true
+          "num_images": 4
         }
       },
       "expect_images": 4,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
-      "expect_image_steps": 50,
       "timeout_s": 900,
       "description": "SenseNova default correctness gate."
     },
@@ -278,28 +298,47 @@
       "type": "verify",
       "server": "gate/server/bagel",
       "payload": {
-        "constraint": "gen_only",
-        "prompt": "A red bicycle leaning against a weathered brick wall, golden hour light",
-        "seed": 42,
-        "image": {
+        "model": "BAGEL",
+        "modalities": [
+          "image"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "A red bicycle leaning against a weathered brick wall, golden hour light"
+          }
+        ],
+        "image_config": {
           "width": 1024,
           "height": 1024,
-          "steps": 50
+          "steps": 50,
+          "seed": 42
         }
       },
       "expect_images": 1,
-      "expect_image_steps": 50,
       "expect_image_width": 1024,
       "expect_image_height": 1024,
-      "description": "BAGEL native image correctness gate."
+      "description": "BAGEL chat image correctness gate."
     },
     "gate/bagel/i2t-house": {
       "type": "verify",
       "server": "gate/server/bagel",
       "payload": {
-        "constraint": "und_only",
-        "prompt": "Describe this image in detail.",
-        "max_tokens": 128,
+        "model": "BAGEL",
+        "stream": true,
+        "stream_options": {
+          "include_usage": true
+        },
+        "modalities": [
+          "text"
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Describe this image in detail."
+          }
+        ],
+        "max_completion_tokens": 128,
         "temperature": 0
       },
       "input_image_synthetic": {
@@ -333,7 +372,9 @@
         "--width",
         "2048",
         "--height",
-        "1152"
+        "1152",
+        "--wire",
+        "openai_chat_json"
       ],
       "expect_metrics": {
         "image_latency_ms.mean": {
@@ -362,7 +403,7 @@
         "--seed",
         "42",
         "--wire",
-        "native"
+        "openai_chat"
       ],
       "expect_metrics": {
         "output_throughput": {
@@ -396,7 +437,9 @@
         "--width",
         "1024",
         "--height",
-        "1024"
+        "1024",
+        "--wire",
+        "openai_chat_json"
       ],
       "expect_metrics": {
         "image_latency_ms.mean": {
@@ -425,7 +468,7 @@
         "--seed",
         "42",
         "--wire",
-        "native"
+        "openai_chat"
       ],
       "expect_metrics": {
         "output_throughput": {
@@ -508,9 +551,7 @@
           "points": [
             "sensenova_mjhq_t2i_uniserve",
             "sensenova_beans_i2t_uniserve",
-            "sensenova_beans_i2t_chat_uniserve",
-            "sensenova_ueval_default_uniserve",
-            "sensenova_ueval_default_chat_uniserve"
+            "sensenova_ueval_default_uniserve"
           ]
         },
         "sensenova-omni": {
@@ -524,9 +565,7 @@
           "server": "benchmark/server/bagel-uniserve",
           "points": [
             "bagel_mjhq_t2i_uniserve",
-            "bagel_mjhq_t2i_chat_uniserve",
-            "bagel_beans_i2t_uniserve",
-            "bagel_beans_i2t_chat_uniserve"
+            "bagel_beans_i2t_uniserve"
           ]
         },
         "bagel-omni": {
@@ -575,7 +614,8 @@
             "num_prompts": 200,
             "steps": 50,
             "width": 2048,
-            "height": 1152
+            "height": 1152,
+            "wire": "openai_chat_json"
           }
         },
         "sensenova_mjhq_t2i_omni": {
@@ -604,7 +644,7 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "native"
+            "wire": "openai_chat"
           }
         },
         "sensenova_beans_i2t_omni": {
@@ -635,22 +675,6 @@
             "steps": 50,
             "width": 2048,
             "height": 1152,
-            "temperature": 0.7
-          }
-        },
-        "sensenova_ueval_default_chat_uniserve": {
-          "axis": "arrival_rate",
-          "name": "sensenova-uniserve-ueval-chat-r{rate_tag}",
-          "output": "sensenova_ueval_default/uniserve_chat_r{rate_tag}",
-          "harness": {
-            "task": "default",
-            "model": "SenseNova-U1",
-            "dataset": "ueval",
-            "num_prompts": 32,
-            "max_tokens": 8192,
-            "steps": 50,
-            "width": 2048,
-            "height": 1152,
             "wire": "openai_chat",
             "temperature": 0.7
           }
@@ -666,7 +690,8 @@
             "num_prompts": 200,
             "steps": 50,
             "width": 1024,
-            "height": 1024
+            "height": 1024,
+            "wire": "openai_chat_json"
           }
         },
         "bagel_mjhq_t2i_omni": {
@@ -695,7 +720,7 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "native"
+            "wire": "openai_chat"
           }
         },
         "bagel_beans_i2t_omni": {
@@ -710,51 +735,6 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "openai_chat_json"
-          }
-        },
-        "sensenova_beans_i2t_chat_uniserve": {
-          "axis": "arrival_rate",
-          "name": "sensenova-uniserve-i2t-chat-r{rate_tag}",
-          "output": "sensenova_beans_i2t/uniserve_chat_r{rate_tag}",
-          "harness": {
-            "task": "i2t",
-            "model": "SenseNova-U1",
-            "dataset": "image-dir",
-            "dataset_ref": "beans",
-            "num_prompts": 200,
-            "max_tokens": 256,
-            "temperature": 0,
-            "wire": "openai_chat"
-          }
-        },
-        "bagel_beans_i2t_chat_uniserve": {
-          "axis": "arrival_rate",
-          "name": "bagel-uniserve-i2t-chat-r{rate_tag}",
-          "output": "bagel_beans_i2t/uniserve_chat_r{rate_tag}",
-          "harness": {
-            "task": "i2t",
-            "model": "BAGEL",
-            "dataset": "image-dir",
-            "dataset_ref": "beans",
-            "num_prompts": 200,
-            "max_tokens": 256,
-            "temperature": 0,
-            "wire": "openai_chat"
-          }
-        },
-        "bagel_mjhq_t2i_chat_uniserve": {
-          "axis": "arrival_rate",
-          "name": "bagel-uniserve-t2i-chat-r{rate_tag}",
-          "output": "bagel_mjhq_t2i/uniserve_chat_r{rate_tag}",
-          "harness": {
-            "task": "t2i",
-            "model": "BAGEL",
-            "dataset": "mjhq",
-            "num_prompts": 200,
-            "steps": 50,
-            "width": 1024,
-            "height": 1024,
             "wire": "openai_chat_json"
           }
         }

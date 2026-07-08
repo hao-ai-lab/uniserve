@@ -25,7 +25,6 @@ IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 
 # Wire = request/response shape used to exercise one task over one endpoint.
 #
-# * "native"            -> UniServe /generate SSE
 # * "openai_chat"       -> OpenAI chat completions SSE, streamed; per-chunk
 #                          timing (TTFT/ITL) and delta.images image counting
 # * "openai_chat_json"  -> OpenAI chat completions, one non-streamed JSON
@@ -37,13 +36,12 @@ IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 TASK_WIRES = {
     TaskName.TEXT: ("openai_chat",),
     TaskName.T2I: ("images_generations", "openai_chat_json"),
-    TaskName.I2I: ("native",),
-    TaskName.I2T: ("native", "openai_chat", "openai_chat_json"),
-    TaskName.DEFAULT: ("native", "openai_chat"),
+    TaskName.I2I: ("openai_chat_json",),
+    TaskName.I2T: ("openai_chat", "openai_chat_json"),
+    TaskName.DEFAULT: ("openai_chat",),
 }
 
 WIRE_ENDPOINTS = {
-    "native": "/generate",
     "openai_chat": "/v1/chat/completions",
     "openai_chat_json": "/v1/chat/completions",
     "images_generations": "/v1/images/generations",

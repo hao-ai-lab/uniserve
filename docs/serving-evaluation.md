@@ -40,7 +40,7 @@ are expanded at launch; unresolved variables fail before a server starts.
 
 - `benchmark/server/...`: servers used by the official benchmark matrix.
 - `gate/server/...`: servers for correctness gates and small tripwires.
-- `gate/...`: native correctness workloads.
+- `gate/...`: chat-completions correctness workloads.
 - `perf/tripwire/...`: small regression sentinels, not headline numbers.
 - `benchmarks.main`: the current benchmark matrix.
 
@@ -51,10 +51,7 @@ once in `benchmarks.main`.
 
 ### `verify`
 
-Native `/generate` SSE correctness gates. The verifier checks expected image
-count, image dimensions, per-image step count, minimum text token count, clean
-finish, and absence of `error` events. I2T gates can inject a deterministic
-synthetic image through `input_image_synthetic`.
+Chat-completions correctness gates. The verifier posts OpenAI-compatible chat payloads to `/v1/chat/completions` and checks status, OpenAI error chunks, finish reasons, terminal `[DONE]` for streamed requests, generated text, generated-image count, decoded PNG dimensions, and response shape. I2T gates can inject a deterministic synthetic image through `input_image_synthetic`.
 
 ### `perf`
 

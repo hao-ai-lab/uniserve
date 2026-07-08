@@ -13,7 +13,7 @@ The two halves communicate over a zero-copy shared-memory transport (iceoryx2) t
 | Component | Requirement                                                                   |
 | --------- | ----------------------------------------------------------------------------- |
 | OS / arch | Linux, x86-64 or aarch64                                                      |
-| GPU       | NVIDIA GPU + recent driver (CUDA). `--device cpu` / `--sim` for GPU-free runs |
+| GPU       | NVIDIA GPU + recent driver (CUDA). `--device cpu` is available for CPU-compatible paths |
 | Python    | 3.11+ with **PyTorch 2.8+** built for your CUDA/arch                          |
 | Rust      | stable toolchain (`rustup`), edition 2024 — needed at install time            |
 
@@ -38,8 +38,8 @@ uv pip install -e .
 With the venv active, serving is a single command:
 
 ```bash
-uniserve serve Qwen/Qwen3-32B          # downloads from the Hub on first run
-uniserve serve /path/to/Qwen3-32B      # …or serve a local model directory
+uniserve serve --model-path Qwen/Qwen3-32B          # downloads from the Hub on first run
+uniserve serve --model-path /path/to/Qwen3-32B      # …or serve a local model directory
 ```
 
 Then:
@@ -53,7 +53,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "Qwen3-32B",
-    "messages": [{"role": "user", "content": "Give me one fun fact about octopuses."}],
+    "messages": [{"role": "user", "content": "Give me one concise fact about matrix multiplication."}],
     "max_tokens": 128,
     "chat_template_kwargs": {"enable_thinking": false}
   }'
@@ -66,14 +66,6 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 Any OpenAI client works — point its `base_url` at `http://<host>:<port>/v1`.
 
-### Without a GPU
-
-`--sim` runs the built-in CPU simulation engine (no Python worker, no GPU, no weights) , which is useful for exercising the API surface and scheduler:
-
-```bash
-uniserve serve sim-model --sim --port 8000
-```
-
 ## Configuration
 
 Run `uniserve serve --help` for the full list. The most useful flags:
@@ -81,29 +73,36 @@ Run `uniserve serve --help` for the full list. The most useful flags:
 
 | Flag                       | Default                           | Description                                                                               |
 | -------------------------- | --------------------------------- | ----------------------------------------------------------------------------------------- |
-| `<MODEL>`                  | —                                 | Local model directory or Hugging Face repo id                                             |
+| `--model-path`             | —                                 | Local model directory or Hugging Face repo id                                             |
 | `--host` / `--port`        | `127.0.0.1` / `8000`              | HTTP bind address                                                                         |
 | `--uds <path>`             | —                                 | Bind a Unix domain socket instead of host/port                                            |
 | `--device`                 | `cuda`                            | `cuda`, `cpu`                                                                             |
-| `--worker-python`          | auto (venv beside the binary)     | Interpreter for the worker; resolved automatically, override only if you must             |
-| `--worker-ranks`           | `1`                               | Tensor-parallel worker processes (set >1 for models that exceed one GPU)                  |
+| `--tp-size`                | `1`                               | Tensor-parallel worker processes (set >1 for models that exceed one GPU)                  |
 | `--max-model-len`          | model's `max_position_embeddings` | Context-length cap                                                                        |
-| `--max-num-seqs`           | engine default                    | Max concurrent running requests                                                           |
+| `--max-running-requests`   | engine default                    | Scheduler active-request limit                                                            |
+| `--max-concurrent-requests` | —                                | Front-door HTTP admission limit for in-flight inference requests                          |
 | `--max-num-batched-tokens` | engine default                    | Per-step token budget (chunked prefill)                                                   |
+| `--max-total-tokens`       | auto-fit                          | KV token capacity override                                                                |
 | `--attention-backend`      | `auto`                            | `auto` picks flashinfer/flash-attn/sgl-kernel if present, else a correct PyTorch fallback |
-| `--grpc-port`              | —                                 | Also start the gRPC Generate service                                                      |
-| `--sim`                    | off                               | GPU-free CPU simulation engine                                                            |
-| `--served-model-name`      | `--model`                         | Public model id(s) returned by the API                                                    |
+| `--api-key`                | —                                 | Bearer token for public API routes                                                        |
+| `--admin-api-key`          | —                                 | Bearer token for sensitive management routes                                              |
+| `--request-timeout`        | —                                 | Per-request wall-clock timeout in seconds                                                 |
+| `--log-level` / `--log-level-http` | `INFO` / inherited        | Default and HTTP-target log levels                                                        |
+| `--log-stats`              | enabled                           | Set `false` to disable periodic engine statistics logging                                 |
+| `--enable-lora`            | off                               | Mount runtime LoRA management routes                                                      |
+| `--lora-allowed-path-prefixes` | —                              | Comma-separated absolute prefixes for local runtime LoRA adapter paths                    |
+| `SGLANG_GRPC_PORT`         | —                                 | gRPC Generate service port when `SGLANG_ENABLE_GRPC` is enabled                           |
+| `--served-model-name`      | `--model-path`                    | Public model id(s) returned by the API                                                    |
 
 
-KV-cache size is auto-fitted to free GPU memory; override with `--kv-token-capacity`. Context length, when not pinned with `--max-model-len`, is read from the model config (e.g. 40960 for Qwen3-32B).
+KV-cache size is auto-fitted to free GPU memory; override with `--max-total-tokens`. Context length, when not pinned with `--max-model-len`, is read from the model config (e.g. 40960 for Qwen3-32B).
 
 ### Multiple GPUs
 
 For a model that does not fit on one GPU, run it tensor-parallel with one worker rank per GPU:
 
 ```bash
-uniserve serve /path/to/big-model --worker-ranks 4
+uniserve serve --model-path /path/to/big-model --tp-size 4
 ```
 
 ## Dependencies
@@ -123,7 +122,7 @@ just test-rust                 # cargo test --workspace
 just lint                      # fmt + clippy + ruff + mypy
 just test-python-fast          # unit / contract / architecture tests
 just test-python-integration   # fake/simulated-backend tests
-just test-python-e2e           # black-box server tests (uses --sim)
+just test-python-e2e           # black-box server tests
 just test-all                  # all of the above in one shot
 ```
 

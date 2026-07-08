@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use std::{fmt, fs};
 
 use axum::body::{Body, to_bytes};
@@ -1041,6 +1042,161 @@ async fn list_models_returns_configured_model() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn api_key_protects_serving_routes_but_not_operational_probes() {
+    let (chat, engine_task) = test_chat_with_engine_handle().await;
+    let mut app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+            .with_api_key(Some("public-key".to_string())),
+    ));
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer public-key")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    drop(app);
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn admin_api_key_protects_management_routes_when_configured() {
+    let (chat, engine_task) = test_chat_with_engine_handle().await;
+    let app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+            .with_api_key(Some("public-key".to_string()))
+            .with_admin_api_key(Some("admin-key".to_string()))
+            .with_server_dev_mode(true),
+    ));
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .uri("/server_info")
+                .header("authorization", "Bearer public-key")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .uri("/server_info")
+                .header("authorization", "Bearer admin-key")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn configured_admission_limit_sheds_tracked_requests() {
+    let (chat, engine_task) = test_chat_with_engine_handle().await;
+    let state = Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+            .with_max_concurrent_requests(Some(1)),
+    );
+    state.increment_server_load();
+    let mut app = build_router(Arc::clone(&state));
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    state.decrement_server_load();
+    drop(app);
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn configured_request_timeout_returns_gateway_timeout() {
+    let (client, mock) = EngineCoreClient::connect_mock("test-model");
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(mock, |mut mock| {
+        boxed_test_future(async move {
+            let _request = mock.recv_request().await;
+            std::future::pending::<()>().await;
+        })
+    }));
+    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
+    let mut app = build_router(Arc::new(
+        AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+            .with_request_timeout(Some(Duration::from_millis(10))),
+    ));
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    drop(app);
+    engine_task.abort_and_join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn request_id_header_is_absent_by_default() {
     let app = test_app().await;
     let response = health_response(&app, None).await;
@@ -1925,6 +2081,105 @@ async fn chat_completions_streams_default_image_deltas() {
     assert!(!text.contains("image_step"), "{text}");
     assert!(!text.contains("image_done"), "{text}");
     assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn public_generate_route_is_not_mounted_but_chat_and_images_are_available() {
+    let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
+        boxed_test_future(async move {
+            for _ in 0..2 {
+                let request = mock.recv_request().await;
+                let native = request.native.as_ref().expect("native request extension");
+                assert_eq!(native.constraint, GenerationConstraint::GenOnly);
+                mock.send_outputs(EngineCoreOutputs {
+                    engine_index: 0,
+                    outputs: vec![
+                        native_image_output(
+                            &request.request_id,
+                            WireImageEvent::Done {
+                                image_id: 0,
+                                height: 1152,
+                                width: 2048,
+                                bytes: 3,
+                                sha256: "sha".to_string(),
+                                png_b64: "QUJD".to_string(),
+                            },
+                        ),
+                        native_finish_output(&request.request_id, "image_done", 7, 0, 1),
+                    ],
+                    scheduler_stats: None,
+                    timestamp: 0.0,
+                    utility_output: None,
+                    finished_requests: None,
+                    wave_complete: None,
+                    start_wave: None,
+                });
+            }
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "modalities": ["image"],
+                        "messages": [{"role": "user", "content": "draw"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(
+        json["choices"][0]["message"]["images"][0]["image_url"]["url"],
+        "data:image/png;base64,QUJD"
+    );
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"prompt": "draw"}).to_string()))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(json["data"][0]["b64_json"], "QUJD");
+
+    engine_task.await.expect("mock engine task");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

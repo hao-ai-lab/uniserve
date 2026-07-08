@@ -4,11 +4,9 @@ Follows the academic/industry convention for diffusion-model serving (Baseten /
 GigaGPU / NVIDIA Cosmos / Lambda): the headline is per-image latency percentiles
 plus image throughput, reported under a stated config and after warmup.
 
-* per-image latency = request E2E (t2i is one image per request; for i2i, the
-  per-image ``image_done`` latency is used when the native stream exposes it).
+* per-image latency = request E2E unless the response stream exposes per-image completion timing.
 * throughput = images/s and images/min over the wall-clock timed region.
-* i2i additionally reports time-to-first-image and per-image generation time
-  (``image_done - image_begin``) and steps/s derived from the SSE events.
+* streamed image responses additionally report time-to-first-image, per-image generation time, and steps/s when those fields are available.
 """
 from __future__ import annotations
 
@@ -43,7 +41,7 @@ def summarize_image(records: list[RequestRecord], dur_s: float) -> dict[str, Any
         "image_latency_ms": distribution(image_latencies, scale=1000),
     }
 
-    # i2i (native SSE) extras: only present when the stream exposed image events.
+    # Stream extras: only present when the stream exposed image timing events.
     ttfi = [r.first_image_latency for r in successful if r.first_image_latency is not None]
     if ttfi:
         summary["time_to_first_image_ms"] = distribution(ttfi, scale=1000)
