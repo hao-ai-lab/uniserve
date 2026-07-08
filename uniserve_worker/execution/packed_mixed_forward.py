@@ -4,15 +4,13 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import torch
 
-from ..backends.paged_kv_math import paged_kv_write
 from ..contracts.batches import UniForwardBatch
-from ..contracts.forward_context import get_forward_context, use_forward_context
+from ..contracts.forward_context import get_forward_context
 from ..contracts.forward_mode import ForwardMode
 from ..contracts.outputs import TextTokenOutput
 from ..foundation.env import env_flag
@@ -24,7 +22,6 @@ from .denoise_driver import TextImageDenoiseStep, combine_text_image_velocity, t
 from .forward_stream import (
     ForwardPagedKVSegment,
     ForwardPagedKVView,
-    ForwardStream,
     ForwardStreamBuilder,
 )
 from .interleaved_text_stepper import hydrate_cached_prefix_from_op
@@ -35,8 +32,6 @@ logger = logging.getLogger(__name__)
 
 _PACKED_MIXED_TIMING = env_flag("UNISERVE_PACKED_MIXED_TIMING")
 _PACKED_MIXED_TIMING_SYNC = env_flag("UNISERVE_PACKED_MIXED_TIMING_SYNC")
-_PACKED_MIXED_GRAPH = env_flag("UNISERVE_PACKED_MIXED_GRAPH")
-_PACKED_MIXED_GRAPH_RUNNER_ATTR = "_packed_mixed_decoder_graph_runner"
 
 
 def run_packed_mixed_forward(
@@ -232,26 +227,20 @@ def run_packed_mixed_forward(
         decoder_component_start = timing.component_snapshot(ctx)
         packed_embeds = torch.cat(embed_chunks, dim=0)
         packed_indicators = torch.cat(indicators, dim=0)
-        hidden = _maybe_run_packed_mixed_decoder_graph(
-            owner,
+        # No CUDA-graph fast path here, deliberately: a mixed und+gen batch only
+        # exists under concurrency, where text-row base lengths grow every step
+        # and neighbouring requests re-plan the shared FlashInfer prefill
+        # wrapper — a captured replay would run against stale/foreign attention
+        # plans (observed as cudaGraphLaunch segfaults on both TP ranks). The
+        # denoise-step graph (frozen per-image geometry + exclusive wrapper)
+        # remains the sanctioned graph path for the denoise loop.
+        hidden = owner.packed_decoder_forward(
             packed_embeds,
             image_gen_indicators=packed_indicators,
             indexes=forward_stream.indexes,
             forward_stream=forward_stream,
             kv_view=kv_view,
-            ctx=ctx,
         )
-        if hidden is None:
-            hidden = owner.packed_decoder_forward(
-                packed_embeds,
-                image_gen_indicators=packed_indicators,
-                indexes=forward_stream.indexes,
-                forward_stream=forward_stream,
-                kv_view=kv_view,
-            )
-            timing.values["decoder_graph"] = 0.0
-        else:
-            timing.values["decoder_graph"] = 1.0
         timing.add_component_deltas(
             ctx,
             decoder_component_start,
@@ -405,358 +394,6 @@ def run_packed_mixed_forward(
             details={"cause_type": type(exc).__name__, "cause": str(exc)[:500]},
         ) from exc
 
-
-def _maybe_run_packed_mixed_decoder_graph(
-    owner: Any,
-    inputs_embeds: torch.Tensor,
-    *,
-    image_gen_indicators: torch.Tensor,
-    indexes: torch.Tensor,
-    forward_stream: ForwardStream,
-    kv_view: ForwardPagedKVView,
-    ctx: Any,
-) -> torch.Tensor | None:
-    if not _PACKED_MIXED_GRAPH:
-        return None
-    if not torch.cuda.is_available() or inputs_embeds.device.type != "cuda":
-        return None
-    if not bool(getattr(forward_stream, "fully_visible", False)):
-        return None
-    has_und = any(seg.modality == "und" for seg in forward_stream.segments)
-    has_gen = any(seg.modality == "gen" for seg in forward_stream.segments)
-    if not (has_und and has_gen):
-        return None
-    if any(not bool(seg.write_kv) for seg in kv_view.segments):
-        return None
-    runner = getattr(owner, _PACKED_MIXED_GRAPH_RUNNER_ATTR, None)
-    if runner is None:
-        runner = _PackedMixedDecoderGraphRunner()
-        setattr(owner, _PACKED_MIXED_GRAPH_RUNNER_ATTR, runner)
-    return runner.maybe_run(
-        owner,
-        inputs_embeds,
-        image_gen_indicators=image_gen_indicators,
-        indexes=indexes,
-        forward_stream=forward_stream,
-        kv_view=kv_view,
-        ctx=ctx,
-    )
-
-
-@dataclass
-class _PackedMixedDecoderGraphState:
-    key: tuple[Any, ...]
-    graph: torch.cuda.CUDAGraph
-    input_embeds: torch.Tensor
-    image_gen_indicators: torch.Tensor
-    indexes: torch.Tensor
-    forward_stream: ForwardStream
-    kv_view: "_GraphForwardPagedKVView"
-    hidden: torch.Tensor | None = None
-
-    def copy_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
-        indexes: torch.Tensor,
-        kv_view: ForwardPagedKVView,
-    ) -> bool:
-        if tuple(inputs_embeds.shape) != tuple(self.input_embeds.shape):
-            return False
-        if tuple(indexes.shape) != tuple(self.indexes.shape):
-            return False
-        self.input_embeds.copy_(inputs_embeds, non_blocking=True)
-        self.image_gen_indicators.copy_(image_gen_indicators, non_blocking=True)
-        self.indexes.copy_(indexes, non_blocking=True)
-        return self.kv_view.copy_from(kv_view)
-
-
-class _GraphForwardPagedKVView:
-    def __init__(
-        self,
-        source: ForwardPagedKVView,
-        *,
-        device: torch.device,
-    ) -> None:
-        self.pool = source.pool
-        self.block_size = int(source.pool.block_size)
-        self.q_lens = tuple(int(seg.q_len) for seg in source.segments)
-        self.block_cols = tuple(len(seg.block_ids) for seg in source.segments)
-        self.write_flags = tuple(bool(seg.write_kv) for seg in source.segments)
-        self.persist_flags = tuple(bool(seg.persist_kv) for seg in source.segments)
-        max_blocks = max(self.block_cols)
-        self._block_table = torch.zeros(
-            (len(self.q_lens), max_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        self._cache_after = torch.empty((len(self.q_lens),), dtype=torch.int32, device=device)
-        self._cu_after = torch.empty((len(self.q_lens) + 1,), dtype=torch.int32, device=device)
-        write_tokens = sum(
-            q_len for q_len, write in zip(self.q_lens, self.write_flags, strict=True) if write
-        )
-        self._page_ids = torch.empty((write_tokens,), dtype=torch.int64, device=device)
-        self._offsets = torch.empty((write_tokens,), dtype=torch.int64, device=device)
-        self.segments = tuple(
-            ForwardPagedKVSegment(
-                block_ids=tuple(0 for _ in range(blocks)),
-                base_len=max(0, int(blocks) * self.block_size - int(q_len)),
-                q_len=int(q_len),
-                write_kv=write,
-                persist_kv=persist,
-            )
-            for q_len, blocks, write, persist in zip(
-                self.q_lens,
-                self.block_cols,
-                self.write_flags,
-                self.persist_flags,
-                strict=True,
-            )
-        )
-
-    def copy_from(self, source: ForwardPagedKVView) -> bool:
-        if len(source.segments) != len(self.q_lens):
-            return False
-        block_rows: list[list[int]] = []
-        cache_after: list[int] = []
-        page_ids: list[int] = []
-        offsets: list[int] = []
-        for seg, q_len, blocks, write in zip(
-            source.segments,
-            self.q_lens,
-            self.block_cols,
-            self.write_flags,
-            strict=True,
-        ):
-            if int(seg.q_len) != q_len or bool(seg.write_kv) != write:
-                return False
-            seg_blocks = [int(block_id) for block_id in seg.block_ids]
-            if len(seg_blocks) != blocks:
-                return False
-            block_rows.append(seg_blocks)
-            cache_after.append(int(seg.base_len) + int(seg.q_len))
-            if write:
-                for local in range(int(seg.q_len)):
-                    position = int(seg.base_len) + local
-                    block_slot = position // self.block_size
-                    if block_slot >= len(seg_blocks):
-                        return False
-                    page_ids.append(seg_blocks[block_slot])
-                    offsets.append(position % self.block_size)
-
-        if len(page_ids) != int(self._page_ids.numel()):
-            return False
-        self._block_table.zero_()
-        for row, blocks in enumerate(block_rows):
-            if blocks:
-                self._block_table[row, : len(blocks)] = torch.tensor(
-                    blocks,
-                    dtype=torch.int32,
-                    device=self._block_table.device,
-                )
-        self._cache_after.copy_(
-            torch.tensor(cache_after, dtype=torch.int32, device=self._cache_after.device),
-            non_blocking=True,
-        )
-        cu = [0]
-        for length in cache_after:
-            cu.append(cu[-1] + int(length))
-        self._cu_after.copy_(
-            torch.tensor(cu, dtype=torch.int32, device=self._cu_after.device),
-            non_blocking=True,
-        )
-        self._page_ids.copy_(
-            torch.tensor(page_ids, dtype=torch.int64, device=self._page_ids.device),
-            non_blocking=True,
-        )
-        self._offsets.copy_(
-            torch.tensor(offsets, dtype=torch.int64, device=self._offsets.device),
-            non_blocking=True,
-        )
-        return True
-
-    def block_table(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        del device
-        return self._block_table
-
-    def cache_seqlens_after(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        del device
-        return self._cache_after
-
-    def cu_seqlens_after(self, *, device: torch.device | str | None = None) -> torch.Tensor:
-        del device
-        return self._cu_after
-
-    def append_packed(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        if k.shape != v.shape:
-            raise invalid_descriptor("graph packed KV key/value shapes must match")
-        if int(k.shape[0]) != int(self._page_ids.numel()):
-            raise invalid_descriptor("graph packed KV token count mismatch")
-        k_cache, v_cache = self.pool.layer_cache(layer)
-        paged_kv_write(
-            k_cache,
-            v_cache,
-            self._page_ids,
-            self._offsets,
-            k,
-            v,
-            cast=k.dtype != k_cache.dtype or v.dtype != v_cache.dtype,
-        )
-
-
-class _PackedMixedDecoderGraphRunner:
-    def __init__(self) -> None:
-        self.states: dict[tuple[Any, ...], _PackedMixedDecoderGraphState] = {}
-        self._captures = 0
-        self._replays = 0
-
-    def maybe_run(
-        self,
-        owner: Any,
-        inputs_embeds: torch.Tensor,
-        *,
-        image_gen_indicators: torch.Tensor,
-        indexes: torch.Tensor,
-        forward_stream: ForwardStream,
-        kv_view: ForwardPagedKVView,
-        ctx: Any,
-    ) -> torch.Tensor | None:
-        key = self._key(owner, inputs_embeds, image_gen_indicators, forward_stream, kv_view)
-        if key is None:
-            return None
-        state = self.states.get(key)
-        if state is None:
-            state = self._capture(
-                key,
-                owner,
-                inputs_embeds,
-                image_gen_indicators=image_gen_indicators,
-                indexes=indexes,
-                forward_stream=forward_stream,
-                kv_view=kv_view,
-                ctx=ctx,
-            )
-            self.states[key] = state
-            self._captures += 1
-            logger.info("packed mixed decoder CUDA graph active: captured shape=%s", key)
-            return state.hidden
-        start = ctx.component_timer_start()
-        if not state.copy_inputs(inputs_embeds, image_gen_indicators, indexes, kv_view):
-            raise RuntimeError("packed mixed graph input copy failed before replay")
-        ctx.record_component_elapsed("packed_mixed_decoder_graph_input_copy", start)
-        start = ctx.component_timer_start()
-        state.graph.replay()
-        ctx.record_component_elapsed("packed_mixed_decoder_graph_replay", start)
-        self._replays += 1
-        return state.hidden
-
-    def _capture(
-        self,
-        key: tuple[Any, ...],
-        owner: Any,
-        inputs_embeds: torch.Tensor,
-        *,
-        image_gen_indicators: torch.Tensor,
-        indexes: torch.Tensor,
-        forward_stream: ForwardStream,
-        kv_view: ForwardPagedKVView,
-        ctx: Any,
-    ) -> _PackedMixedDecoderGraphState:
-        device = inputs_embeds.device
-        graph_kv_view = _GraphForwardPagedKVView(kv_view, device=device)
-        state_indexes = torch.empty_like(indexes)
-        graph_stream = ForwardStream(
-            segments=forward_stream.segments,
-            cu_seqlens_q=forward_stream.cu_seqlens_q.detach().clone(),
-            visible_end=forward_stream.visible_end.detach().clone(),
-            indexes=state_indexes,
-            fully_visible=forward_stream.fully_visible,
-            und_indices=(
-                forward_stream.und_indices.detach().clone()
-                if forward_stream.und_indices is not None
-                else None
-            ),
-            gen_indices=(
-                forward_stream.gen_indices.detach().clone()
-                if forward_stream.gen_indices is not None
-                else None
-            ),
-        )
-        state = _PackedMixedDecoderGraphState(
-            key=key,
-            graph=torch.cuda.CUDAGraph(),
-            input_embeds=torch.empty_like(inputs_embeds),
-            image_gen_indicators=image_gen_indicators.detach().clone(),
-            indexes=state_indexes,
-            forward_stream=graph_stream,
-            kv_view=graph_kv_view,
-        )
-        if not state.copy_inputs(inputs_embeds, image_gen_indicators, indexes, kv_view):
-            raise RuntimeError("packed mixed graph input copy failed during capture")
-        graph_ctx = replace(ctx, stats=None)
-
-        def run() -> torch.Tensor:
-            with use_forward_context(graph_ctx):
-                return owner.packed_decoder_forward(
-                    state.input_embeds,
-                    image_gen_indicators=state.image_gen_indicators,
-                    indexes=state.indexes,
-                    forward_stream=state.forward_stream,
-                    kv_view=state.kv_view,
-                )
-
-        for _ in range(2):
-            state.hidden = run()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        with torch.cuda.graph(state.graph):
-            state.hidden = run()
-        return state
-
-    @staticmethod
-    def _key(
-        owner: Any,
-        inputs_embeds: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
-        forward_stream: ForwardStream,
-        kv_view: ForwardPagedKVView,
-    ) -> tuple[Any, ...] | None:
-        del owner
-        if not kv_view.segments:
-            return None
-        if not forward_stream.fully_visible:
-            return None
-        if any(not bool(seg.write_kv) for seg in kv_view.segments):
-            return None
-        segment_shape = tuple(
-            (
-                str(seg.modality),
-                str(seg.segment_class),
-                int(seg.q_len),
-                str(seg.visible_policy),
-                int(seg.branch_id),
-            )
-            for seg in forward_stream.segments
-        )
-        kv_shape = tuple(
-            (
-                int(seg.q_len),
-                len(seg.block_ids),
-                bool(seg.write_kv),
-                bool(seg.persist_kv),
-            )
-            for seg in kv_view.segments
-        )
-        return (
-            str(inputs_embeds.device),
-            str(inputs_embeds.dtype),
-            tuple(inputs_embeds.shape),
-            tuple(image_gen_indicators.shape),
-            segment_shape,
-            kv_shape,
-            int(getattr(kv_view.pool, "block_size", 0)),
-            id(kv_view.pool),
-        )
 
 
 class _PackedMixedTiming:

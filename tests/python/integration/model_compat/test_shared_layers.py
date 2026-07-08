@@ -2675,6 +2675,66 @@ def test_sensenova_packed_mixed_runs_text_only_forward_batch():
     assert [result.sampled_token_id for result in results] == [4, 4]
 
 
+def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class Owner:
+        def __init__(self) -> None:
+            self.completed_decode = False
+            self.completed_denoise = False
+
+        def _complete_packed_decode_bursts(self, _batch, _request_states, _results):
+            self.completed_decode = True
+
+        def _complete_packed_denoise_bursts(self, _batch, _request_states, _results):
+            self.completed_denoise = True
+
+        def decode_image(self, _latent, *, req_id, state, op):
+            assert req_id == 7
+            assert op["kind"] == "commit_gen"
+            logits = torch.zeros((1, 1, 6), dtype=torch.float32)
+            logits[..., 5] = 10.0
+            return {
+                "req_id": req_id,
+                "image_png_b64": "png",
+                "image_hw": [16, 16],
+                "logits": logits,
+            }
+
+    def packed_forward(_owner, _batch, _request_states, denoise_steps, results):
+        assert denoise_steps == []
+        assert results == [None, None]
+        return True
+
+    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", packed_forward)
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    batch = UniForwardBatch.from_ops(
+        [
+            {"req_id": 7, "kind": "decode_und", "token_ids": [13], "pos_range": [2, 3]},
+            {"req_id": 7, "kind": "commit_gen"},
+        ]
+    )
+    owner = Owner()
+
+    results = sensenova_u1.SenseNovaU1ForUnifiedGeneration.run_forward(
+        owner,
+        batch,
+        request_states=states,
+        group=None,
+    )
+
+    assert owner.completed_decode
+    assert owner.completed_denoise
+    assert results[1]["image_png_b64"] == "png"
+    assert results[1]["image_hw"] == [16, 16]
+    assert results[1]["sampled_token_id"] == 5
+    assert "logits" not in results[1]
+
+
 def test_sensenova_packed_mixed_reserves_transient_denoise_cache_capacity():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode

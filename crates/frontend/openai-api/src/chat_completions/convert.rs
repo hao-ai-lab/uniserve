@@ -722,6 +722,7 @@ mod tests {
             content: Some("answer".to_string()),
             tool_calls: None,
             reasoning: Some("inner".to_string()),
+            images: None,
         };
         let message_json = serde_json::to_value(message).expect("message serializes");
 
