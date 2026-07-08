@@ -33,6 +33,22 @@ from .profiles import (
     spec_env,
 )
 
+CUDA_VISIBLE_OVERRIDE_ENV = "UNISERVE_BENCH_CUDA_VISIBLE_DEVICES"
+
+
+def resolve_cuda_visible_devices(profile_value: str | None) -> str | None:
+    """Pick the CUDA_VISIBLE_DEVICES for a server launch.
+
+    The ``UNISERVE_BENCH_CUDA_VISIBLE_DEVICES`` override wins over the
+    profile's (already-expanded) ``cuda_visible_devices`` value; ``None``
+    means inherit the ambient environment.
+    """
+
+    override = os.environ.get(CUDA_VISIBLE_OVERRIDE_ENV)
+    if override is not None:
+        return override
+    return profile_value
+
 
 def _repo_path(config: dict[str, Any], key: str, default: str) -> str:
     value = str(expand_profile_value(config.get(key, default)))
@@ -136,8 +152,14 @@ def launch(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = build_serve_cmd(config, spec, strict_env=True)
     env = os.environ.copy()
-    if spec.get("cuda_visible_devices") is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(expand_profile_value(spec["cuda_visible_devices"]))
+    profile_value = (
+        str(expand_profile_value(spec["cuda_visible_devices"]))
+        if spec.get("cuda_visible_devices") is not None
+        else None
+    )
+    cuda_visible_devices = resolve_cuda_visible_devices(profile_value)
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     env.update(spec_env(spec))
     log_path = server_log_path(config, args.server)
     print("launch:", " ".join(cmd))

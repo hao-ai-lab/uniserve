@@ -29,7 +29,7 @@ def test_op_kind_table_is_single_source_of_truth():
 
 def test_validate_caps_accepts_stub_caps():
     caps = validate_caps(StubEngine().caps(), owner="StubEngine")
-    assert caps.block_size == 256
+    assert caps.block_size == 64
     assert "prefill_und" in caps.supported_ops
     assert "kv_block" in caps.resource_classes
     assert caps.to_wire()["adapter_mode"] == "none"

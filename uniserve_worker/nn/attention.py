@@ -169,10 +169,10 @@ class RadixAttention(nn.Module):
         # Shared gate for all paged/varlen branches.
         paged_eligible = update_cache and hasattr(kv_cache, "pool")
         if paged_eligible:
-            if self._can_run_contiguous_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
-                return AttentionPath.CONTIGUOUS_VARLEN
             if self._can_run_paged_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
                 return AttentionPath.PAGED_VARLEN
+            if self._can_run_contiguous_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
+                return AttentionPath.CONTIGUOUS_VARLEN
             if self._can_run_transient_paged_varlen(ctx, preferred, kv_cache, q, k, v):
                 return AttentionPath.TRANSIENT_PAGED_VARLEN
             # Self-managing segment decoders pass a single-request paged view
@@ -817,8 +817,6 @@ class RadixAttention(nn.Module):
         if getattr(metadata, "mode", None) not in {"extend", "mixed"}:
             return False
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-            return False
-        if not any(int(length) != 0 for length in getattr(kv_cache, "base_lens", [])):
             return False
         required = (
             "block_table",

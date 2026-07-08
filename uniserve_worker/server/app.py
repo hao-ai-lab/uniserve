@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import time
 from collections import deque
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -287,6 +288,61 @@ def _result_has_deferred(result: dict | None) -> bool:
     return isinstance(per_seq, list) and any(isinstance(item, FinalizableSeqResult) for item in per_seq)
 
 
+def _result_ready(resp: dict) -> bool:
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return True
+    per_seq = result.get("per_seq")
+    if not isinstance(per_seq, list):
+        return True
+    for item in per_seq:
+        if not isinstance(item, FinalizableSeqResult):
+            continue
+        ready = getattr(item, "ready", None)
+        if callable(ready) and not bool(ready()):
+            return False
+    return True
+
+
+def _add_forward_component_us(resp: dict, component: str, dur_ns: int) -> None:
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return
+    stats = result.get("forward_stats")
+    if not isinstance(stats, dict):
+        return
+    component_us = stats.setdefault("component_us", {})
+    if not isinstance(component_us, dict):
+        return
+    key = str(component)
+    component_us[key] = int(component_us.get(key) or 0) + int(dur_ns) // 1000
+
+
+def _add_deferred_cuda_ready_component(resp: dict) -> None:
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return
+    per_seq = result.get("per_seq")
+    if not isinstance(per_seq, list):
+        return
+    seen: set[int] = set()
+    total_us = 0
+    for item in per_seq:
+        elapsed = getattr(item, "cuda_ready_elapsed_us", None)
+        if not callable(elapsed):
+            continue
+        key_fn = getattr(item, "cuda_ready_group_key", None)
+        key = int(key_fn()) if callable(key_fn) else id(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        value = elapsed()
+        if isinstance(value, int) and value > 0:
+            total_us += int(value)
+    if total_us > 0:
+        _add_forward_component_us(resp, "worker_cuda_ready_elapsed", total_us * 1000)
+
+
 @runtime_checkable
 class FinalizableSeqResult(Protocol):
     def finalize(self) -> Mapping[str, Any]: ...
@@ -431,6 +487,7 @@ class WorkerRuntime:
             self._annotate_execute_result(result, dur, ops)
             if has_deferred:
                 resp["_deferred_batch"] = batch
+                resp["_deferred_wait_start_ns"] = self.metrics.now_ns()
         return resp
 
     def _run_execute(self, req: dict, *, allow_deferred: bool) -> dict:
@@ -476,6 +533,12 @@ class WorkerRuntime:
 
     def _respond(self, resp: dict) -> None:
         call_id = resp.get("call_id")
+        wait_start = resp.pop("_deferred_wait_start_ns", None)
+        if isinstance(wait_start, int):
+            wait_ns = self.metrics.now_ns() - wait_start
+            _add_forward_component_us(resp, "worker_deferred_wait", wait_ns)
+            self.metrics.record_pipeline("deferred_wait", wait_ns)
+            _add_deferred_cuda_ready_component(resp)
         t0 = self.metrics.now_ns()
         try:
             resp = self._prepare_response_for_send(resp)
@@ -488,6 +551,7 @@ class WorkerRuntime:
                 resp["call_id"] = call_id
         # Split deferred-D2H materialize wall time from the ring write for metrics.
         t1 = self.metrics.now_ns()
+        _add_forward_component_us(resp, "worker_result_finalize", t1 - t0)
         self.server.respond(_complete_response(resp))
         self.metrics.record_pipeline("finalize", t1 - t0)
         self.metrics.record_pipeline("encode_send", self.metrics.now_ns() - t1)
@@ -499,11 +563,11 @@ class WorkerRuntime:
 
 
 class _PipelineServeLoop:
-    """FIFO pipelined receive/dispatch/finalize loop for ``WorkerRuntime``.
+    """Pipelined receive/dispatch/finalize loop for ``WorkerRuntime``.
 
     The runtime owns dispatch/classification/metrics; this helper owns only the
     transport scheduling policy: non-blocking refill while in-flight work exists,
-    FIFO finalization, and blocking receive when idle.
+    ready-response finalization, and blocking receive when idle.
     """
 
     def __init__(self, runtime: WorkerRuntime) -> None:
@@ -516,10 +580,12 @@ class _PipelineServeLoop:
         try:
             while True:
                 self._refill_nonblocking()
-                if self._finalize_oldest():
+                if self._finalize_ready():
                     continue
                 if self._finish_shutdown_if_drained():
                     break
+                if self._wait_for_ready_inflight():
+                    continue
                 if self._receive_idle_request():
                     break
         finally:
@@ -534,14 +600,29 @@ class _PipelineServeLoop:
                 return
             self.inflight.append(self._dispatch(req))
 
-    def _finalize_oldest(self) -> bool:
+    def _finalize_ready(self) -> bool:
         if not self.inflight:
             return False
-        self._finalize_and_send(self.inflight.popleft())
+        for idx, item in enumerate(self.inflight):
+            if _result_ready(item[1]):
+                ready = self.inflight[idx]
+                del self.inflight[idx]
+                self._finalize_and_send(ready)
+                return True
+        return False
+
+    def _wait_for_ready_inflight(self) -> bool:
+        if not self.inflight:
+            return False
+        while self.inflight:
+            self._refill_nonblocking()
+            if self._finalize_ready():
+                return True
+            time.sleep(0.0005)
         return True
 
     def _finish_shutdown_if_drained(self) -> bool:
-        if not self.draining:
+        if not self.draining or self.inflight:
             return False
         self.runtime._respond(self.shutdown_resp or {"kind": "ok"})
         return True
@@ -586,7 +667,7 @@ class _PipelineServeLoop:
 
         For an execute this launches the GPU forward (CUDA-async) and returns a
         response that may carry deferred per-seq results; for a control it runs
-        the control inline. Finalize/send happens later, in receive order."""
+        the control inline. Finalize/send happens when the response is ready."""
         call_id = req.get("call_id")
         t0 = self.runtime.metrics.now_ns()
         resp = self.runtime.handle(req, allow_deferred=self.runtime._defer_text_results)

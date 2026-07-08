@@ -41,6 +41,7 @@ def _load_optional_backend(module: str, attr: str):
 
 
 _OPTIONAL_BACKENDS = (
+    ("trtllm_mha", "TRTLLMMHAAttentionBackend"),
     ("flashinfer", "FlashInferAttentionBackend"),
     ("fa4_cute", "Fa4CuteAttentionBackend"),
     ("flash_attn", "FlashAttentionBackend"),
