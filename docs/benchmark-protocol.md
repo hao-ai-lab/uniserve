@@ -22,6 +22,7 @@ Set these before launching the benchmark runner:
 | `UNISERVE_SHAREGPT_PATH` | ShareGPT JSON dataset path |
 | `UNISERVE_SGLANG_PYTHON` | Python executable for `refs/sglang` |
 | `UNISERVE_OMNI_VLLM` | `vllm` executable for vllm-omni |
+| `UNISERVE_BENCH_CUDA_VISIBLE_DEVICES` | optional: overrides every profile's `cuda_visible_devices` for this run |
 
 If any variable is missing, launch paths must fail before starting a server. Dry-run output may keep `${VAR}` placeholders for audit.
 

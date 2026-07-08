@@ -359,11 +359,8 @@ pub enum AdapterMode {
 /// Execution / batching constraints a worker declares so the scheduler assembles
 /// only batches the worker can run. All scalars — never tensors.
 ///
-/// und/gen mixed-batch single-forward is a non-negotiable model invariant: there
-/// is deliberately no `supports_mixed_op_kinds` flag here, since
-/// the existence of such a flag would imply mixing could be disabled. The
-/// scheduler mixes op kinds unconditionally; any worker receiving a mixed batch
-/// must process it in one forward.
+/// The scheduler owns lane formation; workers advertise scalar limits here
+/// rather than a separate mixed-op capability flag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionConstraints {
     /// Max ops the worker accepts in one `ForwardBatch` (0 == host default).
@@ -448,7 +445,7 @@ fn default_max_cfg_branches() -> u32 {
 impl Default for EngineCaps {
     fn default() -> Self {
         Self {
-            block_size: 256,
+            block_size: 64,
             num_blocks: 4096,
             num_layers: 28,
             scratch_capacity_tokens: 1 << 20,

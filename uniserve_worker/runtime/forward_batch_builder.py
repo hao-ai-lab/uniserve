@@ -58,6 +58,7 @@ def build_text_attention_metadata(
     cache: BatchedPagedRequestCache,
     *,
     stager: Any | None = None,
+    max_context_len: int = 0,
 ) -> TextAttentionMetadata:
     """Build the per-forward text attention plan from ``ForwardBatch`` indices.
 
@@ -92,6 +93,7 @@ def build_text_attention_metadata(
             decode_page_offsets=decode_page_offsets,
             max_seqlen_q=max(query_lens_values, default=0),
             max_seqlen_k=max(kv_lens_values, default=0),
+            max_context_len=int(max_context_len),
             mode=batch.mode,
         )
 
@@ -113,6 +115,7 @@ def build_text_attention_metadata(
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(query_lens_values, default=0),
         max_seqlen_k=max(kv_lens_values, default=0),
+        max_context_len=int(max_context_len),
         mode=batch.mode,
     )
 
@@ -127,8 +130,9 @@ class ForwardBatchBuilder:
     the finished attention plan on ``attn_metadata``.
     """
 
-    def __init__(self, *, ring_depth: int = 3) -> None:
+    def __init__(self, *, ring_depth: int = 3, max_context_len: int = 0) -> None:
         self._stager = TextTensorStager(ring_depth=ring_depth)
+        self.max_context_len = max(0, int(max_context_len))
 
     def build_text(
         self,
@@ -211,6 +215,7 @@ class ForwardBatchBuilder:
             kv_seqlens_cpu=(base_len + query_len,),
             max_seqlen_q=query_len,
             max_seqlen_k=base_len + query_len,
+            max_context_len=self.max_context_len,
             mode=mode,
         )
         last_token = torch.tensor([query_len - 1], dtype=torch.long, device=device)
@@ -240,7 +245,12 @@ class ForwardBatchBuilder:
         """Resolve the paged request-cache view + attention plan onto ``fb``."""
 
         cache = self._batched_cache(fb, kv_pool=kv_pool, request_states=request_states)
-        metadata = build_text_attention_metadata(fb, cache, stager=stager)
+        metadata = build_text_attention_metadata(
+            fb,
+            cache,
+            stager=stager,
+            max_context_len=self.max_context_len,
+        )
         fb.attn_metadata = metadata
         fb.block_table = metadata.block_table
         fb.cache_seqlens = metadata.cache_seqlens

@@ -11,6 +11,7 @@ from ..backends.paged_kv_math import decode_write_locations
 from ..contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
+from ..foundation.sizing import ceil_div
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.paged_text_cache import BatchedPagedRequestCache
 from .cuda_graph_base import (
@@ -151,6 +152,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         num_blocks: int,
         batch_size: int,
         device: torch.device | str,
+        max_context_len: int = 0,
     ) -> TextDecodeGraphState:
         return make_text_decode_graph_state(
             kv_pool=kv_pool,
@@ -158,6 +160,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             batch_size=batch_size,
             device=device,
             buffer_pool=self,
+            max_context_len=max_context_len,
         )
 
     def capture(
@@ -181,6 +184,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             num_blocks=num_blocks,
             batch_size=batch_size,
             device=device,
+            max_context_len=int(getattr(attention_metadata, "max_context_len", 0) or 0),
         )
         copy_text_decode_graph_inputs(
             state,
@@ -342,6 +346,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         kv_pool: PagedKVPool,
         num_blocks: int,
         device: torch.device,
+        max_context_len: int = 0,
         forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
         prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
     ) -> None:
@@ -358,6 +363,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
                 _synthetic_decode_cache(kv_pool, batch_size),
                 batch_size,
                 device,
+                max_context_len=max_context_len,
             )
             return self.capture(
                 kv_pool=kv_pool,
@@ -374,7 +380,12 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         def copy_inputs(batch_size: int, state: TextDecodeGraphState) -> None:
             batch_size = int(batch_size)
             input_ids, positions = _synthetic_decode_inputs(batch_size, device)
-            metadata = _synthetic_decode_metadata(state.cache, batch_size, device)
+            metadata = _synthetic_decode_metadata(
+                state.cache,
+                batch_size,
+                device,
+                max_context_len=max_context_len,
+            )
             copy_text_decode_graph_inputs(
                 state,
                 input_ids=input_ids,
@@ -423,6 +434,8 @@ def _synthetic_decode_metadata(
     cache: BatchedPagedRequestCache,
     batch_size: int,
     device: torch.device,
+    *,
+    max_context_len: int = 0,
 ) -> TextAttentionMetadata:
     batch_size = int(batch_size)
     return TextAttentionMetadata(
@@ -433,6 +446,7 @@ def _synthetic_decode_metadata(
         query_lens=torch.ones(batch_size, dtype=torch.int32, device=device),
         query_lens_cpu=tuple(1 for _ in range(batch_size)),
         kv_seqlens_cpu=tuple(1 for _ in range(batch_size)),
+        max_context_len=int(max_context_len),
         mode=ForwardMode.DECODE,
     )
 
@@ -444,12 +458,16 @@ def make_text_decode_graph_state(
     batch_size: int,
     device: torch.device | str,
     buffer_pool: _GraphRunnerBase | None = None,
+    max_context_len: int = 0,
 ) -> TextDecodeGraphState:
     """Allocate fixed buffers for a paged one-token decode graph bucket."""
 
     batch_size = int(batch_size)
     device = torch.device(device)
     max_blocks_per_seq = max(1, int(num_blocks))
+    context_len = max(0, int(max_context_len))
+    if context_len > 0:
+        max_blocks_per_seq = max(1, min(max_blocks_per_seq, ceil_div(context_len, kv_pool.block_size)))
     if buffer_pool is not None:
         share = buffer_pool.share_graph_input_buffer
     else:
@@ -498,6 +516,7 @@ def make_text_decode_graph_state(
                 "text_decode.decode_page_offsets",
                 torch.empty(batch_size, dtype=torch.long, device=device),
             ),
+            max_context_len=max_context_len,
         ),
     )
     return state
@@ -585,21 +604,20 @@ def copy_text_decode_graph_inputs(
     # stay attached to the same object while the dynamic CPU summaries change.
     state.metadata.cache_seqlens_cpu = cache_cpu
     state.metadata.kv_seqlens_cpu = kv_cpu
+    state.metadata.max_context_len = int(
+        getattr(attention_metadata, "max_context_len", 0) or state.metadata.max_context_len
+    )
 
 
 def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> Any | None:
     """Return the attention backend that can host a *captured* paged-decode graph.
 
     A paged-decode graph is only correct when its backend refills the page-index /
-    length plan buffers before every replay (``prepare_paged_decode_cuda_graph``):
-    that is what lets a single captured graph adapt to sequence growth *and*
-    block-id changes with no baked plan. Backends without that method would bake
-    the capture-time plan into the graph and silently read stale/foreign pages on
-    later steps, so this returns ``None`` for them and the caller stays eager.
-
-    Paged-decode graphs are FlashInfer-only today, so a concrete non-FlashInfer
-    selection (e.g. ``torch_sdpa``) also returns ``None`` rather than silently
-    swapping the backend the eager run would have used.
+    length plan buffers before every replay, or when the backend has no wrapper
+    plan state to bake into the graph. FlashInfer's wrapper path uses
+    ``prepare_paged_decode_cuda_graph``; the direct TRT-LLM MHA path consumes the
+    live block-table and sequence-length tensors directly, so a no-op prepare is
+    enough. Other backends stay eager rather than capture a stale paged plan.
     """
 
     from ..backends.attention import (
@@ -609,6 +627,15 @@ def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> An
     )
 
     normalized = normalize_attention_backend_name(attention_backend_name)
+    if normalized == "auto" and has_attention_backend("trtllm_mha"):
+        backend = get_attention_backend("trtllm_mha")
+        if bool(getattr(backend.capabilities(), "available", True)):
+            return backend
+    if normalized == "trtllm_mha" and has_attention_backend("trtllm_mha"):
+        backend = get_attention_backend("trtllm_mha")
+        if bool(getattr(backend.capabilities(), "available", True)):
+            return backend
+        return None
     if normalized not in ("auto", "flashinfer"):
         return None
     if not has_attention_backend("flashinfer"):
@@ -651,18 +678,19 @@ def resolve_paged_decode_graph_prepare(
     def prepare(state: TextDecodeGraphState, ctx: Any) -> None:
         if before is not None:
             before(state, ctx)
-        prepare_paged_decode_graph_backend(
-            state,
-            backend=backend,
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(kv_pool.n_kv),
-            head_dim=int(kv_pool.head_dim),
-            page_size=int(kv_pool.block_size),
-            q_dtype=q_dtype,
-            kv_dtype=kv_pool.k.dtype,
-            scale=scale,
-            max_indices=num_blocks * int(state.batch_size),
-        )
+        if hasattr(backend, "prepare_paged_decode_cuda_graph"):
+            prepare_paged_decode_graph_backend(
+                state,
+                backend=backend,
+                num_q_heads=int(num_q_heads),
+                num_kv_heads=int(kv_pool.n_kv),
+                head_dim=int(kv_pool.head_dim),
+                page_size=int(kv_pool.block_size),
+                q_dtype=q_dtype,
+                kv_dtype=kv_pool.k.dtype,
+                scale=scale,
+                max_indices=num_blocks * int(state.batch_size),
+            )
 
     return prepare
 

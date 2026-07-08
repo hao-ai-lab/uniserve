@@ -245,7 +245,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
 }
 
 #[test]
-fn scheduler_prioritizes_new_prefill_over_decode_batch_slots() {
+fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressure() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
         EngineCaps, ExecutionConstraints, ForwardBatch, ForwardResult, OpKind,
@@ -299,7 +299,7 @@ fn scheduler_prioritizes_new_prefill_over_decode_batch_slots() {
 
     fn run() {
         let mut sim = SimEngine::new();
-        sim.set_pipeline_depth(1);
+        sim.set_pipeline_depth(2);
         sim.set_text_len(64);
         sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
             max_batch_ops: 1024,
@@ -376,19 +376,23 @@ fn scheduler_prioritizes_new_prefill_over_decode_batch_slots() {
             }
         }
         let log = batches.lock().unwrap();
-        let next_batch = log.get(before).unwrap_or_else(|| {
-            panic!("expected a submitted batch after admitting request 3: {log:?}")
+        let prefill_batch = log.get(before).unwrap_or_else(|| {
+            panic!("expected a prefill batch after admitting request 3: {log:?}")
         });
         assert!(
-            next_batch
+            prefill_batch
                 .iter()
                 .any(|(id, kind)| *id == RequestId(3) && *kind == OpKind::PrefillUnd),
-            "new request prefill should take a batch slot ahead of older decodes, got {next_batch:?}"
+            "new request prefill should use an idle pipeline slot, got {prefill_batch:?}"
+        );
+        assert!(
+            prefill_batch
+                .iter()
+                .all(|(_, kind)| *kind != OpKind::DecodeUnd),
+            "idle-slot text prefill must not mix with decode, got {prefill_batch:?}"
         );
     }
 
-    // und/gen mixing is unconditional; the new-prefill-over-decode admission
-    // priority holds regardless, so this runs once.
     run();
 }
 

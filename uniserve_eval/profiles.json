@@ -57,7 +57,22 @@
       "host": "127.0.0.1",
       "port": 18081,
       "cuda_visible_devices": "0",
-      "serve_args": [],
+      "serve_args": [
+        "--kv-token-capacity",
+        "131072",
+        "--max-num-seqs",
+        "128",
+        "--max-batch",
+        "128",
+        "--max-num-batched-tokens",
+        "16384",
+        "--long-prefill-threshold",
+        "16384",
+        "--prefill-cuda-graph",
+        "true",
+        "--prefill-cuda-graph-warmup",
+        "true"
+      ],
       "description": "UniServe Qwen3-32B benchmark server."
     },
     "benchmark/server/qwen-sglang": {
@@ -80,6 +95,14 @@
         "127.0.0.1",
         "--port",
         "18080",
+        "--chunked-prefill-size",
+        "16384",
+        "--max-prefill-tokens",
+        "16384",
+        "--page-size",
+        "64",
+        "--reasoning-parser",
+        "qwen3",
         "--trust-remote-code"
       ],
       "description": "SGLang Qwen3-32B benchmark server."

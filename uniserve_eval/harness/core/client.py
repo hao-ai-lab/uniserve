@@ -42,10 +42,12 @@ async def send_request(
     task: str,
     prompt_len: int = 0,
     output_len_fallback: int = 0,
+    scheduled_time: float | None = None,
 ) -> RequestRecord:
     payload = {key: value for key, value in request.payload.items() if value is not None}
     url = base_url.rstrip("/") + request.endpoint
     record = RequestRecord(request_id=request_id, task=task)
+    record.scheduled_time = scheduled_time
     record.endpoint = request.endpoint
     record.start_time = time.perf_counter()
     try:
@@ -78,7 +80,9 @@ async def _send_images(
     record: RequestRecord,
 ) -> None:
     response = await client.post(url, json=payload)
+    record.http_response_time = time.perf_counter()
     record.latency = time.perf_counter() - record.start_time
+    record.final_event_time = record.start_time + record.latency
     record.status_code = response.status_code
     try:
         data = response.json()
@@ -110,7 +114,9 @@ async def _send_chat_json(
     """One non-streamed chat completion (diffusion-pipeline backends and
     image-only chat). Success requires text or images."""
     response = await client.post(url, json=payload)
+    record.http_response_time = time.perf_counter()
     record.latency = time.perf_counter() - record.start_time
+    record.final_event_time = record.start_time + record.latency
     record.status_code = response.status_code
     try:
         data = response.json()
@@ -151,6 +157,7 @@ async def _send_chat_json(
     )
     # Non-streaming: the full completion shares the request E2E latency.
     record.ttft = record.latency
+    record.first_text_time = record.final_event_time
 
 
 async def _send_sse(
@@ -164,10 +171,12 @@ async def _send_sse(
     output_len_fallback: int,
 ) -> None:
     async with client.stream("POST", url, json=payload) as response:
+        record.http_response_time = time.perf_counter()
         record.status_code = response.status_code
         if response.status_code != 200:
             body = await response.aread()
             record.latency = time.perf_counter() - record.start_time
+            record.final_event_time = record.start_time + record.latency
             record.success = False
             record.classifier = f"transport_status_{response.status_code}"
             record.error = body.decode("utf-8", errors="replace")[:500]
@@ -185,7 +194,9 @@ async def _send_sse(
                 stamp_time=True,
                 on_parse_error="record",
             )
-    record.latency = _last_event_time(events, record.start_time) - record.start_time
+    last_event_time = _last_event_time(events, record.start_time)
+    record.final_event_time = last_event_time
+    record.latency = last_event_time - record.start_time
     if protocol == "openai":
         _parse_openai(events, record, output_len_fallback=output_len_fallback, prompt_len=prompt_len)
     else:
@@ -237,6 +248,7 @@ def _parse_openai(
                 timestamp_f = float(timestamp)
                 if last_text_time is None:
                     record.ttft = timestamp_f - record.start_time
+                    record.first_text_time = timestamp_f
                 elif not image_since_last_text:
                     itl.append(timestamp_f - last_text_time)
                 last_text_time = timestamp_f
@@ -248,6 +260,7 @@ def _parse_openai(
                 timestamp_f = float(timestamp)
                 if record.first_image_latency is None:
                     record.first_image_latency = timestamp_f - record.start_time
+                    record.first_image_done_time = timestamp_f
                 record.image_latencies.extend([timestamp_f - record.start_time] * len(images))
 
     if prompt_tokens is not None:
@@ -273,18 +286,27 @@ def _parse_native(
     image_since_last_text = False
     first_image_begin_t: float | None = None
     image_begins: dict[Any, tuple[float | None, int | None]] = {}
+    image_step_counts: dict[Any, int] = {}
     image_done_events: list[dict[str, Any]] = []
     finished: dict[str, Any] | None = None
 
     for event in events:
         kind = event.get("type")
         timestamp = event.get("_client_t")
-        if kind == "text":
+        if kind == "scheduled":
+            queued_at = event.get("queued_at")
+            scheduled_at = event.get("scheduled_at")
+            if isinstance(queued_at, (int, float)):
+                record.server_queued_at = float(queued_at)
+            if isinstance(scheduled_at, (int, float)):
+                record.server_scheduled_at = float(scheduled_at)
+        elif kind == "text":
             record.generated_text += event.get("text", "")
             if timestamp is not None:
                 timestamp = float(timestamp)
                 if last_text_time is None:
                     record.ttft = timestamp - record.start_time
+                    record.first_text_time = timestamp
                 elif not image_since_last_text:
                     # Skip the inter-token gap that straddles an image so the
                     # image generation time does not inflate text ITL.
@@ -296,6 +318,7 @@ def _parse_native(
             image_since_last_text = True
             if timestamp is not None and first_image_begin_t is None:
                 first_image_begin_t = float(timestamp)
+                record.first_image_begin_time = first_image_begin_t
             steps = event.get("steps")
             image_begins[event.get("image_id")] = (
                 float(timestamp) if timestamp is not None else None,
@@ -303,6 +326,8 @@ def _parse_native(
             )
         elif kind == "image_step":
             image_since_last_text = True
+            image_id = event.get("image_id")
+            image_step_counts[image_id] = image_step_counts.get(image_id, 0) + 1
         elif kind == "image_done":
             image_since_last_text = True
             image_done_events.append(event)
@@ -316,9 +341,26 @@ def _parse_native(
         timestamp = event.get("_client_t")
         begin_t, steps = image_begins.get(image_id, (None, None))
         if timestamp is not None:
-            record.image_latencies.append(float(timestamp) - record.start_time)
+            done_t = float(timestamp)
+            record.image_latencies.append(done_t - record.start_time)
+            if record.first_image_done_time is None:
+                record.first_image_done_time = done_t
             if begin_t is not None:
-                record.image_gen_seconds.append(float(timestamp) - begin_t)
+                record.image_gen_seconds.append(done_t - begin_t)
+            record.image_spans.append(
+                {
+                    "image_id": image_id,
+                    "begin_ms": (begin_t - record.start_time) * 1000.0
+                    if begin_t is not None
+                    else None,
+                    "done_ms": (done_t - record.start_time) * 1000.0,
+                    "generation_ms": (done_t - begin_t) * 1000.0
+                    if begin_t is not None
+                    else None,
+                    "steps": steps,
+                    "step_events": image_step_counts.get(image_id, 0),
+                }
+            )
         if steps is not None:
             record.image_steps.append(steps)
     if first_image_begin_t is not None:

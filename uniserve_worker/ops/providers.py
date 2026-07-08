@@ -1009,6 +1009,12 @@ class _AttentionBackendProvider:
             return False
         if self.name in {"sgl_kernel", "flashinfer", "flash_attn", "fa4_cute"} and req.q.device.type != "cuda":
             return False
+        if self.name == "trtllm_mha":
+            if req.q.device.type != "cuda":
+                return False
+            major, minor = torch.cuda.get_device_capability(req.q.device)
+            if (int(major), int(minor)) < (10, 0):
+                return False
         if not self._head_dim_supported(caps, req.q.shape[-1]):
             return False
         if not self._trunk_geometry_supported(caps, req, backend_name=getattr(self.backend, "name", self.name)):
@@ -1124,7 +1130,7 @@ def attention_dispatcher():
     init_attention_backends = attention_pkg.init_attention_backends
 
     init_attention_backends()
-    names = ("sgl_kernel", "flashinfer", "flash_attn", "fa4_cute", "torch_sdpa")
+    names = ("trtllm_mha", "sgl_kernel", "flashinfer", "flash_attn", "fa4_cute", "torch_sdpa")
     providers = [_ContextAttentionProvider()]
     for name in names:
         try:

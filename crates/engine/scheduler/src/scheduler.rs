@@ -3,8 +3,8 @@
 //! interleave FSM, admit pending requests against the block and scratch budget,
 //! assemble a `ForwardBatch`, submit it asynchronously through the `Executor`,
 //! and resolve completed `ForwardResult`s into `GenEvent`s and FSM transitions.
-//! A single `ForwardBatch` may mix op kinds across requests; workers group
-//! compatible ops internally while preserving one result per submitted op.
+//! `ForwardBatch` assembly is lane-aware for text prefill/decode and may still
+//! mix compatible non-text ops; workers preserve one result per submitted op.
 //!
 //! Scheduling follows vLLM-style budgeted, chunked-prefill, preempting scheduling:
 //! - waiting requests live in a [`RequestQueue`] (FCFS deque or priority
@@ -33,6 +33,12 @@ pub const DEFAULT_MAX_BATCH: usize = 128;
 pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
 pub const DEFAULT_MAX_NUM_SEQS: usize = 128;
 pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+/// Default per-step budget of text prefill tokens that may ride along inside a
+/// decode batch (a mixed extend+decode forward shares the decode step's weight
+/// sweep instead of paying its own). `0` disables mixing — matching SGLang's
+/// `enable_mixed_chunk` default: its reference serving configuration keeps
+/// prefill and decode in separate batches.
+pub const DEFAULT_MIXED_PREFILL_TOKENS: usize = 0;
 pub const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
 pub const DEFAULT_DECODE_TOKEN_BURST: u16 = 1;
 /// Default admission backpressure bound: maximum waiting requests buffered
@@ -181,6 +187,13 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use uniserve_executor::{ControlOp, Executor, WorkerExecError};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AssemblyLane {
+    Prefill,
+    Decode,
+    Other,
+}
+
 /// default per-step multimodal encode budget when the worker caps do not pin it.
 const DEFAULT_MM_ENCODE_BUDGET: usize = 4;
 /// default encoder-output cache capacity when the worker reports no
@@ -286,6 +299,10 @@ pub struct SchedulerConfig {
     /// grammar-gated) buffered before new submits are rejected at enqueue.
     /// `usize::MAX` disables the cap (unbounded).
     pub max_num_waiting: usize,
+    /// Per-step budget of text prefill tokens allowed to join a decode batch
+    /// as a mixed extend+decode forward. `0` keeps prefill and decode in
+    /// separate batches.
+    pub mixed_prefill_tokens: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -297,6 +314,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: DEFAULT_MAX_NUM_SEQS,
             long_prefill_threshold: DEFAULT_LONG_PREFILL_THRESHOLD,
             max_num_waiting: DEFAULT_MAX_NUM_WAITING,
+            mixed_prefill_tokens: DEFAULT_MIXED_PREFILL_TOKENS,
         }
     }
 }
@@ -560,6 +578,18 @@ fn mode_str(mode: GenMode) -> &'static str {
     }
 }
 
+fn assembly_lane_for_kind(kind: OpKind) -> AssemblyLane {
+    match kind {
+        OpKind::PrefillUnd | OpKind::VitEncode | OpKind::VaeEncode => AssemblyLane::Prefill,
+        OpKind::DecodeUnd | OpKind::TargetVerifyUnd => AssemblyLane::Decode,
+        OpKind::DenoiseGen
+        | OpKind::CommitGen
+        | OpKind::CommitWriteback
+        | OpKind::Sample
+        | OpKind::EncodeFrame => AssemblyLane::Other,
+    }
+}
+
 fn policy_str(policy: SchedulingPolicy) -> &'static str {
     match policy {
         SchedulingPolicy::Fcfs => "fcfs",
@@ -685,6 +715,7 @@ impl Scheduler {
                     "max_num_batched_tokens": config.max_num_batched_tokens,
                     "max_num_seqs": config.max_num_seqs,
                     "long_prefill_threshold": config.long_prefill_threshold,
+                    "mixed_prefill_tokens": config.mixed_prefill_tokens,
                     "spec_ngram_max_tokens": spec_ngram_max_tokens,
                     "decode_lookahead": decode_lookahead,
                     "denoise_step_burst": denoise_step_burst,
@@ -1725,6 +1756,16 @@ impl Scheduler {
         any
     }
 
+    /// Whether any request currently has a prefill op in flight. Prompt work
+    /// coalesces behind it: while one prefill batch runs, newly arrived
+    /// prompts wait (decode fills the slot) and merge into the next prefill
+    /// batch, so bursts cost one sweep instead of one sweep per arrival.
+    fn any_prefill_inflight(&self) -> bool {
+        self.inflight_ops
+            .values()
+            .any(|items| items.iter().any(|op| op.kind == OpKind::PrefillUnd))
+    }
+
     fn has_inflight(&self, id: RequestId) -> bool {
         self.inflight_ops
             .get(&id)
@@ -1872,6 +1913,10 @@ impl Scheduler {
             .timing
             .batch_timing_count
             .fetch_add(1, Ordering::Relaxed);
+        let forward_stats_trace = result
+            .forward_stats
+            .as_ref()
+            .map(worker_forward_stats_trace);
         self.record_worker_forward_stats(result.forward_stats.as_ref());
         let mut resolved_ops = Vec::with_capacity(result.per_seq.len());
         let mut progress_ops = Vec::with_capacity(result.per_seq.len());
@@ -1962,6 +2007,7 @@ impl Scheduler {
             "step_id": result_step_id,
             "worker_exec_us": worker_us,
             "host_roundtrip_us": batch_roundtrip_us,
+            "forward_stats": forward_stats_trace,
             "batch_size": resolved_ops.len(),
             "ops": resolved_ops,
             "progress": progress_ops,
@@ -2352,6 +2398,25 @@ impl Scheduler {
     /// at most one op, clip prefill chunks to the remaining token budget, and
     /// pair first-dispatch requests with their `NewRequestData` record.
     fn assemble(&mut self) -> (Vec<NewRequestData>, Vec<ForwardOp>) {
+        let ids = self.assembly_order();
+        let lane = self.select_assembly_lane(&ids);
+        let (new_reqs, ops) = self.assemble_pass(&ids, lane);
+        if ops.is_empty() && lane == Some(AssemblyLane::Prefill) {
+            // Prefill runs first *if possible* (SGLang's order). When no
+            // prefill op could actually be built (e.g. blocked on KV memory
+            // it may not preempt), fall through to the decode lane instead of
+            // idling — otherwise a starved waiting prompt would stall ready
+            // decodes forever.
+            return self.assemble_pass(&ids, Some(AssemblyLane::Decode));
+        }
+        (new_reqs, ops)
+    }
+
+    fn assemble_pass(
+        &mut self,
+        ids: &[RequestId],
+        lane: Option<AssemblyLane>,
+    ) -> (Vec<NewRequestData>, Vec<ForwardOp>) {
         let mut new_reqs: Vec<NewRequestData> = Vec::new();
         let mut ops: Vec<ForwardOp> = Vec::new();
         let mut selected: HashSet<RequestId> = HashSet::new();
@@ -2360,15 +2425,29 @@ impl Scheduler {
         let mut budget: usize = self.config.max_num_batched_tokens;
         // per-step multimodal encode budget.
         let mut encodes_left = self.mm_encode_budget;
-        let ids = self.assembly_order();
-        for id in ids {
-            if ops.len() >= self.config.max_batch {
+        // Text prefill tokens may ride along inside a decode batch (mixed
+        // extend+decode forward): the prompt work then shares the decode
+        // step's weight sweep instead of paying a full sweep of its own.
+        // Mixed prefill rows are appended after the decode rows so the batch
+        // keeps an extend row last (graph token-bucket padding extends the
+        // last row).
+        let mut mixed_left: usize = if lane == Some(AssemblyLane::Decode) {
+            self.config.mixed_prefill_tokens
+        } else {
+            0
+        };
+        let mut mixed_ops: Vec<ForwardOp> = Vec::new();
+        for id in ids.iter().copied() {
+            if ops.len() + mixed_ops.len() >= self.config.max_batch {
                 break;
             }
             if budget == 0 {
                 break;
             }
-            if self.has_inflight(id) && !self.can_decode_lookahead(id) {
+            if self.has_inflight(id)
+                && !self.can_decode_lookahead(id)
+                && !self.can_prefill_decode_lookahead(id)
+            {
                 continue;
             }
             let cancelled = self.running.get(&id).map(|s| s.cancelled).unwrap_or(true);
@@ -2376,14 +2455,29 @@ impl Scheduler {
                 continue;
             }
             let next_kind = self.peek_next_kind(id);
-            // und/gen mixed-batch single-forward is a non-negotiable invariant:
-            // the scheduler mixes op kinds unconditionally. There is no
-            // `supports_mixed_op_kinds` gate — any worker that receives a mixed
-            // batch processes it in one forward. Co-batched rows shift each
-            // other's numerics only through inherent batched-kernel FP
-            // non-invariance (measured identical for und-only and mixed
-            // batches; identical co-batched rows produce identical outputs),
-            // never through structural corruption.
+            // When a decode pass admits text prefill rows, the worker receives a
+            // single mixed forward. There is no `supports_mixed_op_kinds` gate;
+            // co-batched rows shift each other's numerics only through inherent
+            // batched-kernel FP non-invariance, not structural corruption.
+            let mut mixed_prefill = false;
+            if let (Some(target), Some(kind)) = (lane, next_kind)
+                && {
+                    let candidate_lane = assembly_lane_for_kind(kind);
+                    matches!(candidate_lane, AssemblyLane::Prefill | AssemblyLane::Decode)
+                        && candidate_lane != target
+                }
+            {
+                mixed_prefill = target == AssemblyLane::Decode
+                    && kind == OpKind::PrefillUnd
+                    && mixed_left > 0
+                    && self
+                        .running
+                        .get(&id)
+                        .is_some_and(|st| st.req.mode == GenMode::Text);
+                if !mixed_prefill {
+                    continue;
+                }
+            }
             if next_kind == Some(OpKind::DenoiseGen) && !self.can_schedule_denoise(id) {
                 continue;
             }
@@ -2391,7 +2485,12 @@ impl Scheduler {
             // and retry — else skip this request for the step.
             let mut tries = 0usize;
             loop {
-                match self.next_op(id, budget) {
+                let op_budget = if mixed_prefill {
+                    budget.min(mixed_left)
+                } else {
+                    budget
+                };
+                match self.next_op(id, op_budget) {
                     Some(mut op) => {
                         // bound encode work per step; defer if over budget.
                         if op.kind == OpKind::VitEncode || op.kind == OpKind::VaeEncode {
@@ -2399,6 +2498,9 @@ impl Scheduler {
                                 break;
                             }
                             encodes_left -= 1;
+                        }
+                        if mixed_prefill {
+                            mixed_left = mixed_left.saturating_sub(op_token_cost(&op));
                         }
                         budget = budget.saturating_sub(op_token_cost(&op));
                         // Stateful-diff contract: a request's static state and
@@ -2424,7 +2526,11 @@ impl Scheduler {
                             self.reserve_worker_image_latent_for_denoise(id);
                         }
                         selected.insert(id);
-                        ops.push(op);
+                        if mixed_prefill {
+                            mixed_ops.push(op);
+                        } else {
+                            ops.push(op);
+                        }
                         break;
                     }
                     None => {
@@ -2436,6 +2542,12 @@ impl Scheduler {
                         {
                             break;
                         }
+                        // A mixed rider must not preempt running decodes to
+                        // make room for itself; it waits for a prefill-lane
+                        // step instead.
+                        if mixed_prefill {
+                            break;
+                        }
                         if tries < self.running.len() && self.preempt_one(id, &selected) {
                             tries += 1;
                             continue;
@@ -2445,7 +2557,59 @@ impl Scheduler {
                 }
             }
         }
+        ops.extend(mixed_ops);
         (new_reqs, ops)
+    }
+
+    fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
+        let mut decode_ready = false;
+        let mut decode_ready_without_lookahead = false;
+        let mut prefill_ready = false;
+        for id in ids.iter().copied() {
+            if self.running.get(&id).map(|s| s.cancelled).unwrap_or(true) {
+                continue;
+            }
+            let Some(kind) = self.peek_next_kind(id) else {
+                continue;
+            };
+            match assembly_lane_for_kind(kind) {
+                AssemblyLane::Decode => {
+                    if self.has_inflight(id) {
+                        if self.can_decode_lookahead(id) || self.can_prefill_decode_lookahead(id) {
+                            decode_ready = true;
+                        }
+                    } else {
+                        decode_ready = true;
+                        decode_ready_without_lookahead = true;
+                    }
+                }
+                AssemblyLane::Prefill => {
+                    if !self.has_inflight(id) {
+                        prefill_ready = true;
+                    }
+                }
+                AssemblyLane::Other => {}
+            }
+        }
+        if decode_ready_without_lookahead {
+            Some(AssemblyLane::Decode)
+        } else if decode_ready && self.config.mixed_prefill_tokens > 0 {
+            // With mixed batching, prompt work rides inside the decode batch
+            // (sharing its weight sweep) instead of claiming a sweep of its
+            // own; the decode lane wins even when decodes are only
+            // lookahead-ready.
+            Some(AssemblyLane::Decode)
+        } else if prefill_ready && !self.any_prefill_inflight() {
+            Some(AssemblyLane::Prefill)
+        } else if decode_ready {
+            Some(AssemblyLane::Decode)
+        } else if prefill_ready {
+            // a prefill batch is already in flight and no decode can fill the
+            // slot: run the waiting prompts anyway rather than idling.
+            Some(AssemblyLane::Prefill)
+        } else {
+            None
+        }
     }
 
     fn assembly_order(&self) -> Vec<RequestId> {
@@ -2502,6 +2666,54 @@ impl Scheduler {
             && st.req.stop_token_ids.is_empty()
             && st.n_generated >= sp.min_tokens
             && st.n_generated.saturating_add(depth) < st.req.max_tokens
+            && sp.n_logprobs == 0
+            && sp.bad_words_ids.is_empty()
+            && !penalties
+    }
+
+    /// Cross-boundary async submission (the analog of SGLang's overlap
+    /// scheduler's future-token map): once a request's FINAL prefill chunk is
+    /// in flight, its first decode op may be submitted immediately with
+    /// `token_source = last_sampled`, reading the prefill's sampled token from
+    /// the worker's device-side relay. The first decode step then starts right
+    /// after the prefill step instead of waiting one extra pipeline slot for
+    /// the prefill result's host round-trip.
+    fn can_prefill_decode_lookahead(&self, id: RequestId) -> bool {
+        if !self.decode_lookahead {
+            return false;
+        }
+        let Some(st) = self.running.get(&id) else {
+            return false;
+        };
+        if st.cancelled
+            || st.req.mode != GenMode::Text
+            || st.phase != Phase::Prefill
+            || st.grammar.is_some()
+        {
+            return false;
+        }
+        // The whole prompt must already be cursored into the in-flight chunk
+        // (cursor advances at build time), i.e. the final prefill is running.
+        if (st.prompt_cursor as usize) < Self::effective_prompt(st).len() {
+            return false;
+        }
+        let Some(items) = self.inflight_ops.get(&id) else {
+            return false;
+        };
+        if items.len() != 1 || items.iter().any(|op| op.kind != OpKind::PrefillUnd) {
+            return false;
+        }
+        let sp = &st.req.sampling;
+        let greedy = sp.temperature <= 0.0;
+        let penalties = sp.repetition_penalty != 1.0
+            || sp.frequency_penalty != 0.0
+            || sp.presence_penalty != 0.0;
+        greedy
+            && sp.ignore_eos
+            && st.req.stop_token_ids.is_empty()
+            && st.n_generated >= sp.min_tokens
+            // prefill samples one token, the lookahead decode a second.
+            && st.n_generated.saturating_add(2) <= st.req.max_tokens
             && sp.n_logprobs == 0
             && sp.bad_words_ids.is_empty()
             && !penalties
@@ -2636,6 +2848,7 @@ impl Scheduler {
                 OpKind::VaeEncode
             }
             Phase::Encode => OpKind::VitEncode,
+            Phase::Prefill if self.can_prefill_decode_lookahead(id) => OpKind::DecodeUnd,
             Phase::Prefill => OpKind::PrefillUnd,
             Phase::DecodeUnd => OpKind::DecodeUnd,
             Phase::DenoiseGen => OpKind::DenoiseGen,
@@ -3008,6 +3221,13 @@ impl Scheduler {
             }
         }
         let phase = self.running.get(&id)?.phase;
+        // Final-prefill-in-flight requests build their first decode op early
+        // (cross-boundary lookahead); the FSM phase itself advances at resolve.
+        let phase = if phase == Phase::Prefill && self.can_prefill_decode_lookahead(id) {
+            Phase::DecodeUnd
+        } else {
+            phase
+        };
         match phase {
             Phase::Encode => {
                 // skip any images already in the encoder cache (pinning them),
@@ -3089,9 +3309,13 @@ impl Scheduler {
             }
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
+                let prefill_lookahead = st.phase == Phase::Prefill;
                 let lookahead_depth = self.inflight_decode_count(id);
-                let use_last_sampled = lookahead_depth > 0;
-                if use_last_sampled && !self.can_decode_lookahead(id) {
+                let use_last_sampled = lookahead_depth > 0 || prefill_lookahead;
+                if use_last_sampled
+                    && !self.can_decode_lookahead(id)
+                    && !self.can_prefill_decode_lookahead(id)
+                {
                     return None;
                 }
                 let pos = st.pos + lookahead_depth as u32;
@@ -4402,6 +4626,41 @@ impl Scheduler {
     }
 }
 
+fn worker_forward_stats_trace(stats: &WorkerForwardStats) -> serde_json::Value {
+    json!({
+        "mode_counts": stats.mode_counts,
+        "mode_tokens": stats.mode_tokens,
+        "mode_us": stats.mode_us,
+        "component_us": stats.component_us,
+        "attention_launches": stats.attention_launches,
+        "attention_us": stats.attention_us,
+        "attention_backend_counts": stats.attention_backend_counts,
+        "cuda_graph_captures": stats.cuda_graph_captures,
+        "cuda_graph_replays": stats.cuda_graph_replays,
+        "cuda_graph_misses": stats.cuda_graph_misses,
+        "cuda_graph_fallbacks": stats.cuda_graph_fallbacks,
+        "cuda_graph_unpadded_tokens": stats.cuda_graph_unpadded_tokens,
+        "cuda_graph_padded_tokens": stats.cuda_graph_padded_tokens,
+        "cuda_graph_runtime_mode_counts": stats.cuda_graph_runtime_mode_counts,
+        "text_decode_token_relay_hits": stats.text_decode_token_relay_hits,
+        "text_decode_token_relay_misses": stats.text_decode_token_relay_misses,
+        "text_decode_position_relay_hits": stats.text_decode_position_relay_hits,
+        "text_decode_position_relay_misses": stats.text_decode_position_relay_misses,
+        "flashinfer_decode_plan_calls": stats.flashinfer_decode_plan_calls,
+        "flashinfer_decode_plan_reuses": stats.flashinfer_decode_plan_reuses,
+        "flashinfer_decode_plan_rows": stats.flashinfer_decode_plan_rows,
+        "flashinfer_decode_plan_indices": stats.flashinfer_decode_plan_indices,
+        "flashinfer_decode_graph_plan_calls": stats.flashinfer_decode_graph_plan_calls,
+        "flashinfer_decode_graph_plan_reuses": stats.flashinfer_decode_graph_plan_reuses,
+        "spec_verify_rows": stats.spec_verify_rows,
+        "spec_verify_draft_tokens": stats.spec_verify_draft_tokens,
+        "spec_verify_accepted_tokens": stats.spec_verify_accepted_tokens,
+        "spec_verify_rejected_tokens": stats.spec_verify_rejected_tokens,
+        "spec_verify_committed_tokens": stats.spec_verify_committed_tokens,
+        "spec_verify_path_counts": stats.spec_verify_path_counts,
+    })
+}
+
 /// Does `hay` contain `needle` as a contiguous subsequence? Used to
 /// detect the literal `<image_start>` trigger (its stable "image_start" core) in
 /// a finished text round. Empty needle never matches (literal trigger disabled).
@@ -4787,6 +5046,254 @@ mod tests {
             0,
             "no staged request should be requeued by preemption"
         );
+    }
+
+    #[test]
+    fn assemble_keeps_ready_text_decode_separate_from_prefill() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                // mixing disabled: the decode lane must stay pure.
+                mixed_prefill_tokens: 0,
+                ..Default::default()
+            },
+        );
+        let mut receivers = Vec::new();
+        for id in 1..=2 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut req = test_request(id, 4);
+            req.sampling.ignore_eos = true;
+            req.event_tx = tx;
+            receivers.push(rx);
+            sched.submit_for_test(req);
+        }
+        sched.admit();
+        assert_eq!(sched.running.len(), 2);
+        assert_eq!(sched.order.len(), 2);
+        let ids = sched.assembly_order();
+        assert_eq!(ids, vec![RequestId(1), RequestId(2)]);
+        assert_eq!(
+            sched.select_assembly_lane(&ids),
+            Some(AssemblyLane::Prefill)
+        );
+        let (_new_reqs, prefill_ops) = sched.assemble();
+        assert_eq!(
+            prefill_ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OpKind::PrefillUnd, OpKind::PrefillUnd]
+        );
+        for op in prefill_ops {
+            sched.resolve(
+                op.req_id,
+                op.kind,
+                uniserve_worker_wire::SeqResult {
+                    req_id: op.req_id,
+                    sampled_token_id: Some(11 + op.req_id.0 as u32),
+                    ..Default::default()
+                },
+                Vec::new(),
+            );
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(3, 4);
+        req.sampling.ignore_eos = true;
+        req.event_tx = tx;
+        receivers.push(rx);
+        sched.submit_for_test(req);
+        sched.admit();
+        let ids = sched.assembly_order();
+        assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
+
+        let (_new_reqs, ops) = sched.assemble();
+
+        assert_eq!(
+            ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OpKind::DecodeUnd, OpKind::DecodeUnd]
+        );
+        assert!(
+            ops.iter().all(|op| op.req_id != RequestId(3)),
+            "ready decode lane must not mix in a text prefill op: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_coalesces_prompts_while_prefill_inflight() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                mixed_prefill_tokens: 0,
+                ..Default::default()
+            },
+        );
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(1, 4);
+        req.sampling.ignore_eos = true;
+        req.event_tx = tx1;
+        sched.submit_for_test(req);
+        sched.admit();
+        let (_new_reqs, ops) = sched.assemble();
+        assert_eq!(ops[0].kind, OpKind::PrefillUnd);
+        sched.register_inflight(&ops[0], Instant::now());
+
+        // A second prompt arrives while request 1's prefill is in flight:
+        // decode work (request 1's lookahead decode) fills the slot and the
+        // prompt coalesces into the next prefill batch.
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(2, 4);
+        req.sampling.ignore_eos = true;
+        req.event_tx = tx2;
+        sched.submit_for_test(req);
+        sched.admit();
+        let (_new_reqs, ops2) = sched.assemble();
+        assert_eq!(
+            ops2.iter().map(|op| (op.kind, op.req_id)).collect::<Vec<_>>(),
+            vec![(OpKind::DecodeUnd, RequestId(1))]
+        );
+        sched.register_inflight(&ops2[0], Instant::now());
+
+        // With no decode left to run, the waiting prompt proceeds even though
+        // a prefill batch is still in flight (never idle the pipeline).
+        let (_new_reqs, ops3) = sched.assemble();
+        assert_eq!(
+            ops3.iter().map(|op| (op.kind, op.req_id)).collect::<Vec<_>>(),
+            vec![(OpKind::PrefillUnd, RequestId(2))]
+        );
+    }
+
+    #[test]
+    fn assemble_submits_first_decode_while_final_prefill_inflight() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                mixed_prefill_tokens: 0,
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(1, 4);
+        req.sampling.ignore_eos = true;
+        req.event_tx = tx;
+        sched.submit_for_test(req);
+        sched.admit();
+
+        // step 1: the whole prompt goes out as the final prefill chunk.
+        let (_new_reqs, ops) = sched.assemble();
+        assert_eq!(
+            ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OpKind::PrefillUnd]
+        );
+        sched.register_inflight(&ops[0], Instant::now());
+
+        // step 2: with the final prefill still in flight, the first decode op
+        // is submitted early, reading its token from the device relay.
+        let (_new_reqs, ops2) = sched.assemble();
+        assert_eq!(
+            ops2.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OpKind::DecodeUnd]
+        );
+        assert_eq!(ops2[0].pos_range, (4, 5));
+        assert_eq!(ops2[0].token_source, TokenSource::LastSampled);
+
+        // both in flight: nothing further until a result resolves.
+        sched.register_inflight(&ops2[0], Instant::now());
+        let (_new_reqs, ops3) = sched.assemble();
+        assert!(ops3.is_empty(), "unexpected extra ops: {ops3:?}");
+    }
+
+    #[test]
+    fn assemble_mixes_small_text_prefill_into_decode_batch() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                // small budget so the rider's prompt is chunk-clipped to it.
+                mixed_prefill_tokens: 2,
+                ..Default::default()
+            },
+        );
+        let mut receivers = Vec::new();
+        for id in 1..=2 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut req = test_request(id, 4);
+            req.sampling.ignore_eos = true;
+            req.event_tx = tx;
+            receivers.push(rx);
+            sched.submit_for_test(req);
+        }
+        sched.admit();
+        let (_new_reqs, prefill_ops) = sched.assemble();
+        assert_eq!(prefill_ops.len(), 2);
+        for op in prefill_ops {
+            sched.resolve(
+                op.req_id,
+                op.kind,
+                uniserve_worker_wire::SeqResult {
+                    req_id: op.req_id,
+                    sampled_token_id: Some(11 + op.req_id.0 as u32),
+                    ..Default::default()
+                },
+                Vec::new(),
+            );
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(3, 4);
+        req.sampling.ignore_eos = true;
+        req.event_tx = tx;
+        receivers.push(rx);
+        sched.submit_for_test(req);
+        sched.admit();
+        let ids = sched.assembly_order();
+        assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
+
+        let (_new_reqs, ops) = sched.assemble();
+
+        // Both ready decodes run, and the new request's prefill rides along —
+        // appended last, its chunk clipped to the mixed budget.
+        assert_eq!(
+            ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            vec![OpKind::DecodeUnd, OpKind::DecodeUnd, OpKind::PrefillUnd]
+        );
+        let rider = ops.last().unwrap();
+        assert_eq!(rider.req_id, RequestId(3));
+        assert_eq!(op_token_cost(rider), 2, "rider chunk must clip to the mixed budget");
     }
 
     #[test]

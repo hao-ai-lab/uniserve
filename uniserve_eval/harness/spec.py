@@ -92,7 +92,6 @@ class BenchmarkSpec:
     # Request/response shape for this task; see TASK_WIRES. Empty selects the
     # task's first (default) wire.
     wire: str = ""
-
     i2t_question: str = "Describe this image in detail."
 
     # Harness-side GPU memory sampling (nvidia-smi poll) during the timed

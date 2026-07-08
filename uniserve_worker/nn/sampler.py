@@ -196,6 +196,7 @@ class DeferredBatchedSamplingResult:
         tokens_cpu: torch.Tensor,
         device_tokens: torch.Tensor,
         copy_event: torch.cuda.Event | None,
+        ready_start_event: torch.cuda.Event | None = None,
         n_logprobs: list[int] | None = None,
         selected_cpu: torch.Tensor | None = None,
         top_values_cpu: torch.Tensor | None = None,
@@ -204,6 +205,7 @@ class DeferredBatchedSamplingResult:
         self._tokens_cpu = tokens_cpu
         self.device_tokens = device_tokens
         self._copy_event = copy_event
+        self._ready_start_event = ready_start_event
         self._n_logprobs = n_logprobs
         self._selected_cpu = selected_cpu
         self._top_values_cpu = top_values_cpu
@@ -222,6 +224,24 @@ class DeferredBatchedSamplingResult:
                 device_tokens=self.device_tokens,
             )
         return self._finalized
+
+    def ready(self) -> bool:
+        if self._finalized is not None or self._copy_event is None:
+            return True
+        return bool(self._copy_event.query())
+
+    def set_ready_start_event(self, event: torch.cuda.Event | None) -> None:
+        self._ready_start_event = event
+
+    def cuda_ready_elapsed_us(self) -> int | None:
+        if self._ready_start_event is None or self._copy_event is None:
+            return None
+        if not self.ready():
+            return None
+        try:
+            return int(round(float(self._ready_start_event.elapsed_time(self._copy_event)) * 1000.0))
+        except (RuntimeError, ValueError):
+            return None
 
     def _sample_for_row(self, row: int) -> TokenSample:
         token_id = int(self._tokens_cpu[row].item())
@@ -312,6 +332,7 @@ def apply_sampling_batched_with_device_tokens(
     suppress: list[list[int] | tuple[int, ...] | None],
     *,
     defer_cpu: bool = False,
+    enable_cuda_timing: bool = False,
 ) -> BatchedSamplingResult | DeferredBatchedSamplingResult:
     """Sample one token per row from a ``[B, V]`` logits tensor.
 
@@ -349,7 +370,12 @@ def apply_sampling_batched_with_device_tokens(
         vocab,
     )
     if greedy_logits is not None:
-        return _draw_greedy_fast_path(state, greedy_logits, defer_cpu=defer_cpu)
+        return _draw_greedy_fast_path(
+            state,
+            greedy_logits,
+            defer_cpu=defer_cpu,
+            enable_cuda_timing=enable_cuda_timing,
+        )
 
     work = _writable_float_work(logits)
     _apply_mask_bias_penalty_stage(state, work)
@@ -357,7 +383,14 @@ def apply_sampling_batched_with_device_tokens(
     _apply_truncation_stage(state, work)
     tokens = _draw_stage(state, work, sampled_rows)
     logprobs = _logprobs_stage(state, work, tokens)
-    return _device_to_host_stage(state, work, tokens, logprobs, defer_cpu=defer_cpu)
+    return _device_to_host_stage(
+        state,
+        work,
+        tokens,
+        logprobs,
+        defer_cpu=defer_cpu,
+        enable_cuda_timing=enable_cuda_timing,
+    )
 
 
 @dataclass(frozen=True)
@@ -380,6 +413,7 @@ def _draw_greedy_fast_path(
     greedy_logits: torch.Tensor,
     *,
     defer_cpu: bool,
+    enable_cuda_timing: bool = False,
 ) -> BatchedSamplingResult | DeferredBatchedSamplingResult:
     """Greedy-only draw + device-to-host copy (the fast-path stage subset).
 
@@ -389,7 +423,11 @@ def _draw_greedy_fast_path(
     """
     tokens = torch.argmax(greedy_logits, dim=-1)
     tokens = sync_tp_sampled_tokens(tokens)
-    tokens_cpu, copy_event = _copy_tensor_to_cpu_async(tokens, state.logits.device)
+    tokens_cpu, copy_event = _copy_tensor_to_cpu_async(
+        tokens,
+        state.logits.device,
+        enable_cuda_timing=enable_cuda_timing,
+    )
     if defer_cpu and copy_event is not None:
         return DeferredBatchedSamplingResult(
             tokens_cpu=tokens_cpu,
@@ -517,6 +555,7 @@ def _device_to_host_stage(
     logprobs: _BatchLogprobs,
     *,
     defer_cpu: bool = False,
+    enable_cuda_timing: bool = False,
 ) -> BatchedSamplingResult | DeferredBatchedSamplingResult:
     """Copy tokens/logprobs to CPU on the copy stream and assemble samples.
 
@@ -540,7 +579,7 @@ def _device_to_host_stage(
             if logprobs.top_values is not None and logprobs.top_indices is not None:
                 top_values_cpu = _copy_to_pinned_cpu(logprobs.top_values)
                 top_indices_cpu = _copy_to_pinned_cpu(logprobs.top_indices)
-            copy_event = torch.cuda.Event()
+            copy_event = torch.cuda.Event(enable_timing=enable_cuda_timing)
             copy_event.record(copy_stream)
     else:
         tokens_cpu = tokens.detach().to("cpu")
@@ -898,6 +937,8 @@ def _copy_tensor_to_cpu(tensor: torch.Tensor, device: torch.device | str) -> tor
 def _copy_tensor_to_cpu_async(
     tensor: torch.Tensor,
     device: torch.device | str,
+    *,
+    enable_cuda_timing: bool = False,
 ) -> tuple[torch.Tensor, torch.cuda.Event | None]:
     copy_stream = _cuda_copy_stream(device)
     if copy_stream is None:
@@ -905,7 +946,7 @@ def _copy_tensor_to_cpu_async(
     copy_stream.wait_stream(torch.cuda.current_stream(torch.device(device)))
     with torch.cuda.stream(copy_stream):
         out = _copy_to_pinned_cpu(tensor)
-        event = torch.cuda.Event()
+        event = torch.cuda.Event(enable_timing=enable_cuda_timing)
         event.record(copy_stream)
     return out, event
 
