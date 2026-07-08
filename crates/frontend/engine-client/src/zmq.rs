@@ -8,24 +8,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use futures::StreamExt as _;
 use futures::future::{join_all, try_join_all};
 use tokio::sync::mpsc;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, trace};
 
-use uniserve_engine_api::GenEvent;
-use uniserve_engine_wire::native::{NativeControlTokens, NativeRequestExt, WireMmItem};
+use uniserve_engine_wire::native::NativeControlTokens;
 
 use crate::client::{AbortRequest, EngineCoreOutputStream};
 use crate::error::{Error, Result};
-use crate::native::{NativeEventStream, NativeGenerateRequest, wire_output_to_gen_events};
+use crate::native::{
+    NativeEventStream, NativeGenerateRequest, native_request_to_wire,
+    native_stream_from_wire_stream,
+};
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
 use crate::protocol::utility::EngineCoreUtilityRequest;
-use crate::protocol::{
-    EngineCoreControlRequest, EngineCoreRequest, EngineCoreSamplingParams, ModelDtype,
-};
+use crate::protocol::{EngineCoreControlRequest, EngineCoreRequest, ModelDtype};
 use crate::zmq::imp::{ClientInner, run_abort_loop, run_output_dispatcher_loop};
 
 pub(crate) mod imp;
@@ -117,12 +116,6 @@ impl ZmqClientConfig {
         self.native_controls = controls;
         self
     }
-}
-
-fn now_secs() -> f64 {
-    // single shared epoch helper (matches the frontend metrics layer's
-    // wall-clock timestamps).
-    uniserve_core::now_unix_secs()
 }
 
 /// The ZMQ-based engine client talking to headless engine processes.
@@ -357,57 +350,9 @@ impl ZmqEngineCoreClient {
     pub async fn generate_native(&self, req: NativeGenerateRequest) -> Result<NativeEventStream> {
         let seq = self.native_seq.fetch_add(1, Ordering::Relaxed);
         let request_id = format!("native-{}-{}", std::process::id(), seq);
-
-        let sampling = to_wire_sampling(&req.sampling, req.max_tokens, &req.stop_token_ids);
-        let wire = EngineCoreRequest {
-            request_id: request_id.clone(),
-            prompt_token_ids: Some(req.prompt_ids),
-            sampling_params: Some(sampling),
-            arrival_time: now_secs(),
-            native: Some(NativeRequestExt {
-                mode: req.mode,
-                image: req.image,
-                neg_prompt_ids: req.neg_prompt_ids,
-                mm_items: req
-                    .mm_items
-                    .into_iter()
-                    .map(|m| WireMmItem {
-                        hash: m.hash,
-                        position: m.position,
-                        num_tokens: m.num_tokens,
-                        b64: m.b64,
-                    })
-                    .collect(),
-            }),
-            ..Default::default()
-        };
-
-        let mut stream = self.call(wire).await?;
-        let (tx, rx) = mpsc::unbounded_channel::<GenEvent>();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                // Consumer dropped the native stream: drop the wire stream,
-                // whose Drop auto-aborts the request upstream.
-                                   _ = tx.closed() => return,
-                                   item = stream.next() => match item {
-                                       Some(Ok(out)) => {
-                                           for ev in wire_output_to_gen_events(&out.output) {
-                                               if tx.send(ev).is_err() {
-                                                   return;
-                                               }
-                                           }
-                                       }
-                                       Some(Err(error)) => {
-                                           let _ = tx.send(GenEvent::Error { message: error.to_string() });
-                                           return;
-                                       }
-                                       None => return,
-                                   },
-                               }
-            }
-        });
-        Ok(NativeEventStream::new(rx))
+        let wire = native_request_to_wire(req, request_id);
+        let stream = self.call(wire).await?;
+        Ok(native_stream_from_wire_stream(stream))
     }
 
     /// Abort currently in-flight requests by request ID.
@@ -628,40 +573,5 @@ impl ZmqEngineCoreClient {
 
         info!("engine client shut down");
         Ok(())
-    }
-}
-
-/// Reverse-map the engine sampling params onto the wire DTO for native
-/// requests sent over the socket.
-fn to_wire_sampling(
-    s: &uniserve_core::SamplingParams,
-    max_tokens: usize,
-    stop_token_ids: &[u32],
-) -> EngineCoreSamplingParams {
-    EngineCoreSamplingParams {
-        temperature: s.temperature,
-        top_p: s.top_p,
-        top_k: s.top_k,
-        seed: s.seed.map(|x| x as i64),
-        max_tokens: max_tokens as u32,
-        min_tokens: s.min_tokens as u32,
-        ignore_eos: s.ignore_eos,
-        logprobs: (s.n_logprobs > 0).then_some(s.n_logprobs as i32),
-        prompt_logprobs: None,
-        min_p: s.min_p,
-        frequency_penalty: s.frequency_penalty,
-        presence_penalty: s.presence_penalty,
-        repetition_penalty: s.repetition_penalty,
-        stop_token_ids: stop_token_ids.to_vec(),
-        eos_token_id: None,
-        all_stop_token_ids: stop_token_ids.iter().copied().collect(),
-        logit_bias: (!s.logit_bias.is_empty()).then(|| s.logit_bias.iter().copied().collect()),
-        allowed_token_ids: s.allowed_token_ids.clone(),
-        bad_words_token_ids: (!s.bad_words_ids.is_empty()).then(|| s.bad_words_ids.clone()),
-        choice_token_ids: None,
-        structured_outputs: None,
-        logprob_token_ids: None,
-        skip_reading_prefix_cache: None,
-        extra_args: None,
     }
 }

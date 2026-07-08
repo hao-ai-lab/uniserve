@@ -999,16 +999,15 @@ impl Scheduler {
                 continue;
             }
 
-            if !progressed
-                && self.running.is_empty()
-                && self.pending.is_empty()
-                && self.executor.in_flight() == 0
-            {
-                // even fully idle, wake periodically to probe worker
-                // liveness so a worker that dies with nothing in flight is
-                // detected promptly (the engine latches fatal and the frontend
-                // stops routing here) instead of only being noticed when the
-                // next request arrives. When gated on grammar compilation we use
+            if !progressed && self.executor.in_flight() == 0 {
+                // Nothing in flight and nothing schedulable this pass — park on
+                // the command channel instead of spinning. This covers both the
+                // fully idle case and the backpressured case (requests resident
+                // or queued but no op currently buildable): any state change
+                // arrives as a command or as freed capacity from a command
+                // (cancel/finish), and the timeout doubles as the worker
+                // liveness probe so a worker that dies with nothing in flight
+                // is detected promptly. When gated on grammar compilation we use
                 // the shorter slice so the compiler is polled responsively.
                 let wait = if self.skipped_waiting.is_empty() {
                     IDLE_LIVENESS_POLL
@@ -1576,11 +1575,20 @@ impl Scheduler {
                 prompt_len + self.generated_image_span(&req.image) * req.image.max_images as usize
             }
             GenMode::AutoInterleave => {
-                // Text generation can stop naturally far before `max_tokens` on
-                // chat-style auto-interleave requests. Reserve the finite image
-                // envelope up front, then let decode grow KV under the normal
-                // per-step capacity gates.
-                prompt_len + self.generated_image_span(&req.image) * req.image.max_images as usize
+                // Deadlock-freedom invariant: the complete worst case (full
+                // text budget + retained-image envelope) is physically
+                // allocated at admission, so a resident interleave request can
+                // always reach EOS/max_tokens/its image boundaries without
+                // taking blocks from — or waiting on — any other resident.
+                // AutoInterleave is not preemptible (committed image KV cannot
+                // be replayed from generated_ids), so reserving less than this
+                // deadlocks the engine once concurrent residents exhaust the
+                // free pool mid-decode: every request needs one more block,
+                // none can be evicted, none can finish. Concurrency scales
+                // with --kv-token-capacity, not with optimistic admission.
+                prompt_len
+                    + req.max_tokens
+                    + self.generated_image_span(&req.image) * req.image.max_images as usize
             }
             // Exact image token counts come back from the worker's encode ops;
             // reserve generously up front for the input image + each generated
@@ -2447,6 +2455,10 @@ impl Scheduler {
                 continue;
             }
             let next_kind = self.peek_next_kind(id);
+            // When a decode pass admits text prefill rows, the worker receives a
+            // single mixed forward. There is no `supports_mixed_op_kinds` gate;
+            // co-batched rows shift each other's numerics only through inherent
+            // batched-kernel FP non-invariance, not structural corruption.
             let mut mixed_prefill = false;
             if let (Some(target), Some(kind)) = (lane, next_kind)
                 && {
@@ -3377,8 +3389,7 @@ impl Scheduler {
                 let timestep = st.steps_done;
                 let remaining = st.req.image.steps.saturating_sub(timestep).max(1);
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
-                // pure text->image path runs single-branch CFG.
-                let cfg = cfg_params(&st.req.image, 1);
+                let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let image_prompt = Self::image_prompt_for(st);
                 Some(ForwardOp {
                     req_id: id,
@@ -4495,7 +4506,7 @@ impl Scheduler {
         // agree.
         let scratch_branches = {
             let st = self.running.get(&id).unwrap();
-            cfg_params(&st.req.image, 1).branch_count as u64
+            cfg_params(&st.req.image, cfg_branch_count(&st.req.image)).branch_count as u64
         };
         // lease the denoise latent (pinned — evicting discards diffusion
         // work) + the CFG scratch; both released when the image commits.
@@ -4728,6 +4739,22 @@ fn cfg_params(image: &uniserve_core::ImageParams, branch_count: u8) -> CfgParams
     }
 }
 
+fn cfg_scale_approx(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 1.0e-6_f32 * a.abs().max(b.abs()).max(1.0)
+}
+
+fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
+    let text_off = cfg_scale_approx(image.cfg_text_scale, 1.0);
+    let img_off = cfg_scale_approx(image.cfg_img_scale, 1.0);
+    if text_off && img_off {
+        1
+    } else if text_off || img_off || cfg_scale_approx(image.cfg_text_scale, image.cfg_img_scale) {
+        2
+    } else {
+        3
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4849,6 +4876,25 @@ mod tests {
         img.cfg_text_scale = 1.0;
         img.cfg_img_scale = 1.0;
         assert_eq!(cfg_params(&img, 3).branch_count, 3);
+    }
+
+    #[test]
+    fn cfg_branch_count_tracks_active_guidance_axes() {
+        let mut img = uniserve_core::ImageParams {
+            cfg_text_scale: 4.0,
+            cfg_img_scale: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(cfg_branch_count(&img), 2);
+        img.cfg_text_scale = 1.0;
+        img.cfg_img_scale = 1.0;
+        assert_eq!(cfg_branch_count(&img), 1);
+        img.cfg_text_scale = 3.0;
+        img.cfg_img_scale = 3.0;
+        assert_eq!(cfg_branch_count(&img), 2);
+        img.cfg_text_scale = 4.0;
+        img.cfg_img_scale = 1.5;
+        assert_eq!(cfg_branch_count(&img), 3);
     }
 
     /// A no-op executor: every submit succeeds, no result ever returns, and
@@ -5328,7 +5374,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_interleave_decode_preserves_remaining_image_capacity() {
+    fn auto_interleave_admission_reserves_full_worstcase_and_never_deadlocks() {
+        // Deadlock regression (2026-07-07 benchmark stall): AutoInterleave is
+        // not preemptible, so admitting it with less than its complete KV worst
+        // case (prompt + max_tokens + retained-image envelope) lets concurrent
+        // requests exhaust the free pool mid-decode where none can grow, none
+        // can be evicted, and none can finish. Admission must reserve the full
+        // worst case; excess concurrency queues instead of wedging the engine.
         let make_scheduler = |num_blocks| {
             Scheduler::with_config(
                 Box::new(NullExecutor {
@@ -5350,9 +5402,9 @@ mod tests {
                 },
             )
         };
-        let make_request = || {
+        let make_request = |id| {
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut req = test_request(1, 10);
+            let mut req = test_request(id, 10);
             req.mode = GenMode::AutoInterleave;
             req.max_tokens = 16;
             req.image = uniserve_core::ImageParams {
@@ -5366,40 +5418,134 @@ mod tests {
             req
         };
 
-        let mut full = make_scheduler(5);
-        full.submit_for_test(make_request());
-        full.admit();
-        let id = RequestId(1);
-        if let Some(st) = full.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = st.req.prompt_ids.len() as u32;
-        }
-        assert_eq!(full.bm.free_blocks(), 0);
-        assert!(
-            full.next_op(id, 16).is_none(),
-            "decode must wait instead of consuming the retained-image envelope"
-        );
-        assert_eq!(full.bm.blocks_for(id).len(), 4);
+        // worstcase = prompt(10) + max_tokens(16) + image span(4) = 30 tokens
+        // = 8 blocks at block_size 4.
+        let mut sched = make_scheduler(12); // 11 usable blocks: one request fits.
+        sched.submit_for_test(make_request(1));
+        sched.submit_for_test(make_request(2));
+        sched.admit();
 
-        let mut roomy = make_scheduler(6);
-        roomy.decode_token_burst = 8;
-        roomy.submit_for_test(make_request());
-        roomy.admit();
-        if let Some(st) = roomy.running.get_mut(&id) {
+        let id = RequestId(1);
+        let st = sched.running.get(&id).expect("first request admitted");
+        assert!(st.reserve_worstcase);
+        assert_eq!(st.worstcase_blocks, 8);
+        assert_eq!(
+            sched.bm.blocks_for(id).len(),
+            8,
+            "full worst case is physically allocated at admission"
+        );
+        assert!(
+            !sched.running.contains_key(&RequestId(2)),
+            "second request queues: its worst case does not fit alongside the first"
+        );
+        assert_eq!(sched.pending.len(), 1);
+
+        // The admitted request can decode through its entire text budget from
+        // its own allocation, with the retained-image envelope intact — no
+        // dependency on any other request freeing blocks.
+        if let Some(st) = sched.running.get_mut(&id) {
             st.phase = Phase::DecodeUnd;
             st.pos = st.req.prompt_ids.len() as u32;
         }
-        let op = roomy
+        let op = sched
             .next_op(id, 16)
-            .expect("one free block allows text growth while preserving image capacity");
+            .expect("decode proceeds from the preallocated envelope");
         assert_eq!(op.kind, OpKind::DecodeUnd);
-        assert_eq!(op.decode_token_count, Some(4));
-        assert_eq!(roomy.bm.blocks_for(id).len(), 5);
-        let st = roomy.running.get(&id).unwrap();
+        assert_eq!(
+            sched.bm.blocks_for(id).len(),
+            8,
+            "decode does not allocate beyond the admission worst case"
+        );
+        let st = sched.running.get(&id).unwrap();
         let target = st.pos as usize
-            + op.decode_token_count.unwrap() as usize
-            + roomy.auto_interleave_remaining_image_span(st);
-        assert!(roomy.bm.blocks_for(id).len() * roomy.caps.block_size as usize >= target);
+            + op.decode_token_count.unwrap_or(1) as usize
+            + sched.auto_interleave_remaining_image_span(st);
+        assert!(sched.bm.blocks_for(id).len() * sched.caps.block_size as usize >= target);
+
+        // Finishing the resident request frees its envelope and unblocks the
+        // queued one — the FIFO drains instead of deadlocking.
+        sched.finish(id, FinishReason::Eos);
+        sched.admit();
+        assert!(
+            sched.running.contains_key(&RequestId(2)),
+            "queued request admits once the envelope is released"
+        );
+        assert_eq!(sched.pending.len(), 0);
+    }
+
+    #[test]
+    fn assemble_co_batches_und_decode_with_denoise() {
+        // und/gen mixed-batch single-forward is a core project invariant: a
+        // text-decode op and an image-denoise op resident at the same step
+        // MUST land in one batch (one packed forward), never be serialized
+        // into separate forwards. Drive one request into DenoiseGen and one
+        // into DecodeUnd, then assert one assemble() pass emits both.
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            latent_downsample: 16,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 8,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 8,
+                long_prefill_threshold: 16,
+                ..Default::default()
+            },
+        );
+
+        // Request 1: an AutoInterleave request at an image boundary -> DenoiseGen.
+        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        let mut gen_req = test_request(1, 4);
+        gen_req.mode = GenMode::AutoInterleave;
+        gen_req.max_tokens = 64;
+        gen_req.image = uniserve_core::ImageParams {
+            height: 64,
+            width: 64,
+            max_images: 2,
+            retain_images: true,
+            ..Default::default()
+        };
+        gen_req.event_tx = tx1;
+        sched.submit_for_test(gen_req);
+        // Request 2: a plain text-decode request -> DecodeUnd.
+        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
+        let mut und_req = test_request(2, 4);
+        und_req.max_tokens = 64;
+        und_req.event_tx = tx2;
+        sched.submit_for_test(und_req);
+        sched.admit();
+
+        if let Some(st) = sched.running.get_mut(&RequestId(1)) {
+            st.phase = Phase::DecodeUnd;
+            st.pos = 4;
+            st.n_generated = 1;
+            st.generated_ids.clear();
+        }
+        sched.begin_image(RequestId(1));
+        assert_eq!(
+            sched.running.get(&RequestId(1)).map(|s| s.phase),
+            Some(Phase::DenoiseGen),
+            "request 1 must be denoising"
+        );
+        if let Some(st) = sched.running.get_mut(&RequestId(2)) {
+            st.phase = Phase::DecodeUnd;
+            st.pos = 4;
+            st.next_token = 7;
+        }
+
+        let (_new, ops) = sched.assemble();
+        let has_gen = ops.iter().any(|o| o.kind == OpKind::DenoiseGen);
+        let has_und_decode = ops.iter().any(|o| o.kind == OpKind::DecodeUnd);
+        assert!(
+            has_gen && has_und_decode,
+            "assemble must co-batch text-decode with image-denoise in one forward: {:?}",
+            ops.iter().map(|o| o.kind).collect::<Vec<_>>()
+        );
     }
 
     fn drain_text_tokens(rx: &mut tokio::sync::mpsc::UnboundedReceiver<GenEvent>) -> Vec<u32> {

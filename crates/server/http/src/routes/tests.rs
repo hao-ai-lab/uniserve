@@ -24,12 +24,14 @@ use uniserve_chat::{
 use uniserve_engine_client::protocol::logprobs::{
     Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob,
 };
+use uniserve_engine_client::protocol::native::{NativeFinishExt, NativeOutputExt, WireImageEvent};
 use uniserve_engine_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, StopReason,
 };
 use uniserve_engine_client::test_utils::spawn_mock_engine_task;
-use uniserve_engine_client::{EngineCoreClient, MockEngine};
+use uniserve_engine_client::{EngineCoreClient, GenMode, MockEngine};
 use uniserve_llm::Llm;
+use uniserve_native_api::resolve_native_profile_for_model;
 use uniserve_observability::METRICS;
 use uniserve_text::tokenizer::{DynTokenizer, Tokenizer};
 use uniserve_text::{Prompt, TextBackend};
@@ -119,6 +121,41 @@ fn request_output_with_logprobs_and_kv(
         routed_experts: None,
         num_nans_in_logits: 0,
         native: None,
+    }
+}
+
+fn native_image_output(request_id: &str, image: WireImageEvent) -> EngineCoreOutput {
+    EngineCoreOutput {
+        request_id: request_id.to_string(),
+        native: Some(NativeOutputExt {
+            image: Some(image),
+            finish: None,
+        }),
+        ..Default::default()
+    }
+}
+
+fn native_finish_output(
+    request_id: &str,
+    reason: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    images: u64,
+) -> EngineCoreOutput {
+    EngineCoreOutput {
+        request_id: request_id.to_string(),
+        finish_reason: Some(EngineCoreFinishReason::Stop),
+        native: Some(NativeOutputExt {
+            image: None,
+            finish: Some(NativeFinishExt {
+                reason: reason.to_string(),
+                prompt_tokens,
+                completion_tokens,
+                images,
+                message: None,
+            }),
+        }),
+        ..Default::default()
     }
 }
 
@@ -422,6 +459,16 @@ impl Tokenizer for FakeChatTokenizer {
                 rest = stripped;
                 continue;
             }
+            if let Some(stripped) = rest.strip_prefix("<img>") {
+                token_ids.push(151670);
+                rest = stripped;
+                continue;
+            }
+            if let Some(stripped) = rest.strip_prefix("</img>") {
+                token_ids.push(151671);
+                rest = stripped;
+                continue;
+            }
 
             let ch = rest.chars().next().expect("rest is not empty");
             let mut buf = [0; 4];
@@ -446,6 +493,10 @@ impl Tokenizer for FakeChatTokenizer {
         match token {
             "<image>" => Some(999),
             "<|image_pad|>" => Some(151655),
+            "<|im_start|>" => Some(151644),
+            "<|im_end|>" => Some(151645),
+            "<img>" => Some(151670),
+            "</img>" => Some(151671),
             "<think>" => Some(0xF001),
             "</think>" => Some(0xF002),
             "<|START_THINKING|>" => Some(0xF003),
@@ -460,6 +511,10 @@ impl Tokenizer for FakeChatTokenizer {
         match id {
             999 => Some("<image>".to_string()),
             151655 => Some("<|image_pad|>".to_string()),
+            151644 => Some("<|im_start|>".to_string()),
+            151645 => Some("<|im_end|>".to_string()),
+            151670 => Some("<img>".to_string()),
+            151671 => Some("</img>".to_string()),
             0xF001 => Some("<think>".to_string()),
             0xF002 => Some("</think>".to_string()),
             0xF003 => Some("<|START_THINKING|>".to_string()),
@@ -781,6 +836,26 @@ where
             true,
             true,
         ),
+        engine_task,
+    )
+}
+
+async fn test_app_with_native_engine_script<F>(script: F) -> (axum::Router, MockEngineTask)
+where
+    F: FnOnce(MockEngine) -> TestFuture<'static> + Send + 'static,
+{
+    let (client, mock) = EngineCoreClient::connect_mock("test-model");
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task(mock, script));
+    let chat = ChatLlm::from_shared_backend(
+        test_llm(client),
+        Arc::new(FakeChatBackend::with_model_id("SenseNova-U1")),
+    );
+    let profile = resolve_native_profile_for_model("SenseNova-U1", &FakeChatTokenizer);
+    (
+        build_router(Arc::new(
+            AppState::new(vec!["Qwen/Qwen1.5-0.5B-Chat".to_string()], chat)
+                .with_native_profile(profile),
+        )),
         engine_task,
     )
 }
@@ -1720,6 +1795,352 @@ async fn happy_path_returns_sse_stream() {
             None,
         ),
         1.0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_completions_streams_interleaved_image_deltas() {
+    let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
+        boxed_test_future(async move {
+            let request = mock.recv_request().await;
+            let native = request.native.as_ref().expect("native request extension");
+            assert_eq!(native.mode, GenMode::AutoInterleave);
+            assert_eq!(native.image.width, 2048);
+            assert_eq!(native.image.height, 1152);
+            assert_eq!(native.image.steps, 7);
+            assert_eq!(native.image.cfg_text_scale, 4.5);
+            assert_eq!(native.image.cfg_img_scale, 1.25);
+            assert_eq!(native.image.cfg_renorm_type, "none");
+            assert_eq!(native.image.timestep_shift, 3.0);
+            assert_eq!(native.image.seed, Some(123));
+            assert_eq!(native.image.max_images, 2);
+            assert_eq!(request.sampling_params.as_ref().unwrap().max_tokens, 16);
+            assert!(!request.prompt_token_ids.as_ref().unwrap().is_empty());
+
+            mock.send_outputs(EngineCoreOutputs {
+                engine_index: 0,
+                outputs: vec![
+                    request_output(&request.request_id, bytes_to_token_ids(b"hi"), None),
+                    native_image_output(
+                        &request.request_id,
+                        WireImageEvent::Begin {
+                            image_id: 0,
+                            height: 1152,
+                            width: 2048,
+                            steps: 7,
+                        },
+                    ),
+                    native_image_output(
+                        &request.request_id,
+                        WireImageEvent::Step {
+                            image_id: 0,
+                            step: 1,
+                        },
+                    ),
+                    native_image_output(
+                        &request.request_id,
+                        WireImageEvent::Done {
+                            image_id: 0,
+                            height: 1152,
+                            width: 2048,
+                            bytes: 3,
+                            sha256: "sha".to_string(),
+                            png_b64: "QUJD".to_string(),
+                        },
+                    ),
+                    request_output(&request.request_id, bytes_to_token_ids(b"!"), None),
+                    native_finish_output(&request.request_id, "stop", 17, 3, 1),
+                ],
+                scheduler_stats: None,
+                timestamp: 0.0,
+                utility_output: None,
+                finished_requests: None,
+                wave_complete: None,
+                start_wave: None,
+            });
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": true,
+                        "stream_options": {"include_usage": true},
+                        "modalities": ["text", "image"],
+                        "messages": [
+                            {"role": "system", "content": "system"},
+                            {"role": "user", "content": "draw a compact travel scene"}
+                        ],
+                        "max_completion_tokens": 16,
+                        "temperature": 0.0,
+                        "image_config": {
+                            "aspect_ratio": "16:9",
+                            "steps": 7,
+                            "seed": 123,
+                            "guidance_scale": 4.5,
+                            "image_guidance_scale": 1.25,
+                            "cfg_norm": "none",
+                            "num_images": 2
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+
+    assert_eq!(streamed_chat_content(&text), "hi!");
+    let chunks = sse_json_chunks(&text);
+    let image_urls: Vec<String> = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"].get(0))
+        .filter_map(|choice| choice["delta"]["images"].as_array())
+        .flat_map(|images| images.iter())
+        .filter_map(|image| image["image_url"]["url"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(image_urls, vec!["data:image/png;base64,QUJD"]);
+    assert_eq!(streamed_finish_reason(&text), Some("stop".to_string()));
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["usage"]["prompt_tokens"] == json!(17))
+    );
+    assert!(!text.contains("image_begin"), "{text}");
+    assert!(!text.contains("image_step"), "{text}");
+    assert!(!text.contains("image_done"), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_completions_rejects_unsupported_image_config_output_type() {
+    let (mut app, engine_task) =
+        test_app_with_native_engine_script(|_mock| boxed_test_future(async move {})).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": true,
+                        "modalities": ["text", "image"],
+                        "messages": [{"role": "user", "content": "draw"}],
+                        "image_config": {
+                            "width": 2048,
+                            "height": 1152,
+                            "image_type": "jpeg"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(
+        json["error"]["message"],
+        "image_type must be png for image chat completions"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_completions_routes_image_input_to_native_understanding() {
+    let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
+        boxed_test_future(async move {
+            let request = mock.recv_request().await;
+            let native = request.native.as_ref().expect("native request extension");
+            assert_eq!(native.mode, GenMode::InterleaveUnd);
+            assert_eq!(native.mm_items.len(), 1);
+            assert_eq!(native.mm_items[0].b64, "QUJD");
+
+            mock.send_outputs(EngineCoreOutputs {
+                engine_index: 0,
+                outputs: vec![
+                    request_output(&request.request_id, bytes_to_token_ids(b"hi"), None),
+                    native_finish_output(&request.request_id, "eos", 9, 2, 0),
+                ],
+                scheduler_stats: None,
+                timestamp: 0.0,
+                utility_output: None,
+                finished_requests: None,
+                wave_complete: None,
+                start_wave: None,
+            });
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": true,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe this image."},
+                                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+                            ]
+                        }],
+                        "max_completion_tokens": 16
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8(body.to_vec()).expect("utf8 body");
+    assert_eq!(status, StatusCode::OK, "{text}");
+    engine_task.await.expect("mock engine task");
+    assert_eq!(streamed_chat_content(&text), "hi");
+    assert_eq!(streamed_finish_reason(&text), Some("stop".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_completions_maps_image_size_alias_to_profile_bucket() {
+    let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
+        boxed_test_future(async move {
+            let request = mock.recv_request().await;
+            let native = request.native.as_ref().expect("native request extension");
+            assert_eq!(native.mode, GenMode::Image);
+            assert_eq!(native.image.width, 2048);
+            assert_eq!(native.image.height, 1152);
+
+            mock.send_outputs(EngineCoreOutputs {
+                engine_index: 0,
+                outputs: vec![
+                    native_image_output(
+                        &request.request_id,
+                        WireImageEvent::Done {
+                            image_id: 0,
+                            height: 1152,
+                            width: 2048,
+                            bytes: 3,
+                            sha256: "sha".to_string(),
+                            png_b64: "QUJD".to_string(),
+                        },
+                    ),
+                    native_finish_output(&request.request_id, "image_done", 7, 0, 1),
+                ],
+                scheduler_stats: None,
+                timestamp: 0.0,
+                utility_output: None,
+                finished_requests: None,
+                wave_complete: None,
+                start_wave: None,
+            });
+        })
+    })
+    .await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "modalities": ["image"],
+                        "messages": [{"role": "user", "content": "draw"}],
+                        "image_config": {"image_size": "1.5K", "steps": 7}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    let images = json["choices"][0]["message"]["images"]
+        .as_array()
+        .expect("images array");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["image_url"]["url"], "data:image/png;base64,QUJD");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_completions_rejects_ambiguous_resolution_aliases() {
+    let (mut app, engine_task) =
+        test_app_with_native_engine_script(|_mock| boxed_test_future(async move {})).await;
+
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "modalities": ["image"],
+                        "messages": [{"role": "user", "content": "draw"}],
+                        "image_config": {"aspect_ratio": "16:9", "image_size": "1.5K"}
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    engine_task.await.expect("mock engine task");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(
+        json["error"]["message"],
+        "aspect_ratio and image_size are mutually exclusive"
     );
 }
 

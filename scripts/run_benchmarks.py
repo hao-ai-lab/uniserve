@@ -20,17 +20,26 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCRIPT_ROOT = Path(__file__).resolve().parents[1]
-if str(SCRIPT_ROOT) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_ROOT))
+# This runner and every harness/server child it spawns must resolve packages
+# from its own checkout, even when the shared venv's editable uniserve install
+# points at a sibling checkout. Re-exec once with PYTHONPATH pinned so the
+# import below and all subprocesses agree.
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if os.environ.get("UNISERVE_BENCH_PYTHONPATH_PINNED") != _REPO_ROOT:
+    existing = os.environ.get("PYTHONPATH")
+    os.environ["PYTHONPATH"] = f"{_REPO_ROOT}:{existing}" if existing else _REPO_ROOT
+    os.environ["UNISERVE_BENCH_PYTHONPATH_PINNED"] = _REPO_ROOT
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
-from uniserve_eval.backends import build_serve_cmd, resolve_cuda_visible_devices
-from uniserve_eval.profiles import (
+from uniserve_eval.backends import build_serve_cmd, resolve_cuda_visible_devices  # noqa: E402
+from uniserve_eval.profiles import (  # noqa: E402
     DEFAULT_CONFIG,
     ROOT,
     expand_profile_value,
@@ -39,7 +48,6 @@ from uniserve_eval.profiles import (
     server_spec,
     spec_env,
 )
-
 
 PROCESS_RE = re.compile(
     r"uniserve_eval\.harness\.cli|sglang\.launch_server|vllm serve|"
@@ -59,8 +67,7 @@ HARNESS_FLAGS = {
     "steps": "--steps",
     "max_images": "--max-images",
     "i2i_mode": "--i2i-mode",
-    "interleave_wire": "--interleave-wire",
-    "i2t_wire": "--i2t-wire",
+    "wire": "--wire",
     "i2t_question": "--i2t-question",
     "sharegpt_output_len": "--sharegpt-output-len",
     "sharegpt_context_len": "--sharegpt-context-len",
@@ -151,6 +158,17 @@ def ps_snapshot() -> str:
     return "\n".join(lines) if lines else "(none)"
 
 
+def active_benchmark_processes() -> str:
+    """Any benchmark/server process on the host, regardless of checkout.
+
+    Benchmarks share the machine (CPU, memory bandwidth, NVLink fabric) even
+    when pinned to different GPUs, so exactly one experiment may run at a
+    time host-wide. A sibling checkout's server or harness blocks this runner
+    the same as our own.
+    """
+    return ps_snapshot()
+
+
 def nvidia_smi() -> str:
     if not shutil.which("nvidia-smi"):
         return "nvidia-smi not found"
@@ -226,18 +244,39 @@ def wait_for_clean_gpu(timeout_s: float = 120.0) -> None:
 
 
 def wait_for_port(host: str, port: int, proc: subprocess.Popen[str], timeout_s: float) -> None:
+    """Wait until the server is inference-ready, not merely listening.
+
+    The Rust HTTP server binds its port while its (tensor-parallel) workers are
+    still loading — `/health` returns 503 in that window and generate requests
+    500. Poll `/health` for a 200; a non-503 HTTP error (e.g. a backend with no
+    `/health`) falls back to the open socket as the readiness signal.
+    """
     deadline = time.time() + timeout_s
     last_error: Exception | None = None
+    health_url = f"http://{host}:{port}/health"
     while time.time() < deadline:
         if proc.poll() is not None:
             raise RuntimeError(f"server exited before opening {host}:{port}, rc={proc.returncode}")
         try:
             with socket.create_connection((host, port), timeout=1):
-                return
+                pass
         except OSError as exc:
             last_error = exc
             time.sleep(1)
-    raise RuntimeError(f"server did not open {host}:{port}: {last_error}")
+            continue
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as resp:  # noqa: S310 - local health probe.
+                if resp.status == 200:
+                    return
+            last_error = RuntimeError("/health returned non-200")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 503:
+                return
+            last_error = exc
+        except OSError as exc:
+            last_error = exc
+        time.sleep(1)
+    raise RuntimeError(f"server did not become ready on {host}:{port}: {last_error}")
 
 
 def summary_ok(output_dir: Path) -> bool:
@@ -268,8 +307,9 @@ def materialize_datasets(output_root: Path, benchmark: dict[str, Any]) -> dict[s
         for old in out.glob(f"{prefix}_*.jpg"):
             old.unlink()
 
-        from datasets import load_dataset
         import random
+
+        from datasets import load_dataset
 
         ds = load_dataset(str(spec["name"]), split=str(spec.get("split", "train")))
         indices = list(range(len(ds)))
@@ -346,10 +386,6 @@ def benchmark_spec(config: dict[str, Any], name: str) -> dict[str, Any]:
         known = ", ".join(sorted(benchmarks))
         raise SystemExit(f"unknown benchmark {name!r}; known benchmarks: {known}")
     return expand_profile_value(dict(benchmarks[name]))
-
-
-def active_benchmark_processes() -> str:
-    return ps_snapshot()
 
 
 def build_servers(

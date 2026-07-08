@@ -98,6 +98,12 @@ class Caps:
     commit_marker_tokens: int = 2
     gen_rope_advance: int = 2
     max_cfg_branches: int = 3
+    tp_rank: int = 0
+    tp_size: int = 1
+    pp_rank: int = 0
+    pp_size: int = 1
+    dp_rank: int = 0
+    dp_size: int = 1
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -114,12 +120,12 @@ class Caps:
             "attention_backend": self.attention_backend or "auto",
             "quantization": self.quantization,
             "rank": {
-                "tp_rank": 0,
-                "tp_size": 1,
-                "pp_rank": 0,
-                "pp_size": 1,
-                "dp_rank": 0,
-                "dp_size": 1,
+                "tp_rank": self.tp_rank,
+                "tp_size": self.tp_size,
+                "pp_rank": self.pp_rank,
+                "pp_size": self.pp_size,
+                "dp_rank": self.dp_rank,
+                "dp_size": self.dp_size,
             },
             "pipeline_depth": self.pipeline_depth or 1,
             "encoder_cache_budget": self.encoder_cache_budget or 0,
@@ -146,6 +152,7 @@ def validate_caps(raw: Mapping[str, Any], *, owner: str = "driver") -> Caps:
     supported_controls, adapter_mode = _validate_controls_and_adapters(caps, owner)
     resource_classes = _validate_resource_classes(caps, owner)
     execution_constraints = _validate_execution_constraints(caps, owner)
+    rank = wire_mapping(caps.get("rank") or {}, f"{owner}.caps.rank")
 
     return Caps(
         block_size=wire_int_field(caps["block_size"], f"{owner}.caps.block_size", minimum=1),
@@ -207,6 +214,12 @@ def validate_caps(raw: Mapping[str, Any], *, owner: str = "driver") -> Caps:
             f"{owner}.caps.max_cfg_branches",
             minimum=1,
         ),
+        tp_rank=wire_int_field(rank.get("tp_rank", 0), f"{owner}.caps.rank.tp_rank", minimum=0),
+        tp_size=wire_int_field(rank.get("tp_size", 1), f"{owner}.caps.rank.tp_size", minimum=1),
+        pp_rank=wire_int_field(rank.get("pp_rank", 0), f"{owner}.caps.rank.pp_rank", minimum=0),
+        pp_size=wire_int_field(rank.get("pp_size", 1), f"{owner}.caps.rank.pp_size", minimum=1),
+        dp_rank=wire_int_field(rank.get("dp_rank", 0), f"{owner}.caps.rank.dp_rank", minimum=0),
+        dp_size=wire_int_field(rank.get("dp_size", 1), f"{owner}.caps.rank.dp_size", minimum=1),
     )
 
 

@@ -79,7 +79,19 @@ class BenchmarkRunner:
 
             async def warmup_submit(row: dict[str, Any]) -> RequestRecord:
                 warm = {**row, "output_len": 32, "max_tokens": 32}
-                return await self._submit(client, warm)
+                record = await self._submit(client, warm)
+                # A warmup that reached the server and terminated cleanly did
+                # its job even when the capped token budget produced no visible
+                # output — e.g. a reasoning model whose hidden <think> stream
+                # consumes all 32 tokens before any content/image is emitted.
+                if (
+                    not record.success
+                    and record.status_code == 200
+                    and record.classifier == "protocol_empty_output"
+                ):
+                    record.success = True
+                    record.classifier = "warmup_empty_output_ok"
+                return record
 
             sampler = GpuMemorySampler() if self.spec.sample_gpu_memory else None
             if sampler is not None:

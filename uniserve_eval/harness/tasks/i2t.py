@@ -6,25 +6,27 @@ from .base import BenchmarkTask, TaskRequest
 
 
 class I2TTask(BenchmarkTask):
-    """Image understanding (image → text), dual-wire.
+    """Image understanding (image → text), tri-wire.
 
-    ``spec.i2t_wire`` selects the request shape so the same dataset, arrival
+    ``spec.wire`` selects the request shape so the same dataset, arrival
     engine, and stream metrics compare backends over each system's public API:
 
     * ``"native"`` — UniServe ``/generate`` SSE with ``mode:"understand"`` and
       the image as ``input_image_b64``.
     * ``"openai_chat"`` — OpenAI chat completions SSE with the image as an
-      ``image_url`` data URI content part (vLLM-Omni's SenseNova i2t shape,
-      ``modalities: ["text"]``).
+      ``image_url`` data-URI content part, streamed; measures true TTFT/ITL
+      through the public chat endpoint.
+    * ``"openai_chat_json"`` — the same chat payload, one non-streamed JSON
+      response; E2E + token counts only. Diffusion-pipeline chat backends
+      (vLLM-Omni) answer with one chat.completion JSON regardless of
+      ``stream``, so this is their honest measurement.
     """
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
         max_tokens = int(item.get("max_tokens", self.spec.max_tokens or 512))
         image_b64 = item.get("input_image_b64")
-        if self.spec.i2t_wire == "openai_chat":
-            # Diffusion-pipeline chat backends (vLLM-Omni) answer with one
-            # non-streamed chat.completion JSON regardless of ``stream``, so
-            # this wire measures E2E + tokens (no TTFT/ITL decomposition).
+        if self.spec.wire in ("openai_chat", "openai_chat_json"):
+            streamed = self.spec.wire == "openai_chat"
             payload: dict[str, Any] = {
                 "model": self.spec.model,
                 "messages": [
@@ -43,14 +45,12 @@ class I2TTask(BenchmarkTask):
                 "temperature": self.spec.temperature,
                 "max_tokens": max_tokens,
             }
+            if streamed:
+                payload["stream"] = True
+                payload["stream_options"] = {"include_usage": True}
             if self.spec.extra_request_body:
                 payload.update(self.spec.extra_request_body)
-            endpoint = (
-                self.spec.endpoint
-                if self.spec.endpoint != "/generate"
-                else "/v1/chat/completions"
-            )
-            return TaskRequest(endpoint=endpoint, payload=payload, kind="openai_chat_json")
+            return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind=self.spec.wire)
 
         payload = {
             "prompt": item["prompt"],

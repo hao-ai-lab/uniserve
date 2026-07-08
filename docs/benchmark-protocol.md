@@ -1,17 +1,12 @@
 # Benchmark Protocol
 
-This document defines the benchmark matrix and diagnostic protocol for
-UniServe, SGLang, and vllm-omni comparisons. The runnable spec lives in
-`uniserve_eval/profiles.json` under `benchmarks.main`; the runner is
-`scripts/run_benchmarks.py`.
+This document defines the benchmark matrix and diagnostic protocol for UniServe, SGLang, and vllm-omni comparisons. The runnable spec lives in `uniserve_eval/profiles.json` under `benchmarks.main`; the runner is `scripts/run_benchmarks.py`.
 
 ## Principles
 
 - Benchmark definitions are profile data, not local script constants.
-- Tracked files must not contain machine-local model, dataset, or virtualenv
-  paths. Use environment variables documented below.
-- Load is expressed as open-loop request arrival rate unless a workload is
-  explicitly labeled as a correctness gate or a diagnostic.
+- Tracked files must not contain machine-local model, dataset, or virtualenv paths. Use environment variables documented below.
+- Load is expressed as open-loop request arrival rate unless a workload is explicitly labeled as a correctness gate or a diagnostic.
 - Server command lines are part of the audited spec.
 - Backend comparisons use the declared production-facing server profiles.
 
@@ -29,8 +24,7 @@ Set these before launching the benchmark runner:
 | `UNISERVE_OMNI_VLLM` | `vllm` executable for vllm-omni |
 | `UNISERVE_BENCH_CUDA_VISIBLE_DEVICES` | optional: overrides every profile's `cuda_visible_devices` for this run |
 
-If any variable is missing, launch paths must fail before starting a server.
-Dry-run output may keep `${VAR}` placeholders for audit.
+If any variable is missing, launch paths must fail before starting a server. Dry-run output may keep `${VAR}` placeholders for audit.
 
 ## Matrix
 
@@ -51,8 +45,7 @@ All official benchmark points use arrival rates:
 | load axis | arrival rate 1,2,4,8,16 |
 | metrics | TTFT, TPOT, E2E latency, output tokens/s |
 
-SGLang runs through the declared benchmark server profile. Cache-mode evidence
-for the Qwen3 text-serving comparison is tracked in `specs/tasks.md`.
+SGLang runs through the declared benchmark server profile. Cache-mode evidence for the Qwen3 text-serving comparison is tracked in `specs/tasks.md`.
 
 ### MJHQ T2I
 
@@ -76,8 +69,8 @@ for the Qwen3 text-serving comparison is tracked in `specs/tasks.md`.
 | load axis | arrival rate 1,2,4,8,16 | arrival rate 1,2,4,8,16 |
 | max tokens | 256 | 256 |
 | temperature | 0 | 0 |
-| UniServe wire | native | native |
-| vllm-omni wire | OpenAI chat image_url | OpenAI chat image_url |
+| UniServe wires | native, openai_chat (streamed) | native, openai_chat (streamed) |
+| vllm-omni wire | openai_chat_json (non-streamed chat JSON) | openai_chat_json (non-streamed chat JSON) |
 | metrics | request throughput, output tokens/s, TTFT, TPOT, E2E | same |
 
 ### SenseNova UEval Interleave
@@ -92,8 +85,10 @@ for the Qwen3 text-serving comparison is tracked in `specs/tasks.md`.
 | image cap | none |
 | image size | 2048x1152 |
 | steps | 50 |
-| wire | native, and an `openai_chat` variant (`sensenova_ueval_interleave_chat_uniserve`) |
+| wires | native (/generate SSE), openai_chat (/v1/chat/completions SSE with modalities ["text","image"] + image_config) |
 | metrics | request throughput, output tokens/s, images/s, TTFT, TPOT, time-to-first-image |
+
+Text ITL excludes generated-image spans on both wires: the inter-token gap that straddles an image delta is dropped so image generation time never inflates text ITL.
 
 ## Runner Contract
 
@@ -111,8 +106,7 @@ Useful non-executing audit mode:
 
 The runner must:
 
-- Load servers, benchmark groups, load axes, and point templates from
-  `uniserve_eval/profiles.json`.
+- Load servers, benchmark groups, load axes, and point templates from `uniserve_eval/profiles.json`.
 - Run at most one server and one harness process at a time.
 - Write `COMMANDS.md` from the same resolved specs used for execution.
 - Write `command.txt`, `run.log`, `summary.json`, `preflight.txt`, and
@@ -131,16 +125,13 @@ Profiles use namespace-style keys:
 - `perf/tripwire/...` for small regression sentinels.
 - `benchmarks.main` for the official benchmark matrix.
 
-Official benchmark points live under `benchmarks.main`. Correctness and
-regression sentinels live under `workloads`.
+Official benchmark points live under `benchmarks.main`. Correctness and regression sentinels live under `workloads`.
 
 ## Required Investigations
 
 ### SenseNova UEval TTFT Jump
 
-The SenseNova UEval diagnostic compares request rates 4 and 8 and attributes
-p90 TTFT to request queueing, first-forward work, image spans, stream flushing,
-and client-side accounting.
+The SenseNova UEval diagnostic compares request rates 4 and 8 and attributes p90 TTFT to request queueing, first-forward work, image spans, stream flushing, and client-side accounting.
 
 Minimum artifacts:
 
@@ -152,12 +143,8 @@ Minimum artifacts:
 - GPU utilization and memory timeline.
 - Server and worker logs.
 
-The investigation should distinguish actual compute saturation from admission
-queueing, head-of-line blocking, image-span effects, and SSE/client accounting.
+The investigation should distinguish actual compute saturation from admission queueing, head-of-line blocking, image-span effects, and SSE/client accounting.
 
 ### UniServe Radix/Prefix Cache
 
-The Qwen3 ShareGPT diagnostic records SGLang results with the declared server
-profile, records the matching UniServe results when available, and determines
-whether UniServe needs prefix/radix-cache support before final text-serving
-claims.
+The Qwen3 ShareGPT diagnostic records SGLang results with the declared server profile, records the matching UniServe results when available, and determines whether UniServe needs prefix/radix-cache support before final text-serving claims.

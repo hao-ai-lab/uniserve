@@ -48,6 +48,7 @@ pub struct WorkerLaunchConfig {
     pub transformers_attn_implementation: String,
     pub disable_model_arch: Vec<String>,
     pub strict_model_imports: bool,
+    pub mesh: Option<String>,
     pub tp_backend: Option<String>,
     pub mooncake_device: String,
     pub mooncake_protocol: String,
@@ -87,6 +88,7 @@ impl Default for WorkerLaunchConfig {
             transformers_attn_implementation: "uniserve".to_string(),
             disable_model_arch: Vec::new(),
             strict_model_imports: false,
+            mesh: None,
             tp_backend: None,
             mooncake_device: String::new(),
             mooncake_protocol: "rdma".to_string(),
@@ -138,6 +140,9 @@ impl WorkerLaunchConfig {
         }
         if self.strict_model_imports {
             cmd.arg("--strict-model-imports");
+        }
+        if let Some(value) = &self.mesh {
+            cmd.arg("--mesh").arg(value);
         }
         if let Some(value) = &self.tp_backend {
             cmd.arg("--tp-backend").arg(value);
