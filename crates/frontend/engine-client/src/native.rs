@@ -5,7 +5,9 @@ use crate::client::EngineCoreOutputStream;
 use crate::protocol::native::{NativeRequestExt, WireMmItem};
 use crate::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
 
-pub use uniserve_core::{GenMode, ImageParams, SamplingParams as EngineSamplingParams};
+pub use uniserve_core::{
+    GenerationConstraint, ImageParams, SamplingParams as EngineSamplingParams,
+};
 pub use uniserve_engine_api::{FinishReason as NativeFinishReason, GenEvent, MmItem};
 
 /// Reverse adaptation of one wire output into the typed native [`GenEvent`]s a
@@ -13,16 +15,13 @@ pub use uniserve_engine_api::{FinishReason as NativeFinishReason, GenEvent, MmIt
 /// client and the headless engine share a single definition.
 pub use uniserve_engine_wire::translate::wire_output_to_gen_events;
 
-/// Inputs for a native, image/interleave-capable generate request.
-
-/// This bypasses the text-only engine request DTO so callers can express pure
-/// text-to-image, interleaved text+image, and image-understanding flows.
+/// Inputs for a native generate request.
 pub struct NativeGenerateRequest {
     pub prompt_ids: Vec<u32>,
     pub neg_prompt_ids: Vec<u32>,
     pub sampling: EngineSamplingParams,
     pub image: ImageParams,
-    pub mode: GenMode,
+    pub constraint: GenerationConstraint,
     pub max_tokens: usize,
     pub mm_items: Vec<MmItem>,
     pub stop_token_ids: Vec<u32>,
@@ -39,7 +38,7 @@ pub(crate) fn native_request_to_wire(
         sampling_params: Some(sampling),
         arrival_time: now_secs(),
         native: Some(NativeRequestExt {
-            mode: req.mode,
+            constraint: req.constraint,
             image: req.image,
             neg_prompt_ids: req.neg_prompt_ids,
             mm_items: req

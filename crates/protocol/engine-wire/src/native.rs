@@ -1,18 +1,18 @@
-//! UniServe protocol extensions for native image/interleave generation.
+//! UniServe protocol extensions for native generation.
 //!
 //! This is the one deliberate fork from the upstream vllm-rs wire protocol
 //!: the upstream `EngineCoreRequest`/`EngineCoreOutput`
 //! cannot express image generation, so UniServe appends one optional extension
 //! field to each (`native`) and one to the handshake INIT message
 //! (`native_controls`). Plain text traffic leaves them all `None`, keeping the
-//! upstream encoding shape; image/interleave traffic is impossible to confuse
+//! upstream encoding shape; native traffic is impossible to confuse
 //! with upstream messages because the extension is a dedicated trailing slot.
 //!
 //! Everything here is a descriptor or small result (token ids, dimensions,
 //! finished PNG bytes).
 
 use serde::{Deserialize, Serialize};
-use uniserve_core::{GenMode, ImageParams};
+use uniserve_core::{GenerationConstraint, ImageParams};
 
 /// A staged multimodal input item on the wire: an input image referenced by
 /// content hash that occupies `num_tokens` positions in the AR sequence once
@@ -31,13 +31,13 @@ pub struct WireMmItem {
     pub b64: String,
 }
 
-/// UniServe extension to [`crate::EngineCoreRequest`]: the native
-/// image/interleave generation parameters the upstream text protocol cannot
-/// express. Present iff the request runs one of the image-capable modes.
+/// UniServe extension to [`crate::EngineCoreRequest`]: the native generation
+/// parameters the upstream text protocol cannot express.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeRequestExt {
-    /// Generation mode (text / image / auto-interleave / understanding).
-    pub mode: GenMode,
+    /// Output constraint applied to the default generation paradigm.
+    #[serde(default)]
+    pub constraint: GenerationConstraint,
     /// Image diffusion parameters.
     pub image: ImageParams,
     /// CFG text-unconditional / image precontext prompt (may be empty).
@@ -86,7 +86,7 @@ pub enum WireImageEvent {
 }
 
 /// Native finish statistics attached to the terminal output of an
-/// image/interleave request, so the frontend can reconstruct the typed
+/// native generation request, so the frontend can reconstruct the typed
 /// `Finished` event without engine-side state.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NativeFinishExt {
@@ -117,7 +117,7 @@ pub struct NativeOutputExt {
 
 /// Model control-token ids resolved from the tokenizer by the frontend and
 /// shipped to the engine in the handshake INIT message (a UniServe extension to
-/// `HandshakeInitMessage`): the engine's scheduler FSM needs them, but the
+/// `HandshakeInitMessage`): the engine's scheduler lifecycle decisions need them, but the
 /// tokenizer lives with the frontend.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeControlTokens {
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn native_request_ext_roundtrip() {
         let ext = NativeRequestExt {
-            mode: GenMode::AutoInterleave,
+            constraint: GenerationConstraint::Default,
             image: ImageParams::default(),
             neg_prompt_ids: vec![1, 2],
             mm_items: vec![WireMmItem {

@@ -13,7 +13,7 @@ Concepts:
 Examples:
   uniserve-eval list
   uniserve-eval launch gate/server/sensenova
-  uniserve-eval verify gate/sensenova/interleave-travel
+  uniserve-eval verify gate/sensenova/default-travel
   uniserve-eval perf perf/tripwire/bagel/i2t
   uniserve-eval run gate/all --manage-servers
 """

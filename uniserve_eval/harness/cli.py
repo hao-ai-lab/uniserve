@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--max-tokens", type=int, help="output token cap (text/interleave)")
+    parser.add_argument("--max-tokens", type=int, help="output token cap")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--disable-ignore-eos", action="store_true", help="respect EOS (default ignores EOS)")
@@ -63,9 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-images",
         type=int,
         default=None,
-        help="interleave image cap; omit to leave image count uncapped",
+        help="default-task image cap; omit to leave image count uncapped",
     )
-    parser.add_argument("--i2i-mode", default="image")
     parser.add_argument(
         "--wire",
         default=None,
@@ -124,7 +123,6 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         height=args.height,
         steps=args.steps,
         max_images=args.max_images,
-        i2i_mode=args.i2i_mode,
         wire=args.wire or "",
         i2t_question=args.i2t_question,
         sample_gpu_memory=not args.no_gpu_memory,

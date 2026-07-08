@@ -53,7 +53,7 @@ from uniserve_eval.harness.sse import (
     iter_sse_events,
 )
 from uniserve_eval.harness.tasks.i2t import I2TTask
-from uniserve_eval.harness.tasks.interleave import InterleaveTask
+from uniserve_eval.harness.tasks.default import DefaultTask
 from uniserve_eval.harness.tasks.t2i import T2ITask
 
 pytestmark = [pytest.mark.unit]
@@ -193,7 +193,7 @@ def test_classify_json_image_response_routes_payloads() -> None:
 
 
 def test_native_parser_excludes_image_step_gaps_from_text_itl() -> None:
-    record = RequestRecord(request_id="interleave", task="interleave")
+    record = RequestRecord(request_id="default", task="default")
     record.start_time = 10.0
     record.scheduled_time = 9.95
     events = [
@@ -244,7 +244,7 @@ def test_native_parser_excludes_image_step_gaps_from_text_itl() -> None:
 
 
 def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
-    record = RequestRecord(request_id="openai-interleave", task="interleave")
+    record = RequestRecord(request_id="openai-default", task="default")
     record.start_time = 10.0
     events = [
         {"choices": [{"delta": {"content": "a"}}], "_client_t": 11.0},
@@ -284,10 +284,10 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
     assert record.finish_reason == "stop"
 
 
-def test_interleave_task_omits_image_cap_unless_explicit() -> None:
-    uncapped = InterleaveTask(
+def test_default_task_omits_image_cap_unless_explicit() -> None:
+    uncapped = DefaultTask(
         BenchmarkSpec(
-            task=TaskName.INTERLEAVE,
+            task=TaskName.DEFAULT,
             model="SenseNova-U1",
             max_tokens=8192,
             width=2048,
@@ -298,9 +298,9 @@ def test_interleave_task_omits_image_cap_unless_explicit() -> None:
 
     assert uncapped.payload["image"] == {"width": 2048, "height": 1152, "steps": 50}
 
-    capped = InterleaveTask(
+    capped = DefaultTask(
         BenchmarkSpec(
-            task=TaskName.INTERLEAVE,
+            task=TaskName.DEFAULT,
             model="SenseNova-U1",
             max_tokens=8192,
             max_images=8,
@@ -313,10 +313,10 @@ def test_interleave_task_omits_image_cap_unless_explicit() -> None:
     assert capped.payload["image"]["max_images"] == 8
 
 
-def test_interleave_task_can_emit_openai_chat_wire() -> None:
-    request = InterleaveTask(
+def test_default_task_can_emit_openai_chat_wire() -> None:
+    request = DefaultTask(
         BenchmarkSpec(
-            task=TaskName.INTERLEAVE,
+            task=TaskName.DEFAULT,
             model="SenseNova-U1",
             max_tokens=8192,
             max_images=4,
@@ -579,7 +579,7 @@ def test_native_send_sse_stops_on_terminal_event(monkeypatch: pytest.MonkeyPatch
     async def run_once() -> None:
         transport = httpx.MockTransport(lambda _request: httpx.Response(200, text=""))
         async with httpx.AsyncClient(transport=transport) as async_client:
-            record = RequestRecord(request_id="native", task="interleave")
+            record = RequestRecord(request_id="native", task="default")
             record.start_time = 1.0
             await _send_sse(
                 async_client,
@@ -688,7 +688,7 @@ def test_load_ueval_local_jsonl_shapes_rows(tmp_path: Path) -> None:
     rows = load_ueval(str(path), num_requests=2, seed=7)
 
     assert len(rows) == 2
-    assert all(row["task"] == "interleave" for row in rows)
+    assert all(row["task"] == "default" for row in rows)
     assert [row["id"] for row in rows] == ["ueval-000000", "ueval-000001"]
     # All sampled prompts come from the source set (sampling, not invention).
     source = {f"ueval prompt {i}" for i in range(4)}
@@ -796,11 +796,11 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
 
 
 def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
-    spec = BenchmarkSpec(task=TaskName.INTERLEAVE, model="M", num_prompts=1)
+    spec = BenchmarkSpec(task=TaskName.DEFAULT, model="M", num_prompts=1)
     records = [
         RequestRecord(
             request_id="a",
-            task="interleave",
+            task="default",
             success=True,
             latency=1.0,
             classifier="ok",

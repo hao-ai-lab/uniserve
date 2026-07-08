@@ -211,7 +211,7 @@ impl InProcessEngineClient for RuntimeEngineClient {
             req.prompt_ids,
             req.sampling,
             req.image,
-            req.mode,
+            req.constraint,
             req.max_tokens,
             event_tx,
         );
@@ -311,8 +311,7 @@ mod tests {
         EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
     };
     use uniserve_engine_client::{
-        EngineCoreClient, EngineSamplingParams, GenEvent, GenMode, ImageParams,
-        NativeGenerateRequest,
+        EngineCoreClient, EngineSamplingParams, GenEvent, ImageParams, NativeGenerateRequest,
     };
     use uniserve_engine_runtime::EngineCoreConfig;
 
@@ -389,7 +388,7 @@ mod tests {
                 steps: 4,
                 ..ImageParams::default()
             },
-            mode: GenMode::Image,
+            constraint: uniserve_core::GenerationConstraint::GenOnly,
             max_tokens: 0,
             mm_items: vec![],
             stop_token_ids: vec![],

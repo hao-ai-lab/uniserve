@@ -131,7 +131,7 @@ def test_benchmark_runner_forwards_wire(tmp_path):
         output_dir=tmp_path,
         defaults={},
         harness={
-            "task": "interleave",
+            "task": "default",
             "model": "SenseNova-U1",
             "dataset": "ueval",
             "num_prompts": 1,

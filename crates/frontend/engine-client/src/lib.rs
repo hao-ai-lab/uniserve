@@ -19,7 +19,7 @@ pub use client::{
 pub use error::{Error, Result};
 pub use mock::{MockClientMessage, MockEngine};
 pub use native::{
-    EngineSamplingParams, GenEvent, GenMode, ImageParams, MmItem, NativeEventStream,
+    EngineSamplingParams, GenEvent, GenerationConstraint, ImageParams, MmItem, NativeEventStream,
     NativeFinishReason, NativeGenerateRequest,
 };
 pub use zmq::{EngineId, TransportMode, ZmqClientConfig, ZmqEngineCoreClient};

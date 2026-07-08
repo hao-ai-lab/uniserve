@@ -12,7 +12,7 @@ use uniserve_engine_client::protocol::{
     EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
 };
 use uniserve_engine_client::{
-    EngineCoreClient, EngineSamplingParams, GenEvent, GenMode, ImageParams, NativeGenerateRequest,
+    EngineCoreClient, EngineSamplingParams, GenEvent, ImageParams, NativeGenerateRequest,
     TransportMode, ZmqClientConfig,
 };
 use uniserve_engine_process::{EngineProcConfig, run_engine_proc};
@@ -139,7 +139,7 @@ async fn socket_mode_native_image_generation() {
             steps: 4,
             ..ImageParams::default()
         },
-        mode: GenMode::Image,
+        constraint: uniserve_core::GenerationConstraint::GenOnly,
         max_tokens: 0,
         mm_items: vec![],
         stop_token_ids: vec![],
@@ -188,8 +188,8 @@ async fn socket_mode_native_image_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn socket_mode_interleave_generation() {
-    let handshake = ipc_endpoint("interleave");
+async fn socket_mode_default_generation() {
+    let handshake = ipc_endpoint("default-generation");
     let shutdown = CancellationToken::new();
     let proc_task = spawn_sim_proc(&handshake, 0, shutdown.clone());
 
@@ -202,7 +202,7 @@ async fn socket_mode_interleave_generation() {
         .await
         .expect("connect zmq client");
 
-    // Interleaved text+image over the wire: text rounds and two images.
+    // Mixed text+image over the wire: text rounds and two images.
     let request = NativeGenerateRequest {
         prompt_ids: vec![1, 2, 3],
         neg_prompt_ids: vec![],
@@ -215,7 +215,7 @@ async fn socket_mode_interleave_generation() {
             max_images: 2,
             ..ImageParams::default()
         },
-        mode: GenMode::AutoInterleave,
+        constraint: uniserve_core::GenerationConstraint::Default,
         max_tokens: 64,
         mm_items: vec![],
         stop_token_ids: vec![],
@@ -247,9 +247,9 @@ async fn socket_mode_interleave_generation() {
     assert!(finished, "expected a terminal Finished event");
     assert!(
         text_tokens >= 1,
-        "expected interleaved text, got {text_tokens} tokens"
+        "expected mixed-output text, got {text_tokens} tokens"
     );
-    assert_eq!(dones, 2, "expected two interleaved images, got {dones}");
+    assert_eq!(dones, 2, "expected two generated images, got {dones}");
     assert_eq!(finished_images, 2);
 
     shutdown.cancel();

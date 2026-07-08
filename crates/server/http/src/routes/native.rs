@@ -1,4 +1,4 @@
-//! UniServe-native image / interleaved-generation surface.
+//! UniServe-native generation surface.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use futures::stream;
 use serde_json::{Value, json};
 
+use uniserve_engine_client::GenerationConstraint;
 use uniserve_native_api::events::{Detok, event_json, is_terminal};
 use uniserve_native_api::{
     NativeDelimitedText, NativeGenerateBody, NativeImageBody, NativeOutputFilter,
@@ -361,7 +362,7 @@ pub(crate) async fn images_generations(
     };
     let native = NativeGenerateBody {
         prompt,
-        mode: Some("image".into()),
+        constraint: Some(GenerationConstraint::GenOnly),
         image: Some(image),
         ..Default::default()
     };

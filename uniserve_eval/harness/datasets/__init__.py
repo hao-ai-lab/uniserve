@@ -73,7 +73,7 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
     if dataset in _PIE_BENCH_ALIASES or spec.task == TaskName.I2I:
         return load_pie_bench(path, spec.num_prompts, seed=spec.seed)
 
-    if dataset == "ueval" or spec.task == TaskName.INTERLEAVE:
+    if dataset == "ueval" or spec.task == TaskName.DEFAULT:
         return load_ueval(path, spec.num_prompts, seed=spec.seed)
 
     raise ValueError(f"unknown dataset {spec.dataset!r} for task {spec.task.value!r}")

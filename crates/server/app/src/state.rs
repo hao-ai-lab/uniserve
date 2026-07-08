@@ -32,7 +32,7 @@ pub struct AppState {
     server_load: AtomicU64,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
-    /// Model-family profile for the native image/interleave surface.
+    /// Model-family profile for the native generation surface.
     native_profile: NativeModelProfile,
 }
 
@@ -62,7 +62,7 @@ impl AppState {
         }
     }
 
-    /// Attach the native image/interleave profile resolved from the model
+    /// Attach the native generation profile resolved from the model
     /// tokenizer.
     pub fn with_native_profile(mut self, profile: NativeModelProfile) -> Self {
         self.native_profile = profile;
@@ -92,7 +92,7 @@ impl AppState {
         &self.chat
     }
 
-    /// Return the model-family profile for the native image/interleave surface.
+    /// Return the model-family profile for the native generation surface.
     pub fn native_profile(&self) -> &NativeModelProfile {
         &self.native_profile
     }

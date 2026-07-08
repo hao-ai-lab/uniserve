@@ -18,10 +18,10 @@ use uniserve_chat::{
     CollectedAssistantMessage, FinishReason,
 };
 use uniserve_engine_client::protocol::StopReason;
-use uniserve_engine_client::{GenEvent, GenMode};
+use uniserve_engine_client::{GenEvent, GenerationConstraint};
 use uniserve_native_api::events::{Detok, event_json};
 use uniserve_native_api::schema::NativeInputImage;
-use uniserve_native_api::{NativeGenerateBody, NativeImageBody, NativeRequestBuilder, mode_name};
+use uniserve_native_api::{NativeGenerateBody, NativeImageBody, NativeRequestBuilder};
 use uniserve_openai_api::chat_completions::{prepare_chat_request, validate_request_compat};
 use uniserve_openai_api::logprobs::{
     decoded_logprobs_to_openai_chat, decoded_prompt_logprobs_to_maps,
@@ -53,13 +53,13 @@ pub(crate) async fn chat_completions(
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let lora_resolution = state.resolve_model_with_loras(Some(&body.model)).await;
 
-    if let Some(native_mode) = native_chat_mode(&state, &body) {
+    if let Some(native_constraint) = native_chat_constraint(&state, &body) {
         return native_chat_completions(
             state,
             body,
             &lora_resolution,
             request_context,
-            native_mode,
+            native_constraint,
         )
         .await;
     }
@@ -257,12 +257,12 @@ async fn native_chat_completions(
     body: ChatCompletionRequest,
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
-    native_mode: GenMode,
+    native_constraint: GenerationConstraint,
 ) -> Response {
     if let Err(error) = validate_request_compat(&body, &lora_resolution.model_names) {
         return ApiError::from(error).into_response();
     }
-    if let Err(error) = validate_native_chat_request(&body, native_mode) {
+    if let Err(error) = validate_native_chat_request(&body, native_constraint) {
         return error.into_response();
     }
 
@@ -283,7 +283,7 @@ async fn native_chat_completions(
                 .unwrap_or_default()
         });
     let created = unix_timestamp();
-    let native_body = match native_chat_body(&body, native_mode) {
+    let native_body = match native_chat_body(&body, native_constraint) {
         Ok(body) => body,
         Err(error) => return error.into_response(),
     };
@@ -745,29 +745,25 @@ fn usage_chunk(
     chunk
 }
 
-/// Derive the native generation mode for one chat request, if the request
-/// belongs on the native engine path at all.
-
-/// Explicit `image` output modality always selects a native mode; the
-/// builder's profile check turns unsupported modes into clean 400s. Image
-/// *inputs* with text-only output select native understanding only when the
-/// model has no generic multimodal chat backend and the native profile
-/// declares understanding support — otherwise the request stays on the
-/// generic chat stack.
-fn native_chat_mode(state: &AppState, request: &ChatCompletionRequest) -> Option<GenMode> {
+fn native_chat_constraint(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+) -> Option<GenerationConstraint> {
     let has_image = request.modalities.contains(&ChatModality::Image);
     let has_text = request.modalities.contains(&ChatModality::Text);
     match (has_text, has_image) {
-        (true, true) => Some(GenMode::AutoInterleave),
-        (false, true) => Some(GenMode::Image),
+        (true, true) => Some(GenerationConstraint::Default),
+        (false, true) => Some(GenerationConstraint::GenOnly),
         (true, false) => {
             let has_image_input = request.messages.iter().any(|message| {
                 matches!(message, ChatMessage::User { content, .. } if content_has_image_parts(content))
             });
             (has_image_input
                 && !state.chat().has_multimodal_backend()
-                && state.native_profile().supports_mode(GenMode::InterleaveUnd))
-            .then_some(GenMode::InterleaveUnd)
+                && state
+                    .native_profile()
+                    .supports_constraint(GenerationConstraint::UndOnly))
+            .then_some(GenerationConstraint::UndOnly)
         }
         (false, false) => None,
     }
@@ -783,7 +779,7 @@ fn content_has_image_parts(content: &MessageContent) -> bool {
 
 fn validate_native_chat_request(
     request: &ChatCompletionRequest,
-    native_mode: GenMode,
+    native_constraint: GenerationConstraint,
 ) -> Result<(), ApiError> {
     if request.logprobs
         || request.prompt_logprobs.is_some()
@@ -808,7 +804,7 @@ fn validate_native_chat_request(
             None,
         ));
     }
-    if native_mode == GenMode::AutoInterleave && !request.stream {
+    if native_constraint == GenerationConstraint::Default && !request.stream {
         return Err(ApiError::invalid_request(
             "text+image chat completions require stream=true".to_string(),
             None,
@@ -845,7 +841,7 @@ fn validate_native_chat_request(
 
 fn native_chat_body(
     request: &ChatCompletionRequest,
-    native_mode: GenMode,
+    native_constraint: GenerationConstraint,
 ) -> Result<NativeGenerateBody, ApiError> {
     let mut system_parts = Vec::new();
     let mut prompt_parts = Vec::new();
@@ -891,7 +887,7 @@ fn native_chat_body(
 
     Ok(NativeGenerateBody {
         prompt: prompt_parts.join("\n"),
-        mode: Some(mode_name(native_mode).to_string()),
+        constraint: Some(native_constraint),
         system_prompt: (!system_parts.is_empty()).then(|| system_parts.join("\n")),
         assistant_prefix: None,
         negative_prompt: None,

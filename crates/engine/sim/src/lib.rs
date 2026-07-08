@@ -1,5 +1,5 @@
 //! GPU-free CPU model engine that fabricates text tokens and denoise-step
-//! progress against the same [`ModelEngine`] trait, so the scheduler, FSM, block
+//! progress against the same [`ModelEngine`] trait, so the scheduler, lifecycle, block
 //! manager, and frontend can be exercised without a GPU or Python worker.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -497,7 +497,6 @@ impl ModelEngine for SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_executor::Executor as _;
 
     #[test]
     fn control_wait_acks_every_control_op() {

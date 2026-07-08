@@ -4,7 +4,7 @@
 //! keep its msgpack encodings — tuple-encoded request/output structs, the
 //! single-byte request-type frame, the HELLO/INIT/READY handshake messages —
 //! so vllm-rs protocol tests port over as conformance tests. The deliberate
-//! UniServe fork is the [`native`] module: image/interleave generation events
+//! UniServe fork is the [`native`] module: native generation events
 //! and request parameters the upstream protocol cannot express.
 //!
 //! Both sides of the boundary use this crate: `uniserve-engine-client`
@@ -468,7 +468,7 @@ pub struct EngineCoreRequest {
     #[serde(default)]
     pub abort_immediately: bool,
     /// UniServe protocol extension (appended; absent on the upstream wire):
-    /// native image/interleave generation parameters. `None` for plain text
+    /// native generation parameters. `None` for plain text
     /// requests — the request then matches the upstream encoding except for the
     /// extra trailing nil.
     #[serde(default)]
@@ -524,7 +524,7 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub num_nans_in_logits: u32,
     /// UniServe protocol extension (appended; absent on the upstream wire):
-    /// typed image events and native finish statistics for image/interleave
+    /// typed image events and native finish statistics for native generation
     /// requests. `None` on the plain text path.
     #[serde(default)]
     pub native: Option<NativeOutputExt>,

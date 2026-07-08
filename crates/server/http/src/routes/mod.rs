@@ -212,7 +212,7 @@ fn build_router_with_options(
         .route("/v1/chat/completions", post(openai::chat_completions))
         // inference endpoints
         .route("/inference/v1/generate", post(inference::generate))
-        // UniServe native image / interleaved-generation surface (no OpenAI analog)
+        // UniServe native generation surface (no OpenAI analog)
         .route("/generate", post(native::generate))
         .route("/v1/images/generations", post(native::images_generations));
 
@@ -251,7 +251,7 @@ fn build_router_with_options(
         .layer(from_fn_with_state(state, middleware::track_server_load))
         .layer(from_fn(middleware::track_http_metrics))
         .layer(TraceLayer::new_for_http())
-        // Native image-understanding requests carry base64 photos in the body;
+        // Native image-context requests carry base64 photos in the body;
         // raise the default 2 MB cap so real images fit.
         .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
 

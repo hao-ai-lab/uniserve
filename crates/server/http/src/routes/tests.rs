@@ -29,7 +29,7 @@ use uniserve_engine_client::protocol::{
     EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest, StopReason,
 };
 use uniserve_engine_client::test_utils::spawn_mock_engine_task;
-use uniserve_engine_client::{EngineCoreClient, GenMode, MockEngine};
+use uniserve_engine_client::{EngineCoreClient, GenerationConstraint, MockEngine};
 use uniserve_llm::Llm;
 use uniserve_native_api::resolve_native_profile_for_model;
 use uniserve_observability::METRICS;
@@ -1800,12 +1800,12 @@ async fn happy_path_returns_sse_stream() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn chat_completions_streams_interleaved_image_deltas() {
+async fn chat_completions_streams_default_image_deltas() {
     let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
         boxed_test_future(async move {
             let request = mock.recv_request().await;
             let native = request.native.as_ref().expect("native request extension");
-            assert_eq!(native.mode, GenMode::AutoInterleave);
+            assert_eq!(native.constraint, GenerationConstraint::Default);
             assert_eq!(native.image.width, 2048);
             assert_eq!(native.image.height, 1152);
             assert_eq!(native.image.steps, 7);
@@ -1972,12 +1972,12 @@ async fn chat_completions_rejects_unsupported_image_config_output_type() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn chat_completions_routes_image_input_to_native_understanding() {
+async fn chat_completions_routes_image_input_to_native_und_only() {
     let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
         boxed_test_future(async move {
             let request = mock.recv_request().await;
             let native = request.native.as_ref().expect("native request extension");
-            assert_eq!(native.mode, GenMode::InterleaveUnd);
+            assert_eq!(native.constraint, GenerationConstraint::UndOnly);
             assert_eq!(native.mm_items.len(), 1);
             assert_eq!(native.mm_items[0].b64, "QUJD");
 
@@ -2042,7 +2042,7 @@ async fn chat_completions_maps_image_size_alias_to_profile_bucket() {
         boxed_test_future(async move {
             let request = mock.recv_request().await;
             let native = request.native.as_ref().expect("native request extension");
-            assert_eq!(native.mode, GenMode::Image);
+            assert_eq!(native.constraint, GenerationConstraint::GenOnly);
             assert_eq!(native.image.width, 2048);
             assert_eq!(native.image.height, 1152);
 

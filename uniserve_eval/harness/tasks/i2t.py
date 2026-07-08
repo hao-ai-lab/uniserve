@@ -6,13 +6,13 @@ from .base import BenchmarkTask, TaskRequest
 
 
 class I2TTask(BenchmarkTask):
-    """Image understanding (image → text), tri-wire.
+    """Image-to-text, tri-wire.
 
     ``spec.wire`` selects the request shape so the same dataset, arrival
     engine, and stream metrics compare backends over each system's public API:
 
-    * ``"native"`` — UniServe ``/generate`` SSE with ``mode:"understand"`` and
-      the image as ``input_image_b64``.
+    * ``"native"`` — UniServe ``/generate`` SSE with ``constraint:"und_only"``
+      and the image as ``input_image_b64``.
     * ``"openai_chat"`` — OpenAI chat completions SSE with the image as an
       ``image_url`` data-URI content part, streamed; measures true TTFT/ITL
       through the public chat endpoint.
@@ -54,7 +54,7 @@ class I2TTask(BenchmarkTask):
 
         payload = {
             "prompt": item["prompt"],
-            "mode": "understand",
+            "constraint": "und_only",
             "max_tokens": max_tokens,
             "temperature": self.spec.temperature,
             "input_image_b64": image_b64,

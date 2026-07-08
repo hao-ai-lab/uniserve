@@ -8,10 +8,9 @@ pub fn text_prompt(prompt: &str, model: &str) -> Value {
     })
 }
 
-pub fn native_interleave_prompt(prompt: &str) -> Value {
+pub fn native_default_prompt(prompt: &str) -> Value {
     json!({
         "prompt": prompt,
-        "mode": "interleave",
         "image": {
             "max_images": 1
         }
@@ -26,7 +25,7 @@ pub fn native_image_prompt(prompt: &str, width: Option<u32>, height: Option<u32>
     }
     json!({
         "prompt": prompt,
-        "mode": "image",
+        "constraint": "gen_only",
         "image": image
     })
 }
@@ -36,8 +35,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_payload_keeps_interleave_explicit() {
-        let payload = native_interleave_prompt("travel");
-        assert_eq!(payload["mode"], "interleave");
+    fn native_default_payload_omits_constraint() {
+        let payload = native_default_prompt("travel");
+        assert!(payload.get("constraint").is_none());
     }
 }

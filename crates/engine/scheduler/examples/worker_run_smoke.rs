@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{Command, EngineHandle, GenEvent, GenerateRequest};
 use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
@@ -28,7 +28,7 @@ fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<
         vec![1, 2, 3],
         SamplingParams::default(),
         ImageParams::default(),
-        GenMode::Text,
+        GenerationConstraint::UndOnly,
         16,
         tx,
     );

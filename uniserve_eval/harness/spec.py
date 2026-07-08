@@ -16,16 +16,16 @@ class TaskName(StrEnum):
     T2I = "t2i"
     I2I = "i2i"
     I2T = "i2t"
-    INTERLEAVE = "interleave"
+    DEFAULT = "default"
 
 
 # Streaming token metrics (Family A) vs image-speed metrics (Family B).
-STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.INTERLEAVE, TaskName.I2T})
+STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.DEFAULT, TaskName.I2T})
 IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 
 # Wire = request/response shape used to exercise one task over one endpoint.
 #
-# * "native"            -> UniServe /generate SSE (mode from the task)
+# * "native"            -> UniServe /generate SSE
 # * "openai_chat"       -> OpenAI chat completions SSE, streamed; per-chunk
 #                          timing (TTFT/ITL) and delta.images image counting
 # * "openai_chat_json"  -> OpenAI chat completions, one non-streamed JSON
@@ -39,7 +39,7 @@ TASK_WIRES = {
     TaskName.T2I: ("images_generations", "openai_chat_json"),
     TaskName.I2I: ("native",),
     TaskName.I2T: ("native", "openai_chat", "openai_chat_json"),
-    TaskName.INTERLEAVE: ("native", "openai_chat"),
+    TaskName.DEFAULT: ("native", "openai_chat"),
 }
 
 WIRE_ENDPOINTS = {
@@ -57,7 +57,7 @@ DEFAULT_DATASETS = {
     TaskName.T2I: "mjhq",
     TaskName.I2I: "pie-bench",
     TaskName.I2T: "synthetic-images",
-    TaskName.INTERLEAVE: "ueval",
+    TaskName.DEFAULT: "ueval",
 }
 
 
@@ -87,7 +87,6 @@ class BenchmarkSpec:
     height: int | None = None
     steps: int | None = None
     max_images: int | None = None
-    i2i_mode: str = "image"
 
     # Request/response shape for this task; see TASK_WIRES. Empty selects the
     # task's first (default) wire.

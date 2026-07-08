@@ -536,14 +536,14 @@ class GenState:
 
     ``paged_branches`` (when set) holds scratch-paged CFG branch prefixes and
     their batched-row cache memo. ``None`` keeps the per-branch eager segment
-    path (understanding-interleave, no scratch pool, or an ineligible attention
+    path (context-image feedback, no scratch pool, or an ineligible attention
     backend).
     """
 
     __slots__ = ("x_t", "vae_pos_ids", "num_vae", "H", "W", "schedule",
                  "cfg_cache", "cfg_pos", "cfg_text_scale", "cfg_img_scale",
                  "cfg_renorm_type", "cfg_renorm_min", "cfg_interval", "cond_pos",
-                 "understanding", "cond_branch_kvlen", "text_branch_pos", "text_branch_kvlen",
+                 "uses_context_image_feedback", "cond_branch_kvlen", "text_branch_pos", "text_branch_kvlen",
                  "cfg_img_cache", "cfg_img_pos",
                  "paged_branches")
 
@@ -995,7 +995,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         rec = self._record(r)
         rec["dims"] = image_hw
         if op["kind"] == "vit_encode":
-            rec["understanding_interleave"] = True
+            rec["context_image_feedback"] = True
             rec["text_branch_kvlen"] = new_len
             rec["text_branch_pos"] = rope + 1
         handle = self._encoder_handle(op.get("mm_hash"))
@@ -1083,8 +1083,8 @@ class BagelForUnifiedGeneration(UniModelBase):
         gs.cfg_renorm_type = str(params.cfg_norm)
         gs.cfg_renorm_min = float(params.cfg_renorm_min)
         gs.cfg_interval = tuple(params.cfg_interval)
-        gs.understanding = bool(rec.get("understanding_interleave"))
-        if gs.understanding:
+        gs.uses_context_image_feedback = bool(rec.get("context_image_feedback"))
+        if gs.uses_context_image_feedback:
             gs.cond_branch_kvlen = int(self._length(op["req_id"]) or gs.cond_pos)
             gs.text_branch_pos = int(rec["text_branch_pos"])
             gs.text_branch_kvlen = int(rec["text_branch_kvlen"])
@@ -1126,12 +1126,12 @@ class BagelForUnifiedGeneration(UniModelBase):
         trivial-tower path. The neg-prompt (text-uncond) branch prefills
         directly into scratch through the shared paged und-stack forward.
 
-        Any ineligibility (no scratch pool, understanding-interleave branches,
+        Any ineligibility (no scratch pool, context-image feedback branches,
         quantized KV store, a backend without paged attention, or scratch
         exhaustion) leaves ``gs.paged_branches`` ``None`` and the eager
         per-branch segment path fully authoritative.
         """
-        if self.scratch_pool is None or gs.understanding:
+        if self.scratch_pool is None or gs.uses_context_image_feedback:
             return
         allocate_blocks = self.residency.allocator_for_pool(self.scratch_pool)
         if not callable(allocate_blocks):
@@ -1246,7 +1246,7 @@ class BagelForUnifiedGeneration(UniModelBase):
 
         The denoise driver prefers this over per-branch ``predict_velocity``
         calls. Steps whose branches are not fully staged in scratch-paged
-        caches (understanding-interleave, or no scratch/backend support) run
+        caches (context-image feedback, or no scratch/backend support) run
         the per-branch path with its exact existing semantics.
         """
         self._ensure_loaded()
@@ -1313,7 +1313,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             cache = self.pool.view(self._state(step.req_id).block_ids, gs.cond_branch_kvlen)
             position = gs.cond_pos
         elif branch == "text_uncond":
-            if gs.understanding:
+            if gs.uses_context_image_feedback:
                 cache = self.pool.view(self._state(step.req_id).block_ids, gs.text_branch_kvlen)
                 position = gs.text_branch_pos
             else:
@@ -1372,7 +1372,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             return {"req_id": r}
         self._extend_blocks(op)
         img = m.vae_decode(gs.x_t, gs.H, gs.W)
-        if gs.understanding:
+        if gs.uses_context_image_feedback:
             base = self._length(r) or gs.cond_branch_kvlen
             rope = gs.cond_pos
             pre = self.image_processor.resize_for_vae(img)

@@ -3,7 +3,7 @@
 //! through the scheduler, and exercise correlated control fan-out.
 use std::collections::HashMap;
 
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{GenEvent, GenerateRequest};
 use uniserve_executor::{ControlOp, Executor};
 use uniserve_scheduler::{ControlTokens, Scheduler};
@@ -55,9 +55,9 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             if id == 3 {
-                GenMode::Image
+                GenerationConstraint::GenOnly
             } else {
-                GenMode::Text
+                GenerationConstraint::UndOnly
             },
             20,
             tx,

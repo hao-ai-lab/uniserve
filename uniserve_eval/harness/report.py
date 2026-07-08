@@ -132,7 +132,7 @@ def _stream_markdown(metrics: dict[str, Any]) -> list[str]:
         img = metrics["images"]["image_latency_ms"]
         lines += [
             "",
-            f"- interleave images: {metrics['images']['total_images']} total, "
+            f"- default-task images: {metrics['images']['total_images']} total, "
             f"{_fmt(metrics['images']['images_per_second'])} img/s, "
             f"image E2E p50/p99 = {_fmt(img['p50'])}/{_fmt(img['p99'])} ms",
         ]

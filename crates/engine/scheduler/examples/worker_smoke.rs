@@ -2,7 +2,7 @@
 //! and drive a few requests through the scheduler over the shared-memory ring.
 use std::collections::HashMap;
 
-use uniserve_core::{GenMode, ImageParams, RequestId, SamplingParams};
+use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
 use uniserve_engine_api::{GenEvent, GenerateRequest};
 use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
@@ -42,7 +42,7 @@ fn main() -> anyhow::Result<()> {
     // we drive step directly here instead of the run thread
     let mut reqs = Vec::new();
     let mk = |id: u64,
-              mode: GenMode,
+              constraint: GenerationConstraint,
               kind: &'static str,
               rxs: &mut HashMap<RequestId, (&'static str, _)>| {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -57,14 +57,14 @@ fn main() -> anyhow::Result<()> {
                 width: 128,
                 ..Default::default()
             },
-            mode,
+            constraint,
             20,
             tx,
         )
     };
-    reqs.push(mk(1, GenMode::Text, "text", &mut rxs));
-    reqs.push(mk(2, GenMode::Text, "text", &mut rxs));
-    reqs.push(mk(3, GenMode::Image, "image", &mut rxs));
+    reqs.push(mk(1, GenerationConstraint::UndOnly, "text", &mut rxs));
+    reqs.push(mk(2, GenerationConstraint::UndOnly, "text", &mut rxs));
+    reqs.push(mk(3, GenerationConstraint::GenOnly, "image", &mut rxs));
     for r in reqs {
         sched.submit_for_test(r);
     }

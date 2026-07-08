@@ -5,8 +5,6 @@ use std::env;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use uniserve_core::GenMode;
-
 use crate::scheduler::{MAX_SPEC_DECODE_POS_STATS, ReqState, SchedStats};
 
 const SPEC_NGRAM_MAX_TOKENS_ENV: &str = "UNISERVE_SPEC_NGRAM_MAX_TOKENS";
@@ -95,7 +93,7 @@ impl SpecDecodeAccounting {
         // penalties, logit bias, and static allowed-token masks. Keep drafts off
         // for controls whose legal set can change inside the drafted prefix or
         // whose per-token response semantics are not yet represented.
-        st.req.mode == GenMode::Text
+        st.req.is_plain_und()
             && st.grammar.is_none()
             && st.n_generated >= sp.min_tokens
             && sp.n_logprobs == 0

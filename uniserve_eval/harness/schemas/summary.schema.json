@@ -15,7 +15,7 @@
   ],
   "properties": {
     "harness_status": {"type": "string"},
-    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "interleave"]},
+    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "i2t", "default"]},
     "dataset": {"type": "string"},
     "endpoint": {"type": "string"},
     "model": {"type": "string"},

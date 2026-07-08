@@ -1,12 +1,12 @@
 use uniserve_engine_client::{
-    EngineSamplingParams, GenMode, ImageParams, MmItem, NativeGenerateRequest,
+    EngineSamplingParams, GenerationConstraint, ImageParams, MmItem, NativeGenerateRequest,
 };
 use uniserve_text::tokenizer::DynTokenizer;
 
 use super::defaults;
-use super::profiles::NativeModelProfile;
+use super::profiles::{NativeModelProfile, NativePromptKind};
 use super::resolution::resolve_resolution;
-use super::schema::NativeGenerateBody;
+use super::schema::{NativeGenerateBody, NativeInputImage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildError {
@@ -25,24 +25,23 @@ impl BuildError {
     }
 }
 
-/// CFG and resolution constants for understanding (InterleaveUnd) mode.
-
-/// Understanding mode uses a fixed, model-agnostic visual-reasoning configuration
-/// that intentionally differs from the per-profile image-generation defaults
-/// (`NativeModelProfile::image_defaults`). Naming them here keeps the values
-/// discoverable and prevents silent drift between call sites.
-mod understanding_defaults {
-    /// Text-guidance CFG scale for understanding-mode visual reasoning.
+/// CFG and resolution constants for text output with image context.
+///
+/// Context-image requests use a fixed, model-agnostic visual-reasoning
+/// configuration that intentionally differs from the per-profile image
+/// generation defaults (`NativeModelProfile::image_defaults`).
+mod context_image_defaults {
+    /// Text-guidance CFG scale for visual reasoning.
     pub(super) const CFG_TEXT_SCALE: f32 = 4.0;
-    /// Image-guidance CFG scale for understanding-mode visual reasoning.
+    /// Image-guidance CFG scale for visual reasoning.
     pub(super) const CFG_IMG_SCALE: f32 = 2.0;
-    /// CFG renorm strategy for understanding-mode visual reasoning.
+    /// CFG renorm strategy for visual reasoning.
     pub(super) const CFG_RENORM_TYPE: &str = "text_channel";
-    /// CFG renorm floor for understanding-mode visual reasoning.
+    /// CFG renorm floor for visual reasoning.
     pub(super) const CFG_RENORM_MIN: f32 = 0.0;
-    /// CFG interval (lo, hi) for understanding-mode visual reasoning.
+    /// CFG interval (lo, hi) for visual reasoning.
     pub(super) const CFG_INTERVAL: (f32, f32) = (0.0, 1.0);
-    /// Square latent resolution used for understanding-mode thinking images.
+    /// Square latent resolution used for visual reasoning images.
     pub(super) const RESOLUTION: u32 = 512;
 }
 
@@ -57,63 +56,60 @@ impl<'a> NativeRequestBuilder<'a> {
     }
 
     pub fn build(&self, body: &NativeGenerateBody) -> Result<NativeGenerateRequest, BuildError> {
-        let mode_name = body
-            .mode
-            .as_deref()
-            .unwrap_or(self.profile.default_mode_name());
-        let mode = parse_mode(mode_name)?;
-        validate_prompt(body, mode)?;
-        if !self.profile.supports_mode(mode) {
+        let constraint = body.constraint.unwrap_or_default();
+        let input_images = body.input_images();
+        let path = RequestPath::new(constraint, !input_images.is_empty());
+        validate_prompt(body)?;
+        if !self.profile.supports_constraint(constraint) {
             return Err(BuildError::new(format!(
-                "mode {} is not supported by this model profile",
-                mode_name
+                "constraint {} is not supported by this model profile",
+                constraint.as_str()
             )));
         }
-        if mode == GenMode::InterleaveUnd {
-            return self.build_understanding(body);
+        if path.uses_feedback_ingest() {
+            return self.build_und_with_images(body, constraint, &input_images);
         }
 
-        let image = self.resolve_image_params(body, mode)?;
+        let image = self.resolve_image_params(body, constraint)?;
         let negative_prompt = body.negative_prompt();
-        let prompt_ids = self.profile.build_prompt_ids(&self.tokenizer, body, mode);
+        let (prompt_ids, mm_items) = self.build_context_prompt(body, path.prompt, &input_images)?;
         let neg_prompt_ids = self
             .profile
             .build_negative_prompt_ids(&self.tokenizer, &negative_prompt);
-        let sampling = self.resolve_sampling(body, mode)?;
+        let sampling = self.resolve_sampling(body, constraint)?;
 
         Ok(NativeGenerateRequest {
             prompt_ids,
             neg_prompt_ids,
             sampling,
             image,
-            mode,
+            constraint,
             max_tokens: body.max_tokens.unwrap_or(defaults::DEFAULT_MAX_TOKENS),
-            mm_items: Vec::new(),
+            mm_items,
             stop_token_ids: body.stop_token_ids.clone(),
         })
     }
 
-    fn build_understanding(
+    fn build_und_with_images(
         &self,
         body: &NativeGenerateBody,
+        constraint: GenerationConstraint,
+        input_images: &[NativeInputImage],
     ) -> Result<NativeGenerateRequest, BuildError> {
-        if self.profile.understanding_markers_in_prompt() {
-            return self.build_understanding_marked(body);
+        if self.profile.context_markers_in_prompt() {
+            return self.build_und_with_marked_images(body, constraint, input_images);
         }
-        let input_images = body.input_images();
-        let first_image = input_images
-            .first()
-            .ok_or_else(|| BuildError::new("understand mode requires an input image"))?;
+        let first_image = input_images.first().ok_or_else(|| {
+            BuildError::new("und_only requests with context images require image data")
+        })?;
         let system = body
             .system_prompt
             .as_deref()
-            .unwrap_or_else(|| self.profile.understanding_system_prompt());
-        let mut sys_ids = self
-            .profile
-            .wrap_understanding_text(&self.tokenizer, system);
+            .unwrap_or_else(|| self.profile.context_system_prompt());
+        let mut sys_ids = self.profile.wrap_context_text(&self.tokenizer, system);
         let question_ids = self
             .profile
-            .wrap_understanding_text(&self.tokenizer, &body.prompt);
+            .wrap_context_text(&self.tokenizer, &body.prompt);
         let image_position = first_image.position.unwrap_or(sys_ids.len() as u32);
         sys_ids.extend_from_slice(&question_ids);
 
@@ -128,16 +124,16 @@ impl<'a> NativeRequestBuilder<'a> {
 
         let image = ImageParams {
             steps,
-            cfg_text_scale: understanding_defaults::CFG_TEXT_SCALE,
-            cfg_img_scale: understanding_defaults::CFG_IMG_SCALE,
-            cfg_renorm_type: understanding_defaults::CFG_RENORM_TYPE.into(),
-            cfg_renorm_min: understanding_defaults::CFG_RENORM_MIN,
-            cfg_interval: understanding_defaults::CFG_INTERVAL,
+            cfg_text_scale: context_image_defaults::CFG_TEXT_SCALE,
+            cfg_img_scale: context_image_defaults::CFG_IMG_SCALE,
+            cfg_renorm_type: context_image_defaults::CFG_RENORM_TYPE.into(),
+            cfg_renorm_min: context_image_defaults::CFG_RENORM_MIN,
+            cfg_interval: context_image_defaults::CFG_INTERVAL,
             timestep_shift: image_body
                 .timestep_shift
                 .unwrap_or(self.profile.image_defaults.timestep_shift),
-            height: understanding_defaults::RESOLUTION,
-            width: understanding_defaults::RESOLUTION,
+            height: context_image_defaults::RESOLUTION,
+            width: context_image_defaults::RESOLUTION,
             seed,
             negative_prompt: String::new(),
             max_images,
@@ -147,9 +143,9 @@ impl<'a> NativeRequestBuilder<'a> {
         Ok(NativeGenerateRequest {
             neg_prompt_ids: sys_ids.clone(),
             prompt_ids: sys_ids,
-            sampling: self.resolve_sampling(body, GenMode::InterleaveUnd)?,
+            sampling: self.resolve_sampling(body, constraint)?,
             image,
-            mode: GenMode::InterleaveUnd,
+            constraint,
             max_tokens: body.max_tokens.unwrap_or(defaults::DEFAULT_MAX_TOKENS),
             mm_items: vec![MmItem {
                 hash: fnv1a(first_image.b64.as_bytes()),
@@ -161,86 +157,89 @@ impl<'a> NativeRequestBuilder<'a> {
         })
     }
 
-    /// Understanding build for marker-in-prompt profiles: the image begin/end
-    /// markers are ordinary prompt tokens rendered through the profile's
-    /// `understand` recipe; each image's encode op fills the gap between its
-    /// markers at one shared temporal RoPE index. Image-generation parameters
-    /// resolve exactly like the other modes (profile defaults + user
-    /// overrides), so a model that decides to answer with an image uses its
-    /// normal generation policy.
-    fn build_understanding_marked(
+    fn build_und_with_marked_images(
         &self,
         body: &NativeGenerateBody,
+        constraint: GenerationConstraint,
+        input_images: &[NativeInputImage],
     ) -> Result<NativeGenerateRequest, BuildError> {
-        let input_images = body.input_images();
         if input_images.is_empty() {
-            return Err(BuildError::new("understand mode requires an input image"));
-        }
-        let controls = &self.profile.controls;
-        if controls.start_of_image_text.is_empty() || controls.end_of_image_text.is_empty() {
             return Err(BuildError::new(
-                "model profile declares no image marker tokens for understanding inputs",
+                "und_only requests with context images require image data",
             ));
         }
-        let mut user_text = String::new();
-        if input_images.len() == 1 {
-            user_text.push_str(&controls.start_of_image_text);
-            user_text.push_str(&controls.end_of_image_text);
-            user_text.push('\n');
-        } else {
-            for index in 0..input_images.len() {
-                user_text.push_str(&format!(
-                    "Image-{}:{}{}\n",
-                    index + 1,
-                    controls.start_of_image_text,
-                    controls.end_of_image_text
-                ));
-            }
-        }
-        user_text.push_str(&body.prompt);
-        let prompt_ids =
-            self.profile
-                .build_understanding_prompt_ids(&self.tokenizer, body, &user_text);
-        // The markers precede any user text, so the first N occurrences of the
-        // end marker are ours; each image's patch block replaces the gap ahead
-        // of its end marker.
-        let end_id = controls.end_of_image;
-        let mut marker_positions = prompt_ids
-            .iter()
-            .enumerate()
-            .filter(|&(_, &token)| token == end_id)
-            .map(|(index, _)| index as u32);
-        let mut mm_items = Vec::with_capacity(input_images.len());
-        for image in &input_images {
-            let position = marker_positions.next().ok_or_else(|| {
-                BuildError::new("understanding prompt lost its input-image markers")
-            })?;
-            mm_items.push(MmItem {
-                hash: fnv1a(image.b64.as_bytes()),
-                position,
-                num_tokens: image.num_tokens.unwrap_or(0),
-                b64: image.b64.clone(),
-            });
-        }
+        let (prompt_ids, mm_items) =
+            self.build_context_prompt(body, NativePromptKind::UndWithImages, input_images)?;
         let negative_prompt = body.negative_prompt();
         Ok(NativeGenerateRequest {
             neg_prompt_ids: self
                 .profile
                 .build_negative_prompt_ids(&self.tokenizer, &negative_prompt),
             prompt_ids,
-            sampling: self.resolve_sampling(body, GenMode::InterleaveUnd)?,
-            image: self.resolve_image_params(body, GenMode::InterleaveUnd)?,
-            mode: GenMode::InterleaveUnd,
+            sampling: self.resolve_sampling(body, constraint)?,
+            image: self.resolve_image_params(body, constraint)?,
+            constraint,
             max_tokens: body.max_tokens.unwrap_or(defaults::DEFAULT_MAX_TOKENS),
             mm_items,
             stop_token_ids: body.stop_token_ids.clone(),
         })
     }
 
+    fn build_context_prompt(
+        &self,
+        body: &NativeGenerateBody,
+        kind: NativePromptKind,
+        input_images: &[NativeInputImage],
+    ) -> Result<(Vec<u32>, Vec<MmItem>), BuildError> {
+        if input_images.is_empty() {
+            return Ok((
+                self.profile.build_prompt_ids(&self.tokenizer, body, kind),
+                Vec::new(),
+            ));
+        }
+        let controls = &self.profile.controls;
+        if self.profile.context_markers_in_prompt() {
+            if controls.start_of_image_text.is_empty() || controls.end_of_image_text.is_empty() {
+                return Err(BuildError::new(
+                    "model profile declares no image marker tokens for context images",
+                ));
+            }
+            let user_text = prompt_with_image_markers(
+                &body.prompt,
+                input_images.len(),
+                &controls.start_of_image_text,
+                &controls.end_of_image_text,
+            );
+            let prompt_ids =
+                self.profile
+                    .build_prompt_ids_with_text(&self.tokenizer, body, kind, &user_text);
+            let mut marker_positions = prompt_ids
+                .iter()
+                .enumerate()
+                .filter(|&(_, &token)| token == controls.end_of_image)
+                .map(|(index, _)| index as u32);
+            let mut mm_items = Vec::with_capacity(input_images.len());
+            for image in input_images {
+                let position = marker_positions.next().ok_or_else(|| {
+                    BuildError::new("context image prompt lost its image markers")
+                })?;
+                mm_items.push(mm_item(image, position));
+            }
+            return Ok((prompt_ids, mm_items));
+        }
+        let prompt_ids = self.profile.build_prompt_ids(&self.tokenizer, body, kind);
+        let fallback_position = prompt_ids.len() as u32;
+        let mm_items = input_images
+            .iter()
+            .map(|image| mm_item(image, image.position.unwrap_or(fallback_position)))
+            .collect();
+        Ok((prompt_ids, mm_items))
+    }
+
     fn resolve_image_params(
         &self,
         body: &NativeGenerateBody,
-        mode: GenMode,
+        constraint: GenerationConstraint,
     ) -> Result<ImageParams, BuildError> {
         let image_body = body.image();
         let defaults = &self.profile.image_defaults;
@@ -296,18 +295,16 @@ impl<'a> NativeRequestBuilder<'a> {
             negative_prompt,
             max_images,
             image_prompts: image_body.prompts,
-            // Pure image mode ends at the commit: writing the finished image
-            // back into the text KV (a full image-length forward, twice with a
-            // CFG cache) feeds nothing. Retention stays the default wherever a
-            // decode can consume it; explicit client values are always honored.
-            retain_images: image_body.retain_images.unwrap_or(mode != GenMode::Image),
+            retain_images: image_body
+                .retain_images
+                .unwrap_or(constraint != GenerationConstraint::GenOnly),
         })
     }
 
     fn resolve_sampling(
         &self,
         body: &NativeGenerateBody,
-        mode: GenMode,
+        constraint: GenerationConstraint,
     ) -> Result<EngineSamplingParams, BuildError> {
         let temperature = finite_or(
             body.temperature.unwrap_or(defaults::DEFAULT_TEMPERATURE),
@@ -321,7 +318,7 @@ impl<'a> NativeRequestBuilder<'a> {
             return Err(BuildError::new("top_p must be in (0, 1]"));
         }
         let image_bias = body.image_bias.unwrap_or(0.0);
-        let logit_bias = if mode == GenMode::AutoInterleave
+        let logit_bias = if constraint == GenerationConstraint::Default
             && image_bias != 0.0
             && self.profile.controls.start_of_image != 0
         {
@@ -353,29 +350,78 @@ impl<'a> NativeRequestBuilder<'a> {
     }
 }
 
-pub fn parse_mode(value: &str) -> Result<GenMode, BuildError> {
-    match value {
-        "text" => Ok(GenMode::Text),
-        "image" => Ok(GenMode::Image),
-        "auto" | "auto_interleave" | "interleave" => Ok(GenMode::AutoInterleave),
-        "understand" | "interleave_und" | "understanding" => Ok(GenMode::InterleaveUnd),
-        other => Err(BuildError::new(format!("unsupported mode: {other}"))),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestPath {
+    prompt: NativePromptKind,
+    feedback_ingest: bool,
+}
+
+impl RequestPath {
+    fn new(constraint: GenerationConstraint, has_input_images: bool) -> Self {
+        match (constraint, has_input_images) {
+            (GenerationConstraint::Default, _) => Self {
+                prompt: NativePromptKind::Default,
+                feedback_ingest: false,
+            },
+            (GenerationConstraint::UndOnly, true) => Self {
+                prompt: NativePromptKind::UndWithImages,
+                feedback_ingest: true,
+            },
+            (GenerationConstraint::UndOnly, false) => Self {
+                prompt: NativePromptKind::Und,
+                feedback_ingest: false,
+            },
+            (GenerationConstraint::GenOnly, _) => Self {
+                prompt: NativePromptKind::Gen,
+                feedback_ingest: false,
+            },
+        }
+    }
+
+    fn uses_feedback_ingest(self) -> bool {
+        self.feedback_ingest
     }
 }
 
-fn validate_prompt(body: &NativeGenerateBody, mode: GenMode) -> Result<(), BuildError> {
+fn validate_prompt(body: &NativeGenerateBody) -> Result<(), BuildError> {
     if body.prompt.trim().is_empty() {
-        return Err(BuildError::new(format!(
-            "{} mode requires a non-empty prompt",
-            match mode {
-                GenMode::Text => "text",
-                GenMode::Image => "image",
-                GenMode::AutoInterleave => "interleave",
-                GenMode::InterleaveUnd => "understand",
-            }
-        )));
+        return Err(BuildError::new("generation requires a non-empty prompt"));
     }
     Ok(())
+}
+
+fn prompt_with_image_markers(
+    prompt: &str,
+    image_count: usize,
+    start_marker: &str,
+    end_marker: &str,
+) -> String {
+    let mut user_text = String::new();
+    if image_count == 1 {
+        user_text.push_str(start_marker);
+        user_text.push_str(end_marker);
+        user_text.push('\n');
+    } else {
+        for index in 0..image_count {
+            user_text.push_str(&format!(
+                "Image-{}:{}{}\n",
+                index + 1,
+                start_marker,
+                end_marker
+            ));
+        }
+    }
+    user_text.push_str(prompt);
+    user_text
+}
+
+fn mm_item(image: &NativeInputImage, position: u32) -> MmItem {
+    MmItem {
+        hash: fnv1a(image.b64.as_bytes()),
+        position,
+        num_tokens: image.num_tokens.unwrap_or(0),
+        b64: image.b64.clone(),
+    }
 }
 
 fn validate_cfg_interval(value: (f32, f32)) -> Result<(), BuildError> {
@@ -480,7 +526,7 @@ mod tests {
         let request = NativeRequestBuilder::new(tok, &profile)
             .build(&body)
             .unwrap();
-        assert_eq!(request.mode, GenMode::AutoInterleave);
+        assert_eq!(request.constraint, GenerationConstraint::Default);
         assert_eq!(request.image.width, 2048);
         assert_eq!(request.image.height, 1152);
         assert_eq!(request.image.steps, 50);
@@ -492,22 +538,30 @@ mod tests {
         assert!(request.image.retain_images);
         assert!(request.image.image_prompts.is_empty());
         assert_eq!(request.max_tokens, 32768);
+        let rendered = request
+            .prompt_ids
+            .iter()
+            .filter_map(|id| u8::try_from(*id).ok())
+            .map(char::from)
+            .collect::<String>();
+        assert!(rendered.contains("MUST interleave text with generated images"));
+        assert!(!rendered.contains("MAY place generated images"));
     }
 
     #[test]
-    fn sensenova_understand_builds_marked_mm_items() {
+    fn sensenova_context_images_build_marked_mm_items() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "Describe this image in detail.".into(),
-            mode: Some("understand".into()),
+            constraint: Some(GenerationConstraint::UndOnly),
             input_image_b64: Some("aGVsbG8=".into()),
             ..Default::default()
         };
         let request = NativeRequestBuilder::new(tok, &profile)
             .build(&body)
             .unwrap();
-        assert_eq!(request.mode, GenMode::InterleaveUnd);
+        assert_eq!(request.constraint, GenerationConstraint::UndOnly);
         assert_eq!(request.mm_items.len(), 1);
         let position = request.mm_items[0].position as usize;
         // The encode gap sits exactly between the in-prompt markers.
@@ -520,20 +574,20 @@ mod tests {
             151670,
             "preceded by <img>"
         );
-        // No CFG branch for plain understanding: negative ids stay empty.
+        // No CFG branch is needed for a text-only answer.
         assert!(request.neg_prompt_ids.is_empty());
-        // Understanding image params resolve like the other modes (profile bucket).
+        // Context-image requests still use the profile resolution bucket.
         assert_eq!(request.image.width, 2048);
         assert_eq!(request.image.height, 1152);
     }
 
     #[test]
-    fn sensenova_understand_multi_image_positions_are_ordered() {
+    fn sensenova_und_only_multi_image_positions_are_ordered() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "Compare the two images.".into(),
-            mode: Some("understand".into()),
+            constraint: Some(GenerationConstraint::UndOnly),
             input_images: vec![
                 super::super::schema::NativeInputImage {
                     b64: "aQ==".into(),
@@ -566,7 +620,7 @@ mod tests {
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
-            mode: Some("image".into()),
+            constraint: Some(GenerationConstraint::GenOnly),
             image: Some(super::super::schema::NativeImageBody {
                 resolution: Some("preview".into()),
                 ..Default::default()
@@ -586,7 +640,7 @@ mod tests {
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
-            mode: Some("image".into()),
+            constraint: Some(GenerationConstraint::GenOnly),
             image: Some(super::super::schema::NativeImageBody {
                 resolution: Some("1:1".into()),
                 steps: Some(12),
@@ -605,19 +659,17 @@ mod tests {
         assert_eq!(request.image.cfg_text_scale, 3.0);
         assert_eq!(request.image.max_images, 2);
         assert_eq!(request.image.seed, Some(7));
-        // Pure image mode ends at the commit, so KV retention defaults off
-        // (nothing decodes after it); an explicit client value still wins.
         assert!(!request.image.retain_images);
         assert!(request.image.image_prompts.is_empty());
     }
 
     #[test]
-    fn image_mode_respects_explicit_retain_images() {
+    fn gen_only_respects_explicit_retain_images() {
         let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
-            mode: Some("image".into()),
+            constraint: Some(GenerationConstraint::GenOnly),
             image: Some(super::super::schema::NativeImageBody {
                 retain_images: Some(true),
                 ..Default::default()
@@ -636,7 +688,6 @@ mod tests {
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "Generate a travel guide".into(),
-            mode: Some("interleave".into()),
             image: Some(super::super::schema::NativeImageBody {
                 prompts: vec!["custom visual prompt".into()],
                 ..Default::default()
@@ -656,7 +707,7 @@ mod tests {
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
-            mode: Some("image".into()),
+            constraint: Some(GenerationConstraint::GenOnly),
             image: Some(super::super::schema::NativeImageBody {
                 cfg_interval: Some([0.8, 0.2]),
                 ..Default::default()
@@ -676,7 +727,7 @@ mod tests {
         let profile = resolve_native_profile_for_model("sensenova-u1", &*tok);
         let body = NativeGenerateBody {
             prompt: "paint".into(),
-            mode: Some("image".into()),
+            constraint: Some(GenerationConstraint::GenOnly),
             image: Some(super::super::schema::NativeImageBody {
                 cfg_interval: Some([-1.0, 2.0]),
                 ..Default::default()

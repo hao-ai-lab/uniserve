@@ -2,6 +2,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 pub(crate) mod bench_trace;
+pub mod generation;
 pub mod grammar;
 pub mod logits;
 pub mod policy;
@@ -21,12 +22,9 @@ pub use resources::{LedgerStats, ResourceLedger};
 pub use scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
-    HealthSnapshot,
-    MAX_SPEC_DECODE_POS_STATS, SchedStats, Scheduler, SchedulerConfig, SchedulingPolicy,
+    HealthSnapshot, MAX_SPEC_DECODE_POS_STATS, SchedStats, Scheduler, SchedulerConfig,
+    SchedulingPolicy,
 };
 pub use stats_report::SchedStatsReporter;
 pub use trace::{RequestTrace, TraceEvent, TraceEventKind};
 pub use uniserve_executor::{ControlAck, ControlOp, Executor};
-pub use uniserve_program::{
-    InferenceProgram, LatencyClass, OpState, ProgramOp, ProgramOpKind, Recurrence,
-};

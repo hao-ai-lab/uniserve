@@ -5,10 +5,10 @@ from typing import Any
 from .base import BenchmarkTask, TaskRequest
 
 
-class InterleaveTask(BenchmarkTask):
-    """Interleaved text+image generation, dual-wire.
+class DefaultTask(BenchmarkTask):
+    """Default text+image generation, dual-wire.
 
-    * ``"native"`` — UniServe ``/generate`` SSE with ``mode:"interleave"``.
+    * ``"native"`` — UniServe ``/generate`` SSE with the default generation constraint.
     * ``"openai_chat"`` — OpenAI chat completions SSE with
       ``modalities: ["text", "image"]`` and ``image_config`` (the official
       LightLLM V2 chat shape); text arrives as ``delta.content`` and
@@ -54,7 +54,7 @@ class InterleaveTask(BenchmarkTask):
 
         payload = {
             "prompt": item["prompt"],
-            "mode": "interleave",
+            "constraint": "default",
             "max_tokens": int(max_tokens),
             "temperature": self.spec.temperature,
             "image": image,

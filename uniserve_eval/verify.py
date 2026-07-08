@@ -3,7 +3,7 @@
 POSTs the workload's declared ``payload`` to ``/generate`` and validates the
 event stream: exact image counts / pixel sizes / per-image step counts, text
 token floors, clean termination, and zero ``error`` events. For
-understanding-mode inputs, ``input_image_synthetic`` renders a deterministic
+image-to-text inputs, ``input_image_synthetic`` renders a deterministic
 geometric scene and injects it as ``input_image_b64`` so i2t gates run
 hermetically.
 """

@@ -153,7 +153,7 @@ _DENOISE_RESIDUAL_RESCALE_COEFFS = (
     7.61309272e-01,
 )
 MAX_CFG_BRANCHES = 3
-INTERLEAVE_T_EPS = 0.02
+GENERATION_T_EPS = 0.02
 
 # Resolution-aware modes apply sqrt sequence-length scaling; the others leave the
 # base noise scale unchanged. Unknown string modes are treated like fixed scale.
@@ -2145,7 +2145,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.tokenizer = tokenizer
         self.device = str(device)
         if self.config is not None and hasattr(self.config, "t_eps"):
-            self.config.t_eps = INTERLEAVE_T_EPS
+            self.config.t_eps = GENERATION_T_EPS
         # Tower device profile: when set ("und"/"gen"), only this tower's modules
         # were materialized by the loader; the other tower's params stay on
         # ``meta`` (no memory, never read by this worker's ops).
