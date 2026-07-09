@@ -7,13 +7,13 @@ from typing import Any
 
 import torch
 
-from ..contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
-from ..contracts.forward_mode import ForwardMode
-from ..foundation.errors import invalid_descriptor
-from ..foundation.sizing import ceil_div
-from ..runtime.kv_pool import PagedKVPool
-from ..runtime.paged_text_cache import BatchedPagedRequestCache
-from .cuda_graph_base import (
+from ....contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
+from ....contracts.forward_mode import ForwardMode
+from ....foundation.errors import invalid_descriptor
+from ....foundation.sizing import ceil_div
+from ....runtime.kv_pool import PagedKVPool
+from ....runtime.paged_text_cache import BatchedPagedRequestCache
+from .base import (
     _DEFAULT_METRIC_PREFIX,
     _DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
     GraphEvent,
@@ -884,7 +884,7 @@ def _resolve_graph_prefill_backend(ctx: Any) -> Any:
     if backend is not None:
         return backend
     try:
-        from ..backends.attention import (
+        from ....backends.attention import (
             get_attention_backend,
             has_attention_backend,
             normalize_attention_backend_name,

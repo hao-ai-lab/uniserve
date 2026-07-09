@@ -12,7 +12,7 @@ from uniserve_worker.backends.attention import get_attention_backend, has_attent
 from uniserve_worker.backends.attention.fa4_cute import _PREFIX_BOUNDS_CACHE, _cached_prefix_bounds
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.execution.forward_stream import ForwardPagedKVSegment, ForwardPagedKVView
+from uniserve_worker.execution.forward.stream import ForwardPagedKVSegment, ForwardPagedKVView
 from uniserve_worker.models.sensenova import model as sensenova_u1
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 
@@ -440,7 +440,7 @@ def test_sensenova_packed_visible_path_uses_real_fa4_and_matches_dense() -> None
         attention_mask={"full_attention": dense_mask},
     ).last_hidden_state.squeeze(0)
 
-    from uniserve_worker.execution.forward_stream import ForwardStreamBuilder
+    from uniserve_worker.execution.forward.stream import ForwardStreamBuilder
 
     builder = ForwardStreamBuilder()
     builder.add_segment(

@@ -10,42 +10,54 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from ..contracts.batches import UniForwardBatch
-from ..contracts.forward_context import get_forward_context
-from ..contracts.forward_mode import ForwardMode
-from ..contracts.outputs import TextTokenOutput
-from ..foundation.env import env_flag
-from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.profiling import profile_range
-from ..nn.diffusion.cfg import Branch, CfgPlan
-from ..nn.sampler import (
+from ....contracts.batches import UniForwardBatch
+from ....contracts.forward_context import get_forward_context
+from ....contracts.forward_mode import ForwardMode
+from ....contracts.outputs import TextTokenOutput
+from ....foundation.env import env_flag
+from ....foundation.errors import capability_mismatch, invalid_descriptor
+from ....foundation.profiling import profile_range
+from ....nn.diffusion import euler_step
+from ....nn.diffusion.cfg import Branch, CfgPlan
+from ....nn.sampler import (
     BatchedSamplingResult,
     DeferredBatchedSamplingResult,
     apply_sampling_batched_with_device_tokens,
 )
-from ..runtime.forward_batch_builder import state_block_ids_for_op
-from ..runtime.host_staging import fill_cpu_ints, is_pinned
-from ..runtime.paged_text_cache import (
+from ....runtime.forward_batch_builder import state_block_ids_for_op
+from ....runtime.host_staging import fill_cpu_ints, is_pinned
+from ....runtime.paged_text_cache import (
     PagedTextCache,
     PagedTextCacheSpanCopy,
     copy_paged_text_cache_spans,
 )
-from ..runtime.tensor_staging import TextTensorStager
-from .deferred_text_result import DeferredTextSeqResult
-from .denoise_driver import TextImageDenoiseStep, text_image_cfg_plan
-from .forward_stream import (
+from ....runtime.tensor_staging import TextTensorStager
+from ...denoise_driver import TextImageDenoiseStep, text_image_cfg_plan
+from ...interleaved_text_stepper import hydrate_cached_prefix_from_op
+from ...text_decode_relay import TextDecodeRelay
+from ..deferred_text import DeferredTextSeqResult
+from ..graph.packed_visible import (
+    maybe_run_packed_mixed_graph,
+    packed_mixed_graph_promotions_supported,
+)
+from ..result import (
+    DenoiseBranchKey,
+    DenoisePostprocessEntry,
+    ForwardResult,
+    TextPostprocessEntry,
+)
+from ..stream import (
     ForwardPagedKVSegment,
     ForwardPagedKVView,
     ForwardStreamBuilder,
 )
-from .interleaved_text_stepper import hydrate_cached_prefix_from_op
-from .packed_mixed_graph import (
-    maybe_run_packed_mixed_graph,
-    packed_mixed_graph_promotions_supported,
-)
-from .text_decode_relay import TextDecodeRelay
 
-__all__ = ["PackedForwardPlan", "PackedMixedForward", "run_packed_mixed_forward"]
+__all__ = [
+    "PackedForwardPlan",
+    "PackedMixedForward",
+    "run_packed_mixed_forward",
+    "run_packed_visible_forward_result",
+]
 
 logger = logging.getLogger(__name__)
 _DECODE_RELAY = TextDecodeRelay()
@@ -154,14 +166,45 @@ class PackedMixedForward:
         results: list[Any],
         *,
         defer_text_cpu_results: bool = False,
+        allow_graph: bool = True,
+        require_graph: bool = False,
     ) -> bool:
         plan = PackedForwardPlan(batch=batch, denoise_steps=denoise_steps, results=results)
-        return _run_packed_mixed_forward_impl(
+        result = _run_packed_mixed_forward_impl(
             self.owner,
             plan,
             request_states,
             defer_text_cpu_results=defer_text_cpu_results,
+            allow_graph=allow_graph,
+            require_graph=require_graph,
         )
+        return bool(result)
+
+    def execute_forward_result(
+        self,
+        batch: UniForwardBatch,
+        request_states: Any,
+        denoise_steps: list[tuple[int, TextImageDenoiseStep]],
+        *,
+        defer_text_cpu_results: bool = False,
+        allow_graph: bool = False,
+        require_graph: bool = False,
+    ) -> ForwardResult | None:
+        plan = PackedForwardPlan(
+            batch=batch,
+            denoise_steps=denoise_steps,
+            results=[None] * len(batch.ops),
+        )
+        result = _run_packed_mixed_forward_impl(
+            self.owner,
+            plan,
+            request_states,
+            defer_text_cpu_results=defer_text_cpu_results,
+            return_forward_result=True,
+            allow_graph=allow_graph,
+            require_graph=require_graph,
+        )
+        return result if isinstance(result, ForwardResult) else None
 
 
 def run_packed_mixed_forward(
@@ -172,6 +215,8 @@ def run_packed_mixed_forward(
     results: list[Any],
     *,
     defer_text_cpu_results: bool = False,
+    allow_graph: bool = True,
+    require_graph: bool = False,
 ) -> bool:
     return PackedMixedForward(owner).execute(
         batch,
@@ -179,6 +224,28 @@ def run_packed_mixed_forward(
         denoise_steps,
         results,
         defer_text_cpu_results=defer_text_cpu_results,
+        allow_graph=allow_graph,
+        require_graph=require_graph,
+    )
+
+
+def run_packed_visible_forward_result(
+    owner,
+    batch: UniForwardBatch,
+    request_states: Any,
+    denoise_steps: list[tuple[int, TextImageDenoiseStep]],
+    *,
+    defer_text_cpu_results: bool = False,
+    allow_graph: bool = False,
+    require_graph: bool = False,
+) -> ForwardResult | None:
+    return PackedMixedForward(owner).execute_forward_result(
+        batch,
+        request_states,
+        denoise_steps,
+        defer_text_cpu_results=defer_text_cpu_results,
+        allow_graph=allow_graph,
+        require_graph=require_graph,
     )
 
 
@@ -188,7 +255,10 @@ def _run_packed_mixed_forward_impl(
     request_states: Any,
     *,
     defer_text_cpu_results: bool = False,
-) -> bool:
+    return_forward_result: bool = False,
+    allow_graph: bool = True,
+    require_graph: bool = False,
+) -> bool | ForwardResult:
     if owner.model is None:
         return False
     batch = plan.batch
@@ -457,16 +527,20 @@ def _run_packed_mixed_forward_impl(
                 indicator_spans,
                 device=device,
             )
-        hidden = maybe_run_packed_mixed_graph(
-            owner,
-            packed_embeds,
-            image_gen_indicators=packed_indicators,
-            forward_stream=forward_stream,
-            kv_view=kv_view,
-            text_kv_promotions=graph_text_kv_promotions,
-        )
+        hidden = None
+        if allow_graph:
+            hidden = maybe_run_packed_mixed_graph(
+                owner,
+                packed_embeds,
+                image_gen_indicators=packed_indicators,
+                forward_stream=forward_stream,
+                kv_view=kv_view,
+                text_kv_promotions=graph_text_kv_promotions,
+            )
         graph_promoted_text_kv = hidden is not None and bool(graph_text_kv_promotions)
         if hidden is None:
+            if require_graph:
+                return False
             hidden = owner.packed_decoder_forward(
                 packed_embeds,
                 image_gen_indicators=packed_indicators,
@@ -495,6 +569,8 @@ def _run_packed_mixed_forward_impl(
         text_device_tokens_by_row: dict[int, torch.Tensor] = {}
         text_sample_indices_by_row: dict[int, int] = {}
         deferred_text_sampling: DeferredBatchedSamplingResult | None = None
+        text_logits_for_result: torch.Tensor | None = None
+        text_postprocess_entries: list[TextPostprocessEntry] = []
         if plan.text_result_slots:
             with profile_range("uniserve.packed_mixed.text_last_hidden"):
                 text_hidden = torch.stack(
@@ -509,58 +585,61 @@ def _run_packed_mixed_forward_impl(
             with profile_range("uniserve.packed_mixed.text_logits_scatter"):
                 for offset, (row_index, *_rest) in enumerate(plan.text_result_slots):
                     text_logits_by_row[int(row_index)] = text_logits[offset:offset + 1].unsqueeze(0)
-            sample_logits: list[torch.Tensor] = []
-            sampling_params: list[dict[str, Any]] = []
-            with profile_range("uniserve.packed_mixed.text_sampling_inputs"):
-                for row_index, *_rest in plan.text_result_slots:
-                    req_id = int(batch.ops[row_index]["req_id"])
-                    state = request_states.get(req_id)
-                    sampling_params.append(dict(state.sampling or {}))
-                    sample_logits.append(text_logits_by_row[int(row_index)].reshape(-1, text_logits.shape[-1])[-1])
-            can_defer_text_cpu = bool(defer_text_cpu_results)
-            with profile_range("uniserve.packed_mixed.text_sampling"):
-                sampled = apply_sampling_batched_with_device_tokens(
-                    torch.stack(sample_logits, dim=0),
-                    sampling_params,
-                    [[] for _ in sample_logits],
-                    [None for _ in sample_logits],
-                    [None for _ in sample_logits],
-                    defer_cpu=can_defer_text_cpu,
-                )
-            if isinstance(sampled, DeferredBatchedSamplingResult) and can_defer_text_cpu:
-                deferred_text_sampling = sampled
-                for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
-                    text_sample_indices_by_row[int(row_index)] = sample_index
-                    text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
-                        sample_index:sample_index + 1
-                    ]
-            elif not isinstance(sampled, BatchedSamplingResult):
-                sampled = sampled.finalize()
-            if isinstance(sampled, BatchedSamplingResult):
-                for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
-                    req_id = int(batch.ops[row_index]["req_id"])
-                    sample = sampled.samples[sample_index]
-                    top_logprobs = (
-                        [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
-                        if sample.top_logprobs is not None
-                        else None
+            if return_forward_result:
+                text_logits_for_result = text_logits.reshape(len(plan.text_result_slots), -1)
+            else:
+                sample_logits: list[torch.Tensor] = []
+                sampling_params: list[dict[str, Any]] = []
+                with profile_range("uniserve.packed_mixed.text_sampling_inputs"):
+                    for row_index, *_rest in plan.text_result_slots:
+                        req_id = int(batch.ops[row_index]["req_id"])
+                        state = request_states.get(req_id)
+                        sampling_params.append(dict(state.sampling or {}))
+                        sample_logits.append(text_logits_by_row[int(row_index)].reshape(-1, text_logits.shape[-1])[-1])
+                can_defer_text_cpu = bool(defer_text_cpu_results)
+                with profile_range("uniserve.packed_mixed.text_sampling"):
+                    sampled = apply_sampling_batched_with_device_tokens(
+                        torch.stack(sample_logits, dim=0),
+                        sampling_params,
+                        [[] for _ in sample_logits],
+                        [None for _ in sample_logits],
+                        [None for _ in sample_logits],
+                        defer_cpu=can_defer_text_cpu,
                     )
-                    text_outputs_by_row[int(row_index)] = TextTokenOutput(
-                        req_id=req_id,
-                        sampled_token_id=int(sample.token_id),
-                        sampled_logprob=sample.logprob,
-                        top_logprobs=top_logprobs,
-                    )
-                    text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
-                        sample_index:sample_index + 1
-                    ]
+                if isinstance(sampled, DeferredBatchedSamplingResult) and can_defer_text_cpu:
+                    deferred_text_sampling = sampled
+                    for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
+                        text_sample_indices_by_row[int(row_index)] = sample_index
+                        text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
+                            sample_index:sample_index + 1
+                        ]
+                elif not isinstance(sampled, BatchedSamplingResult):
+                    sampled = sampled.finalize()
+                if isinstance(sampled, BatchedSamplingResult):
+                    for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
+                        req_id = int(batch.ops[row_index]["req_id"])
+                        sample = sampled.samples[sample_index]
+                        top_logprobs = (
+                            [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
+                            if sample.top_logprobs is not None
+                            else None
+                        )
+                        text_outputs_by_row[int(row_index)] = TextTokenOutput(
+                            req_id=req_id,
+                            sampled_token_id=int(sample.token_id),
+                            sampled_logprob=sample.logprob,
+                            top_logprobs=top_logprobs,
+                        )
+                        text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
+                            sample_index:sample_index + 1
+                        ]
         with profile_range("uniserve.packed_mixed.burst_position_stage"):
             burst_position_tensors_by_row = _forward_burst_position_tensors(
                 owner,
                 plan,
                 device=device,
             )
-        if text_kv_promotions and not graph_promoted_text_kv:
+        if text_kv_promotions and not graph_promoted_text_kv and not return_forward_result:
             with profile_range("uniserve.packed_mixed.text_kv_promote"):
                 copy_paged_text_cache_spans(
                     text_kv_promotions,
@@ -568,7 +647,7 @@ def _run_packed_mixed_forward_impl(
                     missing_message="forward text K/V span is missing from staged cache",
                 )
         with profile_range("uniserve.packed_mixed.text_result_publish"):
-            for (
+            for logits_index, (
                 row_index,
                 start,
                 q_len,
@@ -576,16 +655,44 @@ def _run_packed_mixed_forward_impl(
                 staged_cache,
                 base_len,
                 last_input_token,
-            ) in plan.text_result_slots:
+            ) in enumerate(plan.text_result_slots):
                 op = batch.ops[row_index]
                 req_id = int(op["req_id"])
                 logits = text_logits_by_row[int(row_index)]
                 state = owner.interleaved_image_state(req_id)
                 position_id = int((op.get("pos_range") or [0, state.cond.t_index + q_len])[1])
+                new_len = int(base_len) + int(q_len)
+                if return_forward_result:
+                    promotion = (
+                        PagedTextCacheSpanCopy(
+                            source=staged_cache,
+                            target=persistent_cache,
+                            start=base_len,
+                            length=q_len,
+                        )
+                        if staged_cache is not persistent_cache and not graph_promoted_text_kv
+                        else None
+                    )
+                    text_postprocess_entries.append(
+                        TextPostprocessEntry(
+                            row_index=int(row_index),
+                            req_id=req_id,
+                            logits_index=int(logits_index),
+                            position_id=position_id,
+                            kv_new_length=new_len,
+                            last_input_token=int(last_input_token),
+                            interleaved_state=state,
+                            persistent_cache=persistent_cache,
+                            staged_cache=staged_cache,
+                            kv_promotion=promotion,
+                            num_layers=int(owner.num_layers),
+                            mark_staging_advanced=owner._mark_forward_staging_advanced,
+                        )
+                    )
+                    continue
                 state.cond.t_index = position_id - 1
                 state.cond.last_logits = logits
                 state.cond.last_token_id = int(last_input_token)
-                new_len = int(base_len) + int(q_len)
                 persistent_cache.length = new_len
                 if staged_cache is not persistent_cache:
                     owner._mark_forward_staging_advanced(staged_cache, persistent_cache, new_len)
@@ -626,6 +733,8 @@ def _run_packed_mixed_forward_impl(
         velocity_stats_start = ctx.component_timer_start()
         velocity_start = timing.start()
         branch_velocities: dict[int, dict[str, torch.Tensor]] = {}
+        denoise_velocities: dict[DenoiseBranchKey, torch.Tensor] = {}
+        denoise_branch_counts: dict[int, int] = {}
         with profile_range("uniserve.packed_mixed.velocity"):
             for row_index, step, start, q_len, branch in plan.denoise_result_slots:
                 img = step.extra["img"]
@@ -638,8 +747,45 @@ def _run_packed_mixed_forward_impl(
                         image_size=(img.width, img.height),
                     )
                 branch_velocities.setdefault(row_index, {})[branch] = velocity
+                branch_id = denoise_branch_counts.get(int(row_index), 0)
+                denoise_velocities[DenoiseBranchKey(int(row_index), branch_id)] = velocity
+                denoise_branch_counts[int(row_index)] = branch_id + 1
         timing.stop("velocity_ms", velocity_start)
         ctx.record_component_elapsed("packed_mixed_velocity", velocity_stats_start)
+        if return_forward_result:
+            denoise_updates: dict[int, DenoisePostprocessEntry] = {}
+            for result_index, step in plan.denoise_steps:
+                cfg_plan = plan.denoise_cfg_plan_for_row(result_index)
+                denoise_updates[int(result_index)] = DenoisePostprocessEntry(
+                    row_index=int(result_index),
+                    req_id=int(step.req_id),
+                    step_index=int(step.step_index),
+                    total_steps=int(step.total_steps),
+                    branch_names=tuple(cfg_plan.branches),
+                    latent=step.latent,
+                    t=step.t,
+                    t_next=step.t_next,
+                    combine_velocity=lambda values, cfg_plan=cfg_plan: cfg_plan.combine(values),
+                    accept_update=lambda updated, owner=owner, step=step: owner.accept_denoise_update(
+                        step,
+                        updated,
+                    ),
+                )
+            timing.stop("total_ms", total_start)
+            timing.log(
+                batch=batch,
+                forward_stream=forward_stream,
+                embed_chunks=embed_chunks,
+                text_result_slots=plan.text_result_slots,
+                denoise_result_slots=plan.denoise_result_slots,
+                kv_segments=kv_segments,
+            )
+            return ForwardResult(
+                text_logits=text_logits_for_result,
+                text_postprocess=tuple(text_postprocess_entries),
+                denoise_velocities=denoise_velocities,
+                denoise_updates=denoise_updates,
+            )
         update_stats_start = ctx.component_timer_start()
         update_start = timing.start()
         with profile_range("uniserve.packed_mixed.denoise_update"):
@@ -648,8 +794,6 @@ def _run_packed_mixed_forward_impl(
                 if not velocities:
                     return False
                 velocity = plan.denoise_cfg_plan_for_row(result_index).combine(velocities)
-                from ..nn.diffusion import euler_step
-
                 updated = euler_step(step.latent, velocity, step.t, step.t_next)
                 owner.accept_denoise_update(step, updated)
                 plan.set_denoise_result(result_index, step)

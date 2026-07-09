@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.execution.forward_stream import (
+from uniserve_worker.execution.forward.stream import (
     ForwardGraphPagedKVView,
     ForwardGraphStreamState,
     ForwardPagedKVSegment,

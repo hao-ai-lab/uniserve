@@ -44,7 +44,7 @@ class ForwardExecutor:
     ) -> ForwardResult:
         policy = plan.graph_policy or self.graph_policy
         stats = get_forward_context().stats
-        if policy.graph_selection_delegated and self.graph_runner is None:
+        if policy.graph_selection_delegated:
             return self.eager_runner.run(batch, plan, forward_fn=forward_fn)
         if policy.prefer_graph and self.graph_runner is not None:
             try:

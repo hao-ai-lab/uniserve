@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
+from uniserve_worker.contracts.batches import UniForwardBatch
+from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
+from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.execution.forward import (
+    DenoiseBranchKey,
+    DenoisePostprocessEntry,
     EagerFallbackRecorder,
     ForwardBatchBuilder,
     ForwardExecutor,
@@ -19,13 +26,23 @@ from uniserve_worker.execution.forward import (
     ForwardResult,
     ForwardRuntimeHandles,
     StrictForwardGraphError,
+    TextPostprocessEntry,
+    WorkerForwardAdapter,
 )
 from uniserve_worker.execution.forward.graph import (
+    CudaGraphForwardRunner,
+    DecodeGraphProgram,
+    DenoiseStepGraphProgram,
     ForwardGraphBufferRegistry,
+    ForwardGraphStats,
+    ModelOwnedTextGraphProgram,
+    PackedVisibleGraphProgram,
     PaddingPolicy,
     SlotAxis,
     graph_shape_key,
 )
+from uniserve_worker.execution.text_driver import TextDriver
+from uniserve_worker.runtime.request_state import RequestStateTable
 
 pytestmark = pytest.mark.unit
 
@@ -112,6 +129,514 @@ def test_graph_buffer_registry_preserves_identity_and_applies_padding():
     torch.testing.assert_close(registry.tensor("tokens"), torch.tensor([3, 4, -1, -1]))
 
 
+def test_cuda_graph_runner_replays_same_shape_with_refreshed_runtime_values():
+    class Adapter:
+        def __init__(self) -> None:
+            self.tokens: list[int] = []
+
+        def forward(self, batch):
+            token = int(batch.input_ids.reshape(-1)[0].item())
+            self.tokens.append(token)
+            return ForwardResult(runtime_outputs=({"req_id": int(batch.req_ids[0]), "token": token},))
+
+    stats = ForwardGraphStats()
+    graph_runner = CudaGraphForwardRunner(
+        programs=(DecodeGraphProgram(),),
+        stats=stats,
+    )
+    executor = ForwardExecutor(
+        model=Adapter(),
+        graph_runner=graph_runner,
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    builder = ForwardPlanBuilder()
+    batch_builder = ForwardBatchBuilder()
+    plan_a = builder.build(
+        [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    plan_b = builder.build(
+        [{"req_id": 9, "kind": "decode_und", "token_ids": [99], "pos_range": [128, 129]}],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    first = executor.execute(batch_builder.build(plan_a), plan_a)
+    second = executor.execute(batch_builder.build(plan_b), plan_b)
+
+    assert first.graph is not None and first.graph.captured and not first.graph.replayed
+    assert second.graph is not None and second.graph.replayed
+    assert first.runtime_outputs == ({"req_id": 1, "token": 10},)
+    assert second.runtime_outputs == ({"req_id": 9, "token": 99},)
+    assert stats.captures == 1
+    assert stats.replays == 1
+    assert stats.misses == 0
+    assert stats.unpadded_tokens == 2
+
+
+def test_cuda_graph_runner_projects_metrics_to_forward_context():
+    class Adapter:
+        def forward(self, batch):
+            return ForwardResult(runtime_outputs=({"req_id": int(batch.req_ids[0])},))
+
+    graph_runner = CudaGraphForwardRunner(programs=(DecodeGraphProgram(),))
+    executor = ForwardExecutor(
+        model=Adapter(),
+        graph_runner=graph_runner,
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    builder = ForwardPlanBuilder()
+    batch_builder = ForwardBatchBuilder()
+    plan_a = builder.build(
+        [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    plan_b = builder.build(
+        [{"req_id": 9, "kind": "decode_und", "token_ids": [99], "pos_range": [128, 129]}],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    stats = ForwardStats()
+
+    with use_forward_context(ForwardContext(stats=stats)):
+        executor.execute(batch_builder.build(plan_a), plan_a)
+        executor.execute(batch_builder.build(plan_b), plan_b)
+
+    wire = stats.to_wire()
+    assert wire["forward_graph_captures"] == 1
+    assert wire["forward_graph_replays"] == 1
+    assert wire["forward_graph_misses"] == 0
+    assert wire["forward_graph_unpadded_tokens"] == 2
+    assert wire["forward_graph_padded_tokens"] == 2
+    assert wire["forward_graph_runtime_mode_counts"] == {"decode": 2}
+    assert len(wire["forward_graph_shape_counts"]) == 1
+
+
+def test_decode_graph_program_runs_bound_text_graph_path():
+    graph_object = object()
+    request_states = object()
+
+    class TextDriver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, Any, Any, Any]] = []
+
+        def forward_logits_graph(
+            self,
+            fb,
+            states,
+            model,
+            *,
+            graph_runner,
+            defer_cpu_results,
+            defer_sampling,
+        ):
+            assert states is request_states
+            assert model == "model"
+            assert graph_runner is graph_object
+            assert defer_cpu_results is False
+            assert defer_sampling is False
+            self.calls.append((fb, states, model, graph_runner))
+            return SimpleNamespace(
+                logits=torch.tensor([[float(len(self.calls))]], dtype=torch.float32),
+                req_ids=tuple(int(op["req_id"]) for op in fb.ops),
+                cuda_ready_start_event=None,
+            )
+
+    text_driver = TextDriver()
+    graph_runner = CudaGraphForwardRunner(
+        programs=(
+            DecodeGraphProgram(
+                text_driver=text_driver,
+                model="model",
+                request_states=request_states,
+                text_graph_runner=graph_object,
+            ),
+        )
+    )
+    executor = ForwardExecutor(
+        graph_runner=graph_runner,
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    builder = ForwardPlanBuilder()
+    batch_builder = ForwardBatchBuilder()
+
+    def build(req_id: int, token_id: int):
+        op = {"req_id": req_id, "kind": "decode_und", "token_ids": [token_id], "pos_range": [0, 1]}
+        handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
+        plan = builder.build(
+            [op],
+            graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+            runtime_handles=handles,
+        )
+        return plan, batch_builder.build(plan)
+
+    plan_a, batch_a = build(1, 10)
+    plan_b, batch_b = build(9, 99)
+
+    first = executor.execute(batch_a, plan_a)
+    second = executor.execute(batch_b, plan_b)
+
+    assert first.graph is not None and first.graph.captured
+    assert second.graph is not None and second.graph.replayed
+    torch.testing.assert_close(first.text_logits, torch.tensor([[1.0]]))
+    torch.testing.assert_close(second.text_logits, torch.tensor([[2.0]]))
+    assert len(text_driver.calls) == 2
+
+
+def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch):
+    import uniserve_worker.execution.forward.programs.packed_visible as packed_visible_programs
+
+    class RequestStates:
+        def __init__(self) -> None:
+            self.states = {2: object()}
+
+        def get(self, req_id: int):
+            return self.states[int(req_id)]
+
+    class Residual:
+        def __init__(self) -> None:
+            self.invalidated = False
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+
+    class Owner:
+        def __init__(self) -> None:
+            self.residual = Residual()
+            self.prepared: list[tuple[Any, dict[str, Any]]] = []
+
+        def prepare_denoise(self, state, op):
+            self.prepared.append((state, op))
+            return SimpleNamespace(extra={"img": SimpleNamespace(residual_cache=self.residual)})
+
+        def packed_decoder_forward(self):
+            raise AssertionError("packed graph program should require the graph path")
+
+        def packed_text_embeddings(self):
+            raise AssertionError("fake packed runner owns the graph-only result")
+
+    owner = Owner()
+    states = RequestStates()
+
+    def fake_run(owner_arg, dispatch_batch, states_arg, denoise_steps, **kwargs):
+        assert owner_arg is owner
+        assert states_arg is states
+        assert [op["req_id"] for op in dispatch_batch.ops] == [1, 2]
+        assert [row for row, _step in denoise_steps] == [1]
+        assert kwargs == {
+            "defer_text_cpu_results": False,
+            "allow_graph": True,
+            "require_graph": True,
+        }
+        return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
+
+    monkeypatch.setattr(packed_visible_programs, "run_packed_visible_forward_result", fake_run)
+    ops = [
+        {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
+        {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
+    ]
+    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
+    plan = ForwardPlanBuilder().build(
+        ops,
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+        runtime_handles=handles,
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=CudaGraphForwardRunner(
+            programs=(PackedVisibleGraphProgram(owner=owner, request_states=states),)
+        ),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    result = executor.execute(batch, plan)
+
+    assert result.graph is not None and result.graph.captured
+    torch.testing.assert_close(result.text_logits, torch.tensor([[3.0]]))
+    assert owner.prepared == [(states.states[2], ops[1])]
+    assert owner.residual.invalidated is True
+
+
+def test_denoise_step_graph_program_runs_required_graph_mode():
+    class RequestStates:
+        def __init__(self) -> None:
+            self.states = {5: object()}
+
+        def get(self, req_id: int):
+            return self.states[int(req_id)]
+
+    class Driver:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, Any, dict[str, Any]]] = []
+
+        def forward_result(self, items, model, **kwargs):
+            self.calls.append((items, model, kwargs))
+            return ForwardResult(
+                denoise_velocities={
+                    DenoiseBranchKey(0, 0): torch.tensor([1.0], dtype=torch.float32)
+                }
+            )
+
+    states = RequestStates()
+    driver = Driver()
+    op = {"req_id": 5, "kind": "denoise_gen", "cfg": {"branch_count": 1}}
+    plan = ForwardPlanBuilder().build(
+        [op],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=CudaGraphForwardRunner(
+            programs=(DenoiseStepGraphProgram(denoise_driver=driver, model="model", request_states=states),)
+        ),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    result = executor.execute(batch, plan)
+
+    assert result.graph is not None and result.graph.captured
+    assert driver.calls == [
+        (
+            [(5, states.states[5], op)],
+            "model",
+            {"row_indices": (0,), "graph_mode": "require"},
+        )
+    ]
+
+
+def test_model_owned_text_graph_program_uses_graph_only_text_driver():
+    class RequestStates:
+        def get(self, req_id: int):
+            return {"req_id": int(req_id)}
+
+    class TextDriver:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def forward_logits_graph(
+            self,
+            dispatch_batch,
+            request_states,
+            model,
+            *,
+            graph_runner,
+            defer_cpu_results,
+            defer_sampling,
+        ):
+            self.calls.append(
+                {
+                    "ops": tuple(dict(op) for op in dispatch_batch.ops),
+                    "request_states": request_states,
+                    "model": model,
+                    "graph_runner": graph_runner,
+                    "defer_cpu_results": defer_cpu_results,
+                    "defer_sampling": defer_sampling,
+                }
+            )
+            return SimpleNamespace(logits=torch.tensor([[8.0, 9.0]]), req_ids=(7,))
+
+    class Model:
+        def try_run_text_graph_logits_batch(self, _ops):
+            raise AssertionError("program must route through TextDriver graph logits")
+
+    states = RequestStates()
+    text_driver = TextDriver()
+    model = Model()
+    op = {
+        "req_id": 7,
+        "kind": "prefill_und",
+        "token_ids": [1, 2],
+        "pos_range": [0, 2],
+        "decode_token_count": 4,
+    }
+    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
+    plan = ForwardPlanBuilder().build(
+        [op],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+        runtime_handles=handles,
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=CudaGraphForwardRunner(
+            programs=(
+                ModelOwnedTextGraphProgram(
+                    text_driver=text_driver,
+                    model=model,
+                    request_states=states,
+                ),
+            )
+        ),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    result = executor.execute(batch, plan)
+
+    assert result.graph is not None and result.graph.captured
+    torch.testing.assert_close(result.text_logits, torch.tensor([[8.0, 9.0]]))
+    assert text_driver.calls == [
+        {
+            "ops": (op,),
+            "request_states": states,
+            "model": model,
+            "graph_runner": None,
+            "defer_cpu_results": False,
+            "defer_sampling": False,
+        }
+    ]
+
+
+def test_model_owned_text_graph_program_uses_runtime_result_for_decode_burst():
+    class RequestStates:
+        def get(self, req_id: int):
+            return {"req_id": int(req_id)}
+
+    class TextDriver:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def forward_graph_result(
+            self,
+            dispatch_batch,
+            request_states,
+            model,
+            *,
+            graph_runner,
+            defer_cpu_results,
+            defer_sampling,
+        ):
+            self.calls.append(
+                {
+                    "ops": tuple(dict(op) for op in dispatch_batch.ops),
+                    "request_states": request_states,
+                    "model": model,
+                    "graph_runner": graph_runner,
+                    "defer_cpu_results": defer_cpu_results,
+                    "defer_sampling": defer_sampling,
+                }
+            )
+            return ForwardResult(runtime_outputs=({"req_id": 7, "sampled_token_ids": [4, 5]},))
+
+    class Model:
+        def try_run_text_graph_logits_batch(self, _ops):
+            raise AssertionError("program must route through TextDriver graph result")
+
+    states = RequestStates()
+    text_driver = TextDriver()
+    model = Model()
+    op = {
+        "req_id": 7,
+        "kind": "decode_und",
+        "token_ids": [3],
+        "pos_range": [4, 5],
+        "decode_token_count": 2,
+    }
+    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
+    plan = ForwardPlanBuilder().build(
+        [op],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+        runtime_handles=handles,
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=CudaGraphForwardRunner(
+            programs=(
+                ModelOwnedTextGraphProgram(
+                    text_driver=text_driver,
+                    model=model,
+                    request_states=states,
+                ),
+            )
+        ),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    result = executor.execute(batch, plan)
+
+    assert result.graph is not None and result.graph.captured
+    assert result.runtime_outputs == ({"req_id": 7, "sampled_token_ids": [4, 5]},)
+    assert text_driver.calls == [
+        {
+            "ops": (op,),
+            "request_states": states,
+            "model": model,
+            "graph_runner": None,
+            "defer_cpu_results": False,
+            "defer_sampling": False,
+        }
+    ]
+
+
+def test_text_driver_graph_result_runs_decode_burst_without_eager_fallback():
+    states = RequestStateTable()
+    state = states.get(7)
+    state.sampling = {}
+
+    class Model:
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, Any]]] = []
+
+        def try_run_text_graph_logits_batch(self, ops):
+            self.calls.append([dict(op) for op in ops])
+            token = 4 if len(self.calls) == 1 else 5
+            logits = torch.full((1, 8), -10.0, dtype=torch.float32)
+            logits[0, token] = 10.0
+            return [logits]
+
+        def run_text_logits_batch(self, _ops):
+            raise AssertionError("graph result path must not use eager text logits")
+
+    model = Model()
+    op = {
+        "req_id": 7,
+        "kind": "decode_und",
+        "token_ids": [3],
+        "pos_range": [4, 5],
+        "decode_token_count": 2,
+    }
+    driver = TextDriver()
+    fb = UniForwardBatch.from_ops([op])
+
+    with use_forward_context(ForwardContext(stats=ForwardStats())):
+        result = driver.forward_graph_result(
+            fb,
+            states,
+            model,
+            graph_runner=None,
+            defer_cpu_results=False,
+            defer_sampling=False,
+        )
+
+    assert result is not None
+    assert result.runtime_outputs == (
+        {"req_id": 7, "sampled_token_id": 5, "sampled_token_ids": [4, 5]},
+    )
+    assert len(model.calls) == 2
+    assert model.calls[0] == [
+        {
+            "req_id": 7,
+            "kind": "decode_und",
+            "token_ids": [3],
+            "pos_range": [4, 5],
+            "decode_token_count": 1,
+            "decode_stop_token_ids": [],
+        }
+    ]
+    followup = dict(model.calls[1][0])
+    token_tensor = followup.pop("token_tensor")
+    assert followup == {
+        "req_id": 7,
+        "kind": "decode_und",
+        "token_ids": [4],
+        "pos_range": [5, 6],
+        "decode_token_count": 1,
+        "decode_stop_token_ids": [],
+        "new_block_ids": [],
+        "token_source": "last_sampled",
+    }
+    torch.testing.assert_close(token_tensor, torch.tensor([4], dtype=torch.long))
+    assert state.kv_length("text") == 6
+    assert state.decode_relay.token_id == 5
+    torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([5], dtype=torch.long))
+
+
 def test_executor_strict_graph_policy_rejects_eager_fallback():
     plan = ForwardPlanBuilder().build(
         [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
@@ -150,6 +675,64 @@ def test_executor_delegated_graph_policy_does_not_record_fallback():
     assert recorder.counts == {}
 
 
+def test_executor_delegated_graph_policy_bypasses_installed_graph_runner():
+    recorder = EagerFallbackRecorder()
+    plan = ForwardPlanBuilder().build(
+        [{"req_id": 1, "kind": "commit_gen"}],
+        graph_policy=ForwardGraphPolicy(
+            prefer_graph=True,
+            strict=True,
+            graph_selection_delegated=True,
+        ),
+    )
+    batch = ForwardBatchBuilder().build(plan)
+
+    class GraphRunner:
+        def run(self, *args, **kwargs):
+            raise AssertionError("delegated graph policy must not query the graph runner")
+
+    executor = ForwardExecutor(
+        graph_runner=GraphRunner(),
+        graph_policy=ForwardGraphPolicy(graph_selection_delegated=True),
+        fallback_recorder=recorder,
+    )
+
+    result = executor.execute(
+        batch,
+        plan,
+        forward_fn=lambda _batch: ForwardResult(runtime_outputs=({"req_id": 1},)),
+    )
+
+    assert result.runtime_outputs == ({"req_id": 1},)
+    assert recorder.counts == {}
+
+
+def test_executor_invokes_adapter_forward_as_eager_surface():
+    class Adapter:
+        def __init__(self) -> None:
+            self.batches: list[Any] = []
+
+        def forward(self, batch):
+            self.batches.append(batch)
+            return ForwardResult(runtime_outputs=({"req_id": 1, "via": "adapter"},))
+
+    adapter = Adapter()
+    plan = ForwardPlanBuilder().build(
+        [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
+        graph_policy=ForwardGraphPolicy(graph_selection_delegated=True),
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        model=adapter,
+        graph_policy=ForwardGraphPolicy(graph_selection_delegated=True),
+    )
+
+    result = executor.execute(batch, plan)
+
+    assert adapter.batches == [batch]
+    assert result.runtime_outputs == ({"req_id": 1, "via": "adapter"},)
+
+
 def test_postprocessor_validates_before_runtime_side_effects():
     touched: list[Any] = []
     handles = ForwardRuntimeHandles(
@@ -166,6 +749,465 @@ def test_postprocessor_validates_before_runtime_side_effects():
         ForwardPostprocessor().apply(plan, ForwardResult(runtime_outputs=()))
 
     assert touched == []
+
+
+def test_worker_adapter_text_path_returns_logits_without_request_state_mutation():
+    op = {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}
+    state = _FakeTextState()
+    request_states = _FakeRequestStates({1: state})
+
+    class Driver:
+        def forward_logits(self, fb, states, model, *, defer_cpu_results, defer_sampling):
+            del fb, model, defer_cpu_results, defer_sampling
+            assert states is request_states
+            assert state.kv_updates == []
+            assert state.decode_relay.token_tensor is None
+            return SimpleNamespace(
+                logits=torch.tensor([[0.0, 4.0]], dtype=torch.float32),
+                req_ids=(1,),
+                cuda_ready_start_event=None,
+            )
+
+        def step(self, *args, **kwargs):
+            raise AssertionError("typed text adapter path should not call TextDriver.step")
+
+    class Model:
+        device = "cpu"
+        vocab_size = 2
+
+        def forward(self, *args, **kwargs):
+            raise AssertionError("fake model forward is owned by the fake text driver")
+
+    descriptor = ForwardModelDescriptor(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=1,
+        vocab_size=2,
+        num_layers=1,
+        num_q_heads=1,
+        num_kv_heads=1,
+        head_dim=1,
+        supports_text=True,
+        modules=ForwardModelModules(logits=lambda: None),
+    )
+    adapter = WorkerForwardAdapter(
+        model=Model(),
+        request_states=request_states,
+        text_driver=Driver(),
+        denoise_driver=object(),
+        encode_driver=object(),
+        image_decode_driver=object(),
+        descriptor=descriptor,
+    )
+    plan = ForwardPlanBuilder().build([op], request_states=request_states)
+    batch = ForwardBatchBuilder().build(plan)
+    fb = UniForwardBatch.from_ops([op])
+
+    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
+        result = adapter.forward(batch)
+
+    assert result.runtime_outputs is None
+    torch.testing.assert_close(result.text_logits, torch.tensor([[0.0, 4.0]]))
+    assert state.kv_updates == []
+    assert state.decode_relay.token_tensor is None
+
+
+def test_postprocessor_text_logits_samples_relays_and_advances_kv_after_validation():
+    op = {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}
+    state = _FakeTextState()
+    request_states = _FakeRequestStates({1: state})
+    handles = ForwardRuntimeHandles(
+        request_states=request_states,
+        values={"dispatch_batch": UniForwardBatch.from_ops([op])},
+    )
+    plan = ForwardPlanBuilder().build([op], request_states=request_states, runtime_handles=handles)
+
+    outputs = ForwardPostprocessor().apply(
+        plan,
+        ForwardResult(text_logits=torch.tensor([[0.0, 1.0, 7.0]], dtype=torch.float32)),
+    )
+
+    assert outputs[0].sampled_token_id == 2
+    assert state.kv_updates == [("text", 1)]
+    assert state.decode_relay.token_id == 2
+    torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long))
+    assert state.decode_relay.position_id == 1
+    torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([1], dtype=torch.long))
+
+
+def test_postprocessor_text_validation_failure_leaves_request_state_unchanged():
+    op = {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}
+    state = _FakeTextState()
+    request_states = _FakeRequestStates({1: state})
+    handles = ForwardRuntimeHandles(
+        request_states=request_states,
+        values={"dispatch_batch": UniForwardBatch.from_ops([op])},
+    )
+    plan = ForwardPlanBuilder().build([op], request_states=request_states, runtime_handles=handles)
+
+    with pytest.raises(Exception, match="row count"):
+        ForwardPostprocessor().apply(
+            plan,
+            ForwardResult(text_logits=torch.empty((0, 3), dtype=torch.float32)),
+        )
+
+    assert state.kv_updates == []
+    assert state.decode_relay.token_tensor is None
+    assert state.decode_relay.position_tensor is None
+
+
+def test_worker_adapter_denoise_result_updates_latent_only_in_postprocess():
+    op = {"req_id": 1, "kind": "denoise_gen", "cfg": {"branch_count": 2}, "num_steps": 1}
+    state = SimpleNamespace(updated=None)
+    request_states = _FakeRequestStates({1: state})
+
+    class Driver:
+        def forward_result(self, items, model, *, row_indices, graph_mode):
+            del model
+            assert [(req_id, item_state, item_op) for req_id, item_state, item_op in items] == [
+                (1, state, op)
+            ]
+            assert tuple(row_indices) == (0,)
+            assert graph_mode == "eager"
+            assert state.updated is None
+            return ForwardResult(
+                denoise_velocities={
+                    DenoiseBranchKey(0, 0): torch.tensor([3.0]),
+                    DenoiseBranchKey(0, 1): torch.tensor([1.0]),
+                },
+                denoise_updates={
+                    0: DenoisePostprocessEntry(
+                        row_index=0,
+                        req_id=1,
+                        step_index=0,
+                        total_steps=1,
+                        branch_names=("cond", "uncond"),
+                        latent=torch.tensor([0.0]),
+                        t=torch.tensor(0.0),
+                        t_next=torch.tensor(1.0),
+                        combine_velocity=lambda velocities: velocities["cond"] - velocities["uncond"],
+                        accept_update=lambda updated: setattr(state, "updated", updated),
+                    )
+                },
+            )
+
+        def step_many(self, *args, **kwargs):
+            raise AssertionError("typed denoise adapter path should not call DenoiseDriver.step_many")
+
+    class Model(ModelHooks):
+        device = "cpu"
+
+        def predict_velocity(self, ctx, t, latent, branch):
+            raise AssertionError("fake driver owns branch prediction in this test")
+
+    descriptor = ForwardModelDescriptor(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=1,
+        vocab_size=0,
+        num_layers=1,
+        num_q_heads=1,
+        num_kv_heads=1,
+        head_dim=1,
+        supports_denoise=True,
+    )
+    adapter = WorkerForwardAdapter(
+        model=Model(),
+        request_states=request_states,
+        text_driver=object(),
+        denoise_driver=Driver(),
+        encode_driver=object(),
+        image_decode_driver=object(),
+        descriptor=descriptor,
+    )
+    plan = ForwardPlanBuilder().build([op], request_states=request_states)
+    batch = ForwardBatchBuilder().build(plan)
+    fb = UniForwardBatch.from_ops([op])
+
+    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
+        result = adapter.forward(batch)
+
+    assert result.runtime_outputs is None
+    assert state.updated is None
+
+    outputs = ForwardPostprocessor().apply(plan, result)
+
+    assert len(outputs) == 1
+    assert outputs[0].req_id == 1
+    assert outputs[0].denoise_done is True
+    assert outputs[0].num_steps_done == 1
+    torch.testing.assert_close(state.updated, torch.tensor([2.0]))
+
+
+def test_worker_adapter_encode_result_is_published_by_postprocess():
+    op = {"req_id": 2, "kind": "vit_encode", "mm_hash": 9}
+
+    class Driver:
+        def forward_result(self, fb, model, *, row_indices):
+            del fb, model
+            assert tuple(row_indices) == (0,)
+            return ForwardResult(
+                encode_outputs={
+                    0: {"req_id": 2, "encoder_handle": 44, "num_tokens": 3, "image_hw": [8, 9]}
+                }
+            )
+
+        def step(self, *args, **kwargs):
+            raise AssertionError("typed encode adapter path should not call EncodeDriver.step")
+
+    class Model(ModelHooks):
+        device = "cpu"
+
+        def encode_image(self, pixels=None, grid=None, *, op=None):
+            raise AssertionError("fake driver owns encode publication in this test")
+
+    descriptor = ForwardModelDescriptor(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=1,
+        vocab_size=0,
+        num_layers=1,
+        num_q_heads=1,
+        num_kv_heads=1,
+        head_dim=1,
+        supports_encode=True,
+    )
+    adapter = WorkerForwardAdapter(
+        model=Model(),
+        request_states=_FakeRequestStates({}),
+        text_driver=object(),
+        denoise_driver=object(),
+        encode_driver=Driver(),
+        image_decode_driver=object(),
+        descriptor=descriptor,
+    )
+    plan = ForwardPlanBuilder().build([op])
+    batch = ForwardBatchBuilder().build(plan)
+    fb = UniForwardBatch.from_ops([op])
+
+    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
+        result = adapter.forward(batch)
+
+    assert result.runtime_outputs is None
+    outputs = ForwardPostprocessor().apply(plan, result)
+
+    assert len(outputs) == 1
+    assert outputs[0].req_id == 2
+    assert outputs[0].encoder_handle == 44
+    assert outputs[0].num_tokens == 3
+    assert outputs[0].image_hw == (8, 9)
+
+
+def test_worker_adapter_commit_result_is_sampled_by_postprocess():
+    op = {"req_id": 3, "kind": "commit_gen"}
+    state = _FakeTextState()
+    state.sampling = {"temperature": 0.0}
+    request_states = _FakeRequestStates({3: state})
+
+    class Driver:
+        def forward_result(self, items, model, *, row_indices):
+            del model
+            assert [(req_id, item_state, item_op) for req_id, item_state, item_op in items] == [
+                (3, state, op)
+            ]
+            assert tuple(row_indices) == (0,)
+            return ForwardResult(
+                commit_outputs={
+                    0: {
+                        "req_id": 3,
+                        "image_hw": [4, 5],
+                        "logits": torch.tensor([0.0, 6.0, 2.0], dtype=torch.float32),
+                    }
+                }
+            )
+
+        def step(self, *args, **kwargs):
+            raise AssertionError("typed commit adapter path should not call ImageDecodeDriver.step")
+
+    class Model(ModelHooks):
+        device = "cpu"
+
+        def decode_image(self, latent, *, req_id=None, state=None, op=None):
+            raise AssertionError("fake driver owns commit decode in this test")
+
+    descriptor = ForwardModelDescriptor(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=1,
+        vocab_size=3,
+        num_layers=1,
+        num_q_heads=1,
+        num_kv_heads=1,
+        head_dim=1,
+        supports_commit=True,
+    )
+    adapter = WorkerForwardAdapter(
+        model=Model(),
+        request_states=request_states,
+        text_driver=object(),
+        denoise_driver=object(),
+        encode_driver=object(),
+        image_decode_driver=Driver(),
+        descriptor=descriptor,
+    )
+    handles = ForwardRuntimeHandles(request_states=request_states)
+    plan = ForwardPlanBuilder().build([op], request_states=request_states, runtime_handles=handles)
+    batch = ForwardBatchBuilder().build(plan)
+    fb = UniForwardBatch.from_ops([op])
+
+    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
+        result = adapter.forward(batch)
+
+    assert result.runtime_outputs is None
+    outputs = ForwardPostprocessor().apply(plan, result)
+
+    assert len(outputs) == 1
+    assert outputs[0].req_id == 3
+    assert outputs[0].image_hw == (4, 5)
+    assert outputs[0].sampled_token_id == 1
+
+
+def test_worker_adapter_private_mixed_hook_can_return_forward_result():
+    ops = [
+        {"req_id": 7, "kind": "decode_und", "token_ids": [4], "pos_range": [0, 1]},
+        {"req_id": 8, "kind": "denoise_gen"},
+    ]
+    expected = ForwardResult(
+        text_logits=torch.tensor([[0.0, 1.0]], dtype=torch.float32),
+        denoise_velocities={DenoiseBranchKey(1, 0): torch.tensor([1.0])},
+    )
+
+    class Model(ModelHooks):
+        device = "cpu"
+
+        def _run_forward_adapter(self, batch, *, request_states, group, defer_text_cpu_results=False):
+            assert request_states is states
+            assert [item[1] for item in group] == ops
+            assert defer_text_cpu_results is False
+            assert batch.ops == tuple(ops)
+            return expected
+
+    states = _FakeRequestStates({7: _FakeTextState(), 8: SimpleNamespace()})
+    descriptor = ForwardModelDescriptor(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=1,
+        vocab_size=2,
+        num_layers=1,
+        num_q_heads=1,
+        num_kv_heads=1,
+        head_dim=1,
+        supports_text=True,
+        supports_denoise=True,
+    )
+    adapter = WorkerForwardAdapter(
+        model=Model(),
+        request_states=states,
+        text_driver=object(),
+        denoise_driver=object(),
+        encode_driver=object(),
+        image_decode_driver=object(),
+        descriptor=descriptor,
+    )
+    plan = ForwardPlanBuilder().build(ops, request_states=states)
+    batch = ForwardBatchBuilder().build(plan)
+    fb = UniForwardBatch.from_ops(ops)
+
+    with adapter.bind(dispatch_batch=fb, group=list(enumerate(ops)), defer_text_cpu_results=False):
+        result = adapter.forward(batch)
+
+    assert result is expected
+
+
+def test_postprocessor_mixed_text_entry_samples_relays_and_advances_interleaved_state():
+    text_op = {"req_id": 4, "kind": "decode_und", "token_ids": [8], "pos_range": [6, 7]}
+    denoise_op = {"req_id": 5, "kind": "denoise_gen"}
+    text_state = _FakeTextState()
+    denoise_state = SimpleNamespace(updated=None)
+    request_states = _FakeRequestStates({4: text_state, 5: denoise_state})
+    image_state = SimpleNamespace(
+        cond=SimpleNamespace(
+            t_index=5,
+            last_logits=None,
+            last_token_id=None,
+        )
+    )
+    cache = SimpleNamespace(length=6)
+    handles = ForwardRuntimeHandles(request_states=request_states)
+    plan = ForwardPlanBuilder().build(
+        [text_op, denoise_op],
+        request_states=request_states,
+        runtime_handles=handles,
+    )
+    result = ForwardResult(
+        text_logits=torch.tensor([[0.0, 2.0, 9.0]], dtype=torch.float32),
+        text_postprocess=(
+            TextPostprocessEntry(
+                row_index=0,
+                req_id=4,
+                logits_index=0,
+                position_id=7,
+                kv_new_length=7,
+                last_input_token=8,
+                interleaved_state=image_state,
+                persistent_cache=cache,
+            ),
+        ),
+        denoise_velocities={
+            DenoiseBranchKey(1, 0): torch.tensor([1.0]),
+        },
+        denoise_updates={
+            1: DenoisePostprocessEntry(
+                row_index=1,
+                req_id=5,
+                step_index=0,
+                total_steps=1,
+                branch_names=("cond",),
+                latent=torch.tensor([0.0]),
+                t=torch.tensor(0.0),
+                t_next=torch.tensor(1.0),
+                combine_velocity=lambda velocities: velocities["cond"],
+                accept_update=lambda updated: setattr(denoise_state, "updated", updated),
+            )
+        },
+    )
+
+    outputs = ForwardPostprocessor().apply(plan, result)
+
+    assert outputs[0].sampled_token_id == 2
+    assert outputs[1].denoise_done is True
+    assert image_state.cond.t_index == 6
+    assert image_state.cond.last_token_id == 8
+    assert cache.length == 7
+    torch.testing.assert_close(image_state.cond.last_logits, torch.tensor([[[0.0, 2.0, 9.0]]]))
+    assert text_state.decode_relay.token_id == 2
+    assert text_state.decode_relay.position_id == 7
+    torch.testing.assert_close(text_state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long))
+    torch.testing.assert_close(text_state.decode_relay.position_tensor, torch.tensor([7], dtype=torch.long))
+    torch.testing.assert_close(denoise_state.updated, torch.tensor([1.0]))
+
+
+class _FakeTextState:
+    def __init__(self) -> None:
+        self.sampling: dict[str, Any] = {}
+        self.decode_relay = SimpleNamespace(
+            token_id=None,
+            token_tensor=None,
+            position_id=None,
+            position_tensor=None,
+        )
+        self.kv_updates: list[tuple[str, int]] = []
+
+    def set_kv_length(self, value: int, *, lane: str) -> None:
+        self.kv_updates.append((str(lane), int(value)))
+
+
+class _FakeRequestStates:
+    def __init__(self, states: dict[int, _FakeTextState]) -> None:
+        self._states = states
+
+    def get(self, req_id: int) -> _FakeTextState:
+        return self._states[int(req_id)]
 
 
 def test_descriptor_rejects_missing_declared_text_surfaces():

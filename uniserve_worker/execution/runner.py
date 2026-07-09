@@ -6,9 +6,8 @@ Owns request-state creation, wire-op parsing into ``UniForwardBatch``, model
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Mapping, cast
+from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
@@ -16,21 +15,15 @@ from ..backends.attention import (
     get_attention_backend,
     normalize_attention_backend_name,
 )
+from ..contracts.batch_policy import BatchPolicy
 from ..contracts.batches import ExecuteBatch, UniForwardBatch
 from ..contracts.caps import Caps
-from ..contracts.forward_context import ForwardContext, use_forward_context
 from ..contracts.forward_mode import ForwardMode, mode_for_op
 from ..contracts.forward_stats import ForwardStats
 from ..contracts.model_protocols import ModelHooks, UniModel
-from ..contracts.outputs import ForwardOutput, ForwardOutputBase
-
-if TYPE_CHECKING:
-    from ..contracts.model_protocols import DenoiseCapable
-from ..contracts.batch_policy import BatchPolicy
 from ..contracts.resource_plan import LatentTokens, ResourcePlan
 from ..foundation.env import env_flag
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.profiling import profile_range
 from ..foundation.runtime_config import get_worker_config
 from ..runtime.forward_batch_builder import ForwardBatchBuilder
 from ..runtime.request_session import RequestSessionTable
@@ -42,14 +35,16 @@ from .forward import (
     EagerFallbackRecorder,
     ForwardExecutor,
     ForwardGraphPolicy,
+    ForwardGroupPlanner,
     ForwardPlanBuilder,
     ForwardPostprocessor,
+    ForwardStepExecutor,
+    ForwardStepOptions,
+    WorkerForwardAdapter,
 )
 from .forward import (
     ForwardBatchBuilder as UnifiedForwardBatchBuilder,
 )
-from .forward_driver import ForwardDriver
-from .forward_step import ForwardGroupPlanner, ForwardStepExecutor, ForwardStepOptions
 from .image_decode_driver import ImageDecodeDriver
 from .text_driver import TextDriver
 
@@ -85,12 +80,6 @@ def _model_max_context_len(model: Any) -> int:
     return max(0, parsed)
 
 
-def _overrides_model_hook(model: Any, name: str) -> bool:
-    hook = getattr(type(model), name, None)
-    default = getattr(ModelHooks, name, None)
-    return hook is not None and hook is not default
-
-
 @dataclass
 class RunnerDrivers:
     """Optional per-modality driver overrides for ``ModelRunner``.
@@ -100,7 +89,6 @@ class RunnerDrivers:
     """
 
     denoise_driver: DenoiseDriver | None = None
-    forward_driver: ForwardDriver | None = None
     encode_driver: EncodeDriver | None = None
     image_decode_driver: ImageDecodeDriver | None = None
     text_driver: TextDriver | None = None
@@ -126,7 +114,6 @@ class _ResolvedRunnerDeps:
     batch_policy: BatchPolicy | None
     attention_backend: Any | None
     denoise_driver: DenoiseDriver | None
-    forward_driver: ForwardDriver | None
     encode_driver: EncodeDriver | None
     image_decode_driver: ImageDecodeDriver | None
     text_driver: TextDriver | None
@@ -193,21 +180,17 @@ class ModelRunner:
             deps.attention_backend
         )
         self.denoise_driver = deps.denoise_driver or DenoiseDriver()
-        self.forward_driver = deps.forward_driver or ForwardDriver()
         self.encode_driver = deps.encode_driver or EncodeDriver()
         self.image_decode_driver = deps.image_decode_driver or ImageDecodeDriver()
         self._init_text_execution(model, residency, deps.text_driver)
         self._init_unified_forward_execution(model, residency)
         self.multimodal_processor = deps.multimodal_processor
-        self._init_capability_flags(model)
-        self._mode_strategies = self._build_mode_strategies()
         self._init_resource_accounting(resource_runtime, residency)
         # CUDA Green Context SM partitioning. ``None`` unless runtime config
         # enables it and the model runs on a CUDA device.
         self.stream_manager = self._maybe_build_stream_manager()
         self._group_planner = ForwardGroupPlanner(
             self.batch_policy,
-            accepts_forward_batch=self._accepts_forward_batch,
             log_text_mixed_split=self._log_text_mixed_split,
         )
         self._step_executor = ForwardStepExecutor(self, group_planner=self._group_planner)
@@ -229,15 +212,84 @@ class ModelRunner:
         self.forward_graph_policy = ForwardGraphPolicy(
             prefer_graph=bool(get_worker_config().cuda_graph),
             strict=env_flag("UNISERVE_STRICT_FORWARD_GRAPH"),
-            graph_selection_delegated=True,
         )
+        self.forward_graph_runner = self._build_forward_graph_runner(model)
         self.forward_fallback_recorder = EagerFallbackRecorder()
-        self.forward_executor = ForwardExecutor(
+        self.forward_adapter = WorkerForwardAdapter(
             model=model,
+            request_states=self.request_states,
+            text_driver=self.text_driver,
+            denoise_driver=self.denoise_driver,
+            encode_driver=self.encode_driver,
+            image_decode_driver=self.image_decode_driver,
+            defer_sampling=self.defer_sampling,
+            tensor_store=self.tensor_store,
+            mixed_proof_callback=self._log_mixed_proof if _MIXED_PROOF_ENABLED else None,
+        )
+        self.forward_executor = ForwardExecutor(
+            model=self.forward_adapter,
+            graph_runner=self.forward_graph_runner,
             graph_policy=self.forward_graph_policy,
             fallback_recorder=self.forward_fallback_recorder,
         )
         self.forward_postprocessor = ForwardPostprocessor()
+
+    def _build_forward_graph_runner(self, model: UniModel) -> Any | None:
+        programs = []
+        from .forward.graph import (
+            CudaGraphForwardRunner,
+            DenoiseStepGraphProgram,
+            PackedVisibleGraphProgram,
+        )
+
+        if self.text_graph_runner is not None:
+            from .forward.graph import (
+                DecodeGraphProgram,
+                PrefillGraphProgram,
+            )
+
+            programs.extend(
+                (
+                    DecodeGraphProgram(
+                        text_driver=self.text_driver,
+                        model=model,
+                        request_states=self.request_states,
+                        text_graph_runner=self.text_graph_runner,
+                    ),
+                    PrefillGraphProgram(
+                        text_driver=self.text_driver,
+                        model=model,
+                        request_states=self.request_states,
+                        text_graph_runner=self.text_graph_runner,
+                    ),
+                )
+            )
+        programs.append(
+            PackedVisibleGraphProgram(
+                owner=model,
+                request_states=self.request_states,
+            )
+        )
+        if callable(getattr(model, "try_run_text_graph_logits_batch", None)):
+            from .forward.graph import ModelOwnedTextGraphProgram
+
+            programs.append(
+                ModelOwnedTextGraphProgram(
+                    text_driver=self.text_driver,
+                    model=model,
+                    request_states=self.request_states,
+                )
+            )
+        programs.append(
+            DenoiseStepGraphProgram(
+                denoise_driver=self.denoise_driver,
+                model=model,
+                request_states=self.request_states,
+            )
+        )
+        if programs:
+            return CudaGraphForwardRunner(programs=tuple(programs))
+        return None
 
     def _init_text_execution(
         self,
@@ -255,20 +307,7 @@ class ModelRunner:
             builder=self.forward_batch_builder,
             gate=self.text_gate,
             kv_pool=residency.kv if residency is not None else None,
-            graph_runner=self.text_graph_runner,
         )
-
-    def _init_capability_flags(self, model: UniModel) -> None:
-        # Resolve model capability flags once for dispatch.
-        self._has_text_forward = hasattr(model, "forward")
-        self._has_text_logits_batch = _overrides_model_hook(model, "run_text_logits_batch")
-        self._is_text_capable = self._has_text_forward or self._has_text_logits_batch
-        self._has_predict_velocity = _overrides_model_hook(model, "predict_velocity")
-        self._has_decode_image = _overrides_model_hook(model, "decode_image")
-        self._has_encode = _overrides_model_hook(model, "encode_image") or _overrides_model_hook(
-            model, "encode_latents"
-        )
-        self._whole_batch_forward = bool(getattr(model, "whole_batch_forward", False))
 
     def _init_resource_accounting(
         self,
@@ -314,7 +353,6 @@ class ModelRunner:
                 attention_backend if attention_backend is not None else config.attention_backend
             ),
             denoise_driver=denoise_driver if denoise_driver is not None else drivers.denoise_driver,
-            forward_driver=drivers.forward_driver,
             encode_driver=encode_driver if encode_driver is not None else drivers.encode_driver,
             image_decode_driver=(
                 image_decode_driver
@@ -380,7 +418,7 @@ class ModelRunner:
         )
         graph_runner = None
         if device.type == "cuda":
-            from .text_graph_runner import TextGraphRunner
+            from .forward.graph.text import TextGraphRunner
 
             graph_runner = TextGraphRunner(
                 kv_pool=residency.kv,
@@ -485,50 +523,6 @@ class ModelRunner:
                 raise
             self.model.on_new_request(req_id, state)
 
-    def _run_group(
-        self,
-        group: list[tuple[int, Mapping[str, Any]]],
-        results: list[dict[str, Any] | None],
-        *,
-        forward_stats: ForwardStats | None,
-        defer_text_cpu_results: bool,
-    ) -> None:
-        """Account, forward, and post-advance one single-step op group in place.
-
-        Writes each op's per-seq result into ``results`` at its original index.
-        """
-        indices = [idx for idx, _ in group]
-        fb = UniForwardBatch.from_ops([op for _, op in group])
-        with profile_range(f"uniserve.runner.group.{fb.mode.value}"):
-            self._accountant.account_group(group)
-            if forward_stats is not None:
-                self._record_group_shape(forward_stats, fb)
-            ctx = ForwardContext(
-                attention_backend=self.attention_backend,
-                attention_backend_name=self.attention_backend_name,
-                stats=forward_stats,
-            )
-            group_start = time.perf_counter_ns() if forward_stats is not None else 0
-            stream_ctx = self._forward_stream_context(fb)
-            with torch.inference_mode(), use_forward_context(ctx), stream_ctx:
-                outputs = self._dispatch_by_mode(
-                    fb, group, defer_text_cpu_results=defer_text_cpu_results
-                )
-            if forward_stats is not None:
-                forward_stats.record_mode_wall_time(
-                    fb.mode.value, time.perf_counter_ns() - group_start
-                )
-            if len(outputs) != len(group):
-                raise invalid_descriptor(
-                    f"model returned {len(outputs)} outputs for {len(group)} ops"
-                )
-            for idx, output in zip(indices, outputs):
-                results[idx] = _to_seq_result(output)
-            # Every index in this group was just populated above, so the
-            # per-op results line up with `fb.op_modes` one-for-one.
-            self._advance_state(fb, [results[idx] for idx in indices])
-            self._stamp_conditioning_locators(fb, group, results)
-
     def _stamp_conditioning_locators(
         self,
         fb: UniForwardBatch,
@@ -553,247 +547,6 @@ class ModelRunner:
             locator = self.model.maybe_publish_conditioning(int(op["req_id"]), int(sampled))
             if locator:
                 result["locator"] = locator
-
-    def _dispatch_by_mode(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        *,
-        defer_text_cpu_results: bool,
-    ) -> list[Any]:
-        """Route one single-mode group to the forward path implementing its mode.
-
-        ``fb.mode`` comes from the shared ``ForwardMode``/``mode_for_op`` mapping;
-        the model-capability flags (``self._has_*``) are resolved once in
-        ``__init__``. A group whose mode has no matching implemented path is a
-        capability mismatch.
-        """
-        strategy = self._mode_strategies.get(fb.mode)
-        if strategy is not None:
-            result = strategy(fb, group, defer_text_cpu_results)
-            if result is not None:
-                return result
-        result = self._run_whole_batch_forward(fb, group, defer_text_cpu_results)
-        if result is not None:
-            return result
-        raise capability_mismatch(
-            f"model advertises ops for mode {fb.mode.value!r} but implements no "
-            f"matching forward path"
-        )
-
-    def _build_mode_strategies(
-        self,
-    ) -> dict[ForwardMode, Callable[[UniForwardBatch, list[tuple[int, Mapping[str, Any]]], bool], list[Any] | None]]:
-        strategies: dict[
-            ForwardMode,
-            Callable[[UniForwardBatch, list[tuple[int, Mapping[str, Any]]], bool], list[Any] | None],
-        ] = {ForwardMode.MIXED: self._run_mixed_mode}
-        strategies.update({mode: self._run_text_mode for mode in _TEXT_DRIVER_MODES})
-        strategies[ForwardMode.DENOISE] = self._run_denoise_mode
-        strategies[ForwardMode.COMMIT] = self._run_commit_mode
-        strategies[ForwardMode.ENCODE] = self._run_encode_mode
-        return strategies
-
-    def _run_mixed_mode(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> list[Any] | None:
-        if self.forward_driver.can_run(self.model, fb):
-            if _MIXED_PROOF_ENABLED:
-                self._log_mixed_proof(fb, group)
-            with profile_range("uniserve.runner.forward"):
-                return self.forward_driver.step(
-                    fb,
-                    group,
-                    self.request_states,
-                    self.model,
-                    defer_text_cpu_results=defer_text_cpu_results,
-                )
-        if self._whole_batch_forward:
-            return self._run_model_forward(fb)
-        if not all(m in _TEXT_DRIVER_MODES for m in fb.op_modes):
-            return None
-        if _MIXED_PROOF_ENABLED:
-            self._log_mixed_proof(fb, group)
-        return self._run_text_driver(fb, defer_text_cpu_results)
-
-    def _run_text_mode(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> list[Any] | None:
-        del group
-        if self._whole_batch_forward:
-            return self._run_model_forward(fb)
-        if self._is_text_capable:
-            return self._run_text_driver(fb, defer_text_cpu_results)
-        return None
-
-    def _run_text_driver(
-        self,
-        fb: UniForwardBatch,
-        defer_text_cpu_results: bool,
-    ) -> list[Any]:
-        with profile_range("uniserve.runner.text_driver"):
-            return self.text_driver.step(
-                fb,
-                self.request_states,
-                self.model,
-                defer_cpu_results=defer_text_cpu_results,
-                defer_sampling=self.defer_sampling,
-                tensor_store=self.tensor_store,
-            )
-
-    def _run_denoise_mode(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> list[Any] | None:
-        del fb, defer_text_cpu_results
-        if not self._has_predict_velocity:
-            return None
-        with profile_range("uniserve.runner.denoise_driver"):
-            return self.denoise_driver.step_many(
-                [
-                    (int(op["req_id"]), self.request_states.get(int(op["req_id"])), op)
-                    for _, op in group
-                ],
-                cast("DenoiseCapable", self.model),
-            )
-
-    def _run_commit_mode(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> list[Any] | None:
-        del fb, defer_text_cpu_results
-        if not self._has_decode_image:
-            return None
-        with profile_range("uniserve.runner.image_decode"):
-            return [
-                self.image_decode_driver.step(
-                    int(op["req_id"]),
-                    self.request_states.get(int(op["req_id"])),
-                    self.model,
-                    op,
-                )
-                for _, op in group
-            ]
-
-    def _run_encode_mode(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> list[Any] | None:
-        del group, defer_text_cpu_results
-        if not self._has_encode:
-            return None
-        with profile_range("uniserve.runner.encode_driver"):
-            return self.encode_driver.step(fb, self.model)
-
-    def _run_whole_batch_forward(
-        self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> list[Any] | None:
-        del group, defer_text_cpu_results
-        if not self._whole_batch_forward:
-            return None
-        return self._run_model_forward(fb)
-
-    def _run_model_forward(self, fb: UniForwardBatch) -> list[Any]:
-        with profile_range("uniserve.runner.model_forward"):
-            return self.model.forward(fb)
-
-    def _groups(self, ops: list[Mapping[str, Any]]) -> list[list[tuple[int, Mapping[str, Any]]]]:
-        """Group ops for one forward step.
-
-        ``supports_mixed_modes`` selects per-mode (not per-position) grouping via
-        ``_mode_ordered_groups``. Mixed windows admitted by
-        ``ForwardAdmissionRouter`` run as one forward when the model exposes the
-        mixed-forward seam; generic text-only models still require the system
-        ``TextBackendGate`` and otherwise split per-mode.
-        """
-        if self.batch_policy.supports_mixed_modes:
-            return self._group_planner.groups(ops)
-        return self._group_planner.groups(ops)
-
-    def _accepts_forward_batch(self, ops: list[Mapping[str, Any]], decision: Any) -> bool:
-        """Whether the admitted mixed window is semantically supported."""
-
-        del decision
-        modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
-        supported = _TEXT_DRIVER_MODES | {ForwardMode.DENOISE, ForwardMode.COMMIT}
-        return bool(modes) and set(modes).issubset(supported)
-
-    @staticmethod
-    def _is_text_denoise_modes(modes: tuple[ForwardMode, ...]) -> bool:
-        mode_set = set(modes)
-        return (
-            bool(mode_set & {ForwardMode.EXTEND, ForwardMode.DECODE})
-            and ForwardMode.DENOISE in mode_set
-        )
-
-    @staticmethod
-    def _is_text_denoise_forward_batch(fb: UniForwardBatch) -> bool:
-        return fb.mode is ForwardMode.MIXED and ModelRunner._is_text_denoise_modes(fb.op_modes)
-
-    def _contiguous_groups(
-        self, ops: list[Mapping[str, Any]]
-    ) -> list[list[tuple[int, Mapping[str, Any]]]]:
-        groups: list[list[tuple[int, Mapping[str, Any]]]] = []
-        for idx, op in enumerate(ops):
-            mode = self._validated_mode(idx, op)
-            if groups:
-                modes = [mode_for_op(item[1]["kind"]) for item in groups[-1]]
-                if self.batch_policy.allows_group([*modes, mode]):
-                    groups[-1].append((idx, op))
-                    continue
-            groups.append([(idx, op)])
-        return groups
-
-    def _mode_ordered_groups(
-        self, ops: list[Mapping[str, Any]]
-    ) -> list[list[tuple[int, Mapping[str, Any]]]]:
-        buckets: dict[ForwardMode, list[tuple[int, Mapping[str, Any]]]] = {}
-        first_seen: list[ForwardMode] = []
-        for idx, op in enumerate(ops):
-            mode = self._validated_mode(idx, op)
-            if mode not in buckets:
-                buckets[mode] = []
-                first_seen.append(mode)
-            buckets[mode].append((idx, op))
-
-        ordered_modes: list[ForwardMode] = []
-        for mode in self.batch_policy.mode_order:
-            if mode in buckets:
-                ordered_modes.append(mode)
-        for mode in first_seen:
-            if mode not in ordered_modes:
-                ordered_modes.append(mode)
-
-        groups: list[list[tuple[int, Mapping[str, Any]]]] = []
-        max_batch_ops = self.batch_policy.max_batch_ops
-        for mode in ordered_modes:
-            items = buckets[mode]
-            for start in range(0, len(items), max_batch_ops):
-                groups.append(items[start:start + max_batch_ops])
-        return groups
-
-    def _validated_mode(self, idx: int, op: Mapping[str, Any]) -> ForwardMode:
-        if not isinstance(op, Mapping):
-            raise invalid_descriptor(f"execute batch.ops[{idx}] must be a map")
-        kind = op.get("kind")
-        if not isinstance(kind, str):
-            raise invalid_descriptor(f"execute batch.ops[{idx}].kind must be a string")
-        return mode_for_op(kind)
 
     def _log_mixed_proof(
         self,
@@ -912,16 +665,3 @@ class ModelRunner:
             latent_rule = self.resource_plan.image_latent or LatentTokens(downsample=16)
             return self._accountant.latent_units(op, state.image, latent_rule)
         return 0
-
-
-def _to_seq_result(output: ForwardOutput | Mapping[str, Any]) -> Any:
-    # Typed drivers return ForwardOutput; whole-batch forward may return raw maps.
-    if isinstance(output, ForwardOutputBase):
-        return output.to_seq_result()
-    if isinstance(output, Mapping):
-        return dict(output)
-    raise invalid_descriptor(f"unsupported forward output type {type(output).__name__}")
-
-
-def _forward_metrics_enabled() -> bool:
-    return env_flag("UNISERVE_FORWARD_METRICS")

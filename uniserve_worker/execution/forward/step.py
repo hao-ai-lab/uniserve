@@ -3,28 +3,29 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
 
-from ..contracts.batch_policy import BatchPolicy
-from ..contracts.batches import ExecuteBatch, UniForwardBatch
-from ..contracts.forward_context import ForwardContext, use_forward_context
-from ..contracts.forward_mode import ForwardMode, mode_for_op
-from ..contracts.forward_stats import ForwardStats
-from ..contracts.outputs import ForwardOutput, ForwardOutputBase
-from ..foundation.env import env_flag
-from ..foundation.errors import invalid_descriptor
-from ..foundation.profiling import profile_range
-from .forward import ForwardResult, ForwardRuntimeHandles
-from .forward_admission import ForwardAdmissionRouter
+from ...contracts.batch_policy import BatchPolicy
+from ...contracts.batches import ExecuteBatch, UniForwardBatch
+from ...contracts.forward_context import ForwardContext, use_forward_context
+from ...contracts.forward_mode import ForwardMode, mode_for_op
+from ...contracts.forward_stats import ForwardStats
+from ...contracts.outputs import ForwardOutput, ForwardOutputBase
+from ...foundation.env import env_flag
+from ...foundation.errors import invalid_descriptor
+from ...foundation.profiling import profile_range
+from .plan import ForwardAdmissionRouter, ForwardRuntimeHandles
 
 __all__ = [
     "ForwardGroupPlanner",
     "ForwardStepExecutor",
     "ForwardStepOptions",
 ]
+
+_GRAPH_SELECTION_DELEGATED_MODES = frozenset({ForwardMode.COMMIT, ForwardMode.ENCODE})
 
 
 @dataclass(frozen=True)
@@ -39,17 +40,15 @@ class ForwardGroupPlanner:
         self,
         batch_policy: BatchPolicy,
         *,
-        accepts_forward_batch: Callable[[list[Mapping[str, Any]], Any], bool],
         log_text_mixed_split: Callable[[list[Mapping[str, Any]], Any], None],
     ) -> None:
         self.batch_policy = batch_policy
-        self._accepts_forward_batch = accepts_forward_batch
         self._log_text_mixed_split = log_text_mixed_split
 
     def groups(self, ops: list[Mapping[str, Any]]) -> list[list[tuple[int, Mapping[str, Any]]]]:
         if self.batch_policy.supports_mixed_modes:
             decision = ForwardAdmissionRouter.from_runtime_config().decide(ops)
-            if decision.use_forward and self._accepts_forward_batch(ops, decision):
+            if decision.use_forward:
                 return [list(enumerate(ops))]
             self._log_text_mixed_split(ops, decision)
             return self._mode_ordered_groups(ops)
@@ -207,6 +206,8 @@ class ForwardStepExecutor:
             tensor_store=self.runner.tensor_store,
             values={
                 "dispatch_batch": fb,
+                "defer_text_cpu_results": defer_text_cpu_results,
+                "defer_sampling": self.runner.defer_sampling,
                 "output_normalizer": normalize_output,
                 "postprocess_side_effects": postprocess_side_effects,
             },
@@ -214,26 +215,18 @@ class ForwardStepExecutor:
         plan = self.runner.forward_plan_builder.build(
             group,
             request_states=self.runner.request_states,
-            graph_policy=self.runner.forward_graph_policy,
+            graph_policy=_graph_policy_for_group(self.runner.forward_graph_policy, fb),
             runtime_handles=runtime_handles,
         )
         device = torch.device(str(getattr(self.runner.model, "device", "cpu") or "cpu"))
         batch = self.runner.unified_forward_batch_builder.build(plan, device=device)
 
-        def run_runtime_forward(_batch: Any) -> ForwardResult:
-            del _batch
-            outputs = self.runner._dispatch_by_mode(
-                fb,
-                group,
-                defer_text_cpu_results=defer_text_cpu_results,
-            )
-            return ForwardResult(runtime_outputs=tuple(outputs))
-
-        result = self.runner.forward_executor.execute(
-            batch,
-            plan,
-            forward_fn=run_runtime_forward,
-        )
+        with self.runner.forward_adapter.bind(
+            dispatch_batch=fb,
+            group=group,
+            defer_text_cpu_results=defer_text_cpu_results,
+        ):
+            result = self.runner.forward_executor.execute(batch, plan)
         if forward_stats is not None and result.graph is not None:
             forward_stats.cuda_graph_runtime_mode_counts[result.graph.program] = (
                 forward_stats.cuda_graph_runtime_mode_counts.get(result.graph.program, 0) + 1
@@ -247,3 +240,11 @@ def _to_seq_result(output: ForwardOutput | Mapping[str, Any]) -> Any:
     if isinstance(output, Mapping):
         return dict(output)
     raise invalid_descriptor(f"unsupported forward output type {type(output).__name__}")
+
+
+def _graph_policy_for_group(policy: Any, fb: UniForwardBatch) -> Any:
+    if getattr(fb, "mode", None) not in _GRAPH_SELECTION_DELEGATED_MODES:
+        return policy
+    if policy is None:
+        return None
+    return replace(policy, graph_selection_delegated=True)

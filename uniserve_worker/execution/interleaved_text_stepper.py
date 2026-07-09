@@ -24,7 +24,7 @@ from ..nn.logits import forced_eos_logits
 from ..runtime.masks import create_causal_mask
 from ..runtime.paged_text_cache import PagedTextCache
 from ..runtime.request_state import append_new_block_ids
-from .forward_stream import build_text_position_indexes
+from .forward.stream import build_text_position_indexes
 
 if TYPE_CHECKING:
     from ..runtime.kv_pool import PagedKVPool
@@ -186,9 +186,10 @@ class InterleavedTextCacheDriver:
         self.owner = owner
         self.request_state_factory = request_state_factory
         self.image_start_token = image_start_token
-        # System-owned decode CUDA graph adapter, constructed lazily on first use
-        # so CPU/eager and non-CUDA integrations never import the graph stack.
+        # System-owned CUDA graph adapters, constructed lazily on first use so
+        # CPU/eager and non-CUDA integrations never import the graph stack.
         self._decode_graph_runner: Any | None = None
+        self._prefill_graph_runner: Any | None = None
 
     def state(self, op: dict[str, Any]) -> Any:
         req_id = int(op["req_id"])
@@ -209,10 +210,24 @@ class InterleavedTextCacheDriver:
         op_list = [dict(op) for op in ops]
         if not op_list:
             return []
-        graphed = self.try_run_decode_graph_logits_batch(op_list)
+        graphed = self.try_run_text_graph_logits_batch(op_list)
         if graphed is not None:
             return graphed
         return [self._run_text_logits_one(op) for op in op_list]
+
+    def try_run_text_graph_logits_batch(
+        self,
+        ops: Sequence[Mapping[str, Any]],
+    ) -> list[torch.Tensor] | None:
+        """Return graph-produced logits for eligible text rows without eager fallback."""
+
+        op_list = [dict(op) for op in ops]
+        if not op_list:
+            return []
+        graphed = self._prefill_graph().maybe_run_batch(self, op_list)
+        if graphed is not None:
+            return graphed
+        return self.try_run_decode_graph_logits_batch(op_list)
 
     def try_run_decode_graph_logits_batch(
         self,
@@ -257,10 +272,19 @@ class InterleavedTextCacheDriver:
     def _decode_graph(self) -> Any:
         runner = self._decode_graph_runner
         if runner is None:
-            from .interleaved_text_graph_runner import InterleavedTextDecodeGraphRunner
+            from .forward.graph.interleaved_text import InterleavedTextDecodeGraphRunner
 
             runner = InterleavedTextDecodeGraphRunner()
             self._decode_graph_runner = runner
+        return runner
+
+    def _prefill_graph(self) -> Any:
+        runner = self._prefill_graph_runner
+        if runner is None:
+            from .forward.graph.interleaved_text import InterleavedTextPrefillGraphRunner
+
+            runner = InterleavedTextPrefillGraphRunner()
+            self._prefill_graph_runner = runner
         return runner
 
     def extend_cache_blocks(self, cache: TextCache, op: dict[str, Any]) -> None:

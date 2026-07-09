@@ -42,15 +42,15 @@ import torch
 
 import uniserve_worker.ops as ops
 
-from ..contracts.forward_context import get_forward_context, use_forward_context
-from ..contracts.forward_mode import ForwardMode
-from ..foundation.env import env_flag
-from ..nn.attention import RadixAttention
-from ..runtime.paged_text_cache import BatchedPagedTextCache
-from .cuda_graph_base import GraphEvent, _GraphRunnerBase, record_graph_stats
+from ....contracts.forward_context import get_forward_context, use_forward_context
+from ....contracts.forward_mode import ForwardMode
+from ....foundation.env import env_flag
+from ....nn.attention import RadixAttention
+from ....runtime.paged_text_cache import BatchedPagedTextCache
+from .base import GraphEvent, _GraphRunnerBase, record_graph_stats
 
 if TYPE_CHECKING:
-    from .interleaved_image_denoise import DenoiseRow
+    from ...interleaved_image_denoise import DenoiseRow
 
 logger = logging.getLogger(__name__)
 

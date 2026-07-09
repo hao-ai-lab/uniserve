@@ -77,24 +77,30 @@ def descriptor_from_model(model: Any) -> ForwardModelDescriptor:
         embed_text=_first_callable(model, ("embed_tokens", "packed_text_embeddings")),
         embed_generation=_first_callable(model, ("embed_generation", "prepare_generation_embeddings")),
         decoder=_first_callable(model, ("forward", "decoder_forward", "packed_decoder_forward")),
-        logits=_first_callable(model, ("compute_logits", "logits", "lm_head")),
+        logits=_first_callable(model, ("compute_logits", "logits", "lm_head"))
+        or _first_overridden_callable(model, ("run_text_logits_batch", "run_text_logits")),
         velocity=_first_callable(model, ("predict_velocity", "velocity", "project_velocity")),
         encode=_first_callable(model, ("encode_image", "encode_latents")),
         commit=_first_callable(model, ("decode_image", "commit")),
     )
+    supports_text = (
+        callable(getattr(model, "forward", None))
+        or _overrides(model, "run_text_logits_batch")
+        or _overrides(model, "run_text_logits")
+    )
+    raw_vocab_size = int(_attr(model, ("vocab_size",), 0))
     descriptor = ForwardModelDescriptor(
         device=device,
         dtype=dtype,
         hidden_size=max(1, int(_attr(model, ("hidden_size", "d_model"), 1))),
-        vocab_size=max(0, int(_attr(model, ("vocab_size",), 0))),
+        vocab_size=max(1 if supports_text else 0, raw_vocab_size),
         num_layers=max(1, int(_attr(model, ("num_layers", "n_layers"), 1))),
         num_q_heads=max(1, int(_attr(model, ("num_q_heads", "num_attention_heads"), 1))),
         num_kv_heads=max(1, int(_attr(model, ("num_kv_heads", "num_key_value_heads"), 1))),
         head_dim=max(1, int(_attr(model, ("head_dim",), 1))),
         attention_scale=float(_attr(model, ("attention_scale",), 1.0)),
         kv_page_size=_optional_int(_attr(model, ("block_size", "kv_page_size"), None)),
-        supports_text=callable(getattr(model, "forward", None))
-        or callable(getattr(model, "run_text_logits_batch", None)),
+        supports_text=supports_text,
         supports_denoise=_overrides(model, "predict_velocity"),
         supports_encode=_overrides(model, "encode_image") or _overrides(model, "encode_latents"),
         supports_commit=_overrides(model, "decode_image"),
@@ -131,6 +137,14 @@ def _first_callable(model: Any, names: tuple[str, ...]) -> Callable[..., Any] | 
     for name in names:
         value = getattr(model, name, None)
         if callable(value):
+            return value
+    return None
+
+
+def _first_overridden_callable(model: Any, names: tuple[str, ...]) -> Callable[..., Any] | None:
+    for name in names:
+        value = getattr(model, name, None)
+        if callable(value) and _overrides(model, name):
             return value
     return None
 

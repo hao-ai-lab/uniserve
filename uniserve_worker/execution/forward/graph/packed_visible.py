@@ -9,23 +9,23 @@ import torch
 
 import uniserve_worker.ops as ops
 
-from ..contracts.forward_context import (
+from ....contracts.forward_context import (
     TextAttentionMetadata,
     get_forward_context,
     use_forward_context,
 )
-from ..contracts.forward_mode import ForwardMode
-from ..foundation.env import env_flag
-from ..foundation.errors import invalid_descriptor
-from ..runtime.host_staging import fill_cpu_ints, is_pinned
-from ..runtime.paged_text_cache import PagedTextCacheSpanCopy
-from .cuda_graph_base import GraphEvent, _GraphRunnerBase, record_graph_stats
-from .forward_stream import (
+from ....contracts.forward_mode import ForwardMode
+from ....foundation.env import env_flag
+from ....foundation.errors import invalid_descriptor
+from ....runtime.host_staging import fill_cpu_ints, is_pinned
+from ....runtime.paged_text_cache import PagedTextCacheSpanCopy
+from ..stream import (
     ForwardGraphPagedKVView,
     ForwardGraphStreamState,
     ForwardPagedKVView,
     ForwardStream,
 )
+from .base import GraphEvent, _GraphRunnerBase, record_graph_stats
 
 logger = logging.getLogger(__name__)
 
@@ -654,7 +654,7 @@ def _backend_can_host_graph(backend: Any) -> bool:
 
 
 def _explicit_attention_backend_name(name: str | None) -> str | None:
-    from ..backends.attention.registry import normalize_attention_backend_name
+    from ....backends.attention.registry import normalize_attention_backend_name
 
     normalized = normalize_attention_backend_name(name)
     if normalized in {"", "auto", "0", "false", "off", "1", "true", "on"}:

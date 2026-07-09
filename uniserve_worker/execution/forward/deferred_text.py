@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ..contracts.outputs import ForwardOutputBase
-from ..foundation.errors import invalid_descriptor
-from ..nn.sampler import DeferredBatchedSamplingResult
-from .text_decode_relay import TextDecodeRelay
+from ...contracts.outputs import ForwardOutputBase
+from ...foundation.errors import invalid_descriptor
+from ...nn.sampler import DeferredBatchedSamplingResult
+from ..text_decode_relay import TextDecodeRelay
 
 if TYPE_CHECKING:
     from ..runtime.request_state import RequestState
