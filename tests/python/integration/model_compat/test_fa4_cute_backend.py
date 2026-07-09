@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -45,6 +47,51 @@ def test_fa4_cute_prefix_bounds_use_packed_gqa_tile_space() -> None:
 
     expected = torch.tensor([[[10, 10], [20, 20], [30, 30]]], dtype=torch.int32)
     torch.testing.assert_close(bounds, expected)
+
+
+def test_fa4_cute_forward_paged_uses_metadata_context_len_without_scalar_sync(monkeypatch) -> None:
+    from uniserve_worker.backends.attention import fa4_cute
+
+    backend = fa4_cute.Fa4CuteAttentionBackend()
+    calls: list[dict[str, object]] = []
+
+    def fake_flash_attn_fwd(q, k, v, **kwargs):
+        del k, v
+        calls.append(dict(kwargs))
+        return q
+
+    def forbid_item(self):  # pragma: no cover - only runs on regression.
+        raise AssertionError("forward_paged must not read max sequence length through Tensor.item()")
+
+    monkeypatch.setattr(fa4_cute, "_fa4_flash_attn_fwd", fake_flash_attn_fwd)
+    monkeypatch.setattr(fa4_cute, "_write_paged_kv_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.Tensor, "item", forbid_item)
+
+    q = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    k_cache = torch.zeros((2, 64, 1, 128), dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.tensor([[0, 1]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([3], dtype=torch.int32)
+    metadata = SimpleNamespace(max_context_len=128)
+
+    with use_forward_context(ForwardContext(attention_metadata=metadata)):
+        out = backend.forward_paged(
+            q,
+            k_cache,
+            v_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            k=k,
+            v=v,
+            causal=True,
+            scale=128**-0.5,
+        )
+
+    assert out.shape == q.shape
+    assert calls
+    assert calls[0]["max_seqlen_k"] == 128
 
 
 def _fa4_cute_unavailable_reason() -> str | None:

@@ -618,6 +618,33 @@ def test_text_denoise_route_uses_forward_driver_unconditionally(text_kind):
     assert model.forward_calls == [[text_kind, "denoise_gen"]]
 
 
+def test_mixed_forward_driver_threads_deferred_text_cpu_flag():
+    class DeferredForwardHookModel(ForwardHookModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.defer_flags: list[bool] = []
+
+        def run_forward(self, batch, *, request_states, group, defer_text_cpu_results=False):
+            self.defer_flags.append(bool(defer_text_cpu_results))
+            return super().run_forward(batch, request_states=request_states, group=group)
+
+    model = DeferredForwardHookModel()
+    submitted = ops("decode_und", "denoise_gen")
+    req_ids = sorted({int(op["req_id"]) for op in submitted})
+
+    result = ModelRunner(model).execute(
+        {
+            "step_id": 1,
+            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
+            "ops": submitted,
+        },
+        defer_text_cpu_results=True,
+    )
+
+    assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
+    assert model.defer_flags == [True]
+
+
 @pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
 def test_text_denoise_forward_route_splits_without_hook(text_kind):
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))

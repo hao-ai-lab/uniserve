@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 
+from ...contracts.forward_context import get_forward_context
 from ...foundation.sizing import ceil_div
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionCapabilities
@@ -146,6 +147,9 @@ class Fa4CuteAttentionBackend:
                 raise ValueError("current paged K/V must match q batch and each other")
             _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k_blh, v_blh)
             live_seqlens += int(k_blh.shape[1])
+        max_seqlen_k = _metadata_context_len(0)
+        if max_seqlen_k <= 0:
+            max_seqlen_k = int(live_seqlens.max().item()) if live_seqlens.numel() else 0
 
         out = _fa4_output(
             _fa4_flash_attn_fwd(
@@ -155,7 +159,7 @@ class Fa4CuteAttentionBackend:
                 page_table=block_table,
                 seqused_k=live_seqlens,
                 max_seqlen_q=int(q_blh.shape[1]),
-                max_seqlen_k=int(live_seqlens.max().item()) if live_seqlens.numel() else 0,
+                max_seqlen_k=max_seqlen_k,
                 softmax_scale=scale,
                 causal=causal,
                 tile_mn=_FA4_TILE_MN,
@@ -354,6 +358,16 @@ def _write_paged_kv_cache(
     # engine sizes block tables so those indices stay in range.
     page_ids, offsets = write_locations(block_table, positions, page_size)
     paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current)
+
+
+def _metadata_context_len(default: int) -> int:
+    metadata = getattr(get_forward_context(), "attention_metadata", None)
+    value = getattr(metadata, "max_context_len", 0)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = 0
+    return max(0, parsed if parsed > 0 else int(default))
 
 
 register_attention_backend("fa4_cute", Fa4CuteAttentionBackend())

@@ -33,7 +33,9 @@ __all__ = [
     'PagedTextCache',
     'BatchedPagedRequestCache',
     'BatchedPagedTextCache',
+    'PagedTextCacheSpanCopy',
     'copy_paged_text_cache_span',
+    'copy_paged_text_cache_spans',
     'stage_paged_text_cache_prefix',
 ]
 
@@ -43,6 +45,14 @@ class _VarlenAppendPlan:
     key: tuple[Any, ...]
     page_ids: torch.Tensor
     offsets: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PagedTextCacheSpanCopy:
+    source: "PagedTextCache"
+    target: "PagedTextCache"
+    start: int
+    length: int
 
 
 class PagedTransformerLayer:
@@ -325,6 +335,149 @@ def copy_paged_text_cache_span(
         )
 
 
+def copy_paged_text_cache_spans(
+    spans: Sequence[PagedTextCacheSpanCopy],
+    *,
+    num_layers: int,
+    missing_message: str = "paged text K/V span is missing",
+) -> None:
+    """Copy multiple logical KV spans between paged text caches."""
+
+    normalized: list[PagedTextCacheSpanCopy] = []
+    for span in spans:
+        start = int(span.start)
+        length = int(span.length)
+        if length <= 0:
+            continue
+        source_pool = getattr(span.source, "pool", None)
+        target_pool = getattr(span.target, "pool", None)
+        source_blocks = list(getattr(span.source, "block_ids", []) or [])
+        if source_pool is None or target_pool is None or not source_blocks:
+            raise RuntimeError(missing_message)
+        span.target.ensure_capacity(start + length)
+        normalized.append(
+            PagedTextCacheSpanCopy(
+                source=span.source,
+                target=span.target,
+                start=start,
+                length=length,
+            )
+        )
+    if not normalized:
+        return
+    if _can_copy_paged_text_cache_spans_direct(normalized, num_layers=int(num_layers)):
+        _copy_paged_text_cache_spans_direct(normalized, num_layers=int(num_layers))
+        return
+    for span in normalized:
+        copy_paged_text_cache_span(
+            span.source,
+            span.target,
+            start=span.start,
+            length=span.length,
+            num_layers=int(num_layers),
+            missing_message=missing_message,
+        )
+
+
+def _can_copy_paged_text_cache_spans_direct(
+    spans: Sequence[PagedTextCacheSpanCopy],
+    *,
+    num_layers: int,
+) -> bool:
+    for span in spans:
+        source_pool = span.source.pool
+        target_pool = span.target.pool
+        if bool(getattr(source_pool, "is_quantized", False)) or bool(
+            getattr(target_pool, "is_quantized", False)
+        ):
+            return False
+        if (
+            source_pool.k.device != source_pool.v.device
+            or target_pool.k.device != target_pool.v.device
+            or source_pool.k.device != target_pool.k.device
+        ):
+            return False
+        if source_pool.num_layers < int(num_layers) or target_pool.num_layers < int(num_layers):
+            return False
+        if source_pool.n_kv != target_pool.n_kv or source_pool.head_dim != target_pool.head_dim:
+            return False
+    return True
+
+
+def _copy_paged_text_cache_spans_direct(
+    spans: Sequence[PagedTextCacheSpanCopy],
+    *,
+    num_layers: int,
+) -> None:
+    groups: dict[tuple[int, int], list[PagedTextCacheSpanCopy]] = {}
+    for span in spans:
+        groups.setdefault((id(span.source.pool), id(span.target.pool)), []).append(span)
+    for group in groups.values():
+        source_pool = group[0].source.pool
+        target_pool = group[0].target.pool
+        source_index = _span_positions(
+            source_pool,
+            [(span.source.block_ids, int(span.start), int(span.length)) for span in group],
+        )
+        target_index = _span_positions(
+            target_pool,
+            [(span.target.block_ids, int(span.start), int(span.length)) for span in group],
+        )
+        if source_index.numel() <= 0:
+            continue
+        layer_count = int(num_layers)
+        source_k = source_pool.k[:layer_count].reshape(
+            layer_count, -1, source_pool.n_kv, source_pool.head_dim
+        )
+        source_v = source_pool.v[:layer_count].reshape(
+            layer_count, -1, source_pool.n_kv, source_pool.head_dim
+        )
+        target_k = target_pool.k[:layer_count].reshape(
+            layer_count, -1, target_pool.n_kv, target_pool.head_dim
+        )
+        target_v = target_pool.v[:layer_count].reshape(
+            layer_count, -1, target_pool.n_kv, target_pool.head_dim
+        )
+        tokens_per_source_layer = int(source_k.shape[1])
+        tokens_per_target_layer = int(target_k.shape[1])
+        layer_offsets = torch.arange(layer_count, device=source_index.device, dtype=torch.long)
+        flat_source_index = (
+            source_index.reshape(1, -1)
+            + (layer_offsets * tokens_per_source_layer).reshape(-1, 1)
+        ).reshape(-1)
+        flat_target_index = (
+            target_index.reshape(1, -1)
+            + (layer_offsets * tokens_per_target_layer).reshape(-1, 1)
+        ).reshape(-1)
+        source_k_flat = source_k.reshape(-1, source_pool.n_kv, source_pool.head_dim)
+        source_v_flat = source_v.reshape(-1, source_pool.n_kv, source_pool.head_dim)
+        target_k_flat = target_k.reshape(-1, target_pool.n_kv, target_pool.head_dim)
+        target_v_flat = target_v.reshape(-1, target_pool.n_kv, target_pool.head_dim)
+        target_k_flat.index_copy_(
+            0,
+            flat_target_index,
+            source_k_flat.index_select(0, flat_source_index).to(dtype=target_k_flat.dtype),
+        )
+        target_v_flat.index_copy_(
+            0,
+            flat_target_index,
+            source_v_flat.index_select(0, flat_source_index).to(dtype=target_v_flat.dtype),
+        )
+
+
+def _span_positions(
+    pool: PagedKVPool,
+    spans: Sequence[tuple[Sequence[int], int, int]],
+) -> torch.Tensor:
+    positions: list[int] = []
+    block_size = int(pool.block_size)
+    for block_ids, start, length in spans:
+        for block_id, offset, count in pool.spans(list(block_ids), int(start), int(length)):
+            base = int(block_id) * block_size + int(offset)
+            positions.extend(range(base, base + int(count)))
+    return torch.tensor(positions, device=pool.k.device, dtype=torch.long)
+
+
 class BatchedPagedRequestCache:
     """Batched transient page view over compatible request caches."""
 
@@ -364,6 +517,9 @@ class BatchedPagedRequestCache:
         self._append_plan = None
         self._block_table_cache.clear()
         self._cache_seqlens_cache.clear()
+
+    def invalidate_append_plan(self) -> None:
+        self._append_plan = None
 
     def block_table(
         self,

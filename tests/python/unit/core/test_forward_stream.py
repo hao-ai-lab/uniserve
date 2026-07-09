@@ -5,6 +5,8 @@ import torch
 
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.execution.forward_stream import (
+    ForwardGraphPagedKVView,
+    ForwardGraphStreamState,
     ForwardPagedKVSegment,
     ForwardPagedKVView,
     ForwardStreamBuilder,
@@ -55,6 +57,38 @@ def test_forward_stream_builds_causal_and_bidirectional_visible_end():
     assert not stream.fully_visible
     torch.testing.assert_close(stream.indexes[:, :3], torch.tensor([[4, 5, 6], [0, 0, 0], [0, 0, 0]]))
     torch.testing.assert_close(stream.indexes[:, 3:], image_indexes)
+
+
+def test_forward_stream_generated_indexes_preserve_explicit_position_start():
+    builder = ForwardStreamBuilder()
+    builder.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=2,
+        prefix_len=100,
+        visible_policy="causal",
+        index_start=7,
+    )
+    builder.add_segment(
+        op_index=1,
+        req_id=2,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=1,
+        prefix_len=4,
+        visible_policy="causal",
+    )
+
+    stream = builder.build()
+
+    assert stream.visible_end.tolist() == [[101, 102], [5, 0]]
+    torch.testing.assert_close(stream.indexes, torch.tensor([[7, 8, 4], [0, 0, 0], [0, 0, 0]]))
 
 
 def test_forward_stream_marks_decode_and_denoise_rows_fully_visible():
@@ -143,6 +177,114 @@ def test_forward_stream_rejects_bad_segment_shapes():
         )
 
 
+def test_forward_graph_stream_state_refreshes_values_without_reallocating_tensors():
+    builder = ForwardStreamBuilder()
+    builder.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=1,
+        prefix_len=3,
+        visible_policy="causal",
+    )
+    builder.add_segment(
+        op_index=1,
+        req_id=2,
+        kind="denoise_gen",
+        mode=ForwardMode.DENOISE,
+        modality="gen",
+        segment_class="denoise",
+        q_len=2,
+        prefix_len=7,
+        branch_id=1,
+        visible_policy="bidirectional",
+        indexes=torch.tensor([[7, 7], [0, 1], [1, 0]], dtype=torch.long),
+    )
+    initial = builder.build(device="cpu")
+    state = ForwardGraphStreamState.from_stream(initial)
+    cu_ptr = state.stream.cu_seqlens_q.data_ptr()
+    visible_ptr = state.stream.visible_end.data_ptr()
+    indexes_ptr = state.stream.indexes.data_ptr()
+    und_ptr = state.stream.und_indices.data_ptr()
+    gen_ptr = state.stream.gen_indices.data_ptr()
+
+    refreshed_builder = ForwardStreamBuilder()
+    refreshed_builder.add_segment(
+        op_index=2,
+        req_id=11,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=1,
+        prefix_len=9,
+        visible_policy="causal",
+    )
+    refreshed_builder.add_segment(
+        op_index=3,
+        req_id=12,
+        kind="denoise_gen",
+        mode=ForwardMode.DENOISE,
+        modality="gen",
+        segment_class="denoise",
+        q_len=2,
+        prefix_len=4,
+        branch_id=1,
+        visible_policy="bidirectional",
+        indexes=torch.tensor([[4, 4], [1, 1], [0, 1]], dtype=torch.long),
+    )
+    refreshed = refreshed_builder.build(device="cpu")
+
+    graph_stream = state.refresh(refreshed)
+
+    assert graph_stream is state.stream
+    assert graph_stream.cu_seqlens_q.data_ptr() == cu_ptr
+    assert graph_stream.visible_end.data_ptr() == visible_ptr
+    assert graph_stream.indexes.data_ptr() == indexes_ptr
+    assert graph_stream.und_indices.data_ptr() == und_ptr
+    assert graph_stream.gen_indices.data_ptr() == gen_ptr
+    assert [seg.req_id for seg in graph_stream.segments] == [11, 12]
+    torch.testing.assert_close(graph_stream.cu_seqlens_q, refreshed.cu_seqlens_q)
+    torch.testing.assert_close(graph_stream.visible_end, refreshed.visible_end)
+    torch.testing.assert_close(graph_stream.indexes, refreshed.indexes)
+    torch.testing.assert_close(graph_stream.und_indices, refreshed.und_indices)
+    torch.testing.assert_close(graph_stream.gen_indices, refreshed.gen_indices)
+
+
+def test_forward_graph_stream_state_rejects_geometry_changes():
+    builder = ForwardStreamBuilder()
+    builder.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=1,
+        prefix_len=0,
+        visible_policy="causal",
+    )
+    state = ForwardGraphStreamState.from_stream(builder.build())
+    changed = ForwardStreamBuilder()
+    changed.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="prefill_und",
+        mode=ForwardMode.EXTEND,
+        modality="und",
+        segment_class="extend",
+        q_len=2,
+        prefix_len=0,
+        visible_policy="causal",
+    )
+
+    with pytest.raises(Exception, match="geometry"):
+        state.refresh(changed.build())
+
+
 def test_forward_paged_kv_view_appends_ragged_segments_into_one_pool():
     pool = PagedKVPool(
         num_layers=1,
@@ -179,6 +321,84 @@ def test_forward_paged_kv_view_appends_ragged_segments_into_one_pool():
     torch.testing.assert_close(pool.v[0, 3, 3], v[2])
     torch.testing.assert_close(pool.v[0, 4, 0], v[3])
     torch.testing.assert_close(pool.v[0, 4, 1], v[4])
+
+
+def test_forward_graph_paged_kv_view_refreshes_tables_without_reallocating_tensors():
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=5,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    view = ForwardGraphPagedKVView(
+        pool,
+        [
+            ForwardPagedKVSegment(block_ids=(0, 1), base_len=3, q_len=2),
+            ForwardPagedKVSegment(block_ids=(2,), base_len=0, q_len=3, persist_kv=False),
+        ],
+    )
+    block_table = view.block_table()
+    cache_after = view.cache_seqlens_after()
+    cu_after = view.cu_seqlens_after()
+    persistent_after = view.persistent_cache_seqlens_after()
+    page_ids, offsets, token_indices = view._write_plan()
+    ptrs = {
+        "block_table": block_table.data_ptr(),
+        "cache_after": cache_after.data_ptr(),
+        "cu_after": cu_after.data_ptr(),
+        "persistent_after": persistent_after.data_ptr(),
+        "page_ids": page_ids.data_ptr(),
+        "offsets": offsets.data_ptr(),
+    }
+
+    view.refresh(
+        [
+            ForwardPagedKVSegment(block_ids=(3, 4), base_len=4, q_len=2),
+            ForwardPagedKVSegment(block_ids=(1,), base_len=1, q_len=3, persist_kv=False),
+        ]
+    )
+    refreshed_page_ids, refreshed_offsets, refreshed_token_indices = view._write_plan()
+
+    assert view.block_table().data_ptr() == ptrs["block_table"]
+    assert view.cache_seqlens_after().data_ptr() == ptrs["cache_after"]
+    assert view.cu_seqlens_after().data_ptr() == ptrs["cu_after"]
+    assert view.persistent_cache_seqlens_after().data_ptr() == ptrs["persistent_after"]
+    assert refreshed_page_ids.data_ptr() == ptrs["page_ids"]
+    assert refreshed_offsets.data_ptr() == ptrs["offsets"]
+    assert token_indices is None
+    assert refreshed_token_indices is None
+    assert view.block_table().tolist() == [[3, 4], [1, 0]]
+    assert view.cache_seqlens_before().tolist() == [4, 1]
+    assert view.cache_seqlens_after().tolist() == [6, 4]
+    assert view.cu_seqlens_after().tolist() == [0, 6, 10]
+    assert view.persistent_cache_seqlens_after().tolist() == [6, 1]
+    assert refreshed_page_ids.tolist() == [4, 4, 1, 1, 1]
+    assert refreshed_offsets.tolist() == [0, 1, 1, 2, 3]
+    assert view.max_seqlen_k() == 6
+
+    k = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
+    v = -k
+    view.append_packed(0, k, v)
+
+    torch.testing.assert_close(pool.k[0, 4, 0], k[0])
+    torch.testing.assert_close(pool.k[0, 4, 1], k[1])
+    torch.testing.assert_close(pool.v[0, 1, 1], v[2])
+    torch.testing.assert_close(pool.v[0, 1, 2], v[3])
+    torch.testing.assert_close(pool.v[0, 1, 3], v[4])
+
+
+def test_forward_graph_paged_kv_view_rejects_geometry_changes():
+    pool = PagedKVPool(1, 2, 4, 1, 2, device="cpu", dtype=torch.float32)
+    view = ForwardGraphPagedKVView(
+        pool,
+        [ForwardPagedKVSegment(block_ids=(0,), base_len=0, q_len=1)],
+    )
+
+    with pytest.raises(Exception, match="geometry"):
+        view.refresh([ForwardPagedKVSegment(block_ids=(0,), base_len=0, q_len=2)])
 
 
 def test_forward_paged_kv_view_requires_one_pool():

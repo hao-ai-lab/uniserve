@@ -2743,9 +2743,9 @@ impl Scheduler {
         pos: usize,
         budget: usize,
         allowed: Option<&[u32]>,
-    ) -> (u16, Option<Vec<u32>>) {
+    ) -> (u16, Option<Vec<u32>>, bool) {
         let Some(st) = self.running.get(&id) else {
-            return (1, None);
+            return (1, None, false);
         };
         if self.decode_token_burst <= 1
             || use_last_sampled
@@ -2755,7 +2755,7 @@ impl Scheduler {
             || st.grammar.is_some()
             || allowed.is_some()
         {
-            return (1, None);
+            return (1, None, false);
         }
         let sp = &st.req.sampling;
         let penalties = sp.repetition_penalty != 1.0
@@ -2767,7 +2767,7 @@ impl Scheduler {
             || penalties
             || st.n_generated < sp.min_tokens
         {
-            return (1, None);
+            return (1, None, false);
         }
 
         let remaining = st.req.max_tokens.saturating_sub(st.n_generated);
@@ -2782,7 +2782,7 @@ impl Scheduler {
             )
             .max(1);
         if count <= 1 {
-            return (1, None);
+            return (1, None, false);
         }
 
         let mut stop_ids = Vec::new();
@@ -2802,7 +2802,8 @@ impl Scheduler {
         }
         stop_ids.sort_unstable();
         stop_ids.dedup();
-        (count, (!stop_ids.is_empty()).then_some(stop_ids))
+        let terminal = !stop_ids.is_empty() && !st.req.uses_default_generation();
+        (count, (!stop_ids.is_empty()).then_some(stop_ids), terminal)
     }
 
     fn decode_burst_kv_cap(&self, id: RequestId, pos: usize) -> usize {
@@ -3080,6 +3081,7 @@ impl Scheduler {
                     "denoise_step_count": op.denoise_step_count,
                     "decode_token_count": op.decode_token_count,
                     "decode_stop_token_ids_len": op.decode_stop_token_ids.as_ref().map(|ids| ids.len()).unwrap_or(0),
+                    "decode_stop_terminal": op.decode_stop_terminal,
                     "cond_pos": op.cond_pos,
                     "image_in": op.image_in,
                     "mm_hash": op.mm_hash,
@@ -3293,13 +3295,14 @@ impl Scheduler {
                 let tok = if use_last_sampled { 0 } else { st.next_token };
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                let (decode_token_count, decode_stop_token_ids) = self.decode_burst_plan(
-                    id,
-                    use_last_sampled,
-                    pos as usize,
-                    budget,
-                    allowed.as_deref(),
-                );
+                let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) = self
+                    .decode_burst_plan(
+                        id,
+                        use_last_sampled,
+                        pos as usize,
+                        budget,
+                        allowed.as_deref(),
+                    );
                 let spec_token_ids =
                     if !use_last_sampled && budget > 1 && self.supports_spec_decode() {
                         self.running.get(&id).and_then(|st| {
@@ -3339,6 +3342,7 @@ impl Scheduler {
                     spec_token_ids,
                     decode_token_count: (decode_len > 1).then_some(decode_len as u16),
                     decode_stop_token_ids,
+                    decode_stop_terminal,
                     recent_tokens: recent,
                     allowed_tokens: allowed,
                     suppress_tokens: suppress,
@@ -4026,6 +4030,10 @@ impl Scheduler {
 
     fn resolve_decode_text(&mut self, id: RequestId, sr: uniserve_worker_wire::SeqResult) {
         self.bm.activate(id);
+        let burst_tokens = sr
+            .sampled_token_ids
+            .as_ref()
+            .is_some_and(|ids| !ids.is_empty());
         let tokens = sr
             .sampled_token_ids
             .clone()
@@ -4062,6 +4070,12 @@ impl Scheduler {
                 && uses_default_generation
                 && images_done < max_images
             {
+                if burst_tokens
+                    && is_last
+                    && let Some(st) = self.running.get_mut(&id)
+                {
+                    st.pos = st.pos.saturating_add(1);
+                }
                 self.begin_image(id);
                 return;
             }
@@ -4115,6 +4129,12 @@ impl Scheduler {
                     .map(|s| ends_with(&s.generated_ids, &self.ctrl.image_start_ids))
                     .unwrap_or(false);
                 if triggered {
+                    if burst_tokens
+                        && is_last
+                        && let Some(st) = self.running.get_mut(&id)
+                    {
+                        st.pos = st.pos.saturating_add(1);
+                    }
                     self.begin_image(id);
                     return;
                 }
@@ -4983,6 +5003,67 @@ mod tests {
     }
 
     #[test]
+    fn plain_decode_burst_marks_stop_tokens_terminal() {
+        let mut sched = test_scheduler();
+        sched.decode_token_burst = 8;
+        let mut req = test_request(1, 5);
+        req.stop_token_ids = vec![77];
+        sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.phase = Phase::DecodeUnd;
+            st.prompt_cursor = 5;
+            st.pos = 5;
+            st.next_token = 11;
+        }
+
+        let op = sched.next_op(id, 8).expect("decode op");
+
+        assert_eq!(op.kind, OpKind::DecodeUnd);
+        assert!(op.decode_token_count.unwrap_or(1) > 1);
+        assert!(
+            op.decode_stop_token_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&77))
+        );
+        assert!(op.decode_stop_terminal);
+    }
+
+    #[test]
+    fn default_generation_decode_burst_keeps_transition_stops_nonterminal() {
+        let mut sched = test_scheduler();
+        sched.decode_token_burst = 8;
+        let mut req = test_request(1, 5);
+        req.constraint = uniserve_core::GenerationConstraint::Default;
+        req.image = uniserve_core::ImageParams {
+            max_images: 1,
+            ..Default::default()
+        };
+        sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.phase = Phase::DecodeUnd;
+            st.prompt_cursor = 5;
+            st.pos = 5;
+            st.next_token = 11;
+            st.images_done = 0;
+        }
+
+        let op = sched.next_op(id, 8).expect("decode op");
+
+        assert_eq!(op.kind, OpKind::DecodeUnd);
+        assert!(op.decode_token_count.unwrap_or(1) > 1);
+        assert!(
+            op.decode_stop_token_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(&sched.ctrl.start_of_image))
+        );
+        assert!(!op.decode_stop_terminal);
+    }
+
+    #[test]
     fn planning_text_prefill_does_not_advance_committed_cursor() {
         let mut sched = test_scheduler();
         let req = test_request(1, 5);
@@ -5473,6 +5554,147 @@ mod tests {
         assert!(allocated_blocks >= image_boundary_blocks);
         assert_eq!(generated_ids, vec![sched.ctrl.start_of_image]);
         assert_eq!(phase, Phase::DenoiseGen);
+    }
+
+    #[test]
+    fn default_generation_burst_image_trigger_advances_speculative_feed() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            latent_downsample: 16,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 16,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(1, 4);
+        req.constraint = uniserve_core::GenerationConstraint::Default;
+        req.max_tokens = 8;
+        req.image = uniserve_core::ImageParams {
+            height: 64,
+            width: 64,
+            max_images: 1,
+            retain_images: true,
+            ..Default::default()
+        };
+        req.event_tx = tx;
+        sched.submit_for_test(req);
+        sched.admit();
+
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.phase = Phase::DecodeUnd;
+            st.pos = 10;
+            st.next_token = 77;
+            st.n_generated = 0;
+            st.generated_ids.clear();
+        }
+        let transition = PlannedTransition::from_forward_op(&ForwardOp {
+            req_id: id,
+            kind: OpKind::DecodeUnd,
+            modality: Modality::Und,
+            pos_range: (10, 11),
+            decode_token_count: Some(3),
+            ..Default::default()
+        });
+        sched.resolve(
+            id,
+            transition,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(sched.ctrl.start_of_image),
+                sampled_token_ids: Some(vec![5, sched.ctrl.start_of_image]),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let st = sched.running.get(&id).expect("request enters image phase");
+        assert_eq!(st.phase, Phase::DenoiseGen);
+        assert_eq!(st.pos, 13);
+        assert_eq!(st.cond_pos, 13);
+        assert_eq!(st.generated_ids, vec![5, sched.ctrl.start_of_image]);
+    }
+
+    #[test]
+    fn default_generation_burst_literal_image_trigger_advances_speculative_feed() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            latent_downsample: 16,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens {
+                image_start_ids: vec![21, 22],
+                ..Default::default()
+            },
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 16,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                ..Default::default()
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = test_request(1, 4);
+        req.constraint = uniserve_core::GenerationConstraint::Default;
+        req.max_tokens = 8;
+        req.image = uniserve_core::ImageParams {
+            height: 64,
+            width: 64,
+            max_images: 1,
+            retain_images: true,
+            ..Default::default()
+        };
+        req.event_tx = tx;
+        sched.submit_for_test(req);
+        sched.admit();
+
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.phase = Phase::DecodeUnd;
+            st.pos = 10;
+            st.next_token = 77;
+            st.n_generated = 0;
+            st.generated_ids.clear();
+        }
+        let transition = PlannedTransition::from_forward_op(&ForwardOp {
+            req_id: id,
+            kind: OpKind::DecodeUnd,
+            modality: Modality::Und,
+            pos_range: (10, 11),
+            decode_token_count: Some(3),
+            ..Default::default()
+        });
+        sched.resolve(
+            id,
+            transition,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(22),
+                sampled_token_ids: Some(vec![21, 22]),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let st = sched.running.get(&id).expect("request enters image phase");
+        assert_eq!(st.phase, Phase::DenoiseGen);
+        assert_eq!(st.pos, 13);
+        assert_eq!(st.cond_pos, 13);
+        assert_eq!(st.generated_ids, vec![21, 22]);
     }
 
     #[test]

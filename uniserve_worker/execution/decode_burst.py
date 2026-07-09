@@ -58,6 +58,7 @@ class DecodeBurstExecutor:
     ) -> dict[str, Any]:
         count = _positive_int(first_op.get("decode_token_count") or 1, "decode_token_count")
         stop_ids = set(_int_list(first_op.get("decode_stop_token_ids") or []))
+        terminal_stop = first_op.get("decode_stop_terminal") is True
         tokens: list[int] = []
         last: dict[str, Any] = {}
         op = dict(first_op)
@@ -78,7 +79,7 @@ class DecodeBurstExecutor:
             if pending is not None:
                 last = resolve(pending)
                 pending = None
-                if tokens[-1] in stop_ids:
+                if not terminal_stop and tokens[-1] in stop_ids:
                     out = None
                     break
             pending = out
@@ -89,7 +90,13 @@ class DecodeBurstExecutor:
         if pending is not None:
             last = resolve(pending)
 
-        result = dict(last)
+        if terminal_stop:
+            tokens = _truncate_at_stop(tokens, stop_ids)
+        result = (
+            {"req_id": _positive_int(first_op.get("req_id"), "req_id", minimum=0)}
+            if terminal_stop
+            else dict(last)
+        )
         result["sampled_token_id"] = tokens[-1]
         result["sampled_token_ids"] = tokens
         return result
@@ -116,6 +123,7 @@ class DecodeBurstExecutor:
                     "requested": count,
                     "launched": 0,
                     "stop_ids": set(_int_list(op_dict.get("decode_stop_token_ids") or [])),
+                    "terminal_stop": op_dict.get("decode_stop_terminal") is True,
                     "tokens": [],
                     "last": None,
                     "pending": None,
@@ -150,7 +158,7 @@ class DecodeBurstExecutor:
                 token = _positive_int(result.get("sampled_token_id"), "sampled_token_id", minimum=0)
                 state["tokens"].append(token)
                 state["last"] = result
-                if token in state["stop_ids"]:
+                if not state["terminal_stop"] and token in state["stop_ids"]:
                     state["pending"] = None
                     state["done"] = True
 
@@ -164,9 +172,13 @@ class DecodeBurstExecutor:
                 state["last"] = result
                 state["pending"] = None
             tokens = [int(token) for token in state["tokens"]]
+            if state["terminal_stop"]:
+                tokens = _truncate_at_stop(tokens, state["stop_ids"])
             last = dict(state["last"] or {})
             if not tokens:
                 raise invalid_descriptor("decode burst did not produce a sampled token")
+            if state["terminal_stop"]:
+                last = {"req_id": _positive_int(state["op"].get("req_id"), "req_id", minimum=0)}
             last["sampled_token_id"] = tokens[-1]
             if int(state["requested"]) > 1:
                 last["sampled_token_ids"] = tokens
@@ -227,6 +239,17 @@ def _int_list(value: Any) -> list[int]:
         if not isinstance(item, int) or isinstance(item, bool) or item < 0:
             raise invalid_descriptor(f"decode_stop_token_ids[{idx}] must be a non-negative integer")
         out.append(int(item))
+    return out
+
+
+def _truncate_at_stop(tokens: list[int], stop_ids: set[int]) -> list[int]:
+    if not stop_ids:
+        return tokens
+    out: list[int] = []
+    for token in tokens:
+        out.append(int(token))
+        if int(token) in stop_ids:
+            break
     return out
 
 

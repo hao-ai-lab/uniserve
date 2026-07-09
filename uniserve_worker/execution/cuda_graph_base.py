@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
 from typing import Any, Callable
@@ -28,6 +29,11 @@ _CAPTURE_WARMUP_ITERS = 2
 # passes ``text_`` explicitly; the default matches so component metrics land in
 # one namespace regardless of construction site.
 _DEFAULT_METRIC_PREFIX = "text_"
+
+
+def _record_function_scope(name: str):
+    record = getattr(torch.profiler, "record_function", None)
+    return record(name) if callable(record) else nullcontext()
 
 def maybe_weak_ref_cuda_graph_tensor(tensor: Any) -> Any:
     if not isinstance(tensor, torch.Tensor):
@@ -233,20 +239,25 @@ class _GraphRunnerBase:
             event = GraphEvent.REPLAY
             if state is None:
                 start = ctx.component_timer_start()
-                state = capture()
+                with _record_function_scope(f"uniserve.cuda_graph.{capture_metric}"):
+                    state = capture()
                 ctx.record_component_elapsed(capture_metric, start)
                 self.states[key] = state
                 event = GraphEvent.CAPTURE_REPLAY
             start = ctx.component_timer_start()
-            copy_inputs(state)
+            with _record_function_scope(f"uniserve.cuda_graph.{input_copy_metric}"):
+                copy_inputs(state)
             ctx.record_component_elapsed(input_copy_metric, start)
             if after_copy is not None:
                 start = ctx.component_timer_start()
-                after_copy(state)
+                metric = after_copy_metric or "prepare"
+                with _record_function_scope(f"uniserve.cuda_graph.{metric}"):
+                    after_copy(state)
                 if after_copy_metric is not None:
                     ctx.record_component_elapsed(after_copy_metric, start)
             start = ctx.component_timer_start()
-            logits = replay(state)
+            with _record_function_scope(f"uniserve.cuda_graph.{replay_metric}"):
+                logits = replay(state)
             ctx.record_component_elapsed(replay_metric, start)
             record(event)
             return logits

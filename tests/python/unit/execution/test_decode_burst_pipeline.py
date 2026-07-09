@@ -88,6 +88,18 @@ def test_burst_stop_token_ends_sequence_and_speculative_forward_conditions_on_it
     assert model.seen_sources == ["wire", "last_sampled", "last_sampled"]
 
 
+def test_terminal_burst_stop_truncates_result_after_full_speculative_burst():
+    model = _ScriptedTextModel([5, 7, 9, 10])
+    op = _burst_op(4, stop_ids=[7])
+    op["decode_stop_terminal"] = True
+    seq = _run_burst(model, op)
+
+    assert seq["sampled_token_ids"] == [5, 7]
+    assert seq["sampled_token_id"] == 7
+    assert model.seen_tokens == [[11], [5], [7], [9]]
+    assert model.seen_sources == ["wire", "last_sampled", "last_sampled", "last_sampled"]
+
+
 def test_burst_relay_ops_carry_device_relay_tensor():
     captured: list[dict] = []
 

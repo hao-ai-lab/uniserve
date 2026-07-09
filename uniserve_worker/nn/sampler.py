@@ -211,6 +211,7 @@ class DeferredBatchedSamplingResult:
         self._top_values_cpu = top_values_cpu
         self._top_indices_cpu = top_indices_cpu
         self._finalized: BatchedSamplingResult | None = None
+        self._token_ids: list[int] | None = None
 
     def finalize(self) -> BatchedSamplingResult:
         if self._finalized is None:
@@ -224,6 +225,21 @@ class DeferredBatchedSamplingResult:
                 device_tokens=self.device_tokens,
             )
         return self._finalized
+
+    def _ensure_token_ids(self) -> list[int]:
+        if self._token_ids is None:
+            if self._copy_event is not None:
+                self._copy_event.synchronize()
+            tokens = self._tokens_cpu.reshape(-1)
+            if tokens.device.type != "cpu":
+                tokens = tokens.detach().to("cpu")
+            self._token_ids = [int(token) for token in tokens.tolist()]
+        return self._token_ids
+
+    def token_ids(self) -> list[int]:
+        """Return sampled token ids without materializing logprob payloads."""
+
+        return list(self._ensure_token_ids())
 
     def ready(self) -> bool:
         if self._finalized is not None or self._copy_event is None:
@@ -244,7 +260,7 @@ class DeferredBatchedSamplingResult:
             return None
 
     def _sample_for_row(self, row: int) -> TokenSample:
-        token_id = int(self._tokens_cpu[row].item())
+        token_id = self._ensure_token_ids()[int(row)]
         n = int(self._n_logprobs[row]) if self._n_logprobs is not None else 0
         if n <= 0:
             return TokenSample(token_id, None, None)

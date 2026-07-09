@@ -27,6 +27,7 @@ import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.execution import paged_denoise as paged_denoise_mod
 from uniserve_worker.execution.denoise_step_graph import (
     DENOISE_STEP_GRAPH_ENV,
     DenoiseStepGraphRunner,
@@ -34,7 +35,9 @@ from uniserve_worker.execution.denoise_step_graph import (
     release_denoise_step_graphs,
 )
 from uniserve_worker.execution.interleaved_image_denoise import DenoiseRow
+from uniserve_worker.execution.paged_denoise import can_run_paged_denoise_attention
 from uniserve_worker.nn.attention import RadixAttention
+from uniserve_worker.ops import AttentionRegime
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
@@ -136,6 +139,43 @@ def _make_pool(device: torch.device) -> PagedKVPool:
         device=device,
         dtype=_DTYPE,
     )
+
+
+@requires_cuda
+def test_paged_denoise_uses_transient_varlen_attention_metadata(monkeypatch):
+    device = torch.device("cuda")
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=4,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=8,
+        device=device,
+        dtype=torch.float16,
+    )
+    cache = PagedTextCache(pool, [1], num_layers=1, length=0)
+    prototype = torch.empty((1, 2, 16), device=device, dtype=torch.float16)
+    calls = []
+
+    def fake_can_run_attention(q, k, v, **kwargs):
+        del k, v
+        calls.append((q, kwargs))
+        return True
+
+    monkeypatch.setattr(paged_denoise_mod.ops, "can_run_attention", fake_can_run_attention)
+
+    assert can_run_paged_denoise_attention(cache, prototype=prototype, query_width=8)
+
+    assert len(calls) == 1
+    q_probe, kwargs = calls[0]
+    assert tuple(q_probe.shape) == (1, 1, 8)
+    assert kwargs["regime"] is AttentionRegime.EXTEND
+    assert kwargs["kv_cache"] is cache.request_cache_for_transient(0, 2)
+    assert kwargs["block_table"].shape == (1, 1)
+    assert kwargs["cu_seqlens_q"].tolist() == [0, 2]
+    assert kwargs["cu_seqlens_k"].tolist() == [0, 2]
+    assert kwargs["max_seqlen_q"] == 2
+    assert kwargs["max_seqlen_k"] == 2
 
 
 def _make_caches(

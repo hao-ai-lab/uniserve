@@ -216,6 +216,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         raw_num_tokens: int,
         ctx: Any,
         forward_fn: Callable[[TextInitialPrefillGraphState], torch.Tensor],
+        prepare_backend: Callable[[TextInitialPrefillGraphState, Any], None] | None = None,
     ) -> TextInitialPrefillGraphState:
         """Capture an initial-prefill token bucket bound to the model forward."""
 
@@ -254,13 +255,18 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 last_token_indices=last_token_indices,
             )
 
+        def prepare(capture_state: TextInitialPrefillGraphState) -> None:
+            _reset_append_plan(capture_state)
+            if prepare_backend is not None:
+                prepare_backend(capture_state, graph_ctx)
+
         try:
             captured = self._capture_graph_state(
                 device=device,
                 state=state,
                 run=run,
                 copy_inputs=copy_inputs,
-                before_run=_reset_append_plan,
+                before_run=prepare,
             )
             assert_paged_prefill_graph_wrapper_planned(captured, graph_ctx)
             return captured
@@ -270,6 +276,16 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
             if callable(release):
                 release()
             raise
+
+    def _prepare_prefill_graph(
+        self,
+        state: TextInitialPrefillGraphState,
+        ctx: Any,
+        prepare_backend: Callable[[TextInitialPrefillGraphState, Any], None] | None,
+    ) -> None:
+        _reset_append_plan(state)
+        if prepare_backend is not None:
+            prepare_backend(state, ctx)
 
     def maybe_run(
         self,
@@ -286,6 +302,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         raw_num_tokens: int,
         ctx: Any,
         forward_fn: Callable[[TextInitialPrefillGraphState], torch.Tensor],
+        prepare_backend: Callable[[TextInitialPrefillGraphState, Any], None] | None = None,
     ) -> torch.Tensor | None:
         """Capture-or-replay an initial-prefill bucket; ``None`` on miss/fallback."""
 
@@ -315,6 +332,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 raw_num_tokens=raw_num_tokens,
                 ctx=ctx,
                 forward_fn=forward_fn,
+                prepare_backend=prepare_backend,
             )
 
         def copy_inputs(state: TextInitialPrefillGraphState) -> None:
@@ -357,7 +375,8 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
             capture_metric=f"{self.metric_prefix}prefill_graph_capture",
             input_copy_metric=f"{self.metric_prefix}prefill_graph_input_copy",
             replay_metric=f"{self.metric_prefix}prefill_graph_replay_launch",
-            after_copy=_reset_append_plan,
+            after_copy=lambda state: self._prepare_prefill_graph(state, ctx, prepare_backend),
+            after_copy_metric=f"{self.metric_prefix}prefill_graph_attention_prepare",
         )
 
     def warmup(
@@ -368,12 +387,14 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         block_size: int,
         device: torch.device,
         max_context_len: int = 0,
+        attention_backend_name: str | None = "auto",
         forward_fn: Callable[[TextInitialPrefillGraphState], torch.Tensor],
+        prepare_backend: Callable[[TextInitialPrefillGraphState, Any], None] | None = None,
     ) -> None:
         """Pre-capture initial-prefill token/batch buckets ahead of serving."""
 
         max_tokens = int(num_blocks) * int(block_size)
-        ctx = ForwardContext(attention_backend_name="auto")
+        ctx = ForwardContext(attention_backend_name=attention_backend_name or "auto")
 
         def max_kv_bucket() -> int:
             context_len = int(max_context_len)
@@ -424,6 +445,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 raw_num_tokens=num_tokens,
                 ctx=capture_ctx,
                 forward_fn=forward_fn,
+                prepare_backend=prepare_backend,
             )
 
         def copy_inputs(bucket: tuple[int, int], state: TextInitialPrefillGraphState) -> None:
@@ -446,6 +468,10 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 last_token_indices=inputs.last_token_indices,
             )
 
+        def replay_state(state: TextInitialPrefillGraphState) -> None:
+            self._prepare_prefill_graph(state, ctx, prepare_backend)
+            state.graph.replay()
+
         self._warmup_capture_buckets(
             device=device,
             ctx=ctx,
@@ -454,7 +480,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
             should_skip=should_skip,
             capture_bucket=capture_bucket,
             copy_inputs=copy_inputs,
-            replay=lambda state: state.graph.replay(),
+            replay=replay_state,
             disable=lambda bucket, exc: self.disable(
                 int(bucket[0]),
                 exc,
@@ -747,6 +773,89 @@ def copy_text_initial_prefill_graph_inputs(
         state.last_token_indices[:real_rows].copy_(flat_indices.to(dtype=torch.long), non_blocking=True)
         if real_rows < state.batch_size:
             state.last_token_indices[real_rows:].zero_()
+
+
+def resolve_paged_prefill_graph_prepare(
+    *,
+    owner: Any,
+    kv_pool: PagedKVPool,
+    attention_backend_name: str | None,
+    before: Callable[[TextInitialPrefillGraphState, Any], None] | None = None,
+) -> Callable[[TextInitialPrefillGraphState, Any], None] | None:
+    """Build the per-replay prefill-graph prepare hook, or ``None`` to stay eager."""
+
+    backend = _resolve_graph_prefill_backend(ForwardContext(attention_backend_name=attention_backend_name))
+    if backend is None:
+        return None
+    prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
+    if callable(prepare):
+        geometry_hook = getattr(owner, "text_decode_graph_query_geometry", None)
+        if not callable(geometry_hook):
+            return None
+        num_q_heads, scale, q_dtype = geometry_hook()
+
+        def prepare_with_backend(state: TextInitialPrefillGraphState, ctx: Any) -> None:
+            if before is not None:
+                before(state, ctx)
+            bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
+            release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
+            if state.release_backend is None and callable(bind) and callable(release):
+                bind(state.metadata, device=state.input_ids.device)
+                state.release_backend = lambda: release(state.metadata)
+            prepare_paged_prefill_graph_backend(
+                state,
+                backend=backend,
+                num_q_heads=int(num_q_heads),
+                num_kv_heads=int(kv_pool.n_kv),
+                head_dim=int(kv_pool.head_dim),
+                page_size=int(kv_pool.block_size),
+                q_dtype=q_dtype,
+                kv_dtype=kv_pool.k.dtype,
+                causal=True,
+                scale=scale,
+            )
+
+        return prepare_with_backend
+    try:
+        caps = backend.capabilities()
+    except Exception:
+        return None
+    if not bool(getattr(caps, "paged_varlen_cuda_graph", False)):
+        return None
+
+    def prepare_direct_graph_backend(state: TextInitialPrefillGraphState, ctx: Any) -> None:
+        if before is not None:
+            before(state, ctx)
+
+    return prepare_direct_graph_backend
+
+
+def prepare_paged_prefill_graph_backend(
+    state: TextInitialPrefillGraphState,
+    *,
+    backend: Any,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    causal: bool,
+    scale: float | None,
+) -> None:
+    """Refresh ``backend``'s graph-prefill plan buffers for the pending replay."""
+
+    backend.prepare_paged_prefill_cuda_graph(
+        state.metadata,
+        num_q_heads=int(num_q_heads),
+        num_kv_heads=int(num_kv_heads),
+        head_dim=int(head_dim),
+        page_size=int(page_size),
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        causal=bool(causal),
+        scale=scale,
+    )
 
 
 def bind_paged_prefill_graph_wrapper(state: TextInitialPrefillGraphState, ctx: Any) -> None:

@@ -225,6 +225,53 @@ def test_attention_provider_skips_paged_only_varlen_without_block_table():
     )
 
 
+def test_attention_provider_rejects_raw_paged_varlen_page_size_mismatch():
+    class _PagedVarlenBackend:
+        name = "paged_varlen"
+
+        def capabilities(self):
+            return AttentionCapabilities(
+                varlen_attention=True,
+                varlen_paged_kv=True,
+                paged_block_size_multiple=256,
+            )
+
+    provider = _AttentionBackendProvider(_PagedVarlenBackend())
+    q = torch.empty(3, 2, 4)
+    v = torch.empty(4, 64, 2, 4)
+    cu = torch.tensor([0, 1, 3], dtype=torch.int32)
+    req = AttentionReq(
+        q=q,
+        k=torch.empty(4, 64, 2, 4),
+        v=v,
+        regime=AttentionRegime.EXTEND,
+        causal=True,
+        scale=1.0,
+        block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        max_seqlen_q=2,
+        max_seqlen_k=2,
+    )
+
+    assert not provider.can_run(req)
+    assert provider.can_run(
+        AttentionReq(
+            q=q,
+            k=torch.empty(4, 256, 2, 4),
+            v=torch.empty(4, 256, 2, 4),
+            regime=AttentionRegime.EXTEND,
+            causal=True,
+            scale=1.0,
+            block_table=torch.tensor([[0], [1]], dtype=torch.int32),
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            max_seqlen_q=2,
+            max_seqlen_k=2,
+        )
+    )
+
+
 def test_text_backend_gate_skips_paged_only_varlen_for_initial_ragged_prefill(monkeypatch):
     class _PagedOnlyVarlenProvider:
         name = "paged_only_varlen"

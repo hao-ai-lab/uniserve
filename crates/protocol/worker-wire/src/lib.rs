@@ -164,6 +164,10 @@ pub struct ForwardOp {
     /// Token ids that force a worker-side decode burst to stop immediately
     /// after sampling. Small id list only; typically EOS/stop/image triggers.
     pub decode_stop_token_ids: Option<Vec<u32>>,
+    /// True when a stop-token hit finishes the request and any additional
+    /// speculative KV rows can be discarded with that request.
+    #[serde(default)]
+    pub decode_stop_terminal: bool,
     // ---- op-lifecycle id so the host correlates this op's result with the
     // submitted op. Scalar, never a tensor. ----
     pub op_id: Option<u64>,
@@ -201,6 +205,7 @@ impl Default for ForwardOp {
             denoise_step_count: None,
             decode_token_count: None,
             decode_stop_token_ids: None,
+            decode_stop_terminal: false,
             image_b64: None,
             op_id: None,
             logits_handle: None,
@@ -806,6 +811,7 @@ mod tests {
                 denoise_step_count: Some(2),
                 decode_token_count: Some(4),
                 decode_stop_token_ids: Some(vec![9, 10]),
+                decode_stop_terminal: true,
                 op_id: Some(44),
                 logits_handle: Some(0xBEEF),
                 locator: Some("bG9jYXRvcg==".into()),
@@ -828,6 +834,7 @@ mod tests {
         assert_eq!(batch.ops[0].denoise_step_count, Some(2));
         assert_eq!(batch.ops[0].decode_token_count, Some(4));
         assert_eq!(batch.ops[0].decode_stop_token_ids, Some(vec![9, 10]));
+        assert!(batch.ops[0].decode_stop_terminal);
         assert_eq!(batch.ops[0].logits_handle, Some(0xBEEF));
         assert_eq!(batch.ops[0].locator.as_deref(), Some("bG9jYXRvcg=="));
     }
@@ -1206,6 +1213,7 @@ mod tests {
             denoise_step_count: _,    // scalar burst count for sequential denoise
             decode_token_count: _,    // scalar burst count for sequential text decode
             decode_stop_token_ids: _, // id list of scalar burst stop tokens
+            decode_stop_terminal: _,  // whether stop ends the request
             op_id: _,                 // lifecycle id (scalar)
             logits_handle: _,         // opaque logits handle (scalar); logits stay off-wire
             locator: _, // base64 data-plane locator (small descriptor); tensor stays off-wire
