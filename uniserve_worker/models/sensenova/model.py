@@ -29,6 +29,11 @@ from ...contracts.resource_plan import (
     PerBranch,
     ResourcePlan,
 )
+from ...execution.deferred_text_result import (
+    DeferredDecodeBurstSeqResult,
+    DeferredTerminalDecodeBurstSeqResult,
+    DeferredTextSeqResult,
+)
 from ...execution.denoise_driver import (
     DenoiseDriver,
     TextImageDenoiseStep,
@@ -55,9 +60,11 @@ from ...execution.interleaved_text_stepper import (
 )
 from ...execution.model_base import UniModelBase
 from ...execution.packed_mixed_forward import run_packed_mixed_forward
+from ...execution.text_decode_relay import TextDecodeRelay
 from ...execution.text_driver import sample_logits_result
 from ...execution.tower_execution_session import TowerExecutionSession
 from ...foundation.errors import capability_mismatch, invalid_descriptor
+from ...foundation.profiling import profile_range
 from ...foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -93,15 +100,24 @@ from ...nn.diffusion.cfg import CfgRecipe
 from ...nn.linear import local_kv_head_count as _local_kv_head_count
 from ...nn.quant import (
     QuantizationConfig,
-    get_current_kv_cache_dtype,
     kv_cache_bytes_per_token,
     use_quantization_config,
+)
+from ...nn.sampler import (
+    BatchedSamplingResult,
+    DeferredBatchedSamplingResult,
+    apply_sampling_batched_with_device_tokens,
 )
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...processors.registry import get_processor_for_model
 from ...runtime.compile import CompileTarget
+from ...runtime.host_staging import fill_cpu_ints, is_pinned
 from ...runtime.kv_pool import PagedKVPool
-from ...runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
+from ...runtime.paged_text_cache import (
+    PagedTextCache,
+    PagedTextCacheSpanCopy,
+    copy_paged_text_cache_span,
+)
 from ...runtime.request_state import RequestState as RunnerRequestState
 from ...runtime.residency import (
     GenResidencySpec,
@@ -109,6 +125,7 @@ from ...runtime.residency import (
     ResidencyManager,
     encoder_handle_from_mm_hash,
 )
+from ...runtime.tensor_staging import TextTensorStager
 from ...runtime.tower_handoff import (
     ConditioningSnapshot,
     DataPlaneTowerHandoff,
@@ -163,6 +180,8 @@ _NOISE_DYNAMIC_SQRT_EXPONENT = 0.5
 _NOISE_RESOLUTION_MODES = frozenset({"resolution", "dynamic", "dynamic_sqrt"})
 
 logger = logging.getLogger(__name__)
+_DECODE_RELAY = TextDecodeRelay()
+_RELAY_PLACEHOLDER_TOKEN_ID = -1
 
 
 def _packed_mixed_has_und_and_gen(op_modes: Sequence[ForwardMode]) -> bool:
@@ -176,6 +195,11 @@ def _output_value(output: Any, field: str) -> Any:
         return output.get(field)
     if hasattr(output, field):
         return getattr(output, field)
+    finalize = getattr(output, "finalize", None)
+    if callable(finalize):
+        finalized = finalize()
+        if isinstance(finalized, Mapping):
+            return finalized.get(field)
     to_seq_result = getattr(output, "to_seq_result", None)
     if callable(to_seq_result):
         return dict(to_seq_result()).get(field)
@@ -196,8 +220,10 @@ def _output_bool(output: Any, field: str) -> bool:
     return bool(value)
 
 
-def _sampled_token_id(output: Any) -> int:
-    token = _output_int(output, "sampled_token_id")
+def _sampled_token_id(output: Any, *, profile_name: str) -> int:
+    materialize = getattr(output, "materialize_sampled_token_id", None)
+    with profile_range(profile_name):
+        token = int(materialize()) if callable(materialize) else _output_int(output, "sampled_token_id")
     if token < 0:
         raise invalid_descriptor("sampled_token_id must be non-negative")
     return token
@@ -212,6 +238,166 @@ def _decode_burst_result(op: Mapping[str, Any], tokens: Sequence[int]) -> dict[s
         "sampled_token_id": token_ids[-1],
         "sampled_token_ids": token_ids,
     }
+
+
+def _decode_burst_result_with_pending(
+    op: Mapping[str, Any],
+    tokens: Sequence[int],
+    pending: Any,
+    *,
+    defer_cpu: bool,
+) -> dict[str, Any] | DeferredDecodeBurstSeqResult:
+    materialize = getattr(pending, "materialize_sampled_token_id", None)
+    ready = getattr(pending, "ready", None)
+    if defer_cpu and callable(materialize) and callable(ready):
+        return DeferredDecodeBurstSeqResult(
+            req_id=int(op["req_id"]),
+            prefix_token_ids=tokens,
+            pending=pending,
+        )
+    token = _sampled_token_id(
+        pending,
+        profile_name="uniserve.packed_burst.finalize_pending",
+    )
+    return _decode_burst_result(op, [*tokens, token])
+
+
+def _decode_burst_terminal_result(
+    op: Mapping[str, Any],
+    pending_tokens: Sequence[Any],
+    stop_ids: set[int],
+    *,
+    defer_cpu: bool,
+) -> dict[str, Any] | DeferredTerminalDecodeBurstSeqResult:
+    if not pending_tokens:
+        return _decode_burst_result(op, [])
+    if defer_cpu and all(callable(getattr(pending, "materialize_sampled_token_id", None)) for pending in pending_tokens):
+        return DeferredTerminalDecodeBurstSeqResult(
+            req_id=int(op["req_id"]),
+            pending_tokens=pending_tokens,
+            stop_token_ids=stop_ids,
+        )
+    token_ids: list[int] = []
+    for pending in pending_tokens:
+        token = _sampled_token_id(
+            pending,
+            profile_name="uniserve.packed_burst.finalize_terminal",
+        )
+        token_ids.append(token)
+        if token in stop_ids:
+            break
+    return _decode_burst_result(op, token_ids)
+
+
+def _attach_decode_relay_input(op: dict[str, Any], state: Any) -> bool:
+    relay = getattr(state, "decode_relay", None)
+    token_tensor = getattr(relay, "token_tensor", None)
+    if not isinstance(token_tensor, torch.Tensor) or token_tensor.dtype != torch.long:
+        return False
+    op["token_tensor"] = token_tensor
+    return True
+
+
+def _decode_op_next_pos(op: Mapping[str, Any]) -> int:
+    pos = op.get("pos_range") or [0, 0]
+    if not isinstance(pos, Sequence) or len(pos) != 2:
+        raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
+    return int(pos[1])
+
+
+def _coerce_logits_row(logits: Any) -> torch.Tensor:
+    if not isinstance(logits, torch.Tensor):
+        raise invalid_descriptor("decode graph follow-up must return logits tensors")
+    if logits.ndim == 0:
+        raise invalid_descriptor("decode graph follow-up logits must have a vocabulary dimension")
+    return logits.reshape(-1, logits.shape[-1])[-1]
+
+
+def _store_decode_followup_relay(
+    state: Any,
+    *,
+    token_id: int | None,
+    device: torch.device,
+    position_id: int,
+    token_tensor: torch.Tensor,
+    position_tensor: torch.Tensor | None = None,
+) -> None:
+    relay = getattr(state, "decode_relay", None)
+    if relay is None:
+        return
+    token_tensor = token_tensor.reshape(1).to(device=device, dtype=torch.long)
+    _DECODE_RELAY.publish_sample(
+        state,
+        token_id=None if token_id is None else int(token_id),
+        token_tensor=token_tensor,
+    )
+    if position_tensor is None:
+        position_tensor = torch.tensor([int(position_id)], dtype=torch.long, device=device)
+    else:
+        position_tensor = position_tensor.reshape(1).to(device=device, dtype=torch.long)
+    _DECODE_RELAY.publish_position(
+        state,
+        position_id=int(position_id),
+        position_tensor=position_tensor,
+    )
+
+
+def _decode_followup_position_tensors(
+    owner: Any,
+    ops: Sequence[Mapping[str, Any]],
+    *,
+    device: torch.device,
+) -> tuple[list[int], list[torch.Tensor]]:
+    position_ids = [int((op.get("pos_range") or [0, 0])[1]) for op in ops]
+    if not position_ids:
+        return [], []
+    if device.type != "cuda":
+        positions = torch.tensor(position_ids, dtype=torch.long, device=device)
+    else:
+        stager = getattr(owner, "_decode_followup_position_stager", None)
+        if not isinstance(stager, TextTensorStager):
+            stager = TextTensorStager(ring_depth=3)
+            setattr(owner, "_decode_followup_position_stager", stager)
+        slot = stager.next_slot()
+        cpu = slot.long_buffer("sensenova_decode_followup_positions", len(position_ids), pin=True)
+        fill_cpu_ints(cpu, position_ids)
+        positions = slot.device_buffer(
+            "sensenova_decode_followup_positions",
+            len(position_ids),
+            dtype=torch.long,
+            device=device,
+        )
+        positions.copy_(cpu, non_blocking=is_pinned(cpu))
+    return position_ids, [positions[row : row + 1] for row in range(len(position_ids))]
+
+
+def _cat_token_slices(parts: Sequence[torch.Tensor]) -> torch.Tensor:
+    tensors = [part for part in parts if int(part.shape[0]) > 0]
+    if not tensors:
+        raise invalid_descriptor("modality slice routing requires at least one tensor")
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+
+
+def _text_first_modality_split(forward_stream: ForwardStream, total_tokens: int) -> int | None:
+    text_tokens = 0
+    gen_tokens = 0
+    seen_gen = False
+    for seg in forward_stream.segments:
+        q_len = int(seg.q_len)
+        if seg.modality == "und":
+            if seen_gen:
+                return None
+            text_tokens += q_len
+        elif seg.modality == "gen":
+            seen_gen = True
+            gen_tokens += q_len
+        else:
+            return None
+    if text_tokens <= 0 or gen_tokens <= 0:
+        return None
+    if text_tokens + gen_tokens != int(total_tokens):
+        return None
+    return int(text_tokens)
 
 
 @dataclass(frozen=True)
@@ -320,6 +506,15 @@ class SenseNovaPackedRope:
         return SenseNovaPackedRope(
             tuple(axis.index_select(0, positions) for axis in self.cos),
             tuple(axis.index_select(0, positions) for axis in self.sin),
+            hw_identity=self.hw_identity,
+        )
+
+    def slice(self, start: int, end: int) -> "SenseNovaPackedRope":
+        start = int(start)
+        end = int(end)
+        return SenseNovaPackedRope(
+            tuple(axis[start:end] for axis in self.cos),
+            tuple(axis[start:end] for axis in self.sin),
             hw_identity=self.hw_identity,
         )
 
@@ -542,6 +737,53 @@ class _SenseNovaAttention(nn.Module):
             packed_rope=packed_rope,
         )
         return query_states, key_states, value_states
+
+    def _project_qkv_packed_slices(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.Tensor,
+        text_tokens: int,
+        *,
+        packed_rope: SenseNovaPackedRope | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        text_tokens = int(text_tokens)
+        total_tokens = int(hidden_states.shape[0])
+        if text_tokens <= 0 or text_tokens >= total_tokens:
+            raise invalid_descriptor("packed slice routing requires both text and gen tokens")
+        pieces: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        text_rope = packed_rope.slice(0, text_tokens) if packed_rope is not None else None
+        q_text, k_text, v_text = self._project_qkv(
+            hidden_states[:text_tokens].unsqueeze(0),
+            indexes[:, :text_tokens],
+            gen_branch=False,
+            packed_rope=text_rope,
+        )
+        pieces.append(
+            (
+                q_text.squeeze(0).transpose(0, 1).contiguous(),
+                k_text.squeeze(0).transpose(0, 1).contiguous(),
+                v_text.squeeze(0).transpose(0, 1).contiguous(),
+            )
+        )
+        gen_rope = packed_rope.slice(text_tokens, total_tokens) if packed_rope is not None else None
+        q_gen, k_gen, v_gen = self._project_qkv(
+            hidden_states[text_tokens:].unsqueeze(0),
+            indexes[:, text_tokens:],
+            gen_branch=True,
+            packed_rope=gen_rope,
+        )
+        pieces.append(
+            (
+                q_gen.squeeze(0).transpose(0, 1).contiguous(),
+                k_gen.squeeze(0).transpose(0, 1).contiguous(),
+                v_gen.squeeze(0).transpose(0, 1).contiguous(),
+            )
+        )
+        return (
+            _cat_token_slices([piece[0] for piece in pieces]),
+            _cat_token_slices([piece[1] for piece in pieces]),
+            _cat_token_slices([piece[2] for piece in pieces]),
+        )
 
     def _qk_norm_rope_3d(
         self,
@@ -766,23 +1008,25 @@ class _SenseNovaAttention(nn.Module):
         # max_seqlen_k is identical for every layer of the packed forward; derive
         # it on the host from the segment metadata (Python ints) instead of
         # forcing a per-layer device->host sync via cache_after.max().item().
-        max_seqlen_k = max(
-            (seg.base_len + seg.q_len for seg in kv_view.segments),
-            default=0,
+        max_seqlen_k = (
+            kv_view.max_seqlen_k()
+            if callable(getattr(kv_view, "max_seqlen_k", None))
+            else max((seg.base_len + seg.q_len for seg in kv_view.segments), default=0)
         )
         if forward_stream.fully_visible:
-            out = ops.attention(
+            out = self.attn.forward_visible_end(
                 q,
                 k_cache,
                 v_cache,
-                regime=ops.AttentionRegime.EXTEND,
+                visible_end=forward_stream.visible_end,
                 cu_seqlens_q=forward_stream.cu_seqlens_q,
-                cu_seqlens_k=kv_view.cu_seqlens_after(device=q.device),
+                page_table=kv_view.block_table(device=q.device),
+                seqused_k=cache_after,
                 max_seqlen_q=int(forward_stream.visible_end.shape[1]),
                 max_seqlen_k=int(max_seqlen_k),
-                causal=False,
                 scale=self.scaling,
-                block_table=kv_view.block_table(device=q.device),
+                use_prefix_bounds=True,
+                fully_visible=True,
             )
             return out.contiguous()
         # Route visible_end attention through RadixAttention (backend resolution + stats).
@@ -816,6 +1060,7 @@ class _SenseNovaAttention(nn.Module):
         kv_view: ForwardPagedKVView,
         packed_rope: SenseNovaPackedRope | None = None,
         dense_gen_route: bool = False,
+        modality_split: int | None = None,
     ) -> torch.Tensor:
         # gen mask (image_gen_indicators) and its complement (und) plus the exist
         # flags are precomputed once by the model; reuse them so the o_proj
@@ -834,6 +1079,13 @@ class _SenseNovaAttention(nn.Module):
             q = q_bhld.squeeze(0).transpose(0, 1).contiguous()
             k = k_bhld.squeeze(0).transpose(0, 1).contiguous()
             v = v_bhld.squeeze(0).transpose(0, 1).contiguous()
+        elif modality_split is not None:
+            q, k, v = self._project_qkv_packed_slices(
+                hidden_states,
+                indexes,
+                int(modality_split),
+                packed_rope=packed_rope,
+            )
         elif dense_gen_route:
             q_bhld, k_bhld, v_bhld = self._project_qkv(
                 hidden_states.unsqueeze(0),
@@ -889,6 +1141,10 @@ class _SenseNovaAttention(nn.Module):
             projected = self.o_proj_mot_gen(out)
             ctx.record_component_elapsed("packed_decoder_o_proj", o_proj_start)
             return projected
+        if modality_split is not None:
+            routed = self._route_o_proj_slices(out, int(modality_split))
+            ctx.record_component_elapsed("packed_decoder_o_proj", o_proj_start)
+            return routed
         if dense_gen_route:
             routed = self.o_proj_mot_gen(out)
             if und_indices is None:
@@ -964,8 +1220,6 @@ class _SenseNovaAttention(nn.Module):
         request_cache = getattr(past_key_values, "request_cache_for_transient", None)
         if not callable(request_cache):
             return None
-        if not self.attn.can_run_paged_attention(q, None):
-            return None
         n_tokens = int(q.shape[2])
         cache = request_cache(self.layer_idx, n_tokens)
         pool = getattr(cache, "pool", None)
@@ -974,6 +1228,12 @@ class _SenseNovaAttention(nn.Module):
             q = q.to(dtype=cache_dtype)
             k = k.to(dtype=cache_dtype)
             v = v.to(dtype=cache_dtype)
+        if not self.attn.can_run_transient_paged_varlen(q, k, v, kv_cache=cache):
+            if getattr(past_key_values, "supports_batched_paged", False):
+                raise capability_mismatch(
+                    "batched transient denoise attention requires a paged-varlen attention backend"
+                )
+            return None
         out = self.attn(
             q,
             k,
@@ -1099,6 +1359,16 @@ class _SenseNovaAttention(nn.Module):
             transport=self._tower_transport,
             coords=self._tower_coords,
         )
+
+    def _route_o_proj_slices(self, attn_out: torch.Tensor, text_tokens: int) -> torch.Tensor:
+        text_tokens = int(text_tokens)
+        partial = _cat_token_slices(
+            (
+                self.o_proj(attn_out[:text_tokens], reduce=False),
+                self.o_proj_mot_gen(attn_out[text_tokens:], reduce=False),
+            )
+        )
+        return self.o_proj.reduce_output(partial)
 
     def forward(
         self,
@@ -1370,6 +1640,7 @@ class _SenseNovaDecoderLayer(nn.Module):
         kv_view: ForwardPagedKVView,
         packed_rope: SenseNovaPackedRope | None = None,
         dense_gen_route: bool = False,
+        modality_split: int | None = None,
     ) -> torch.Tensor:
         # gen/und masks and the exist flags are precomputed once by the model
         # and threaded down so each layer avoids per-layer device->host syncs.
@@ -1383,6 +1654,14 @@ class _SenseNovaDecoderLayer(nn.Module):
             routed = self.input_layernorm(hidden_states)
         elif not exist_non_image_gen_tokens and exist_image_gen_tokens:
             routed = self.input_layernorm_mot_gen(hidden_states)
+        elif modality_split is not None:
+            split = int(modality_split)
+            routed = _cat_token_slices(
+                (
+                    self.input_layernorm(hidden_states[:split]),
+                    self.input_layernorm_mot_gen(hidden_states[split:]),
+                )
+            )
         elif dense_gen_route:
             routed = self.input_layernorm_mot_gen(hidden_states)
             if und_indices is None:
@@ -1418,16 +1697,42 @@ class _SenseNovaDecoderLayer(nn.Module):
             kv_view=kv_view,
             packed_rope=packed_rope,
             dense_gen_route=dense_gen_route,
+            modality_split=modality_split,
         )
         ctx.record_component_elapsed("packed_decoder_attn_block", attn_block_start)
-        hidden_states = residual + attn_out
-        residual = hidden_states
+        if modality_split is None:
+            hidden_states = residual + attn_out
+            residual = hidden_states
 
         mlp_start = ctx.component_timer_start()
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
         elif not exist_non_image_gen_tokens and exist_image_gen_tokens:
             mlp_out = self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states))
+        elif modality_split is not None:
+            split = int(modality_split)
+            text_mlp_in, text_residual = self.post_attention_layernorm.forward_with_residual(
+                attn_out[:split],
+                residual[:split],
+            )
+            gen_mlp_in, gen_residual = self.post_attention_layernorm_mot_gen.forward_with_residual(
+                attn_out[split:],
+                residual[split:],
+            )
+            residual = _cat_token_slices((text_residual, gen_residual))
+            partial = _cat_token_slices(
+                (
+                    self.mlp.down_proj(
+                        self.mlp.act(self.mlp.gate_up_proj(text_mlp_in)),
+                        reduce=False,
+                    ),
+                    self.mlp_mot_gen.down_proj(
+                        self.mlp_mot_gen.act(self.mlp_mot_gen.gate_up_proj(gen_mlp_in)),
+                        reduce=False,
+                    ),
+                )
+            )
+            mlp_out = self.mlp.down_proj.reduce_output(partial)
         elif dense_gen_route:
             mlp_out = self.mlp_mot_gen(self.post_attention_layernorm_mot_gen(hidden_states))
             if und_indices is None:
@@ -1614,10 +1919,15 @@ class _SenseNovaDecoderModel(nn.Module):
         cache_position: torch.Tensor,
         inputs_embeds: torch.Tensor,
     ) -> torch.Tensor:
+        batch = int(inputs_embeds.shape[0])
         seq_len = int(inputs_embeds.shape[1])
         positions = cache_position.to(device=inputs_embeds.device, dtype=torch.long).reshape(-1)
-        if positions.numel() != seq_len:
+        if positions.numel() == seq_len:
+            zeros = torch.zeros_like(positions)
+            return torch.stack((positions, zeros, zeros), dim=0)
+        if positions.numel() != batch * seq_len:
             raise ValueError("cache_position must provide one position per token when indexes are omitted")
+        positions = positions.view(batch, seq_len)
         zeros = torch.zeros_like(positions)
         return torch.stack((positions, zeros, zeros), dim=0)
 
@@ -1730,11 +2040,17 @@ class _SenseNovaDecoderModel(nn.Module):
         packed_rope = self.layers[0].self_attn._packed_rope(indexes) if self.layers else None
         und_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "und")
         gen_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "gen")
+        modality_split = (
+            _text_first_modality_split(forward_stream, inputs_embeds.shape[0])
+            if self._tower_transport is None
+            else None
+        )
         dense_gen_route = (
             exist_non_image_gen_tokens
             and exist_image_gen_tokens
             and gen_tokens >= und_tokens
             and self._tower_transport is None
+            and modality_split is None
         )
 
         hidden_states = inputs_embeds
@@ -1755,6 +2071,7 @@ class _SenseNovaDecoderModel(nn.Module):
                 kv_view=kv_view,
                 packed_rope=packed_rope,
                 dense_gen_route=dense_gen_route,
+                modality_split=modality_split,
             )
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             return self.norm(hidden_states)
@@ -1770,6 +2087,14 @@ class _SenseNovaDecoderModel(nn.Module):
                 self.norm(hidden_states.index_select(0, und_indices)),
             )
             return out
+        if modality_split is not None:
+            split = int(modality_split)
+            return _cat_token_slices(
+                (
+                    self.norm(hidden_states[:split]),
+                    self.norm_mot_gen(hidden_states[split:]),
+                )
+            )
         return route_by_modality(
             hidden_states,
             {
@@ -2254,7 +2579,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # "a KV group too small to split stays whole" rule QKVParallelLinear
         # applies, so pool geometry always matches what sharded attention writes.
         n_kv = _local_kv_head_count(n_kv)
-        self.kv_cache_dtype = get_current_kv_cache_dtype(config)
+        self.kv_cache_dtype = self._requested_kv_cache_dtype_for(config)
         if self.kv_cache_dtype in {None, "auto", "native", "compute"}:
             self.kv_cache_dtype = "bf16"
         self._kv_num_heads = n_kv
@@ -3026,6 +3351,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         *,
         target_pool: PagedKVPool,
         end_len: int,
+        pending_prefix_copies: list[PagedTextCacheSpanCopy] | None = None,
     ) -> PagedTextCache:
         if target_pool is not self.gen_scratch_pool and target_pool is not self.scratch_pool:
             raise RuntimeError("forward text staging target must be a scratch KV pool")
@@ -3051,16 +3377,28 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             staged.ensure_capacity(int(end_len))
             copied_len = int(staged.length)
             if copied_len < source_len:
-                copy_paged_text_cache_span(
-                    source,
-                    staged,
-                    start=copied_len,
-                    length=source_len - copied_len,
-                    num_layers=self.num_layers,
-                    missing_message="cannot extend mixed forward staging without a paged source cache",
-                )
+                if pending_prefix_copies is None:
+                    copy_paged_text_cache_span(
+                        source,
+                        staged,
+                        start=copied_len,
+                        length=source_len - copied_len,
+                        num_layers=self.num_layers,
+                        missing_message="cannot extend mixed forward staging without a paged source cache",
+                    )
+                    setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
+                else:
+                    pending_prefix_copies.append(
+                        PagedTextCacheSpanCopy(
+                            source=source,
+                            target=staged,
+                            start=copied_len,
+                            length=source_len - copied_len,
+                        )
+                    )
                 staged.length = source_len
-            setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
+            if copied_len >= source_len:
+                setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
             return staged
         if staged is not None:
             self.residency.release_scratch_cache(staged)
@@ -3072,16 +3410,31 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             allocate_blocks=allocator,
         )
         staged.ensure_capacity(int(end_len))
-        copy_paged_text_cache_span(
-            source,
-            staged,
-            start=0,
-            length=source_len,
-            num_layers=self.num_layers,
-            missing_message="cannot stage mixed forward prefix without a paged source cache",
-        )
+        if source_len > 0:
+            if pending_prefix_copies is None:
+                copy_paged_text_cache_span(
+                    source,
+                    staged,
+                    start=0,
+                    length=source_len,
+                    num_layers=self.num_layers,
+                    missing_message="cannot stage mixed forward prefix without a paged source cache",
+                )
+                setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
+            else:
+                pending_prefix_copies.append(
+                    PagedTextCacheSpanCopy(
+                        source=source,
+                        target=staged,
+                        start=0,
+                        length=source_len,
+                    )
+                )
+        elif pending_prefix_copies is None:
+            setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
         staged.length = source_len
-        setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
+        if source_len <= 0:
+            setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
         staged_by_pool[key] = staged
         return staged
 
@@ -3159,7 +3512,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             q_len=q_len,
             prefix_len=int(cache.past.length),
             visible_policy="causal",
-            indexes=self._text_indexes(start_pos, q_len, device=device),
+            index_start=int(start_pos),
         )
         kv_segments.append(
             ForwardPagedKVSegment(
@@ -3212,20 +3565,29 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             )
         )
 
-    def run_forward(self, batch: UniForwardBatch, *, request_states: Any, group: Any) -> list[Any]:
+    def run_forward(
+        self,
+        batch: UniForwardBatch,
+        *,
+        request_states: Any,
+        group: Any,
+        defer_text_cpu_results: bool = False,
+    ) -> list[Any]:
         results: list[Any] = [None] * len(batch.ops)
         denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
         commit_rows: list[tuple[int, int, dict[str, Any]]] = []
-        for row_index, op in enumerate(batch.ops):
-            mode = batch.op_modes[row_index]
-            req_id = int(op["req_id"])
-            if mode is ForwardMode.DENOISE:
-                step = self.prepare_denoise(request_states.get(req_id), dict(op))
-                denoise_steps.append((row_index, step))
-            elif mode is ForwardMode.COMMIT:
-                commit_rows.append((row_index, req_id, dict(op)))
-            elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
-                raise RuntimeError(f"unsupported mixed SenseNova mode {mode.value!r}")
+        with profile_range("uniserve.sensenova.mixed_prepare_ops"):
+            for row_index, op in enumerate(batch.ops):
+                mode = batch.op_modes[row_index]
+                req_id = int(op["req_id"])
+                if mode is ForwardMode.DENOISE:
+                    with profile_range("uniserve.sensenova.mixed_prepare_denoise"):
+                        step = self.prepare_denoise(request_states.get(req_id), dict(op))
+                    denoise_steps.append((row_index, step))
+                elif mode is ForwardMode.COMMIT:
+                    commit_rows.append((row_index, req_id, dict(op)))
+                elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
+                    raise RuntimeError(f"unsupported mixed SenseNova mode {mode.value!r}")
         # Packed-mixed denoise runs outside the residual-reuse policy's view:
         # drop any replay state so the next pure-denoise step recomputes
         # instead of replaying a stale residual.
@@ -3235,8 +3597,20 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             residual_state = getattr(img, "residual_cache", None)
             if residual_state is not None:
                 residual_state.invalidate()
-        if run_packed_mixed_forward(self, batch, request_states, denoise_steps, results):
-            self._complete_packed_decode_bursts(batch, request_states, results)
+        if run_packed_mixed_forward(
+            self,
+            batch,
+            request_states,
+            denoise_steps,
+            results,
+            defer_text_cpu_results=defer_text_cpu_results,
+        ):
+            self._complete_packed_decode_bursts(
+                batch,
+                request_states,
+                results,
+                defer_final_cpu_results=defer_text_cpu_results,
+            )
             self._complete_packed_denoise_bursts(batch, request_states, results)
             for row_index, req_id, op in commit_rows:
                 state = request_states.get(req_id)
@@ -3268,6 +3642,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         batch: UniForwardBatch,
         request_states: Any,
         results: list[Any],
+        *,
+        defer_final_cpu_results: bool = False,
     ) -> None:
         active: list[dict[str, Any]] = []
         for row_index, op in enumerate(batch.ops):
@@ -3276,12 +3652,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             requested = int(op.get("decode_token_count") or 1)
             if requested <= 1:
                 continue
-            first_token = _sampled_token_id(results[row_index])
-            tokens = [first_token]
             stop_ids = {int(token) for token in (op.get("decode_stop_token_ids") or [])}
-            if first_token in stop_ids:
-                results[row_index] = _decode_burst_result(op, tokens)
-                continue
+            terminal_stop = not stop_ids or op.get("decode_stop_terminal") is True
             pos = op.get("pos_range") or [0, 0]
             if not isinstance(pos, Sequence) or len(pos) != 2:
                 raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
@@ -3289,45 +3661,217 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                 {
                     "row_index": row_index,
                     "op": dict(op),
-                    "tokens": tokens,
-                    "remaining": requested - 1,
-                    "next_pos": int(pos[1]),
+                    "tokens": [],
+                    "requested": requested,
+                    "launched": 1,
+                    "last_op": dict(op),
+                    "pending": results[row_index],
+                    "pending_tokens": [results[row_index]] if terminal_stop else [],
                     "stop_ids": stop_ids,
+                    "terminal_stop": terminal_stop,
+                    "done": False,
                 }
             )
 
-        while active:
+        warned_graph_fallback = False
+        while any(not bool(item["done"]) for item in active):
             iter_ops: list[dict[str, Any]] = []
             iter_items: list[dict[str, Any]] = []
             for item in active:
+                if bool(item["done"]) or int(item["launched"]) >= int(item["requested"]):
+                    continue
                 op = dict(item["op"])
                 op["new_block_ids"] = []
-                op["token_ids"] = [int(item["tokens"][-1])]
-                op["pos_range"] = [int(item["next_pos"]), int(item["next_pos"]) + 1]
+                state = request_states.get(int(op["req_id"]))
+                if _attach_decode_relay_input(op, state):
+                    op["token_ids"] = [_RELAY_PLACEHOLDER_TOKEN_ID]
+                    op["token_source"] = "last_sampled"
+                else:
+                    pending = item.get("pending")
+                    if pending is None:
+                        raise invalid_descriptor("decode burst relay input is missing")
+                    token = _sampled_token_id(
+                        pending,
+                        profile_name="uniserve.packed_burst.relay_input_materialize",
+                    )
+                    item["tokens"].append(token)
+                    item["pending"] = None
+                    if token in item["stop_ids"]:
+                        item["done"] = True
+                        continue
+                    op["token_ids"] = [token]
+                    op.pop("token_source", None)
+                    op.pop("token_tensor", None)
+                next_pos = _decode_op_next_pos(item["last_op"])
+                op["pos_range"] = [next_pos, next_pos + 1]
                 op["decode_token_count"] = None
                 op["decode_stop_token_ids"] = []
+                item["last_op"] = op
                 iter_ops.append(op)
                 iter_items.append(item)
+            if not iter_ops:
+                break
 
-            followup_batch = UniForwardBatch.from_ops(iter_ops)
-            followup_results: list[Any] = [None] * len(iter_ops)
-            if not run_packed_mixed_forward(self, followup_batch, request_states, [], followup_results):
-                raise capability_mismatch("packed decode burst follow-up could not run")
-
-            next_active: list[dict[str, Any]] = []
-            for item, output in zip(iter_items, followup_results, strict=True):
-                token = _sampled_token_id(output)
-                item["tokens"].append(token)
-                item["remaining"] = int(item["remaining"]) - 1
-                item["next_pos"] = int(item["next_pos"]) + 1
-                if token not in item["stop_ids"] and int(item["remaining"]) > 0:
-                    next_active.append(item)
-                else:
-                    results[int(item["row_index"])] = _decode_burst_result(
-                        item["op"],
-                        item["tokens"],
+            followup_results = self._run_packed_decode_burst_graph_followup(
+                iter_ops,
+                request_states,
+                defer_cpu_results=True,
+            )
+            if followup_results is None:
+                if not warned_graph_fallback:
+                    logger.warning(
+                        "packed decode burst follow-up CUDA graph unavailable; using eager packed follow-up"
                     )
-            active = next_active
+                    warned_graph_fallback = True
+                followup_batch = UniForwardBatch.from_ops(iter_ops)
+                followup_results = [None] * len(iter_ops)
+                if not run_packed_mixed_forward(
+                    self,
+                    followup_batch,
+                    request_states,
+                    [],
+                    followup_results,
+                    defer_text_cpu_results=True,
+                ):
+                    raise capability_mismatch("packed decode burst follow-up could not run")
+
+            for item, output in zip(iter_items, followup_results, strict=True):
+                previous = item.get("pending")
+                item["pending"] = output
+                item["launched"] = int(item["launched"]) + 1
+                if bool(item.get("terminal_stop")):
+                    item["pending_tokens"].append(output)
+                    continue
+                if previous is None:
+                    continue
+                token = _sampled_token_id(
+                    previous,
+                    profile_name="uniserve.packed_burst.stop_check",
+                )
+                item["tokens"].append(token)
+                if token in item["stop_ids"]:
+                    item["pending"] = None
+                    item["done"] = True
+        for item in active:
+            if bool(item.get("terminal_stop")):
+                results[int(item["row_index"])] = _decode_burst_terminal_result(
+                    item["op"],
+                    item["pending_tokens"],
+                    item["stop_ids"],
+                    defer_cpu=bool(defer_final_cpu_results),
+                )
+                item["pending"] = None
+                continue
+            pending = item.get("pending")
+            if pending is not None:
+                results[int(item["row_index"])] = _decode_burst_result_with_pending(
+                    item["op"],
+                    item["tokens"],
+                    pending,
+                    defer_cpu=bool(defer_final_cpu_results),
+                )
+                item["pending"] = None
+                continue
+            results[int(item["row_index"])] = _decode_burst_result(
+                item["op"],
+                item["tokens"],
+            )
+
+    def _run_packed_decode_burst_graph_followup(
+        self,
+        ops: Sequence[Mapping[str, Any]],
+        request_states: Any,
+        *,
+        defer_cpu_results: bool = False,
+    ) -> list[Any] | None:
+        driver = self._text_driver()
+        run_graph = getattr(driver, "try_run_decode_graph_logits_batch", None)
+        if not callable(run_graph):
+            return None
+        logits_rows = run_graph(ops)
+        if logits_rows is None:
+            return None
+        if len(logits_rows) != len(ops):
+            raise invalid_descriptor("decode graph follow-up logits row count must match ops")
+        rows = [_coerce_logits_row(logits) for logits in logits_rows]
+        if not rows:
+            return []
+        logits_batch = torch.stack(rows, dim=0)
+        sampling_params: list[dict[str, Any]] = []
+        recent: list[list[int] | tuple[int, ...]] = []
+        allowed: list[list[int] | tuple[int, ...] | None] = []
+        suppress: list[list[int] | tuple[int, ...] | None] = []
+        for op in ops:
+            sampling_params.append(dict(request_states.get(int(op["req_id"])).sampling or {}))
+            recent.append(op.get("recent_tokens") or [])
+            allowed.append(op.get("allowed_tokens"))
+            suppress.append(op.get("suppress_tokens"))
+        sampled = apply_sampling_batched_with_device_tokens(
+            logits_batch,
+            sampling_params,
+            recent,
+            allowed,
+            suppress,
+            defer_cpu=defer_cpu_results,
+        )
+        device = logits_batch.device
+        position_ids, position_tensors = _decode_followup_position_tensors(
+            self,
+            ops,
+            device=device,
+        )
+        if isinstance(sampled, DeferredBatchedSamplingResult) and defer_cpu_results:
+            outputs: list[Any] = []
+            for row, op in enumerate(ops):
+                req_id = int(op["req_id"])
+                state = request_states.get(req_id)
+                _store_decode_followup_relay(
+                    state,
+                    token_id=None,
+                    device=device,
+                    position_id=position_ids[row],
+                    token_tensor=sampled.device_tokens[row:row + 1],
+                    position_tensor=position_tensors[row],
+                )
+                outputs.append(
+                    DeferredTextSeqResult(
+                        req_id=req_id,
+                        row=row,
+                        state=state,
+                        sampling_result=sampled,
+                        relay_token_tensor=state.decode_relay.token_tensor,
+                    )
+                )
+            return outputs
+        if not isinstance(sampled, BatchedSamplingResult):
+            sampled = sampled.finalize()
+        outputs: list[Any] = []
+        for row, op in enumerate(ops):
+            req_id = int(op["req_id"])
+            sample = sampled.samples[row]
+            token_id = int(sample.token_id)
+            _store_decode_followup_relay(
+                request_states.get(req_id),
+                token_id=token_id,
+                device=device,
+                position_id=position_ids[row],
+                token_tensor=sampled.device_tokens[row:row + 1],
+                position_tensor=position_tensors[row],
+            )
+            top_logprobs = (
+                [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
+                if sample.top_logprobs is not None
+                else None
+            )
+            outputs.append(
+                {
+                    "req_id": req_id,
+                    "sampled_token_id": token_id,
+                    "sampled_logprob": sample.logprob,
+                    "top_logprobs": top_logprobs,
+                }
+            )
+        return outputs
 
     def _complete_packed_denoise_bursts(
         self,

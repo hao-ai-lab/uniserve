@@ -16,6 +16,9 @@ from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import (
     BatchedPagedTextCache,
     PagedTextCache,
+    PagedTextCacheSpanCopy,
+    copy_paged_text_cache_span,
+    copy_paged_text_cache_spans,
 )
 from uniserve_worker.runtime.residency import ScratchKvPool
 
@@ -61,6 +64,16 @@ def _make_scratch_pool(
     )
 
 
+def _write_cache_span(cache: PagedTextCache, *, start: int, length: int, value_base: float) -> None:
+    shape = (int(length), cache.pool.n_kv, cache.pool.head_dim)
+    numel = int(length) * int(cache.pool.n_kv) * int(cache.pool.head_dim)
+    values = torch.arange(numel, dtype=torch.float32).reshape(shape)
+    for layer_idx in range(cache.pool.num_layers):
+        k = values + float(value_base) + float(layer_idx * 1000)
+        v = values.mul(-1) - float(value_base) - float(layer_idx * 1000)
+        cache.pool.write(layer_idx, cache.block_ids, start=int(start), k=k, v=v)
+
+
 def test_scratch_pool_owns_transient_block_leases():
     pool = _make_scratch_pool(num_blocks=3, block_size=4)
     cache = PagedTextCache(
@@ -79,6 +92,33 @@ def test_scratch_pool_owns_transient_block_leases():
     pool.release_cache(cache)
 
     assert pool.allocate_blocks(3) == [0, 1, 2]
+
+
+def test_batched_span_copy_matches_per_span_copy_across_rows_and_blocks():
+    source_pool = _make_pool(num_layers=2, num_blocks=8, block_size=3)
+    batched_target_pool = _make_pool(num_layers=2, num_blocks=8, block_size=3)
+    sequential_target_pool = _make_pool(num_layers=2, num_blocks=8, block_size=3)
+    source_a = PagedTextCache(source_pool, [0, 1, 2], num_layers=2)
+    source_b = PagedTextCache(source_pool, [3, 4, 5], num_layers=2)
+    batched_target_a = PagedTextCache(batched_target_pool, [0, 1, 2], num_layers=2)
+    batched_target_b = PagedTextCache(batched_target_pool, [3, 4, 5], num_layers=2)
+    sequential_target_a = PagedTextCache(sequential_target_pool, [0, 1, 2], num_layers=2)
+    sequential_target_b = PagedTextCache(sequential_target_pool, [3, 4, 5], num_layers=2)
+    _write_cache_span(source_a, start=2, length=4, value_base=10)
+    _write_cache_span(source_b, start=1, length=5, value_base=100)
+
+    copy_paged_text_cache_spans(
+        [
+            PagedTextCacheSpanCopy(source_a, batched_target_a, start=2, length=4),
+            PagedTextCacheSpanCopy(source_b, batched_target_b, start=1, length=5),
+        ],
+        num_layers=2,
+    )
+    copy_paged_text_cache_span(source_a, sequential_target_a, start=2, length=4, num_layers=2)
+    copy_paged_text_cache_span(source_b, sequential_target_b, start=1, length=5, num_layers=2)
+
+    assert torch.equal(batched_target_pool.k, sequential_target_pool.k)
+    assert torch.equal(batched_target_pool.v, sequential_target_pool.v)
 
 
 # --------------------------------------------------------------------------

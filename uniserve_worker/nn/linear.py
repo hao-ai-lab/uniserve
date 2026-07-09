@@ -201,8 +201,13 @@ class RowParallelLinear(LinearBase):
         if isinstance(weight_scale, nn.Parameter):
             set_shard_plan(weight_scale, ShardPlan(spec=shard_spec(0, mesh, replicated=mesh.tp_size > 1)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, reduce: bool = True) -> torch.Tensor:
         out = super().forward(x)
+        if not reduce:
+            return out
+        return self.reduce_output(out)
+
+    def reduce_output(self, out: torch.Tensor) -> torch.Tensor:
         return reshard(out, _TP_PARTIAL, _TP_REPLICATE, self.mesh, owner="RowParallelLinear")
 
 

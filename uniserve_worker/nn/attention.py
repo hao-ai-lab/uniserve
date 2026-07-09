@@ -523,6 +523,12 @@ class RadixAttention(nn.Module):
             cache_get = getattr(kv_cache, "get", None)
             if not callable(cache_get):
                 self._raise_unsupported_paged_fallback(kv_cache)
+            if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+                raise capability_mismatch(
+                    "dense KV-cache fallback expects token-major [tokens, heads, dim] "
+                    "Q/K/V; paged batched or transient attention requires a supported "
+                    "paged attention backend"
+                )
             cached_k, cached_v = cache_get(self.layer_id)
             if cached_k is not None:
                 k = torch.cat([cached_k, k], dim=0)
@@ -636,6 +642,20 @@ class RadixAttention(nn.Module):
             cache_seqlens=cache_seqlens,
             override=self._attention_override(ctx, preferred),
         )
+
+    def can_run_transient_paged_varlen(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        kv_cache,
+        preferred: str | None = None,
+        ctx=None,
+    ) -> bool:
+        ctx = get_forward_context() if ctx is None else ctx
+        selected = preferred or ctx.attention_backend_name or self.backend_name or "torch_sdpa"
+        return self._can_run_transient_paged_varlen(ctx, selected, kv_cache, q, k, v)
 
     @staticmethod
     def _can_run_empty_paged_prefill(ctx, kv_cache, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:

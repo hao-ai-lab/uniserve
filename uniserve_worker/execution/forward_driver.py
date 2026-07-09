@@ -1,6 +1,7 @@
 """Runner-owned mixed forward execution seam."""
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -43,13 +44,29 @@ class ForwardDriver:
         group: Sequence[tuple[int, Mapping[str, Any]]],
         request_states: RequestStateTable,
         model: Any,
+        *,
+        defer_text_cpu_results: bool = False,
     ) -> list[Any]:
         hook = getattr(model, "run_forward", None)
         if not callable(hook):
             raise capability_mismatch("model does not implement run_forward")
-        result = hook(fb, request_states=request_states, group=list(group))
+        kwargs: dict[str, Any] = {"request_states": request_states, "group": list(group)}
+        if _accepts_deferred_text_cpu_results(hook):
+            kwargs["defer_text_cpu_results"] = bool(defer_text_cpu_results)
+        result = hook(fb, **kwargs)
         if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
             raise invalid_descriptor("run_forward must return one result per mixed op")
         if len(result) != len(group):
             raise invalid_descriptor("run_forward returned the wrong number of results")
         return list(result)
+
+
+def _accepts_deferred_text_cpu_results(hook: Any) -> bool:
+    try:
+        signature = inspect.signature(hook)
+    except (TypeError, ValueError):
+        return False
+    for parameter in signature.parameters.values():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "defer_text_cpu_results" in signature.parameters

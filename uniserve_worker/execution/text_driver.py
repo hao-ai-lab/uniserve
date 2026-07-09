@@ -35,6 +35,7 @@ from ..nn.sampler import (
 )
 from ..runtime.request_state import RequestState, RequestStateTable
 from .decode_burst import DecodeBurstExecutor
+from .deferred_text_result import DeferredTextSeqResult
 from .text_decode_relay import TextDecodeRelay
 
 if TYPE_CHECKING:
@@ -73,62 +74,6 @@ def text_input_id_replacements_from_relays(
     """
 
     return _DECODE_RELAY.replace_inputs(text, request_states, device)
-
-
-class DeferredTextSeqResult(ForwardOutputBase):
-    """One text seq-result whose CPU token id is finalized at response time."""
-
-    def __init__(
-        self,
-        *,
-        req_id: int,
-        row: int,
-        state: RequestState,
-        sampling_result: DeferredBatchedSamplingResult,
-        relay_token_tensor: torch.Tensor,
-    ) -> None:
-        object.__setattr__(self, "req_id", int(req_id))
-        object.__setattr__(self, "_row", int(row))
-        object.__setattr__(self, "_state", state)
-        object.__setattr__(self, "_sampling_result", sampling_result)
-        object.__setattr__(self, "_relay_token_tensor", relay_token_tensor)
-        object.__setattr__(self, "_finalized", None)
-
-    def to_seq_result(self) -> "DeferredTextSeqResult":
-        return self
-
-    def finalize(self) -> dict[str, Any]:
-        if self._finalized is None:
-            sample = self._sampling_result.finalize().samples[self._row]
-            tok, lp, top = sample
-            _DECODE_RELAY.publish_deferred_sample_id_if_current(
-                self._state,
-                token_id=int(tok),
-                relay_token_tensor=self._relay_token_tensor,
-            )
-            result: dict[str, Any] = {
-                "req_id": self.req_id,
-                "sampled_token_id": int(tok),
-            }
-            if lp is not None:
-                result["sampled_logprob"] = lp
-            if top:
-                result["top_logprobs"] = top
-            object.__setattr__(self, "_finalized", result)
-        return dict(self._finalized)
-
-    def ready(self) -> bool:
-        if self._finalized is not None:
-            return True
-        ready = getattr(self._sampling_result, "ready", None)
-        return bool(ready()) if callable(ready) else True
-
-    def cuda_ready_group_key(self) -> int:
-        return id(self._sampling_result)
-
-    def cuda_ready_elapsed_us(self) -> int | None:
-        elapsed = getattr(self._sampling_result, "cuda_ready_elapsed_us", None)
-        return elapsed() if callable(elapsed) else None
 
 
 def sample_logits_result(
@@ -686,32 +631,6 @@ class TextDriver:
             position_id=position_id,
             position_tensor=position_tensor,
         )
-
-
-def _coalesce_relay_rows(rows: list[torch.Tensor]) -> torch.Tensor:
-    if not rows:
-        raise invalid_descriptor("decode relay rows must not be empty")
-    if len(rows) == 1:
-        return rows[0].reshape(-1)
-    first = rows[0].reshape(-1)
-    if int(first.numel()) != 1:
-        return torch.cat([row.reshape(-1) for row in rows], dim=0)
-    elem_size = int(first.element_size())
-    base_ptr = int(first.data_ptr())
-    for idx, row in enumerate(rows):
-        flat = row.reshape(-1)
-        if (
-            int(flat.numel()) != 1
-            or flat.dtype != first.dtype
-            or flat.device != first.device
-            or int(flat.data_ptr()) != base_ptr + idx * elem_size
-        ):
-            return torch.cat([candidate.reshape(-1) for candidate in rows], dim=0)
-    try:
-        return first.as_strided((len(rows),), (1,))
-    except RuntimeError:
-        return torch.cat([candidate.reshape(-1) for candidate in rows], dim=0)
-
 
 def _can_decode_burst(text: "TextBatch", ops: list[Mapping[str, Any]], *, defer_sampling: bool) -> bool:
     if defer_sampling or text.mode != ForwardMode.DECODE:

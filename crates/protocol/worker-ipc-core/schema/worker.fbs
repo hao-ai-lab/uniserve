@@ -222,6 +222,10 @@ table ForwardOp {
   // Token ids that force a decode burst to stop immediately after sampling.
   // Small id list only; append-only for FlatBuffers compatibility.
   decode_stop_token_ids:[uint];
+  // True when a stop-token hit finishes the request and any extra speculative
+  // KV written after the stop will be discarded with that request.
+  // Append-only for FlatBuffers compatibility.
+  decode_stop_terminal:bool = false;
 }
 
 table ForwardBatch {

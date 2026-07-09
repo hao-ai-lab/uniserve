@@ -17,6 +17,10 @@ from uniserve_worker.contracts.op_kinds import (
     OP_KIND_TABLE,
     PREFILL_UND,
 )
+from uniserve_worker.execution.deferred_text_result import (
+    DeferredDecodeBurstSeqResult,
+    DeferredTerminalDecodeBurstSeqResult,
+)
 from uniserve_worker.execution.forward_admission import (
     ForwardAdmissionRouter,
     Route,
@@ -268,3 +272,60 @@ def test_finalize_is_idempotent():
     second = deferred.finalize()
 
     assert first == second == {"req_id": 3, "sampled_token_id": 13}
+
+
+def test_deferred_decode_burst_result_finalizes_final_token():
+    torch.manual_seed(0)
+    state = RequestState()
+    sampling_result = _deferred_sampling_result(17)
+    relay_tensor = sampling_result.device_tokens[0:1].detach().reshape(1)
+    _store_relay(state, token_id=None, tensor=relay_tensor)
+    pending = DeferredTextSeqResult(
+        req_id=3,
+        row=0,
+        state=state,
+        sampling_result=sampling_result,
+        relay_token_tensor=state.decode_relay.token_tensor,
+    )
+    burst = DeferredDecodeBurstSeqResult(
+        req_id=3,
+        prefix_token_ids=[11, 13],
+        pending=pending,
+    )
+
+    first = burst.finalize()
+    second = burst.finalize()
+
+    assert first == second == {"req_id": 3, "sampled_token_id": 17, "sampled_token_ids": [11, 13, 17]}
+    assert state.decode_relay.token_id == 17
+
+
+def test_deferred_terminal_decode_burst_result_truncates_at_stop_token():
+    first = DeferredTextSeqResult(
+        req_id=3,
+        row=0,
+        state=RequestState(),
+        sampling_result=_deferred_sampling_result(11),
+        relay_token_tensor=torch.tensor([11], dtype=torch.long),
+    )
+    stop = DeferredTextSeqResult(
+        req_id=3,
+        row=0,
+        state=RequestState(),
+        sampling_result=_deferred_sampling_result(13),
+        relay_token_tensor=torch.tensor([13], dtype=torch.long),
+    )
+    after = DeferredTextSeqResult(
+        req_id=3,
+        row=0,
+        state=RequestState(),
+        sampling_result=_deferred_sampling_result(17),
+        relay_token_tensor=torch.tensor([17], dtype=torch.long),
+    )
+    burst = DeferredTerminalDecodeBurstSeqResult(
+        req_id=3,
+        pending_tokens=[first, stop, after],
+        stop_token_ids=[13],
+    )
+
+    assert burst.finalize() == {"req_id": 3, "sampled_token_id": 13, "sampled_token_ids": [11, 13]}

@@ -115,6 +115,30 @@ class TextTensorStager:
             slot[name] = buf
         return buf[: int(numel)]
 
+    def _bool_buffer(
+        self,
+        slot: dict[str, torch.Tensor],
+        name: str,
+        numel: int,
+        *,
+        pin: bool,
+    ) -> torch.Tensor:
+        want_pin = bool(pin and self._pin_memory_supported)
+        buf = slot.get(name)
+        if (
+            buf is None
+            or int(buf.numel()) < int(numel)
+            or buf.dtype != torch.bool
+            or (_is_pinned(buf) != want_pin)
+        ):
+            try:
+                buf = torch.empty(int(numel), dtype=torch.bool, pin_memory=want_pin)
+            except RuntimeError:
+                self._pin_memory_supported = False
+                buf = torch.empty(int(numel), dtype=torch.bool)
+            slot[name] = buf
+        return buf[: int(numel)]
+
     @staticmethod
     def _device_key(name: str, dtype: torch.dtype, device: torch.device | str) -> str:
         dev = _canonical_device(device)
@@ -153,6 +177,9 @@ class TextTensorStagingSlot:
 
     def int_buffer(self, name: str, numel: int, *, pin: bool) -> torch.Tensor:
         return self.stager._int_buffer(self.buffers, name, numel, pin=pin)
+
+    def bool_buffer(self, name: str, numel: int, *, pin: bool) -> torch.Tensor:
+        return self.stager._bool_buffer(self.buffers, name, numel, pin=pin)
 
     def device_buffer(
         self,

@@ -260,6 +260,22 @@ def test_quantization_config_extracts_kv_cache_dtype():
         )
 
 
+def test_sensenova_kv_geometry_honors_runtime_cache_dtype_override(monkeypatch):
+    from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
+
+    _set_worker_runtime(monkeypatch, kv_cache_dtype="fp32")
+    wrapper = SenseNovaU1ForUnifiedGeneration.__new__(SenseNovaU1ForUnifiedGeneration)
+    wrapper.block_size = 64
+    llm_cfg = SimpleNamespace(num_hidden_layers=2, num_key_value_heads=1, head_dim=8)
+    config = SimpleNamespace(quantization_config={"kv_cache_dtype": "bf16"})
+
+    n_kv, head_dim = wrapper._init_kv_geometry(config, llm_cfg, kv_token_capacity=128)
+
+    assert (n_kv, head_dim) == (1, 8)
+    assert wrapper.kv_cache_dtype == "fp32"
+    assert wrapper.bytes_per_token == 1 * 8 * 2 * 2 * 4
+
+
 def test_fp8_linear_online_quantizes_and_uses_dequantized_correctness_floor():
     from uniserve_worker.nn.quant import QuantizationConfig, use_quantization_config
     from uniserve_worker.nn.quant.base import process_quantized_modules
@@ -756,6 +772,39 @@ def test_row_parallel_forward_requires_or_uses_tp_collective():
     expected = F.linear(x, row2.weight, None) + 1
     torch.testing.assert_close(out, expected)
     assert calls == ["sum"]
+
+
+def test_row_parallel_reduce_after_merge_matches_per_slice_reduces():
+    from uniserve_worker.nn import DeviceMesh, RowParallelLinear, use_mesh
+
+    calls = []
+
+    class _FakeTransport:
+        size = 2
+        coord = 0
+
+        def all_reduce(self, tensor, op="sum"):
+            calls.append((op, tuple(tensor.shape)))
+            return tensor + 1
+
+    with use_mesh(DeviceMesh.tp(0, 2, transport=_FakeTransport())):
+        text = RowParallelLinear(4, 3, bias=True)
+        gen = RowParallelLinear(4, 3, bias=True)
+    with torch.no_grad():
+        text.weight.copy_(torch.arange(6, dtype=torch.float32).reshape(3, 2))
+        gen.weight.copy_(torch.arange(6, 12, dtype=torch.float32).reshape(3, 2))
+        text.bias.copy_(torch.tensor([0.5, 1.5, 2.5]))
+        gen.bias.copy_(torch.tensor([3.5, 4.5, 5.5]))
+    text_x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    gen_x = torch.tensor([[5.0, 6.0]])
+
+    expected = torch.cat((text(text_x), gen(gen_x)), dim=0)
+    calls.clear()
+    partial = torch.cat((text(text_x, reduce=False), gen(gen_x, reduce=False)), dim=0)
+    merged = text.reduce_output(partial)
+
+    torch.testing.assert_close(merged, expected)
+    assert calls == [("sum", (3, 3))]
 
 
 def test_qkv_parallel_loader_shards_q_and_replicates_small_kv_heads():
@@ -1495,6 +1544,59 @@ def test_uni_attention_runs_transient_paged_varlen_without_context_metadata():
     assert append_kwargs["cu_seqlens_q"].tolist() == [0, 3, 6]
 
 
+def test_uni_attention_rejects_dense_fallback_for_transient_paged_cache_layout():
+    from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
+
+    class FakeDecodeOnlyBackend:
+        name = "fake_decode_only"
+
+        def capabilities(self):
+            return AttentionCapabilities(paged_kv=True, paged_decode_only=True)
+
+        def forward_paged(self, *args, **kwargs):  # pragma: no cover - must not be called
+            del args, kwargs
+            raise AssertionError("multi-token transient attention must not run as paged decode")
+
+    class FakePool:
+        block_size = 4
+        supports_paged_attention_storage = True
+
+        def layer_cache(self, layer):
+            assert layer == 0
+            empty = torch.empty(4, 4, 2, 4)
+            return empty, empty
+
+    class FakeCache:
+        def __init__(self):
+            self.pool = FakePool()
+            self.base_lens = (3, 5)
+
+        def block_table(self, *, device=None):
+            return torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
+
+        def cache_seqlens(self, *, device=None):
+            return torch.tensor([3, 5], dtype=torch.int32, device=device)
+
+        def append_varlen(self, *args, **kwargs):  # pragma: no cover - must not be called
+            del args, kwargs
+            raise AssertionError("decode-only backend should not accept transient varlen")
+
+        def get(self, layer):  # pragma: no cover - guard must fail before dense cache reads
+            del layer
+            raise AssertionError("dense fallback must reject 4-D paged cache tensors before reading")
+
+    attn = RadixAttention(2, 2, 4, layer_id=0)
+    q = torch.randn(2, 2, 3, 4)
+    k = torch.randn(2, 2, 3, 4)
+    v = torch.randn(2, 2, 3, 4)
+
+    with use_forward_context(ForwardContext(attention_backend=FakeDecodeOnlyBackend())):
+        with pytest.raises(WorkerError, match="dense KV-cache fallback") as exc_info:
+            attn(q, k, v, kv_cache=FakeCache(), update_cache=True, causal=False)
+
+    assert exc_info.value.code == "CapabilityMismatch"
+
+
 def test_uni_attention_falls_back_for_non_trunk_fa4_geometry():
     from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 
@@ -1824,7 +1926,7 @@ def test_sensenova_packed_visible_all_gen_uses_single_modality_qkv(monkeypatch):
     assert calls == [True]
 
 
-def test_sensenova_packed_visible_fully_visible_uses_paged_varlen(monkeypatch):
+def test_sensenova_packed_visible_fully_visible_uses_visible_end_backend():
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.forward_stream import (
         ForwardPagedKVSegment,
@@ -1880,24 +1982,27 @@ def test_sensenova_packed_visible_fully_visible_uses_paged_varlen(monkeypatch):
     q = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
     k = q + 100
     v = q + 200
-    calls = []
+    class FakeAttention:
+        def __init__(self):
+            self.calls = []
 
-    def fake_attention(got_q, got_k_cache, got_v_cache, **kwargs):
-        calls.append(kwargs)
-        assert got_q is q
-        assert got_k_cache.data_ptr() == pool.k[0].data_ptr()
-        assert got_v_cache.data_ptr() == pool.v[0].data_ptr()
-        assert kwargs["regime"] is sensenova_u1.ops.AttentionRegime.EXTEND
-        assert kwargs["causal"] is False
-        assert kwargs["max_seqlen_q"] == 3
-        assert kwargs["max_seqlen_k"] == 3
-        assert kwargs["block_table"].tolist() == [[0], [1]]
-        assert kwargs["cu_seqlens_q"].tolist() == [0, 1, 4]
-        assert kwargs["cu_seqlens_k"].tolist() == [0, 2, 5]
-        return got_q + 1
+        def forward_visible_end(self, got_q, got_k_cache, got_v_cache, **kwargs):
+            self.calls.append(kwargs)
+            assert got_q is q
+            assert got_k_cache.data_ptr() == pool.k[0].data_ptr()
+            assert got_v_cache.data_ptr() == pool.v[0].data_ptr()
+            assert kwargs["max_seqlen_q"] == 3
+            assert kwargs["max_seqlen_k"] == 3
+            assert kwargs["page_table"].tolist() == [[0], [1]]
+            assert kwargs["cu_seqlens_q"].tolist() == [0, 1, 4]
+            assert kwargs["seqused_k"].tolist() == [2, 3]
+            assert kwargs["visible_end"].tolist() == stream.visible_end.tolist()
+            assert kwargs["use_prefix_bounds"] is True
+            assert kwargs["fully_visible"] is True
+            return got_q + 1
 
-    monkeypatch.setattr(sensenova_u1.ops, "attention", fake_attention)
-    owner = SimpleNamespace(layer_idx=0, scaling=0.5)
+    fake_attention = FakeAttention()
+    owner = SimpleNamespace(layer_idx=0, scaling=0.5, attn=fake_attention)
 
     out = sensenova_u1._SenseNovaAttention._attend_packed_visible(
         owner,
@@ -1908,7 +2013,7 @@ def test_sensenova_packed_visible_fully_visible_uses_paged_varlen(monkeypatch):
         kv_view=view,
     )
 
-    assert len(calls) == 1
+    assert len(fake_attention.calls) == 1
     torch.testing.assert_close(out, q + 1)
     torch.testing.assert_close(pool.k[0, 0, 1], k[0])
     torch.testing.assert_close(pool.k[0, 1, :3], k[1:])
@@ -2028,6 +2133,7 @@ def test_sensenova_forward_sampling_updates_decode_relay():
         [None],
     )
     sample = sampled.samples[0]
+    position_tensor = torch.tensor([9], dtype=torch.long)
 
     assert RequestStates().get(1) is state
     packed_mixed_forward._store_forward_sampled_token_relay(
@@ -2036,6 +2142,7 @@ def test_sensenova_forward_sampling_updates_decode_relay():
         device=torch.device("cpu"),
         position_id=9,
         token_tensor=sampled.device_tokens[0:1],
+        position_tensor=position_tensor,
     )
 
     assert int(sample.token_id) == 2
@@ -2043,6 +2150,137 @@ def test_sensenova_forward_sampling_updates_decode_relay():
     torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long))
     assert state.decode_relay.position_id == 9
     torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([9], dtype=torch.long))
+    assert state.decode_relay.position_tensor.data_ptr() == position_tensor.data_ptr()
+
+
+def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.execution import packed_mixed_forward
+
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 1,
+                "kind": "decode_und",
+                "token_ids": [11],
+                "pos_range": [4, 5],
+                "decode_token_count": 4,
+            },
+            {
+                "req_id": 2,
+                "kind": "decode_und",
+                "token_ids": [12],
+                "pos_range": [8, 9],
+                "decode_token_count": 1,
+            },
+        ]
+    )
+    plan = packed_mixed_forward.PackedForwardPlan(batch=batch, denoise_steps=[], results=[None, None])
+    cache = SimpleNamespace()
+    plan.add_text_slot(
+        row_index=0,
+        segment_start=0,
+        q_len=1,
+        persistent_cache=cache,
+        staged_cache=cache,
+        base_len=4,
+        last_input_token=11,
+    )
+    plan.add_text_slot(
+        row_index=1,
+        segment_start=1,
+        q_len=1,
+        persistent_cache=cache,
+        staged_cache=cache,
+        base_len=8,
+        last_input_token=12,
+    )
+
+    tensors = packed_mixed_forward._forward_burst_position_tensors(
+        SimpleNamespace(),
+        plan,
+        device=torch.device("cpu"),
+    )
+
+    assert list(tensors) == [0]
+    torch.testing.assert_close(tensors[0], torch.tensor([5], dtype=torch.long))
+
+
+def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class GraphDriver:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        def try_run_decode_graph_logits_batch(self, ops):
+            self.calls.append([dict(op) for op in ops])
+            token = 3 + len(self.calls) - 1
+            logits = torch.full((1, 6), -10.0, dtype=torch.float32)
+            logits[0, token] = 10.0
+            return [logits]
+
+    class Owner:
+        device = torch.device("cpu")
+
+        def __init__(self) -> None:
+            self.driver = GraphDriver()
+
+        def _text_driver(self):
+            return self.driver
+
+        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+            return sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_packed_decode_burst_graph_followup(
+                self,
+                ops,
+                request_states,
+                defer_cpu_results=defer_cpu_results,
+            )
+
+    def eager_followup_called(*_args):
+        raise AssertionError("graph-eligible burst follow-up should not use packed eager fallback")
+
+    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", eager_followup_called)
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    state = states.get(7)
+    state.decode_relay.token_id = 2
+    state.decode_relay.token_tensor = torch.tensor([2], dtype=torch.long)
+    state.decode_relay.position_id = 4
+    state.decode_relay.position_tensor = torch.tensor([4], dtype=torch.long)
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [11],
+                "pos_range": [3, 4],
+                "decode_token_count": 3,
+            }
+        ]
+    )
+    results = [{"req_id": 7, "sampled_token_id": 2}]
+    owner = Owner()
+
+    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
+        owner,
+        batch,
+        states,
+        results,
+    )
+
+    assert results == [{"req_id": 7, "sampled_token_id": 4, "sampled_token_ids": [2, 3, 4]}]
+    assert [call[0]["pos_range"] for call in owner.driver.calls] == [[4, 5], [5, 6]]
+    assert [call[0]["token_source"] for call in owner.driver.calls] == ["last_sampled", "last_sampled"]
+    assert int(owner.driver.calls[0][0]["token_tensor"].item()) == 2
+    assert int(owner.driver.calls[1][0]["token_tensor"].item()) == 3
+    assert state.decode_relay.token_id == 4
+    torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([4], dtype=torch.long))
+    assert state.decode_relay.position_id == 6
+    torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([6], dtype=torch.long))
 
 
 def test_sensenova_text_batch_delegates_to_scalar_text_stepper(monkeypatch):
@@ -2524,6 +2762,536 @@ def test_packed_mixed_hydrates_cached_prefix_length_from_pos_range():
     assert results[0].sampled_token_id == 3
 
 
+def test_sensenova_packed_mixed_sorted_segments_scatter_to_original_rows(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_mode import ForwardMode
+    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
+    from uniserve_worker.execution.forward_stream import (
+        ForwardPagedKVSegment,
+        ForwardStreamBuilder,
+    )
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    monkeypatch.setattr(packed_mixed_forward, "_PACKED_MIXED_SORT_BY_MODALITY", True)
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=4,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    text_cache = SimpleNamespace(
+        block_ids=[0],
+        past=PagedTextCache(pool, [0], num_layers=1, length=2),
+        t_index=1,
+        last_logits=None,
+        last_token_id=None,
+    )
+    image_cache = PagedTextCache(pool, [1], num_layers=1, length=0)
+    image_embeds = torch.full((1, 1, 4), 2.0, dtype=torch.float32)
+    indexes = torch.tensor([[0], [0], [0]], dtype=torch.long)
+    step = TextImageDenoiseStep(
+        req_id=8,
+        state=SimpleNamespace(),
+        op={"req_id": 8, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
+        latent=torch.zeros(1, 3),
+        t=torch.tensor(0.0),
+        t_next=torch.tensor(1.0),
+        step_index=0,
+        total_steps=1,
+        cfg_text_scale=1.0,
+        cfg_img_scale=1.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_renorm_type="none",
+        cfg_renorm_min=0.0,
+        extra={"img": SimpleNamespace(token_h=1, token_w=1, width=16, height=16), "image_embeds": image_embeds},
+    )
+
+    class Owner:
+        model = object()
+        device = torch.device("cpu")
+        num_layers = 1
+        eos_id = 0
+        kv_pool = pool
+        residency = SimpleNamespace(release_scratch_cache=lambda _cache: None)
+
+        def __init__(self) -> None:
+            self.text_state = SimpleNamespace(cond=text_cache)
+            self.segment_modalities: list[str] = []
+            self.segment_rows: list[int] = []
+            self.input_embeds = None
+            self.image_gen_indicators = None
+            self.updated = None
+
+        def _forward_target_pool(self, _denoise_steps):
+            return pool
+
+        def interleaved_image_state(self, req_id):
+            assert int(req_id) == 7
+            return self.text_state
+
+        def _extend_cache_blocks(self, _cache, _op):
+            return None
+
+        def _ensure_host_cache(self, _cache):
+            return None
+
+        def _same_kv_pool(self, candidate, first):
+            return first is None or candidate is first
+
+        def _stage_text_cache_for_forward(self, *_args, **_kwargs):
+            raise AssertionError("text cache already uses the packed pool")
+
+        def packed_text_embeddings(self, ids):
+            return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
+
+        def _text_indexes(self, start, seq_len, *, device):
+            return torch.stack(
+                [
+                    torch.arange(int(start), int(start) + int(seq_len), device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+
+        def _add_text_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            mode: ForwardMode,
+            cache,
+            q_len: int,
+            start_pos: int,
+            device: torch.device,
+        ) -> None:
+            builder.add_segment(
+                op_index=row_index,
+                req_id=req_id,
+                kind=str(op["kind"]),
+                mode=mode,
+                modality="und",
+                segment_class="decode",
+                q_len=q_len,
+                prefix_len=int(cache.past.length),
+                indexes=self._text_indexes(start_pos, q_len, device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.past.block_ids),
+                    base_len=int(cache.past.length),
+                    q_len=q_len,
+                    write_kv=True,
+                )
+            )
+
+        def _denoise_branch_inputs(self, _img, _branch):
+            return indexes, image_cache
+
+        def _wait_gen_cache_ready(self, _cache):
+            return None
+
+        def _add_denoise_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            cache,
+            indexes: torch.Tensor,
+            q_len: int,
+            branch_index: int,
+            device: torch.device,
+        ) -> None:
+            builder.add_segment(
+                op_index=row_index,
+                req_id=req_id,
+                kind=str(op["kind"]),
+                mode=ForwardMode.DENOISE,
+                modality="gen",
+                segment_class="denoise",
+                q_len=q_len,
+                prefix_len=int(cache.length),
+                branch_id=branch_index,
+                visible_policy="bidirectional",
+                indexes=indexes.to(device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.block_ids),
+                    base_len=int(cache.length),
+                    q_len=q_len,
+                    write_kv=True,
+                    persist_kv=False,
+                    branch_id=branch_index,
+                )
+            )
+
+        def packed_decoder_forward(self, input_embeds, **kwargs):
+            stream = kwargs["forward_stream"]
+            self.segment_modalities = [seg.modality for seg in stream.segments]
+            self.segment_rows = [seg.op_index for seg in stream.segments]
+            self.input_embeds = input_embeds.clone()
+            self.image_gen_indicators = kwargs["image_gen_indicators"].clone()
+            return input_embeds
+
+        def packed_text_logits(self, hidden):
+            logits = torch.zeros((hidden.shape[0], hidden.shape[1], 6), dtype=torch.float32)
+            logits[..., 4] = 1.0
+            return logits
+
+        def packed_hidden_to_velocity(self, hidden_states, _t, latent, **_kwargs):
+            torch.testing.assert_close(hidden_states, image_embeds)
+            return torch.zeros_like(latent)
+
+        def accept_denoise_update(self, _step, updated):
+            self.updated = updated
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
+    states.create_or_update(8, {"req_id": 8, "block_ids": [1]})
+    batch = UniForwardBatch.from_ops(
+        [
+            step.op,
+            {"req_id": 8, "kind": "commit_gen"},
+            {"req_id": 7, "kind": "decode_und", "token_ids": [5], "pos_range": [2, 3]},
+        ]
+    )
+    owner = Owner()
+    results = [None, None, None]
+
+    assert packed_mixed_forward.run_packed_mixed_forward(owner, batch, states, [(0, step)], results)
+
+    assert owner.segment_modalities == ["und", "gen"]
+    assert owner.segment_rows == [2, 0]
+    assert owner.image_gen_indicators.tolist() == [False, True]
+    torch.testing.assert_close(owner.input_embeds[0], torch.ones(4))
+    torch.testing.assert_close(owner.input_embeds[1], torch.full((4,), 2.0))
+    assert results[0] == {"req_id": 8, "denoise_done": True, "num_steps_done": 1}
+    assert results[1] is None
+    assert results[2].sampled_token_id == 4
+    assert text_cache.past.length == 3
+    assert image_cache.length == 0
+
+
+def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_mode import ForwardMode
+    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
+    from uniserve_worker.execution.forward_stream import (
+        ForwardPagedKVSegment,
+        ForwardStreamBuilder,
+    )
+    from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    host_pool = PagedKVPool(
+        num_layers=2,
+        num_blocks=4,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    stage_pool = PagedKVPool(
+        num_layers=2,
+        num_blocks=6,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+
+    def write_prefix(cache: PagedTextCache, *, value: float) -> None:
+        k = torch.full((2, 1, 2), value, dtype=torch.float32)
+        v = torch.full((2, 1, 2), -value, dtype=torch.float32)
+        for layer_idx in range(2):
+            cache.pool.write(layer_idx, cache.block_ids, start=0, k=k + layer_idx, v=v - layer_idx)
+
+    text_a = SimpleNamespace(
+        block_ids=[0],
+        past=PagedTextCache(host_pool, [0], num_layers=2, length=2),
+        t_index=1,
+        last_logits=None,
+        last_token_id=None,
+    )
+    text_b = SimpleNamespace(
+        block_ids=[1],
+        past=PagedTextCache(host_pool, [1], num_layers=2, length=2),
+        t_index=1,
+        last_logits=None,
+        last_token_id=None,
+    )
+    write_prefix(text_a.past, value=10.0)
+    write_prefix(text_b.past, value=20.0)
+    image_cache = PagedTextCache(stage_pool, [0], num_layers=2, length=0)
+    image_embeds = torch.full((1, 1, 4), 3.0, dtype=torch.float32)
+    indexes = torch.tensor([[0], [0], [0]], dtype=torch.long)
+    img = SimpleNamespace(token_h=1, token_w=1, width=16, height=16)
+    step = TextImageDenoiseStep(
+        req_id=9,
+        state=SimpleNamespace(),
+        op={"req_id": 9, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
+        latent=torch.zeros(1, 3),
+        t=torch.tensor(0.0),
+        t_next=torch.tensor(1.0),
+        step_index=0,
+        total_steps=1,
+        cfg_text_scale=1.0,
+        cfg_img_scale=1.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_renorm_type="none",
+        cfg_renorm_min=0.0,
+        extra={"img": img, "image_embeds": image_embeds},
+    )
+
+    class Residency:
+        def __init__(self) -> None:
+            self.next_block = 1
+
+        def require_allocator_for_pool(self, pool, *, label):
+            assert pool is stage_pool
+            assert label == "forward scratch KV pool"
+
+            def allocate(count: int) -> list[int]:
+                start = self.next_block
+                self.next_block += int(count)
+                return list(range(start, start + int(count)))
+
+            return allocate
+
+        def release_scratch_cache(self, _cache) -> None:
+            return None
+
+    class Owner:
+        model = object()
+        device = torch.device("cpu")
+        num_layers = 2
+        eos_id = 0
+        kv_pool = host_pool
+        scratch_pool = stage_pool
+        gen_scratch_pool = stage_pool
+        block_size = 4
+
+        def __init__(self) -> None:
+            self.residency = Residency()
+            self.states = {
+                7: SimpleNamespace(cond=text_a),
+                8: SimpleNamespace(cond=text_b),
+            }
+            self.checked_staging = False
+            self.updated = None
+
+        def _forward_target_pool(self, _denoise_steps):
+            return stage_pool
+
+        def interleaved_image_state(self, req_id):
+            return self.states[int(req_id)]
+
+        def _extend_cache_blocks(self, _cache, _op):
+            return None
+
+        def _ensure_host_cache(self, _cache):
+            return None
+
+        def _same_kv_pool(self, candidate, first):
+            return first is None or candidate is first
+
+        def _stage_text_cache_for_forward(self, *args, **kwargs):
+            return SenseNovaU1ForUnifiedGeneration._stage_text_cache_for_forward(
+                self,
+                *args,
+                **kwargs,
+            )
+
+        def _mark_forward_staging_advanced(self, *args, **kwargs):
+            return SenseNovaU1ForUnifiedGeneration._mark_forward_staging_advanced(
+                self,
+                *args,
+                **kwargs,
+            )
+
+        @staticmethod
+        def _forward_staging_source_prefix(cache, length):
+            return SenseNovaU1ForUnifiedGeneration._forward_staging_source_prefix(cache, length)
+
+        def packed_text_embeddings(self, ids):
+            return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
+
+        def _text_indexes(self, start, seq_len, *, device):
+            return torch.stack(
+                [
+                    torch.arange(int(start), int(start) + int(seq_len), device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+
+        def _add_text_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            mode: ForwardMode,
+            cache,
+            q_len: int,
+            start_pos: int,
+            device: torch.device,
+        ) -> None:
+            builder.add_segment(
+                op_index=row_index,
+                req_id=req_id,
+                kind=str(op["kind"]),
+                mode=mode,
+                modality="und",
+                segment_class="decode",
+                q_len=q_len,
+                prefix_len=int(cache.past.length),
+                indexes=self._text_indexes(start_pos, q_len, device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.past.block_ids),
+                    base_len=int(cache.past.length),
+                    q_len=q_len,
+                    write_kv=True,
+                )
+            )
+
+        def _denoise_branch_inputs(self, _img, _branch):
+            return indexes, image_cache
+
+        def _wait_gen_cache_ready(self, _cache):
+            return None
+
+        def _add_denoise_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            cache,
+            indexes: torch.Tensor,
+            q_len: int,
+            branch_index: int,
+            device: torch.device,
+        ) -> None:
+            builder.add_segment(
+                op_index=row_index,
+                req_id=req_id,
+                kind=str(op["kind"]),
+                mode=ForwardMode.DENOISE,
+                modality="gen",
+                segment_class="denoise",
+                q_len=q_len,
+                prefix_len=int(cache.length),
+                branch_id=branch_index,
+                visible_policy="bidirectional",
+                indexes=indexes.to(device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.block_ids),
+                    base_len=int(cache.length),
+                    q_len=q_len,
+                    write_kv=True,
+                    persist_kv=False,
+                    branch_id=branch_index,
+                )
+            )
+
+        def packed_decoder_forward(self, input_embeds, **_kwargs):
+            for text in (text_a, text_b):
+                staged = text.past._uniserve_forward_staging[id(stage_pool)]
+                for layer_idx in range(2):
+                    expected_k, expected_v = text.past.pool.read(
+                        layer_idx,
+                        text.past.block_ids,
+                        start=0,
+                        length=2,
+                    )
+                    got_k, got_v = staged.pool.read(layer_idx, staged.block_ids, start=0, length=2)
+                    torch.testing.assert_close(got_k, expected_k)
+                    torch.testing.assert_close(got_v, expected_v)
+            self.checked_staging = True
+            return input_embeds
+
+        def packed_text_logits(self, hidden):
+            logits = torch.zeros((hidden.shape[0], hidden.shape[1], 7), dtype=torch.float32)
+            logits[..., 4] = 1.0
+            return logits
+
+        def packed_hidden_to_velocity(self, _hidden_states, _t, latent, **_kwargs):
+            return torch.zeros_like(latent)
+
+        def accept_denoise_update(self, _step, updated):
+            self.updated = updated
+
+    original_copy_spans = packed_mixed_forward.copy_paged_text_cache_spans
+    copy_calls: list[list[tuple[object, object, int, int]]] = []
+
+    def recording_copy_spans(spans, **kwargs):
+        span_list = list(spans)
+        copy_calls.append(
+            [
+                (span.source.pool, span.target.pool, int(span.start), int(span.length))
+                for span in span_list
+            ]
+        )
+        return original_copy_spans(span_list, **kwargs)
+
+    monkeypatch.setattr(packed_mixed_forward, "copy_paged_text_cache_spans", recording_copy_spans)
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
+    states.create_or_update(8, {"req_id": 8, "block_ids": [1], "sampling": {"temperature": 0.0}})
+    states.create_or_update(9, {"req_id": 9, "block_ids": [0]})
+    batch = UniForwardBatch.from_ops(
+        [
+            {"req_id": 7, "kind": "decode_und", "token_ids": [11], "pos_range": [2, 3]},
+            {"req_id": 8, "kind": "decode_und", "token_ids": [12], "pos_range": [2, 3]},
+            step.op,
+        ]
+    )
+    owner = Owner()
+    results = [None, None, None]
+
+    assert packed_mixed_forward.run_packed_mixed_forward(owner, batch, states, [(2, step)], results)
+
+    assert owner.checked_staging
+    assert any(
+        call == [
+            (host_pool, stage_pool, 0, 2),
+            (host_pool, stage_pool, 0, 2),
+        ]
+        for call in copy_calls
+    )
+    assert text_a.past.length == 3
+    assert text_b.past.length == 3
+
+
 def test_sensenova_packed_mixed_runs_text_only_forward_batch():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
@@ -2573,8 +3341,10 @@ def test_sensenova_packed_mixed_runs_text_only_forward_batch():
                 7: SimpleNamespace(cond=decode_cache),
                 8: SimpleNamespace(cond=extend_cache),
             }
+            self.embedding_inputs: list[list[int]] = []
             self.text_base_lens: list[int] = []
             self.kv_view = None
+            self.logit_hidden_shape = None
 
         def _forward_target_pool(self, denoise_steps):
             assert denoise_steps == []
@@ -2596,6 +3366,7 @@ def test_sensenova_packed_mixed_runs_text_only_forward_batch():
             raise AssertionError("text-only forward should use the host KV pool directly")
 
         def packed_text_embeddings(self, ids):
+            self.embedding_inputs.append([int(token) for token in ids.reshape(-1).tolist()])
             return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
 
         def _text_indexes(self, start, seq_len, *, device):
@@ -2648,6 +3419,7 @@ def test_sensenova_packed_mixed_runs_text_only_forward_batch():
             return input_embeds
 
         def packed_text_logits(self, hidden):
+            self.logit_hidden_shape = tuple(hidden.shape)
             logits = torch.zeros((hidden.shape[0], hidden.shape[1], 6), dtype=torch.float32)
             logits[..., 4] = 1.0
             return logits
@@ -2665,14 +3437,747 @@ def test_sensenova_packed_mixed_runs_text_only_forward_batch():
     owner = Owner()
 
     assert run_packed_mixed_forward(owner, batch, states, [], results)
+    assert owner.embedding_inputs == [[13, 21, 22]]
     assert owner.text_base_lens == [2, 0]
     assert owner.kv_view is not None
     assert owner.kv_view.cache_seqlens_after().tolist() == [3, 2]
+    assert owner.logit_hidden_shape == (1, 2, 4)
     assert decode_cache.past.length == 3
     assert decode_cache.t_index == 2
     assert extend_cache.past.length == 2
     assert extend_cache.t_index == 1
     assert [result.sampled_token_id for result in results] == [4, 4]
+
+
+def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_mode import ForwardMode
+    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.forward_stream import (
+        ForwardPagedKVSegment,
+        ForwardStreamBuilder,
+    )
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=2,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    text_cache = SimpleNamespace(
+        block_ids=[0],
+        past=PagedTextCache(pool, [0], num_layers=1, length=0),
+        t_index=-1,
+        last_logits=None,
+        last_token_id=None,
+    )
+
+    class Owner:
+        model = object()
+        device = torch.device("cpu")
+        num_layers = 1
+        eos_id = 0
+        kv_pool = pool
+        residency = SimpleNamespace(release_scratch_cache=lambda _cache: None)
+
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(cond=text_cache)
+            self.graph_rows: list[int] = []
+            self.logit_hidden = None
+
+        def _forward_target_pool(self, denoise_steps):
+            assert denoise_steps == []
+            return None
+
+        def interleaved_image_state(self, req_id):
+            assert int(req_id) == 9
+            return self.state
+
+        def _extend_cache_blocks(self, _cache, _op):
+            return None
+
+        def _ensure_host_cache(self, _cache):
+            return None
+
+        def _same_kv_pool(self, candidate, first):
+            return first is None or candidate is first
+
+        def packed_text_embeddings(self, ids):
+            return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
+
+        def _text_indexes(self, start, seq_len, *, device):
+            return torch.stack(
+                [
+                    torch.arange(int(start), int(start) + int(seq_len), device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+
+        def _add_text_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            mode: ForwardMode,
+            cache,
+            q_len: int,
+            start_pos: int,
+            device: torch.device,
+        ) -> None:
+            builder.add_segment(
+                op_index=row_index,
+                req_id=req_id,
+                kind=str(op["kind"]),
+                mode=mode,
+                modality="und",
+                segment_class="decode",
+                q_len=q_len,
+                prefix_len=int(cache.past.length),
+                indexes=self._text_indexes(start_pos, q_len, device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.past.block_ids),
+                    base_len=int(cache.past.length),
+                    q_len=q_len,
+                    write_kv=True,
+                )
+            )
+
+        def packed_decoder_forward(self, *_args, **_kwargs):
+            raise AssertionError("graph-hidden path should skip eager decoder")
+
+        def packed_text_logits(self, hidden):
+            self.logit_hidden = hidden.detach().clone()
+            logits = torch.zeros((hidden.shape[0], hidden.shape[1], 8), dtype=torch.float32)
+            logits[..., 6] = 1.0
+            return logits
+
+    def graph_hidden(
+        owner,
+        packed_embeds,
+        *,
+        image_gen_indicators,
+        forward_stream,
+        kv_view,
+        text_kv_promotions=(),
+    ):
+        del image_gen_indicators, kv_view, text_kv_promotions
+        owner.graph_rows = [seg.op_index for seg in forward_stream.segments]
+        return packed_embeds + 7
+
+    monkeypatch.setattr(packed_mixed_forward, "maybe_run_packed_mixed_graph", graph_hidden)
+    states = RequestStateTable()
+    states.create_or_update(9, {"req_id": 9, "block_ids": [0], "sampling": {"temperature": 0.0}})
+    batch = UniForwardBatch.from_ops(
+        [{"req_id": 9, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}]
+    )
+    owner = Owner()
+    results = [None]
+
+    assert packed_mixed_forward.run_packed_mixed_forward(owner, batch, states, [], results)
+
+    assert owner.graph_rows == [0]
+    torch.testing.assert_close(owner.logit_hidden, torch.full((1, 1, 4), 8.0))
+    assert results[0].sampled_token_id == 6
+
+
+def test_sensenova_packed_mixed_defers_text_cpu_result_when_not_burst(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_mode import ForwardMode
+    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.forward_stream import (
+        ForwardPagedKVSegment,
+        ForwardStreamBuilder,
+    )
+    from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=2,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    text_cache = SimpleNamespace(
+        block_ids=[0],
+        past=PagedTextCache(pool, [0], num_layers=1, length=2),
+        t_index=1,
+        last_logits=None,
+        last_token_id=None,
+    )
+
+    class Owner:
+        model = object()
+        device = torch.device("cpu")
+        num_layers = 1
+        eos_id = 0
+        kv_pool = pool
+        residency = SimpleNamespace(release_scratch_cache=lambda _cache: None)
+
+        def _forward_target_pool(self, denoise_steps):
+            assert denoise_steps == []
+            return None
+
+        def interleaved_image_state(self, req_id):
+            assert int(req_id) == 7
+            return SimpleNamespace(cond=text_cache)
+
+        def _extend_cache_blocks(self, _cache, _op):
+            return None
+
+        def _ensure_host_cache(self, _cache):
+            return None
+
+        def _same_kv_pool(self, candidate, first):
+            return first is None or candidate is first
+
+        def _stage_text_cache_for_forward(self, *_args, **_kwargs):
+            raise AssertionError("text cache already targets the packed forward pool")
+
+        def packed_text_embeddings(self, ids):
+            return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
+
+        def _text_indexes(self, start, seq_len, *, device):
+            return torch.stack(
+                [
+                    torch.arange(int(start), int(start) + int(seq_len), device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                    torch.zeros(int(seq_len), dtype=torch.long, device=device),
+                ],
+                dim=0,
+            )
+
+        def _add_text_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            mode: ForwardMode,
+            cache,
+            q_len: int,
+            start_pos: int,
+            device: torch.device,
+        ) -> None:
+            del req_id, op, mode
+            builder.add_segment(
+                op_index=row_index,
+                req_id=7,
+                kind="decode_und",
+                mode=ForwardMode.DECODE,
+                modality="und",
+                segment_class="decode",
+                q_len=q_len,
+                prefix_len=int(cache.past.length),
+                indexes=self._text_indexes(int(start_pos), q_len, device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.past.block_ids),
+                    base_len=int(cache.past.length),
+                    q_len=q_len,
+                    write_kv=True,
+                )
+            )
+
+        def packed_decoder_forward(self, input_embeds, **_kwargs):
+            return input_embeds
+
+        def packed_text_logits(self, hidden):
+            logits = torch.zeros((hidden.shape[0], hidden.shape[1], 8), dtype=torch.float32)
+            logits[..., 4] = 1.0
+            return logits
+
+    defer_flags: list[bool] = []
+
+    def fake_sampling(logits, *_args, defer_cpu=False, **_kwargs):
+        defer_flags.append(bool(defer_cpu))
+        tokens = torch.full((int(logits.shape[0]),), 4, dtype=torch.long, device=logits.device)
+        return DeferredBatchedSamplingResult(
+            tokens_cpu=tokens.cpu(),
+            device_tokens=tokens,
+            copy_event=None,
+        )
+
+    monkeypatch.setattr(
+        packed_mixed_forward,
+        "apply_sampling_batched_with_device_tokens",
+        fake_sampling,
+    )
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
+    batch = UniForwardBatch.from_ops(
+        [{"req_id": 7, "kind": "decode_und", "token_ids": [13], "pos_range": [2, 3]}]
+    )
+    results = [None]
+
+    assert packed_mixed_forward.run_packed_mixed_forward(
+        Owner(),
+        batch,
+        states,
+        [],
+        results,
+        defer_text_cpu_results=True,
+    )
+
+    assert defer_flags == [True]
+    assert hasattr(results[0], "finalize")
+    state = states.get(7)
+    assert state.decode_relay.token_id is None
+    torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([4], dtype=torch.long))
+    assert state.decode_relay.position_id == 3
+    assert results[0].finalize() == {"req_id": 7, "sampled_token_id": 4}
+    assert state.decode_relay.token_id == 4
+    assert text_cache.past.length == 3
+
+
+def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followup():
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.execution.deferred_text_result import DeferredTextSeqResult
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class GraphDriver:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        def try_run_decode_graph_logits_batch(self, ops):
+            self.calls.append([dict(op) for op in ops])
+            logits = torch.full((1, 6), -10.0, dtype=torch.float32)
+            logits[0, 5] = 10.0
+            return [logits]
+
+    class Owner:
+        def __init__(self) -> None:
+            self.driver = GraphDriver()
+
+        def _text_driver(self):
+            return self.driver
+
+        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+            return sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_packed_decode_burst_graph_followup(
+                self,
+                ops,
+                request_states,
+                defer_cpu_results=defer_cpu_results,
+            )
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    state = states.get(7)
+    token = torch.tensor([2], dtype=torch.long)
+    state.decode_relay.token_id = None
+    state.decode_relay.token_tensor = token
+    first_sampling = DeferredBatchedSamplingResult(
+        tokens_cpu=token.clone(),
+        device_tokens=token,
+        copy_event=None,
+    )
+    results = [
+        DeferredTextSeqResult(
+            req_id=7,
+            row=0,
+            state=state,
+            sampling_result=first_sampling,
+            relay_token_tensor=state.decode_relay.token_tensor,
+        )
+    ]
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [13],
+                "pos_range": [2, 3],
+                "decode_token_count": 3,
+                "decode_stop_token_ids": [2],
+            }
+        ]
+    )
+    owner = Owner()
+
+    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
+        owner,
+        batch,
+        states,
+        results,
+    )
+
+    assert results == [{"req_id": 7, "sampled_token_id": 2, "sampled_token_ids": [2]}]
+    assert len(owner.driver.calls) == 1
+    assert owner.driver.calls[0][0]["token_source"] == "last_sampled"
+    assert int(owner.driver.calls[0][0]["token_tensor"].item()) == 2
+    assert owner.driver.calls[0][0]["pos_range"] == [3, 4]
+
+
+def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_finalizing():
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.execution.deferred_text_result import DeferredTextSeqResult
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class GuardedSampling(DeferredBatchedSamplingResult):
+        def __init__(self, *, tokens_cpu: torch.Tensor, device_tokens: torch.Tensor) -> None:
+            super().__init__(
+                tokens_cpu=tokens_cpu,
+                device_tokens=device_tokens,
+                copy_event=None,
+            )
+            self.token_id_reads = 0
+
+        def token_ids(self) -> list[int]:
+            self.token_id_reads += 1
+            return super().token_ids()
+
+        def finalize(self):  # pragma: no cover - the assertion is the behavior under test.
+            raise AssertionError("burst stop checks must not finalize deferred rows")
+
+    class Owner:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+            self.followup_sampling: GuardedSampling | None = None
+
+        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+            self.calls.append([dict(op) for op in ops])
+            token = torch.tensor([5], dtype=torch.long)
+            state = request_states.get(int(ops[0]["req_id"]))
+            state.decode_relay.token_tensor = token
+            self.followup_sampling = GuardedSampling(
+                tokens_cpu=token.clone(),
+                device_tokens=token,
+            )
+            return [
+                DeferredTextSeqResult(
+                    req_id=int(ops[0]["req_id"]),
+                    row=0,
+                    state=state,
+                    sampling_result=self.followup_sampling,
+                    relay_token_tensor=state.decode_relay.token_tensor,
+                )
+            ]
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    state = states.get(7)
+    first_token = torch.tensor([2], dtype=torch.long)
+    state.decode_relay.token_id = None
+    state.decode_relay.token_tensor = first_token
+    first_sampling = GuardedSampling(
+        tokens_cpu=first_token.clone(),
+        device_tokens=first_token,
+    )
+    results = [
+        DeferredTextSeqResult(
+            req_id=7,
+            row=0,
+            state=state,
+            sampling_result=first_sampling,
+            relay_token_tensor=state.decode_relay.token_tensor,
+        )
+    ]
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [13],
+                "pos_range": [2, 3],
+                "decode_token_count": 3,
+                "decode_stop_token_ids": [2],
+            }
+        ]
+    )
+    owner = Owner()
+
+    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
+        owner,
+        batch,
+        states,
+        results,
+    )
+
+    assert results == [{"req_id": 7, "sampled_token_id": 2, "sampled_token_ids": [2]}]
+    assert len(owner.calls) == 1
+    assert first_sampling.token_id_reads == 1
+    assert owner.followup_sampling is not None
+    assert owner.followup_sampling.token_id_reads == 0
+
+
+def test_sensenova_packed_decode_burst_defers_final_pending_token():
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.execution.deferred_text_result import (
+        DeferredDecodeBurstSeqResult,
+        DeferredTextSeqResult,
+    )
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class GuardedSampling(DeferredBatchedSamplingResult):
+        def __init__(self, *, token: torch.Tensor) -> None:
+            super().__init__(
+                tokens_cpu=token.clone(),
+                device_tokens=token,
+                copy_event=None,
+            )
+            self.token_id_reads = 0
+
+        def token_ids(self) -> list[int]:
+            self.token_id_reads += 1
+            return super().token_ids()
+
+        def finalize(self):  # pragma: no cover - token_ids is the intended materialization path.
+            raise AssertionError("burst token materialization must not finalize full sampling rows")
+
+    class Owner:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+            self.followup_samplings: list[GuardedSampling] = []
+
+        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+            del defer_cpu_results
+            self.calls.append([dict(op) for op in ops])
+            token = torch.tensor([3 + len(self.followup_samplings)], dtype=torch.long)
+            state = request_states.get(int(ops[0]["req_id"]))
+            state.decode_relay.token_tensor = token
+            sampling = GuardedSampling(token=token)
+            self.followup_samplings.append(sampling)
+            return [
+                DeferredTextSeqResult(
+                    req_id=int(ops[0]["req_id"]),
+                    row=0,
+                    state=state,
+                    sampling_result=sampling,
+                    relay_token_tensor=state.decode_relay.token_tensor,
+                )
+            ]
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    state = states.get(7)
+    first_token = torch.tensor([2], dtype=torch.long)
+    state.decode_relay.token_id = None
+    state.decode_relay.token_tensor = first_token
+    first_sampling = GuardedSampling(token=first_token)
+    results = [
+        DeferredTextSeqResult(
+            req_id=7,
+            row=0,
+            state=state,
+            sampling_result=first_sampling,
+            relay_token_tensor=state.decode_relay.token_tensor,
+        )
+    ]
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [13],
+                "pos_range": [2, 3],
+                "decode_token_count": 3,
+                "decode_stop_token_ids": [99],
+            }
+        ]
+    )
+    owner = Owner()
+
+    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
+        owner,
+        batch,
+        states,
+        results,
+        defer_final_cpu_results=True,
+    )
+
+    assert len(owner.calls) == 2
+    assert first_sampling.token_id_reads == 1
+    assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [1, 0]
+    assert isinstance(results[0], DeferredDecodeBurstSeqResult)
+    assert results[0].finalize() == {"req_id": 7, "sampled_token_id": 4, "sampled_token_ids": [2, 3, 4]}
+    assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [1, 1]
+    assert state.decode_relay.token_id == 4
+
+
+def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.execution.deferred_text_result import (
+        DeferredTerminalDecodeBurstSeqResult,
+        DeferredTextSeqResult,
+    )
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class GuardedSampling(DeferredBatchedSamplingResult):
+        def __init__(self, *, token: torch.Tensor) -> None:
+            super().__init__(
+                tokens_cpu=token.clone(),
+                device_tokens=token,
+                copy_event=None,
+            )
+            self.token_id_reads = 0
+
+        def token_ids(self) -> list[int]:
+            self.token_id_reads += 1
+            return super().token_ids()
+
+    class Owner:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+            self.followup_samplings: list[GuardedSampling] = []
+
+        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+            del defer_cpu_results
+            self.calls.append([dict(op) for op in ops])
+            token_values = [5, 7, 9]
+            token = torch.tensor([token_values[len(self.followup_samplings)]], dtype=torch.long)
+            state = request_states.get(int(ops[0]["req_id"]))
+            state.decode_relay.token_tensor = token
+            sampling = GuardedSampling(token=token)
+            self.followup_samplings.append(sampling)
+            return [
+                DeferredTextSeqResult(
+                    req_id=int(ops[0]["req_id"]),
+                    row=0,
+                    state=state,
+                    sampling_result=sampling,
+                    relay_token_tensor=state.decode_relay.token_tensor,
+                )
+            ]
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    state = states.get(7)
+    first_token = torch.tensor([3], dtype=torch.long)
+    state.decode_relay.token_id = None
+    state.decode_relay.token_tensor = first_token
+    first_sampling = GuardedSampling(token=first_token)
+    results = [
+        DeferredTextSeqResult(
+            req_id=7,
+            row=0,
+            state=state,
+            sampling_result=first_sampling,
+            relay_token_tensor=state.decode_relay.token_tensor,
+        )
+    ]
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [13],
+                "pos_range": [2, 3],
+                "decode_token_count": 4,
+                "decode_stop_token_ids": [7],
+                "decode_stop_terminal": True,
+            }
+        ]
+    )
+    owner = Owner()
+
+    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
+        owner,
+        batch,
+        states,
+        results,
+        defer_final_cpu_results=True,
+    )
+
+    assert len(owner.calls) == 3
+    assert first_sampling.token_id_reads == 0
+    assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [0, 0, 0]
+    assert isinstance(results[0], DeferredTerminalDecodeBurstSeqResult)
+    assert results[0].finalize() == {"req_id": 7, "sampled_token_id": 7, "sampled_token_ids": [3, 5, 7]}
+    assert first_sampling.token_id_reads == 1
+    assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [1, 1, 0]
+
+
+def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(monkeypatch):
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class GraphDriver:
+        def try_run_decode_graph_logits_batch(self, _ops):
+            logits = torch.full((1, 6), -10.0, dtype=torch.float32)
+            logits[0, 4] = 10.0
+            return [logits]
+
+    class Owner:
+        def _text_driver(self):
+            return GraphDriver()
+
+    defer_flags: list[bool] = []
+    sampling_metadata: list[tuple[list, list, list]] = []
+
+    def fake_sampling(logits, _sampling_params, recent, allowed, suppress, *, defer_cpu=False, **_kwargs):
+        defer_flags.append(bool(defer_cpu))
+        sampling_metadata.append((list(recent), list(allowed), list(suppress)))
+        tokens = torch.full((int(logits.shape[0]),), 4, dtype=torch.long, device=logits.device)
+        return DeferredBatchedSamplingResult(
+            tokens_cpu=tokens.cpu(),
+            device_tokens=tokens,
+            copy_event=None,
+        )
+
+    monkeypatch.setattr(
+        sensenova_u1,
+        "apply_sampling_batched_with_device_tokens",
+        fake_sampling,
+    )
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    state = states.get(7)
+    outputs = sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_packed_decode_burst_graph_followup(
+        Owner(),
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [13],
+                "pos_range": [3, 4],
+                "recent_tokens": [2],
+                "allowed_tokens": [4],
+                "suppress_tokens": [5],
+            }
+        ],
+        states,
+        defer_cpu_results=True,
+    )
+
+    assert defer_flags == [True]
+    assert sampling_metadata == [([[2]], [[4]], [[5]])]
+    assert outputs is not None and hasattr(outputs[0], "finalize")
+    assert state.decode_relay.token_id is None
+    torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([4], dtype=torch.long))
+    assert state.decode_relay.position_id == 4
+    assert outputs[0].finalize() == {"req_id": 7, "sampled_token_id": 4}
+    assert state.decode_relay.token_id == 4
 
 
 def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
@@ -2685,7 +4190,7 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
             self.completed_decode = False
             self.completed_denoise = False
 
-        def _complete_packed_decode_bursts(self, _batch, _request_states, _results):
+        def _complete_packed_decode_bursts(self, _batch, _request_states, _results, **_kwargs):
             self.completed_decode = True
 
         def _complete_packed_denoise_bursts(self, _batch, _request_states, _results):
@@ -2703,7 +4208,7 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
                 "logits": logits,
             }
 
-    def packed_forward(_owner, _batch, _request_states, denoise_steps, results):
+    def packed_forward(_owner, _batch, _request_states, denoise_steps, results, **_kwargs):
         assert denoise_steps == []
         assert results == [None, None]
         return True
@@ -2872,6 +4377,155 @@ def test_sensenova_packed_mixed_reserves_transient_denoise_cache_capacity():
     assert owner.kv_view.cache_seqlens_after().tolist() == [6]
     assert owner.kv_view.persistent_cache_seqlens_after().tolist() == [4]
     torch.testing.assert_close(owner.updated, torch.zeros(1, 3))
+
+
+def test_sensenova_packed_mixed_caches_denoise_cfg_plan_before_decoder(monkeypatch):
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_mode import ForwardMode
+    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
+    from uniserve_worker.execution.forward_stream import (
+        ForwardPagedKVSegment,
+        ForwardStreamBuilder,
+    )
+    from uniserve_worker.nn.diffusion.cfg import Branch
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import PagedTextCache
+
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=8,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cache = PagedTextCache(
+        pool,
+        [0],
+        num_layers=1,
+        length=0,
+        allocate_blocks=lambda n: list(range(1, 1 + int(n))),
+    )
+    image_embeds = torch.randn(1, 2, 4)
+    img = SimpleNamespace(token_h=1, token_w=2, width=32, height=16)
+    indexes = torch.tensor([[0, 1], [0, 0], [0, 1]], dtype=torch.long)
+    step = TextImageDenoiseStep(
+        req_id=9,
+        state=SimpleNamespace(),
+        op={"req_id": 9, "kind": "denoise_gen", "cfg": {"branch_count": 3}},
+        latent=torch.zeros(1, 3),
+        t=torch.tensor(0.5),
+        t_next=torch.tensor(1.0),
+        step_index=0,
+        total_steps=1,
+        cfg_text_scale=2.0,
+        cfg_img_scale=3.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_renorm_type="none",
+        cfg_renorm_min=0.0,
+        cfg_branch_count=3,
+        extra={"img": img, "image_embeds": image_embeds},
+    )
+
+    class Owner:
+        model = object()
+        device = torch.device("cpu")
+        num_layers = 1
+        residency = SimpleNamespace(release_scratch_cache=lambda _cache: None)
+
+        def __init__(self) -> None:
+            self.decoder_calls = 0
+            self.branches: list[Branch] = []
+            self.velocity_calls = 0
+            self.updated = None
+
+        def _forward_target_pool(self, _denoise_steps):
+            return pool
+
+        def _denoise_branch_inputs(self, _img, branch):
+            self.branches.append(branch)
+            return indexes, cache
+
+        def _wait_gen_cache_ready(self, _cache):
+            return None
+
+        def _same_kv_pool(self, candidate, first):
+            return first is None or candidate is first
+
+        def _add_denoise_forward_segment(
+            self,
+            *,
+            builder: ForwardStreamBuilder,
+            kv_segments: list[ForwardPagedKVSegment],
+            row_index: int,
+            req_id: int,
+            op: dict,
+            cache,
+            indexes: torch.Tensor,
+            q_len: int,
+            branch_index: int,
+            device: torch.device,
+        ) -> None:
+            builder.add_segment(
+                op_index=row_index,
+                req_id=req_id,
+                kind=str(op["kind"]),
+                mode=ForwardMode.DENOISE,
+                modality="gen",
+                segment_class="denoise",
+                q_len=q_len,
+                prefix_len=int(cache.length),
+                branch_id=branch_index,
+                visible_policy="bidirectional",
+                indexes=indexes.to(device=device),
+            )
+            kv_segments.append(
+                ForwardPagedKVSegment(
+                    block_ids=tuple(cache.block_ids),
+                    base_len=int(cache.length),
+                    q_len=q_len,
+                    write_kv=True,
+                    persist_kv=False,
+                    branch_id=branch_index,
+                )
+            )
+
+        def packed_decoder_forward(self, input_embeds, **_kwargs):
+            self.decoder_calls += 1
+            return input_embeds
+
+        def packed_hidden_to_velocity(self, _hidden_states, _t, latent, **_kwargs):
+            self.velocity_calls += 1
+            return torch.full_like(latent, float(self.velocity_calls))
+
+        def accept_denoise_update(self, _step, updated):
+            self.updated = updated
+
+    owner = Owner()
+    cfg_plan_decoder_counts: list[int] = []
+    real_cfg_plan = packed_mixed_forward.text_image_cfg_plan
+
+    def recording_cfg_plan(step_arg):
+        cfg_plan_decoder_counts.append(owner.decoder_calls)
+        return real_cfg_plan(step_arg)
+
+    monkeypatch.setattr(packed_mixed_forward, "text_image_cfg_plan", recording_cfg_plan)
+
+    batch = UniForwardBatch.from_ops([step.op])
+
+    assert packed_mixed_forward.run_packed_mixed_forward(
+        owner,
+        batch,
+        SimpleNamespace(),
+        [(0, step)],
+        [None],
+    )
+    assert cfg_plan_decoder_counts == [0]
+    assert owner.branches == [Branch.COND, Branch.TEXT_UNCOND, Branch.IMG_UNCOND]
+    assert owner.velocity_calls == 3
+    assert owner.updated is not None
 
 
 def test_qwen_attention_paged_update_is_not_env_gated(monkeypatch):

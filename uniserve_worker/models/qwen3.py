@@ -61,11 +61,9 @@ from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
 from ..nn.quant import (
     QuantizationConfig,
-    get_current_kv_cache_dtype,
     kv_cache_bytes_per_token,
     use_quantization_config,
 )
-from ..nn.quant.kv_cache import KV_CACHE_NO_OVERRIDE_SENTINELS
 from ..runtime.compile import CompileTarget
 from ..runtime.residency import KvCacheSpec
 
@@ -98,13 +96,6 @@ def _cfg(config: Any | None) -> SimpleNamespace:
     cfg.tie_word_embeddings = bool(getattr(cfg, "tie_word_embeddings", False))
     cfg.qk_norm_output_fp32 = bool(getattr(cfg, "qk_norm_output_fp32", False))
     return cfg
-
-
-def _requested_kv_cache_dtype(config: Any | None) -> str | None:
-    value = get_worker_config().kv_cache_dtype
-    if value is not None and value.lower() not in KV_CACHE_NO_OVERRIDE_SENTINELS | {"null"}:
-        return value
-    return get_current_kv_cache_dtype(config)
 
 
 def _expert_cfg(cfg: SimpleNamespace, intermediate_size: int | None = None) -> SimpleNamespace:
@@ -386,7 +377,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         self.block_size = DEFAULT_BLOCK_SIZE
         self.num_blocks = derive_num_blocks(self.block_size, None)
         self.output_vocab_size: int | None = None
-        self.kv_cache_dtype = _requested_kv_cache_dtype(self.config)
+        self.kv_cache_dtype = self._requested_kv_cache_dtype_for(self.config)
         self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
 
     @property

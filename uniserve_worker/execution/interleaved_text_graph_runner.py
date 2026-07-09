@@ -14,7 +14,8 @@ The adapter contributes only the interleaved-specific glue:
 * eligible one-token host-KV decode rows resolved from the op batch,
 * a tiny "past" adapter bridging the native language model's paged-cache update
   protocol onto the shared :class:`BatchedPagedRequestCache`, and
-* a stable three-axis ``indexes`` sidecar the native language model reads.
+* cache-position inputs that the native language model resolves into pure-text
+  three-axis RoPE indexes inside the captured forward.
 
 Correctness across sequence growth and across requests rests on graph-aware
 FlashInfer decode planning: the prepare hook refills the decode wrapper's static
@@ -37,20 +38,15 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
-from ..contracts.forward_context import TextAttentionMetadata, get_forward_context
+from ..contracts.forward_context import get_forward_context
 from ..contracts.forward_mode import ForwardMode, mode_for_op
 from ..foundation.errors import invalid_descriptor
 from ..foundation.runtime_config import get_worker_config
-from ..runtime.host_staging import (
-    copy_cpu_to_device,
-    cpu_int_staging_buffer,
-    fill_cpu_ints,
-    is_pinned,
-)
 from ..runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
 from ..runtime.tensor_staging import TextTensorStager
 from .decode_cuda_graph import (
     DecodeCudaGraphRunner,
+    TextDecodeGraphHostInputs,
     TextDecodeGraphState,
     resolve_paged_decode_graph_prepare,
 )
@@ -76,6 +72,23 @@ def _padding_block_id(owner: Any, pool: Any) -> int | None:
     if block_id < 0 or block_id >= num_blocks:
         raise invalid_descriptor("reserved interleaved decode graph padding block is out of range")
     return block_id
+
+
+def _owner_max_context_len(owner: Any, pool: Any) -> int:
+    config = getattr(owner, "config", None)
+    candidates = (
+        getattr(config, "max_position_embeddings", None),
+        getattr(config, "model_max_length", None),
+        getattr(owner, "max_context_len", None),
+    )
+    for value in candidates:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return max(0, int(getattr(pool, "num_blocks", 0) or 0) * int(getattr(pool, "block_size", 0) or 0))
 
 
 class _InterleavedDecodeGraphPast:
@@ -114,9 +127,8 @@ class _InterleavedDecodeGraphPast:
 
 @dataclass
 class _Sidecar:
-    """Per-graph-state stable tensors the interleaved language-model closure reads."""
+    """Per-graph-state stable adapter the interleaved language-model closure reads."""
 
-    indexes: torch.Tensor
     past: _InterleavedDecodeGraphPast
 
 
@@ -187,49 +199,30 @@ class InterleavedTextDecodeGraphRunner:
         device = rows[0].past_cache.pool.k.device
         pool = rows[0].past_cache.pool
         graph_rows = self._pad_rows(driver, rows, graph_batch, pool)
-
         slot = self._stager.next_slot()
-        input_ids = self._staged_column(
-            [r.token_id if r.token_id is not None else 0 for r in graph_rows],
-            device=device,
-            slot=slot,
-            name="interleaved_decode_input_ids",
-        )
-        for row_idx, row in enumerate(graph_rows):
-            if row.token_tensor is not None:
-                input_ids[row_idx, 0:1].copy_(row.token_tensor.reshape(1))
-        positions = self._staged_column(
-            [r.pos for r in graph_rows],
-            device=device,
-            slot=slot,
-            name="interleaved_decode_positions",
-        )
-        source_cache = BatchedPagedRequestCache(
-            pool,
-            [r.block_ids for r in graph_rows],
-            [r.base_len for r in graph_rows],
-        )
-        source_metadata = TextAttentionMetadata(
-            cache=source_cache,
-            block_table=source_cache.block_table(device=device, stager=slot),
-            cache_seqlens=source_cache.cache_seqlens(device=device, stager=slot),
+        host_inputs = TextDecodeGraphHostInputs(
+            input_ids=tuple(r.token_id if r.token_id is not None else 0 for r in graph_rows),
+            positions=tuple(r.pos for r in graph_rows),
+            block_ids_by_row=tuple(tuple(r.block_ids) for r in graph_rows),
             cache_seqlens_cpu=tuple(r.base_len for r in graph_rows),
-            query_lens=torch.ones(len(graph_rows), dtype=torch.int32, device=device),
-            query_lens_cpu=tuple(1 for _ in graph_rows),
             kv_seqlens_cpu=tuple(r.base_len + 1 for r in graph_rows),
-            mode=ForwardMode.DECODE,
+            token_replacements=tuple(
+                (row_idx, r.token_tensor)
+                for row_idx, r in enumerate(graph_rows)
+                if r.token_tensor is not None
+            ),
+            max_context_len=_owner_max_context_len(driver.owner, pool),
         )
 
-        logits = self._decode.maybe_run(
+        logits = self._decode.maybe_run_host_inputs(
             kv_pool=pool,
             num_blocks=int(pool.num_blocks),
-            batch_size=len(graph_rows),
-            input_ids=input_ids,
-            positions=positions,
-            attention_metadata=source_metadata,
+            device=device,
+            host_inputs=host_inputs,
             ctx=get_forward_context(),
             forward_fn=lambda state: self._forward(driver, state),
             prepare_backend=prepare_backend,
+            staging_slot=slot,
         )
         if logits is None:
             return None
@@ -278,28 +271,6 @@ class InterleavedTextDecodeGraphRunner:
             )
         return padded
 
-    @staticmethod
-    def _staged_column(
-        values: list[int],
-        *,
-        device: torch.device,
-        slot: Any,
-        name: str,
-    ) -> torch.Tensor:
-        """Stage a ``[batch, 1]`` long tensor through pinned host memory."""
-        cpu = cpu_int_staging_buffer(
-            len(values), dtype=torch.long, pin=device.type == "cuda", slot=slot, name=name
-        )
-        fill_cpu_ints(cpu, values)
-        out = copy_cpu_to_device(
-            cpu,
-            device=device,
-            non_blocking=device.type == "cuda" and is_pinned(cpu),
-            slot=slot,
-            name=name,
-        )
-        return out.view(len(values), 1)
-
     # -- eligibility + mutation ----------------------------------------------
 
     def _prepare(
@@ -331,7 +302,6 @@ class InterleavedTextDecodeGraphRunner:
             attention_backend_name=getattr(
                 get_forward_context(), "attention_backend_name", None
             ),
-            before=self._prepare_sidecar_indexes,
         )
         if prepare_backend is None:
             # No re-plannable paged-decode backend or no query-geometry hook: a
@@ -407,26 +377,10 @@ class InterleavedTextDecodeGraphRunner:
 
     # -- forward closure + commit --------------------------------------------
 
-    def _prepare_sidecar_indexes(self, state: TextDecodeGraphState, _ctx: Any) -> None:
-        """Refill the three-axis text indexes sidecar before capture/replay.
-
-        Row 0 is the temporal position per row; the spatial rows stay zero
-        (pure text decode), which is also what licenses the owner's fused
-        ``text_only_rope`` path inside the captured forward.
-        """
-        sidecar = self._sidecar_for(state)
-        sidecar.indexes[0, :, 0].copy_(state.positions[:, 0], non_blocking=True)
-        sidecar.indexes[1:, :, :].zero_()
-
     def _sidecar_for(self, state: TextDecodeGraphState) -> _Sidecar:
         sidecar = self._sidecars.get(id(state))
         if sidecar is None:
-            indexes = torch.zeros(
-                (3, int(state.batch_size), 1),
-                dtype=torch.long,
-                device=state.input_ids.device,
-            )
-            sidecar = _Sidecar(indexes=indexes, past=_InterleavedDecodeGraphPast(state.cache))
+            sidecar = _Sidecar(past=_InterleavedDecodeGraphPast(state.cache))
             self._sidecars[id(state)] = sidecar
         return sidecar
 
@@ -434,11 +388,9 @@ class InterleavedTextDecodeGraphRunner:
         sidecar = self._sidecar_for(state)
         outputs = driver.owner.interleaved_text_forward(
             input_ids=state.input_ids,
-            indexes=sidecar.indexes,
+            cache_position=state.positions.reshape(-1),
             past_key_values=sidecar.past,
             use_cache=True,
-            # The sidecar zeroes the spatial index rows before every replay, so
-            # the owner may take its pure-text fused-RoPE path.
             text_only_rope=True,
         )
         # Return ``[batch, vocab]``; DecodeCudaGraphRunner slices dim 0 back to the

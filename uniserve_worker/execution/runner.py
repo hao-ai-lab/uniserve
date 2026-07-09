@@ -566,7 +566,13 @@ class ModelRunner:
             if _MIXED_PROOF_ENABLED:
                 self._log_mixed_proof(fb, group)
             with profile_range("uniserve.runner.forward"):
-                return self.forward_driver.step(fb, group, self.request_states, self.model)
+                return self.forward_driver.step(
+                    fb,
+                    group,
+                    self.request_states,
+                    self.model,
+                    defer_text_cpu_results=defer_text_cpu_results,
+                )
         if not all(m in _TEXT_DRIVER_MODES for m in fb.op_modes):
             return None
         if _MIXED_PROOF_ENABLED:

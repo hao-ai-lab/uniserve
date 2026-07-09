@@ -24,8 +24,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import uniserve_worker.execution.decode_cuda_graph as decode_cuda_graph
 from uniserve_worker.contracts.forward_batch import ForwardBatch
-from uniserve_worker.contracts.forward_context import ForwardContext, TextAttentionMetadata
+from uniserve_worker.contracts.forward_context import (
+    ForwardContext,
+    TextAttentionMetadata,
+    get_forward_context,
+    use_forward_context,
+)
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.execution.cuda_graph_base import (
@@ -36,16 +42,25 @@ from uniserve_worker.execution.cuda_graph_base import (
 from uniserve_worker.execution.decode_cuda_graph import (
     DecodeCudaGraphRunner,
     PrefillCudaGraphRunner,
+    TextDecodeGraphHostInputs,
+    _dense_token_replacements,
+    copy_text_decode_graph_host_inputs,
     copy_text_decode_graph_inputs,
     copy_text_initial_prefill_graph_inputs,
     make_text_decode_graph_state,
     make_text_initial_prefill_graph_state,
     resolve_paged_decode_graph_backend,
+    resolve_paged_decode_graph_prepare,
+)
+from uniserve_worker.execution.interleaved_text_graph_runner import (
+    InterleavedTextDecodeGraphRunner,
+    _Row,
 )
 from uniserve_worker.execution.text_graph_runner import (
     TextGraphRunner,
     _padded_prefill_max_kv_tokens,
 )
+from uniserve_worker.nn.mesh import DeviceMesh, use_mesh
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedRequestCache
 
@@ -102,6 +117,51 @@ def _decode_metadata(
         kv_seqlens_cpu=kv_seqlens_cpu,
         mode=ForwardMode.DECODE,
     )
+
+
+@requires_cuda
+@pytest.mark.gpu
+def test_batched_request_cache_append_plan_can_be_invalidated_for_dynamic_lengths():
+    device = torch.device("cuda")
+    pool = _kv_pool(device, block_size=8)
+    cache = BatchedPagedRequestCache(pool, [[0]], [2])
+    block_table = torch.tensor([[0]], dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([2], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    first_k = torch.full((1, pool.n_kv, pool.head_dim), 10.0, dtype=pool.dtype, device=device)
+    first_v = torch.full((1, pool.n_kv, pool.head_dim), -10.0, dtype=pool.dtype, device=device)
+    second_k = torch.full((1, pool.n_kv, pool.head_dim), 20.0, dtype=pool.dtype, device=device)
+    second_v = torch.full((1, pool.n_kv, pool.head_dim), -20.0, dtype=pool.dtype, device=device)
+
+    cache.append_varlen(
+        0,
+        first_k,
+        first_v,
+        [1],
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    cache_seqlens.fill_(3)
+    cache.invalidate_append_plan()
+    cache.append_varlen(
+        0,
+        second_k,
+        second_v,
+        [1],
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+    torch.cuda.synchronize()
+
+    k_read, v_read = pool.read(0, [0], start=2, length=2)
+    assert k_read is not None
+    assert v_read is not None
+    torch.testing.assert_close(k_read[0], first_k[0])
+    torch.testing.assert_close(v_read[0], first_v[0])
+    torch.testing.assert_close(k_read[1], second_k[0])
+    torch.testing.assert_close(v_read[1], second_v[0])
 
 
 def _prefill_metadata(
@@ -234,6 +294,76 @@ def test_prefill_kv_bucket_uses_context_capacity_when_available():
     assert runner.bucket_kv_tokens(160, max_context_len=128) == 160
 
 
+def test_decode_graph_backend_resolver_accepts_direct_fa4_paged_backend(monkeypatch):
+    from uniserve_worker.backends import attention as attention_registry
+
+    backend = SimpleNamespace(
+        capabilities=lambda: SimpleNamespace(available=True, paged_kv=True),
+        forward_paged=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        attention_registry,
+        "normalize_attention_backend_name",
+        lambda name: "fa4_cute" if name == "fa4_cute" else str(name or "auto"),
+    )
+    monkeypatch.setattr(attention_registry, "has_attention_backend", lambda name: name == "fa4_cute")
+    monkeypatch.setattr(attention_registry, "get_attention_backend", lambda name: backend)
+
+    assert resolve_paged_decode_graph_backend("fa4_cute") is backend
+
+
+def test_decode_graph_prepare_accepts_direct_backend_without_plan_hook(monkeypatch):
+    from uniserve_worker.execution import decode_cuda_graph as dcg
+
+    backend = SimpleNamespace(
+        capabilities=lambda: SimpleNamespace(available=True, paged_kv=True, paged_block_size_multiple=1),
+        forward_paged=lambda *args, **kwargs: None,
+    )
+    before_calls: list[tuple[object, object]] = []
+    monkeypatch.setattr(dcg, "resolve_paged_decode_graph_backend", lambda _name: backend)
+
+    owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
+    kv_pool = SimpleNamespace(
+        block_size=64,
+        n_kv=2,
+        head_dim=128,
+        k=torch.empty(1, dtype=torch.bfloat16),
+    )
+    prepare = resolve_paged_decode_graph_prepare(
+        owner=owner,
+        kv_pool=kv_pool,
+        num_blocks=16,
+        attention_backend_name="fa4_cute",
+        before=lambda state, ctx: before_calls.append((state, ctx)),
+    )
+
+    assert prepare is not None
+    state = SimpleNamespace(batch_size=8, metadata=object())
+    ctx = SimpleNamespace()
+    prepare(state, ctx)
+    assert before_calls == [(state, ctx)]
+
+
+def test_decode_graph_prepare_rejects_direct_backend_page_size_mismatch(monkeypatch):
+    from uniserve_worker.execution import decode_cuda_graph as dcg
+
+    backend = SimpleNamespace(
+        capabilities=lambda: SimpleNamespace(available=True, paged_kv=True, paged_block_size_multiple=256),
+        forward_paged=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(dcg, "resolve_paged_decode_graph_backend", lambda _name: backend)
+
+    owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
+    kv_pool = SimpleNamespace(block_size=64, n_kv=2, head_dim=128, k=torch.empty(1))
+
+    assert resolve_paged_decode_graph_prepare(
+        owner=owner,
+        kv_pool=kv_pool,
+        num_blocks=16,
+        attention_backend_name="fa4_cute",
+    ) is None
+
+
 def test_prefill_graph_warmup_mode_does_not_live_capture_missing_shape():
     runner = PrefillCudaGraphRunner(name="t", default_enabled=True, default_warmup=True)
     stats = ForwardStats()
@@ -258,6 +388,195 @@ def test_prefill_graph_warmup_mode_does_not_live_capture_missing_shape():
     assert stats.cuda_graph_captures == 0
 
 
+def test_flashinfer_prefill_graph_prepare_replans_live_side_tables(monkeypatch):
+    from uniserve_worker.backends.attention import flashinfer as fi
+
+    class RecordingPrefillWrapper:
+        def __init__(self) -> None:
+            self.calls = []
+            self._plan_info = None
+
+        def plan(self, *args, **kwargs) -> None:
+            self.calls.append((args, kwargs))
+            self._plan_info = object()
+
+    monkeypatch.setattr(fi, "_BatchPrefillWithPagedKVCacheWrapper", object)
+    backend = fi.FlashInferAttentionBackend()
+    monkeypatch.setattr(
+        backend,
+        "_workspace",
+        lambda device: torch.empty(1, dtype=torch.uint8, device=device),
+    )
+    wrapper = RecordingPrefillWrapper()
+    wrapper_key = fi.WrapperKey("prefill", "cpu", "fa2", scope=1)
+    metadata = SimpleNamespace(
+        block_table=torch.tensor([[0, 1, 2], [3, 4, 0]], dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 7, 11], dtype=torch.int32),
+    )
+    backend._prefill_wrappers[wrapper_key] = wrapper
+    backend._metadata_prefill_graph_wrappers[id(metadata)] = (wrapper_key, None)
+    stats = ForwardStats()
+
+    def prepare() -> None:
+        backend.prepare_paged_prefill_cuda_graph(
+            metadata,
+            num_q_heads=4,
+            num_kv_heads=2,
+            head_dim=8,
+            page_size=4,
+            q_dtype=torch.bfloat16,
+            kv_dtype=torch.bfloat16,
+            causal=False,
+            scale=0.125,
+        )
+
+    with use_forward_context(ForwardContext(stats=stats)):
+        prepare()
+        metadata.cu_seqlens_k.copy_(torch.tensor([0, 8, 14], dtype=torch.int32))
+        prepare()
+
+    assert len(wrapper.calls) == 2
+    first_args, first_kwargs = wrapper.calls[0]
+    second_args, second_kwargs = wrapper.calls[1]
+    assert first_args[0].tolist() == [0, 2, 5]
+    assert first_args[1].tolist() == [0, 2, 3]
+    assert first_args[2].tolist() == [0, 1, 3]
+    assert first_args[3].tolist() == [3, 4]
+    assert first_kwargs["seq_lens"].tolist() == [7, 4]
+    assert first_kwargs["seq_lens_q"].tolist() == [2, 3]
+    assert first_kwargs["block_tables"] is metadata.block_table
+    assert first_kwargs["q_data_type"] == torch.bfloat16
+    assert first_kwargs["kv_data_type"] == torch.bfloat16
+    assert first_kwargs["o_data_type"] == torch.bfloat16
+    assert first_kwargs["causal"] is False
+    assert first_kwargs["sm_scale"] == 0.125
+    assert second_args[1].tolist() == [0, 2, 4]
+    assert second_args[2].tolist() == [0, 1, 3, 4]
+    assert second_args[3].tolist() == [4, 2]
+    assert second_kwargs["seq_lens"].tolist() == [8, 6]
+    assert second_kwargs["seq_lens_q"].tolist() == [2, 3]
+    assert backend.paged_prefill_graph_wrapper_planned(metadata)
+    assert stats.flashinfer_prefill_plan_calls == 2
+    assert stats.flashinfer_prefill_plan_rows == 4
+    assert stats.flashinfer_prefill_plan_indices == 7
+
+
+def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
+    from uniserve_worker.execution import prefill_cuda_graph as pcg
+
+    class Backend:
+        def __init__(self) -> None:
+            self.calls = []
+            self.binds = []
+
+        def bind_paged_prefill_graph_wrapper(self, metadata, *, device) -> None:
+            self.binds.append((metadata, torch.device(device)))
+
+        def release_paged_prefill_graph_wrapper(self, metadata) -> None:
+            del metadata
+
+        def prepare_paged_prefill_cuda_graph(self, metadata, **kwargs) -> None:
+            self.calls.append((metadata, kwargs))
+
+    backend = Backend()
+    metadata = object()
+    owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
+    kv_pool = SimpleNamespace(
+        n_kv=2,
+        head_dim=8,
+        block_size=4,
+        k=torch.empty(1, dtype=torch.float16),
+    )
+    monkeypatch.setattr(pcg, "_resolve_graph_prefill_backend", lambda ctx: backend)
+
+    prepare = pcg.resolve_paged_prefill_graph_prepare(
+        owner=owner,
+        kv_pool=kv_pool,
+        attention_backend_name="flashinfer",
+    )
+
+    assert prepare is not None
+    state = SimpleNamespace(
+        metadata=metadata,
+        input_ids=torch.empty(1),
+        release_backend=None,
+    )
+    prepare(state, SimpleNamespace())
+    assert backend.binds == [(metadata, torch.device("cpu"))]
+    assert callable(state.release_backend)
+    assert backend.calls == [
+        (
+            metadata,
+            {
+                "num_q_heads": 4,
+                "num_kv_heads": 2,
+                "head_dim": 8,
+                "page_size": 4,
+                "q_dtype": torch.bfloat16,
+                "kv_dtype": torch.float16,
+                "causal": True,
+                "scale": 0.125,
+            },
+        )
+    ]
+
+
+def test_prefill_graph_prepare_resolver_accepts_direct_graph_safe_backend(monkeypatch):
+    from uniserve_worker.execution import prefill_cuda_graph as pcg
+
+    class Backend:
+        def capabilities(self):
+            return SimpleNamespace(paged_varlen_cuda_graph=True)
+
+    calls = []
+    monkeypatch.setattr(pcg, "_resolve_graph_prefill_backend", lambda ctx: Backend())
+
+    prepare = pcg.resolve_paged_prefill_graph_prepare(
+        owner=object(),
+        kv_pool=SimpleNamespace(),
+        attention_backend_name="trtllm_mha",
+        before=lambda state, ctx: calls.append((state, ctx)),
+    )
+
+    assert prepare is not None
+    state = SimpleNamespace()
+    ctx = SimpleNamespace()
+    prepare(state, ctx)
+    assert calls == [(state, ctx)]
+
+
+def test_graph_warmup_context_uses_configured_attention_backend(monkeypatch):
+    seen: list[tuple[str, str | None]] = []
+
+    def capture_decode(self, **kwargs):
+        seen.append(("decode", kwargs["ctx"].attention_backend_name))
+
+    def capture_prefill(self, **kwargs):
+        seen.append(("prefill", kwargs["ctx"].attention_backend_name))
+
+    monkeypatch.setattr(DecodeCudaGraphRunner, "_warmup_capture_buckets", capture_decode)
+    monkeypatch.setattr(PrefillCudaGraphRunner, "_warmup_capture_buckets", capture_prefill)
+
+    DecodeCudaGraphRunner(name="t", default_enabled=True, default_warmup=True).warmup(
+        kv_pool=SimpleNamespace(),
+        num_blocks=1,
+        device=torch.device("cpu"),
+        attention_backend_name="flashinfer",
+        forward_fn=lambda state: state,
+    )
+    PrefillCudaGraphRunner(name="t", default_enabled=True, default_warmup=True).warmup(
+        kv_pool=SimpleNamespace(),
+        num_blocks=1,
+        block_size=1,
+        device=torch.device("cpu"),
+        attention_backend_name="flashinfer",
+        forward_fn=lambda state: state,
+    )
+
+    assert seen == [("decode", "flashinfer"), ("prefill", "flashinfer")]
+
+
 def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
     class PrefillStub:
         def enabled(self) -> bool:
@@ -280,6 +599,8 @@ def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
     runner.kv_pool = None
     runner.num_blocks = 0
     runner.max_context_len = 128
+    runner.attention_backend_name = None
+    runner._prefill_prepare_backend = lambda *args, **kwargs: lambda state, ctx: None
     metadata = TextAttentionMetadata(
         cache=None,
         block_table=None,
@@ -708,6 +1029,165 @@ def test_decode_input_copy_extends_cpu_seqlen_mirrors():
     # (the padded rows still attend over a single synthetic token).
     assert state.metadata.cache_seqlens_cpu == (3, 5, 0, 0)
     assert state.metadata.kv_seqlens_cpu == (4, 6, 1, 1)
+
+
+@requires_cuda
+def test_decode_host_input_copy_populates_static_bucket_inputs():
+    device = torch.device("cuda")
+    pool = _kv_pool(device)
+    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    replacement = torch.tensor([99], dtype=torch.long, device=device)
+
+    copy_text_decode_graph_host_inputs(
+        state,
+        TextDecodeGraphHostInputs(
+            input_ids=(11, 0),
+            positions=(3, 5),
+            block_ids_by_row=((0,), (1, 2)),
+            cache_seqlens_cpu=(3, 5),
+            kv_seqlens_cpu=(4, 6),
+            token_replacements=((1, replacement),),
+        ),
+    )
+    torch.cuda.synchronize()
+
+    assert state.input_ids.flatten().tolist() == [11, 99, 0, 0]
+    assert state.positions.flatten().tolist() == [3, 5, 0, 0]
+    assert state.block_table[:2, :2].tolist() == [[0, 0], [1, 2]]
+    assert state.block_table[:2, 2:].sum().item() == 0
+    assert state.block_table[2:].sum().item() == 0
+    assert state.cache_seqlens.tolist() == [3, 5, 0, 0]
+    assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
+    assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
+    assert state.metadata.cache_seqlens_cpu == (3, 5, 0, 0)
+    assert state.metadata.kv_seqlens_cpu == (4, 6, 1, 1)
+
+
+@requires_cuda
+def test_decode_host_input_copy_dense_replacements_clear_inactive_bucket_rows():
+    device = torch.device("cuda")
+    pool = _kv_pool(device)
+    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state.input_ids.copy_(torch.tensor([[7], [8], [777], [888]], dtype=torch.long, device=device))
+    replacements = (
+        (0, torch.tensor([11], dtype=torch.long, device=device)),
+        (1, torch.tensor([22], dtype=torch.long, device=device)),
+    )
+
+    copy_text_decode_graph_host_inputs(
+        state,
+        TextDecodeGraphHostInputs(
+            input_ids=(0, 0),
+            positions=(3, 5),
+            block_ids_by_row=((0,), (1, 2)),
+            cache_seqlens_cpu=(3, 5),
+            kv_seqlens_cpu=(4, 6),
+            token_replacements=replacements,
+        ),
+    )
+    torch.cuda.synchronize()
+
+    assert state.input_ids.flatten().tolist() == [11, 22, 0, 0]
+    assert state.positions.flatten().tolist() == [3, 5, 0, 0]
+    assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
+    assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
+
+
+@requires_cuda
+def test_decode_host_input_copy_dense_replacements_preserve_contiguous_relay_span():
+    device = torch.device("cuda")
+    pool = _kv_pool(device)
+    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    relay_tokens = torch.tensor([31, 41], dtype=torch.long, device=device)
+    replacements = (
+        (0, relay_tokens[0:1]),
+        (1, relay_tokens[1:2]),
+    )
+
+    dense = _dense_token_replacements(state, replacements, actual_batch=2)
+
+    assert isinstance(dense, torch.Tensor)
+    assert dense.data_ptr() == relay_tokens.data_ptr()
+    assert tuple(dense.shape) == (2,)
+
+    copy_text_decode_graph_host_inputs(
+        state,
+        TextDecodeGraphHostInputs(
+            input_ids=(0, 0),
+            positions=(3, 5),
+            block_ids_by_row=((0,), (1, 2)),
+            cache_seqlens_cpu=(3, 5),
+            kv_seqlens_cpu=(4, 6),
+            token_replacements=replacements,
+        ),
+    )
+    torch.cuda.synchronize()
+
+    assert state.input_ids.flatten().tolist() == [31, 41, 0, 0]
+    assert state.positions.flatten().tolist() == [3, 5, 0, 0]
+    assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
+    assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
+
+
+@requires_cuda
+def test_decode_host_input_copy_reuses_unchanged_block_table(monkeypatch):
+    device = torch.device("cuda")
+    pool = _kv_pool(device)
+    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    calls: list[str] = []
+    original = decode_cuda_graph._copy_host_ints_to_device
+
+    def record_copy(values, target, *, dtype, slot, name, view_shape=None):
+        calls.append(str(name))
+        return original(values, target, dtype=dtype, slot=slot, name=name, view_shape=view_shape)
+
+    monkeypatch.setattr(decode_cuda_graph, "_copy_host_ints_to_device", record_copy)
+    stable_rows = ((0, 4), (1, 2))
+
+    copy_text_decode_graph_host_inputs(
+        state,
+        TextDecodeGraphHostInputs(
+            input_ids=(11, 22),
+            positions=(3, 5),
+            block_ids_by_row=stable_rows,
+            cache_seqlens_cpu=(3, 5),
+            kv_seqlens_cpu=(4, 6),
+        ),
+    )
+    calls.clear()
+
+    copy_text_decode_graph_host_inputs(
+        state,
+        TextDecodeGraphHostInputs(
+            input_ids=(33, 44),
+            positions=(4, 6),
+            block_ids_by_row=stable_rows,
+            cache_seqlens_cpu=(4, 6),
+            kv_seqlens_cpu=(5, 7),
+        ),
+    )
+    torch.cuda.synchronize()
+
+    assert "text_decode.block_table" not in calls
+    assert state.block_table[:2, :2].tolist() == [[0, 4], [1, 2]]
+    assert state.cache_seqlens.tolist() == [4, 6, 0, 0]
+    calls.clear()
+
+    copy_text_decode_graph_host_inputs(
+        state,
+        TextDecodeGraphHostInputs(
+            input_ids=(55, 66),
+            positions=(5, 7),
+            block_ids_by_row=((0, 4), (1, 2, 3)),
+            cache_seqlens_cpu=(5, 8),
+            kv_seqlens_cpu=(6, 9),
+        ),
+    )
+    torch.cuda.synchronize()
+
+    assert "text_decode.block_table" in calls
+    assert state.block_table[:2, :3].tolist() == [[0, 4, 0], [1, 2, 3]]
+    assert state.cache_seqlens.tolist() == [5, 8, 0, 0]
 
 
 # --------------------------------------------------------------------------- #

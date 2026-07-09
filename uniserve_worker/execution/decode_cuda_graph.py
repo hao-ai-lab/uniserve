@@ -1,8 +1,8 @@
 """CUDA graph plumbing for text decode (re-exports the shared and prefill surface)."""
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -12,8 +12,10 @@ from ..contracts.forward_context import ForwardContext, TextAttentionMetadata, u
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import ceil_div
+from ..runtime.host_staging import cpu_int_staging_buffer, fill_cpu_ints, is_pinned
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.paged_text_cache import BatchedPagedRequestCache
+from ..runtime.tensor_views import adjacent_one_token_view
 from .cuda_graph_base import (
     _DEFAULT_DECODE_GRAPH_BATCH_SIZES,
     _DEFAULT_METRIC_PREFIX,
@@ -27,6 +29,7 @@ from .cuda_graph_base import (
 __all__ = [
     'GraphEvent',
     'record_graph_stats',
+    'TextDecodeGraphHostInputs',
     'TextDecodeGraphState',
     'TextInitialPrefillGraphState',
     'DecodeCudaGraphRunner',
@@ -34,6 +37,7 @@ __all__ = [
     'make_text_decode_graph_state',
     'make_text_initial_prefill_graph_state',
     'copy_text_decode_graph_inputs',
+    'copy_text_decode_graph_host_inputs',
     'copy_text_initial_prefill_graph_inputs',
     'maybe_weak_ref_cuda_graph_tensor',
     'resolve_paged_decode_graph_backend',
@@ -53,6 +57,25 @@ class TextDecodeGraphState:
     cache: BatchedPagedRequestCache
     metadata: TextAttentionMetadata
     logits: torch.Tensor | None = None
+    long_inputs: torch.Tensor | None = None
+    block_table_rows: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class TextDecodeGraphHostInputs:
+    """Host-resident dynamic inputs for a one-token decode graph replay."""
+
+    input_ids: Sequence[int]
+    positions: Sequence[int]
+    block_ids_by_row: Sequence[Sequence[int]]
+    cache_seqlens_cpu: Sequence[int]
+    kv_seqlens_cpu: Sequence[int]
+    token_replacements: Sequence[tuple[int, torch.Tensor]] = field(default_factory=tuple)
+    max_context_len: int = 0
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.input_ids)
 
 
 class DecodeCudaGraphRunner(_GraphRunnerBase):
@@ -218,6 +241,50 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             before_run=prepare,
         )
 
+    def capture_host_inputs(
+        self,
+        *,
+        kv_pool: PagedKVPool,
+        num_blocks: int,
+        batch_size: int,
+        device: torch.device | str,
+        host_inputs: TextDecodeGraphHostInputs,
+        ctx: Any,
+        forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
+        prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
+        staging_slot: Any | None = None,
+    ) -> TextDecodeGraphState:
+        """Capture a decode graph bucket using host-staged dynamic inputs."""
+
+        state = self.make_state(
+            kv_pool=kv_pool,
+            num_blocks=num_blocks,
+            batch_size=batch_size,
+            device=device,
+            max_context_len=int(host_inputs.max_context_len),
+        )
+        copy_text_decode_graph_host_inputs(state, host_inputs, staging_slot=staging_slot)
+        graph_ctx = replace(ctx, attention_metadata=state.metadata, stats=None)
+
+        def run() -> torch.Tensor:
+            with use_forward_context(graph_ctx):
+                return forward_fn(state)
+
+        def copy_inputs(capture_state: TextDecodeGraphState) -> None:
+            copy_text_decode_graph_host_inputs(capture_state, host_inputs, staging_slot=staging_slot)
+
+        def prepare(capture_state: TextDecodeGraphState) -> None:
+            if prepare_backend is not None:
+                prepare_backend(capture_state, graph_ctx)
+
+        return self._capture_graph_state(
+            device=device,
+            state=state,
+            run=run,
+            copy_inputs=copy_inputs,
+            before_run=prepare,
+        )
+
     def _record_decode_graph_miss(
         self,
         *,
@@ -340,6 +407,64 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             after_copy_metric=f"{self.metric_prefix}decode_graph_attention_prepare",
         )
 
+    def maybe_run_host_inputs(
+        self,
+        *,
+        kv_pool: PagedKVPool,
+        num_blocks: int,
+        device: torch.device | str,
+        host_inputs: TextDecodeGraphHostInputs,
+        ctx: Any,
+        forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
+        prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
+        staging_slot: Any | None = None,
+    ) -> torch.Tensor | None:
+        """Capture-or-replay the decode graph from host-staged inputs."""
+
+        batch_size = int(host_inputs.batch_size)
+        graph_batch_size = self.resolve_bucket(batch_size)
+        if not self.can_use(graph_batch_size):
+            self._record_decode_graph_miss(
+                ctx=ctx,
+                batch_size=batch_size,
+                graph_batch_size=graph_batch_size,
+            )
+            return None
+
+        return self._capture_or_replay(
+            key=graph_batch_size,
+            ctx=ctx,
+            capture=lambda: self.capture_host_inputs(
+                kv_pool=kv_pool,
+                num_blocks=num_blocks,
+                batch_size=graph_batch_size,
+                device=device,
+                host_inputs=host_inputs,
+                ctx=ctx,
+                forward_fn=forward_fn,
+                prepare_backend=prepare_backend,
+                staging_slot=staging_slot,
+            ),
+            copy_inputs=lambda state: copy_text_decode_graph_host_inputs(
+                state,
+                host_inputs,
+                staging_slot=staging_slot,
+            ),
+            replay=lambda state: _replay_decode_graph(state, batch_size),
+            record=lambda event: self._record_decode_graph_event(
+                ctx=ctx,
+                event=event,
+                batch_size=batch_size,
+                graph_batch_size=graph_batch_size,
+            ),
+            disable=lambda exc: self.disable(graph_batch_size, exc, phase="disabling"),
+            capture_metric=f"{self.metric_prefix}decode_graph_capture",
+            input_copy_metric=f"{self.metric_prefix}decode_graph_input_copy",
+            replay_metric=f"{self.metric_prefix}decode_graph_replay_launch",
+            after_copy=lambda state: self._prepare_decode_graph(state, ctx, prepare_backend),
+            after_copy_metric=f"{self.metric_prefix}decode_graph_attention_prepare",
+        )
+
     def warmup(
         self,
         *,
@@ -347,12 +472,13 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         num_blocks: int,
         device: torch.device,
         max_context_len: int = 0,
+        attention_backend_name: str | None = "auto",
         forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
         prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
     ) -> None:
         """Pre-capture decode graph buckets ahead of serving."""
 
-        ctx = ForwardContext(attention_backend_name="auto")
+        ctx = ForwardContext(attention_backend_name=attention_backend_name or "auto")
         def should_skip(batch_size: int) -> bool:
             return int(batch_size) <= 0 or int(batch_size) > int(num_blocks)
 
@@ -477,6 +603,10 @@ def make_text_decode_graph_state(
         [[] for _ in range(batch_size)],
         [0 for _ in range(batch_size)],
     )
+    long_inputs = share(
+        "text_decode.long_inputs",
+        torch.empty(4 * batch_size, dtype=torch.long, device=device),
+    )
     block_table = share(
         "text_decode.block_table",
         torch.empty((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device),
@@ -487,14 +617,8 @@ def make_text_decode_graph_state(
     )
     state = TextDecodeGraphState(
         batch_size=batch_size,
-        input_ids=share(
-            "text_decode.input_ids",
-            torch.empty((batch_size, 1), dtype=torch.long, device=device),
-        ),
-        positions=share(
-            "text_decode.positions",
-            torch.empty((batch_size, 1), dtype=torch.long, device=device),
-        ),
+        input_ids=long_inputs[:batch_size].view(batch_size, 1),
+        positions=long_inputs[batch_size : 2 * batch_size].view(batch_size, 1),
         block_table=block_table,
         cache_seqlens=cache_seqlens,
         graph=torch.cuda.CUDAGraph(),
@@ -508,16 +632,11 @@ def make_text_decode_graph_state(
                 "text_decode.query_lens",
                 torch.ones(batch_size, dtype=torch.int32, device=device),
             ),
-            decode_page_ids=share(
-                "text_decode.decode_page_ids",
-                torch.empty(batch_size, dtype=torch.long, device=device),
-            ),
-            decode_page_offsets=share(
-                "text_decode.decode_page_offsets",
-                torch.empty(batch_size, dtype=torch.long, device=device),
-            ),
+            decode_page_ids=long_inputs[2 * batch_size : 3 * batch_size],
+            decode_page_offsets=long_inputs[3 * batch_size : 4 * batch_size],
             max_context_len=max_context_len,
         ),
+        long_inputs=long_inputs,
     )
     return state
 
@@ -556,14 +675,19 @@ def copy_text_decode_graph_inputs(
         raise invalid_descriptor("decode CUDA graph block-table batch mismatch")
     if block_table.shape[1] > state.block_table.shape[1]:
         raise invalid_descriptor("decode CUDA graph block-table width exceeded")
-    state.block_table[:actual_batch, : block_table.shape[1]].copy_(
-        block_table.to(dtype=torch.int32),
-        non_blocking=True,
-    )
-    if block_table.shape[1] < state.block_table.shape[1]:
-        state.block_table[:actual_batch, block_table.shape[1]:].zero_()
-    if actual_batch < state.batch_size:
-        state.block_table[actual_batch:].zero_()
+    block_rows_key: tuple[tuple[int, ...], ...] | None = None
+    if isinstance(source_cache, BatchedPagedRequestCache):
+        block_rows_key = _block_rows_key(source_cache.block_ids_by_row[:actual_batch])
+    if not _block_table_rows_match(state, block_rows_key):
+        state.block_table[:actual_batch, : block_table.shape[1]].copy_(
+            block_table.to(dtype=torch.int32),
+            non_blocking=True,
+        )
+        if block_table.shape[1] < state.block_table.shape[1]:
+            state.block_table[:actual_batch, block_table.shape[1]:].zero_()
+        if actual_batch < state.batch_size:
+            state.block_table[actual_batch:].zero_()
+        state.block_table_rows = block_rows_key or ()
     cache_seqlens = attention_metadata.cache_seqlens
     if cache_seqlens is None:
         raise invalid_descriptor("decode CUDA graph cache lengths are missing")
@@ -609,13 +733,363 @@ def copy_text_decode_graph_inputs(
     )
 
 
+def copy_text_decode_graph_host_inputs(
+    state: TextDecodeGraphState,
+    host_inputs: TextDecodeGraphHostInputs,
+    *,
+    staging_slot: Any | None = None,
+) -> None:
+    """Refresh decode graph inputs directly from host row descriptors."""
+
+    rows = _normalize_text_decode_graph_host_inputs(state, host_inputs)
+    actual_batch = len(rows["input_ids"])
+    block_rows = rows["block_ids_by_row"]
+    max_blocks = max(len(row) for row in block_rows)
+    if max_blocks > int(state.block_table.shape[1]):
+        raise invalid_descriptor("decode CUDA graph block-table width exceeded")
+
+    cache_lens = rows["cache_seqlens_cpu"]
+    decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
+    decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
+    page_ids: list[int] = []
+    offsets: list[int] = []
+    if isinstance(decode_page_ids, torch.Tensor) and isinstance(decode_page_offsets, torch.Tensor):
+        page_ids, offsets = _host_decode_write_locations(
+            block_rows,
+            cache_lens,
+            int(state.cache.pool.block_size),
+        )
+
+    dense_replacements = _dense_token_replacements(
+        state,
+        host_inputs.token_replacements,
+        actual_batch=actual_batch,
+    )
+    copied_long = _copy_fused_long_host_inputs(
+        state,
+        input_ids=rows["input_ids"],
+        positions=rows["positions"],
+        page_ids=page_ids,
+        page_offsets=offsets,
+        include_input_ids=dense_replacements is None,
+        actual_batch=actual_batch,
+        slot=staging_slot,
+    )
+    if not copied_long:
+        _copy_host_ints_to_device(
+            rows["input_ids"],
+            state.input_ids[:actual_batch],
+            dtype=torch.long,
+            slot=staging_slot,
+            name="text_decode.input_ids",
+            view_shape=(actual_batch, 1),
+        )
+        _copy_host_ints_to_device(
+            rows["positions"],
+            state.positions[:actual_batch],
+            dtype=torch.long,
+            slot=staging_slot,
+            name="text_decode.positions",
+            view_shape=(actual_batch, 1),
+        )
+        if isinstance(decode_page_ids, torch.Tensor) and isinstance(decode_page_offsets, torch.Tensor):
+            _copy_host_ints_to_device(
+                page_ids,
+                decode_page_ids[:actual_batch],
+                dtype=torch.long,
+                slot=staging_slot,
+                name="text_decode.decode_page_ids",
+            )
+            _copy_host_ints_to_device(
+                offsets,
+                decode_page_offsets[:actual_batch],
+                dtype=torch.long,
+                slot=staging_slot,
+                name="text_decode.decode_page_offsets",
+            )
+        if actual_batch < state.batch_size:
+            state.input_ids[actual_batch:].zero_()
+            state.positions[actual_batch:].zero_()
+            if isinstance(decode_page_ids, torch.Tensor) and isinstance(decode_page_offsets, torch.Tensor):
+                decode_page_ids[actual_batch:].zero_()
+                decode_page_offsets[actual_batch:].zero_()
+    if dense_replacements is None:
+        _copy_token_replacements(
+            state,
+            host_inputs.token_replacements,
+            actual_batch=actual_batch,
+        )
+    else:
+        _copy_dense_token_replacements(state, dense_replacements)
+
+    block_rows_key = _block_rows_key(block_rows)
+    if not _block_table_rows_match(state, block_rows_key):
+        block_values: list[int] = []
+        for row in block_rows:
+            block_values.extend(row)
+            block_values.extend(0 for _ in range(max_blocks - len(row)))
+        _copy_host_ints_to_device(
+            block_values,
+            state.block_table[:actual_batch, :max_blocks],
+            dtype=torch.int32,
+            slot=staging_slot,
+            name="text_decode.block_table",
+            view_shape=(actual_batch, max_blocks),
+        )
+        if max_blocks < int(state.block_table.shape[1]):
+            state.block_table[:actual_batch, max_blocks:].zero_()
+        if actual_batch < state.batch_size:
+            state.block_table[actual_batch:].zero_()
+        state.block_table_rows = block_rows_key
+
+    _copy_host_ints_to_device(
+        cache_lens,
+        state.cache_seqlens[:actual_batch],
+        dtype=torch.int32,
+        slot=staging_slot,
+        name="text_decode.cache_seqlens",
+    )
+    if actual_batch < state.batch_size:
+        state.cache_seqlens[actual_batch:].zero_()
+
+    if isinstance(state.cache, BatchedPagedRequestCache):
+        graph_block_rows = [list(row) for row in block_rows]
+        graph_base_lens = [int(length) for length in cache_lens]
+        if actual_batch < state.batch_size:
+            graph_block_rows.extend([] for _ in range(state.batch_size - actual_batch))
+            graph_base_lens.extend(0 for _ in range(state.batch_size - actual_batch))
+        state.cache.reset_rows(graph_block_rows, graph_base_lens)
+
+    cache_cpu = tuple(int(x) for x in rows["cache_seqlens_cpu"])
+    kv_cpu = tuple(int(x) for x in rows["kv_seqlens_cpu"])
+    if actual_batch < state.batch_size:
+        cache_cpu = cache_cpu + tuple(0 for _ in range(state.batch_size - actual_batch))
+        kv_cpu = kv_cpu + tuple(1 for _ in range(state.batch_size - actual_batch))
+    state.metadata.cache_seqlens_cpu = cache_cpu
+    state.metadata.kv_seqlens_cpu = kv_cpu
+    state.metadata.max_context_len = int(host_inputs.max_context_len or state.metadata.max_context_len)
+
+
+def _normalize_text_decode_graph_host_inputs(
+    state: TextDecodeGraphState,
+    host_inputs: TextDecodeGraphHostInputs,
+) -> dict[str, Any]:
+    actual_batch = int(host_inputs.batch_size)
+    if actual_batch <= 0 or actual_batch > int(state.batch_size):
+        raise invalid_descriptor("decode CUDA graph input shape mismatch")
+    if (
+        len(host_inputs.positions) != actual_batch
+        or len(host_inputs.block_ids_by_row) != actual_batch
+        or len(host_inputs.cache_seqlens_cpu) != actual_batch
+        or len(host_inputs.kv_seqlens_cpu) != actual_batch
+    ):
+        raise invalid_descriptor("decode CUDA graph host input row mismatch")
+    block_rows = [[int(block_id) for block_id in row] for row in host_inputs.block_ids_by_row]
+    if any(not row for row in block_rows):
+        raise invalid_descriptor("decode CUDA graph host block rows must be non-empty")
+    cache_lens = [int(length) for length in host_inputs.cache_seqlens_cpu]
+    kv_lens = [int(length) for length in host_inputs.kv_seqlens_cpu]
+    if any(length < 0 for length in cache_lens) or any(length <= 0 for length in kv_lens):
+        raise invalid_descriptor("decode CUDA graph host sequence lengths are invalid")
+    return {
+        "input_ids": [int(token) for token in host_inputs.input_ids],
+        "positions": [int(pos) for pos in host_inputs.positions],
+        "block_ids_by_row": block_rows,
+        "cache_seqlens_cpu": cache_lens,
+        "kv_seqlens_cpu": kv_lens,
+    }
+
+
+def _copy_host_ints_to_device(
+    values: Sequence[int],
+    target: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    slot: Any | None,
+    name: str,
+    view_shape: tuple[int, ...] | None = None,
+) -> None:
+    cpu = cpu_int_staging_buffer(
+        len(values),
+        dtype=dtype,
+        pin=target.device.type == "cuda",
+        slot=slot,
+        name=name,
+    )
+    fill_cpu_ints(cpu, [int(value) for value in values])
+    source = cpu if view_shape is None else cpu.view(*view_shape)
+    target.copy_(source, non_blocking=target.device.type == "cuda" and is_pinned(cpu))
+
+
+def _block_rows_key(rows: Sequence[Sequence[int]]) -> tuple[tuple[int, ...], ...]:
+    return tuple(tuple(int(block_id) for block_id in row) for row in rows)
+
+
+def _block_table_rows_match(
+    state: TextDecodeGraphState,
+    rows: tuple[tuple[int, ...], ...] | None,
+) -> bool:
+    return rows is not None and bool(rows) and state.block_table_rows == rows
+
+
+def _copy_fused_long_host_inputs(
+    state: TextDecodeGraphState,
+    *,
+    input_ids: Sequence[int],
+    positions: Sequence[int],
+    page_ids: Sequence[int],
+    page_offsets: Sequence[int],
+    include_input_ids: bool,
+    actual_batch: int,
+    slot: Any | None,
+) -> bool:
+    if not _long_inputs_match_state(state):
+        return False
+    actual_batch = int(actual_batch)
+    batch = int(state.batch_size)
+    if len(page_ids) > 0 and len(page_ids) != actual_batch:
+        raise invalid_descriptor("decode CUDA graph page-id batch mismatch")
+    if len(page_offsets) > 0 and len(page_offsets) != actual_batch:
+        raise invalid_descriptor("decode CUDA graph page-offset batch mismatch")
+    row_values: list[int] = []
+    if include_input_ids:
+        row_values.extend(int(value) for value in input_ids)
+        row_values.extend(0 for _ in range(batch - actual_batch))
+    row_values.extend(int(value) for value in positions)
+    row_values.extend(0 for _ in range(batch - actual_batch))
+    if len(page_ids) > 0:
+        row_values.extend(int(value) for value in page_ids)
+        row_values.extend(0 for _ in range(batch - actual_batch))
+    if len(page_offsets) > 0:
+        row_values.extend(int(value) for value in page_offsets)
+        row_values.extend(0 for _ in range(batch - actual_batch))
+    if not row_values:
+        return True
+    start = 0 if include_input_ids else batch
+    target = state.long_inputs[start : start + len(row_values)]
+    _copy_host_ints_to_device(
+        row_values,
+        target,
+        dtype=torch.long,
+        slot=slot,
+        name="text_decode.long_inputs",
+    )
+    return True
+
+
+def _long_inputs_match_state(state: TextDecodeGraphState) -> bool:
+    long_inputs = state.long_inputs
+    if not isinstance(long_inputs, torch.Tensor):
+        return False
+    batch = int(state.batch_size)
+    if int(long_inputs.numel()) < 4 * batch or long_inputs.dtype != torch.long:
+        return False
+    decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
+    decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
+    if not isinstance(decode_page_ids, torch.Tensor) or not isinstance(decode_page_offsets, torch.Tensor):
+        return False
+    return (
+        state.input_ids.data_ptr() == long_inputs[:batch].data_ptr()
+        and state.positions.data_ptr() == long_inputs[batch : 2 * batch].data_ptr()
+        and decode_page_ids.data_ptr() == long_inputs[2 * batch : 3 * batch].data_ptr()
+        and decode_page_offsets.data_ptr() == long_inputs[3 * batch : 4 * batch].data_ptr()
+    )
+
+
+def _copy_token_replacements(
+    state: TextDecodeGraphState,
+    replacements: Sequence[tuple[int, torch.Tensor]],
+    *,
+    actual_batch: int,
+) -> None:
+    for row_idx, token in replacements:
+        row = int(row_idx)
+        if row < 0 or row >= actual_batch:
+            raise invalid_descriptor("decode CUDA graph token replacement row is out of range")
+        if token.dtype != torch.long or int(token.numel()) != 1:
+            raise invalid_descriptor("decode CUDA graph token replacement must be one int64 token")
+        if torch.device(token.device) != torch.device(state.input_ids.device):
+            raise invalid_descriptor("decode CUDA graph token replacement device mismatch")
+        state.input_ids[row, 0:1].copy_(token.reshape(1), non_blocking=True)
+
+
+def _dense_token_replacements(
+    state: TextDecodeGraphState,
+    replacements: Sequence[tuple[int, torch.Tensor]],
+    *,
+    actual_batch: int,
+) -> torch.Tensor | list[torch.Tensor] | None:
+    if len(replacements) != int(actual_batch):
+        return None
+    tokens: list[torch.Tensor | None] = [None for _ in range(int(actual_batch))]
+    for row_idx, token in replacements:
+        row = int(row_idx)
+        if row < 0 or row >= int(actual_batch):
+            raise invalid_descriptor("decode CUDA graph token replacement row is out of range")
+        if tokens[row] is not None:
+            return None
+        if token.dtype != torch.long or int(token.numel()) != 1:
+            raise invalid_descriptor("decode CUDA graph token replacement must be one int64 token")
+        if torch.device(token.device) != torch.device(state.input_ids.device):
+            raise invalid_descriptor("decode CUDA graph token replacement device mismatch")
+        tokens[row] = token.reshape(1)
+    if any(token is None for token in tokens):
+        return None
+    dense = [token for token in tokens if token is not None]
+    view = adjacent_one_token_view(dense)
+    return view if view is not None else dense
+
+
+def _copy_dense_token_replacements(
+    state: TextDecodeGraphState,
+    replacements: torch.Tensor | Sequence[torch.Tensor],
+) -> None:
+    if isinstance(replacements, torch.Tensor):
+        source = replacements.reshape(-1)
+        count = int(source.numel())
+        if count <= 0:
+            return
+        state.input_ids[:count, 0].copy_(source, non_blocking=True)
+        if count < int(state.batch_size):
+            state.input_ids[count:].zero_()
+        return
+    if not replacements:
+        return
+    target = state.input_ids[: len(replacements), 0]
+    if len(replacements) == 1:
+        target.copy_(replacements[0], non_blocking=True)
+        if len(replacements) < int(state.batch_size):
+            state.input_ids[len(replacements) :].zero_()
+        return
+    torch.cat(tuple(replacements), out=target)
+    if len(replacements) < int(state.batch_size):
+        state.input_ids[len(replacements) :].zero_()
+
+
+def _host_decode_write_locations(
+    block_ids_by_row: Sequence[Sequence[int]],
+    cache_lens: Sequence[int],
+    page_size: int,
+) -> tuple[list[int], list[int]]:
+    page_size = max(1, int(page_size))
+    page_ids: list[int] = []
+    offsets: list[int] = []
+    for row, length in zip(block_ids_by_row, cache_lens, strict=True):
+        page_slot = int(length) // page_size
+        if page_slot < 0 or page_slot >= len(row):
+            raise invalid_descriptor("decode CUDA graph host row lacks write page")
+        page_ids.append(int(row[page_slot]))
+        offsets.append(int(length) % page_size)
+    return page_ids, offsets
+
+
 def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> Any | None:
     """Return the attention backend that can host a *captured* paged-decode graph.
 
     A paged-decode graph is only correct when its backend refills the page-index /
     length plan buffers before every replay, or when the backend has no wrapper
     plan state to bake into the graph. FlashInfer's wrapper path uses
-    ``prepare_paged_decode_cuda_graph``; the direct TRT-LLM MHA path consumes the
+    ``prepare_paged_decode_cuda_graph``; direct paged-decode backends consume the
     live block-table and sequence-length tensors directly, so a no-op prepare is
     enough. Other backends stay eager rather than capture a stale paged plan.
     """
@@ -637,11 +1111,28 @@ def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> An
             return backend
         return None
     if normalized not in ("auto", "flashinfer"):
+        if normalized != "fa4_cute":
+            return None
+        if not has_attention_backend("fa4_cute"):
+            return None
+        backend = get_attention_backend("fa4_cute")
+        caps = backend.capabilities()
+        if not bool(getattr(caps, "available", True)) or not bool(getattr(caps, "paged_kv", False)):
+            return None
+        if not hasattr(backend, "forward_paged"):
+            return None
+        return backend
+    if has_attention_backend("flashinfer"):
+        backend = get_attention_backend("flashinfer")
+        if hasattr(backend, "prepare_paged_decode_cuda_graph"):
+            return backend
+    if normalized != "auto" or not has_attention_backend("fa4_cute"):
         return None
-    if not has_attention_backend("flashinfer"):
+    backend = get_attention_backend("fa4_cute")
+    caps = backend.capabilities()
+    if not bool(getattr(caps, "available", True)) or not bool(getattr(caps, "paged_kv", False)):
         return None
-    backend = get_attention_backend("flashinfer")
-    if not hasattr(backend, "prepare_paged_decode_cuda_graph"):
+    if not hasattr(backend, "forward_paged"):
         return None
     return backend
 
@@ -671,6 +1162,10 @@ def resolve_paged_decode_graph_prepare(
         return None
     backend = resolve_paged_decode_graph_backend(attention_backend_name)
     if backend is None:
+        return None
+    caps = backend.capabilities()
+    multiple = int(getattr(caps, "paged_block_size_multiple", 1) or 1)
+    if int(kv_pool.block_size) % max(1, multiple) != 0:
         return None
     num_q_heads, scale, q_dtype = geometry_hook()
     num_blocks = int(num_blocks)

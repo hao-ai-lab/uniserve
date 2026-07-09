@@ -32,6 +32,7 @@ __all__ = [
     "TextImageDenoiseStep",
     "combine_text_image_velocity",
     "text_image_branches",
+    "text_image_cfg_plan",
     "text_image_cfg_branch_count",
 ]
 
@@ -383,7 +384,11 @@ def _text_image_cfg_plan(step: TextImageDenoiseStep) -> CfgPlan:
 
 
 def text_image_branches(step: TextImageDenoiseStep) -> tuple[str, ...]:
-    return _text_image_cfg_plan(step).branches
+    return text_image_cfg_plan(step).branches
+
+
+def text_image_cfg_plan(step: TextImageDenoiseStep) -> CfgPlan:
+    return _text_image_cfg_plan(step)
 
 
 def text_image_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
@@ -403,7 +408,7 @@ def combine_text_image_velocity(
     step: TextImageDenoiseStep,
     outputs: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
-    return _text_image_cfg_plan(step).combine(outputs)
+    return text_image_cfg_plan(step).combine(outputs)
 
 
 def _validate_batched_text_image_outputs(

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from ..foundation.errors import invalid_descriptor
+from ..runtime.tensor_views import coalesce_one_token_rows
 
 if TYPE_CHECKING:
     from ..contracts.batches import TextBatch
@@ -199,11 +200,11 @@ class TextDecodeRelay:
         _bump_stat(stats, "text_decode_token_relay_hits", len(relay_rows))
         if position_complete and len(position_rows) == len(relay_rows):
             _bump_stat(stats, "text_decode_position_relay_hits", len(position_rows))
-            relay_positions = _coalesce_relay_rows(position_rows)
+            relay_positions = coalesce_one_token_rows(position_rows)
         else:
             _bump_stat(stats, "text_decode_position_relay_misses")
             relay_positions = None
-        return _coalesce_relay_rows(relay_rows), relay_positions
+        return coalesce_one_token_rows(relay_rows), relay_positions
 
     def attach_last_sampled_to_op(self, op: dict[str, Any], state: "RequestState") -> None:
         relay = state.decode_relay
@@ -223,32 +224,6 @@ class TextDecodeRelay:
                 "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
             )
         return None
-
-
-def _coalesce_relay_rows(rows: list[torch.Tensor]) -> torch.Tensor:
-    if not rows:
-        raise invalid_descriptor("decode relay rows must not be empty")
-    if len(rows) == 1:
-        return rows[0].reshape(-1)
-    first = rows[0].reshape(-1)
-    if int(first.numel()) != 1:
-        return torch.cat([row.reshape(-1) for row in rows], dim=0)
-    elem_size = int(first.element_size())
-    base_ptr = int(first.data_ptr())
-    for idx, row in enumerate(rows):
-        flat = row.reshape(-1)
-        if (
-            int(flat.numel()) != 1
-            or flat.dtype != first.dtype
-            or flat.device != first.device
-            or int(flat.data_ptr()) != base_ptr + idx * elem_size
-        ):
-            return torch.cat([candidate.reshape(-1) for candidate in rows], dim=0)
-    try:
-        return first.as_strided((len(rows),), (1,))
-    except RuntimeError:
-        return torch.cat([candidate.reshape(-1) for candidate in rows], dim=0)
-
 
 def _same_tensor(lhs: Any, rhs: torch.Tensor) -> bool:
     if not isinstance(lhs, torch.Tensor):

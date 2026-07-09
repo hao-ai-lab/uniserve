@@ -209,10 +209,26 @@ class InterleavedTextCacheDriver:
         op_list = [dict(op) for op in ops]
         if not op_list:
             return []
-        graphed = self._decode_graph().maybe_run_batch(self, op_list)
+        graphed = self.try_run_decode_graph_logits_batch(op_list)
         if graphed is not None:
             return graphed
         return [self._run_text_logits_one(op) for op in op_list]
+
+    def try_run_decode_graph_logits_batch(
+        self,
+        ops: Sequence[Mapping[str, Any]],
+    ) -> list[torch.Tensor] | None:
+        """Return graph-produced logits for eligible one-token decode rows.
+
+        Unlike :meth:`run_text_logits_batch`, this method does not fall back to
+        eager execution. Callers that must account for graph misses explicitly can
+        use this seam and keep the existing eager path authoritative.
+        """
+
+        op_list = [dict(op) for op in ops]
+        if not op_list:
+            return []
+        return self._decode_graph().maybe_run_batch(self, op_list)
 
     def run_text_logits(self, op: dict[str, Any]) -> torch.Tensor:
         return self._run_text_logits_one(dict(op))

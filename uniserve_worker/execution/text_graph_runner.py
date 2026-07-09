@@ -20,10 +20,13 @@ from ..foundation.runtime_config import get_worker_config
 from ..runtime.paged_text_cache import BatchedPagedRequestCache
 from .decode_cuda_graph import (
     DecodeCudaGraphRunner,
-    PrefillCudaGraphRunner,
     TextDecodeGraphState,
-    TextInitialPrefillGraphState,
     resolve_paged_decode_graph_prepare,
+)
+from .prefill_cuda_graph import (
+    PrefillCudaGraphRunner,
+    TextInitialPrefillGraphState,
+    resolve_paged_prefill_graph_prepare,
 )
 
 if TYPE_CHECKING:
@@ -169,6 +172,13 @@ class TextGraphRunner:
             max_kv_tokens=max_kv_tokens,
         ):
             return None
+        prepare_backend = self._prefill_prepare_backend(
+            model,
+            attention_backend_name=getattr(ctx, "attention_backend_name", None)
+            or getattr(self, "attention_backend_name", None),
+        )
+        if prepare_backend is None:
+            return None
         return self._prefill.maybe_run(
             kv_pool=self.kv_pool,
             num_blocks=self.num_blocks,
@@ -182,6 +192,19 @@ class TextGraphRunner:
             raw_num_tokens=raw_tokens,
             ctx=ctx,
             forward_fn=lambda state: self._prefill_forward(model, state),
+            prepare_backend=prepare_backend,
+        )
+
+    def _prefill_prepare_backend(
+        self,
+        model: Any,
+        *,
+        attention_backend_name: str | None,
+    ) -> Any | None:
+        return resolve_paged_prefill_graph_prepare(
+            owner=model,
+            kv_pool=self.kv_pool,
+            attention_backend_name=attention_backend_name,
         )
 
     # ---- the graph-unaware model forward ------------------------------------
@@ -301,18 +324,30 @@ class TextGraphRunner:
                     num_blocks=self.num_blocks,
                     device=self.device,
                     max_context_len=self.max_context_len,
+                    attention_backend_name=self.attention_backend_name,
                     forward_fn=lambda state: self._decode_forward(model, state),
                     prepare_backend=prepare_backend,
                 )
         if self._prefill.enabled() and self._prefill.warmup_enabled():
-            self._prefill.warmup(
-                kv_pool=self.kv_pool,
-                num_blocks=self.num_blocks,
-                block_size=self.block_size,
-                device=self.device,
-                max_context_len=self.max_context_len,
-                forward_fn=lambda state: self._prefill_forward(model, state),
+            prepare_backend = self._prefill_prepare_backend(
+                model, attention_backend_name=self.attention_backend_name
             )
+            if prepare_backend is None:
+                logger.info(
+                    "skipping prefill graph warmup: no graph-capable paged-prefill "
+                    "backend or model geometry hook; prefill stays eager"
+                )
+            else:
+                self._prefill.warmup(
+                    kv_pool=self.kv_pool,
+                    num_blocks=self.num_blocks,
+                    block_size=self.block_size,
+                    device=self.device,
+                    max_context_len=self.max_context_len,
+                    attention_backend_name=self.attention_backend_name,
+                    forward_fn=lambda state: self._prefill_forward(model, state),
+                    prepare_backend=prepare_backend,
+                )
 
 
 def _blocks_for_tokens(tokens: int, block_size: int) -> int:

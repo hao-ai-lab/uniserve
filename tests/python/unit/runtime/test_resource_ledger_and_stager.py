@@ -270,6 +270,18 @@ def test_int_buffer_is_int32_and_reuses_within_capacity():
     assert reused.data_ptr() == base_ptr
 
 
+def test_bool_buffer_is_bool_and_reuses_within_capacity():
+    slot = TextTensorStager(ring_depth=1).next_slot()
+
+    first = slot.bool_buffer("mask", 6, pin=False)
+    base_ptr = first.data_ptr()
+    reused = slot.bool_buffer("mask", 4, pin=False)
+
+    assert first.dtype == torch.bool
+    assert reused.dtype == torch.bool
+    assert reused.data_ptr() == base_ptr
+
+
 def test_distinct_buffer_names_get_independent_storage():
     slot = TextTensorStager(ring_depth=1).next_slot()
 

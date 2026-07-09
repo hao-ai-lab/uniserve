@@ -442,21 +442,58 @@ class FlashInferAttentionBackend(_WrapperPool):
             kv_seqlens,
             int(k.shape[1]),
         )
+        self._plan_prefill_wrapper(
+            wrapper_key,
+            wrapper,
+            plan,
+            block_table=block_table,
+            kv_seqlens=kv_seqlens,
+            query_lens=query_lens,
+            num_q_heads=int(q.shape[1]),
+            num_kv_heads=int(k.shape[2]),
+            head_dim=int(q.shape[2]),
+            page_size=int(k.shape[1]),
+            q_dtype=q.dtype,
+            kv_dtype=k.dtype,
+            causal=causal,
+            scale=scale,
+        )
+        return plan.index_count
+
+    def _plan_prefill_wrapper(
+        self,
+        wrapper_key: WrapperKey,
+        wrapper: Any,
+        plan: _PrefillPlanTensors,
+        *,
+        block_table: torch.Tensor,
+        kv_seqlens: torch.Tensor,
+        query_lens: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        causal: bool,
+        scale: float | None,
+    ) -> None:
+        scale_value = None if scale is None else float(scale)
         self.plan_prefill(
             (
                 tuple(wrapper_key),
-                int(q.shape[1]),
-                int(k.shape[2]),
-                int(q.shape[2]),
-                int(k.shape[1]),
+                int(num_q_heads),
+                int(num_kv_heads),
+                int(head_dim),
+                int(page_size),
                 bool(causal),
-                float(scale),
+                None if scale_value is None else float(scale_value),
                 int(plan.qo_indptr.numel()),
                 int(plan.indices.numel()),
                 get_worker_config().flashinfer.prefill_split_tile_size,
                 get_worker_config().flashinfer.disable_split_kv,
             ),
-            workspace=self._workspace(q.device),
+            workspace=self._workspace(block_table.device),
             wrapper=wrapper,
         )
         wrapper.plan(
@@ -464,15 +501,15 @@ class FlashInferAttentionBackend(_WrapperPool):
             plan.kv_indptr,
             plan.indices,
             plan.last_page_len,
-            int(q.shape[1]),
-            int(k.shape[2]),
-            int(q.shape[2]),
-            int(k.shape[1]),
+            int(num_q_heads),
+            int(num_kv_heads),
+            int(head_dim),
+            int(page_size),
             causal=causal,
-            q_data_type=q.dtype,
-            kv_data_type=k.dtype,
-            o_data_type=q.dtype,
-            sm_scale=scale,
+            q_data_type=q_dtype,
+            kv_data_type=kv_dtype,
+            o_data_type=q_dtype,
+            sm_scale=scale_value,
             non_blocking=True,
             seq_lens=kv_seqlens,
             seq_lens_q=query_lens,
@@ -480,7 +517,73 @@ class FlashInferAttentionBackend(_WrapperPool):
             fixed_split_size=get_worker_config().flashinfer.prefill_split_tile_size,
             disable_split_kv=get_worker_config().flashinfer.disable_split_kv,
         )
-        return plan.index_count
+
+    def prepare_paged_prefill_cuda_graph(
+        self,
+        metadata: Any,
+        *,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        causal: bool,
+        scale: float | None = None,
+    ) -> None:
+        """Refresh a graph-scoped paged-prefill wrapper from live side-table tensors."""
+
+        if _BatchPrefillWithPagedKVCacheWrapper is None:
+            raise RuntimeError("flashinfer paged prefill wrapper is not available")
+        bound = self._prefill_graph_wrapper_for_metadata(metadata)
+        if bound is None:
+            raise RuntimeError("no graph-scoped paged prefill wrapper is bound to metadata")
+        wrapper_key, wrapper = bound
+        block_table = getattr(metadata, "block_table", None)
+        cu_seqlens_q = getattr(metadata, "cu_seqlens_q", None)
+        cu_seqlens_k = getattr(metadata, "cu_seqlens_k", None)
+        if not (
+            isinstance(block_table, torch.Tensor)
+            and isinstance(cu_seqlens_q, torch.Tensor)
+            and isinstance(cu_seqlens_k, torch.Tensor)
+        ):
+            raise RuntimeError("paged prefill graph metadata is missing plan tensors")
+        if int(cu_seqlens_q.numel()) != int(cu_seqlens_k.numel()):
+            raise RuntimeError("paged prefill graph q/k sequence tables must have the same length")
+        batch_size = int(cu_seqlens_q.numel()) - 1
+        if batch_size <= 0 or int(block_table.shape[0]) != batch_size:
+            raise RuntimeError("paged prefill graph block table row count mismatch")
+        kv_seqlens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int32).contiguous()
+        query_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32).contiguous()
+        plan = self._prefill_plan_tensors(
+            wrapper_key,
+            block_table,
+            cu_seqlens_q,
+            kv_seqlens,
+            int(page_size),
+        )
+        self._plan_prefill_wrapper(
+            wrapper_key,
+            wrapper,
+            plan,
+            block_table=block_table,
+            kv_seqlens=kv_seqlens,
+            query_lens=query_lens,
+            num_q_heads=int(num_q_heads),
+            num_kv_heads=int(num_kv_heads),
+            head_dim=int(head_dim),
+            page_size=int(page_size),
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            causal=bool(causal),
+            scale=scale,
+        )
+        _record_prefill_plan_stats(
+            get_forward_context().stats,
+            planned=True,
+            rows=batch_size,
+            indices=plan.index_count,
+        )
 
     def prepare_paged_decode_cuda_graph(
         self,
