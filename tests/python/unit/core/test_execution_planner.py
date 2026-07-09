@@ -185,19 +185,16 @@ def test_und_gen_mixed_policy_keeps_entire_batch_for_forward_hook():
     ]
 
 
-def test_non_thin_text_extend_decode_splits_per_mode():
-    # A non-thin (whole-batch) model never fuses an extend+decode window; only a
-    # thin text model fuses (via the system TextBackendGate). Everything else
-    # splits per-mode through the system drivers.
+def test_non_thin_text_extend_decode_runs_as_unified_mixed_batch():
+    # Mixed extend+decode grouping is a system-level decision; a whole-batch model receives the admitted mixed batch directly.
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
     submitted = ops("decode_und", "prefill_und")
 
     result = execute(model, submitted)
 
-    assert [r["mode"] for r in result["per_seq"]] == ["decode", "extend"]
+    assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed"]
     assert model.calls == [
-        (ForwardMode.EXTEND, [2], ["prefill_und"]),
-        (ForwardMode.DECODE, [1], ["decode_und"]),
+        (ForwardMode.MIXED, [1, 2], ["decode_und", "prefill_und"]),
     ]
 
 
@@ -646,7 +643,7 @@ def test_mixed_forward_driver_threads_deferred_text_cpu_flag():
 
 
 @pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
-def test_text_denoise_forward_route_splits_without_hook(text_kind):
+def test_text_denoise_forward_route_uses_unified_whole_batch_without_hook(text_kind):
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
     submitted = ops(text_kind, "denoise_gen")
 
@@ -659,12 +656,7 @@ def test_text_denoise_forward_route_splits_without_hook(text_kind):
         }
     )
 
-    expected_text_mode = ForwardMode.DECODE if text_kind == "decode_und" else ForwardMode.EXTEND
-    assert [row["mode"] for row in result["per_seq"]] == [
-        expected_text_mode.value,
-        ForwardMode.DENOISE.value,
-    ]
+    assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
     assert model.calls == [
-        (expected_text_mode, [1], [text_kind]),
-        (ForwardMode.DENOISE, [2], ["denoise_gen"]),
+        (ForwardMode.MIXED, [1, 2], [text_kind, "denoise_gen"]),
     ]

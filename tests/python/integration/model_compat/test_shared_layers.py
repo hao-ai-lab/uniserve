@@ -2038,7 +2038,7 @@ def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
             return {"req_id": req_id}
 
     monkeypatch.setattr(wrapper, "prepare_denoise", lambda _state, _op: object())
-    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", lambda *_args: False)
+    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", lambda *_args, **_kwargs: False)
 
     def split_fallback_called(_op):
         raise AssertionError("admitted mixed batch must not use text split fallback")

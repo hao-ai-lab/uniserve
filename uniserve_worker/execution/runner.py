@@ -38,6 +38,16 @@ from ..runtime.residency_manager import ResidencyLeaseManager
 from ..runtime.resources import ResourceRuntime
 from .denoise_driver import DenoiseDriver
 from .encode_driver import EncodeDriver
+from .forward import (
+    EagerFallbackRecorder,
+    ForwardExecutor,
+    ForwardGraphPolicy,
+    ForwardPlanBuilder,
+    ForwardPostprocessor,
+)
+from .forward import (
+    ForwardBatchBuilder as UnifiedForwardBatchBuilder,
+)
 from .forward_driver import ForwardDriver
 from .forward_step import ForwardGroupPlanner, ForwardStepExecutor, ForwardStepOptions
 from .image_decode_driver import ImageDecodeDriver
@@ -187,6 +197,7 @@ class ModelRunner:
         self.encode_driver = deps.encode_driver or EncodeDriver()
         self.image_decode_driver = deps.image_decode_driver or ImageDecodeDriver()
         self._init_text_execution(model, residency, deps.text_driver)
+        self._init_unified_forward_execution(model, residency)
         self.multimodal_processor = deps.multimodal_processor
         self._init_capability_flags(model)
         self._mode_strategies = self._build_mode_strategies()
@@ -200,6 +211,33 @@ class ModelRunner:
             log_text_mixed_split=self._log_text_mixed_split,
         )
         self._step_executor = ForwardStepExecutor(self, group_planner=self._group_planner)
+
+    def _init_unified_forward_execution(
+        self,
+        model: UniModel,
+        residency: "ResidencyManager | None",
+    ) -> None:
+        device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
+        kv_pool = residency.kv if residency is not None else None
+        self.forward_plan_builder = ForwardPlanBuilder()
+        self.unified_forward_batch_builder = UnifiedForwardBatchBuilder(
+            runtime_builder=self.forward_batch_builder,
+            kv_pool=kv_pool,
+            request_states=self.request_states,
+            default_device=device,
+        )
+        self.forward_graph_policy = ForwardGraphPolicy(
+            prefer_graph=bool(get_worker_config().cuda_graph),
+            strict=env_flag("UNISERVE_STRICT_FORWARD_GRAPH"),
+            graph_selection_delegated=True,
+        )
+        self.forward_fallback_recorder = EagerFallbackRecorder()
+        self.forward_executor = ForwardExecutor(
+            model=model,
+            graph_policy=self.forward_graph_policy,
+            fallback_recorder=self.forward_fallback_recorder,
+        )
+        self.forward_postprocessor = ForwardPostprocessor()
 
     def _init_text_execution(
         self,
@@ -562,7 +600,7 @@ class ModelRunner:
         group: list[tuple[int, Mapping[str, Any]]],
         defer_text_cpu_results: bool,
     ) -> list[Any] | None:
-        if self.forward_driver.can_run(self.model, fb) or self._is_text_denoise_forward_batch(fb):
+        if self.forward_driver.can_run(self.model, fb):
             if _MIXED_PROOF_ENABLED:
                 self._log_mixed_proof(fb, group)
             with profile_range("uniserve.runner.forward"):
@@ -573,6 +611,8 @@ class ModelRunner:
                     self.model,
                     defer_text_cpu_results=defer_text_cpu_results,
                 )
+        if self._whole_batch_forward:
+            return self._run_model_forward(fb)
         if not all(m in _TEXT_DRIVER_MODES for m in fb.op_modes):
             return None
         if _MIXED_PROOF_ENABLED:
@@ -686,32 +726,12 @@ class ModelRunner:
         return self._group_planner.groups(ops)
 
     def _accepts_forward_batch(self, ops: list[Mapping[str, Any]], decision: Any) -> bool:
-        """Whether the admitted mixed window can actually run as one forward.
+        """Whether the admitted mixed window is semantically supported."""
 
-        Text-only extend+decode windows prefer a model-owned packed forward when
-        the model exposes ``run_forward``. Generic text models run through the
-        system ``TextBackendGate``. Decode+denoise generation windows admitted by
-        ``ForwardAdmissionRouter`` use model-owned packed forward only when the
-        model exposes that hook; otherwise they stay on the per-mode drivers.
-        """
-
-        has_forward_hook = callable(getattr(self.model, "run_forward", None))
-        if not decision.requires_model_acceptance:
-            return bool(decision.use_forward) and has_forward_hook
+        del decision
         modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
-        if (
-            bool(decision.use_forward)
-            and ForwardMode.DECODE in modes
-            and ForwardMode.EXTEND in modes
-            and set(modes) <= _TEXT_DRIVER_MODES
-            and has_forward_hook
-        ):
-            return True
-        if self.text_gate is not None:
-            return self.text_gate.mixed_capable(
-                ops, attention_backend_name=self.attention_backend_name
-            )
-        return False
+        supported = _TEXT_DRIVER_MODES | {ForwardMode.DENOISE, ForwardMode.COMMIT}
+        return bool(modes) and set(modes).issubset(supported)
 
     @staticmethod
     def _is_text_denoise_modes(modes: tuple[ForwardMode, ...]) -> bool:

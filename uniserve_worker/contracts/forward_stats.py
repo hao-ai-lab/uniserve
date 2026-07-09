@@ -58,9 +58,15 @@ class CudaGraphStats:
     replays: int = 0
     misses: int = 0
     fallbacks: int = 0
+    capture_failures: int = 0
+    replay_failures: int = 0
     unpadded_tokens: int = 0
     padded_tokens: int = 0
+    eager_fallbacks: int = 0
+    eager_tokens: int = 0
+    eager_rows: int = 0
     runtime_mode_counts: dict[str, int] = field(default_factory=dict)
+    shape_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -269,6 +275,54 @@ class ForwardStats:
     @cuda_graph_runtime_mode_counts.setter
     def cuda_graph_runtime_mode_counts(self, value: dict[str, int]) -> None:
         self.cuda_graph.runtime_mode_counts = value
+
+    @property
+    def forward_graph_capture_failures(self) -> int:
+        return self.cuda_graph.capture_failures
+
+    @forward_graph_capture_failures.setter
+    def forward_graph_capture_failures(self, value: int) -> None:
+        self.cuda_graph.capture_failures = value
+
+    @property
+    def forward_graph_replay_failures(self) -> int:
+        return self.cuda_graph.replay_failures
+
+    @forward_graph_replay_failures.setter
+    def forward_graph_replay_failures(self, value: int) -> None:
+        self.cuda_graph.replay_failures = value
+
+    @property
+    def forward_eager_fallbacks(self) -> int:
+        return self.cuda_graph.eager_fallbacks
+
+    @forward_eager_fallbacks.setter
+    def forward_eager_fallbacks(self, value: int) -> None:
+        self.cuda_graph.eager_fallbacks = value
+
+    @property
+    def forward_eager_tokens(self) -> int:
+        return self.cuda_graph.eager_tokens
+
+    @forward_eager_tokens.setter
+    def forward_eager_tokens(self, value: int) -> None:
+        self.cuda_graph.eager_tokens = value
+
+    @property
+    def forward_eager_rows(self) -> int:
+        return self.cuda_graph.eager_rows
+
+    @forward_eager_rows.setter
+    def forward_eager_rows(self, value: int) -> None:
+        self.cuda_graph.eager_rows = value
+
+    @property
+    def forward_graph_shape_counts(self) -> dict[str, int]:
+        return self.cuda_graph.shape_counts
+
+    @forward_graph_shape_counts.setter
+    def forward_graph_shape_counts(self, value: dict[str, int]) -> None:
+        self.cuda_graph.shape_counts = value
 
     @property
     def text_decode_token_relay_hits(self) -> int:
@@ -512,6 +566,19 @@ class ForwardStats:
             "cuda_graph_unpadded_tokens": self.cuda_graph.unpadded_tokens,
             "cuda_graph_padded_tokens": self.cuda_graph.padded_tokens,
             "cuda_graph_runtime_mode_counts": dict(self.cuda_graph.runtime_mode_counts),
+            "forward_graph_captures": self.cuda_graph.captures,
+            "forward_graph_replays": self.cuda_graph.replays,
+            "forward_graph_misses": self.cuda_graph.misses,
+            "forward_graph_fallbacks": self.cuda_graph.fallbacks,
+            "forward_graph_capture_failures": self.cuda_graph.capture_failures,
+            "forward_graph_replay_failures": self.cuda_graph.replay_failures,
+            "forward_eager_fallbacks": self.cuda_graph.eager_fallbacks,
+            "forward_eager_tokens": self.cuda_graph.eager_tokens,
+            "forward_eager_rows": self.cuda_graph.eager_rows,
+            "forward_graph_runtime_mode_counts": dict(self.cuda_graph.runtime_mode_counts),
+            "forward_graph_shape_counts": dict(self.cuda_graph.shape_counts),
+            "forward_graph_unpadded_tokens": self.cuda_graph.unpadded_tokens,
+            "forward_graph_padded_tokens": self.cuda_graph.padded_tokens,
             "text_decode_token_relay_hits": self.text_relay.token_relay_hits,
             "text_decode_token_relay_misses": self.text_relay.token_relay_misses,
             "text_decode_position_relay_hits": self.text_relay.position_relay_hits,

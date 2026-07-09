@@ -17,6 +17,7 @@ from ..contracts.outputs import ForwardOutput, ForwardOutputBase
 from ..foundation.env import env_flag
 from ..foundation.errors import invalid_descriptor
 from ..foundation.profiling import profile_range
+from .forward import ForwardResult, ForwardRuntimeHandles
 from .forward_admission import ForwardAdmissionRouter
 
 __all__ = [
@@ -158,9 +159,11 @@ class ForwardStepExecutor:
             group_start = time.perf_counter_ns() if forward_stats is not None else 0
             stream_ctx = self.runner._forward_stream_context(fb)
             with torch.inference_mode(), use_forward_context(ctx), stream_ctx:
-                outputs = self.runner._dispatch_by_mode(
+                outputs = self._execute_unified_group(
                     fb,
                     group,
+                    results,
+                    forward_stats=forward_stats,
                     defer_text_cpu_results=defer_text_cpu_results,
                 )
             if forward_stats is not None:
@@ -172,13 +175,70 @@ class ForwardStepExecutor:
                 raise invalid_descriptor(
                     f"model returned {len(outputs)} outputs for {len(group)} ops"
                 )
-            group_results = [_to_seq_result(output) for output in outputs]
+            for idx, result in zip(indices, outputs):
+                results[idx] = result
+
+    def _execute_unified_group(
+        self,
+        fb: UniForwardBatch,
+        group: list[tuple[int, Mapping[str, Any]]],
+        results: list[dict[str, Any] | None],
+        *,
+        forward_stats: ForwardStats | None,
+        defer_text_cpu_results: bool,
+    ) -> list[Any]:
+        indices = [idx for idx, _ in group]
+
+        def normalize_output(output: Any) -> Any:
+            return _to_seq_result(output)
+
+        def postprocess_side_effects(group_results: list[Any]) -> None:
             staged_results = list(results)
             for idx, result in zip(indices, group_results):
                 staged_results[idx] = result
             self.runner._advance_state(fb, group_results)
             self.runner._stamp_conditioning_locators(fb, group, staged_results)
-            results[:] = staged_results
+            for row, idx in enumerate(indices):
+                group_results[row] = staged_results[idx]
+
+        runtime_handles = ForwardRuntimeHandles(
+            request_states=self.runner.request_states,
+            residency=self.runner.residency,
+            tensor_store=self.runner.tensor_store,
+            values={
+                "dispatch_batch": fb,
+                "output_normalizer": normalize_output,
+                "postprocess_side_effects": postprocess_side_effects,
+            },
+        )
+        plan = self.runner.forward_plan_builder.build(
+            group,
+            request_states=self.runner.request_states,
+            graph_policy=self.runner.forward_graph_policy,
+            runtime_handles=runtime_handles,
+        )
+        device = torch.device(str(getattr(self.runner.model, "device", "cpu") or "cpu"))
+        batch = self.runner.unified_forward_batch_builder.build(plan, device=device)
+
+        def run_runtime_forward(_batch: Any) -> ForwardResult:
+            del _batch
+            outputs = self.runner._dispatch_by_mode(
+                fb,
+                group,
+                defer_text_cpu_results=defer_text_cpu_results,
+            )
+            return ForwardResult(runtime_outputs=tuple(outputs))
+
+        result = self.runner.forward_executor.execute(
+            batch,
+            plan,
+            forward_fn=run_runtime_forward,
+        )
+        if forward_stats is not None and result.graph is not None:
+            forward_stats.cuda_graph_runtime_mode_counts[result.graph.program] = (
+                forward_stats.cuda_graph_runtime_mode_counts.get(result.graph.program, 0) + 1
+            )
+        return self.runner.forward_postprocessor.apply(plan, result)
 
 
 def _to_seq_result(output: ForwardOutput | Mapping[str, Any]) -> Any:
