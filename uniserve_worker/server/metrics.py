@@ -143,6 +143,21 @@ _FORWARD_METRICS: tuple[_MetricSpec, ...] = (
     _MetricSpec(
         "cuda_graph_runtime_mode_counts", "cuda_graph_runtime_mode_counts", is_map=True
     ),
+    _MetricSpec("forward_graph_captures", "forward_graph_captures", is_map=False),
+    _MetricSpec("forward_graph_replays", "forward_graph_replays", is_map=False),
+    _MetricSpec("forward_graph_misses", "forward_graph_misses", is_map=False),
+    _MetricSpec("forward_graph_fallbacks", "forward_graph_fallbacks", is_map=False),
+    _MetricSpec("forward_graph_capture_failures", "forward_graph_capture_failures", is_map=False),
+    _MetricSpec("forward_graph_replay_failures", "forward_graph_replay_failures", is_map=False),
+    _MetricSpec("forward_eager_fallbacks", "forward_eager_fallbacks", is_map=False),
+    _MetricSpec("forward_eager_tokens", "forward_eager_tokens", is_map=False),
+    _MetricSpec("forward_eager_rows", "forward_eager_rows", is_map=False),
+    _MetricSpec(
+        "forward_graph_runtime_mode_counts", "forward_graph_runtime_mode_counts", is_map=True
+    ),
+    _MetricSpec("forward_graph_shape_counts", "forward_graph_shape_counts", is_map=True),
+    _MetricSpec("forward_graph_unpadded_tokens", "forward_graph_unpadded_tokens", is_map=False),
+    _MetricSpec("forward_graph_padded_tokens", "forward_graph_padded_tokens", is_map=False),
     _MetricSpec("text_decode_token_relay_hits", "text_decode_token_relay_hits", is_map=False),
     _MetricSpec("text_decode_token_relay_misses", "text_decode_token_relay_misses", is_map=False),
     _MetricSpec("text_decode_position_relay_hits", "text_decode_position_relay_hits", is_map=False),
