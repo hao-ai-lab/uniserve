@@ -126,6 +126,31 @@ class _FakeOwner(TextImageDenoiseOps):
         return torch.zeros_like(latent)
 
 
+class _FakePagedCache:
+    pass
+
+
+class _SingleRowGraphOwner(TextImageDenoiseOps):
+    device = "cpu"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, bool, str]] = []
+        self.cache = _FakePagedCache()
+
+    def denoise_residual_cache_adapter(self):
+        return None
+
+    def _denoise_branch_inputs(self, img, branch):
+        return torch.zeros(3, 4), self.cache
+
+    def _predict_v_batched(self, rows, *, return_hidden=False, graph_mode="auto"):
+        self.calls.append((len(rows), bool(return_hidden), str(graph_mode)))
+        return torch.ones_like(rows[0].step.latent)
+
+    def predict_denoise_velocity(self, step, branch, *, return_hidden=False):  # pragma: no cover
+        raise AssertionError("single-row graph-required denoise must use the batched path")
+
+
 def _image_state() -> ImageState:
     dummy = torch.zeros(1)
     pool = SimpleNamespace(get=lambda handle: dummy, set=lambda handle, value: None)
@@ -217,3 +242,25 @@ def test_engine_disabled_without_policy(monkeypatch):
     owner.predict_text_image_velocity_batch([_step(img, embeds)], [["cond"]])
     assert owner.forward_calls == 2
     assert img.residual_cache is None
+
+
+def test_single_paged_denoise_row_uses_graph_required_batched_path(monkeypatch):
+    monkeypatch.setattr(denoise_mod, "PagedTextCache", _FakePagedCache)
+    monkeypatch.setattr(
+        denoise_mod,
+        "_RESIDUAL_CACHE_POLICY",
+        DenoiseResidualCachePolicy(enabled=False, threshold=0.5),
+    )
+    owner = _SingleRowGraphOwner()
+    img = _image_state()
+    embeds = torch.ones(1, 4, 8)
+
+    result = owner.predict_text_image_velocity_batch(
+        [_step(img, embeds)],
+        [["cond"]],
+        graph_mode="require",
+    )
+
+    assert result is not None
+    torch.testing.assert_close(result[0]["cond"], torch.ones(1, 4, 8))
+    assert owner.calls == [(1, False, "require")]

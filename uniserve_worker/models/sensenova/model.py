@@ -29,19 +29,23 @@ from ...contracts.resource_plan import (
     PerBranch,
     ResourcePlan,
 )
-from ...execution.deferred_text_result import (
-    DeferredDecodeBurstSeqResult,
-    DeferredTerminalDecodeBurstSeqResult,
-    DeferredTextSeqResult,
-)
 from ...execution.denoise_driver import (
     DenoiseDriver,
     TextImageDenoiseStep,
     text_image_branches,
 )
 from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
-from ...execution.denoise_step_graph import release_denoise_step_graphs
-from ...execution.forward_stream import (
+from ...execution.forward.deferred_text import (
+    DeferredDecodeBurstSeqResult,
+    DeferredTerminalDecodeBurstSeqResult,
+    DeferredTextSeqResult,
+)
+from ...execution.forward.graph.denoise_step import release_denoise_step_graphs
+from ...execution.forward.programs.packed_visible import (
+    run_packed_mixed_forward,
+    run_packed_visible_forward_result,
+)
+from ...execution.forward.stream import (
     ForwardPagedKVSegment,
     ForwardPagedKVView,
     ForwardStream,
@@ -59,7 +63,6 @@ from ...execution.interleaved_text_stepper import (
     TextCache,
 )
 from ...execution.model_base import UniModelBase
-from ...execution.packed_mixed_forward import run_packed_mixed_forward
 from ...execution.text_decode_relay import TextDecodeRelay
 from ...execution.text_driver import sample_logits_result
 from ...execution.tower_execution_session import TowerExecutionSession
@@ -1182,9 +1185,33 @@ class _SenseNovaAttention(nn.Module):
         cancel = getattr(past_key_values, "cancel_layer_update", None)
         if not callable(request_cache) or not callable(finish):
             return None
-        if not self.attn.can_run_paged_attention(q, None):
-            return None
         n_tokens = int(q.shape[2])
+        if not self.attn.can_run_paged_attention(q, None):
+            metadata = getattr(get_forward_context(), "attention_metadata", None)
+            metadata_cache = getattr(metadata, "cache", None)
+            if causal and metadata_cache is not None and getattr(past_key_values, "cache", None) is metadata_cache:
+                cache = request_cache(self.layer_idx, n_tokens)
+                try:
+                    batch, heads, q_len, head_dim = q.shape
+                    q_run = q.transpose(1, 2).reshape(batch * q_len, heads, head_dim).contiguous()
+                    k_run = k.transpose(1, 2).reshape(batch * q_len, k.shape[1], k.shape[3]).contiguous()
+                    v_run = v.transpose(1, 2).reshape(batch * q_len, v.shape[1], v.shape[3]).contiguous()
+                    out = self.attn(
+                        q_run,
+                        k_run,
+                        v_run,
+                        kv_cache=cache,
+                        update_cache=True,
+                        causal=True,
+                        scale=self.scaling,
+                    )
+                except Exception:
+                    if callable(cancel):
+                        cancel(self.layer_idx)
+                    raise
+                finish(self.layer_idx, n_tokens)
+                return out.view(batch, q_len, heads, head_dim).contiguous(), None
+            return None
         cache = request_cache(self.layer_idx, n_tokens)
         try:
             out = self.attn(
@@ -1255,11 +1282,19 @@ class _SenseNovaAttention(nn.Module):
         **kwargs: Any,
     ) -> tuple[torch.Tensor, None]:
         input_shape = hidden_states.shape[:-1]
+        causal_paged_update = bool(kwargs.pop("causal_paged_update", False))
         q, k, v = self._project_qkv(hidden_states, indexes, gen_branch=False, packed_rope=packed_rope)
         if past_key_values is not None:
             update_cache = kwargs.get("update_cache", True)
             if update_cache:
-                paged = self._attend_paged_update(q, k, v, past_key_values, attention_mask=attention_mask)
+                paged = self._attend_paged_update(
+                    q,
+                    k,
+                    v,
+                    past_key_values,
+                    attention_mask=attention_mask,
+                    causal=causal_paged_update,
+                )
                 if paged is not None:
                     out, weights = paged
                     return self.o_proj(out.reshape(*input_shape, -1).contiguous()), weights
@@ -2985,9 +3020,12 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         return self._text_driver().state(op)
 
     def run_text_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor]:
-        # Batching + one-token decode CUDA graph are both system-owned by the
-        # interleaved text driver; the model only supplies the neural forward.
+        # Batching and text CUDA graphs are system-owned by the interleaved text
+        # driver; the model only supplies the neural forward.
         return self._text_driver().run_text_logits_batch(ops)
+
+    def try_run_text_graph_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor] | None:
+        return self._text_driver().try_run_text_graph_logits_batch(ops)
 
     def run_text_logits(self, op: dict[str, Any]):
         return self._text_driver().run_text_logits(dict(op))
@@ -3315,8 +3353,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         del t, latent
         return self.predict_denoise_velocity(ctx, branch)
 
-    def predict_text_image_velocity_batch(self, steps, branches_by_step):
-        return TextImageDenoiseOps.predict_text_image_velocity_batch(self, steps, branches_by_step)
+    def predict_text_image_velocity_batch(self, steps, branches_by_step, *, graph_mode: str = "auto"):
+        return TextImageDenoiseOps.predict_text_image_velocity_batch(
+            self,
+            steps,
+            branches_by_step,
+            graph_mode=graph_mode,
+        )
 
     def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheAdapter | None:
         """Timestep-aware residual-reuse adapter (TeaCache) for SenseNova-U1.
@@ -3565,21 +3608,24 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             )
         )
 
-    def run_forward(
+    def _run_forward_adapter(
         self,
         batch: UniForwardBatch,
         *,
         request_states: Any,
         group: Any,
         defer_text_cpu_results: bool = False,
-    ) -> list[Any]:
+    ) -> Any:
         results: list[Any] = [None] * len(batch.ops)
         denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
         commit_rows: list[tuple[int, int, dict[str, Any]]] = []
+        has_burst_rows = False
         with profile_range("uniserve.sensenova.mixed_prepare_ops"):
             for row_index, op in enumerate(batch.ops):
                 mode = batch.op_modes[row_index]
                 req_id = int(op["req_id"])
+                if int(op.get("decode_token_count") or 1) > 1 or int(op.get("denoise_step_count") or 1) > 1:
+                    has_burst_rows = True
                 if mode is ForwardMode.DENOISE:
                     with profile_range("uniserve.sensenova.mixed_prepare_denoise"):
                         step = self.prepare_denoise(request_states.get(req_id), dict(op))
@@ -3597,6 +3643,16 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             residual_state = getattr(img, "residual_cache", None)
             if residual_state is not None:
                 residual_state.invalidate()
+        if not commit_rows and not has_burst_rows:
+            result = run_packed_visible_forward_result(
+                self,
+                batch,
+                request_states,
+                denoise_steps,
+                defer_text_cpu_results=defer_text_cpu_results,
+            )
+            if result is not None:
+                return result
         if run_packed_mixed_forward(
             self,
             batch,
@@ -3898,7 +3954,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             items.append((req_id, request_states.get(req_id), followup))
         if not items:
             return
-        outputs = DenoiseDriver().step_many(items, self)
+        outputs = DenoiseDriver().step_many(items, self, graph_mode="eager")
         for row_index, output in zip(row_indexes, outputs, strict=True):
             results[row_index] = output
 

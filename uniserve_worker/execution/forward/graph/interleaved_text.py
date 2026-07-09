@@ -38,26 +38,31 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
-from ..contracts.forward_context import get_forward_context
-from ..contracts.forward_mode import ForwardMode, mode_for_op
-from ..foundation.errors import invalid_descriptor
-from ..foundation.runtime_config import get_worker_config
-from ..runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
-from ..runtime.tensor_staging import TextTensorStager
-from .decode_cuda_graph import (
+from ....contracts.forward_context import TextAttentionMetadata, get_forward_context
+from ....contracts.forward_mode import ForwardMode, mode_for_op
+from ....foundation.errors import invalid_descriptor
+from ....foundation.runtime_config import get_worker_config
+from ....runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
+from ....runtime.tensor_staging import TextTensorStager
+from ...interleaved_text_stepper import hydrate_cached_prefix_from_op, resolve_op_token_ids
+from .text_decode import (
     DecodeCudaGraphRunner,
     TextDecodeGraphHostInputs,
     TextDecodeGraphState,
     resolve_paged_decode_graph_prepare,
 )
-from .interleaved_text_stepper import hydrate_cached_prefix_from_op
+from .text_prefill import (
+    PrefillCudaGraphRunner,
+    TextInitialPrefillGraphState,
+    resolve_paged_prefill_graph_prepare,
+)
 
 if TYPE_CHECKING:
-    from .interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
+    from ...interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["InterleavedTextDecodeGraphRunner"]
+__all__ = ["InterleavedTextDecodeGraphRunner", "InterleavedTextPrefillGraphRunner"]
 
 
 def _padding_block_id(owner: Any, pool: Any) -> int | None:
@@ -89,6 +94,12 @@ def _owner_max_context_len(owner: Any, pool: Any) -> int:
         if parsed > 0:
             return parsed
     return max(0, int(getattr(pool, "num_blocks", 0) or 0) * int(getattr(pool, "block_size", 0) or 0))
+
+
+def _blocks_for_tokens(tokens: int, block_size: int) -> int:
+    tokens = max(0, int(tokens))
+    block_size = max(1, int(block_size))
+    return (tokens + block_size - 1) // block_size
 
 
 class _InterleavedDecodeGraphPast:
@@ -148,6 +159,240 @@ class _Row:
     base_len: int
     block_ids: list[int] = field(default_factory=list)
     token_tensor: torch.Tensor | None = None
+
+
+class _InterleavedPrefillGraphPast:
+    """Native-language-model ``past_key_values`` bound to a prefill graph cache."""
+
+    supports_batched_paged = True
+
+    def __init__(self, cache: BatchedPagedRequestCache) -> None:
+        self.cache = cache
+        self.pool = cache.pool
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        del layer_idx
+        return int(self.cache.base_len)
+
+    def request_cache_for_update(self, layer_idx: int, n_tokens: int) -> BatchedPagedRequestCache:
+        if int(n_tokens) <= 0:
+            raise invalid_descriptor("interleaved prefill graph requires positive token count")
+        return self.cache
+
+    def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
+        return None
+
+    def cancel_layer_update(self, layer_idx: int) -> None:
+        self.cache.invalidate_append_plan()
+
+
+@dataclass
+class _PrefillSidecar:
+    """Per-graph-state stable adapter for interleaved prefill replay."""
+
+    past: _InterleavedPrefillGraphPast
+
+
+@dataclass
+class _PrefillRow:
+    text_cache: "TextCache"
+    past_cache: PagedTextCache
+    tokens: list[int]
+    base_len: int
+    raw_len: int
+    block_ids: list[int]
+
+
+class InterleavedTextPrefillGraphRunner:
+    """Route interleaved text prefill through the shared prefill graph."""
+
+    def __init__(self) -> None:
+        runtime = get_worker_config()
+        self._prefill = PrefillCudaGraphRunner(
+            name="interleaved_text",
+            default_enabled=runtime.prefill_cuda_graph,
+            default_warmup=False,
+            default_warmup_token_buckets=runtime.prefill_cuda_graph_warmup_tokens,
+            default_warmup_batch_sizes=(1,),
+            metric_prefix="text_",
+            logger=logger,
+        )
+        self._sidecars: dict[int, _PrefillSidecar] = {}
+        self._graphed_steps = 0
+
+    def maybe_run_batch(
+        self,
+        driver: "InterleavedTextCacheDriver",
+        ops: Sequence[Mapping[str, Any]],
+    ) -> list[torch.Tensor] | None:
+        """Capture/replay a single interleaved text extend row, or return ``None``."""
+
+        prep = self._prepare(driver, ops)
+        if prep is None:
+            return None
+        row, inputs, prepare_backend = prep
+        logits = self._prefill.maybe_run(
+            kv_pool=row.past_cache.pool,
+            num_blocks=int(row.past_cache.pool.num_blocks),
+            num_tokens=int(inputs["num_tokens"]),
+            max_kv_tokens=int(inputs["max_kv_tokens"]),
+            batch_size=1,
+            input_ids=inputs["input_ids"],
+            positions=inputs["positions"],
+            attention_metadata=inputs["metadata"],
+            last_token_indices=inputs["last_token_indices"],
+            raw_num_tokens=row.raw_len,
+            ctx=get_forward_context(),
+            forward_fn=lambda state: self._forward(driver, state),
+            prepare_backend=prepare_backend,
+        )
+        if logits is None:
+            return None
+        self._graphed_steps += 1
+        if self._graphed_steps == 1:
+            logger.info(
+                "interleaved text prefill CUDA graph active: captured bucket(s)=%s (shared PrefillCudaGraphRunner)",
+                sorted(self._prefill.states),
+            )
+        return self._commit(row, logits)
+
+    def _prepare(
+        self,
+        driver: "InterleavedTextCacheDriver",
+        ops: Sequence[Mapping[str, Any]],
+    ) -> tuple[_PrefillRow, dict[str, Any], Any] | None:
+        if not self._prefill.enabled() or not torch.cuda.is_available():
+            return None
+        if len(ops) != 1:
+            return None
+        op = dict(ops[0])
+        if mode_for_op(str(op.get("kind"))) is not ForwardMode.EXTEND:
+            return None
+        tokens = resolve_op_token_ids(op)
+        if not tokens:
+            return None
+        owner = driver.owner
+        pool = getattr(owner, "kv_pool", None)
+        model = getattr(owner, "model", None)
+        if pool is None or model is None:
+            return None
+        device = torch.device(str(getattr(owner, "device", "cpu") or "cpu"))
+        if device.type != "cuda":
+            return None
+        if getattr(pool, "is_quantized", False) or not bool(
+            getattr(pool, "supports_paged_attention_storage", True)
+        ):
+            return None
+        prepare_backend = resolve_paged_prefill_graph_prepare(
+            owner=owner,
+            kv_pool=pool,
+            attention_backend_name=getattr(get_forward_context(), "attention_backend_name", None),
+        )
+        if prepare_backend is None:
+            return None
+
+        cache = driver.state(op).cond
+        if cache.past is not None and getattr(cache.past, "pool", None) is not pool:
+            return None
+        driver.extend_cache_blocks(cache, op)
+        driver.ensure_host_cache(cache)
+        if cache.past is None:
+            return None
+        hydrate_cached_prefix_from_op(cache, op)
+        base_len = int(cache.past.length)
+        raw_len = len(tokens)
+        raw_end = base_len + raw_len
+        cache.past.ensure_capacity(raw_end)
+        num_tokens = self._prefill.bucket_num_tokens(raw_len)
+        if _blocks_for_tokens(base_len + num_tokens, int(pool.block_size)) > _blocks_for_tokens(
+            raw_end, int(pool.block_size)
+        ):
+            return None
+        max_kv_tokens = self._prefill.bucket_kv_tokens(
+            base_len + num_tokens,
+            max_context_len=_owner_max_context_len(owner, pool),
+        )
+        row = _PrefillRow(
+            text_cache=cache,
+            past_cache=cache.past,
+            tokens=list(tokens),
+            base_len=base_len,
+            raw_len=raw_len,
+            block_ids=list(cache.past.block_ids),
+        )
+        graph_cache = BatchedPagedRequestCache(pool, [row.block_ids], [base_len])
+        input_ids = torch.tensor(row.tokens, dtype=torch.long, device=device)
+        positions = torch.arange(base_len, base_len + raw_len, dtype=torch.long, device=device)
+        query_lens = torch.tensor([raw_len], dtype=torch.int32, device=device)
+        cache_seqlens = graph_cache.cache_seqlens(device=device)
+        kv_seqlens = torch.tensor([raw_end], dtype=torch.int32, device=device)
+        cu_seqlens_q = torch.tensor([0, raw_len], dtype=torch.int32, device=device)
+        cu_seqlens_k = torch.tensor([0, raw_end], dtype=torch.int32, device=device)
+        inputs = {
+            "num_tokens": num_tokens,
+            "max_kv_tokens": max_kv_tokens,
+            "input_ids": input_ids,
+            "positions": positions,
+            "last_token_indices": torch.tensor([raw_len - 1], dtype=torch.long, device=device),
+            "metadata": TextAttentionMetadata(
+                cache=graph_cache,
+                block_table=graph_cache.block_table(device=device),
+                cache_seqlens=cache_seqlens,
+                cache_seqlens_cpu=(base_len,),
+                query_lens=query_lens,
+                query_lens_cpu=(raw_len,),
+                kv_seqlens=kv_seqlens,
+                kv_seqlens_cpu=(raw_end,),
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=raw_len,
+                max_seqlen_k=raw_end,
+                max_context_len=_owner_max_context_len(owner, pool),
+                mode=ForwardMode.EXTEND,
+            ),
+        }
+        return row, inputs, prepare_backend
+
+    def _sidecar_for(self, state: TextInitialPrefillGraphState) -> _PrefillSidecar:
+        sidecar = self._sidecars.get(id(state))
+        if sidecar is None:
+            sidecar = _PrefillSidecar(past=_InterleavedPrefillGraphPast(state.cache))
+            self._sidecars[id(state)] = sidecar
+        return sidecar
+
+    def _forward(
+        self,
+        driver: "InterleavedTextCacheDriver",
+        state: TextInitialPrefillGraphState,
+    ) -> torch.Tensor:
+        sidecar = self._sidecar_for(state)
+        outputs = driver.owner.interleaved_text_forward(
+            input_ids=state.input_ids.reshape(1, int(state.num_tokens)),
+            cache_position=state.positions,
+            past_key_values=sidecar.past,
+            use_cache=True,
+            text_only_rope=True,
+            causal_paged_update=True,
+        )
+        logits = outputs.logits
+        if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
+            raise invalid_descriptor("interleaved prefill graph must return batched logits")
+        batch = int(state.batch_size)
+        row_ids = torch.arange(batch, dtype=torch.long, device=logits.device)
+        indices = state.last_token_indices[:batch].to(device=logits.device, dtype=torch.long)
+        return logits.index_select(0, row_ids).gather(
+            1,
+            indices.view(batch, 1, 1).expand(batch, 1, int(logits.shape[-1])),
+        ).squeeze(1)
+
+    @staticmethod
+    def _commit(row: _PrefillRow, logits: torch.Tensor) -> list[torch.Tensor]:
+        row_logits = logits[:1]
+        row.past_cache.length = row.base_len + row.raw_len
+        row.text_cache.t_index = row.base_len + row.raw_len - 1
+        row.text_cache.last_token_id = int(row.tokens[-1])
+        row.text_cache.last_logits = row_logits.unsqueeze(1)
+        return [row.text_cache.last_logits[:, -1, :]]
 
 
 class InterleavedTextDecodeGraphRunner:

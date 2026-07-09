@@ -9,6 +9,7 @@ from .programs import (
     DenoiseStepGraphProgram,
     ForwardGraphProgram,
     GraphEligibility,
+    ModelOwnedTextGraphProgram,
     PackedVisibleGraphProgram,
     PrefillGraphProgram,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "ForwardGraphSlot",
     "ForwardGraphStats",
     "GraphEligibility",
+    "ModelOwnedTextGraphProgram",
     "PackedVisibleGraphProgram",
     "PaddingPolicy",
     "PrefillGraphProgram",

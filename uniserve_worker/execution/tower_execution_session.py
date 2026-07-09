@@ -202,7 +202,7 @@ class TowerExecutionSession:
         raise RuntimeError("tower session owner does not expose cache staging")
 
     def run_mixed_forward(self, *args: Any, **kwargs: Any) -> Any:
-        run = getattr(self.owner, "run_forward", None)
+        run = getattr(self.owner, "_run_forward_adapter", None)
         if callable(run):
             return run(*args, **kwargs)
         raise RuntimeError("tower session owner does not expose mixed forward")

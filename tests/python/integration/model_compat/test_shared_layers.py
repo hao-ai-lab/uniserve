@@ -1692,7 +1692,7 @@ def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
 
     from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardPagedKVView,
         ForwardStreamBuilder,
@@ -1845,7 +1845,7 @@ def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
 def test_sensenova_packed_visible_all_gen_uses_single_modality_qkv(monkeypatch):
     from transformers import Qwen3Config
 
-    from uniserve_worker.execution.forward_stream import ForwardStream
+    from uniserve_worker.execution.forward.stream import ForwardStream
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
     cfg = Qwen3Config(
@@ -1928,7 +1928,7 @@ def test_sensenova_packed_visible_all_gen_uses_single_modality_qkv(monkeypatch):
 
 def test_sensenova_packed_visible_fully_visible_uses_visible_end_backend():
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardPagedKVView,
         ForwardStreamBuilder,
@@ -2045,7 +2045,7 @@ def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
 
     monkeypatch.setattr(wrapper, "run_text_logits", split_fallback_called)
     with pytest.raises(WorkerError, match="split-mode fallback is disabled"):
-        wrapper.run_forward(
+        wrapper._run_forward_adapter(
             batch,
             request_states=RequestStates(),
             group=list(enumerate(batch.ops)),
@@ -2053,7 +2053,7 @@ def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
 
 
 def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
-    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
 
     relay_tensor = torch.tensor([7], dtype=torch.long)
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=relay_tensor))
@@ -2081,7 +2081,7 @@ def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
 
 
 def test_sensenova_forward_text_input_ids_requires_last_sampled_relay():
-    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
 
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=None))
 
@@ -2106,7 +2106,7 @@ def test_sensenova_forward_text_input_ids_requires_last_sampled_relay():
 
 
 def test_sensenova_forward_sampling_updates_decode_relay():
-    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
     from uniserve_worker.nn.sampler import apply_sampling_batched_with_device_tokens
 
     state = SimpleNamespace(
@@ -2155,7 +2155,7 @@ def test_sensenova_forward_sampling_updates_decode_relay():
 
 def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.execution import packed_mixed_forward
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
 
     batch = UniForwardBatch.from_ops(
         [
@@ -2344,9 +2344,9 @@ def test_sensenova_text_batch_delegates_to_scalar_text_stepper(monkeypatch):
         scalar_calls.append(dict(op))
         return torch.full((1, 8), float(len(scalar_calls)))
 
-    # Batching + the one-token decode graph now live in the system text driver;
-    # the model's run_text_logits_batch delegates to it, and the driver falls back
-    # to its per-op scalar stepper for ineligible batches (here: multi-token prefill).
+    # Batching and text graphs live in the system text driver; the model's
+    # run_text_logits_batch delegates to it, and the driver falls back to its
+    # per-op scalar stepper when the graph adapters report a miss.
     driver = wrapper._text_driver()
     monkeypatch.setattr(driver, "_run_text_logits_one", scalar_fallback)
     logits = wrapper.run_text_logits_batch(
@@ -2374,6 +2374,41 @@ def test_sensenova_text_batch_delegates_to_scalar_text_stepper(monkeypatch):
         }
     ]
     assert language.model.calls == []
+
+
+def test_sensenova_text_prefill_batch_uses_graph_result_before_scalar(monkeypatch):
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
+    )
+    driver = wrapper._text_driver()
+    calls = []
+
+    class FakePrefillGraph:
+        def maybe_run_batch(self, graph_driver, ops):
+            calls.append((graph_driver, tuple(dict(op) for op in ops)))
+            return [torch.tensor([[4.0, 5.0]])]
+
+    monkeypatch.setattr(driver, "_prefill_graph", lambda: FakePrefillGraph())
+    monkeypatch.setattr(
+        driver,
+        "_run_text_logits_one",
+        lambda _op: pytest.fail("graph result should bypass scalar text execution"),
+    )
+
+    op = {
+        "req_id": 7,
+        "kind": "prefill_und",
+        "token_ids": [3, 4],
+        "pos_range": [0, 2],
+        "new_block_ids": [0],
+    }
+    logits = wrapper.run_text_logits_batch([op])
+
+    assert len(logits) == 1
+    torch.testing.assert_close(logits[0], torch.tensor([[4.0, 5.0]]))
+    assert calls == [(driver, (op,))]
 
 
 def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatch):
@@ -2433,7 +2468,7 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
 
 
 def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
-    from uniserve_worker.execution.forward_stream import ForwardStreamBuilder
+    from uniserve_worker.execution.forward.stream import ForwardStreamBuilder
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
     wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
@@ -2497,7 +2532,7 @@ def test_sensenova_duplicate_new_request_preserves_live_interleaved_cache():
 
 
 def test_packed_mixed_syncs_host_cache_blocks_from_runner_state():
-    from uniserve_worker.execution.packed_mixed_forward import _sync_host_cache_blocks
+    from uniserve_worker.execution.forward.programs.packed_visible import _sync_host_cache_blocks
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -2554,11 +2589,11 @@ def test_packed_mixed_hydrates_cached_prefix_length_from_pos_range():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs.packed_visible import run_packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
-    from uniserve_worker.execution.packed_mixed_forward import run_packed_mixed_forward
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -2765,9 +2800,9 @@ def test_packed_mixed_hydrates_cached_prefix_length_from_pos_range():
 def test_sensenova_packed_mixed_sorted_segments_scatter_to_original_rows(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution import packed_mixed_forward
     from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
@@ -2988,9 +3023,9 @@ def test_sensenova_packed_mixed_sorted_segments_scatter_to_original_rows(monkeyp
 def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution import packed_mixed_forward
     from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
@@ -3295,11 +3330,11 @@ def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
 def test_sensenova_packed_mixed_runs_text_only_forward_batch():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs.packed_visible import run_packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
-    from uniserve_worker.execution.packed_mixed_forward import run_packed_mixed_forward
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -3452,8 +3487,8 @@ def test_sensenova_packed_mixed_runs_text_only_forward_batch():
 def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution import packed_mixed_forward
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
@@ -3596,8 +3631,8 @@ def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
 def test_sensenova_packed_mixed_defers_text_cpu_result_when_not_burst(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution import packed_mixed_forward
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
@@ -3753,7 +3788,7 @@ def test_sensenova_packed_mixed_defers_text_cpu_result_when_not_burst(monkeypatc
 
 def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followup():
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.execution.deferred_text_result import DeferredTextSeqResult
+    from uniserve_worker.execution.forward.deferred_text import DeferredTextSeqResult
     from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -3833,7 +3868,7 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
 
 def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_finalizing():
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.execution.deferred_text_result import DeferredTextSeqResult
+    from uniserve_worker.execution.forward.deferred_text import DeferredTextSeqResult
     from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -3927,7 +3962,7 @@ def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_fina
 
 def test_sensenova_packed_decode_burst_defers_final_pending_token():
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.execution.deferred_text_result import (
+    from uniserve_worker.execution.forward.deferred_text import (
         DeferredDecodeBurstSeqResult,
         DeferredTextSeqResult,
     )
@@ -4023,7 +4058,7 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
 
 def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.execution.deferred_text_result import (
+    from uniserve_worker.execution.forward.deferred_text import (
         DeferredTerminalDecodeBurstSeqResult,
         DeferredTextSeqResult,
     )
@@ -4225,7 +4260,7 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
     )
     owner = Owner()
 
-    results = sensenova_u1.SenseNovaU1ForUnifiedGeneration.run_forward(
+    results = sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_forward_adapter(
         owner,
         batch,
         request_states=states,
@@ -4240,15 +4275,44 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
     assert "logits" not in results[1]
 
 
+def test_sensenova_text_image_batch_predictor_forwards_graph_mode(monkeypatch):
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+
+    calls: list[tuple[object, object, str]] = []
+
+    def fake_predict(owner, steps, branches_by_step, *, graph_mode="auto"):
+        calls.append((owner, steps, branches_by_step, graph_mode))
+        return [{"cond": torch.tensor([1.0])}]
+
+    monkeypatch.setattr(
+        sensenova_u1.TextImageDenoiseOps,
+        "predict_text_image_velocity_batch",
+        fake_predict,
+    )
+    owner = object()
+    steps = [object()]
+    branches = [["cond"]]
+
+    result = sensenova_u1.SenseNovaU1ForUnifiedGeneration.predict_text_image_velocity_batch(
+        owner,
+        steps,
+        branches,
+        graph_mode="require",
+    )
+
+    torch.testing.assert_close(result[0]["cond"], torch.tensor([1.0]))
+    assert calls == [(owner, steps, branches, "require")]
+
+
 def test_sensenova_packed_mixed_reserves_transient_denoise_cache_capacity():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs.packed_visible import run_packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
-    from uniserve_worker.execution.packed_mixed_forward import run_packed_mixed_forward
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
 
@@ -4382,9 +4446,9 @@ def test_sensenova_packed_mixed_reserves_transient_denoise_cache_capacity():
 def test_sensenova_packed_mixed_caches_denoise_cfg_plan_before_decoder(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution import packed_mixed_forward
     from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-    from uniserve_worker.execution.forward_stream import (
+    from uniserve_worker.execution.forward.programs import packed_visible as packed_mixed_forward
+    from uniserve_worker.execution.forward.stream import (
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )

@@ -10,6 +10,7 @@ from ..contracts.forward_mode import ForwardMode, mode_for_op
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..contracts.outputs import EncodeOutput
 from ..foundation.errors import invalid_descriptor
+from .forward.result import ForwardResult
 
 __all__ = [
     'EncodeDriver',
@@ -29,6 +30,21 @@ class EncodeDriver:
         if len(outputs) != len(ops):
             raise invalid_descriptor(f"model returned {len(outputs)} encode outputs for {len(ops)} ops")
         return [_coerce_encode_output(output) for output in outputs]
+
+    @torch.inference_mode()
+    def forward_result(
+        self,
+        fb: UniForwardBatch,
+        model: Any,
+        *,
+        row_indices: tuple[int, ...] | list[int] | None = None,
+    ) -> ForwardResult:
+        ops = fb.as_encode().ops
+        rows = tuple(range(len(ops))) if row_indices is None else tuple(int(row) for row in row_indices)
+        if len(rows) != len(ops):
+            raise invalid_descriptor("encode row_indices must align with encode ops")
+        outputs = {row: self._run_one(model, op) for row, op in zip(rows, ops, strict=True)}
+        return ForwardResult(encode_outputs=outputs)
 
     def _run_one(self, model: Any, op: Mapping[str, Any]) -> Any:
         kind = str(op.get("kind"))

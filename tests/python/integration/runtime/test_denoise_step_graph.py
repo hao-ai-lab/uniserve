@@ -1,6 +1,6 @@
 """Denoise-step CUDA graph capture/replay on the real transient paged-varlen path.
 
-Covers the observable contract of ``uniserve_worker.execution.denoise_step_graph``:
+Covers the observable contract of ``uniserve_worker.execution.forward.graph.denoise_step``:
 
 * replay is bitwise identical to the eager ``_predict_v_batched``-shaped forward
   on the *real* transient attention path (RadixAttention -> transient paged
@@ -28,7 +28,7 @@ import torch
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.execution import paged_denoise as paged_denoise_mod
-from uniserve_worker.execution.denoise_step_graph import (
+from uniserve_worker.execution.forward.graph.denoise_step import (
     DENOISE_STEP_GRAPH_ENV,
     DenoiseStepGraphRunner,
     maybe_run_denoise_step_graph,

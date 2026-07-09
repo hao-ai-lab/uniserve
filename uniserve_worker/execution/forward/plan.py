@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum, StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CacheSpanPlan",
+    "ForwardAdmissionDecision",
+    "ForwardAdmissionRouter",
     "ForwardModality",
     "ForwardOutputKind",
     "ForwardOutputSlot",
@@ -28,12 +30,70 @@ __all__ = [
     "ForwardSegmentPlan",
     "ForwardShapeSummary",
     "KvWritePolicy",
+    "Route",
     "TextTokenSpanPlan",
 ]
 
 _TEXT_MODES = frozenset(
     {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
 )
+
+
+class Route(str, Enum):
+    """Planning route for a resource-admitted worker op group."""
+
+    PER_MODE = "per_mode"
+    FORWARD = "forward"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True)
+class ForwardAdmissionDecision:
+    route: Route
+    reason: str
+    modes: tuple[ForwardMode, ...]
+
+    @property
+    def use_forward(self) -> bool:
+        return self.route is Route.FORWARD
+
+
+@dataclass(frozen=True)
+class ForwardAdmissionRouter:
+    @classmethod
+    def from_runtime_config(cls) -> "ForwardAdmissionRouter":
+        return cls()
+
+    def decide(self, ops: Sequence[Mapping[str, object]]) -> ForwardAdmissionDecision:
+        modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
+        if not ops:
+            return ForwardAdmissionDecision(Route.PER_MODE, "empty batch", modes)
+        text_modes = {ForwardMode.EXTEND, ForwardMode.DECODE}
+        if set(modes).issubset(text_modes) and all(mode in modes for mode in text_modes):
+            if any(_has_values(op.get("spec_token_ids")) for op in ops):
+                return ForwardAdmissionDecision(
+                    Route.PER_MODE,
+                    "text mixed forward does not route speculative rows",
+                    modes,
+                )
+            return ForwardAdmissionDecision(
+                Route.FORWARD, "text extend+decode mixed forward", modes
+            )
+        has_text = any(mode in text_modes for mode in modes)
+        gen_modes = {ForwardMode.DENOISE, ForwardMode.COMMIT}
+        has_gen = any(mode in gen_modes for mode in modes)
+        if has_text and has_gen:
+            return ForwardAdmissionDecision(Route.FORWARD, "und/gen mixed forward", modes)
+        supported = {ForwardMode.EXTEND, ForwardMode.DECODE, *gen_modes}
+        if any(mode not in supported for mode in modes):
+            return ForwardAdmissionDecision(
+                Route.PER_MODE,
+                "mixed forward supports only text and gen ops",
+                modes,
+            )
+        return ForwardAdmissionDecision(Route.PER_MODE, "requires concurrent und and gen ops", modes)
 
 
 class ForwardModality(StrEnum):
@@ -617,3 +677,12 @@ def _branch_name(index: int, count: int) -> str:
     if index == 0:
         return "cond"
     return f"branch_{index}"
+
+
+def _has_values(raw: object) -> bool:
+    if raw is None:
+        return False
+    try:
+        return len(raw) > 0  # type: ignore[arg-type]
+    except TypeError:
+        return bool(raw)

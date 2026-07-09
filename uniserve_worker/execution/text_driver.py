@@ -1,18 +1,15 @@
-"""System text execution driver.
+"""System text neural execution and legacy text step support.
 
-The driver *owns* the text forward end to end (SGLang's ``ModelRunner`` role,
-minus the god object): it builds the GPU ``ForwardBatch`` through the
-``ForwardBatchBuilder`` (staging + system-owned KV residency + the attention
-plan), decides batched-paged vs per-op-dense via the ``TextBackendGate``,
-publishes the ``ForwardContext`` (backend + plan + pool), runs the thin
-``model.forward(input_ids, positions, forward_batch)``, advances the KV length,
-and samples. The model contributes only the network forward; pools, metadata,
-graphs, KV-length, and sampling are all system-side here.
+``forward_logits`` builds the system-owned text ``ForwardBatch``, selects the
+attention path, runs the thin model neural forward, and returns logits for the
+unified forward postprocessor. ``step`` remains the full text step entry point
+for speculative verification and decode-burst paths that still need their
+specialized control loops.
 """
 from __future__ import annotations
 
 import base64
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
@@ -35,7 +32,8 @@ from ..nn.sampler import (
 )
 from ..runtime.request_state import RequestState, RequestStateTable
 from .decode_burst import DecodeBurstExecutor
-from .deferred_text_result import DeferredTextSeqResult
+from .forward.deferred_text import DeferredTextSeqResult
+from .forward.result import ForwardResult
 from .text_decode_relay import TextDecodeRelay
 
 if TYPE_CHECKING:
@@ -49,6 +47,7 @@ __all__ = [
     'DeferredTextSeqResult',
     'sample_logits_result',
     'text_input_id_replacements_from_relays',
+    'TextForwardLogits',
     'TextDriver',
 ]
 
@@ -59,6 +58,20 @@ _KV_LANE = "text"
 # that embeds the wire token instead of consuming the relay fails loudly.
 _RELAY_PLACEHOLDER_TOKEN_ID = -1
 _DECODE_RELAY = TextDecodeRelay()
+_GRAPH_RUNNER_UNSET = object()
+
+
+class _DecodeBurstGraphMiss(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class TextForwardLogits:
+    """Neural text forward result before sampling or request-state mutation."""
+
+    logits: torch.Tensor
+    req_ids: tuple[int, ...]
+    cuda_ready_start_event: torch.cuda.Event | None = None
 
 
 def text_input_id_replacements_from_relays(
@@ -190,6 +203,142 @@ class TextDriver:
             tensor_store=tensor_store,
         )
 
+    def forward_logits(
+        self,
+        fb: "UniForwardBatch",
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        defer_cpu_results: bool = False,
+        defer_sampling: bool = False,
+    ) -> TextForwardLogits | None:
+        """Run text neural execution and leave postprocessing to the forward stack."""
+
+        text = fb.as_text(allow_mixed_text=fb.mode == ForwardMode.MIXED)
+        ops = list(text.ops)
+        if any(text.spec_token_ids):
+            return None
+        if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
+            return None
+        stats = get_forward_context().stats
+        cuda_ready_start_event = _record_cuda_ready_start_event(
+            self.kv_pool,
+            stats=stats,
+            defer_cpu_results=defer_cpu_results,
+        )
+        with profile_range("uniserve.text.forward"):
+            logits_batch, req_ids = self._forward_with_optional_padding_reorder(
+                text,
+                ops,
+                request_states,
+                model,
+                store_position_relays=False,
+            )
+        return TextForwardLogits(
+            logits=logits_batch,
+            req_ids=tuple(int(req_id) for req_id in req_ids),
+            cuda_ready_start_event=cuda_ready_start_event,
+        )
+
+    def forward_logits_graph(
+        self,
+        fb: "UniForwardBatch",
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        graph_runner: Any,
+        defer_cpu_results: bool = False,
+        defer_sampling: bool = False,
+    ) -> TextForwardLogits | None:
+        """Run text neural execution only when a CUDA graph handles the batch."""
+
+        if graph_runner is None and self.builder is not None:
+            return None
+        text = fb.as_text(allow_mixed_text=fb.mode == ForwardMode.MIXED)
+        ops = list(text.ops)
+        if any(text.spec_token_ids):
+            return None
+        if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
+            return None
+        stats = get_forward_context().stats
+        cuda_ready_start_event = _record_cuda_ready_start_event(
+            self.kv_pool,
+            stats=stats,
+            defer_cpu_results=defer_cpu_results,
+        )
+        with profile_range("uniserve.text.forward_graph"):
+            if graph_runner is None:
+                graph_result = self._forward(
+                    model,
+                    text,
+                    request_states,
+                    store_position_relays=False,
+                    require_graph=True,
+                )
+            else:
+                graph_result = self._forward_graph_with_optional_padding_reorder(
+                    text,
+                    ops,
+                    request_states,
+                    model,
+                    graph_runner=graph_runner,
+                    store_position_relays=False,
+                )
+        if graph_result is None:
+            return None
+        logits_batch, req_ids = graph_result
+        return TextForwardLogits(
+            logits=logits_batch,
+            req_ids=tuple(int(req_id) for req_id in req_ids),
+            cuda_ready_start_event=cuda_ready_start_event,
+        )
+
+    def forward_graph_result(
+        self,
+        fb: "UniForwardBatch",
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        graph_runner: Any,
+        defer_cpu_results: bool = False,
+        defer_sampling: bool = False,
+    ) -> ForwardResult | None:
+        """Run a text batch only when graph-backed execution can cover it."""
+
+        text = fb.as_text(allow_mixed_text=fb.mode == ForwardMode.MIXED)
+        ops = list(text.ops)
+        if any(text.spec_token_ids):
+            return None
+        if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
+            outputs = self._decode_burst_graph_many(
+                ops,
+                request_states,
+                model,
+                graph_runner=graph_runner,
+                defer_cpu_results=defer_cpu_results,
+            )
+            if outputs is None:
+                return None
+            return ForwardResult(runtime_outputs=tuple(outputs))
+        text_result = self.forward_logits_graph(
+            fb,
+            request_states,
+            model,
+            graph_runner=graph_runner,
+            defer_cpu_results=defer_cpu_results,
+            defer_sampling=defer_sampling,
+        )
+        if text_result is None:
+            return None
+        expected_req_ids = tuple(int(op["req_id"]) for op in ops)
+        req_ids = tuple(int(req_id) for req_id in text_result.req_ids)
+        if req_ids != expected_req_ids:
+            raise invalid_descriptor("text graph result req_ids must align with forward ops")
+        return ForwardResult(
+            text_logits=text_result.logits,
+            text_cuda_ready_start_event=text_result.cuda_ready_start_event,
+        )
+
     def _step_once(
         self,
         text: "TextBatch",
@@ -256,13 +405,103 @@ class TextDriver:
     ) -> list[dict[str, Any]]:
         return DecodeBurstExecutor(
             self._step_once,
-            relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
-        ).run(
-            list(first_ops),
-            request_states,
-            model,
+                relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
+            ).run(
+                list(first_ops),
+                request_states,
+                model,
+                defer_cpu_results=defer_cpu_results,
+            )
+
+    def _decode_burst_graph_many(
+        self,
+        first_ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        graph_runner: Any,
+        defer_cpu_results: bool = False,
+    ) -> list[dict[str, Any]] | None:
+        def step_once_graph(
+            text: "TextBatch",
+            ops: list[Mapping[str, Any]],
+            request_states: RequestStateTable,
+            model: Any,
+            *,
+            defer_cpu_results: bool = False,
+            defer_sampling: bool = False,
+            tensor_store: Any | None = None,
+        ) -> list[Any]:
+            del tensor_store
+            outputs = self._step_once_graph(
+                text,
+                ops,
+                request_states,
+                model,
+                graph_runner=graph_runner,
+                defer_cpu_results=defer_cpu_results,
+                defer_sampling=defer_sampling,
+            )
+            if outputs is None:
+                raise _DecodeBurstGraphMiss
+            return outputs
+
+        try:
+            return DecodeBurstExecutor(
+                step_once_graph,
+                relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
+            ).run(
+                list(first_ops),
+                request_states,
+                model,
+                defer_cpu_results=defer_cpu_results,
+            )
+        except _DecodeBurstGraphMiss:
+            return None
+
+    def _step_once_graph(
+        self,
+        text: "TextBatch",
+        ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        graph_runner: Any,
+        defer_cpu_results: bool = False,
+        defer_sampling: bool = False,
+    ) -> list[Any] | None:
+        stats = get_forward_context().stats
+        cuda_ready_start_event = _record_cuda_ready_start_event(
+            self.kv_pool,
+            stats=stats,
             defer_cpu_results=defer_cpu_results,
         )
+        with profile_range("uniserve.text.forward_graph"):
+            graph_result = self._forward(
+                model,
+                text,
+                request_states,
+                graph_runner=graph_runner,
+                require_graph=True,
+            )
+        if graph_result is None:
+            return None
+        logits_batch, req_ids = graph_result
+        self._advance_kv_lengths(text, request_states)
+        if defer_sampling:
+            return None
+        start = component_timer_start(stats)
+        with profile_range("uniserve.text.sample"):
+            return self._sample_logits_batch(
+                ops,
+                req_ids,
+                logits_batch,
+                request_states,
+                stats,
+                start,
+                defer_cpu_results=defer_cpu_results,
+                cuda_ready_start_event=cuda_ready_start_event,
+            )
 
     # ---- forward ---------------------------------------------------------
 
@@ -271,13 +510,19 @@ class TextDriver:
         model: Any,
         text: "TextBatch",
         request_states: RequestStateTable,
-    ) -> tuple[torch.Tensor, list[int]]:
+        *,
+        store_position_relays: bool = True,
+        graph_runner: Any = _GRAPH_RUNNER_UNSET,
+        require_graph: bool = False,
+    ) -> tuple[torch.Tensor, list[int]] | None:
         if self.builder is None or self.kv_pool is None:
             # Self-managing text models (the HF day-zero fallback and the
             # multimodal/interleaved models whose KV is intrinsically coupled to
             # their modality FSM) declare no ``kv_cache_spec``; the system owns no
             # pool for them. They expose their own per-op text logits and the
             # driver still owns the post-model sampler.
+            if require_graph:
+                return self._model_owned_kv_forward_graph(model, text, request_states)
             return self._model_owned_kv_forward(model, text, request_states)
         ctx = get_forward_context()
         device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
@@ -285,8 +530,92 @@ class TextDriver:
             text, attention_backend_name=ctx.attention_backend_name
         )
         if batched:
-            return self._forward_batched(model, text, request_states, ctx, device)
-        return self._forward_per_op(model, text, request_states, ctx, device)
+            return self._forward_batched(
+                model,
+                text,
+                request_states,
+                ctx,
+                device,
+                store_position_relays=store_position_relays,
+                graph_runner=graph_runner,
+                require_graph=require_graph,
+            )
+        if require_graph:
+            return None
+        return self._forward_per_op(
+            model,
+            text,
+            request_states,
+            ctx,
+            device,
+            store_position_relays=store_position_relays,
+        )
+
+    def _forward_with_optional_padding_reorder(
+        self,
+        text: "TextBatch",
+        ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        store_position_relays: bool,
+    ) -> tuple[torch.Tensor, list[int]]:
+        if text.mode == ForwardMode.MIXED and self.graph_runner is not None:
+            reordered = self.graph_runner.reorder_mixed_for_padding(text)
+            if reordered is not text:
+                row_by_op = {id(op): row for row, op in enumerate(reordered.ops)}
+                logits, req_ids = self._forward(
+                    model,
+                    reordered,
+                    request_states,
+                    store_position_relays=store_position_relays,
+                )
+                rows = [row_by_op[id(op)] for op in ops]
+                order = torch.tensor(rows, dtype=torch.long, device=logits.device)
+                return logits.index_select(0, order), [int(req_ids[row]) for row in rows]
+        return self._forward(
+            model,
+            text,
+            request_states,
+            store_position_relays=store_position_relays,
+        )
+
+    def _forward_graph_with_optional_padding_reorder(
+        self,
+        text: "TextBatch",
+        ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        graph_runner: Any,
+        store_position_relays: bool,
+    ) -> tuple[torch.Tensor, list[int]] | None:
+        if text.mode == ForwardMode.MIXED:
+            reordered = graph_runner.reorder_mixed_for_padding(text)
+            if reordered is not text:
+                row_by_op = {id(op): row for row, op in enumerate(reordered.ops)}
+                graph_result = self._forward(
+                    model,
+                    reordered,
+                    request_states,
+                    store_position_relays=store_position_relays,
+                    graph_runner=graph_runner,
+                    require_graph=True,
+                )
+                if graph_result is None:
+                    return None
+                logits, req_ids = graph_result
+                rows = [row_by_op[id(op)] for op in ops]
+                order = torch.tensor(rows, dtype=torch.long, device=logits.device)
+                return logits.index_select(0, order), [int(req_ids[row]) for row in rows]
+        return self._forward(
+            model,
+            text,
+            request_states,
+            store_position_relays=store_position_relays,
+            graph_runner=graph_runner,
+            require_graph=True,
+        )
 
     def _model_owned_kv_forward(
         self,
@@ -307,14 +636,38 @@ class TextDriver:
         system request state.
         """
 
+        ops = self._model_owned_ops(text, request_states)
+        outputs = list(model.run_text_logits_batch(ops))
+        rows = [self._coerce_logits_row(out) for out in outputs]
+        return torch.stack(rows, dim=0), [int(op["req_id"]) for op in ops]
+
+    def _model_owned_kv_forward_graph(
+        self,
+        model: Any,
+        text: "TextBatch",
+        request_states: RequestStateTable,
+    ) -> tuple[torch.Tensor, list[int]] | None:
+        graph_logits = getattr(model, "try_run_text_graph_logits_batch", None)
+        if not callable(graph_logits):
+            return None
+        ops = self._model_owned_ops(text, request_states)
+        outputs = graph_logits(ops)
+        if outputs is None:
+            return None
+        rows = [self._coerce_logits_row(out) for out in outputs]
+        return torch.stack(rows, dim=0), [int(op["req_id"]) for op in ops]
+
+    @staticmethod
+    def _model_owned_ops(
+        text: "TextBatch",
+        request_states: RequestStateTable,
+    ) -> list[dict[str, Any]]:
         ops = [dict(op) for op in text.ops]
         for op in ops:
             if str(op.get("token_source") or "wire") != "last_sampled":
                 continue
             _DECODE_RELAY.attach_last_sampled_to_op(op, request_states.get(int(op["req_id"])))
-        outputs = list(model.run_text_logits_batch(ops))
-        rows = [self._coerce_logits_row(out) for out in outputs]
-        return torch.stack(rows, dim=0), [int(op["req_id"]) for op in ops]
+        return ops
 
     @staticmethod
     def _coerce_logits_row(logits: Any) -> torch.Tensor:
@@ -329,8 +682,13 @@ class TextDriver:
         request_states: RequestStateTable,
         ctx: Any,
         device: torch.device,
-    ) -> tuple[torch.Tensor, list[int]]:
+        *,
+        store_position_relays: bool = True,
+        graph_runner: Any = _GRAPH_RUNNER_UNSET,
+        require_graph: bool = False,
+    ) -> tuple[torch.Tensor, list[int]] | None:
         stats = ctx.stats
+        active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
         start = component_timer_start(stats)
         # Pure decode uses the contiguous-relay override (fast); a mixed
         # extend+decode batch replaces only its last_sampled decode rows by index.
@@ -342,7 +700,7 @@ class TextDriver:
             relay_replacements = text_input_id_replacements_from_relays(text, request_states, device)
         record_component_elapsed(stats, "text_decode_relay", start)
         start = component_timer_start(stats)
-        padded = self._graph_padded_num_tokens(text, ctx)
+        padded = self._graph_padded_num_tokens(text, ctx, graph_runner=active_graph_runner)
         fb = self.builder.build_text(
             text,
             device=device,
@@ -360,11 +718,22 @@ class TextDriver:
             with use_forward_context(
                 replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=self.kv_pool)
             ):
-                logits = self._run_model_forward(model, input_ids, positions, fb, ctx)
+                logits = self._run_model_forward(
+                    model,
+                    input_ids,
+                    positions,
+                    fb,
+                    ctx,
+                    graph_runner=active_graph_runner,
+                    require_graph=require_graph,
+                )
+        if logits is None:
+            return None
         record_component_elapsed(stats, "text_model_forward", start)
-        start = component_timer_start(stats)
-        self._store_decode_position_relays(text, fb, request_states)
-        record_component_elapsed(stats, "text_decode_position_store", start)
+        if store_position_relays:
+            start = component_timer_start(stats)
+            self._store_decode_position_relays(text, fb, request_states)
+            record_component_elapsed(stats, "text_decode_position_store", start)
         return logits, [int(req_id) for req_id in text.req_ids]
 
     def _forward_per_op(
@@ -374,6 +743,8 @@ class TextDriver:
         request_states: RequestStateTable,
         ctx: Any,
         device: torch.device,
+        *,
+        store_position_relays: bool = True,
     ) -> tuple[torch.Tensor, list[int]]:
         rows: list[torch.Tensor] = []
         next_positions: list[tuple[int, int]] = []
@@ -399,7 +770,7 @@ class TextDriver:
                 logits = model.forward(fb.input_ids, fb.positions, fb)
             rows.append(logits.reshape(-1, logits.shape[-1])[-1])
             next_positions.append((int(req_id), int(pos_range[1])))
-        if text.mode == ForwardMode.DECODE:
+        if store_position_relays and text.mode == ForwardMode.DECODE:
             for (req_id, position), op_positions in zip(next_positions, text.pos_ranges):
                 tensor = torch.tensor([position], dtype=torch.long, device=device)
                 self._store_position_relay(
@@ -416,13 +787,19 @@ class TextDriver:
         positions: torch.Tensor,
         fb: "ForwardBatch",
         ctx: Any,
-    ) -> torch.Tensor:
+        *,
+        graph_runner: Any = _GRAPH_RUNNER_UNSET,
+        require_graph: bool = False,
+    ) -> torch.Tensor | None:
         # System-owned CUDA graphs capture/replay around the graph-unaware model;
         # a miss (or graphs disabled) falls through to the eager forward.
-        if self.graph_runner is not None:
-            logits = self.graph_runner.maybe_run(model, input_ids, positions, fb, ctx)
+        active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        if active_graph_runner is not None:
+            logits = active_graph_runner.maybe_run(model, input_ids, positions, fb, ctx)
             if logits is not None:
                 return logits
+        if require_graph:
+            return None
         return model.forward(input_ids, positions, fb)
 
     def _reshape_inputs(
@@ -443,10 +820,17 @@ class TextDriver:
             return fb.input_ids, fb.positions
         return fb.input_ids, fb.positions
 
-    def _graph_padded_num_tokens(self, text: "TextBatch", ctx: Any) -> int | None:
-        if self.graph_runner is None:
+    def _graph_padded_num_tokens(
+        self,
+        text: "TextBatch",
+        ctx: Any,
+        *,
+        graph_runner: Any = _GRAPH_RUNNER_UNSET,
+    ) -> int | None:
+        active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        if active_graph_runner is None:
             return None
-        return self.graph_runner.padded_num_tokens(text, attention_backend_name=ctx.attention_backend_name)
+        return active_graph_runner.padded_num_tokens(text, attention_backend_name=ctx.attention_backend_name)
 
     def _advance_kv_lengths(self, text: "TextBatch", request_states: RequestStateTable) -> None:
         for req_id, pos_range in zip(text.req_ids, text.pos_ranges):

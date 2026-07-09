@@ -7,16 +7,16 @@ from typing import Any
 
 import torch
 
-from ..backends.paged_kv_math import decode_write_locations
-from ..contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
-from ..contracts.forward_mode import ForwardMode
-from ..foundation.errors import invalid_descriptor
-from ..foundation.sizing import ceil_div
-from ..runtime.host_staging import cpu_int_staging_buffer, fill_cpu_ints, is_pinned
-from ..runtime.kv_pool import PagedKVPool
-from ..runtime.paged_text_cache import BatchedPagedRequestCache
-from ..runtime.tensor_views import adjacent_one_token_view
-from .cuda_graph_base import (
+from ....backends.paged_kv_math import decode_write_locations
+from ....contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
+from ....contracts.forward_mode import ForwardMode
+from ....foundation.errors import invalid_descriptor
+from ....foundation.sizing import ceil_div
+from ....runtime.host_staging import cpu_int_staging_buffer, fill_cpu_ints, is_pinned
+from ....runtime.kv_pool import PagedKVPool
+from ....runtime.paged_text_cache import BatchedPagedRequestCache
+from ....runtime.tensor_views import adjacent_one_token_view
+from .base import (
     _DEFAULT_DECODE_GRAPH_BATCH_SIZES,
     _DEFAULT_METRIC_PREFIX,
     GraphEvent,
@@ -1094,7 +1094,7 @@ def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> An
     enough. Other backends stay eager rather than capture a stale paged plan.
     """
 
-    from ..backends.attention import (
+    from ....backends.attention import (
         get_attention_backend,
         has_attention_backend,
         normalize_attention_backend_name,
@@ -1148,7 +1148,7 @@ def resolve_paged_decode_graph_prepare(
     """Build the per-replay decode-graph prepare hook, or ``None`` to stay eager.
 
     The single assembly point for paged-decode graph preparation shared by the
-    thin :class:`~uniserve_worker.execution.text_graph_runner.TextGraphRunner`
+    thin :class:`~uniserve_worker.execution.forward.graph.text.TextGraphRunner`
     and the interleaved decode adapter: KV-side geometry comes off the shared
     pool, query-side geometry from the owner's
     ``text_decode_graph_query_geometry`` hook, and the backend must expose
@@ -1227,7 +1227,7 @@ def prepare_paged_decode_graph_backend(
     )
 
 
-from .prefill_cuda_graph import (  # noqa: E402
+from .text_prefill import (  # noqa: E402
     PrefillCudaGraphRunner,
     TextInitialPrefillGraphState,
     copy_text_initial_prefill_graph_inputs,

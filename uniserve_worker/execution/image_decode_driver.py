@@ -14,6 +14,7 @@ from ..contracts.outputs import CommitOutput
 from ..foundation.errors import invalid_descriptor
 from ..runtime.image_utils import pil_image_to_png_b64, to_uint8_image
 from ..runtime.request_state import RequestState
+from .forward.result import ForwardResult
 from .text_driver import sample_logits_result
 
 __all__ = [
@@ -32,6 +33,22 @@ class ImageDecodeDriver:
             sampled.pop("req_id", None)
             out.update(sampled)
         return _commit_output_from_dict(int(req_id), out)
+
+    @torch.inference_mode()
+    def forward_result(
+        self,
+        items: list[tuple[int, RequestState, Mapping[str, Any]]] | tuple[tuple[int, RequestState, Mapping[str, Any]], ...],
+        model: Any,
+        *,
+        row_indices: tuple[int, ...] | list[int] | None = None,
+    ) -> ForwardResult:
+        rows = tuple(range(len(items))) if row_indices is None else tuple(int(row) for row in row_indices)
+        if len(rows) != len(items):
+            raise invalid_descriptor("commit row_indices must align with commit items")
+        outputs: dict[int, Any] = {}
+        for row, (req_id, state, op) in zip(rows, items, strict=True):
+            outputs[int(row)] = model.decode_image(state.latent, req_id=int(req_id), state=state, op=op)
+        return ForwardResult(commit_outputs=outputs)
 
 
 def _commit_output_from_dict(req_id: int, out: Mapping[str, Any]) -> CommitOutput:

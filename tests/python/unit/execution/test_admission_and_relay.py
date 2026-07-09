@@ -1,10 +1,4 @@
-"""Admission routing + deferred decode-relay finalize behavior.
-
-Covers ``ForwardAdmissionRouter.decide`` (the worker-side narrowing gate that
-classifies a co-batched op group into PER_MODE / FORWARD / MODEL_CHECKED_FORWARD)
-and ``DeferredTextSeqResult.finalize`` (the deferred-sampling seq-result whose
-CPU token is materialized at response time without clobbering a newer relay).
-"""
+"""Admission routing + deferred decode-relay finalize behavior."""
 from __future__ import annotations
 
 import pytest
@@ -17,13 +11,13 @@ from uniserve_worker.contracts.op_kinds import (
     OP_KIND_TABLE,
     PREFILL_UND,
 )
-from uniserve_worker.execution.deferred_text_result import (
-    DeferredDecodeBurstSeqResult,
-    DeferredTerminalDecodeBurstSeqResult,
-)
-from uniserve_worker.execution.forward_admission import (
+from uniserve_worker.execution.forward import (
     ForwardAdmissionRouter,
     Route,
+)
+from uniserve_worker.execution.forward.deferred_text import (
+    DeferredDecodeBurstSeqResult,
+    DeferredTerminalDecodeBurstSeqResult,
 )
 from uniserve_worker.execution.text_driver import DeferredTextSeqResult
 from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
@@ -45,7 +39,7 @@ def test_decide_empty_group_routes_per_mode():
     assert decision.modes == ()
 
 
-def test_decide_text_extend_plus_decode_routes_model_checked_forward():
+def test_decide_text_extend_plus_decode_routes_forward():
     router = ForwardAdmissionRouter()
     ops = [
         {"kind": PREFILL_UND, "token_ids": [1, 2, 3]},
@@ -54,8 +48,7 @@ def test_decide_text_extend_plus_decode_routes_model_checked_forward():
 
     decision = router.decide(ops)
 
-    assert decision.route is Route.MODEL_CHECKED_FORWARD
-    assert decision.requires_model_acceptance is True
+    assert decision.route is Route.FORWARD
     assert decision.use_forward is True
 
 
@@ -83,7 +76,6 @@ def test_decide_decode_plus_denoise_routes_forward():
 
     assert decision.route is Route.FORWARD
     assert decision.use_forward is True
-    assert decision.requires_model_acceptance is False
 
 
 def test_decide_prefill_plus_denoise_routes_forward():
@@ -134,7 +126,6 @@ def test_decide_terminates_for_every_op_kind(kind):
     assert decision.route in {
         Route.PER_MODE,
         Route.FORWARD,
-        Route.MODEL_CHECKED_FORWARD,
     }
     assert len(decision.modes) == 1
 

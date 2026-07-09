@@ -9,9 +9,9 @@ from typing import Any, Callable
 
 import torch
 
-from ..contracts.forward_mode import ForwardMode
-from ..foundation.errors import classify
-from ..foundation.runtime_config import (
+from ....contracts.forward_mode import ForwardMode
+from ....foundation.errors import classify
+from ....foundation.runtime_config import (
     DEFAULT_DECODE_GRAPH_BATCH_SIZES,
     DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
 )
@@ -49,7 +49,7 @@ def maybe_weak_ref_cuda_graph_tensor(tensor: Any) -> Any:
 
 @lru_cache(maxsize=1)
 def _weak_ref_tensor_func() -> Any:
-    from ..ops.providers import weak_ref_tensor_provider
+    from ....ops.providers import weak_ref_tensor_provider
 
     return weak_ref_tensor_provider()
 

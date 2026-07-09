@@ -337,7 +337,7 @@ def test_interleaved_text_stepper_is_system_owned():
 
 def test_interleaved_text_execution_uses_owner_adapter_not_model_backbone():
     offenders: list[str] = []
-    for rel in ("execution/interleaved_text_stepper.py", "execution/interleaved_text_graph_runner.py"):
+    for rel in ("execution/interleaved_text_stepper.py", "execution/forward/graph/interleaved_text.py"):
         source = (WORKER / rel).read_text(encoding="utf-8")
         for needle in ("owner.model.language_model", "owner.model._build_t2i"):
             if needle in source:
@@ -409,7 +409,7 @@ def test_sensenova_does_not_define_a_second_native_qwen3_backbone_namespace():
 
 
 def test_packed_mixed_forward_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "execution" / "packed_mixed_forward.py").read_text(encoding="utf-8")
+    source = (WORKER / "execution" / "forward" / "programs" / "packed_visible.py").read_text(encoding="utf-8")
     assert "owner.model." not in source
 
 
@@ -718,7 +718,8 @@ def test_shared_layers_do_not_use_legacy_kernel_router():
 
 
 def test_mixed_forward_side_tables_use_forward_names():
-    assert (WORKER / "execution" / "forward_stream.py").exists()
+    assert (WORKER / "execution" / "forward" / "stream.py").exists()
+    assert not (WORKER / "execution" / "forward_stream.py").exists()
     assert not (WORKER / "execution" / "fused_stream.py").exists()
     offenders: list[str] = []
     for path in _py_files(WORKER / "execution") + _py_files(WORKER / "models"):

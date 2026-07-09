@@ -6,6 +6,7 @@ single-mode `UniForwardBatch` values.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -171,7 +172,7 @@ def test_runner_executes_whole_batch_forward_under_inference_mode():
     assert model.inference_modes == [True]
 
 
-def test_und_gen_mixed_policy_keeps_entire_batch_for_forward_hook():
+def test_und_gen_mixed_policy_keeps_entire_batch_for_whole_batch_forward():
     model = ForwardHookModel(max_batch_ops=2)
     submitted = ops("decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und")
 
@@ -179,10 +180,14 @@ def test_und_gen_mixed_policy_keeps_entire_batch_for_forward_hook():
 
     assert [r["req_id"] for r in result["per_seq"]] == [1, 2, 3, 4, 5]
     assert [r["kind"] for r in result["per_seq"]] == [op["kind"] for op in submitted]
-    assert model.calls == []
-    assert model.forward_calls == [
-        ["decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und"]
+    assert model.calls == [
+        (
+            ForwardMode.MIXED,
+            [1, 2, 3, 4, 5],
+            ["decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und"],
+        )
     ]
+    assert model.forward_calls == []
 
 
 def test_non_thin_text_extend_decode_runs_as_unified_mixed_batch():
@@ -198,7 +203,7 @@ def test_non_thin_text_extend_decode_runs_as_unified_mixed_batch():
     ]
 
 
-def test_text_extend_decode_route_uses_forward_hook_when_available():
+def test_text_extend_decode_route_prefers_whole_batch_forward_over_legacy_hook():
     model = ForwardHookModel(max_batch_ops=8)
     submitted = [
         {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [4, 5]},
@@ -214,8 +219,47 @@ def test_text_extend_decode_route_uses_forward_hook_when_available():
     )
 
     assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
-    assert model.calls == []
-    assert model.forward_calls == [["decode_und", "prefill_und"]]
+    assert model.calls == [
+        (ForwardMode.MIXED, [1, 2], ["decode_und", "prefill_und"]),
+    ]
+    assert model.forward_calls == []
+
+
+def test_runner_registers_text_graph_programs_with_forward_executor(monkeypatch):
+    class Model(ModelHooks):
+        device = "cpu"
+
+    graph_runner = object()
+
+    def fake_text_stack(self, model, residency):
+        del self, model, residency
+        return SimpleNamespace(builder=object(), gate=object(), graph_runner=graph_runner)
+
+    monkeypatch.setattr(ModelRunner, "_build_text_execution", fake_text_stack)
+
+    runner = ModelRunner(Model())
+
+    assert runner.forward_graph_policy.graph_selection_delegated is False
+    assert runner.text_graph_runner is graph_runner
+    assert runner.text_driver.graph_runner is None
+    assert runner.forward_executor.graph_runner is runner.forward_graph_runner
+    assert runner.forward_graph_runner is not None
+    assert [program.program_id for program in runner.forward_graph_runner.programs] == [
+        "decode",
+        "prefill",
+        "packed_visible",
+        "denoise_step",
+    ]
+    assert all(
+        program.text_driver is runner.text_driver
+        for program in runner.forward_graph_runner.programs
+        if program.program_id in {"decode", "prefill"}
+    )
+    assert all(
+        program.text_graph_runner is graph_runner
+        for program in runner.forward_graph_runner.programs
+        if program.program_id in {"decode", "prefill"}
+    )
 
 
 def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
@@ -255,8 +299,10 @@ def test_forward_admission_keeps_extra_rows_with_und_gen_mixed_batch():
     result = execute(model, submitted)
 
     assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed", "mixed"]
-    assert model.calls == []
-    assert model.forward_calls == [["decode_und", "denoise_gen", "commit_gen"]]
+    assert model.calls == [
+        (ForwardMode.MIXED, [1, 2, 3], ["decode_und", "denoise_gen", "commit_gen"]),
+    ]
+    assert model.forward_calls == []
 
 
 def test_system_speculative_verify_runs_over_thin_model_forward():
@@ -597,7 +643,7 @@ class ForwardHookModel(RecordingModel):
 
 
 @pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
-def test_text_denoise_route_uses_forward_driver_unconditionally(text_kind):
+def test_text_denoise_route_uses_whole_batch_forward_unconditionally(text_kind):
     model = ForwardHookModel(max_batch_ops=1)
     submitted = ops(text_kind, "denoise_gen")
 
@@ -611,11 +657,13 @@ def test_text_denoise_route_uses_forward_driver_unconditionally(text_kind):
     )
 
     assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
-    assert model.calls == []
-    assert model.forward_calls == [[text_kind, "denoise_gen"]]
+    assert model.calls == [
+        (ForwardMode.MIXED, [1, 2], [text_kind, "denoise_gen"]),
+    ]
+    assert model.forward_calls == []
 
 
-def test_mixed_forward_driver_threads_deferred_text_cpu_flag():
+def test_mixed_adapter_whole_batch_forward_bypasses_legacy_deferred_hook():
     class DeferredForwardHookModel(ForwardHookModel):
         def __init__(self) -> None:
             super().__init__()
@@ -639,7 +687,11 @@ def test_mixed_forward_driver_threads_deferred_text_cpu_flag():
     )
 
     assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
-    assert model.defer_flags == [True]
+    assert model.calls == [
+        (ForwardMode.MIXED, [1, 2], ["decode_und", "denoise_gen"]),
+    ]
+    assert model.forward_calls == []
+    assert model.defer_flags == []
 
 
 @pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])

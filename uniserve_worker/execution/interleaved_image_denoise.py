@@ -41,7 +41,7 @@ from .denoise_residual_cache import (
     ImageResidualCacheState,
     resolve_denoise_residual_cache_policy,
 )
-from .denoise_step_graph import maybe_run_denoise_step_graph
+from .forward.graph.denoise_step import maybe_run_denoise_step_graph
 from .interleaved_text_stepper import TextCache
 from .paged_denoise import can_run_paged_denoise_attention
 
@@ -264,8 +264,12 @@ class TextImageDenoiseOwner(Protocol):
         self, image_embeds: torch.Tensor, cache: "PagedTextCache"
     ) -> bool: ...
     def _predict_v_batched(
-        self, rows: "Sequence[DenoiseRow]", *, return_hidden: bool = False
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+        self,
+        rows: "Sequence[DenoiseRow]",
+        *,
+        return_hidden: bool = False,
+        graph_mode: str = "auto",
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None: ...
     def _predict_v(
         self,
         img: "ImageState",
@@ -594,7 +598,9 @@ class TextImageDenoiseOps:
         self: TextImageDenoiseOwner,
         steps: Sequence[TextImageDenoiseStep],
         branches_by_step: Sequence[Sequence[str]],
-    ) -> list[dict[str, torch.Tensor]]:
+        *,
+        graph_mode: str = "auto",
+    ) -> list[dict[str, torch.Tensor]] | None:
         results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
         rows: list[DenoiseRow] = []
         states: dict[int, ImageResidualCacheState | None] = {}
@@ -608,6 +614,8 @@ class TextImageDenoiseOps:
                 image_embeds = step.extra["image_embeds"]
                 decision = adapter.decision_embedding(image_embeds)
                 if state.decide_reuse(decision, tuple(str(b) for b in branches)):
+                    if graph_mode == "require":
+                        return None
                     # Replay: pre-norm hidden ≈ input embeds + previous
                     # residual, re-finalized (final norm), then the ordinary
                     # hidden→velocity head. No backbone forward.
@@ -626,41 +634,43 @@ class TextImageDenoiseOps:
             for branch in branches:
                 indexes, cache = self._denoise_branch_inputs(img, branch)
                 if not isinstance(cache, PagedTextCache):
+                    if graph_mode == "require":
+                        return None
                     results[step_index][branch] = self._predict_row_recorded(
                         DenoiseRow(step_index, step, branch, img, indexes, cache), state
                     )
                     continue
                 rows.append(DenoiseRow(step_index, step, branch, img, indexes, cache))
 
-        if len(rows) == 1:
-            row = rows[0]
-            results[row.step_index][row.branch] = self._predict_row_recorded(
-                row, states.get(row.step_index)
-            )
-            return results
-
-        grouped: dict[tuple[Any, ...], list[DenoiseRow]] = {}
-        for row in rows:
-            key = self._batched_denoise_row_key(row)
-            if key is None:
-                results[row.step_index][row.branch] = self._predict_row_recorded(
-                    row, states.get(row.step_index)
-                )
-                continue
-            grouped.setdefault(key, []).append(row)
-
-        for group in grouped.values():
-            if len(group) == 1:
-                row = group[0]
-                results[row.step_index][row.branch] = self._predict_row_recorded(
-                    row, states.get(row.step_index)
-                )
-                continue
+        def predict_group(group: Sequence[DenoiseRow]) -> bool:
             record = any(states.get(row.step_index) is not None for row in group)
             if record:
-                batched, hidden = self._predict_v_batched(group, return_hidden=True)
+                predicted = self._predict_v_batched(
+                    group,
+                    return_hidden=True,
+                    graph_mode=graph_mode,
+                )
+                if predicted is None:
+                    if graph_mode == "require":
+                        return False
+                    for row in group:
+                        results[row.step_index][row.branch] = self._predict_row_recorded(
+                            row,
+                            states.get(row.step_index),
+                        )
+                    return True
+                batched, hidden = predicted
             else:
-                batched = self._predict_v_batched(group)
+                batched = self._predict_v_batched(group, graph_mode=graph_mode)
+                if batched is None:
+                    if graph_mode == "require":
+                        return False
+                    for row in group:
+                        results[row.step_index][row.branch] = self._predict_row_recorded(
+                            row,
+                            states.get(row.step_index),
+                        )
+                    return True
                 hidden = None
             for row_index, row in enumerate(group):
                 results[row.step_index][row.branch] = batched[
@@ -673,6 +683,28 @@ class TextImageDenoiseOps:
                         row.step.extra["image_embeds"],
                         hidden[row_index : row_index + 1].contiguous(),
                     )
+            return True
+
+        if len(rows) == 1:
+            if not predict_group(rows):
+                return None
+            return results
+
+        grouped: dict[tuple[Any, ...], list[DenoiseRow]] = {}
+        for row in rows:
+            key = self._batched_denoise_row_key(row)
+            if key is None:
+                if graph_mode == "require":
+                    return None
+                results[row.step_index][row.branch] = self._predict_row_recorded(
+                    row, states.get(row.step_index)
+                )
+                continue
+            grouped.setdefault(key, []).append(row)
+
+        for group in grouped.values():
+            if not predict_group(group):
+                return None
         return results
 
     def _denoise_branch_inputs(self, img: ImageState, branch: str) -> tuple[torch.Tensor, Any]:
@@ -738,7 +770,8 @@ class TextImageDenoiseOps:
         rows: Sequence[DenoiseRow],
         *,
         return_hidden: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        graph_mode: str = "auto",
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         first = rows[0]
         img = first.img
         for row in rows:
@@ -746,9 +779,12 @@ class TextImageDenoiseOps:
         # Capture-or-replay the whole batched step as one CUDA graph when the
         # per-image geometry allows it (env-gated, default off); ``None`` means
         # the eager path below stays authoritative.
-        graphed = maybe_run_denoise_step_graph(self, rows, return_hidden=return_hidden)
-        if graphed is not None:
-            return graphed
+        if graph_mode != "eager":
+            graphed = maybe_run_denoise_step_graph(self, rows, return_hidden=return_hidden)
+            if graphed is not None:
+                return graphed
+            if graph_mode == "require":
+                return None
         image_embeds = torch.cat([row.step.extra["image_embeds"] for row in rows], dim=0)
         indexes = torch.stack([row.indexes for row in rows], dim=1).contiguous()
         cache = BatchedPagedTextCache([row.cache for row in rows])
