@@ -284,6 +284,11 @@ class TextImageDenoiseOwner(Protocol):
     def _denoise_residual_state(
         self, img: "ImageState"
     ) -> ImageResidualCacheState | None: ...
+    def _predict_row_recorded(
+        self,
+        row: "DenoiseRow",
+        state: ImageResidualCacheState | None,
+    ) -> torch.Tensor: ...
 
 
 class TextImageDenoiseOps:
@@ -450,6 +455,8 @@ class TextImageDenoiseOps:
         if st.rng is None:
             seed = params.seed
             st.rng = torch.Generator(device=device).manual_seed(int(seed if seed is not None else 0))
+        if st.cond.last_logits is None:
+            raise model_execution_error("image denoise requires conditional text logits")
         dtype = st.cond.last_logits.dtype
         return init_latent(
             (1, 3, params.height, params.width),
@@ -562,7 +569,7 @@ class TextImageDenoiseOps:
     ) -> ImageResidualCacheState | None:
         policy = _denoise_residual_cache_policy()
         adapter = self.denoise_residual_cache_adapter()
-        if not policy.active(adapter):
+        if adapter is None or not policy.active(adapter):
             return None
         state = img.residual_cache
         if state is None:

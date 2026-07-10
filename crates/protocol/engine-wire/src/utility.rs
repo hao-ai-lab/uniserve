@@ -11,7 +11,7 @@ use super::{OpaqueValue, default_opaque_value_nil};
 use crate::error::{Error, Result};
 
 /// Utility call id as carried on the engine MessagePack wire.
-
+///
 /// Python emits utility ids as MessagePack integers, including values that may
 /// require unsigned 64-bit encoding. Keep MessagePack's signed/unsigned
 /// integer distinction instead of flattening to `i64` or `u64` at decode time.
@@ -99,7 +99,7 @@ impl<'de> Deserialize<'de> for UtilityCallId {
 }
 
 /// Engine-core utility call payload sent from frontend to engine.
-
+///
 /// Original Python payload shape:
 /// `(client_index, call_id, method_name, args)`
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
@@ -144,7 +144,7 @@ impl EngineCoreUtilityRequest {
 }
 
 /// Result of a utility call.
-
+///
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct UtilityOutput {
     pub call_id: UtilityCallId,
@@ -156,7 +156,7 @@ pub struct UtilityOutput {
 }
 
 /// Python `UtilityResult` wrapper carried inside `UtilityOutput.result`.
-
+///
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct UtilityResultEnvelope {
     /// Recursive type information encoded on Python side, serving as the hint

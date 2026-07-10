@@ -107,6 +107,7 @@ class RequestState:
     kv_lengths: dict[str, int] = field(default_factory=dict)
     residency: ResidencyFlags = field(default_factory=ResidencyFlags)
     decode_relay: DecodeRelay = field(default_factory=DecodeRelay)
+    prompt_last_logits: torch.Tensor | None = None
     cfg_geometry: dict[str, Any] | None = None
     lifecycle: RequestLifecycle = RequestLifecycle.CREATED
 
@@ -158,6 +159,7 @@ class RequestState:
             self.schedule_cursor = 0
         self.latent = None
         self.cfg_geometry = None
+        self.prompt_last_logits = None
         self.deactivate_image_latent()
         self.deactivate_scratch()
         self.lifecycle = RequestLifecycle.COMMITTED if reset_cursor else RequestLifecycle.ABORTED

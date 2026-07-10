@@ -225,8 +225,11 @@ class LocalP2PTowerHandoff:
     def _writeback_commit(self, latent: Any, *, device: Any, dtype: Any) -> Any:
         b = self.bind()
         if b.active:
-            done = b.transport.record_ready(b.gen_coord)
-            b.transport.wait_ready(done, b.primary_coord)
+            transport = b.transport
+            if transport is None:
+                raise RuntimeError("active tower handoff has no transport")
+            done = transport.record_ready(b.gen_coord)
+            transport.wait_ready(done, b.primary_coord)
         return latent.to(device=device, dtype=dtype, non_blocking=True)
 
 

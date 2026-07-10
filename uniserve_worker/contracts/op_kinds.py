@@ -14,6 +14,7 @@ type, and lower-bound checks from that data.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
@@ -93,7 +94,10 @@ def _optional_int(result: Mapping[str, Any], key: str, where: str, *, minimum: i
 def _float(value: Any, where: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise invalid_descriptor(f"{where} must be a number")
-    return float(value)
+    result = float(value)
+    if not math.isfinite(result):
+        raise invalid_descriptor(f"{where} must be finite")
+    return result
 
 
 def _optional_float(result: Mapping[str, Any], key: str, where: str) -> float | None:
@@ -109,12 +113,19 @@ def _top_logprobs(value: Any, where: str, *, minimum: int) -> None:
         if (
             not isinstance(pair, Sequence)
             or isinstance(pair, (str, bytes, bytearray))
-            or len(pair) != 2
+            or len(pair) != 3
         ):
-            raise invalid_descriptor(f"{where}[{j}] must be [token_id, logprob]")
+            raise invalid_descriptor(f"{where}[{j}] must be [token_id, logprob, rank]")
         _int(pair[0], f"{where}[{j}][0]", minimum=minimum)
-        if not isinstance(pair[1], (int, float)) or isinstance(pair[1], bool):
-            raise invalid_descriptor(f"{where}[{j}][1] must be a number")
+        _float(pair[1], f"{where}[{j}][1]")
+        _int(pair[2], f"{where}[{j}][2]", minimum=1)
+
+
+def _prompt_logprobs(value: Any, where: str, *, minimum: int) -> None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise invalid_descriptor(f"{where} must be a list")
+    for index, position in enumerate(value):
+        _top_logprobs(position, f"{where}[{index}]", minimum=minimum)
 
 
 def _int_list(value: Any, where: str, *, minimum: int) -> None:
@@ -133,12 +144,13 @@ def _image_hw(value: Any, where: str, *, minimum: int) -> None:
 
 # Field-type dispatch: each token maps to a ``(value, where, *, minimum) -> None``
 # validator. Scalar tokens ignore ``minimum`` where it does not apply.
-_FIELD_VALIDATORS: dict[str, Callable[..., None]] = {
+_FIELD_VALIDATORS: dict[str, Callable[..., object]] = {
     "int": lambda v, w, *, minimum: _int(v, w, minimum=minimum),
     "float": lambda v, w, *, minimum: _float(v, w),
     "str": lambda v, w, *, minimum: _str(v, w),
     "bool": lambda v, w, *, minimum: _bool(v, w),
     "top_logprobs": _top_logprobs,
+    "prompt_logprobs": _prompt_logprobs,
     "int_list": _int_list,
     "image_hw": _image_hw,
 }
@@ -188,6 +200,7 @@ _TEXT_RESULT_SCHEMA: tuple[FieldSpec, ...] = (
     FieldSpec("sampled_token_ids", "int_list", required=False),
     FieldSpec("sampled_logprob", "float", required=False),
     FieldSpec("top_logprobs", "top_logprobs", required=False),
+    FieldSpec("prompt_logprobs", "prompt_logprobs", required=False),
 )
 
 _DENOISE_RESULT_SCHEMA: tuple[FieldSpec, ...] = (

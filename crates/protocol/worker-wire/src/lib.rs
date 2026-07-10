@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+pub use uniserve_core::OpKind;
 use uniserve_core::{
     BlockId, CfgParams, ImageParams, KvCacheGroupSpec, Modality, RankInfo, RequestId,
     SamplingParams,
@@ -24,44 +25,14 @@ pub use resources::{
     ResourcePressure,
 };
 
-/// Forward-op taxonomy.
-
-/// There is no standalone `VaeDecode` op: image decode runs via `CommitGen`
-/// (`commit_gen` -> `decode_image`). The wire enum, FlatBuffers schema, and
-/// Python `contracts.OP_KINDS` / `mode_for_op` vocabularies stay aligned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OpKind {
-    PrefillUnd,
-    DecodeUnd,
-    TargetVerifyUnd,
-    DenoiseGen,
-    CommitGen,
-    CommitWriteback,
-    VaeEncode,
-    VitEncode,
-    /// Sampler-stage op: turn a `Logits` handle into a sampled token. Produced by
-    /// the StageRouter when a Sampler pool is split off; never emitted by the base
-    /// scheduler, which samples inside the decode worker by default.
-    Sample,
-    /// PostProcess-stage op: encode one finished image/video frame. Produced by
-    /// the StageRouter when a PostProcess pool is split off; never
-    /// emitted by the base scheduler.
-    EncodeFrame,
-}
-
 /// Source for text input token ids on a [`ForwardOp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum TokenSource {
+    #[default]
     Wire,
     LastSampled,
-}
-
-impl Default for TokenSource {
-    fn default() -> Self {
-        Self::Wire
-    }
 }
 
 /// Static per-request state that crosses the wire **once**, when the scheduler
@@ -168,6 +139,9 @@ pub struct ForwardOp {
     /// speculative KV rows can be discarded with that request.
     #[serde(default)]
     pub decode_stop_terminal: bool,
+    /// Request logits for every input position so prompt tokens can be scored.
+    #[serde(default)]
+    pub return_all_logits: bool,
     // ---- op-lifecycle id so the host correlates this op's result with the
     // submitted op. Scalar, never a tensor. ----
     pub op_id: Option<u64>,
@@ -206,6 +180,7 @@ impl Default for ForwardOp {
             decode_token_count: None,
             decode_stop_token_ids: None,
             decode_stop_terminal: false,
+            return_all_logits: false,
             image_b64: None,
             op_id: None,
             logits_handle: None,
@@ -213,6 +188,10 @@ impl Default for ForwardOp {
         }
     }
 }
+
+/// One ranked vocabulary candidate at a generated or prompt token position.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TokenLogprob(pub u32, pub f32, pub u32);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardBatch {
@@ -228,6 +207,8 @@ pub struct ForwardBatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SeqResult {
     pub req_id: RequestId,
+    /// Echo of the operation class that produced this result.
+    pub op_kind: Option<OpKind>,
     pub sampled_token_id: Option<u32>,
     pub denoise_done: bool,
     pub num_steps_done: Option<u16>,
@@ -237,7 +218,9 @@ pub struct SeqResult {
     /// Logprob of the sampled token (the `gather_logprobs` analog).
     pub sampled_logprob: Option<f32>,
     /// Top-`n_logprobs` `(token_id, logprob)` pairs for this step.
-    pub top_logprobs: Option<Vec<(u32, f32)>>,
+    pub top_logprobs: Option<Vec<TokenLogprob>>,
+    /// Ranked candidate sets for prompt positions scored by this prefill chunk.
+    pub prompt_logprobs: Option<Vec<Vec<TokenLogprob>>>,
     /// All token ids sampled by a sequential text decode burst. Small id list;
     /// `sampled_token_id` remains the last token for scalar consumers.
     pub sampled_token_ids: Option<Vec<u32>>,
@@ -366,15 +349,10 @@ pub enum AdapterMode {
 ///
 /// The scheduler owns lane formation; workers advertise scalar limits here
 /// rather than a separate mixed-op capability flag.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionConstraints {
     /// Max ops the worker accepts in one `ForwardBatch` (0 == host default).
     pub max_batch_ops: u32,
-}
-impl Default for ExecutionConstraints {
-    fn default() -> Self {
-        Self { max_batch_ops: 0 }
-    }
 }
 
 /// Worker-reported capabilities: supported controls, adapter mode, execution
@@ -386,7 +364,7 @@ pub struct EngineCaps {
     pub num_blocks: u32,
     pub num_layers: u32,
     pub scratch_capacity_tokens: u64,
-    pub supported_ops: Vec<String>,
+    pub supported_ops: Vec<OpKind>,
     pub max_latent_size: u32,
     pub latent_downsample: u32,
     #[serde(default)]
@@ -455,10 +433,10 @@ impl Default for EngineCaps {
             num_layers: 28,
             scratch_capacity_tokens: 1 << 20,
             supported_ops: vec![
-                "prefill_und".into(),
-                "decode_und".into(),
-                "denoise_gen".into(),
-                "commit_gen".into(),
+                OpKind::PrefillUnd,
+                OpKind::DecodeUnd,
+                OpKind::DenoiseGen,
+                OpKind::CommitGen,
             ],
             max_latent_size: 64,
             latent_downsample: 16,
@@ -721,10 +699,10 @@ mod tests {
     }
 
     #[test]
-    fn request_kind_serializes_to_unchanged_wire_strings() {
+    fn request_kind_serializes_to_protocol_strings() {
         // The Python worker reads `WorkerRequest.kind` as a plain string via the
-        // pythonize/serde path; pin every variant's serialized form so the enum
-        // discriminant stays byte-identical to the legacy `kind: String` values.
+        // pythonize/serde path, so every enum discriminant has a fixed protocol
+        // spelling.
         let cases = [
             (RequestKind::GetCaps, "get_caps"),
             (RequestKind::Execute, "execute"),
@@ -812,6 +790,7 @@ mod tests {
                 decode_token_count: Some(4),
                 decode_stop_token_ids: Some(vec![9, 10]),
                 decode_stop_terminal: true,
+                return_all_logits: true,
                 op_id: Some(44),
                 logits_handle: Some(0xBEEF),
                 locator: Some("bG9jYXRvcg==".into()),
@@ -911,6 +890,7 @@ mod tests {
                 step_id: 11,
                 per_seq: vec![SeqResult {
                     req_id: RequestId(5),
+                    op_kind: Some(OpKind::CommitGen),
                     image_hw: Some((2048, 1152)),
                     image_png_b64: Some("AAAA".into()),
                     sampled_token_id: Some(42),
@@ -947,6 +927,7 @@ mod tests {
         assert_eq!(forward_stats.flashinfer_decode_plan_calls, 2);
         assert_eq!(forward_stats.spec_verify_accepted_tokens, 3);
         assert_eq!(result.per_seq[0].image_hw, Some((2048, 1152)));
+        assert_eq!(result.per_seq[0].op_kind, Some(OpKind::CommitGen));
         assert_eq!(result.per_seq[0].sampled_token_id, Some(42));
         assert_eq!(result.per_seq[0].sampled_token_ids, Some(vec![40, 41, 42]));
         assert_eq!(result.per_seq[0].op_id, Some(44));
@@ -1214,6 +1195,7 @@ mod tests {
             decode_token_count: _,    // scalar burst count for sequential text decode
             decode_stop_token_ids: _, // id list of scalar burst stop tokens
             decode_stop_terminal: _,  // whether stop ends the request
+            return_all_logits: _,     // full position logits selector
             op_id: _,                 // lifecycle id (scalar)
             logits_handle: _,         // opaque logits handle (scalar); logits stay off-wire
             locator: _, // base64 data-plane locator (small descriptor); tensor stays off-wire
@@ -1221,13 +1203,15 @@ mod tests {
 
         let SeqResult {
             req_id: _,
+            op_kind: _,             // echoed operation enum
             sampled_token_id: _,    // sampled token id (scalar)
             denoise_done: _,        // bool
             num_steps_done: _,      // scalar
             image_png_b64: _,       // finished image bytes (small result, not KV)
             image_hw: _,            // (u32, u32) descriptor
             sampled_logprob: _,     // scalar
-            top_logprobs: _,        // (id, logprob) scalar pairs, never a logits tensor
+            top_logprobs: _,        // ranked id/logprob scalars, never a logits tensor
+            prompt_logprobs: _,     // ranked prompt-position scalars, never logits tensors
             sampled_token_ids: _,   // sampled token id list, never logits
             encoder_handle: _,      // opaque handle (scalar); embedding stays worker-side
             num_tokens: _,          // scalar

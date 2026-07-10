@@ -24,7 +24,7 @@ use uniserve_core::{BlockId, HashAlgo, KvGroupKind, Modality, RequestId};
 
 mod encoder_cache;
 mod freeq;
-pub use encoder_cache::{EncoderCacheManager, EncoderCacheStats};
+pub use encoder_cache::{CachedEncoderOutput, EncoderCacheManager, EncoderCacheStats};
 use freeq::BlockMeta;
 
 /// Incremental per-block prefix hash, chained as
@@ -254,7 +254,7 @@ impl BlockManager {
 
     /// Build with explicit `(kind, first_block, count)` groups. `first_block`
     /// must be >= 1 (block 0 is padding) and groups must partition `[1, num_blocks)`.
-
+    ///
     /// Panics with a descriptive message (via [`Self::validate_group_specs`]) if
     /// the specs are malformed — a buggy/version-skewed worker handshake that
     /// reports overlapping, gapped, or out-of-range ranges fails loudly here
@@ -537,7 +537,7 @@ impl BlockManager {
     /// Associate a filled block with a prefix `hash` and the `tokens` whose
     /// content produced it, so future requests can reuse it. Emits `BlockStored`.
     /// Idempotent on an already-mapped hash.
-
+    ///
     /// `tokens` are retained for content verification on later hits.
     pub fn cache_block(&mut self, b: BlockId, hash: u64, tokens: &[u32]) {
         if self.hash_to_block.contains_key(&hash) {
@@ -570,7 +570,7 @@ impl BlockManager {
     /// (held by a concurrently-running request whose prompt was already published
     /// to the prefix cache) is shared by bumping its ref_cnt — that cross-request
     /// sharing is the whole point of prefix caching.
-
+    ///
     /// Returns false (treated as a cache miss) when the block no longer carries
     /// `hash`, when the block's stored tokens do not match the candidate
     /// `tokens` (content verification — a digest collision must not reuse a
@@ -645,7 +645,7 @@ impl BlockManager {
     /// For each sliding-window group a request uses, release blocks that fall
     /// outside `[0, sink) ∪ [pos-window, pos)` (analogous to the reference's
     /// `remove_skipped_blocks`). No-op for full-attention groups (BAGEL).
-
+    ///
     /// each block's token range is resolved from its *true* start offset,
     /// not its positional index. For a request that is still token-contiguous
     /// from offset 0 (the post-allocate baseline, including one seeded by a

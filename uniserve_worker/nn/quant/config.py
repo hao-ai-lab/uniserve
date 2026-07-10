@@ -124,6 +124,7 @@ class QuantizationConfig:
             or "unquantized"
         )
         ignored = raw_map.get("ignored_layers") or raw_map.get("modules_to_not_convert") or ()
+        ignored_layers: tuple[str, ...]
         if isinstance(ignored, str):
             ignored_layers = (ignored,)
         else:

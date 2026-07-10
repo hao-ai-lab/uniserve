@@ -9,6 +9,7 @@ import os
 import struct
 import time
 from typing import Any
+from urllib import error as urlerror
 from urllib import request as urlrequest
 
 from .profiles import (
@@ -200,6 +201,13 @@ def usage_completion_tokens(obj: dict[str, Any]) -> int | None:
     return None
 
 
+def usage_image_steps(obj: dict[str, Any]) -> int | None:
+    usage = obj.get("usage")
+    if isinstance(usage, dict) and isinstance(usage.get("image_steps"), int):
+        return int(usage["image_steps"])
+    return None
+
+
 def save_image(url: str, out_dir: Any, images: list[dict[str, Any]]) -> None:
     payload = data_url_payload(url)
     if payload is None:
@@ -240,6 +248,7 @@ def verify(args: argparse.Namespace) -> None:
     event_counts: dict[str, int] = {}
     text = ""
     completion_tokens: int | None = None
+    image_steps: int | None = None
     errors: list[dict[str, Any]] = []
     finished = 0
     current_event: str | None = None
@@ -250,7 +259,14 @@ def verify(args: argparse.Namespace) -> None:
         old_env[key] = os.environ.get(key)
         os.environ[key] = value
     try:
-        resp_ctx = urlrequest.urlopen(req, timeout=timeout_s)  # noqa: S310 - local verification helper.
+        try:
+            resp_ctx = urlrequest.urlopen(req, timeout=timeout_s)  # noqa: S310 - local verification helper.
+        except urlerror.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace").strip()
+            message = f"verify transport error: HTTP {error.code}"
+            if detail:
+                message = f"{message}: {detail}"
+            raise SystemExit(message) from error
     finally:
         for key, old in old_env.items():
             if old is None:
@@ -281,6 +297,9 @@ def verify(args: argparse.Namespace) -> None:
                 tokens = usage_completion_tokens(obj)
                 if tokens is not None:
                     completion_tokens = tokens
+                steps = usage_image_steps(obj)
+                if steps is not None:
+                    image_steps = steps
                 for image_url in image_urls_from_chunk(obj):
                     save_image(image_url, out_dir, images)
                 if done:
@@ -294,6 +313,7 @@ def verify(args: argparse.Namespace) -> None:
             text = text_from_response(obj)
             finished = finish_count(obj)
             completion_tokens = usage_completion_tokens(obj)
+            image_steps = usage_image_steps(obj)
             for image_url in image_urls_from_response(obj):
                 save_image(image_url, out_dir, images)
     text_unit_count = completion_tokens if completion_tokens is not None else len(text.split())
@@ -301,6 +321,7 @@ def verify(args: argparse.Namespace) -> None:
         "endpoint": endpoint,
         "elapsed_s": time.time() - start,
         "image_count": len(images),
+        "image_steps": image_steps,
         "images": images,
         "text": text,
         "text_unit_count": text_unit_count,
@@ -317,6 +338,9 @@ def verify(args: argparse.Namespace) -> None:
     expected_images = workload.get("expect_images")
     if expected_images is not None and len(images) != int(expected_images):
         raise SystemExit(f"expected {expected_images} images, got {len(images)}")
+    expected_image_steps = workload.get("expect_image_steps")
+    if expected_image_steps is not None and image_steps != int(expected_image_steps):
+        raise SystemExit(f"expected {expected_image_steps} image steps, got {image_steps}")
     expected_min_text = workload.get("expect_min_text_tokens")
     if expected_min_text is not None and text_unit_count < int(expected_min_text):
         raise SystemExit(

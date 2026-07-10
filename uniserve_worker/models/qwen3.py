@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -333,7 +333,8 @@ class Qwen3Model(nn.Module):
         hidden_states = input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
         cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
         residual = None
-        for layer in self.layers:
+        for layer_module in self.layers:
+            layer = cast(Qwen3DecoderLayer, layer_module)
             hidden_states, residual = layer(
                 hidden_states,
                 residual,
@@ -398,10 +399,10 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
     def _caps_descriptor(
         self,
         *,
-        block_size: int = DEFAULT_BLOCK_SIZE,
+        block_size: int | None = None,
         kv_token_capacity: int | None = None,
     ) -> CapsDescriptor:
-        block_size = DEFAULT_BLOCK_SIZE if block_size is None else block_size
+        block_size = DEFAULT_BLOCK_SIZE if block_size is None else int(block_size)
         num_blocks = self._runtime_num_blocks(
             block_size=block_size,
             kv_token_capacity=kv_token_capacity,
@@ -435,7 +436,9 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         block_size: int = DEFAULT_BLOCK_SIZE,
         kv_token_capacity: int | None = None,
         caps: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> None:
+        del kwargs
         self.block_size = int(block_size)
         self.num_blocks = int(
             (caps or {}).get("num_blocks")
@@ -496,11 +499,13 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
 
         from ..contracts.forward_mode import ForwardMode
 
-        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY or forward_batch.return_all_logits:
             return self.logits(hidden, self.lm_head, valid_vocab_size=self.output_vocab_size)
         if hidden.ndim == 3:
             last_hidden = hidden[:, -1, :]
         else:
+            if forward_batch.last_token_indices is None:
+                raise RuntimeError("flat Qwen3 logits require last-token indices")
             last_hidden = hidden.index_select(0, forward_batch.last_token_indices)
         return self.logits(last_hidden, self.lm_head, valid_vocab_size=self.output_vocab_size)
 
@@ -578,8 +583,8 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
             )
         return capacity.num_blocks
 
-    def load_weights(self, weights) -> set[str]:
-        stacked = [
+    def load_weights(self, weights) -> WeightLoadReport:
+        stacked: list[tuple[str, str, str | int]] = [
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),

@@ -24,7 +24,7 @@ const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[month]-[day] [hour]:[minute]:[second]");
 
 const PROCESS_LABEL: &str = "RustFrontend";
-const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "uniserve_server_http"];
+const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "uniserve_server"];
 
 /// Install the process-wide tracing subscriber for the CLI binary.
 pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>) {
@@ -52,7 +52,7 @@ pub(crate) fn init_tracing(log_level: Option<&str>, log_level_http: Option<&str>
 
 /// Build the CLI log filter by merging the default level with Rust-style
 /// target overrides.
-
+///
 /// Precedence:
 /// - Start from `--log-level` as the default level for all targets.
 /// - If `RUST_LOG` contains a global default level such as `warn`, it overrides the CLI default.
@@ -241,10 +241,10 @@ where
 
 /// Shorten a source file path for log output while preserving enough context
 /// for common Rust entrypoint and module filenames.
-
+///
 /// - For `mod.rs`, keep the parent directory as `parent/mod.rs`.
 /// - For `src/lib.rs` and `src/main.rs`, keep one additional component as `crate/src/lib.rs` or
-/// `crate/src/main.rs` when available.
+///   `crate/src/main.rs` when available.
 /// - Other files are displayed as just the basename.
 fn shorten_file_path(file: &str) -> &str {
     let mut parts = file.rsplit('/');
@@ -321,7 +321,7 @@ mod tests {
         assert!(filter.to_string().contains("axum=debug"));
         assert!(filter.to_string().contains("hyper=debug"));
         assert!(filter.to_string().contains("tower_http=debug"));
-        assert!(filter.to_string().contains("uniserve_server_http=debug"));
+        assert!(filter.to_string().contains("uniserve_server=debug"));
         assert!(filter.to_string().ends_with(",error"));
     }
 

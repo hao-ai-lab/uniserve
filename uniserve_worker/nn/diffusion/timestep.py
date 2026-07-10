@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -42,4 +43,5 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         t_freq = timestep_embedding(t, self.frequency_embedding_size)
-        return self.mlp(t_freq.to(self.mlp[0].weight.dtype))
+        input_layer = cast(nn.Linear, self.mlp[0])
+        return self.mlp(t_freq.to(input_layer.weight.dtype))

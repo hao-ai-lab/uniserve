@@ -87,6 +87,8 @@ def _owner_max_context_len(owner: Any, pool: Any) -> int:
         getattr(owner, "max_context_len", None),
     )
     for value in candidates:
+        if value is None:
+            continue
         try:
             parsed = int(value)
         except (TypeError, ValueError):
@@ -373,6 +375,7 @@ class InterleavedTextPrefillGraphRunner:
             use_cache=True,
             text_only_rope=True,
             causal_paged_update=True,
+            return_all_logits=True,
         )
         logits = outputs.logits
         if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
@@ -582,7 +585,7 @@ class InterleavedTextDecodeGraphRunner:
                     # Pipelined-burst row: consume the device relay directly and
                     # commit the token lazily; no synchronize on the token value.
                     token_id, token_tensor = None, relay
-                elif token_id < 0:
+                elif token_id is not None and token_id < 0:
                     # Neither a relay tensor nor a resolved id; the eager path
                     # owns the descriptive failure.
                     return None

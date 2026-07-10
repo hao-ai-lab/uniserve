@@ -10,10 +10,48 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-use uniserve_engine_client::protocol::{EngineCoreRequest, EngineCoreSamplingParams};
-use uniserve_engine_client::{EngineCoreClient, TransportMode, ZmqClientConfig};
+use uniserve_core::{
+    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
+    UndVisibility,
+};
+use uniserve_engine_gateway::transport::protocol::EngineCoreRequest;
+use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
 use uniserve_engine_process::{EngineProcConfig, run_engine_proc};
 use uniserve_engine_runtime::{EngineBackend, EngineCoreConfig};
+
+fn text_generation_request() -> GenerationRequest {
+    let constraint = GenerationConstraint::UndOnly;
+    let policy = GenerationPolicyDescriptor::default();
+    GenerationRequest {
+        request_id: RequestId(0),
+        context: vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3],
+            visibility: UndVisibility::Internal,
+        }],
+        negative_context: Vec::new(),
+        constraint,
+        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        },
+        image: ImageParams::default(),
+        max_und_tokens: 64,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache: Default::default(),
+        policy,
+        resources: GenerationResourceBounds {
+            context_tokens: 3,
+            max_kv_tokens: 67,
+            ..GenerationResourceBounds::default()
+        },
+    }
+}
 
 #[tokio::main(worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
@@ -51,21 +89,12 @@ async fn main() -> anyhow::Result<()> {
         },
         model_name: "stub-model".into(),
         client_index: 0,
-        native_controls: None,
+        generation_controls: None,
     })
     .await?;
     println!("connected; submitting a request the worker will die under...");
 
-    let request = EngineCoreRequest {
-        request_id: "req-death".to_string(),
-        prompt_token_ids: Some(vec![1, 2, 3]),
-        sampling_params: Some(EngineCoreSamplingParams {
-            temperature: 0.0,
-            max_tokens: 64,
-            ..EngineCoreSamplingParams::for_test()
-        }),
-        ..Default::default()
-    };
+    let request = EngineCoreRequest::new("req-death".to_string(), text_generation_request());
     let mut stream = client.call(request).await?;
 
     // The in-flight request fails either as a terminal Error output (the
@@ -78,7 +107,9 @@ async fn main() -> anyhow::Result<()> {
         match item {
             Ok(Some(Ok(out))) => {
                 if out.output.finish_reason
-                    == Some(uniserve_engine_client::protocol::EngineCoreFinishReason::Error)
+                    == Some(
+                        uniserve_engine_gateway::transport::protocol::EngineCoreFinishReason::Error,
+                    )
                 {
                     println!("request resolved with finish_reason=Error as expected");
                     saw_error = true;

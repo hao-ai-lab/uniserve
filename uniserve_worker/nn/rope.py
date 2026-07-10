@@ -27,12 +27,20 @@ __all__ = [
 ]
 
 try:  # transformers is present in production, but keep shared layers importable in light envs.
-    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
+    from transformers.modeling_rope_utils import (
+        ROPE_INIT_FUNCTIONS as _HF_ROPE_INIT_FUNCTIONS,
+    )
+    from transformers.modeling_rope_utils import (
+        dynamic_rope_update as _hf_dynamic_rope_update,
+    )
 except Exception:  # pragma: no cover - exercised only in minimal dependency environments.
     ROPE_INIT_FUNCTIONS: dict[str, Callable[..., tuple[torch.Tensor, float]]] = {}
 
     def dynamic_rope_update(fn):
         return fn
+else:
+    ROPE_INIT_FUNCTIONS = _HF_ROPE_INIT_FUNCTIONS
+    dynamic_rope_update = _hf_dynamic_rope_update
 
 try:  # pragma: no cover - availability depends on the serving environment.
     import triton
@@ -1060,6 +1068,9 @@ def _apply_rotary_full_dim(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 class RotaryEmbedding(nn.Module):
     """Default rotary embedding with an optional Qwen frequency-range mode."""
 
+    inv_freq: torch.Tensor
+    original_inv_freq: torch.Tensor
+
     def __init__(
         self,
         dim: int,
@@ -1213,7 +1224,7 @@ def get_rope(
     keep_freq_range: bool = False,
     config: Any | None = None,
     device: torch.device | str | None = None,
-) -> nn.Module:
+) -> RotaryEmbedding | HFRotaryEmbedding:
     """Build the shared RoPE implementation for packed or HF-shaped decoders.
 
     ``keep_freq_range`` selects the dual-resolution rope recipe: a closed

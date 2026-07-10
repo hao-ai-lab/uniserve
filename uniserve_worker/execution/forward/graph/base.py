@@ -5,7 +5,7 @@ import threading
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar
 
 import torch
 
@@ -19,6 +19,7 @@ from ....foundation.runtime_config import (
 # Module-level buffer pool for ``_share_decode_graph_input_buffer`` (contract tests).
 _DECODE_GRAPH_INPUT_BUFFER_POOL: dict[tuple[str, str, str], torch.Tensor] = {}
 _DECODE_GRAPH_INPUT_BUFFER_POOL_LOCK = threading.Lock()
+GraphOutput = TypeVar("GraphOutput")
 
 # Warmup iterations run before each CUDA-graph capture to settle allocator and
 # autotune state so the captured graph is stable. Two passes is the minimum that
@@ -217,7 +218,7 @@ class _GraphRunnerBase:
         ctx: Any,
         capture: Callable[[], Any],
         copy_inputs: Callable[[Any], None],
-        replay: Callable[[Any], torch.Tensor],
+        replay: Callable[[Any], GraphOutput],
         record: Callable[[GraphEvent], None],
         disable: Callable[[BaseException], None],
         capture_metric: str,
@@ -225,7 +226,7 @@ class _GraphRunnerBase:
         replay_metric: str,
         after_copy: Callable[[Any], None] | None = None,
         after_copy_metric: str | None = None,
-    ) -> torch.Tensor | None:
+    ) -> GraphOutput | None:
         """Template method for capture-or-replay lifecycle.
 
         Subclasses provide bucket selection, state construction, input copying,
@@ -273,7 +274,7 @@ class _GraphRunnerBase:
         *,
         device: torch.device | str,
         state: Any,
-        run: Callable[[], torch.Tensor],
+        run: Callable[[], GraphOutput],
         copy_inputs: Callable[[Any], None],
         before_run: Callable[[Any], None] | None = None,
     ) -> Any:

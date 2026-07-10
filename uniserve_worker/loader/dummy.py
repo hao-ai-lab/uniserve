@@ -1,7 +1,7 @@
 """CPU/meta dummy loader for tests and bring-up without real weights."""
 from __future__ import annotations
 
-from typing import Any, Type
+from typing import Any, Type, cast
 
 import torch
 
@@ -25,9 +25,10 @@ class DummyModelLoader(BaseModelLoader):
         **kwargs: Any,
     ) -> LoadResult:
         del model_path, kwargs
-        model = model_cls(config=config)  # type: ignore[call-arg]
-        if hasattr(model, "to"):
-            model.to(device)  # type: ignore[attr-defined]
+        model = cast(Any, model_cls)(config=config)
+        move_to = getattr(model, "to", None)
+        if callable(move_to):
+            move_to(device)
         for param in getattr(model, "parameters", lambda: [])():
             if param.is_floating_point():
                 torch.nn.init.normal_(param, mean=0.0, std=0.02)

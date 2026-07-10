@@ -437,6 +437,8 @@ def _shard_plan_expects_global_shape(tensor: torch.Tensor, target: torch.Tensor)
     target shape exactly, so genuinely wrong checkpoints still fail loudly on
     the direct-write path.
     """
+    if not isinstance(target, torch.nn.Parameter):
+        return False
     plan = get_shard_plan(target)
     if plan is None:
         return False

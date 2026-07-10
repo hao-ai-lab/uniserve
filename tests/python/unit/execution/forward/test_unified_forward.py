@@ -637,6 +637,59 @@ def test_text_driver_graph_result_runs_decode_burst_without_eager_fallback():
     torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([5], dtype=torch.long))
 
 
+def test_text_driver_scores_prompt_across_prefill_chunk_boundaries():
+    states = RequestStateTable()
+    state = states.get(7)
+    state.sampling = {
+        "temperature": 0.0,
+        "return_prompt_logprobs": True,
+        "n_prompt_logprobs": 1,
+    }
+
+    class Model:
+        def run_text_logits(self, op):
+            if op["pos_range"] == [0, 2]:
+                return torch.tensor(
+                    [[[0.0, 1.0, 4.0, 2.0, -1.0], [0.0, 1.0, 2.0, 5.0, -1.0]]]
+                )
+            return torch.tensor(
+                [[[0.0, 1.0, 2.0, 3.0, 6.0], [0.0, 5.0, 2.0, 3.0, 1.0]]]
+            )
+
+    driver = TextDriver()
+    first = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "prefill_und",
+                "token_ids": [1, 2],
+                "pos_range": [0, 2],
+                "return_all_logits": True,
+            }
+        ]
+    )
+    second = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "prefill_und",
+                "token_ids": [3, 4],
+                "pos_range": [2, 4],
+                "return_all_logits": True,
+            }
+        ]
+    )
+
+    with use_forward_context(ForwardContext(stats=ForwardStats())):
+        first_output = driver.step(first, states, Model())[0]
+        second_output = driver.step(second, states, Model())[0]
+
+    assert [position[0][0] for position in first_output.prompt_logprobs] == [2]
+    assert [position[0][0] for position in second_output.prompt_logprobs] == [3, 4]
+    assert all(position[0][2] == 1 for position in first_output.prompt_logprobs)
+    assert all(position[0][2] == 1 for position in second_output.prompt_logprobs)
+
+
 def test_executor_strict_graph_policy_rejects_eager_fallback():
     plan = ForwardPlanBuilder().build(
         [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],

@@ -155,6 +155,7 @@ def test_core_kinds_roundtrip():
     resp = runtime.handle({"kind": "execute", "batch": batch})
     assert resp["kind"] == "result"
     assert resp["result"]["per_seq"][0]["req_id"] == 1
+    assert resp["result"]["per_seq"][0]["op_kind"] == "prefill_und"
 
 
 def test_observability_kinds_are_read_only_and_scalar():

@@ -30,7 +30,7 @@ pub struct UtilityCallOutput {
 }
 
 /// Semantic classification of a raw `EngineCoreOutputs` message.
-
+///
 /// Python currently uses one product-shaped wire struct for several distinct
 /// output families. This enum exposes those families more explicitly without
 /// changing the wire format.

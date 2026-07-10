@@ -5,6 +5,7 @@ import torch
 
 from uniserve_worker.execution.forward.graph.interleaved_text import (
     InterleavedTextDecodeGraphRunner,
+    InterleavedTextPrefillGraphRunner,
     _Row,
 )
 from uniserve_worker.models.sensenova.model import _SenseNovaDecoderModel
@@ -72,6 +73,33 @@ def test_interleaved_decode_graph_forward_uses_cache_position_without_index_side
     assert calls
     assert tuple(logits.shape) == (2, 3)
     torch.testing.assert_close(logits, torch.tensor([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]))
+
+
+def test_interleaved_prefill_graph_selects_last_real_token_from_all_logits():
+    runner = InterleavedTextPrefillGraphRunner()
+    input_ids = torch.tensor([5, 6, 0, 0], dtype=torch.long)
+    positions = torch.tensor([0, 1, 0, 0], dtype=torch.long)
+    cache = SimpleNamespace(pool=object(), base_len=0)
+    state = SimpleNamespace(
+        num_tokens=4,
+        batch_size=1,
+        input_ids=input_ids,
+        positions=positions,
+        last_token_indices=torch.tensor([1], dtype=torch.long),
+        cache=cache,
+    )
+    calls = []
+
+    class Owner:
+        def interleaved_text_forward(self, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["return_all_logits"] is True
+            return SimpleNamespace(logits=torch.arange(12, dtype=torch.float32).view(1, 4, 3))
+
+    logits = runner._forward(SimpleNamespace(owner=Owner()), state)
+
+    assert calls
+    torch.testing.assert_close(logits, torch.tensor([[3.0, 4.0, 5.0]]))
 
 
 def test_decoder_cache_position_builds_batched_text_indexes():

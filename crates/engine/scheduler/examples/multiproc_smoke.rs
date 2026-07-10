@@ -3,8 +3,12 @@
 //! through the scheduler, and exercise correlated control fan-out.
 use std::collections::HashMap;
 
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
-use uniserve_engine_api::{GenEvent, GenerateRequest};
+use uniserve_core::{
+    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
+    TriggerPolicyDescriptor, UndVisibility,
+};
+use uniserve_engine_api::GenEvent;
 use uniserve_executor::{ControlOp, Executor};
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_worker_ipc::MultiprocExecutor;
@@ -44,24 +48,13 @@ fn main() -> anyhow::Result<()> {
     let mut rxs: HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>> =
         HashMap::new();
     for id in 1..=3u64 {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        rxs.insert(RequestId(id), rx);
-        sched.submit_for_test(GenerateRequest::new(
-            RequestId(id),
-            vec![1, 2, 3],
-            SamplingParams::default(),
-            ImageParams {
-                steps: 4,
-                ..Default::default()
-            },
-            if id == 3 {
-                GenerationConstraint::GenOnly
-            } else {
-                GenerationConstraint::UndOnly
-            },
-            20,
-            tx,
-        ));
+        let constraint = if id == 3 {
+            GenerationConstraint::GenOnly
+        } else {
+            GenerationConstraint::UndOnly
+        };
+        let request = generation_request(id, constraint);
+        rxs.insert(RequestId(id), sched.submit_for_test(request));
     }
     for _ in 0..400 {
         if !sched.step() {
@@ -91,4 +84,40 @@ fn main() -> anyhow::Result<()> {
     );
     assert!(ok);
     Ok(())
+}
+
+fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRequest {
+    let policy = GenerationPolicyDescriptor {
+        trigger: TriggerPolicyDescriptor::Token { token_id: 1 },
+        gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
+        ..GenerationPolicyDescriptor::default()
+    };
+    GenerationRequest {
+        request_id: RequestId(id),
+        context: vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3],
+            visibility: UndVisibility::Internal,
+        }],
+        negative_context: Vec::new(),
+        constraint,
+        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+        sampling: SamplingParams::default(),
+        image: ImageParams {
+            steps: 4,
+            ..ImageParams::default()
+        },
+        max_und_tokens: 20,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache: Default::default(),
+        policy,
+        resources: GenerationResourceBounds {
+            context_tokens: 3,
+            max_kv_tokens: 23,
+            ..GenerationResourceBounds::default()
+        },
+    }
 }

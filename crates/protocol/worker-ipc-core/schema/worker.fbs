@@ -64,7 +64,8 @@ enum KvGroupKind : ubyte { Full, SlidingWindow }
 table U32List { items:[uint]; }
 table U64List { items:[ulong]; }
 table TokenBias { token_id:uint; bias:float; }
-table TokenLogprob { token_id:uint; logprob:float; }
+table TokenLogprob { token_id:uint; logprob:float; rank:uint; }
+table PositionLogprobs { entries:[TokenLogprob]; }
 table BlockPair { src:uint; dst:uint; }
 table StringU64Pair { key:string; value:ulong; }
 
@@ -83,6 +84,10 @@ table SamplingParams {
   n_logprobs:uint;
   bad_words_ids:[U32List];
   allowed_token_ids:[uint];
+  return_logprobs:bool;
+  return_prompt_logprobs:bool;
+  n_prompt_logprobs:uint;
+  logprob_token_ids:[uint];
 }
 
 table ImageParams {
@@ -226,6 +231,8 @@ table ForwardOp {
   // KV written after the stop will be discarded with that request.
   // Append-only for FlatBuffers compatibility.
   decode_stop_terminal:bool = false;
+  // Request all token-position logits for prompt scoring. Append-only.
+  return_all_logits:bool = false;
 }
 
 table ForwardBatch {
@@ -259,6 +266,14 @@ table SeqResult {
   // for FlatBuffers compatibility. `sampled_token_id` remains the last token for
   // old scalar consumers.
   sampled_token_ids:[uint];
+  // Echoed operation class for scheduler-side planned-transition validation.
+  // `has_op_kind` distinguishes a real PrefillUnd value from an older payload
+  // whose append-only field is absent.
+  op_kind:OpKind = PrefillUnd;
+  has_op_kind:bool = false;
+  // Ranked candidate sets for prompt positions scored by this prefill chunk.
+  // Append-only; the first prompt token has no entry.
+  prompt_logprobs:[PositionLogprobs];
 }
 
 table ForwardResult {

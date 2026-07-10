@@ -26,7 +26,7 @@ from .host_staging import (
 from .host_staging import (
     is_pinned as _is_pinned,
 )
-from .kv_pool import PagedKVPool
+from .kv_pool import PagedKVPool, PagedRequestCache
 
 __all__ = [
     'PagedTransformerLayer',
@@ -303,7 +303,7 @@ def stage_paged_text_cache_prefix(
 
 
 def copy_paged_text_cache_span(
-    source: PagedTextCache,
+    source: PagedTextCache | PagedRequestCache,
     target: PagedTextCache,
     *,
     start: int,

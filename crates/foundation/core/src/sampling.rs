@@ -16,8 +16,8 @@ use crate::SamplingParams;
 pub struct SampleOutput {
     pub token: u32,
     pub logprob: f32,
-    /// Top `(token_id, logprob)` pairs (length == requested n_logprobs).
-    pub top: Vec<(u32, f32)>,
+    /// Ranked sampled, top, and explicitly requested vocabulary candidates.
+    pub top: Vec<(u32, f32, u32)>,
 }
 
 const NEG_INF: f32 = f32::NEG_INFINITY;
@@ -154,23 +154,71 @@ pub fn apply_sampling(
     // 10. gather logprobs (softmax of the final, masked logits).
     let logprobs = log_softmax(logits);
     let sampled_lp = logprobs.get(token as usize).copied().unwrap_or(NEG_INF);
-    let mut top: Vec<(u32, f32)> = Vec::new();
-    if n_logprobs > 0 {
-        let mut order: Vec<usize> = (0..v).filter(|&i| logits[i] != NEG_INF).collect();
-        order.sort_by(|&a, &b| {
-            logprobs[b]
-                .partial_cmp(&logprobs[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &i in order.iter().take(n_logprobs) {
-            top.push((i as u32, logprobs[i]));
-        }
-    }
+    let top = if p.generated_logprobs_requested() || n_logprobs > 0 {
+        score_token_logprobs(logits, token, n_logprobs, &p.logprob_token_ids)
+    } else {
+        Vec::new()
+    };
     SampleOutput {
         token,
         logprob: sampled_lp,
         top,
     }
+}
+
+/// Score one known token against a vocabulary-logits row and return ranked candidates.
+pub fn score_token_logprobs(
+    logits: &[f32],
+    token: u32,
+    n_logprobs: usize,
+    requested_token_ids: &[u32],
+) -> Vec<(u32, f32, u32)> {
+    let logprobs = log_softmax(logits);
+    let mut order: Vec<usize> = (0..logits.len())
+        .filter(|&index| logits[index] != NEG_INF)
+        .collect();
+    order.sort_by(|&a, &b| {
+        logprobs[b]
+            .partial_cmp(&logprobs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let token_index = token as usize;
+    if token_index >= logits.len() {
+        return Vec::new();
+    }
+    let sampled_rank = competition_rank(&logprobs, logprobs[token_index]);
+    let mut entries = vec![(token, logprobs[token_index], sampled_rank)];
+    for &index in order.iter().take(n_logprobs) {
+        let token_id = index as u32;
+        if !entries.iter().any(|(existing, _, _)| *existing == token_id) {
+            entries.push((
+                token_id,
+                logprobs[index],
+                competition_rank(&logprobs, logprobs[index]),
+            ));
+        }
+    }
+    for &token_id in requested_token_ids {
+        let index = token_id as usize;
+        if index < logits.len() && !entries.iter().any(|(existing, _, _)| *existing == token_id) {
+            entries.push((
+                token_id,
+                logprobs[index],
+                competition_rank(&logprobs, logprobs[index]),
+            ));
+        }
+    }
+    entries
+}
+
+fn competition_rank(logprobs: &[f32], value: f32) -> u32 {
+    let strictly_greater = logprobs
+        .iter()
+        .filter(|&&candidate| candidate > value)
+        .count();
+    u32::try_from(strictly_greater)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -328,6 +376,21 @@ mod tests {
     }
 
     #[test]
+    fn logprob_ranks_use_competition_ranking_for_ties_and_masked_requests() {
+        let logits = [2.0, 2.0, 1.0, NEG_INF, NEG_INF];
+        let scored = score_token_logprobs(&logits, 1, logits.len(), &[4]);
+
+        assert_eq!(
+            scored
+                .iter()
+                .map(|&(token, _, rank)| (token, rank))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (0, 1), (2, 3), (4, 4)]
+        );
+        assert!(scored.iter().all(|&(_, _, rank)| rank >= 1));
+    }
+
+    #[test]
     fn defaults_are_noop_argmax() {
         // Every transform unset => plain argmax, deterministic.
         let mut l = base_logits();
@@ -412,7 +475,7 @@ mod tests {
         };
         let out = apply_sampling(&mut l, &p, &[], None, None, 5);
         assert_eq!(out.top.len(), 2, "only the 2 survivors are reportable");
-        let reported: Vec<u32> = out.top.iter().map(|&(t, _)| t).collect();
+        let reported: Vec<u32> = out.top.iter().map(|&(t, _, _)| t).collect();
         assert!(
             !reported.contains(&2),
             "pruned token 2 excluded from logprobs"

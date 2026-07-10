@@ -203,7 +203,9 @@ impl TransferAgent for InProcessAgent {
         // The in-process locator is the 8-byte little-endian segment id (or
         // empty for a degenerate worker-local handle).
         let segment_id = if locator.len() == 8 {
-            u64::from_le_bytes(locator.try_into().expect("checked len == 8"))
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(locator);
+            u64::from_le_bytes(bytes)
         } else {
             0
         };
@@ -225,14 +227,14 @@ impl TransferAgent for InProcessAgent {
     fn notify(&self, _remote: &RemoteSegment, msg: Vec<u8>) {
         self.notifies
             .lock()
-            .expect("notify queue poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push_back(msg);
     }
 
     fn drain_notifies(&self) -> Vec<Vec<u8>> {
         self.notifies
             .lock()
-            .expect("notify queue poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain(..)
             .collect()
     }

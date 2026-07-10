@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 /// Tensors and ndarrays are encoded with this extension type in Python.
-
+///
 const CUSTOM_TYPE_RAW_VIEW: i8 = 3;
 
 #[easy_ext::ext(ShapeExt)]
@@ -20,10 +20,10 @@ impl [usize] {
 }
 
 /// Python ndarray/tensor wire tuple encoded as `(dtype, shape, data)`.
-
+///
 /// This matches the custom msgpack representation built by Python
 /// `serial_utils.encode_ndarray` / `encode_tensor`.
-
+///
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct WireNdArray {
     pub dtype: String,
@@ -83,7 +83,7 @@ impl WireNdArray {
     }
 
     /// Build a bool tensor/ndarray backed by raw-view bytes.
-
+    ///
     /// This matches `torch.bool` storage: one byte per element, not a packed
     /// bitmap. Values are canonicalized as `false -> 0` and `true -> 1`.
     pub fn from_bool(shape: Vec<usize>, data: Vec<bool>) -> Result<Self, String> {
@@ -96,7 +96,7 @@ impl WireNdArray {
     }
 
     /// Build a tensor/ndarray from already-encoded raw-view bytes.
-
+    ///
     /// Use this as an escape hatch when the caller already owns bytes that
     /// match the requested `dtype` and `shape`.
     pub fn from_raw(dtype: impl Into<String>, shape: Vec<usize>, data: Vec<u8>) -> Self {
@@ -124,16 +124,16 @@ fn validate_element_count(shape: &[usize], len: usize) -> Result<(), String> {
 }
 
 /// Python tensor wire tuple encoded as `(dtype, shape, data)`.
-
+///
 /// This is the same wire shape as [`WireNdArray`]; multimodal request payloads
 /// use it for `torch.Tensor` values.
 pub type WireTensor = WireNdArray;
 
 /// Python array/tensor payload reference inside [`WireNdArray`].
-
+///
 /// The data can be either an inline msgpack raw-view extension or an index into
 /// the multipart aux-frame list carried alongside the primary msgpack frame.
-
+///
 #[derive(Debug, Clone, PartialEq, EnumAsInner)]
 pub enum WireArrayData {
     /// The index of the aux frame where the raw bytes of this array/tensor are

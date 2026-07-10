@@ -8,8 +8,15 @@ use std::collections::{BTreeMap, HashMap};
 
 struct Entry {
     handle: u64,
+    physical_kv_tokens: u32,
     ref_cnt: u32,
     lru: u64, // monotonic tick, larger == more recent
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedEncoderOutput {
+    pub handle: u64,
+    pub physical_kv_tokens: u32,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -28,6 +35,11 @@ pub struct EncoderCacheStats {
 pub struct EncoderCacheManager {
     budget: usize,                // max cached entries
     entries: HashMap<u64, Entry>, // content hash -> entry
+    // Reset removes entries from lookup immediately, but a worker-side tensor
+    // cannot be reclaimed while an in-flight request still holds a reference.
+    // Retired entries remain here until their final pin is released. A later
+    // computation may reactivate an equivalent handle under the same hash.
+    retired: HashMap<u64, Vec<Entry>>, // content hash -> pinned retired generations
     // Index of evictable (ref_cnt == 0) entries ordered by LRU tick, so the
     // victim search and `can_insert` are O(log n) / O(1) instead of full scans
     // of `entries`. Invariant: a hash is in `evictable` keyed by its current
@@ -41,8 +53,9 @@ pub struct EncoderCacheManager {
 impl EncoderCacheManager {
     pub fn new(budget: usize) -> Self {
         Self {
-            budget: budget.max(1),
+            budget,
             entries: HashMap::new(),
+            retired: HashMap::new(),
             evictable: BTreeMap::new(),
             tick: 0,
             stats: EncoderCacheStats::default(),
@@ -50,13 +63,21 @@ impl EncoderCacheManager {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.retired.values().map(Vec::len).sum::<usize>()
     }
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.retired.is_empty()
     }
     pub fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Inspect a resident output without changing LRU order or cache metrics.
+    pub fn peek_output(&self, hash: u64) -> Option<CachedEncoderOutput> {
+        self.entries.get(&hash).map(|entry| CachedEncoderOutput {
+            handle: entry.handle,
+            physical_kv_tokens: entry.physical_kv_tokens,
+        })
     }
 
     fn next_tick(&mut self) -> u64 {
@@ -66,6 +87,11 @@ impl EncoderCacheManager {
 
     /// Look up a cached encoder handle by content hash (counts a query/hit).
     pub fn lookup(&mut self, hash: u64) -> Option<u64> {
+        self.lookup_output(hash).map(|output| output.handle)
+    }
+
+    /// Look up the handle and measured KV effect needed to skip image ingest.
+    pub fn lookup_output(&mut self, hash: u64) -> Option<CachedEncoderOutput> {
         self.stats.queries += 1;
         let tick = self.next_tick();
         if let Some(e) = self.entries.get_mut(&hash) {
@@ -78,7 +104,10 @@ impl EncoderCacheManager {
                 self.evictable.remove(&old_lru);
                 self.evictable.insert(tick, hash);
             }
-            Some(e.handle)
+            Some(CachedEncoderOutput {
+                handle: e.handle,
+                physical_kv_tokens: e.physical_kv_tokens,
+            })
         } else {
             None
         }
@@ -88,12 +117,12 @@ impl EncoderCacheManager {
     /// to insert another entry without exceeding the budget by referenced ones.
     pub fn can_insert(&self) -> bool {
         // room exists if under budget, or some entry is unreferenced (evictable).
-        self.entries.len() < self.budget || !self.evictable.is_empty()
+        self.len() < self.budget || !self.evictable.is_empty()
     }
 
     /// Insert a freshly-computed encoder handle, evicting the LRU unreferenced
     /// entry if at budget. Returns any freed handle (to report to the worker).
-
+    ///
     /// `budget` bounds the *evictable* working set, not the live set. The
     /// encoder output already exists on the worker by the time it reaches here
     /// and the caller pins it immediately for the in-flight request, so a
@@ -105,17 +134,53 @@ impl EncoderCacheManager {
     /// the over-subscription is observable rather than silent. The hard cap is
     /// enforced upstream via [`can_insert`](Self::can_insert) at admission.
     pub fn insert(&mut self, hash: u64, handle: u64) -> Option<u64> {
-        let mut freed = None;
-        // Replacing an existing entry resets its ref_cnt to 0; drop its stale
-        // evictable index slot first so the invariant holds.
-        let existing_evictable_tick = self
-            .entries
+        self.insert_output(hash, handle, 0)
+    }
+
+    pub fn insert_output(
+        &mut self,
+        hash: u64,
+        handle: u64,
+        physical_kv_tokens: u32,
+    ) -> Option<u64> {
+        if self.entries.contains_key(&hash) {
+            let tick = self.next_tick();
+            if let Some(existing) = self.entries.get_mut(&hash) {
+                let existing_handle = existing.handle;
+                let old_lru = existing.lru;
+                let evictable = existing.ref_cnt == 0;
+                existing.lru = tick;
+                existing.physical_kv_tokens = physical_kv_tokens;
+                if evictable {
+                    self.evictable.remove(&old_lru);
+                    self.evictable.insert(tick, hash);
+                }
+                // Concurrent misses compute equivalent output. Preserve the
+                // existing entry and its references; a distinct redundant
+                // handle can be reclaimed by the caller.
+                return (existing_handle != handle).then_some(handle);
+            }
+        }
+
+        let retired_match = self
+            .retired
             .get(&hash)
-            .filter(|old| old.ref_cnt == 0)
-            .map(|old| old.lru);
-        if let Some(old_lru) = existing_evictable_tick {
-            self.evictable.remove(&old_lru);
-        } else if !self.entries.contains_key(&hash) && self.entries.len() >= self.budget {
+            .and_then(|entries| entries.iter().position(|entry| entry.handle == handle));
+        if let Some(index) = retired_match {
+            let mut entry = match self.retired.get_mut(&hash) {
+                Some(entries) if index < entries.len() => entries.swap_remove(index),
+                _ => unreachable!("retired encoder entry disappeared without mutation"),
+            };
+            if self.retired.get(&hash).is_some_and(Vec::is_empty) {
+                self.retired.remove(&hash);
+            }
+            entry.lru = self.next_tick();
+            entry.physical_kv_tokens = physical_kv_tokens;
+            self.entries.insert(hash, entry);
+            return None;
+        }
+        let mut freed = None;
+        if self.len() >= self.budget {
             // At budget and inserting a new key: evict the LRU unreferenced entry
             // (smallest tick in the evictable index), if any exists.
             if let Some((_, victim)) = self.evictable.pop_first() {
@@ -134,6 +199,7 @@ impl EncoderCacheManager {
             hash,
             Entry {
                 handle,
+                physical_kv_tokens,
                 ref_cnt: 0,
                 lru: tick,
             },
@@ -158,9 +224,11 @@ impl EncoderCacheManager {
         Some(e.handle)
     }
 
-    /// Release a reference (entry becomes evictable at ref_cnt 0).
-    pub fn release(&mut self, hash: u64) {
+    /// Release a reference. Active entries become evictable at zero references;
+    /// retired entries are removed and return their worker handle for reclaim.
+    pub fn release(&mut self, hash: u64, handle: u64) -> Option<u64> {
         if let Some(e) = self.entries.get_mut(&hash)
+            && e.handle == handle
             && e.ref_cnt > 0
         {
             e.ref_cnt -= 1;
@@ -169,14 +237,39 @@ impl EncoderCacheManager {
                 let lru = e.lru;
                 self.evictable.insert(lru, hash);
             }
+            return None;
         }
+
+        let mut freed = None;
+        let mut remove_hash = false;
+        if let Some(entries) = self.retired.get_mut(&hash)
+            && let Some(index) = entries
+                .iter()
+                .position(|entry| entry.handle == handle && entry.ref_cnt > 0)
+        {
+            entries[index].ref_cnt -= 1;
+            if entries[index].ref_cnt == 0 {
+                freed = Some(entries.swap_remove(index).handle);
+            }
+            remove_hash = entries.is_empty();
+        }
+        if remove_hash {
+            self.retired.remove(&hash);
+        }
+        freed
     }
 
-    /// Clear the whole cache (the `/reset_encoder_cache` action). Returns all
-    /// freed handles to report to the worker.
+    /// Invalidate the whole cache. Unpinned worker handles are returned
+    /// immediately; pinned entries retire until their final reference drops.
     pub fn clear(&mut self) -> Vec<u64> {
-        let freed: Vec<u64> = self.entries.values().map(|e| e.handle).collect();
-        self.entries.clear();
+        let mut freed = Vec::new();
+        for (hash, entry) in std::mem::take(&mut self.entries) {
+            if entry.ref_cnt == 0 {
+                freed.push(entry.handle);
+            } else {
+                self.retired.entry(hash).or_default().push(entry);
+            }
+        }
         self.evictable.clear();
         freed
     }
@@ -220,6 +313,21 @@ mod tests {
         assert!(c.lookup(1).is_some());
     }
 
+    #[test]
+    fn duplicate_insert_preserves_existing_references() {
+        let mut c = EncoderCacheManager::new(2);
+        c.insert_output(1, 100, 4);
+        c.acquire(1);
+
+        assert_eq!(c.insert_output(1, 100, 5), None);
+        assert_eq!(c.release(1, 100), None);
+        assert!(c.can_insert());
+        assert_eq!(c.lookup_output(1).unwrap().physical_kv_tokens, 5);
+
+        assert_eq!(c.insert_output(1, 101, 5), Some(101));
+        assert_eq!(c.peek_output(1).map(|output| output.handle), Some(100));
+    }
+
     // at budget with every entry pinned, a (necessarily pinned-on-arrival)
     // insert grows the live set past `budget` instead of dropping the handle,
     // and the over-subscription is counted rather than silent.
@@ -242,7 +350,7 @@ mod tests {
         assert!(c.lookup(1).is_some() && c.lookup(2).is_some() && c.lookup(3).is_some());
 
         // Once a pinned entry is released, the budget is reclaimed on next insert.
-        c.release(1);
+        assert_eq!(c.release(1, 100), None);
         let freed = c.insert(4, 400);
         assert_eq!(
             freed,
@@ -260,7 +368,7 @@ mod tests {
         c.insert(2, 200);
         c.acquire(2); // pin 2 -> only 1 is evictable, but acquire makes 2 newest
         assert!(c.can_insert(), "1 is unreferenced, so there is room");
-        c.release(2); // 2 becomes evictable again; its LRU tick is newer than 1
+        assert_eq!(c.release(2, 200), None); // 2 becomes evictable again
         // At budget; inserting a new key must evict the LRU unreferenced entry,
         // which is 1 (touched at insert) — 2's tick advanced on acquire.
         let freed = c.insert(3, 300);
@@ -270,17 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn reinsert_same_hash_keeps_index_consistent() {
-        // Re-inserting an existing hash resets ref_cnt; the evictable index must
-        // not retain a stale slot for the old tick.
+    fn reinsert_same_hash_preserves_pin_and_keeps_index_consistent() {
         let mut c = EncoderCacheManager::new(2);
         c.insert(1, 100);
-        c.acquire(1); // pin -> not evictable
-        c.insert(1, 101); // overwrite resets ref_cnt to 0 -> evictable again
+        c.acquire(1);
+        assert_eq!(c.insert(1, 101), Some(101));
         assert_eq!(c.len(), 1);
-        c.insert(2, 200); // fills budget, no eviction needed
-        let freed = c.insert(3, 300); // at budget -> evict LRU unreferenced (1)
-        assert_eq!(freed, Some(101), "re-inserted entry 1 is the LRU evictable");
+        c.insert(2, 200);
+        assert_eq!(
+            c.insert(3, 300),
+            Some(200),
+            "the duplicate insert must not make pinned entry 1 evictable"
+        );
+        assert_eq!(c.peek_output(1).map(|output| output.handle), Some(100));
+
+        assert_eq!(c.release(1, 100), None);
+        assert_eq!(c.insert(4, 400), Some(100));
         assert_eq!(c.lookup(1), None);
     }
 
@@ -293,5 +406,36 @@ mod tests {
         freed.sort();
         assert_eq!(freed, vec![10, 20]);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn clear_retires_pinned_entries_until_their_final_release() {
+        let mut c = EncoderCacheManager::new(2);
+        c.insert_output(1, 100, 4);
+        assert_eq!(c.acquire(1), Some(100));
+
+        assert!(c.clear().is_empty());
+        assert_eq!(c.lookup(1), None, "reset entries are no longer visible");
+        assert_eq!(c.len(), 1, "the pinned worker tensor remains accounted");
+        assert_eq!(c.release(1, 100), Some(100));
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn recompute_reactivates_an_equivalent_retired_handle() {
+        let mut c = EncoderCacheManager::new(2);
+        c.insert_output(1, 100, 4);
+        assert_eq!(c.acquire(1), Some(100));
+        assert!(c.clear().is_empty());
+
+        assert_eq!(c.insert_output(1, 100, 5), None);
+        assert_eq!(c.acquire(1), Some(100));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.release(1, 100), None);
+        assert_eq!(c.release(1, 100), None);
+        assert_eq!(
+            c.peek_output(1).map(|output| output.physical_kv_tokens),
+            Some(5)
+        );
     }
 }

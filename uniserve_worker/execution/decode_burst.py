@@ -92,7 +92,7 @@ class DecodeBurstExecutor:
 
         if terminal_stop:
             tokens = _truncate_at_stop(tokens, stop_ids)
-        result = (
+        result: dict[str, Any] = (
             {"req_id": _positive_int(first_op.get("req_id"), "req_id", minimum=0)}
             if terminal_stop
             else dict(last)

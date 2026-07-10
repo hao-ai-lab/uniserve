@@ -62,6 +62,8 @@ def zero_vocab_padding(
 
 
 class VocabParallelEmbedding(nn.Module):
+    weight: nn.Parameter
+
     """Embedding table sharded on the vocab axis."""
 
     def __init__(
@@ -196,17 +198,16 @@ class ParallelLMHead(ColumnParallelLinear):
 def _vocab_weight_loader(module: nn.Module):
     def load(param: nn.Parameter, loaded_weight: torch.Tensor, *, shard_id=None) -> None:
         del shard_id
-        vocab_size = (
-            int(module.num_embeddings)
-            if hasattr(module, "num_embeddings")
-            else int(module.vocab_size)
-        )
+        raw_vocab_size = getattr(module, "num_embeddings", None)
+        if raw_vocab_size is None:
+            raw_vocab_size = getattr(module, "vocab_size")
+        vocab_size = int(raw_vocab_size)
         _load_vocab_partition(
             param,
             loaded_weight,
             vocab_size=vocab_size,
-            start=int(module.vocab_start_index),
-            end=int(module.vocab_end_index),
+            start=int(getattr(module, "vocab_start_index")),
+            end=int(getattr(module, "vocab_end_index")),
         )
         zero_padding = getattr(module, "_zero_padding_rows", None)
         if callable(zero_padding):

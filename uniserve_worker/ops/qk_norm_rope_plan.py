@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Protocol, cast
 
 import torch
 
@@ -91,7 +91,7 @@ class QKNormRopePlan:
             raise RuntimeError("multi-axis qk_norm_rope weight/axis mismatch")
 
     @staticmethod
-    def shared_norm_group_end(req: QKNormRopeReq, start: int) -> int:
+    def shared_norm_group_end(req: _QKNormAxes, start: int) -> int:
         if req.axis_dims is None:
             return int(start) + 1
         q_weights = cast(tuple[torch.Tensor, ...], req.q_weight)
@@ -126,3 +126,14 @@ class QKNormRopePlan:
         return table.ndim == 2 and int(table.shape[0]) > 0 and (
             tokens % int(table.shape[0]) == 0 or int(table.shape[0]) % tokens == 0
         )
+
+
+class _QKNormAxes(Protocol):
+    @property
+    def axis_dims(self) -> tuple[int, ...] | None: ...
+
+    @property
+    def q_weight(self) -> torch.Tensor | tuple[torch.Tensor, ...]: ...
+
+    @property
+    def k_weight(self) -> torch.Tensor | tuple[torch.Tensor, ...]: ...

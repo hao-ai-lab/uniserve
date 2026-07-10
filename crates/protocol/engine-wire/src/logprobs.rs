@@ -14,7 +14,7 @@ use crate::error::{Error, Result, bail_ext_value_decode, ext_value_decode};
 use crate::tensor::{WireArrayData, WireNdArray};
 
 /// One token candidate and its logprob metadata for a single sequence position.
-
+///
 /// The first entry in a [`PositionLogprobs`] is always the sampled/selected
 /// token for that position. Any remaining entries follow the engine's returned
 /// top-k candidate order.
@@ -29,7 +29,7 @@ pub struct TokenLogprob {
 }
 
 /// Logprob payload for one sequence position.
-
+///
 /// This is the semantic Rust representation used by the public client API after
 /// the lower-level ndarray/tensor wire payload has been decoded.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,7 +41,7 @@ impl PositionLogprobs {
     /// Convert one decoded logprobs row into this per-position form by grouping
     /// each token/logprob pair together with the sampled/selected token's
     /// actual vocab rank.
-
+    ///
     /// `token_ids` is still in raw signed form: the engine right-pads ragged
     /// top-k rows with a `-1` sentinel (see [`array::TOKEN_ID_PADDING_SENTINEL`])
     /// in the trailing columns. Those padding slots carry no real token and are
@@ -81,12 +81,12 @@ impl PositionLogprobs {
 }
 
 /// Decoded per-request logprobs payload for one engine output.
-
+///
 /// Unlike the Python wire payload, this public Rust type is already fully
 /// semantic: one [`PositionLogprobs`] per scored position, each containing the
 /// sampled/selected token plus any returned top-k alternatives for that same
 /// position.
-
+///
 /// The Python engine still sends logprobs as ndarray/tensor-shaped wire tuples.
 /// Rust resolves that lower-level representation during decode and exposes only
 /// this per-position form to callers.
@@ -126,9 +126,9 @@ impl Deref for MaybeWireLogprobs {
     type Target = Logprobs;
 
     /// Dereferences to the decoded [`Logprobs`].
-
+    ///
     /// # Panics
-
+    ///
     /// Panics if the value is still in [`MaybeWireLogprobs::Wire`] form (i.e.
     /// [`resolve`](MaybeWireLogprobs::resolve) has not yet run). The `Deref`
     /// trait cannot signal this fallibly, so callers that may hold an
@@ -147,9 +147,9 @@ impl Deref for MaybeWireLogprobs {
 
 impl DerefMut for MaybeWireLogprobs {
     /// Mutably dereferences to the decoded [`Logprobs`].
-
+    ///
     /// # Panics
-
+    ///
     /// Panics if the value is still in [`MaybeWireLogprobs::Wire`] form (i.e.
     /// [`resolve`](MaybeWireLogprobs::resolve) has not yet run). The `DerefMut`
     /// trait cannot signal this fallibly, so callers that may hold an
@@ -238,7 +238,7 @@ impl EngineCoreOutput {
 
 impl WireLogprobs {
     /// Convert semantic per-position logprobs into the Python wire tuple shape.
-
+    ///
     /// This exists mainly so Rust-side tests can inject semantic logprobs into
     /// mocked engine outputs without manually building ndarray
     /// raw-view tuples.

@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::Context as _;
-use uniserve_core::RequestId;
-use uniserve_engine_api::{EngineHandle, GenerateRequest};
+use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, RequestId};
+use uniserve_engine_api::{EngineHandle, EventRx};
 use uniserve_executor::{Executor, TransferSpec, WorkerKind, WorkersSpec};
 use uniserve_scheduler::{
     ControlTokens, DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH,
@@ -98,17 +98,15 @@ pub struct EngineCoreConfig {
     pub req_slot_cap: usize,
     /// Response-ring slot capacity in bytes.
     pub resp_slot_cap: usize,
-    /// Control-token ids resolved from the tokenizer (drive EOS / image lifecycle decisions).
+    /// Control-token ids resolved from the tokenizer for EOS and feedback continuation.
     pub bos: u32,
     pub eos: Vec<u32>,
-    pub start_of_image: u32,
     pub end_of_image: u32,
-    pub image_start_ids: Vec<u32>,
 }
 
 impl EngineCoreConfig {
     /// A minimal config for the GPU-free sim backend (used by tests).
-
+    ///
     /// Pair this with [`EngineCore::with_executor`]: [`EngineCore::new`] cannot
     /// build a `Sim` backend because it has no spawnable worker process.
     pub fn sim(model: impl Into<String>) -> Self {
@@ -138,9 +136,7 @@ impl EngineCoreConfig {
             // scheduler must recognize it to finish a sim request.
             bos: 0,
             eos: vec![151645],
-            start_of_image: 0,
             end_of_image: 0,
-            image_start_ids: Vec::new(),
         }
     }
 
@@ -148,9 +144,7 @@ impl EngineCoreConfig {
         ControlTokens {
             bos: self.bos,
             eos: self.eos.clone(),
-            start_of_image: self.start_of_image,
             end_of_image: self.end_of_image,
-            image_start_ids: self.image_start_ids.clone(),
         }
     }
 
@@ -167,6 +161,7 @@ pub struct EngineCore {
     stats: Arc<SchedStats>,
     model_name: String,
     max_model_len: u32,
+    generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities,
     sleeping: Arc<AtomicBool>,
     /// Engine-dead latch: set when the scheduler loop exits fatally (worker
     /// death) or panics.
@@ -178,10 +173,10 @@ pub struct EngineCore {
 impl EngineCore {
     /// Build the scheduler, spawn the forward-only worker, and start the
     /// scheduler owner thread.
-
+    ///
     /// Blocks until the worker has loaded the model and answered the
     /// `get_caps` handshake — for the real worker this can take minutes.
-
+    ///
     /// Only [`EngineBackend::Worker`] is constructible here: the `Sim` backend
     /// has no spawnable process, so a `Sim` config must instead supply its
     /// `SimEngine` executor through [`EngineCore::with_executor`] (which is
@@ -196,7 +191,7 @@ impl EngineCore {
 
     /// Spawn the non-disaggregated single Full pool (the default path). `tp == 1`
     /// is a `UniprocExecutor`; `tp > 1` a `MultiprocExecutor`. No `--worker-kind`
-    /// is passed, so the worker command line matches the legacy default exactly.
+    /// is passed because the worker starts in Full mode by default.
     fn spawn_full_pool(config: &EngineCoreConfig, tp: usize) -> anyhow::Result<Box<dyn Executor>> {
         let kv_token_capacity = config.effective_kv_token_capacity();
         if tp > 1 {
@@ -317,7 +312,7 @@ impl EngineCore {
                 pools.push((pool.kind, Box::new(exec)));
             }
         }
-        Ok(Box::new(StageRouter::new(pools)))
+        Ok(Box::new(StageRouter::try_new(pools)?))
     }
 
     /// Build the engine core from an executor supplied by a higher composition
@@ -336,6 +331,7 @@ impl EngineCore {
 
     fn assemble(config: EngineCoreConfig, executor: Box<dyn Executor>) -> anyhow::Result<Self> {
         let ctrl = config.control_tokens();
+        let generated_image_commit = executor.generated_image_commit_capabilities();
         // Capture the command waker before the executor moves into the
         // scheduler: when the executor is event-driven this fires its park's
         // command notifier; otherwise it is the no-op waker.
@@ -378,6 +374,7 @@ impl EngineCore {
             stats,
             model_name: config.model,
             max_model_len: config.max_model_len,
+            generated_image_commit,
             sleeping: Arc::new(AtomicBool::new(false)),
             dead,
             next_id: AtomicU64::new(1),
@@ -393,6 +390,30 @@ impl EngineCore {
     /// Worker-reported capabilities (the post-load truth).
     pub fn caps(&self) -> &EngineCaps {
         &self.caps
+    }
+
+    /// Serving-facing projection of post-load worker limits.
+    pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
+        let caps = &self.caps;
+        let mut supported_ops = caps.supported_ops.clone();
+        supported_ops.sort();
+        supported_ops.dedup();
+        GenerationRuntimeCapabilities {
+            supported_ops,
+            max_latent_units: u64::from(caps.max_latent_size),
+            latent_downsample: caps.latent_downsample,
+            max_vae_grid_tokens: if caps.max_vae_grid_tokens > 0 {
+                caps.max_vae_grid_tokens
+            } else {
+                caps.max_latent_size
+            },
+            max_vit_grid_tokens: caps.max_vit_grid_tokens,
+            commit_marker_tokens: caps.commit_marker_tokens,
+            max_cfg_branches: caps.max_cfg_branches,
+            scratch_capacity_tokens: caps.scratch_capacity_tokens,
+            encoder_cache_entries: caps.encoder_cache_budget,
+            generated_image_commit: self.generated_image_commit,
+        }
     }
 
     /// Live scheduler stats, shared with the scheduler thread.
@@ -419,20 +440,28 @@ impl EngineCore {
     }
 
     /// Submit one translated request to the scheduler.
-    pub fn submit(&self, req: GenerateRequest) -> anyhow::Result<()> {
+    pub fn submit(&self, request: GenerationRequest) -> anyhow::Result<EventRx> {
         if self.is_dead() {
             anyhow::bail!("engine core is dead (worker failure)");
         }
         self.handle
-            .submit(req)
+            .submit(request)
             .map_err(|message| anyhow::anyhow!(message))
     }
 
     // ---- control surface (the utility-call implementations) ----
 
-    pub fn reset_prefix_cache(&self) -> bool {
-        self.handle.reset_prefix_cache();
-        true
+    pub fn reset_prefix_cache(
+        &self,
+        reset_running_requests: bool,
+        reset_connector: bool,
+    ) -> anyhow::Result<bool> {
+        if reset_connector {
+            anyhow::bail!("no external prefix-cache connector is configured");
+        }
+        self.handle
+            .reset_prefix_cache(reset_running_requests)
+            .map_err(anyhow::Error::msg)
     }
 
     pub fn reset_encoder_cache(&self) {

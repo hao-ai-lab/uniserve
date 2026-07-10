@@ -13,6 +13,10 @@ Res = TypeVar("Res")
 DispatchReq = TypeVar("DispatchReq")
 CombineRes = TypeVar("CombineRes")
 Adapted = TypeVar("Adapted")
+ProviderReq = TypeVar("ProviderReq", contravariant=True)
+ProviderRes = TypeVar("ProviderRes", covariant=True)
+CommReq = TypeVar("CommReq", contravariant=True)
+CommRes = TypeVar("CommRes", covariant=True)
 
 
 @dataclass(frozen=True)
@@ -28,15 +32,15 @@ class Capabilities:
 
 
 @runtime_checkable
-class Provider(Protocol[Req, Res]):
+class Provider(Protocol[ProviderReq, ProviderRes]):
     name: str
     operator: str
 
     def capabilities(self) -> Capabilities: ...
 
-    def can_run(self, req: Req) -> bool: ...
+    def can_run(self, req: ProviderReq) -> bool: ...
 
-    def run(self, req: Req) -> Res: ...
+    def run(self, req: ProviderReq) -> ProviderRes: ...
 
 
 @dataclass(frozen=True)
@@ -57,19 +61,19 @@ class Handoff:
 
 
 @runtime_checkable
-class CommProvider(Protocol[DispatchReq, CombineRes]):
+class CommProvider(Protocol[CommReq, CommRes]):
     name: str
     operator: str
 
     def capabilities(self) -> Capabilities: ...
 
-    def can_dispatch(self, req: DispatchReq, *, mesh: Any | None = None) -> bool: ...
+    def can_dispatch(self, req: CommReq, *, mesh: Any | None = None) -> bool: ...
 
-    def dispatch(self, req: DispatchReq, *, mesh: Any | None = None) -> Handoff: ...
+    def dispatch(self, req: CommReq, *, mesh: Any | None = None) -> Handoff: ...
 
     def can_combine(self, handoff: Handoff, *, mesh: Any | None = None) -> bool: ...
 
-    def combine(self, handoff: Handoff, *, mesh: Any | None = None) -> CombineRes: ...
+    def combine(self, handoff: Handoff, *, mesh: Any | None = None) -> CommRes: ...
 
 
 

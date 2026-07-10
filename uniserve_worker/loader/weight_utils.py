@@ -236,7 +236,7 @@ def stacked_params_mapping_loop(
         if target_name not in params:
             if matched_stacked and name_mapper is not None:
                 fallback = name_mapper(source_name)
-                if fallback in params:
+                if fallback is not None and fallback in params:
                     target_name = fallback
                     shard_id = None
                 else:

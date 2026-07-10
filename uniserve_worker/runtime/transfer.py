@@ -250,7 +250,12 @@ class ShmTransport(Transport):
         raw = host.view(torch.uint8).reshape(-1)
         nbytes = int(raw.numel())
         shm = shared_memory.SharedMemory(create=True, size=max(1, nbytes))
-        memoryview(shm.buf)[:nbytes] = bytes(raw.numpy())
+        shm_buffer = shm.buf
+        if shm_buffer is None:
+            shm.close()
+            shm.unlink()
+            raise RuntimeError("shared-memory segment has no writable buffer")
+        memoryview(shm_buffer)[:nbytes] = bytes(raw.numpy())
         evicted: list[Any] = []
         with self._lock:
             self._segments[shm.name] = shm
@@ -280,7 +285,13 @@ class ShmTransport(Transport):
 
         shm = shared_memory.SharedMemory(name=locator.handle.decode())
         try:
-            buf = bytearray(memoryview(shm.buf)[: locator.nbytes])
+            shm_buffer = shm.buf
+            if shm_buffer is None:
+                raise RuntimeError("shared-memory segment has no readable buffer")
+            try:
+                buf = bytearray(memoryview(shm_buffer)[: locator.nbytes])
+            finally:
+                shm_buffer.release()
         finally:
             shm.close()
         out = (
@@ -480,7 +491,7 @@ def _ensure_mooncake_runtime() -> None:
     import glob
 
     try:
-        import nvidia.cuda_runtime  # type: ignore
+        import nvidia.cuda_runtime
 
         roots = list(getattr(nvidia.cuda_runtime, "__path__", []))
     except Exception:

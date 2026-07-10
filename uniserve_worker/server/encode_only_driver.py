@@ -60,7 +60,13 @@ class EncodeOnlyDriver(BaseWorkerDriver):
             encoder_cache_budget=int(getattr(model, "encoder_cache_budget", 0) or 0),
         )
 
-    def execute(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        defer_text_cpu_results: bool = False,
+    ) -> dict[str, Any]:
+        del defer_text_cpu_results
         for nr in batch.get("new_reqs") or ():
             self._register(nr)
         ops = list(batch.get("ops") or [])

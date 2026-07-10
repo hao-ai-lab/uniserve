@@ -27,7 +27,7 @@ def find_free_port() -> int:
 def require_uniserve_binary() -> Path:
     path = Path.cwd() / "target" / "debug" / "uniserve"
     if not path.exists():
-        raise FileNotFoundError(f"{path} does not exist; run `cargo build -p uniserve` first")
+        raise FileNotFoundError(f"{path} does not exist; run `cargo build -p uniserve-cli` first")
     return path
 
 

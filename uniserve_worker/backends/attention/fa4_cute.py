@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -46,6 +46,25 @@ _PREFIX_BOUNDS_CACHE: OrderedDict[
     tuple[int, int | None, int, int | None, int],
     tuple[torch.Tensor, torch.Tensor | None, torch.Tensor],
 ] = OrderedDict()
+
+
+class _ComputePrefixBounds(Protocol):
+    def __call__(self, visible_end: torch.Tensor, *, q_tile_size: int) -> torch.Tensor: ...
+
+
+class _ComputePrefixBoundsVarlen(Protocol):
+    def __call__(
+        self,
+        visible_end: torch.Tensor,
+        seqlens_q: torch.Tensor,
+        *,
+        q_tile_size: int,
+        num_q_tiles: int | None = None,
+    ) -> torch.Tensor: ...
+
+
+_compute_prefix_bounds: _ComputePrefixBounds | None
+_compute_prefix_bounds_varlen: _ComputePrefixBoundsVarlen | None
 try:  # pragma: no cover - optional CUDA package.
     from uniserve_kernel import mm_attn_varlen
 
@@ -249,6 +268,12 @@ def _cached_prefix_bounds(
     qhead_per_kvhead: int,
     q_tile_size: int,
 ) -> torch.Tensor:
+    compute_prefix_bounds = _compute_prefix_bounds
+    compute_prefix_bounds_varlen = _compute_prefix_bounds_varlen
+    if compute_prefix_bounds is None or compute_prefix_bounds_varlen is None:
+        detail = f": {_IMPORT_ERROR}" if _IMPORT_ERROR is not None else ""
+        raise RuntimeError(f"FA4 prefix-bound provider is unavailable{detail}")
+
     key = (
         id(visible_end),
         None if cu_seqlens_q is None else id(cu_seqlens_q),
@@ -277,13 +302,13 @@ def _cached_prefix_bounds(
             bounds_max_seqlen_q = int(bounds_max_seqlen_q) * int(qhead_per_kvhead)
 
     if cu_seqlens_q is None:
-        prefix_bounds = _compute_prefix_bounds(bounds_visible_end, q_tile_size=q_tile_size)
+        prefix_bounds = compute_prefix_bounds(bounds_visible_end, q_tile_size=q_tile_size)
     else:
         seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
         if qhead_per_kvhead > 1:
             seqlens_q = seqlens_q * int(qhead_per_kvhead)
         tiles = None if bounds_max_seqlen_q is None else ceil_div(bounds_max_seqlen_q, q_tile_size)
-        prefix_bounds = _compute_prefix_bounds_varlen(
+        prefix_bounds = compute_prefix_bounds_varlen(
             bounds_visible_end,
             seqlens_q,
             q_tile_size=q_tile_size,

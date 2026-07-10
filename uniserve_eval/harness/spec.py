@@ -85,6 +85,11 @@ class BenchmarkSpec:
     height: int | None = None
     steps: int | None = None
     max_images: int | None = None
+    guidance_scale: float | None = None
+    image_guidance_scale: float | None = None
+    cfg_norm: str | None = None
+    cfg_interval: tuple[float, float] | None = None
+    timestep_shift: float | None = None
 
     # Request/response shape for this task; see TASK_WIRES. Empty selects the
     # task's first (default) wire.
@@ -108,8 +113,26 @@ class BenchmarkSpec:
     # Per-request body extras (rarely needed).
     extra_request_body: dict = field(default_factory=dict)
 
+    # Formal measurement contract and artifact provenance.
+    runtime_profile_id: str = "unspecified"
+    measurement_interface: str = "public_protocol_adapter"
+    cache_read_policy: str = "enabled"
+    cache_write_policy: str = "enabled"
+    adapter_selection: str = "base"
+    structured_output_policy: str = "none"
+    output_constraint: str = "default"
+    preprocessing: str = "dataset_default"
+    measured_runs: int = 1
+    server_topology: str = "single_server"
+    plan_evidence_policy: str = "declared_contract"
+    acceptance_min_success: int = 1
+    acceptance_max_failed: int = 0
+    acceptance_min_images_per_success: float = 0.0
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "task", TaskName(self.task))
+        if self.num_prompts < 1:
+            raise ValueError("num_prompts must be positive")
         if not self.wire:
             object.__setattr__(self, "wire", TASK_WIRES[self.task][0])
         if self.wire not in TASK_WIRES[self.task]:
@@ -123,6 +146,22 @@ class BenchmarkSpec:
             object.__setattr__(self, "dataset", DEFAULT_DATASETS[self.task])
         if not self.name:
             object.__setattr__(self, "name", f"{self.model}_{self.task.value}_{self.dataset}")
+        if self.cfg_interval is not None and len(self.cfg_interval) != 2:
+            raise ValueError("cfg_interval must contain exactly two values")
+        if self.measured_runs != 1:
+            raise ValueError("one harness invocation is exactly one measured run")
+        if self.plan_evidence_policy not in {
+            "declared_contract",
+            "runtime_inspection",
+            "reference_protocol",
+        }:
+            raise ValueError("unsupported plan evidence policy")
+        if (
+            self.acceptance_min_success < 1
+            or self.acceptance_max_failed < 0
+            or self.acceptance_min_images_per_success < 0
+        ):
+            raise ValueError("acceptance criteria must require success and a non-negative failure bound")
 
     @property
     def is_stream_task(self) -> bool:

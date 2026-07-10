@@ -53,7 +53,7 @@ pub fn is_supported_wire_version(version: u16) -> bool {
 
 /// Fixed-size IPC frame header sent zero-copy across the worker process
 /// boundary.
-
+///
 /// Fields are ordered largest-alignment-first so the `#[repr(C)]` layout is
 /// completely free of implicit padding. This matters because the header is
 /// shipped via [`ZeroCopySend`]: any padding bytes the compiler inserted would
@@ -448,7 +448,7 @@ impl ServerEndpoint {
 }
 
 /// Build the IPC header that accompanies `req`.
-
+///
 /// `call_id` is the authoritative request/response correlation key. The
 /// `step_id`/`op_id` fields are populated from the batch's `step_id` and the
 /// *first* op only, as a cheap at-a-glance diagnostic hint (e.g. for tracing);
@@ -472,7 +472,7 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 }
 
 /// Build the IPC header that accompanies `resp`.
-
+///
 /// As in [`header_for_request`], `call_id` is the authoritative correlation
 /// key. `step_id`/`op_id` are populated from the result's `step_id` and the
 /// *first* per-seq entry only, as a diagnostic hint; a result may aggregate
@@ -604,9 +604,11 @@ mod tests {
 
     #[test]
     fn verify_header_len_rejects_unsupported_version() {
-        let mut h = Header::default();
-        h.version = WIRE_VERSION + 1;
-        h.len = 0;
+        let h = Header {
+            version: WIRE_VERSION + 1,
+            len: 0,
+            ..Default::default()
+        };
         assert!(verify_header_len(h, 0).is_err());
     }
 

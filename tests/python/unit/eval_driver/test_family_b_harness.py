@@ -29,6 +29,7 @@ import uniserve_eval.harness.core.client as client_module
 from uniserve_eval.harness import cli
 from uniserve_eval.harness.core.client import _parse_openai
 from uniserve_eval.harness.datasets import (
+    load_benchmark_inputs,
     load_dataset_rows,
     load_sharegpt,
     load_ueval,
@@ -36,12 +37,16 @@ from uniserve_eval.harness.datasets import (
 )
 from uniserve_eval.harness.metrics import summarize_image
 from uniserve_eval.harness.metrics.common import RequestRecord
-from uniserve_eval.harness.report import build_summary
+from uniserve_eval.harness.report import (
+    benchmark_contract,
+    benchmark_contract_is_valid,
+    build_summary,
+)
 from uniserve_eval.harness.response_classifier import (
     classify_json_image_response,
     classify_openai_events,
 )
-from uniserve_eval.harness.runner import RunResult
+from uniserve_eval.harness.runner import RunResult, reference_request_summary
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 from uniserve_eval.harness.sse import (
     aiter_sse_events,
@@ -49,8 +54,10 @@ from uniserve_eval.harness.sse import (
     iter_sse_events,
 )
 from uniserve_eval.harness.tasks.default import DefaultTask
+from uniserve_eval.harness.tasks.i2i import I2ITask
 from uniserve_eval.harness.tasks.i2t import I2TTask
 from uniserve_eval.harness.tasks.t2i import T2ITask
+from uniserve_eval.harness.tasks.text import TextTask
 
 pytestmark = [pytest.mark.unit]
 TERMINAL_TYPES = frozenset({"finished"})
@@ -227,7 +234,12 @@ def test_default_task_omits_image_cap_unless_explicit() -> None:
         )
     ).build_request({"prompt": "show each step visually and textually"})
 
-    assert uncapped.payload["image_config"] == {"width": 2048, "height": 1152, "steps": 50}
+    assert uncapped.payload["image_config"] == {
+        "width": 2048,
+        "height": 1152,
+        "steps": 50,
+        "seed": 42,
+    }
 
     capped = DefaultTask(
         BenchmarkSpec(
@@ -265,7 +277,13 @@ def test_default_task_can_emit_openai_chat_wire() -> None:
     assert request.payload["stream_options"] == {"include_usage": True}
     assert request.payload["max_completion_tokens"] == 8192
     assert request.payload["messages"] == [{"role": "user", "content": "show each step visually and textually"}]
-    assert request.payload["image_config"] == {"num_images": 4, "width": 2048, "height": 1152, "steps": 50}
+    assert request.payload["image_config"] == {
+        "num_images": 4,
+        "width": 2048,
+        "height": 1152,
+        "steps": 50,
+        "seed": 42,
+    }
 
 
 def test_spec_rejects_unsupported_wire_for_task() -> None:
@@ -330,6 +348,45 @@ def test_t2i_task_can_emit_image_only_chat_wire() -> None:
         "steps": 50,
         "seed": 42,
     }
+
+
+@pytest.mark.parametrize(
+    ("task_class", "task", "wire", "item"),
+    [
+        (DefaultTask, TaskName.DEFAULT, "openai_chat", {"prompt": "p"}),
+        (
+            I2ITask,
+            TaskName.I2I,
+            "openai_chat_json",
+            {"prompt": "p", "input_image_b64": "QUJD"},
+        ),
+        (
+            I2TTask,
+            TaskName.I2T,
+            "openai_chat",
+            {"prompt": "p", "input_image_b64": "QUJD"},
+        ),
+        (T2ITask, TaskName.T2I, "openai_chat_json", {"prompt": "p"}),
+        (TextTask, TaskName.TEXT, "openai_chat", {"prompt": "p"}),
+    ],
+)
+def test_chat_task_builders_preserve_declared_sampling_contract(
+    task_class, task: TaskName, wire: str, item: dict
+) -> None:
+    request = task_class(
+        BenchmarkSpec(
+            task=task,
+            model="M",
+            wire=wire,
+            temperature=0.35,
+            top_p=0.82,
+            ignore_eos=False,
+        )
+    ).build_request(item)
+
+    assert request.payload["temperature"] == 0.35
+    assert request.payload["top_p"] == 0.82
+    assert request.payload["ignore_eos"] is False
 
 
 def test_chat_json_counts_message_images() -> None:
@@ -551,6 +608,24 @@ def test_load_dataset_rows_trace_caps_to_num_prompts(tmp_path: Path) -> None:
     assert [row["id"] for row in rows] == ["0", "1", "2"]
 
 
+def test_benchmark_inputs_require_the_declared_request_count(tmp_path: Path) -> None:
+    path = tmp_path / "trace.jsonl"
+    path.write_text(
+        json.dumps({"id": "only", "task": "t2i", "prompt": "draw"}) + "\n",
+        encoding="utf-8",
+    )
+    spec = BenchmarkSpec(
+        task=TaskName.T2I,
+        model="M",
+        dataset="trace",
+        dataset_path=str(path),
+        num_prompts=2,
+    )
+
+    with pytest.raises(ValueError, match="requires exactly 2"):
+        load_benchmark_inputs(spec)
+
+
 def test_trace_items_rejects_row_missing_required_field(tmp_path: Path) -> None:
     path = tmp_path / "bad.jsonl"
     path.write_text(json.dumps({"id": "1", "task": "text"}) + "\n", encoding="utf-8")
@@ -681,6 +756,7 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
         "classifiers",
         "metric_family",
         "metrics",
+        "artifact",
     }
     assert summary["harness_status"] == "completed"
     assert summary["task"] == "t2i"
@@ -695,6 +771,9 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
     assert summary["load"]["mode"] == "saturation"
     assert summary["load"]["request_rate"] == "inf"
     assert summary["metrics"]["completed_images"] == 1
+    assert summary["artifact"]["valid"] is False
+    assert summary["artifact"]["valid_marker"] is None
+    assert summary["artifact"]["plan_summary"]["runtime_profile_id"] == "unspecified"
 
 
 def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
@@ -714,6 +793,158 @@ def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
 
     assert summary["endpoint"] == "/v1/chat/completions"
     assert summary["spec"]["endpoint"] == "/v1/chat/completions"
+
+
+def test_runtime_plan_evidence_is_required_and_preserved() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.T2I,
+        model="M",
+        num_prompts=1,
+        wire="openai_chat_json",
+        runtime_profile_id="dialect",
+        output_constraint="gen_only",
+        plan_evidence_policy="runtime_inspection",
+        acceptance_min_images_per_success=1.0,
+    )
+    records = [
+        RequestRecord(
+            request_id="a",
+            task="t2i",
+            success=True,
+            latency=1.0,
+            images=1,
+            classifier="ok",
+        )
+    ]
+
+    missing = build_summary(spec, "http://x", records, dur_s=1.0)
+    assert missing["artifact"]["checks"]["plan_evidence"] is False
+    assert missing["artifact"]["valid"] is False
+
+    actual_plan = {
+        "profile_id": "profile",
+        "dialect_id": "dialect",
+        "generation": {
+            "constraint": "gen_only",
+            "max_tokens": None,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "ignore_eos": True,
+            "image": {"seed": 42},
+        },
+        "cache": {"read_enabled": True, "write_enabled": True},
+        "adapter": "Base",
+    }
+    summary = build_summary(
+        spec,
+        "http://x",
+        records,
+        dur_s=1.0,
+        plan_evidence={
+            "source": "runtime_inspection",
+            "endpoint": "/v1/chat/completions/plan",
+            "plan": actual_plan,
+        },
+        contract=benchmark_contract(spec, [{"id": "a"}]),
+    )
+    assert summary["artifact"]["checks"]["plan_evidence"] is True
+    assert summary["artifact"]["plan_summary"] == actual_plan
+    assert summary["artifact"]["valid"] is True
+
+    mismatched = build_summary(
+        spec,
+        "http://x",
+        records,
+        dur_s=1.0,
+        plan_evidence={
+            "source": "runtime_inspection",
+            "endpoint": "/v1/chat/completions/plan",
+            "plan": {**actual_plan, "dialect_id": "other"},
+        },
+        contract=benchmark_contract(spec, [{"id": "a"}]),
+    )
+    assert mismatched["artifact"]["checks"]["plan_evidence"] is False
+    assert mismatched["artifact"]["valid"] is False
+
+    wrong_policy = build_summary(
+        spec,
+        "http://x",
+        records,
+        dur_s=1.0,
+        plan_evidence={
+            "source": "runtime_inspection",
+            "endpoint": "/v1/chat/completions/plan",
+            "plan": {
+                **actual_plan,
+                "generation": {**actual_plan["generation"], "temperature": 0.7},
+            },
+        },
+        contract=benchmark_contract(spec, [{"id": "a"}]),
+    )
+    assert wrong_policy["artifact"]["checks"]["plan_evidence"] is False
+    assert wrong_policy["artifact"]["valid"] is False
+
+
+def test_reference_protocol_evidence_is_derived_from_the_emitted_request() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.T2I,
+        model="M",
+        num_prompts=1,
+        width=1024,
+        height=768,
+        steps=30,
+        max_images=1,
+        guidance_scale=4.0,
+        image_guidance_scale=1.0,
+        cfg_norm="global",
+        cfg_interval=(0.0, 1.0),
+        timestep_shift=1.0,
+        runtime_profile_id="reference",
+        output_constraint="gen_only",
+        plan_evidence_policy="reference_protocol",
+        acceptance_min_images_per_success=1.0,
+    )
+    request = T2ITask(spec).build_request({"prompt": "private prompt"})
+    evidence = {"source": "reference_protocol", "request": reference_request_summary(request)}
+    records = [
+        RequestRecord(
+            request_id="a",
+            task="t2i",
+            success=True,
+            latency=1.0,
+            images=1,
+            classifier="ok",
+        )
+    ]
+
+    contract = benchmark_contract(spec, [{"id": "a"}])
+    persisted_contract = json.loads(json.dumps(contract))
+    assert persisted_contract == contract
+    assert benchmark_contract_is_valid(persisted_contract, spec, request_count=1)
+    summary = build_summary(
+        spec,
+        "http://x",
+        records,
+        dur_s=1.0,
+        plan_evidence=evidence,
+        contract=contract,
+    )
+
+    assert summary["artifact"]["checks"]["plan_evidence"] is True
+    assert summary["artifact"]["valid"] is True
+    assert "private prompt" not in json.dumps(evidence)
+
+    evidence["request"]["image"]["steps"] = 29
+    mismatched = build_summary(
+        spec,
+        "http://x",
+        records,
+        dur_s=1.0,
+        plan_evidence=evidence,
+        contract=contract,
+    )
+    assert mismatched["artifact"]["checks"]["plan_evidence"] is False
+    assert mismatched["artifact"]["valid"] is False
 
 
 def test_build_summary_selects_stream_family_for_text_task() -> None:
@@ -789,7 +1020,14 @@ class _StubRunner:
         self.output_dir = Path(output_dir)
 
     async def run(self) -> RunResult:
-        summary = build_summary(self.spec, "http://stub", type(self).records, dur_s=5.0)
+        rows = [{"id": record.request_id} for record in type(self).records]
+        summary = build_summary(
+            self.spec,
+            "http://stub",
+            type(self).records,
+            dur_s=5.0,
+            contract=benchmark_contract(self.spec, rows),
+        )
         return RunResult(summary=summary, output_dir=self.output_dir)
 
 

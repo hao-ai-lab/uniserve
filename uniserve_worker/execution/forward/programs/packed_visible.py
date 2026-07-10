@@ -20,9 +20,9 @@ from ....foundation.profiling import profile_range
 from ....nn.diffusion import euler_step
 from ....nn.diffusion.cfg import Branch, CfgPlan
 from ....nn.sampler import (
-    BatchedSamplingResult,
-    DeferredBatchedSamplingResult,
     apply_sampling_batched_with_device_tokens,
+    finalize_sampling_result,
+    is_deferred_sampling_result,
 )
 from ....runtime.forward_batch_builder import state_block_ids_for_op
 from ....runtime.host_staging import fill_cpu_ints, is_pinned
@@ -568,7 +568,7 @@ def _run_packed_mixed_forward_impl(
         text_outputs_by_row: dict[int, Any] = {}
         text_device_tokens_by_row: dict[int, torch.Tensor] = {}
         text_sample_indices_by_row: dict[int, int] = {}
-        deferred_text_sampling: DeferredBatchedSamplingResult | None = None
+        deferred_text_sampling: Any | None = None
         text_logits_for_result: torch.Tensor | None = None
         text_postprocess_entries: list[TextPostprocessEntry] = []
         if plan.text_result_slots:
@@ -606,21 +606,23 @@ def _run_packed_mixed_forward_impl(
                         [None for _ in sample_logits],
                         defer_cpu=can_defer_text_cpu,
                     )
-                if isinstance(sampled, DeferredBatchedSamplingResult) and can_defer_text_cpu:
+                if is_deferred_sampling_result(sampled) and can_defer_text_cpu:
                     deferred_text_sampling = sampled
                     for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
                         text_sample_indices_by_row[int(row_index)] = sample_index
                         text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
                             sample_index:sample_index + 1
                         ]
-                elif not isinstance(sampled, BatchedSamplingResult):
-                    sampled = sampled.finalize()
-                if isinstance(sampled, BatchedSamplingResult):
+                else:
+                    immediate_sampling = finalize_sampling_result(sampled)
                     for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
                         req_id = int(batch.ops[row_index]["req_id"])
-                        sample = sampled.samples[sample_index]
+                        sample = immediate_sampling.samples[sample_index]
                         top_logprobs = (
-                            [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
+                            [
+                                (int(item[0]), float(item[1]), int(item[2]))
+                                for item in sample.top_logprobs
+                            ]
                             if sample.top_logprobs is not None
                             else None
                         )
@@ -756,6 +758,20 @@ def _run_packed_mixed_forward_impl(
             denoise_updates: dict[int, DenoisePostprocessEntry] = {}
             for result_index, step in plan.denoise_steps:
                 cfg_plan = plan.denoise_cfg_plan_for_row(result_index)
+
+                def combine_velocity(
+                    values: Mapping[Any, torch.Tensor],
+                    current_plan: CfgPlan = cfg_plan,
+                ) -> torch.Tensor:
+                    return current_plan.combine(values)
+
+                def accept_update(
+                    updated: torch.Tensor,
+                    current_owner: Any = owner,
+                    current_step: TextImageDenoiseStep = step,
+                ) -> None:
+                    current_owner.accept_denoise_update(current_step, updated)
+
                 denoise_updates[int(result_index)] = DenoisePostprocessEntry(
                     row_index=int(result_index),
                     req_id=int(step.req_id),
@@ -765,11 +781,8 @@ def _run_packed_mixed_forward_impl(
                     latent=step.latent,
                     t=step.t,
                     t_next=step.t_next,
-                    combine_velocity=lambda values, cfg_plan=cfg_plan: cfg_plan.combine(values),
-                    accept_update=lambda updated, owner=owner, step=step: owner.accept_denoise_update(
-                        step,
-                        updated,
-                    ),
+                    combine_velocity=combine_velocity,
+                    accept_update=accept_update,
                 )
             timing.stop("total_ms", total_start)
             timing.log(

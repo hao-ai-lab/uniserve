@@ -49,6 +49,10 @@ impl SchedulerTraceSink {
         }
         if let Err(error) = self.writer.write_all(b"\n") {
             tracing::warn!(%error, "failed to write scheduler trace newline");
+            return;
+        }
+        if let Err(error) = self.writer.flush() {
+            tracing::warn!(%error, "failed to flush scheduler trace record");
         }
     }
 }

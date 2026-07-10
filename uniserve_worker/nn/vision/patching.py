@@ -83,7 +83,7 @@ def build_abs_positions_from_grid_hw(
     heights = grid_hw[:, 0]
     widths = grid_hw[:, 1]
     counts = heights * widths
-    total = counts.sum()
+    total = int(counts.sum().item())
     patch_to_sample = torch.repeat_interleave(torch.arange(batch, device=device), counts)
     patch_id = torch.arange(total, device=device)
     offsets = torch.cumsum(torch.cat([torch.tensor([0], device=device), counts[:-1]]), dim=0)

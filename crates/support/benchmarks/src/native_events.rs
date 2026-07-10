@@ -3,7 +3,7 @@ use serde_json::Value;
 use uniserve_testkit::{PngInfo, image_done_json_metadata};
 
 /// Canonical native SSE event-`type` strings.
-
+///
 /// These mirror the production emitter in
 /// `crates/frontend/native-api/src/events.rs` (`event_json`, which serializes a
 /// `GenEvent` into `{"type":...}`) and the terminal set in `is_terminal`

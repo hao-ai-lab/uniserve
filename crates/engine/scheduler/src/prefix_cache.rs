@@ -46,23 +46,23 @@ impl PrefixCacheCoordinator {
         bm: &BlockManager,
         block_size: usize,
     ) -> (usize, usize) {
-        if !self.enable || st.req.skip_reading_prefix_cache || !st.req.mm_items.is_empty() {
+        if !self.enable || !st.req.cache.read || !st.context.images.is_empty() {
             return (0, 0);
         }
-        let prompt = &st.req.prompt_ids;
+        let prompt = st.effective_prompt();
         let bs = block_size;
         if bs == 0 || prompt.len() < bs {
             return (0, 0);
         }
         let num_full = prompt.len() / bs;
-        let lookup_limit = if prompt.len() % bs == 0 {
+        let lookup_limit = if prompt.len().is_multiple_of(bs) {
             num_full.saturating_sub(1)
         } else {
             num_full
         };
         let mut cached = 0usize;
         let mut cached_free = 0usize;
-        let mut parent = self.hash_seed;
+        let mut parent = self.request_hash_seed(st);
         for i in 0..lookup_limit {
             let toks = &prompt[i * bs..(i + 1) * bs];
             let h = block_hash(
@@ -103,14 +103,12 @@ impl PrefixCacheCoordinator {
             return;
         }
         let id = st.req.request_id;
-        // prompts with spliced image embeddings are content-specific; their
-        // placeholder ids would collide in the text hash, so they are excluded
-        // from prefix caching (the same policy as Gen latents). a request
-        // may also opt out of reading the prefix cache.
-        if !st.req.mm_items.is_empty() || st.req.skip_reading_prefix_cache {
+        // Prompts with spliced image embeddings use the encoder cache rather
+        // than text-prefix blocks.
+        if !st.context.images.is_empty() {
             return;
         }
-        let prompt = st.req.prompt_ids.clone();
+        let prompt = st.effective_prompt().to_vec();
         let bs = block_size;
         if bs == 0 || prompt.len() < bs {
             return;
@@ -119,14 +117,14 @@ impl PrefixCacheCoordinator {
         // Always leave at least the final token to (re)compute, so a fully
         // block-aligned prompt still produces logits: cap the lookup at the
         // number of *complete* blocks that precede the last token.
-        let lookup_limit = if prompt.len() % bs == 0 {
+        let lookup_limit = if prompt.len().is_multiple_of(bs) {
             num_full.saturating_sub(1)
         } else {
             num_full
         };
 
         let mut hashes = Vec::with_capacity(num_full);
-        let mut parent = self.hash_seed;
+        let mut parent = self.request_hash_seed(st);
         for i in 0..num_full {
             let toks = &prompt[i * bs..(i + 1) * bs];
             let h = block_hash(
@@ -138,6 +136,11 @@ impl PrefixCacheCoordinator {
             );
             hashes.push(h);
             parent = h;
+        }
+
+        st.replay.block_hashes = hashes.clone();
+        if !st.req.cache.read {
+            return;
         }
 
         let mut cached = 0usize;
@@ -167,25 +170,24 @@ impl PrefixCacheCoordinator {
             .hit_tokens
             .fetch_add((cached * bs) as u64, Ordering::Relaxed);
 
-        st.block_hashes = hashes;
-        st.prefix_cached_blocks = cached;
-        st.prompt_cursor = (cached * bs) as u32;
-        st.pos = st.prompt_cursor;
+        st.replay.prefix_cached_blocks = cached;
+        st.ingest.prompt_cursor = (cached * bs) as u32;
+        st.und.logical_pos = st.ingest.prompt_cursor;
     }
 
     /// after a request's prompt is fully prefilled, publish its full prompt
     /// blocks to the prefix cache so later requests can reuse them. Idempotent
     /// (shared/reused blocks are already mapped).
     pub(crate) fn cache_blocks(&self, st: &mut ReqState, bm: &mut BlockManager, block_size: usize) {
-        if !self.enable {
+        if !self.enable || !st.req.cache.write {
             return;
         }
-        if st.blocks_cached {
+        if st.replay.blocks_cached {
             return;
         }
         let id = st.req.request_id;
-        let hashes = st.block_hashes.clone();
-        let prompt = st.req.prompt_ids.clone();
+        let hashes = st.replay.block_hashes.clone();
+        let prompt = st.effective_prompt().to_vec();
         let bs = block_size;
         let blocks = bm.blocks_for(id).to_vec();
         for (i, h) in hashes.iter().enumerate() {
@@ -197,6 +199,13 @@ impl PrefixCacheCoordinator {
                 bm.cache_block(*b, *h, toks);
             }
         }
-        st.blocks_cached = true;
+        st.replay.blocks_cached = true;
+    }
+
+    fn request_hash_seed(&self, st: &ReqState) -> u64 {
+        st.req
+            .cache
+            .isolation_key
+            .map_or(self.hash_seed, |key| self.hash_seed ^ key.rotate_left(17))
     }
 }

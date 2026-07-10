@@ -1,14 +1,14 @@
-"""System text neural execution and legacy text step support.
+"""System text neural execution and specialized text-step control.
 
 ``forward_logits`` builds the system-owned text ``ForwardBatch``, selects the
 attention path, runs the thin model neural forward, and returns logits for the
-unified forward postprocessor. ``step`` remains the full text step entry point
-for speculative verification and decode-burst paths that still need their
-specialized control loops.
+unified forward postprocessor. ``step`` is the full text-step entry point for
+speculative verification and decode-burst control loops.
 """
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Mapping
 
@@ -26,9 +26,11 @@ from ..contracts.outputs import ForwardOutputBase, TextTokenOutput
 from ..foundation.errors import invalid_descriptor
 from ..foundation.profiling import profile_range
 from ..nn.sampler import (
-    DeferredBatchedSamplingResult,
     apply_sampling_batched_with_device_tokens,
+    finalize_sampling_result,
+    is_deferred_sampling_result,
     sample_one_from_logits,
+    score_prompt_token_logprobs,
 )
 from ..runtime.request_state import RequestState, RequestStateTable
 from .decode_burst import DecodeBurstExecutor
@@ -145,6 +147,11 @@ class TextDriver:
         self.kv_pool = kv_pool
         self.graph_runner = graph_runner
 
+    def _system_forward_runtime(self) -> tuple["ForwardBatchBuilder", "PagedKVPool"]:
+        if self.builder is None or self.kv_pool is None:
+            raise invalid_descriptor("system-managed text forward requires a builder and KV pool")
+        return self.builder, self.kv_pool
+
     @torch.inference_mode()
     def step(
         self,
@@ -158,6 +165,16 @@ class TextDriver:
     ) -> list[Any]:
         text = fb.as_text(allow_mixed_text=fb.mode == ForwardMode.MIXED)
         ops = list(text.ops)
+        if any(bool(op.get("return_all_logits")) for op in ops):
+            with profile_range("uniserve.text.prompt_logprobs"):
+                return self._step_prompt_prefill(
+                    text,
+                    ops,
+                    request_states,
+                    model,
+                    defer_sampling=defer_sampling,
+                    tensor_store=tensor_store,
+                )
         if any(text.spec_token_ids):
             from .spec_verify import verify_speculative_tokens
 
@@ -216,6 +233,8 @@ class TextDriver:
 
         text = fb.as_text(allow_mixed_text=fb.mode == ForwardMode.MIXED)
         ops = list(text.ops)
+        if any(bool(op.get("return_all_logits")) for op in ops):
+            return None
         if any(text.spec_token_ids):
             return None
         if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
@@ -256,6 +275,8 @@ class TextDriver:
             return None
         text = fb.as_text(allow_mixed_text=fb.mode == ForwardMode.MIXED)
         ops = list(text.ops)
+        if any(bool(op.get("return_all_logits")) for op in ops):
+            return None
         if any(text.spec_token_ids):
             return None
         if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
@@ -357,7 +378,10 @@ class TextDriver:
             defer_cpu_results=defer_cpu_results,
         )
         with profile_range("uniserve.text.forward"):
-            logits_batch, req_ids = self._forward(model, text, request_states)
+            forward_result = self._forward(model, text, request_states)
+        if forward_result is None:
+            raise invalid_descriptor("eager text forward did not produce logits")
+        logits_batch, req_ids = forward_result
         # KV-length advance is system-owned now (derived from seq_lens), not the
         # model's job.
         self._advance_kv_lengths(text, request_states)
@@ -564,21 +588,27 @@ class TextDriver:
             reordered = self.graph_runner.reorder_mixed_for_padding(text)
             if reordered is not text:
                 row_by_op = {id(op): row for row, op in enumerate(reordered.ops)}
-                logits, req_ids = self._forward(
+                forward_result = self._forward(
                     model,
                     reordered,
                     request_states,
                     store_position_relays=store_position_relays,
                 )
+                if forward_result is None:
+                    raise invalid_descriptor("reordered eager text forward did not produce logits")
+                logits, req_ids = forward_result
                 rows = [row_by_op[id(op)] for op in ops]
                 order = torch.tensor(rows, dtype=torch.long, device=logits.device)
                 return logits.index_select(0, order), [int(req_ids[row]) for row in rows]
-        return self._forward(
+        forward_result = self._forward(
             model,
             text,
             request_states,
             store_position_relays=store_position_relays,
         )
+        if forward_result is None:
+            raise invalid_descriptor("eager text forward did not produce logits")
+        return forward_result
 
     def _forward_graph_with_optional_padding_reorder(
         self,
@@ -688,6 +718,7 @@ class TextDriver:
         require_graph: bool = False,
     ) -> tuple[torch.Tensor, list[int]] | None:
         stats = ctx.stats
+        builder, kv_pool = self._system_forward_runtime()
         active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
         start = component_timer_start(stats)
         # Pure decode uses the contiguous-relay override (fast); a mixed
@@ -701,10 +732,10 @@ class TextDriver:
         record_component_elapsed(stats, "text_decode_relay", start)
         start = component_timer_start(stats)
         padded = self._graph_padded_num_tokens(text, ctx, graph_runner=active_graph_runner)
-        fb = self.builder.build_text(
+        fb = builder.build_text(
             text,
             device=device,
-            kv_pool=self.kv_pool,
+            kv_pool=kv_pool,
             request_states=request_states,
             input_ids_override=relay_input_ids,
             positions_override=relay_positions,
@@ -716,7 +747,7 @@ class TextDriver:
         start = component_timer_start(stats)
         with profile_range("uniserve.text.model_forward"):
             with use_forward_context(
-                replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=self.kv_pool)
+                replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=kv_pool)
             ):
                 logits = self._run_model_forward(
                     model,
@@ -748,24 +779,25 @@ class TextDriver:
     ) -> tuple[torch.Tensor, list[int]]:
         rows: list[torch.Tensor] = []
         next_positions: list[tuple[int, int]] = []
+        builder, kv_pool = self._system_forward_runtime()
         for req_id, tokens, pos_range, op in zip(
             text.req_ids, text.token_ids, text.pos_ranges, text.ops
         ):
             state = request_states.get(int(req_id))
             relay = self._per_op_relay_input(op, tokens, state, device)
-            fb = self.builder.build_text_op(
+            fb = builder.build_text_op(
                 op=op,
                 token_ids=tokens,
                 pos_range=pos_range,
                 req_id=int(req_id),
                 mode=text.mode,
                 device=device,
-                kv_pool=self.kv_pool,
+                kv_pool=kv_pool,
                 request_states=request_states,
                 input_ids_override=relay,
             )
             with use_forward_context(
-                replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=self.kv_pool)
+                replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=kv_pool)
             ):
                 logits = model.forward(fb.input_ids, fb.positions, fb)
             rows.append(logits.reshape(-1, logits.shape[-1])[-1])
@@ -814,6 +846,8 @@ class TextDriver:
         """
 
         mode = text.mode
+        if fb.input_ids is None or fb.positions is None:
+            raise invalid_descriptor("text forward batch is missing input ids or positions")
         if mode == ForwardMode.DECODE:
             return fb.input_ids.reshape(fb.batch_size, 1), fb.positions.reshape(fb.batch_size, 1)
         if mode == ForwardMode.EXTEND:
@@ -840,8 +874,8 @@ class TextDriver:
 
     def _publish_logits(
         self,
-        ops: list[dict[str, Any]],
-        req_ids: list[int],
+        ops: Sequence[Mapping[str, Any]],
+        req_ids: Sequence[int],
         logits_batch: torch.Tensor,
         tensor_store: Any,
     ) -> list[dict[str, Any]]:
@@ -861,10 +895,168 @@ class TextDriver:
 
     # ---- sampling --------------------------------------------------------
 
+    def _step_prompt_prefill(
+        self,
+        text: "TextBatch",
+        ops: list[Mapping[str, Any]],
+        request_states: RequestStateTable,
+        model: Any,
+        *,
+        defer_sampling: bool,
+        tensor_store: Any | None,
+    ) -> list[Any]:
+        if any(str(op.get("kind")) != "prefill_und" for op in ops):
+            raise invalid_descriptor("prompt scoring is valid only for prefill_und operations")
+
+        final_logits: list[torch.Tensor] = []
+        prompt_scores: list[list[list[tuple[int, float, int]]] | None] = []
+        for row, (op, req_id, tokens, pos_range) in enumerate(
+            zip(ops, text.req_ids, text.token_ids, text.pos_ranges, strict=True)
+        ):
+            del row
+            state = request_states.get(int(req_id))
+            logits = self._forward_prompt_op(
+                model,
+                op,
+                tokens,
+                pos_range,
+                int(req_id),
+                request_states,
+            )
+            rows = logits.reshape(-1, logits.shape[-1])
+            if bool(op.get("return_all_logits")) and int(rows.shape[0]) != len(tokens):
+                raise invalid_descriptor(
+                    "prompt-scoring model output must contain one logits row per input token"
+                )
+            chunk_scores = self._score_prompt_chunk(state, rows, tokens)
+            prompt_scores.append(chunk_scores or None)
+            final_logits.append(rows[-1])
+            state.set_kv_length(int(pos_range[1]), lane=_KV_LANE)
+
+        logits_batch = torch.stack(final_logits, dim=0)
+        if defer_sampling:
+            if tensor_store is None:
+                raise invalid_descriptor("deferred prompt sampling requires a tensor store")
+            results = self._publish_logits(ops, text.req_ids, logits_batch, tensor_store)
+            for result, prompt_score in zip(results, prompt_scores, strict=True):
+                if prompt_score is not None:
+                    result["prompt_logprobs"] = prompt_score
+            return results
+
+        outputs: list[TextTokenOutput] = []
+        for row, (op, req_id, prompt_score) in enumerate(
+            zip(ops, text.req_ids, prompt_scores, strict=True)
+        ):
+            state = request_states.get(int(req_id))
+            sample = sample_one_from_logits(
+                logits_batch[row],
+                dict(state.sampling or {}),
+                recent=op.get("recent_tokens") or [],
+                allowed=op.get("allowed_tokens"),
+                suppress=op.get("suppress_tokens"),
+                n_logprobs=int(state.sampling.get("n_logprobs", 0) or 0),
+            )
+            self._store_sampled_token_relay(
+                state,
+                token_id=int(sample.token_id),
+                token_tensor=torch.tensor(
+                    [int(sample.token_id)], dtype=torch.long, device=logits_batch.device
+                ),
+            )
+            outputs.append(
+                TextTokenOutput(
+                    req_id=int(req_id),
+                    sampled_token_id=int(sample.token_id),
+                    sampled_logprob=sample.logprob,
+                    top_logprobs=(
+                        [
+                            (int(item[0]), float(item[1]), int(item[2]))
+                            for item in sample.top_logprobs
+                        ]
+                        if sample.top_logprobs
+                        else None
+                    ),
+                    prompt_logprobs=prompt_score,
+                )
+            )
+        return outputs
+
+    def _forward_prompt_op(
+        self,
+        model: Any,
+        op: Mapping[str, Any],
+        tokens: tuple[int, ...],
+        pos_range: tuple[int, int],
+        req_id: int,
+        request_states: RequestStateTable,
+    ) -> torch.Tensor:
+        if not tokens:
+            raise invalid_descriptor("prompt-scoring prefill operation has no token ids")
+        if self.builder is None or self.kv_pool is None:
+            predecessor = getattr(model, "prompt_predecessor_logits", None)
+            if bool(op.get("return_all_logits")) and callable(predecessor):
+                previous_logits = predecessor(req_id)
+                if isinstance(previous_logits, torch.Tensor) and previous_logits.ndim > 0:
+                    request_states.get(req_id).prompt_last_logits = previous_logits.reshape(
+                        -1, previous_logits.shape[-1]
+                    )[-1].detach()
+            logits = model.run_text_logits(dict(op))
+        else:
+            ctx = get_forward_context()
+            device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
+            batch = self.builder.build_text_op(
+                op=op,
+                token_ids=tokens,
+                pos_range=pos_range,
+                req_id=req_id,
+                mode=ForwardMode.EXTEND,
+                device=device,
+                kv_pool=self.kv_pool,
+                request_states=request_states,
+            )
+            batch.return_all_logits = bool(op.get("return_all_logits"))
+            with use_forward_context(
+                replace(ctx, attention_metadata=batch.attn_metadata, kv_pool=self.kv_pool)
+            ):
+                logits = model.forward(batch.input_ids, batch.positions, batch)
+        if not isinstance(logits, torch.Tensor) or logits.ndim == 0:
+            raise invalid_descriptor("prompt-scoring model output must be a logits tensor")
+        return logits
+
+    @staticmethod
+    def _score_prompt_chunk(
+        state: RequestState,
+        logits: torch.Tensor,
+        tokens: tuple[int, ...],
+    ) -> list[list[tuple[int, float, int]]]:
+        sampling = dict(state.sampling or {})
+        if not (
+            bool(sampling.get("return_prompt_logprobs"))
+            or int(sampling.get("n_prompt_logprobs", 0) or 0) > 0
+        ):
+            return []
+        predictors: list[torch.Tensor] = []
+        targets: list[int] = []
+        if state.prompt_last_logits is not None:
+            predictors.append(state.prompt_last_logits.reshape(1, -1))
+            targets.append(int(tokens[0]))
+        if len(tokens) > 1:
+            predictors.append(logits[:-1])
+            targets.extend(int(token_id) for token_id in tokens[1:])
+        state.prompt_last_logits = logits[-1].detach()
+        if not predictors:
+            return []
+        return score_prompt_token_logprobs(
+            torch.cat(predictors, dim=0),
+            targets,
+            n_logprobs=int(sampling.get("n_prompt_logprobs", 0) or 0),
+            logprob_token_ids=sampling.get("logprob_token_ids") or (),
+        )
+
     def _sample_logits_batch(
         self,
-        ops: list[dict[str, Any]],
-        req_ids: list[int],
+        ops: Sequence[Mapping[str, Any]],
+        req_ids: Sequence[int],
         logits_batch: torch.Tensor,
         request_states: RequestStateTable,
         stats: ForwardStats | None,
@@ -897,7 +1089,7 @@ class TextDriver:
                 defer_cpu=defer_cpu_results,
                 enable_cuda_timing=cuda_ready_start_event is not None,
             )
-        if isinstance(sampling_result, DeferredBatchedSamplingResult):
+        if is_deferred_sampling_result(sampling_result):
             sampling_result.set_ready_start_event(cuda_ready_start_event)
             out: list[TextTokenOutput | DeferredTextSeqResult] = []
             for row, req_id in enumerate(req_ids):
@@ -910,26 +1102,31 @@ class TextDriver:
                         row=row,
                         state=state,
                         sampling_result=sampling_result,
-                        relay_token_tensor=state.decode_relay.token_tensor,
+                        relay_token_tensor=relay_token_tensor,
                     )
                 )
             record_component_elapsed(stats, "text_sample", start)
             return out
 
-        samples = sampling_result.samples
+        immediate_result = finalize_sampling_result(sampling_result)
+        samples = immediate_result.samples
         out = []
         for row, (req_id, (tok, lp, top)) in enumerate(zip(req_ids, samples)):
             self._store_sampled_token_relay(
                 request_states.get(req_id),
                 token_id=int(tok),
-                token_tensor=sampling_result.device_tokens[row:row + 1],
+                token_tensor=immediate_result.device_tokens[row:row + 1],
             )
             out.append(
                 TextTokenOutput(
                     req_id=int(req_id),
                     sampled_token_id=tok,
                     sampled_logprob=lp,
-                    top_logprobs=top or None,
+                    top_logprobs=(
+                        [(int(item[0]), float(item[1]), int(item[2])) for item in top]
+                        if top
+                        else None
+                    ),
                 )
             )
         record_component_elapsed(stats, "text_sample", start)
@@ -986,6 +1183,8 @@ class TextDriver:
             return
         if any(len(tokens) != 1 for tokens in text.token_ids):
             return
+        if fb.positions is None:
+            raise invalid_descriptor("decode position relay requires position ids")
         next_positions = fb.positions.reshape(-1) + 1
         for row, (req_id, pos_range) in enumerate(zip(text.req_ids, text.pos_ranges)):
             self._store_position_relay(

@@ -1,37 +1,59 @@
 [package]
-name = "uniserve-server-app"
+name = "uniserve-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+asynk-strim-attr.workspace = true
+axum.workspace = true
+futures.workspace = true
+http-body.workspace = true
+itertools.workspace = true
+libc.workspace = true
 rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
+socket2.workspace = true
+thiserror-ext.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tonic.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
-uniserve-chat.workspace = true
+tracing-futures.workspace = true
+uniserve-config.workspace = true
 uniserve-core.workspace = true
-uniserve-engine-client.workspace = true
+uniserve-engine-gateway.workspace = true
 uniserve-engine-api.workspace = true
 uniserve-executor.workspace = true
 uniserve-engine-runtime.workspace = true
 uniserve-engine-wire.workspace = true
-uniserve-llm.workspace = true
-uniserve-native-api.workspace = true
+uniserve-grpc-proto.workspace = true
+uniserve-model-profile.workspace = true
 uniserve-observability.workspace = true
-uniserve-openai-api.workspace = true
+uniserve-openai-types.workspace = true
+uniserve-protocol-adapters.workspace = true
 uniserve-scheduler.workspace = true
 uniserve-serving.workspace = true
 uniserve-sim.workspace = true
-uniserve-text.workspace = true
 uniserve-worker-ipc.workspace = true
+uuid.workspace = true
+validator.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+async-openai = { workspace = true, features = ["full"] }
+bytes.workspace = true
+expect-test.workspace = true
 futures.workspace = true
-uniserve-engine-client = { workspace = true, features = ["test-util"] }
+serial_test.workspace = true
+tower.workspace = true
+uniserve-engine-gateway = { workspace = true, features = ["test-util"] }
+uniserve-testkit.workspace = true
 
 [lints]
 workspace = true

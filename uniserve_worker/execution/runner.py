@@ -235,12 +235,13 @@ class ModelRunner:
         self.forward_postprocessor = ForwardPostprocessor()
 
     def _build_forward_graph_runner(self, model: UniModel) -> Any | None:
-        programs = []
         from .forward.graph import (
             CudaGraphForwardRunner,
             DenoiseStepGraphProgram,
+            ForwardGraphProgram,
             PackedVisibleGraphProgram,
         )
+        programs: list[ForwardGraphProgram] = []
 
         if self.text_graph_runner is not None:
             from .forward.graph import (

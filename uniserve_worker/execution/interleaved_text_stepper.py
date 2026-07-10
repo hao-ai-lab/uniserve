@@ -137,40 +137,47 @@ class InterleavedModelOwner(Protocol):
     of the drivers' contract; the concrete owner must define all of them.
     """
 
-    # Collaborator attributes.
-    model: Any
-    tokenizer: Any
-    device: Any
-    reqs: dict[int, Any]
-    kv_pool: "PagedKVPool | None"
-    scratch_pool: "PagedKVPool | None"
-    residency: Any
-    num_layers: int
-    eos_id: int
-    img_start_id: int
-    img_end_id: int
+    @property
+    def device(self) -> Any: ...
+
+    @property
+    def reqs(self) -> dict[int, Any]: ...
+
+    @property
+    def kv_pool(self) -> "PagedKVPool | None": ...
+
+    @property
+    def scratch_pool(self) -> "PagedKVPool | None": ...
+
+    @property
+    def residency(self) -> Any: ...
+
+    @property
+    def num_layers(self) -> int: ...
+
+    @property
+    def eos_id(self) -> int: ...
+
+    @property
+    def img_start_id(self) -> int: ...
 
     # Collaborator methods. Model-specific state types (the request state / image
     # state) are kept ``Any`` here: this system component is duck-typed against the
     # concrete model and must not name model-layer types.
-    def interleaved_text_forward(self, **kwargs: Any) -> Any: ...
-    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
-    def interleaved_text_inputs(self, query: str) -> tuple[torch.Tensor, torch.Tensor, Any]: ...
-    def interleaved_empty_image_start_query(self, image_start_token: str) -> str: ...
-    def interleaved_image_patch_size(self) -> int: ...
-    def interleaved_image_downsample_ratio(self) -> float: ...
-    def interleaved_image_features(
+    def interleaved_text_forward(
         self,
-        image_input: torch.Tensor,
-        *,
-        grid_hw: torch.Tensor,
-        gen_model: bool = False,
-    ) -> torch.Tensor: ...
-    def _state(self, op: dict[str, Any]) -> Any: ...
-    def _extend_cache_blocks(self, cache: "TextCache", op: dict[str, Any]) -> None: ...
-    def _ensure_host_cache(self, cache: "TextCache") -> None: ...
-    def _release_image_state_caches(self, image_state: Any) -> None: ...
-    def _prepare_generated_image_for_commit(self, image_state: Any) -> torch.Tensor: ...
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        indexes: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        attention_mask: Any = None,
+        past_key_values: Any = None,
+        use_cache: bool = True,
+        text_only_rope: bool = False,
+        causal_paged_update: bool = False,
+        return_all_logits: bool = False,
+    ) -> Any: ...
+    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
 
 
 class InterleavedTextCacheDriver:
@@ -191,7 +198,7 @@ class InterleavedTextCacheDriver:
         self._decode_graph_runner: Any | None = None
         self._prefill_graph_runner: Any | None = None
 
-    def state(self, op: dict[str, Any]) -> Any:
+    def state(self, op: Mapping[str, Any]) -> Any:
         req_id = int(op["req_id"])
         hook = getattr(self.owner, "interleaved_image_state", None)
         if callable(hook):
@@ -224,6 +231,8 @@ class InterleavedTextCacheDriver:
         op_list = [dict(op) for op in ops]
         if not op_list:
             return []
+        if any(bool(op.get("return_all_logits")) for op in op_list):
+            return None
         graphed = self._prefill_graph().maybe_run_batch(self, op_list)
         if graphed is not None:
             return graphed
@@ -260,13 +269,24 @@ class InterleavedTextCacheDriver:
         if st.cond.past is None:
             self.ensure_host_cache(st.cond)
             hydrate_cached_prefix_from_op(st.cond, op)
-            self.prefix_forward_ids(st.cond, tokens, int(op["pos_range"][0]))
+            self.prefix_forward_ids(
+                st.cond,
+                tokens,
+                int(op["pos_range"][0]),
+                return_all_logits=bool(op.get("return_all_logits")),
+            )
         elif len(tokens) == 1:
             hydrate_cached_prefix_from_op(st.cond, op)
             self.append_one(st.cond, int(tokens[0]))
         else:
             hydrate_cached_prefix_from_op(st.cond, op)
-            self.append_ids(st.cond, tokens)
+            self.append_ids(
+                st.cond,
+                tokens,
+                return_all_logits=bool(op.get("return_all_logits")),
+            )
+        if bool(op.get("return_all_logits")):
+            return st.cond.last_logits
         return st.cond.last_logits[:, -1, :]
 
     def _decode_graph(self) -> Any:
@@ -287,7 +307,7 @@ class InterleavedTextCacheDriver:
             self._prefill_graph_runner = runner
         return runner
 
-    def extend_cache_blocks(self, cache: TextCache, op: dict[str, Any]) -> None:
+    def extend_cache_blocks(self, cache: TextCache, op: Mapping[str, Any]) -> None:
         # Host-issued KV block ids belong only to host-KV caches. Scratch caches
         # use worker-local block ids and must not ingest host ids.
         if cache.past is None or getattr(cache.past, "pool", None) is self.owner.kv_pool:
@@ -322,7 +342,14 @@ class InterleavedTextCacheDriver:
             allocate_blocks=allocate_blocks,
         )
 
-    def prefix_forward_ids(self, cache: TextCache, tokens: list[int], start: int = 0) -> None:
+    def prefix_forward_ids(
+        self,
+        cache: TextCache,
+        tokens: list[int],
+        start: int = 0,
+        *,
+        return_all_logits: bool = False,
+    ) -> None:
         if cache.past is None:
             raise model_execution_error("text prefix requires an initialized paged cache")
         input_ids = torch.tensor([tokens], dtype=torch.long, device=self.owner.device)
@@ -338,6 +365,7 @@ class InterleavedTextCacheDriver:
             attention_mask={"full_attention": mask},
             past_key_values=cache.past,
             use_cache=True,
+            return_all_logits=return_all_logits,
         )
         cache.past = outputs.past_key_values
         cache.t_index = int(indexes[0].max().item())
@@ -347,7 +375,10 @@ class InterleavedTextCacheDriver:
     def prefix_from_query(self, query: str) -> TextCache:
         cache = TextCache()
         self.ensure_scratch_cache(cache)
-        ids, indexes, attn = self.owner.interleaved_text_inputs(query)
+        build_inputs = getattr(self.owner, "interleaved_text_inputs", None)
+        if not callable(build_inputs):
+            raise model_execution_error("model does not support worker-side text tokenization")
+        ids, indexes, attn = build_inputs(query)
         outputs = self.owner.interleaved_text_forward(
             input_ids=ids,
             indexes=indexes,
@@ -361,7 +392,13 @@ class InterleavedTextCacheDriver:
         cache.last_token_id = int(ids[0, -1].item())
         return cache
 
-    def append_ids(self, cache: TextCache, tokens: list[int]) -> None:
+    def append_ids(
+        self,
+        cache: TextCache,
+        tokens: list[int],
+        *,
+        return_all_logits: bool = False,
+    ) -> None:
         input_ids = torch.tensor([tokens], dtype=torch.long, device=self.owner.device)
         seq_len = input_ids.shape[1]
         embeds = self.owner.interleaved_text_embeddings(input_ids)
@@ -376,6 +413,7 @@ class InterleavedTextCacheDriver:
             attention_mask={"full_attention": mask},
             past_key_values=cache.past,
             use_cache=True,
+            return_all_logits=return_all_logits,
         )
         cache.past = outputs.past_key_values
         cache.t_index += seq_len
@@ -403,7 +441,10 @@ class InterleavedTextCacheDriver:
         self.append_one(cache, int(self.owner.img_start_id))
 
     def empty_img_start_prefix(self) -> TextCache:
-        query = self.owner.interleaved_empty_image_start_query(self.image_start_token)
+        build_query = getattr(self.owner, "interleaved_empty_image_start_query", None)
+        if not callable(build_query):
+            raise model_execution_error("model does not support an empty image-start prefix")
+        query = str(build_query(self.image_start_token))
         return self.prefix_from_query(query)
 
     def text_indexes(self, start: int, seq_len: int) -> torch.Tensor:

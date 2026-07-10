@@ -1,0 +1,58 @@
+{
+  "id": "thinkmorph",
+  "control_tokens": {
+    "bos": ["<|im_start|>", "<|begin_of_sentence|>"],
+    "eos": ["<|im_end|>", "<|end_of_sentence|>", "<|endoftext|>"],
+    "start_of_image": ["<|vision_start|>", "<img>"],
+    "end_of_image": ["<|vision_end|>", "</img>"],
+    "image_start_text": "<image_start>"
+  },
+  "supported_constraints": ["default", "und_only", "gen_only"],
+  "image_ingest": {
+    "steps": ["vae_encode", "vit_encode"],
+    "logical_positions": 1,
+    "physical_kv_tokens": {"kind": "worker_defined"}
+  },
+  "generation_policy": {
+    "gen_only_start": "immediate",
+    "trigger": {"kind": "round_close_then_image_start_suffix"},
+    "feedback": {
+      "commit": "commit_gen",
+      "writeback": {"kind": "direct_kv"},
+      "next_und_token": {"kind": "bos"},
+      "logical_positions": 2,
+      "physical_kv_tokens": {"kind": "worker_defined"}
+    }
+  },
+  "image_defaults": {
+    "resolution": "1:1",
+    "steps": 50,
+    "cfg_text_scale": 4.0,
+    "cfg_img_scale": 1.0,
+    "cfg_renorm_type": "global",
+    "cfg_renorm_min": 0.0,
+    "cfg_interval": [0.0, 1.0],
+    "timestep_shift": 1.0,
+    "seed": null,
+    "max_images": 4,
+    "max_images_limit": 16
+  },
+  "resolution": {
+    "default": "1:1",
+    "allow_custom": true,
+    "buckets": [{"name": "1:1", "width": 512, "height": 512}]
+  },
+  "output_filter": {
+    "reasoning": {"start": "<think>", "end": "</think>"},
+    "visible_wrappers": [{"start": "<answer>", "end": "</answer>"}]
+  },
+  "context_system_prompt": "Use text and generated images as needed while reasoning, then provide a concise final answer.",
+  "context_images": {"markers_in_prompt": false},
+  "prompts": {
+    "default": {"kind": "bagel_default", "default_system": "Use text and generated images as needed while reasoning, then provide a concise final answer."},
+    "und": {"kind": "bagel_text"},
+    "und_with_images": {"kind": "raw"},
+    "gen": {"kind": "bagel_image"},
+    "negative": {"kind": "bagel_image"}
+  }
+}

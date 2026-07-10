@@ -8,8 +8,14 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
-use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent, GenerateRequest, MmItem};
+use uniserve_core::{
+    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
+    GenerationRuntimeCapabilities, ImageIngestRecipe, ImageKvEffect, ImageParams, ImageSegment,
+    OpKind, RequestId, SamplingParams, SegmentPlacement, TriggerPolicyDescriptor, UndVisibility,
+};
+use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent};
 use uniserve_executor::{ControlAck, ControlOp, Executor};
 use uniserve_scheduler::{ControlTokens, Scheduler, SchedulerConfig, SchedulingPolicy};
 use uniserve_sim::SimEngine;
@@ -18,6 +24,131 @@ use uniserve_worker_ipc::MultiprocExecutor;
 
 fn ctrl() -> ControlTokens {
     ControlTokens::default()
+}
+
+fn text_context(token_ids: Vec<u32>) -> Vec<ContextSegment> {
+    vec![ContextSegment::UndTokens {
+        token_ids,
+        visibility: UndVisibility::Internal,
+    }]
+}
+
+fn context_with_image(
+    before: Vec<u32>,
+    after: Vec<u32>,
+    hash: u64,
+    logical_positions: u32,
+    physical_tokens: u32,
+) -> Vec<ContextSegment> {
+    let position = before.len() as u32;
+    vec![
+        ContextSegment::UndTokens {
+            token_ids: before,
+            visibility: UndVisibility::Internal,
+        },
+        ContextSegment::Image {
+            image: ImageSegment {
+                hash,
+                b64: "aW1hZ2U=".to_string(),
+                placement: SegmentPlacement::AtToken { position },
+            },
+            ingest: ImageIngestRecipe::vit_only(
+                logical_positions,
+                ImageKvEffect::Exact {
+                    tokens: physical_tokens,
+                },
+            ),
+        },
+        ContextSegment::UndTokens {
+            token_ids: after,
+            visibility: UndVisibility::Internal,
+        },
+    ]
+}
+
+fn generation_request(
+    request_id: RequestId,
+    context: Vec<ContextSegment>,
+    sampling: SamplingParams,
+    image: ImageParams,
+    constraint: GenerationConstraint,
+    max_und_tokens: usize,
+) -> GenerationRequest {
+    let policy = GenerationPolicyDescriptor {
+        trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
+        gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
+        feedback: Some(GeneratedImageFeedbackRecipe {
+            commit: CommitRecipe::CommitGenThenWriteback,
+            writeback: FeedbackWriteback::DirectKv,
+            next_und_token: FeedbackNextToken::EndOfImage,
+            logical_positions: 2,
+            physical_kv_tokens: ImageKvEffect::WorkerDefined,
+        }),
+        ..GenerationPolicyDescriptor::default()
+    };
+    let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
+    let cache = Default::default();
+    let capabilities = GenerationRuntimeCapabilities {
+        supported_ops: vec![
+            OpKind::PrefillUnd,
+            OpKind::DecodeUnd,
+            OpKind::VitEncode,
+            OpKind::DenoiseGen,
+            OpKind::CommitGen,
+            OpKind::CommitWriteback,
+        ],
+        max_latent_units: 1_024,
+        latent_downsample: 16,
+        max_vae_grid_tokens: 1_024,
+        max_vit_grid_tokens: 64,
+        commit_marker_tokens: 2,
+        max_cfg_branches: 3,
+        scratch_capacity_tokens: 1 << 20,
+        encoder_cache_entries: 256,
+        generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
+            inline: true,
+            separate_writeback: true,
+        },
+    };
+    let resources = GenerationResourceBounds::conservative(
+        &context,
+        &behavior,
+        &policy,
+        &image,
+        max_und_tokens,
+        &cache,
+        &capabilities,
+    )
+    .expect("bounded simulation request");
+    GenerationRequest {
+        request_id,
+        context,
+        negative_context: Vec::new(),
+        constraint,
+        behavior,
+        sampling,
+        image,
+        max_und_tokens,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache,
+        policy,
+        resources,
+    }
+}
+
+fn with_trigger(
+    mut request: GenerationRequest,
+    trigger: TriggerPolicyDescriptor,
+) -> GenerationRequest {
+    request.policy.trigger = trigger;
+    request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+    request.resources.generated_feedback_makes_non_replayable =
+        request.behavior.generated_image_feedback;
+    request
 }
 
 struct Collected {
@@ -47,10 +178,9 @@ fn run_requests(
     let mut id = 1u64;
     for (constraint, n) in specs {
         for _ in 0..*n {
-            let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
-            let req = GenerateRequest::new(
+            let req = generation_request(
                 RequestId(id),
-                vec![1, 2, 3, 4, 5],
+                text_context(vec![1, 2, 3, 4, 5]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 4,
@@ -58,9 +188,8 @@ fn run_requests(
                 },
                 *constraint,
                 16,
-                etx,
             );
-            handle.submit(req).unwrap();
+            let erx = handle.submit(req).unwrap();
             rxs.insert(RequestId(id), erx);
             id += 1;
         }
@@ -183,23 +312,20 @@ fn scheduler_submits_mixed_op_kind_batches() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (text_tx, mut text_rx) = tokio::sync::mpsc::unbounded_channel();
-    handle
-        .submit(GenerateRequest::new(
+    let mut text_rx = handle
+        .submit(generation_request(
             RequestId(1),
-            vec![1, 2, 3],
+            text_context(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
-            text_tx,
         ))
         .unwrap();
-    let (image_tx, mut image_rx) = tokio::sync::mpsc::unbounded_channel();
-    handle
-        .submit(GenerateRequest::new(
+    let mut image_rx = handle
+        .submit(generation_request(
             RequestId(2),
-            vec![4, 5, 6],
+            text_context(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams {
                 steps: 1,
@@ -207,7 +333,6 @@ fn scheduler_submits_mixed_op_kind_batches() {
             },
             GenerationConstraint::GenOnly,
             0,
-            image_tx,
         ))
         .unwrap();
 
@@ -254,9 +379,11 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         EngineCaps, ExecutionConstraints, ForwardBatch, ForwardResult, OpKind,
     };
 
+    type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, OpKind)>>>>;
+
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<(RequestId, OpKind)>>>>,
+        batches: BatchLog,
     }
 
     impl Executor for Recording {
@@ -323,25 +450,21 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
             },
         );
 
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-        sched.submit_for_test(GenerateRequest::new(
+        let _rx1 = sched.submit_for_test(generation_request(
             RequestId(1),
-            vec![1, 2, 3],
+            text_context(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
-            tx1,
         ));
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
-        sched.submit_for_test(GenerateRequest::new(
+        let _rx2 = sched.submit_for_test(generation_request(
             RequestId(2),
-            vec![4, 5, 6],
+            text_context(vec![4, 5, 6]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
-            tx2,
         ));
 
         let mut saw_decode_pressure = false;
@@ -361,15 +484,13 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         );
 
         let before = batches.lock().unwrap().len();
-        let (tx3, _rx3) = tokio::sync::mpsc::unbounded_channel();
-        sched.submit_for_test(GenerateRequest::new(
+        let _rx3 = sched.submit_for_test(generation_request(
             RequestId(3),
-            vec![7, 8, 9],
+            text_context(vec![7, 8, 9]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
-            tx3,
         ));
 
         for _ in 0..40 {
@@ -471,11 +592,10 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
 
     let mut receivers = Vec::new();
     for id in 1..=3 {
-        let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
-        handle
-            .submit(GenerateRequest::new(
+        let image_rx = handle
+            .submit(generation_request(
                 RequestId(id),
-                vec![4, 5, 6],
+                text_context(vec![4, 5, 6]),
                 SamplingParams::default(),
                 ImageParams {
                     steps: 1,
@@ -483,7 +603,6 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
                 },
                 GenerationConstraint::GenOnly,
                 0,
-                image_tx,
             ))
             .unwrap();
         receivers.push(image_rx);
@@ -535,9 +654,11 @@ fn decode_lookahead_uses_last_sampled_token_source_for_safe_text() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind, TokenSource};
 
+    type OperationLog = Arc<Mutex<Vec<(OpKind, TokenSource, (u32, u32))>>>;
+
     struct Recording {
         inner: SimExecutor,
-        ops: Arc<Mutex<Vec<(OpKind, TokenSource, (u32, u32))>>>,
+        ops: OperationLog,
     }
 
     impl Executor for Recording {
@@ -591,18 +712,17 @@ fn decode_lookahead_uses_last_sampled_token_source_for_safe_text() {
         ops: ops.clone(),
     };
     let mut sched = Scheduler::new(Box::new(exec), ctrl(), 32);
-    let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
-    let _keep = erx;
-    let mut sampling = SamplingParams::default();
-    sampling.ignore_eos = true;
-    sched.submit_for_test(GenerateRequest::new(
+    let sampling = SamplingParams {
+        ignore_eos: true,
+        ..Default::default()
+    };
+    let _keep = sched.submit_for_test(generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         sampling,
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         4,
-        etx,
     ));
 
     let mut idle = 0;
@@ -662,18 +782,16 @@ fn stop_token_terminates_with_stop() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let mut req = GenerateRequest::new(
+    let mut req = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         64,
-        etx,
     );
     req.stop_token_ids = vec![1007];
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut reason = None;
     let mut text = 0;
@@ -708,17 +826,15 @@ fn run_until_control(abort: bool) -> FinishReason {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
+    let req = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         1_000_000,
-        etx,
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     // wait until it's actually generating, then issue the control command.
     let mut saw_token = false;
@@ -787,16 +903,14 @@ fn hybrid_groups_handshake_runs() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    handle
-        .submit(GenerateRequest::new(
+    let mut erx = handle
+        .submit(generation_request(
             RequestId(1),
-            vec![1, 2, 3],
+            text_context(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             16,
-            etx,
         ))
         .unwrap();
 
@@ -836,16 +950,14 @@ fn prefix_cache_reuses_shared_prompt() {
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
 
     let run_one = |rid: u64, handle: &EngineHandle| {
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-        handle
-            .submit(GenerateRequest::new(
+        let mut erx = handle
+            .submit(generation_request(
                 RequestId(rid),
-                prompt.clone(),
+                text_context(prompt.clone()),
                 SamplingParams::default(),
                 ImageParams::default(),
                 GenerationConstraint::UndOnly,
                 8,
-                etx,
             ))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -878,8 +990,82 @@ fn prefix_cache_reuses_shared_prompt() {
     assert!(stats.prefix.hit_tokens.load(Ordering::Relaxed) >= 512);
 
     // resetting the prefix cache clears it.
-    handle.reset_prefix_cache();
-    thread::sleep(Duration::from_millis(20));
+    assert!(handle.reset_prefix_cache(false).unwrap());
+
+    handle.shutdown();
+    let _ = jh.join();
+}
+
+#[test]
+fn prefix_cache_enforces_read_write_and_isolation_policy() {
+    use std::sync::atomic::Ordering;
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(2);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let stats = sched.stats_handle();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+    let prompt: Vec<u32> = (0..600_u32).map(|index| (index % 47) + 5).collect();
+
+    let run = |id: u64, read: bool, write: bool, isolation_key: u64| {
+        let mut request = generation_request(
+            RequestId(id),
+            text_context(prompt.clone()),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            8,
+        );
+        request.cache = uniserve_core::GenerationCachePolicyDescriptor {
+            read,
+            write,
+            isolation_key: Some(isolation_key),
+        };
+        let mut events = handle.submit(request).expect("submit cache request");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(GenEvent::Finished { .. }) => return,
+                Ok(_) => {}
+                Err(_) => thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        panic!("cache request {id} did not finish");
+    };
+
+    run(1, true, true, 11);
+    let cold_hits = stats.prefix.hits.load(Ordering::Relaxed);
+    run(2, true, true, 22);
+    assert_eq!(
+        stats.prefix.hits.load(Ordering::Relaxed),
+        cold_hits,
+        "a different isolation key reused cached blocks"
+    );
+    run(3, true, true, 11);
+    assert!(
+        stats.prefix.hits.load(Ordering::Relaxed) >= cold_hits + 2,
+        "the matching isolation key did not reuse its prefix"
+    );
+
+    let before_bypass = stats.prefix.hits.load(Ordering::Relaxed);
+    run(4, false, true, 33);
+    assert_eq!(stats.prefix.hits.load(Ordering::Relaxed), before_bypass);
+    run(5, true, true, 33);
+    assert!(
+        stats.prefix.hits.load(Ordering::Relaxed) >= before_bypass + 2,
+        "read bypass prevented a write-enabled request from publishing its prefix"
+    );
+
+    let before_no_store = stats.prefix.hits.load(Ordering::Relaxed);
+    run(6, true, false, 44);
+    run(7, true, true, 44);
+    assert_eq!(
+        stats.prefix.hits.load(Ordering::Relaxed),
+        before_no_store,
+        "a write-disabled request published its prefix"
+    );
 
     handle.shutdown();
     let _ = jh.join();
@@ -902,28 +1088,24 @@ fn chunked_prefill_progresses_with_decode() {
 
     // long prompt (≈ 4 full 256-blocks) + a short concurrent request.
     let long_prompt: Vec<u32> = (0..1000u32).map(|i| (i % 91) + 7).collect();
-    let (etx1, mut erx1) = tokio::sync::mpsc::unbounded_channel();
-    handle
-        .submit(GenerateRequest::new(
+    let mut erx1 = handle
+        .submit(generation_request(
             RequestId(1),
-            long_prompt,
+            text_context(long_prompt),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             8,
-            etx1,
         ))
         .unwrap();
-    let (etx2, mut erx2) = tokio::sync::mpsc::unbounded_channel();
-    handle
-        .submit(GenerateRequest::new(
+    let mut erx2 = handle
+        .submit(generation_request(
             RequestId(2),
-            vec![1, 2, 3],
+            text_context(vec![1, 2, 3]),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             8,
-            etx2,
         ))
         .unwrap();
 
@@ -961,36 +1143,32 @@ fn priority_preemption_and_recompute() {
     let stats = sched.stats_handle();
 
     // low-priority A, then (later) high-priority B; 1 usable block forces a choice.
-    let (atx, mut arx) = tokio::sync::mpsc::unbounded_channel();
-    let mut a = GenerateRequest::new(
+    let mut a = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         6,
-        atx,
     );
     a.priority = 10;
-    sched.submit_for_test(a);
+    let mut arx = sched.submit_for_test(a);
 
     // step until A is running and decoding (holds the only block).
     for _ in 0..4 {
         sched.step();
     }
 
-    let (btx, mut brx) = tokio::sync::mpsc::unbounded_channel();
-    let mut b = GenerateRequest::new(
+    let mut b = generation_request(
         RequestId(2),
-        vec![4, 5, 6],
+        text_context(vec![4, 5, 6]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         6,
-        btx,
     );
     b.priority = 0; // higher priority (lower value)
-    sched.submit_for_test(b);
+    let mut brx = sched.submit_for_test(b);
 
     // drive to completion.
     for _ in 0..2000 {
@@ -1029,7 +1207,7 @@ fn run_sampling(
     sampling: SamplingParams,
     text_len: usize,
     max_tokens: usize,
-) -> (Vec<u32>, bool, bool) {
+) -> (Vec<u32>, bool, Option<FinishReason>) {
     let mut sim = SimEngine::new();
     sim.set_text_len(text_len);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1038,23 +1216,21 @@ fn run_sampling(
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
+    let req = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         sampling,
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         max_tokens,
-        etx,
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut toks = Vec::new();
     let mut any_logprob = false;
-    let mut done = false;
+    let mut finished = None;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !done && Instant::now() < deadline {
+    while finished.is_none() && Instant::now() < deadline {
         match erx.try_recv() {
             Ok(GenEvent::TextToken { id, logprob }) => {
                 toks.push(id);
@@ -1062,14 +1238,14 @@ fn run_sampling(
                     any_logprob = true;
                 }
             }
-            Ok(GenEvent::Finished { .. }) => done = true,
+            Ok(GenEvent::Finished { reason, .. }) => finished = Some(reason),
             Ok(_) => {}
             Err(_) => thread::sleep(Duration::from_millis(1)),
         }
     }
     handle.shutdown();
     let _ = jh.join();
-    (toks, any_logprob, done)
+    (toks, any_logprob, finished)
 }
 
 #[test]
@@ -1078,8 +1254,8 @@ fn logprobs_flow_to_events() {
         n_logprobs: 3,
         ..Default::default()
     };
-    let (toks, any_logprob, done) = run_sampling(sp, 8, 16);
-    assert!(done);
+    let (toks, any_logprob, finished) = run_sampling(sp, 8, 16);
+    assert!(finished.is_some());
     assert!(!toks.is_empty());
     assert!(
         any_logprob,
@@ -1093,8 +1269,8 @@ fn allowed_tokens_restricts_output() {
         allowed_token_ids: Some(vec![1234]),
         ..Default::default()
     };
-    let (toks, _lp, done) = run_sampling(sp, 8, 6);
-    assert!(done);
+    let (toks, _lp, finished) = run_sampling(sp, 8, 6);
+    assert!(finished.is_some());
     assert!(!toks.is_empty());
     assert!(
         toks.iter().all(|&t| t == 1234),
@@ -1109,8 +1285,8 @@ fn logit_bias_forces_token() {
         logit_bias: vec![(4321, 1000.0)],
         ..Default::default()
     };
-    let (toks, _lp, done) = run_sampling(sp, 8, 6);
-    assert!(done);
+    let (toks, _lp, finished) = run_sampling(sp, 8, 6);
+    assert!(finished.is_some());
     assert!(
         toks.iter().all(|&t| t == 4321),
         "biased token must always win, got {toks:?}"
@@ -1125,8 +1301,8 @@ fn min_tokens_floor_overrides_early_eos() {
         min_tokens: 5,
         ..Default::default()
     };
-    let (toks, _lp, done) = run_sampling(sp, 1, 50);
-    assert!(done);
+    let (toks, _lp, finished) = run_sampling(sp, 1, 50);
+    assert!(finished.is_some());
     assert!(
         toks.len() >= 5,
         "min_tokens floor not honored, only {} tokens",
@@ -1138,18 +1314,27 @@ fn min_tokens_floor_overrides_early_eos() {
 fn default_sampling_is_unchanged() {
     // No params set => greedy argmax of the synthetic distribution = the natural
     // token (1000 + (1*7+n)%5000); first token is 1007.
-    let (toks, _lp, done) = run_sampling(SamplingParams::default(), 8, 16);
-    assert!(done);
+    let (toks, _lp, finished) = run_sampling(SamplingParams::default(), 8, 16);
+    assert!(finished.is_some());
     assert_eq!(toks[0], 1007);
 }
 
-/// an image-in-prompt request encodes the image (VitEncode) before
-/// prefill and then produces text; a second request with the same image hits the
-/// encoder cache and skips re-encode (no embedding ever crosses the wire).
+#[test]
+fn stochastic_sampling_reaches_synthetic_eos() {
+    let sampling = SamplingParams {
+        temperature: 1.0,
+        seed: Some(7),
+        ..Default::default()
+    };
+    let (_toks, _lp, finished) = run_sampling(sampling, 8, 16);
+    assert_eq!(finished, Some(FinishReason::Eos));
+}
+
+/// An image-in-prompt request encodes the image before prefill; a second request
+/// attaches the resident encoder output to its own KV without rerunning the vision tower.
 #[test]
 fn multimodal_encode_then_cache_hit() {
     use std::sync::atomic::Ordering;
-    use uniserve_engine_api::MmItem;
     let mut sim = SimEngine::new();
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1160,24 +1345,15 @@ fn multimodal_encode_then_cache_hit() {
     let jh = thread::spawn(move || sched.run(rx));
 
     let run_img = |rid: u64, handle: &EngineHandle| -> (bool, Vec<String>) {
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-        // prompt_ids include placeholder positions for the image span [3, 7).
-        let mut req = GenerateRequest::new(
+        let req = generation_request(
             RequestId(rid),
-            vec![1, 2, 3, 0, 0, 0, 0, 9],
+            context_with_image(vec![1, 2, 3], vec![9], 0xCAFE, 4, 1),
             SamplingParams::default(),
             ImageParams::default(),
             GenerationConstraint::GenOnly,
             8,
-            etx,
         );
-        req.mm_items = vec![MmItem {
-            hash: 0xCAFE,
-            position: 3,
-            num_tokens: 4,
-            b64: String::new(),
-        }];
-        handle.submit(req).unwrap();
+        let mut erx = handle.submit(req).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut images = 0;
         let mut done = false;
@@ -1235,41 +1411,85 @@ fn multimodal_encode_then_cache_hit() {
     let _ = jh.join();
 }
 
-/// a single default generation request emits at least two images separated by
+#[test]
+fn und_only_image_context_encodes_then_produces_text_without_gen_output() {
+    use std::sync::atomic::Ordering;
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(20);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let stats = sched.stats_handle();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let request = generation_request(
+        RequestId(81),
+        context_with_image(vec![1, 2], vec![3, 4], 0x81, 4, 1),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        16,
+    );
+    let mut events = handle.submit(request).expect("submit request");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut text_tokens = 0;
+    let mut images = 0;
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => text_tokens += 1,
+            Ok(GenEvent::ImageDone { .. }) => images += 1,
+            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+
+    handle.shutdown();
+    let _ = jh.join();
+    assert!(finished, "Und-only image-context request did not finish");
+    assert!(text_tokens > 0, "Und-only request emitted no visible text");
+    assert_eq!(images, 0, "Und-only request opened a Gen branch");
+    assert!(
+        stats.encoder.cached.load(Ordering::Relaxed) >= 1,
+        "input image was not encoded and retained in the encoder cache"
+    );
+}
+
+/// a single generated branch request emits at least two images separated by
 /// text in one stream, and finishes only on a terminal condition.
 #[test]
-fn default_generation_round_trip_text_image_text_image() {
+fn gen_branch_round_trip_text_image_text_image() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let control = ControlTokens {
-        start_of_image: 2222,
-        ..ctrl()
-    };
+    let control = ControlTokens { ..ctrl() };
     let sched = Scheduler::new(executor, control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3],
-        SamplingParams {
-            logit_bias: vec![(2222, 1000.0)],
-            ..Default::default()
-        },
-        ImageParams {
-            steps: 3,
-            max_images: 2,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        200,
-        etx,
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..Default::default()
+            },
+            ImageParams {
+                steps: 3,
+                max_images: 2,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            200,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     // record the modality sequence: 'T' for a text token, 'I' for an image.
     let mut seq: Vec<char> = Vec::new();
@@ -1287,7 +1507,7 @@ fn default_generation_round_trip_text_image_text_image() {
     handle.shutdown();
     let _ = jh.join();
 
-    assert!(finished, "default generation request did not finish");
+    assert!(finished, "generated branch request did not finish");
     let images = seq.iter().filter(|&&c| c == 'I').count();
     assert!(
         images >= 2,
@@ -1295,16 +1515,14 @@ fn default_generation_round_trip_text_image_text_image() {
         seq
     );
     assert!(
-        seq.iter().any(|&c| c == 'T'),
+        seq.contains(&'T'),
         "expected native text tokens around images (seq={:?})",
         seq
     );
 }
 
-/// Native multi-image passages can be requested intentionally through max_images;
-/// image starts must come from the model, not a scheduler-forced cadence.
 #[test]
-fn default_generation_waits_for_model_image_starts() {
+fn generated_image_reingest_runs_declared_encoder_recipe_before_continuation() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
@@ -1313,21 +1531,92 @@ fn default_generation_waits_for_model_image_starts() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3],
-        SamplingParams::default(),
-        ImageParams {
-            steps: 3,
-            max_images: 3,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        40,
-        etx,
+    let mut request = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..Default::default()
+            },
+            ImageParams {
+                steps: 2,
+                max_images: 1,
+                retain_images: false,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            12,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
-    handle.submit(req).unwrap();
+    request.policy.feedback = Some(GeneratedImageFeedbackRecipe {
+        commit: CommitRecipe::CommitGen,
+        writeback: FeedbackWriteback::Reingest {
+            ingest: Box::new(ImageIngestRecipe::vit_only(
+                1,
+                ImageKvEffect::Exact { tokens: 1 },
+            )),
+        },
+        next_und_token: FeedbackNextToken::Bos,
+        logical_positions: 1,
+        physical_kv_tokens: ImageKvEffect::Exact { tokens: 1 },
+    });
+    request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+    let mut events = handle.submit(request).unwrap();
+
+    let mut sequence = Vec::new();
+    let mut finished = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => sequence.push('T'),
+            Ok(GenEvent::ImageDone { .. }) => sequence.push('I'),
+            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert!(finished, "re-ingest request did not finish: {sequence:?}");
+    assert_eq!(sequence.iter().filter(|&&event| event == 'I').count(), 1);
+    let image = sequence.iter().position(|event| *event == 'I').unwrap();
+    assert!(
+        sequence[image + 1..].contains(&'T'),
+        "Und continuation must begin only after feedback ingest: {sequence:?}"
+    );
+}
+
+/// Native multi-image passages can be requested intentionally through max_images;
+/// image starts must come from the model, not a scheduler-forced cadence.
+#[test]
+fn gen_branch_waits_for_model_image_starts() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    let executor = Box::new(SimExecutor::new(Box::new(sim)));
+    let sched = Scheduler::new(executor, ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 3,
+                max_images: 3,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            40,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
+    );
+    let mut erx = handle.submit(req).unwrap();
 
     let mut seq = Vec::new();
     let mut finished = false;
@@ -1357,12 +1646,114 @@ fn default_generation_waits_for_model_image_starts() {
 }
 
 #[test]
-fn default_generation_model_image_starts_spend_budget() {
+fn gen_only_can_discover_its_trigger_with_internal_und_decode() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(1_000_000);
+    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let mut request = generation_request(
+        RequestId(61),
+        text_context(vec![1, 2, 3]),
+        SamplingParams {
+            logit_bias: vec![(2222, 1000.0)],
+            ..SamplingParams::default()
+        },
+        ImageParams {
+            steps: 2,
+            max_images: 1,
+            ..ImageParams::default()
+        },
+        GenerationConstraint::GenOnly,
+        8,
+    );
+    request.policy.trigger = TriggerPolicyDescriptor::Token { token_id: 2222 };
+    request.policy.gen_only_start = uniserve_core::GenOnlyStartPolicyDescriptor::DiscoverTrigger;
+    request.behavior = GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+    assert!(request.behavior.und_decode);
+    assert!(!request.behavior.start_gen_after_context);
+
+    let mut events = handle.submit(request).expect("submit request");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut visible_text = 0;
+    let mut images = 0;
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => visible_text += 1,
+            Ok(GenEvent::ImageDone { .. }) => images += 1,
+            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert!(finished, "trigger-discovery request did not finish");
+    assert_eq!(visible_text, 0, "Gen-only control tokens became visible");
+    assert_eq!(images, 1, "the discovered trigger did not open Gen");
+}
+
+#[test]
+fn und_only_round_close_trigger_cannot_open_gen() {
+    let mut sim = SimEngine::new();
+    sim.set_text_len(2);
+    let control = ctrl();
+    let close_token_ids = control.eos.clone();
+    let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), control, 32);
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = EngineHandle::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let request = with_trigger(
+        generation_request(
+            RequestId(62),
+            text_context(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 2,
+                max_images: 1,
+                ..ImageParams::default()
+            },
+            GenerationConstraint::UndOnly,
+            16,
+        ),
+        TriggerPolicyDescriptor::RoundCloseThenSuffix {
+            close_token_ids,
+            trigger_token_ids: vec![1008],
+        },
+    );
+    let mut events = handle.submit(request).expect("submit request");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut text = 0;
+    let mut images = 0;
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(GenEvent::TextToken { .. }) => text += 1,
+            Ok(GenEvent::ImageDone { .. }) => images += 1,
+            Ok(GenEvent::Finished { .. }) => finished = true,
+            Ok(_) => {}
+            Err(_) => thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    handle.shutdown();
+    let _ = jh.join();
+
+    assert!(finished, "Und-only round-close request did not finish");
+    assert!(text > 0, "Und-only request emitted no text");
+    assert_eq!(images, 0, "Und-only round-close trigger opened Gen");
+}
+
+#[test]
+fn gen_branch_model_image_starts_spend_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     let trig = ControlTokens {
-        start_of_image: 2222,
         ..ControlTokens::default()
     };
     let sched = Scheduler::new(executor, trig, 32);
@@ -1370,24 +1761,25 @@ fn default_generation_model_image_starts_spend_budget() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3],
-        SamplingParams {
-            logit_bias: vec![(2222, 1000.0)],
-            ..Default::default()
-        },
-        ImageParams {
-            steps: 3,
-            max_images: 3,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        40,
-        etx,
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..Default::default()
+            },
+            ImageParams {
+                steps: 3,
+                max_images: 3,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            40,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut seq = Vec::new();
     let mut finished = false;
@@ -1426,7 +1818,7 @@ fn default_generation_model_image_starts_spend_budget() {
 }
 
 #[test]
-fn default_generation_rejects_oversized_worstcase_at_admission() {
+fn gen_branch_rejects_oversized_worstcase_at_admission() {
     let mut sim = SimEngine::new();
     sim.set_text_len(8);
     sim.set_num_blocks(128);
@@ -1437,10 +1829,9 @@ fn default_generation_rejects_oversized_worstcase_at_admission() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
+    let req = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams {
             steps: 3,
@@ -1450,9 +1841,8 @@ fn default_generation_rejects_oversized_worstcase_at_admission() {
         },
         GenerationConstraint::Default,
         32_768,
-        etx,
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut rejected = false;
     let mut finished = None;
@@ -1470,7 +1860,7 @@ fn default_generation_rejects_oversized_worstcase_at_admission() {
 
     assert!(
         rejected,
-        "oversized default-generation request must be rejected"
+        "oversized generated-branch request must be rejected"
     );
     assert_eq!(finished, None);
 }
@@ -1479,10 +1869,7 @@ fn default_generation_rejects_oversized_worstcase_at_admission() {
 fn commit_eos_finishes_without_spending_remaining_budget() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
-    let control = ControlTokens {
-        start_of_image: 2222,
-        ..ctrl()
-    };
+    let control = ControlTokens { ..ctrl() };
     sim.set_commit_token(Some(control.eos[0]));
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     let sched = Scheduler::new(executor, control, 32);
@@ -1490,24 +1877,25 @@ fn commit_eos_finishes_without_spending_remaining_budget() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3, 2222],
-        SamplingParams {
-            logit_bias: vec![(2222, 1000.0)],
-            ..Default::default()
-        },
-        ImageParams {
-            steps: 3,
-            max_images: 3,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        40,
-        etx,
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3, 2222]),
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..Default::default()
+            },
+            ImageParams {
+                steps: 3,
+                max_images: 3,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            40,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut text = 0usize;
     let mut images = 0usize;
@@ -1553,16 +1941,14 @@ fn multiworker_executor_drives_scheduler_unchanged() {
 
     let mut rxs = std::collections::HashMap::new();
     for id in 1..=3u64 {
-        let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
-        handle
-            .submit(GenerateRequest::new(
+        let erx = handle
+            .submit(generation_request(
                 RequestId(id),
-                vec![1, 2, 3],
+                text_context(vec![1, 2, 3]),
                 SamplingParams::default(),
                 ImageParams::default(),
                 GenerationConstraint::UndOnly,
                 16,
-                etx,
             ))
             .unwrap();
         rxs.insert(RequestId(id), erx);
@@ -1679,34 +2065,30 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
     };
     let mut sched = Scheduler::with_policy(Box::new(exec), ctrl(), 32, SchedulingPolicy::Priority);
 
-    let (atx, _arx) = tokio::sync::mpsc::unbounded_channel();
-    let mut a = GenerateRequest::new(
+    let mut a = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         6,
-        atx,
     );
     a.priority = 10;
-    sched.submit_for_test(a);
+    let _arx = sched.submit_for_test(a);
     for _ in 0..4 {
         sched.step();
     }
 
-    let (btx, _brx) = tokio::sync::mpsc::unbounded_channel();
-    let mut b = GenerateRequest::new(
+    let mut b = generation_request(
         RequestId(2),
-        vec![4, 5, 6],
+        text_context(vec![4, 5, 6]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         6,
-        btx,
     );
     b.priority = 0;
-    sched.submit_for_test(b);
+    let _brx = sched.submit_for_test(b);
     for _ in 0..2000 {
         if !sched.step() {
             break;
@@ -1762,21 +2144,18 @@ fn guided_choice_constrains_output() {
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let mut req = GenerateRequest::new(
+    let mut req = generation_request(
         RequestId(1),
-        vec![1, 2, 3],
+        text_context(vec![1, 2, 3]),
         SamplingParams::default(),
         ImageParams::default(),
         GenerationConstraint::UndOnly,
         64,
-        etx,
     );
-    req.grammar = Some(GrammarSpec::Choice(vec![
-        vec![2000, 2001, 2002],
-        vec![3000],
-    ]));
-    handle.submit(req).unwrap();
+    req.grammar = Some(GrammarSpec::Choice {
+        token_sequences: vec![vec![2000, 2001, 2002], vec![3000]],
+    });
+    let mut erx = handle.submit(req).unwrap();
 
     let mut toks = Vec::new();
     let mut reason = None;
@@ -1809,37 +2188,36 @@ fn guided_choice_constrains_output() {
 /// <|vision_start|> token. The sim never emits EOS here (huge text_len), so
 /// images can only come from the literal trigger.
 #[test]
-fn default_generation_literal_trigger_starts_images() {
+fn gen_branch_literal_trigger_starts_images() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     sim.set_pipeline_depth(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
     // Sim emits 1000 + ((id*7 + n) % 5000) for request id=1: 1007, 1008, 1009…
     // After an image commits, the sim resets and the round repeats from 1007.
-    let trig = ControlTokens {
-        image_start_ids: vec![1008, 1009],
-        ..ControlTokens::default()
-    };
-    let sched = Scheduler::new(executor, trig, 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3],
-        SamplingParams::default(),
-        ImageParams {
-            steps: 3,
-            max_images: 2,
-            ..Default::default()
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 3,
+                max_images: 2,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            40,
+        ),
+        TriggerPolicyDescriptor::Suffix {
+            token_ids: vec![1008, 1009],
         },
-        GenerationConstraint::Default,
-        40,
-        etx,
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut seq: Vec<char> = Vec::new();
     let mut finished = false;
@@ -1871,45 +2249,42 @@ fn default_generation_literal_trigger_starts_images() {
 }
 
 /// The image-likelihood knob: a logit bias on the image-start token steers
-/// when default-generation requests draw. A huge positive bias makes the very first
+/// when generated-branch requests draw. A huge positive bias makes the very first
 /// sampled token the image trigger (image before any text); a huge negative
 /// bias keeps the pathway shut (the sim never EOSes here, so no image can
 /// appear any other way).
 #[test]
-fn image_start_logit_bias_steers_default_generation() {
+fn image_start_logit_bias_steers_gen_branch() {
     let run = |bias: f32| -> (usize, usize, bool) {
         let mut sim = SimEngine::new();
         sim.set_text_len(1_000_000); // never EOS on its own
         let executor = Box::new(SimExecutor::new(Box::new(sim)));
         // an image-start token inside the sim's vocab
-        let trig = ControlTokens {
-            start_of_image: 2222,
-            ..ControlTokens::default()
-        };
-        let sched = Scheduler::new(executor, trig, 32);
+        let sched = Scheduler::new(executor, ctrl(), 32);
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
         let jh = thread::spawn(move || sched.run(rx));
 
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-        let mut req = GenerateRequest::new(
-            RequestId(1),
-            vec![1, 2, 3],
-            SamplingParams {
-                logit_bias: vec![(2222, bias)],
-                ..Default::default()
-            },
-            ImageParams {
-                steps: 3,
-                max_images: 1,
-                ..Default::default()
-            },
-            GenerationConstraint::Default,
-            12,
-            etx,
+        let mut req = with_trigger(
+            generation_request(
+                RequestId(1),
+                text_context(vec![1, 2, 3]),
+                SamplingParams {
+                    logit_bias: vec![(2222, bias)],
+                    ..Default::default()
+                },
+                ImageParams {
+                    steps: 3,
+                    max_images: 1,
+                    ..Default::default()
+                },
+                GenerationConstraint::Default,
+                12,
+            ),
+            TriggerPolicyDescriptor::Token { token_id: 2222 },
         );
         req.sampling.seed = None;
-        handle.submit(req).unwrap();
+        let mut erx = handle.submit(req).unwrap();
 
         let mut text_before_first_image = 0usize;
         let mut images = 0usize;
@@ -1941,38 +2316,35 @@ fn image_start_logit_bias_steers_default_generation() {
     assert_eq!(images, 0, "negative bias must suppress the image pathway");
 }
 
-/// Native assistant prefixes can end at the image boundary. Default generation must
+/// Native assistant prefixes can end at the image boundary. Generated branch must
 /// honor that prefilled control token immediately after prefill instead of
 /// waiting for the model to sample another image-start token.
 #[test]
-fn default_generation_prefilled_image_start_begins_without_text() {
+fn gen_branch_prefilled_image_start_begins_without_text() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let trig = ControlTokens {
-        start_of_image: 2222,
-        ..ControlTokens::default()
-    };
-    let sched = Scheduler::new(executor, trig, 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![10, 11, 2222],
-        SamplingParams::default(),
-        ImageParams {
-            steps: 3,
-            max_images: 1,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        8,
-        etx,
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![10, 11, 2222]),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 3,
+                max_images: 1,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            8,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut text_before_first_image = 0usize;
     let mut images = 0usize;
@@ -2003,36 +2375,32 @@ fn context_image_request_commits_existing_image_context_at_round_close() {
     let mut sim = SimEngine::new();
     sim.set_text_len(2);
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let control = ControlTokens {
-        image_start_ids: vec![1007],
-        ..ctrl()
-    };
+    let control = ctrl();
+    let close_token_ids = control.eos.clone();
     let sched = Scheduler::new(executor, control, 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let mut req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3],
-        SamplingParams::default(),
-        ImageParams {
-            steps: 2,
-            max_images: 1,
-            ..Default::default()
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            context_with_image(Vec::new(), vec![1, 2, 3], 7, 1, 1),
+            SamplingParams::default(),
+            ImageParams {
+                steps: 2,
+                max_images: 1,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            40,
+        ),
+        TriggerPolicyDescriptor::RoundCloseThenSuffix {
+            close_token_ids,
+            trigger_token_ids: vec![1008],
         },
-        GenerationConstraint::UndOnly,
-        40,
-        etx,
     );
-    req.mm_items = vec![MmItem {
-        hash: 7,
-        position: 0,
-        num_tokens: 1,
-        b64: "image".into(),
-    }];
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut seq: Vec<char> = Vec::new();
     let mut finished = false;
@@ -2070,33 +2438,30 @@ fn image_budget_suppresses_biased_image_start() {
     let mut sim = SimEngine::new();
     sim.set_text_len(1_000_000); // never EOS on its own
     let executor = Box::new(SimExecutor::new(Box::new(sim)));
-    let trig = ControlTokens {
-        start_of_image: 2222,
-        ..ControlTokens::default()
-    };
-    let sched = Scheduler::new(executor, trig, 32);
+    let sched = Scheduler::new(executor, ctrl(), 32);
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = EngineHandle::new(tx);
     let jh = thread::spawn(move || sched.run(rx));
 
-    let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
-    let req = GenerateRequest::new(
-        RequestId(1),
-        vec![1, 2, 3],
-        SamplingParams {
-            logit_bias: vec![(2222, 1000.0)],
-            ..Default::default()
-        },
-        ImageParams {
-            steps: 3,
-            max_images: 2,
-            ..Default::default()
-        },
-        GenerationConstraint::Default,
-        24,
-        etx,
+    let req = with_trigger(
+        generation_request(
+            RequestId(1),
+            text_context(vec![1, 2, 3]),
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..Default::default()
+            },
+            ImageParams {
+                steps: 3,
+                max_images: 2,
+                ..Default::default()
+            },
+            GenerationConstraint::Default,
+            24,
+        ),
+        TriggerPolicyDescriptor::Token { token_id: 2222 },
     );
-    handle.submit(req).unwrap();
+    let mut erx = handle.submit(req).unwrap();
 
     let mut images = 0usize;
     let mut post_budget_triggers = 0usize;
@@ -2153,11 +2518,9 @@ fn resource_leases_drain_to_zero_after_completion() {
         GenerationConstraint::UndOnly,
     ];
     for (i, mode) in specs.iter().enumerate() {
-        let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
-        keep_alive.push(erx);
-        let req = GenerateRequest::new(
+        let req = generation_request(
             RequestId(i as u64 + 1),
-            vec![1, 2, 3, 4, 5],
+            text_context(vec![1, 2, 3, 4, 5]),
             SamplingParams::default(),
             ImageParams {
                 steps: 4,
@@ -2166,9 +2529,8 @@ fn resource_leases_drain_to_zero_after_completion() {
             },
             *mode,
             16,
-            etx,
         );
-        sched.submit_for_test(req);
+        keep_alive.push(sched.submit_for_test(req));
     }
 
     let mut max_active = 0usize;
@@ -2218,11 +2580,9 @@ fn policy_facts_and_decisions_are_recorded() {
 
     let mut keep_alive = Vec::new();
     for i in 0..3u64 {
-        let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
-        keep_alive.push(erx);
-        sched.submit_for_test(GenerateRequest::new(
+        keep_alive.push(sched.submit_for_test(generation_request(
             RequestId(i + 1),
-            vec![1, 2, 3, 4, 5],
+            text_context(vec![1, 2, 3, 4, 5]),
             SamplingParams::default(),
             ImageParams {
                 steps: 4,
@@ -2230,8 +2590,7 @@ fn policy_facts_and_decisions_are_recorded() {
             },
             GenerationConstraint::UndOnly,
             16,
-            etx,
-        ));
+        )));
     }
     let mut idle = 0;
     for _ in 0..5000 {
@@ -2278,11 +2637,9 @@ fn policy_facts_and_decisions_are_recorded() {
 fn lifecycle_trace_and_health_snapshot() {
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
     let mut sched = Scheduler::with_policy(executor, ctrl(), 32, SchedulingPolicy::Fcfs);
-    let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
-    let _keep = erx; // keep the receiver alive (a dropped one cancels)
-    sched.submit_for_test(GenerateRequest::new(
+    let _keep = sched.submit_for_test(generation_request(
         RequestId(1),
-        vec![1, 2, 3, 4, 5],
+        text_context(vec![1, 2, 3, 4, 5]),
         SamplingParams::default(),
         ImageParams {
             steps: 4,
@@ -2290,7 +2647,6 @@ fn lifecycle_trace_and_health_snapshot() {
         },
         GenerationConstraint::UndOnly,
         8,
-        etx,
     ));
     let mut idle = 0;
     for _ in 0..5000 {

@@ -70,6 +70,7 @@
       "description": "UniServe Qwen3-32B benchmark server."
     },
     "benchmark/server/qwen-sglang": {
+      "model": "${UNISERVE_QWEN3_MODEL}",
       "served_model_name": "Qwen3-32B",
       "host": "127.0.0.1",
       "port": 18080,
@@ -126,6 +127,7 @@
       "abstract": false
     },
     "benchmark/server/sensenova-omni": {
+      "model": "${UNISERVE_SENSENOVA_MODEL}",
       "served_model_name": "${UNISERVE_SENSENOVA_MODEL}",
       "host": "127.0.0.1",
       "port": 8091,
@@ -151,6 +153,7 @@
       "abstract": false
     },
     "benchmark/server/bagel-omni": {
+      "model": "${UNISERVE_BAGEL_MODEL}",
       "served_model_name": "${UNISERVE_BAGEL_MODEL}",
       "host": "127.0.0.1",
       "port": 8092,
@@ -293,6 +296,7 @@
         }
       },
       "expect_images": 4,
+      "expect_image_steps": 200,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
       "timeout_s": 900,
@@ -515,7 +519,16 @@
       "description": "Main benchmark matrix, expressed as open-loop arrival-rate points.",
       "defaults": {
         "warmup_requests": 1,
-        "seed": 42
+        "seed": 42,
+        "measurement_interface": "public_protocol_adapter",
+        "cache_read_policy": "enabled",
+        "cache_write_policy": "enabled",
+        "adapter_selection": "base",
+        "structured_output_policy": "none",
+        "measured_runs": 1,
+        "server_topology": "single_server_single_harness",
+        "acceptance_min_success": 1,
+        "acceptance_max_failed": 0
       },
       "load_axes": {
         "arrival_rate": [
@@ -583,6 +596,7 @@
       "points": {
         "qwen3_sharegpt_uniserve": {
           "axis": "arrival_rate",
+          "parity_group": "qwen3_sharegpt",
           "name": "qwen-uniserve-sharegpt-r{rate_tag}",
           "output": "qwen3_sharegpt/uniserve_r{rate_tag}",
           "harness": {
@@ -591,11 +605,16 @@
             "dataset": "sharegpt",
             "dataset_path": "${UNISERVE_SHAREGPT_PATH}",
             "tokenizer": "${UNISERVE_QWEN3_MODEL}",
-            "num_prompts": 200
+            "num_prompts": 200,
+          "runtime_profile_id": "qwen3",
+          "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "und_only",
+            "preprocessing": "sharegpt_token_length_shaping_v1"
           }
         },
         "qwen3_sharegpt_sglang": {
           "axis": "arrival_rate",
+          "parity_group": "qwen3_sharegpt",
           "name": "qwen-sglang-sharegpt-r{rate_tag}",
           "output": "qwen3_sharegpt/sglang_r{rate_tag}",
           "harness": {
@@ -604,11 +623,16 @@
             "dataset": "sharegpt",
             "dataset_path": "${UNISERVE_SHAREGPT_PATH}",
             "tokenizer": "${UNISERVE_QWEN3_MODEL}",
-            "num_prompts": 200
+            "num_prompts": 200,
+          "runtime_profile_id": "qwen3-reference",
+          "plan_evidence_policy": "reference_protocol",
+            "output_constraint": "und_only",
+            "preprocessing": "sharegpt_token_length_shaping_v1"
           }
         },
         "sensenova_mjhq_t2i_uniserve": {
           "axis": "arrival_rate",
+          "parity_group": "sensenova_mjhq_t2i",
           "name": "sensenova-uniserve-t2i-r{rate_tag}",
           "output": "sensenova_mjhq_t2i/uniserve_r{rate_tag}",
           "harness": {
@@ -619,11 +643,23 @@
             "steps": 50,
             "width": 2048,
             "height": 1152,
-            "wire": "openai_chat_json"
+            "wire": "images_generations",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+          "runtime_profile_id": "sensenova-u1",
+          "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "gen_only",
+            "preprocessing": "mjhq_prompt_text_v1",
+            "acceptance_min_images_per_success": 1.0
           }
         },
         "sensenova_mjhq_t2i_omni": {
           "axis": "arrival_rate",
+          "parity_group": "sensenova_mjhq_t2i",
           "name": "sensenova-omni-t2i-r{rate_tag}",
           "output": "sensenova_mjhq_t2i/omni_r{rate_tag}",
           "harness": {
@@ -633,11 +669,23 @@
             "num_prompts": 200,
             "steps": 50,
             "width": 2048,
-            "height": 1152
+            "height": 1152,
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+          "runtime_profile_id": "sensenova-u1-reference",
+          "plan_evidence_policy": "reference_protocol",
+            "output_constraint": "gen_only",
+            "preprocessing": "mjhq_prompt_text_v1",
+            "acceptance_min_images_per_success": 1.0
           }
         },
         "sensenova_beans_i2t_uniserve": {
           "axis": "arrival_rate",
+          "parity_group": "sensenova_beans_i2t",
           "name": "sensenova-uniserve-i2t-r{rate_tag}",
           "output": "sensenova_beans_i2t/uniserve_r{rate_tag}",
           "harness": {
@@ -648,11 +696,16 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "openai_chat"
+            "wire": "openai_chat_json",
+          "runtime_profile_id": "sensenova-u1",
+          "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "und_only",
+            "preprocessing": "beans_jpeg95_seed42_v1"
           }
         },
         "sensenova_beans_i2t_omni": {
           "axis": "arrival_rate",
+          "parity_group": "sensenova_beans_i2t",
           "name": "sensenova-omni-i2t-r{rate_tag}",
           "output": "sensenova_beans_i2t/omni_r{rate_tag}",
           "harness": {
@@ -663,7 +716,11 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "openai_chat_json"
+            "wire": "openai_chat_json",
+          "runtime_profile_id": "sensenova-u1-reference",
+          "plan_evidence_policy": "reference_protocol",
+            "output_constraint": "und_only",
+            "preprocessing": "beans_jpeg95_seed42_v1"
           }
         },
         "sensenova_ueval_default_uniserve": {
@@ -680,11 +737,23 @@
             "width": 2048,
             "height": 1152,
             "wire": "openai_chat",
-            "temperature": 0.7
+            "temperature": 0.7,
+            "max_images": 4,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+          "runtime_profile_id": "sensenova-u1",
+          "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "default",
+            "preprocessing": "ueval_prompt_text_v1",
+            "acceptance_min_images_per_success": 1.0
           }
         },
         "bagel_mjhq_t2i_uniserve": {
           "axis": "arrival_rate",
+          "parity_group": "bagel_mjhq_t2i",
           "name": "bagel-uniserve-t2i-r{rate_tag}",
           "output": "bagel_mjhq_t2i/uniserve_r{rate_tag}",
           "harness": {
@@ -695,11 +764,23 @@
             "steps": 50,
             "width": 1024,
             "height": 1024,
-            "wire": "openai_chat_json"
+            "wire": "images_generations",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "global",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 1.0,
+          "runtime_profile_id": "bagel",
+          "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "gen_only",
+            "preprocessing": "mjhq_prompt_text_v1",
+            "acceptance_min_images_per_success": 1.0
           }
         },
         "bagel_mjhq_t2i_omni": {
           "axis": "arrival_rate",
+          "parity_group": "bagel_mjhq_t2i",
           "name": "bagel-omni-t2i-r{rate_tag}",
           "output": "bagel_mjhq_t2i/omni_r{rate_tag}",
           "harness": {
@@ -709,11 +790,23 @@
             "num_prompts": 200,
             "steps": 50,
             "width": 1024,
-            "height": 1024
+            "height": 1024,
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "global",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 1.0,
+          "runtime_profile_id": "bagel-reference",
+          "plan_evidence_policy": "reference_protocol",
+            "output_constraint": "gen_only",
+            "preprocessing": "mjhq_prompt_text_v1",
+            "acceptance_min_images_per_success": 1.0
           }
         },
         "bagel_beans_i2t_uniserve": {
           "axis": "arrival_rate",
+          "parity_group": "bagel_beans_i2t",
           "name": "bagel-uniserve-i2t-r{rate_tag}",
           "output": "bagel_beans_i2t/uniserve_r{rate_tag}",
           "harness": {
@@ -724,11 +817,16 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "openai_chat"
+            "wire": "openai_chat_json",
+          "runtime_profile_id": "bagel",
+          "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "und_only",
+            "preprocessing": "beans_jpeg95_seed42_v1"
           }
         },
         "bagel_beans_i2t_omni": {
           "axis": "arrival_rate",
+          "parity_group": "bagel_beans_i2t",
           "name": "bagel-omni-i2t-r{rate_tag}",
           "output": "bagel_beans_i2t/omni_r{rate_tag}",
           "harness": {
@@ -739,7 +837,11 @@
             "num_prompts": 200,
             "max_tokens": 256,
             "temperature": 0,
-            "wire": "openai_chat_json"
+            "wire": "openai_chat_json",
+          "runtime_profile_id": "bagel-reference",
+          "plan_evidence_policy": "reference_protocol",
+            "output_constraint": "und_only",
+            "preprocessing": "beans_jpeg95_seed42_v1"
           }
         }
       },

@@ -1,6 +1,8 @@
 """FP8 linear quantization method with a dequantized correctness floor."""
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -61,14 +63,20 @@ class W8A8Fp8LinearMethod(QuantizeMethodBase):
             "weight_scale",
             nn.Parameter(torch.ones(int(output_size), 1, dtype=torch.float32), requires_grad=False),
         )
-        set_weight_loader(module.weight, _fp8_weight_loader(module))
-        set_weight_loader(module.weight_scale, _fp8_scale_loader(module))
-        set_optional_checkpoint(module.weight_scale, True)
-        set_skip_serving_cast(module.weight_scale, True)
+        from ..linear import LinearBase
+
+        linear = cast(LinearBase, module)
+        set_weight_loader(linear.weight, _fp8_weight_loader(module))
+        set_weight_loader(linear.weight_scale, _fp8_scale_loader(module))
+        set_optional_checkpoint(linear.weight_scale, True)
+        set_skip_serving_cast(linear.weight_scale, True)
         init_fp8_phase(module)
 
     def process_weights_after_loading(self, module: nn.Module) -> None:
-        weight = getattr(module, "weight")
+        from ..linear import LinearBase
+
+        linear = cast(LinearBase, module)
+        weight = linear.weight
         if weight.dtype == torch.float8_e4m3fn:
             # An offline fp8 checkpoint weight can only be finalized once its
             # matching scale has been loaded; the load lifecycle must have
@@ -78,7 +86,7 @@ class W8A8Fp8LinearMethod(QuantizeMethodBase):
                     "FP8 checkpoint weight requires a loaded weight_scale tensor"
                 )
             weight.data = weight.data.contiguous()
-            module.weight_scale.data = _canonical_scale(module.weight_scale.data, weight.shape[0]).to(
+            linear.weight_scale.data = _canonical_scale(linear.weight_scale.data, weight.shape[0]).to(
                 device=weight.device,
                 dtype=torch.float32,
             )
@@ -90,15 +98,18 @@ class W8A8Fp8LinearMethod(QuantizeMethodBase):
         fp8_weight = nn.Parameter(quantized.contiguous(), requires_grad=False)
         copy_load_state(weight, fp8_weight)
         set_skip_serving_cast(fp8_weight, True)
-        module.weight = fp8_weight
-        module.weight_scale.data = scale.to(device=fp8_weight.device, dtype=torch.float32)
+        linear.weight = fp8_weight
+        linear.weight_scale.data = scale.to(device=fp8_weight.device, dtype=torch.float32)
         set_fp8_scale_loaded(module, True)
 
     def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        weight = getattr(module, "weight")
+        from ..linear import LinearBase
+
+        linear = cast(LinearBase, module)
+        weight = linear.weight
         if weight.dtype != torch.float8_e4m3fn:
-            return F.linear(x, weight, getattr(module, "bias", None))
-        out = _apply_fp8_linear(x, weight, module.weight_scale, getattr(module, "bias", None))
+            return F.linear(x, weight, linear.bias)
+        out = _apply_fp8_linear(x, weight, linear.weight_scale, linear.bias)
         return out
 
 
@@ -129,7 +140,7 @@ def _apply_scaled_mm(
     act_scale = fp8_scale_from(x_float, dim=1)
     x_fp8 = fp8_quantize(x_float, act_scale)
     scale_b = _canonical_scale(weight_scale, weight.shape[0]).t().contiguous()
-    return torch._scaled_mm(  # type: ignore[attr-defined]
+    return torch._scaled_mm(
         x_fp8,
         weight.t(),
         scale_a=act_scale,

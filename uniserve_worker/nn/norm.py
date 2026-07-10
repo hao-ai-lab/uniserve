@@ -1,6 +1,8 @@
 """Audited normalization primitives shared by all model ports."""
 from __future__ import annotations
 
+from typing import overload
+
 import torch
 import torch.nn as nn
 
@@ -307,6 +309,28 @@ class _EagerAddRmsNorm:
     ) -> _AddRmsResult:
         combined = hidden_states + residual
         return _rms_norm(combined, weight, eps), combined
+
+
+@overload
+def _rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: None = None,
+    in_place: bool = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def _rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: torch.Tensor,
+    in_place: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def _rms_norm(

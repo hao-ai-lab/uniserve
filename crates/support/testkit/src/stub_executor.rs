@@ -86,6 +86,7 @@ impl StubExecutor {
             .iter()
             .map(|op| SeqResult {
                 req_id: op.req_id,
+                op_kind: Some(op.kind),
                 sampled_token_id: Some(op.req_id.0 as u32),
                 op_id: op.op_id,
                 ..Default::default()

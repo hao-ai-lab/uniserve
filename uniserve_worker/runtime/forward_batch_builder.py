@@ -18,6 +18,7 @@ import torch
 from ..contracts.forward_batch import ForwardBatch
 from ..contracts.forward_context import TextAttentionMetadata
 from ..contracts.forward_mode import ForwardMode
+from ..foundation.errors import invalid_descriptor
 from .kv_pool import PagedKVPool
 from .paged_text_cache import BatchedPagedRequestCache
 from .text_forward_assembler import TextForwardAssembler
@@ -67,6 +68,8 @@ def build_text_attention_metadata(
     the model.
     """
 
+    if batch.input_ids is None:
+        raise invalid_descriptor("text attention metadata requires input ids")
     device = batch.input_ids.device
     query_lens_values = tuple(len(op.get("token_ids") or []) for op in batch.ops)
     return TextAttentionPlan.from_cache(

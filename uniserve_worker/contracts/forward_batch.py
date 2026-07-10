@@ -224,6 +224,7 @@ class ForwardBatch:
 
     # --- sampling / spec (deferred-handle-friendly) ---
     sampling: Any = None
+    return_all_logits: bool = False
 
     # --- per-forward attention plan (attached by AttentionBackend) ---
     # The system metadata builder stashes the per-forward kernel plan here (the

@@ -12,10 +12,13 @@ from .flashinfer_kernels import _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
 from .registry import register_attention_backend
 
+_flashinfer: Any | None
 try:  # pragma: no cover - depends on optional CUDA package availability.
-    import flashinfer as _flashinfer
+    import flashinfer as _flashinfer_module
 except Exception:  # pragma: no cover
     _flashinfer = None
+else:  # pragma: no cover
+    _flashinfer = _flashinfer_module
 
 _trtllm_decode = None
 _trtllm_context = None

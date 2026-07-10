@@ -27,11 +27,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
-
 use crate::generation::{
-    CursorProjection, GenerationCursor, GenerationPhase as Phase, GenerationPlanner,
-    PlannedTransition, TransitionValidationError,
+    CursorApplyError, CursorProjection, EncoderCachePin, GenerationCursor,
+    GenerationPhase as Phase, GenerationPlanner, PlannedTransition, SchedulerContext,
+    TransitionIntent, TransitionValidationError,
 };
 
 pub const MAX_SPEC_DECODE_POS_STATS: usize = 16;
@@ -175,21 +174,22 @@ pub struct SchedStats {
 }
 
 use crossbeam_channel::Receiver;
-use uniserve_core::{BlockId, CfgParams, Modality};
+use uniserve_core::{BlockId, CfgParams, ImageIngestStep, encoder_cache_key};
+use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities};
 use uniserve_core::{HashAlgo, RequestId};
-use uniserve_engine_api::{Command, FinishReason, GenEvent, GenerateRequest};
+use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSubmission};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
     EngineCaps, ForwardBatch, ForwardOp, ForwardResult, NewRequestData, OpKind, ResourceClass,
     TokenSource, WorkerForwardStats,
 };
 
-use crate::grammar::{GrammarCompiler, GrammarMatcher};
+use crate::grammar::{GrammarCompiler, GrammarMatcher, grammar_allowed_tokens};
+use crate::image_artifact::validate_png_artifact;
 use crate::queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
 #[cfg(test)]
 use crate::spec_decode::ngram_draft_one;
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
 use uniserve_executor::{ControlOp, Executor, WorkerExecError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,9 +201,6 @@ enum AssemblyLane {
 
 /// default per-step multimodal encode budget when the worker caps do not pin it.
 const DEFAULT_MM_ENCODE_BUDGET: usize = 4;
-/// default encoder-output cache capacity when the worker reports no
-/// `encoder_cache_budget` in its caps.
-const DEFAULT_ENCODER_CACHE_BUDGET: usize = 256;
 /// default bound on the recent-output window carried for penalties.
 const DEFAULT_PENALTY_WINDOW: usize = 256;
 const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
@@ -217,47 +214,30 @@ const DECODE_LOOKAHEAD_ENV: &str = "UNISERVE_DECODE_LOOKAHEAD";
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 const DECODE_TOKEN_BURST_ENV: &str = "UNISERVE_DECODE_TOKEN_BURST";
 
-fn image_done_event(image_id: u32, pixels_png_b64: String) -> GenEvent {
-    let (height, width, bytes, sha256) =
-        image_png_metadata(&pixels_png_b64).unwrap_or_else(|| (0, 0, 0, String::new()));
-    GenEvent::ImageDone {
+fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenEvent> {
+    let metadata = validate_png_artifact(&pixels_png_b64, None)?;
+    Some(GenEvent::ImageDone {
         image_id,
-        height,
-        width,
-        bytes,
-        sha256,
+        height: metadata.height,
+        width: metadata.width,
+        bytes: metadata.bytes,
+        sha256: metadata.sha256,
         pixels_png_b64,
-    }
+    })
 }
 
-fn image_png_metadata(pixels_png_b64: &str) -> Option<(u32, u32, u64, String)> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(pixels_png_b64.as_bytes())
-        .ok()?;
-    let width = png_u32_be(&bytes, 16)?;
-    let height = png_u32_be(&bytes, 20)?;
-    if bytes.get(0..8)? != b"\x89PNG\r\n\x1a\n" || bytes.get(12..16)? != b"IHDR" {
-        return None;
-    }
-    let sha256 = Sha256::digest(&bytes);
-    Some((height, width, bytes.len() as u64, format!("{sha256:x}")))
-}
-
-fn png_u32_be(bytes: &[u8], offset: usize) -> Option<u32> {
-    let slice: [u8; 4] = bytes.get(offset..offset + 4)?.try_into().ok()?;
-    Some(u32::from_be_bytes(slice))
+fn transient_encoder_worker_key(cache_key: u64, request_id: RequestId) -> u64 {
+    let mut value = cache_key ^ request_id.0.rotate_left(23) ^ 0xa076_1d64_78bd_642f_u64;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    (value ^ (value >> 31)).max(1)
 }
 
 #[derive(Clone)]
 pub struct ControlTokens {
     pub bos: u32,
     pub eos: Vec<u32>,
-    pub start_of_image: u32,
     pub end_of_image: u32,
-    /// Token-id subsequence for the `<image_start>` trigger. Empty disables
-    /// the literal trigger.
-    #[allow(dead_code)]
-    pub image_start_ids: Vec<u32>,
 }
 
 impl Default for ControlTokens {
@@ -265,9 +245,7 @@ impl Default for ControlTokens {
         Self {
             bos: 151644,
             eos: vec![151645, 151643],
-            start_of_image: 151652,
             end_of_image: 151653,
-            image_start_ids: Vec::new(),
         }
     }
 }
@@ -325,12 +303,10 @@ impl Default for SchedulerConfig {
 }
 
 pub struct ReqState {
-    pub req: GenerateRequest,
+    pub req: GenerationRequest,
+    pub(crate) context: SchedulerContext,
+    pub(crate) event_tx: EventTx,
     pub(crate) cursor: GenerationCursor,
-    /// Worker stateful-diff registration has crossed the wire for this residency epoch.
-    pub(crate) worker_registered: bool,
-    /// Count of logical block ids already sent to the worker for this residency epoch.
-    pub(crate) blocks_sent: usize,
     pub queued_at: f64,
     pub(crate) cancelled: bool,
     /// The cancel was a server-side abort, not a client cancel.
@@ -339,6 +315,46 @@ pub struct ReqState {
     pub(crate) grammar: Option<GrammarMatcher>,
     /// This request's lifecycle trace.
     pub(crate) trace: crate::trace::RequestTrace,
+}
+
+impl ReqState {
+    fn has_context_images(&self) -> bool {
+        !self.context.images.is_empty()
+    }
+
+    fn continues_after_gen_commit(&self) -> bool {
+        self.req.behavior.continue_after_gen_commit
+    }
+
+    fn can_open_gen_branch(&self) -> bool {
+        self.req.behavior.gen_output
+            && self.image_gen.images_done < self.req.image.max_images as usize
+    }
+
+    fn starts_gen_after_context(&self) -> bool {
+        self.req.behavior.start_gen_after_context && self.can_open_gen_branch()
+    }
+
+    pub(crate) fn is_replayable_text(&self) -> bool {
+        self.replay.replayability == crate::generation::Replayability::Replayable
+    }
+
+    pub(crate) fn effective_prompt(&self) -> &[u32] {
+        self.replay
+            .recompute_ids
+            .as_deref()
+            .unwrap_or(&self.context.prompt_ids)
+    }
+
+    fn pending_image_step(&self) -> Option<ImageIngestStep> {
+        self.context
+            .images
+            .get(self.ingest.mm_cursor)?
+            .ingest
+            .steps
+            .get(self.ingest.pending_image_step)
+            .copied()
+    }
 }
 
 impl Deref for ReqState {
@@ -368,12 +384,17 @@ pub struct Scheduler {
     prefix_cache: crate::prefix_cache::PrefixCacheCoordinator,
     /// When sleeping, admission is paused (engine idled).
     sleeping: bool,
+    /// An acknowledged reset waits for submitted ops to resolve before it can
+    /// preempt request state and invalidate cache ownership atomically.
+    pending_prefix_reset: Option<PendingPrefixCacheReset>,
     /// Pluggable host-side logits-processor pipeline.
     logits_pipeline: Vec<Box<dyn crate::logits::LogitsProcessor>>,
     /// Cap on the recent-output window carried for penalties .
     penalty_window: usize,
     /// Encoder-output cache (hashed, LRU, budgeted).
     enc_cache: EncoderCacheManager,
+    /// Encoder-cache entries reserved by admitted image requests.
+    reserved_encoder_entries: usize,
     /// Max image-encode ops admitted per step.
     mm_encode_budget: usize,
     running: HashMap<RequestId, ReqState>,
@@ -426,6 +447,10 @@ pub struct Scheduler {
     pub stats: Arc<SchedStats>,
 }
 
+struct PendingPrefixCacheReset {
+    reply: uniserve_engine_api::PrefixCacheResetReply,
+}
+
 /// A self-describing health snapshot.
 #[derive(Debug, Clone)]
 pub struct HealthSnapshot {
@@ -443,7 +468,7 @@ pub struct HealthSnapshot {
     pub queue_wait_us_total: u64,
     pub queue_wait_us_max: u64,
     pub fatal: bool,
-    pub supported_ops: Vec<String>,
+    pub supported_ops: Vec<OpKind>,
     pub op_latency_us: Vec<(String, u64)>,
 }
 
@@ -483,6 +508,7 @@ fn finish_reason_str(r: &FinishReason) -> &'static str {
         FinishReason::ImageDone => "image_done",
         FinishReason::Cancelled => "cancelled",
         FinishReason::Aborted => "aborted",
+        FinishReason::Repetition => "repetition",
         FinishReason::Error => "error",
     }
 }
@@ -503,13 +529,77 @@ fn opkind_str(k: OpKind) -> &'static str {
     }
 }
 
+fn ranked_logprobs(
+    entries: Vec<uniserve_worker_wire::TokenLogprob>,
+) -> Vec<uniserve_engine_api::TokenLogprob> {
+    entries
+        .into_iter()
+        .map(|entry| uniserve_engine_api::TokenLogprob {
+            token_id: entry.0,
+            logprob: entry.1,
+            rank: entry.2,
+        })
+        .collect()
+}
+
 fn transition_validation_error_str(error: &TransitionValidationError) -> &'static str {
     match error {
         TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
+        TransitionValidationError::OpKindMismatch { .. } => "op_kind_mismatch",
         TransitionValidationError::MissingDenoiseStep => "missing_denoise_step",
-        TransitionValidationError::DenoiseStepRegression { .. } => "denoise_step_regression",
+        TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
         TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
+        TransitionValidationError::EncoderHandleMismatch { .. } => "encoder_handle_mismatch",
+        TransitionValidationError::MissingImageArtifact => "missing_image_artifact",
+        TransitionValidationError::InvalidImageArtifact => "invalid_image_artifact",
+        TransitionValidationError::ImageArtifactDimensionsMismatch { .. } => {
+            "image_artifact_dimensions_mismatch"
+        }
+        TransitionValidationError::MissingImageLocator => "missing_image_locator",
+        TransitionValidationError::MissingImageDimensions => "missing_image_dimensions",
+        TransitionValidationError::ImageDimensionsMismatch { .. } => "image_dimensions_mismatch",
+        TransitionValidationError::MissingImageKvTokens => "missing_image_kv_tokens",
+        TransitionValidationError::ImageKvMismatch { .. } => "image_kv_mismatch",
         TransitionValidationError::UnexpectedSampledToken { .. } => "unexpected_sampled_token",
+        TransitionValidationError::MissingSampledToken { .. } => "missing_sampled_token",
+        TransitionValidationError::AcceptedDraftCountExceeded { .. } => {
+            "accepted_draft_count_exceeded"
+        }
+        TransitionValidationError::TextTokenCountInconsistent { .. } => {
+            "text_token_count_inconsistent"
+        }
+        TransitionValidationError::TextTokenCountMismatch { .. } => "text_token_count_mismatch",
+        TransitionValidationError::SampledTokenNotAllowed { .. } => "sampled_token_not_allowed",
+        TransitionValidationError::UnexpectedPromptLogprobs { .. } => "unexpected_prompt_logprobs",
+        TransitionValidationError::PromptLogprobCountMismatch { .. } => {
+            "prompt_logprob_count_mismatch"
+        }
+        TransitionValidationError::EmptyPromptLogprobPosition { .. } => {
+            "empty_prompt_logprob_position"
+        }
+        TransitionValidationError::PromptLogprobTokenMismatch { .. } => {
+            "prompt_logprob_token_mismatch"
+        }
+        TransitionValidationError::InvalidPromptLogprobCandidates { .. } => {
+            "invalid_prompt_logprob_candidates"
+        }
+        TransitionValidationError::UnexpectedGeneratedLogprobs { .. } => {
+            "unexpected_generated_logprobs"
+        }
+        TransitionValidationError::MissingGeneratedLogprobs { .. } => "missing_generated_logprobs",
+        TransitionValidationError::GeneratedLogprobTokenMismatch { .. } => {
+            "generated_logprob_token_mismatch"
+        }
+        TransitionValidationError::InvalidGeneratedLogprobCandidates => {
+            "invalid_generated_logprob_candidates"
+        }
+    }
+}
+
+fn cursor_apply_error_str(error: &CursorApplyError) -> &'static str {
+    match error {
+        CursorApplyError::MissingOperationId => "missing_operation_id",
+        CursorApplyError::DuplicateOperation { .. } => "duplicate_operation",
     }
 }
 
@@ -521,18 +611,17 @@ fn phase_str(phase: Phase) -> &'static str {
         Phase::DenoiseGen => "denoise_gen",
         Phase::CommitGen => "commit_gen",
         Phase::CommitWriteback => "commit_writeback",
+        Phase::FeedbackIngest => "feedback_ingest",
     }
 }
 
-fn generation_str(req: &GenerateRequest) -> &'static str {
-    if req.uses_default_generation() {
-        "default"
-    } else if req.is_gen_only() {
-        "gen_only"
-    } else if req.uses_feedback_ingest() {
-        "und_only_with_context"
+fn behavior_str(request: &GenerationRequest) -> &'static str {
+    if request.behavior.continue_after_gen_commit {
+        "und_gen_continuation"
+    } else if request.behavior.gen_output {
+        "gen_commit_terminal"
     } else {
-        "und_only"
+        "und_decode"
     }
 }
 
@@ -559,10 +648,8 @@ fn policy_str(policy: SchedulingPolicy) -> &'static str {
 /// resolve path needs so completion can be correlated by `op_id` rather
 /// than by parallel FIFO queues.
 struct InflightOp {
-    kind: OpKind,
     transition: PlannedTransition,
-    /// The op's wire `op_id`, echoed back on its result. `None` for transports
-    /// that do not stamp it (then resolution falls back to FIFO order).
+    /// The op's wire `op_id`, echoed back on its result.
     op_id: Option<u64>,
     /// Speculative draft token ids attached to this op (empty when none).
     spec_tokens: Vec<u32>,
@@ -573,21 +660,16 @@ struct InflightOp {
     started: Instant,
 }
 
-/// Remove the in-flight op whose `op_id` matches the worker-echoed `op_id`,
-/// falling back to the FIFO front when the worker did not echo one (or it is
-/// unknown). This is the op_id-correlated completion of: each op
-/// resolves its exact submission even if a request's ops complete out of order
-/// (decode-priority lanes, disagg fan-in), instead of assuming submission order.
+/// Remove the in-flight op whose `op_id` matches the worker-echoed `op_id`.
+/// Unknown or absent operation identities leave the queue untouched so a
+/// worker result can never resolve a different submission.
 fn take_inflight_by_op_id(
     queue: &mut VecDeque<InflightOp>,
     op_id: Option<u64>,
 ) -> Option<InflightOp> {
-    if let Some(target) = op_id
-        && let Some(pos) = queue.iter().position(|op| op.op_id == Some(target))
-    {
-        return queue.remove(pos);
-    }
-    queue.pop_front()
+    let target = op_id?;
+    let pos = queue.iter().position(|op| op.op_id == Some(target))?;
+    queue.remove(pos)
 }
 
 impl Scheduler {
@@ -630,7 +712,7 @@ impl Scheduler {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
         // build from the worker's reported KV-cache groups (hybrid layouts);
-        // empty == the single full-attention group BAGEL uses today.
+        // Empty means one full-attention group.
         let bm = if caps.groups.is_empty() {
             BlockManager::new(
                 caps.num_blocks as usize,
@@ -707,13 +789,11 @@ impl Scheduler {
             usable_blocks,
             prefix_cache: crate::prefix_cache::PrefixCacheCoordinator::new(),
             sleeping: false,
+            pending_prefix_reset: None,
             logits_pipeline: crate::logits::default_pipeline(),
             penalty_window: DEFAULT_PENALTY_WINDOW,
-            enc_cache: EncoderCacheManager::new(if caps_encoder_budget > 0 {
-                caps_encoder_budget
-            } else {
-                DEFAULT_ENCODER_CACHE_BUDGET
-            }),
+            enc_cache: EncoderCacheManager::new(caps_encoder_budget),
+            reserved_encoder_entries: 0,
             mm_encode_budget: DEFAULT_MM_ENCODE_BUDGET,
             running: HashMap::new(),
             order: Vec::new(),
@@ -1062,28 +1142,35 @@ impl Scheduler {
 
     /// Abort every queued/gated/running request with a terminal event.
     fn abort_all_requests(&mut self) {
+        if let Some(pending) = self.pending_prefix_reset.take() {
+            let _ = pending.reply.send(Err(
+                "scheduler stopped before the prefix-cache reset completed".to_string(),
+            ));
+        }
         let queued: Vec<RequestId> = {
             let mut ids = Vec::new();
             while let Some(st) = self.pending.pop_request() {
                 ids.push(st.req.request_id);
-                let _ = st.req.event_tx.send(GenEvent::Finished {
+                let _ = st.event_tx.send(GenEvent::Finished {
                     reason: FinishReason::Aborted,
                     stop_reason: None,
-                    prompt_tokens: st.req.prompt_ids.len(),
+                    prompt_tokens: st.context.prompt_ids.len(),
                     completion_tokens: 0,
                     images: 0,
+                    kv_transfer_params: None,
                 });
             }
             ids
         };
         let _ = queued;
         for (_, st) in self.skipped_waiting.drain() {
-            let _ = st.req.event_tx.send(GenEvent::Finished {
+            let _ = st.event_tx.send(GenEvent::Finished {
                 reason: FinishReason::Aborted,
                 stop_reason: None,
-                prompt_tokens: st.req.prompt_ids.len(),
+                prompt_tokens: st.context.prompt_ids.len(),
                 completion_tokens: 0,
                 images: 0,
+                kv_transfer_params: None,
             });
         }
         let running: Vec<RequestId> = self.running.keys().copied().collect();
@@ -1095,10 +1182,13 @@ impl Scheduler {
     /// Apply one command; returns true on shutdown.
     fn handle_command(&mut self, cmd: Command) -> bool {
         match cmd {
-            Command::Submit(req) => self.enqueue(*req),
+            Command::Submit(submission) => self.enqueue(*submission),
             Command::Cancel(id) => self.mark_cancelled(id, false),
             Command::Abort(id) => self.mark_cancelled(id, true),
-            Command::ResetPrefixCache => self.reset_prefix_cache(),
+            Command::ResetPrefixCache {
+                reset_running_requests,
+                reply,
+            } => self.begin_prefix_cache_reset(reset_running_requests, reply),
             Command::ResetEncoderCache => self.reset_encoder_cache(),
             Command::LoadLora { id, path } => {
                 self.gated_control(ControlOp::LoadLora { lora_id: id, path });
@@ -1115,9 +1205,12 @@ impl Scheduler {
         false
     }
 
-    /// Test-only direct enqueue (the production path is `run` over the channel).
-    pub fn submit_for_test(&mut self, req: GenerateRequest) {
-        self.enqueue(req);
+    /// Test harness direct enqueue (the production path is `run` over the channel).
+    #[doc(hidden)]
+    pub fn submit_for_test(&mut self, request: GenerationRequest) -> uniserve_engine_api::EventRx {
+        let (event_tx, event_rx) = uniserve_engine_api::event_channel();
+        self.enqueue(GenerationSubmission::new(request, event_tx));
+        event_rx
     }
 
     fn mark_cancelled(&mut self, id: RequestId, abort: bool) {
@@ -1136,17 +1229,18 @@ impl Scheduler {
                 id,
                 &reason,
                 None,
-                st.req.prompt_ids.len(),
+                st.context.prompt_ids.len(),
                 0,
                 0,
                 "skipped_waiting",
             );
-            let _ = st.req.event_tx.send(GenEvent::Finished {
+            let _ = st.event_tx.send(GenEvent::Finished {
                 reason,
                 stop_reason: None,
-                prompt_tokens: st.req.prompt_ids.len(),
+                prompt_tokens: st.context.prompt_ids.len(),
                 completion_tokens: 0,
                 images: 0,
+                kv_transfer_params: None,
             });
             return;
         }
@@ -1161,17 +1255,18 @@ impl Scheduler {
                 id,
                 &reason,
                 None,
-                st.req.prompt_ids.len(),
+                st.context.prompt_ids.len(),
                 0,
                 0,
                 "pending",
             );
-            let _ = st.req.event_tx.send(GenEvent::Finished {
+            let _ = st.event_tx.send(GenEvent::Finished {
                 reason,
                 stop_reason: None,
-                prompt_tokens: st.req.prompt_ids.len(),
+                prompt_tokens: st.context.prompt_ids.len(),
                 completion_tokens: 0,
                 images: 0,
+                kv_transfer_params: None,
             });
         }
     }
@@ -1199,11 +1294,57 @@ impl Scheduler {
         }
     }
 
-    /// Clear the prefix cache.
-    fn reset_prefix_cache(&mut self) {
+    fn begin_prefix_cache_reset(
+        &mut self,
+        reset_running_requests: bool,
+        reply: uniserve_engine_api::PrefixCacheResetReply,
+    ) {
+        if self.pending_prefix_reset.is_some() {
+            let _ = reply.send(Ok(false));
+            return;
+        }
+        if !reset_running_requests && !self.running.is_empty() {
+            let _ = reply.send(Ok(false));
+            return;
+        }
+        self.pending_prefix_reset = Some(PendingPrefixCacheReset { reply });
+        self.progress_prefix_cache_reset();
+    }
+
+    /// Complete a reset once no worker op can still write request-owned KV.
+    fn progress_prefix_cache_reset(&mut self) -> bool {
+        if self.pending_prefix_reset.is_none() || !self.inflight_ops.is_empty() {
+            return false;
+        }
+        let pending = self
+            .pending_prefix_reset
+            .take()
+            .expect("prefix reset presence checked above");
+        if self
+            .running
+            .values()
+            .any(|state| !state.is_replayable_text())
+        {
+            let _ = pending.reply.send(Ok(false));
+            return true;
+        }
+        if self.control_allowed(&ControlOp::ResetPrefixCache)
+            && let Err(error) = self
+                .executor
+                .control_wait(ControlOp::ResetPrefixCache, None)
+        {
+            let _ = pending.reply.send(Err(error.to_string()));
+            return true;
+        }
+
+        let running = self.order.clone();
+        for request_id in running {
+            self.requeue_for_recompute(request_id);
+        }
         self.bm.reset_prefix_cache();
-        self.gated_control(ControlOp::ResetPrefixCache);
         self.publish_cache_stats();
+        let _ = pending.reply.send(Ok(true));
+        true
     }
 
     /// Pause or resume admission.
@@ -1233,13 +1374,13 @@ impl Scheduler {
             "request_id": st.req.request_id.0,
             "trace_id": st.trace.trace_id.0,
             "queue": queue,
-            "generation": generation_str(&st.req),
-            "initial_phase": phase_str(st.phase),
-            "prompt_tokens": st.req.prompt_ids.len(),
-            "max_tokens": st.req.max_tokens,
+            "generation": behavior_str(&st.req),
+            "initial_phase": phase_str(st.lifecycle.phase),
+            "prompt_tokens": st.context.prompt_ids.len(),
+            "max_tokens": st.req.max_und_tokens,
             "priority": st.req.priority,
-            "reserve_worstcase": st.reserve_worstcase,
-            "worstcase_blocks": st.worstcase_blocks,
+            "reserve_worstcase": st.resources.reserve_worstcase,
+            "worstcase_blocks": st.resources.worstcase_blocks,
             "image": {
                 "steps": st.req.image.steps,
                 "max_images": st.req.image.max_images,
@@ -1280,7 +1421,34 @@ impl Scheduler {
         }));
     }
 
-    fn enqueue(&mut self, req: GenerateRequest) {
+    fn enqueue(&mut self, submission: GenerationSubmission) {
+        let GenerationSubmission {
+            request: req,
+            event_tx,
+        } = submission;
+        let context = match SchedulerContext::lower(&req) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = event_tx.send(GenEvent::Rejected {
+                    message: format!("invalid generation request: {error:?}"),
+                });
+                return;
+            }
+        };
+        if let Some(operation) = self.missing_required_operation(&req) {
+            let _ = event_tx.send(GenEvent::Rejected {
+                message: format!(
+                    "generation request requires worker operation `{operation}`, but the worker does not support it"
+                ),
+            });
+            return;
+        }
+        if let Err(error) = req.validate_resources(&self.generation_runtime_capabilities()) {
+            let _ = event_tx.send(GenEvent::Rejected {
+                message: format!("invalid generation resource declaration: {error}"),
+            });
+            return;
+        }
         // admission backpressure. Shed load instead of letting the waiting
         // queues (pending + grammar-gated) grow without bound under overload —
         // an unbounded burst would otherwise OOM the process and take down every
@@ -1299,29 +1467,32 @@ impl Scheduler {
                 "reason": "queue_full",
                 "waiting": waiting,
                 "max_num_waiting": self.config.max_num_waiting,
-                "generation": generation_str(&req),
-                "prompt_tokens": req.prompt_ids.len(),
+                "behavior": {
+                    "und_decode": req.behavior.und_decode,
+                    "und_tokens": format!("{:?}", req.behavior.und_tokens),
+                    "gen_output": req.behavior.gen_output,
+                    "generated_image_feedback": req.behavior.generated_image_feedback,
+                },
+                "prompt_tokens": context.prompt_ids.len(),
             }));
-            let _ = req.event_tx.send(GenEvent::Rejected {
+            let _ = event_tx.send(GenEvent::Rejected {
                 message: "scheduler waiting queue is full".into(),
             });
             return;
         }
-        let prompt_len = req.prompt_ids.len();
-        let worst = self.worstcase(&req, prompt_len);
+        let worst = req
+            .resources
+            .max_kv_tokens
+            .div_ceil(self.caps.block_size as usize);
         // Non-text multimodal requests are not safely preemptible once they
         // start producing image/text state. Reserve their configured bounded KV
         // envelope at admission so excess concurrency queues instead of
         // exhausting KV after all requests have become resident.
-        let reserve_worstcase = req.reserves_worstcase_kv();
+        let reserve_worstcase = !context.images.is_empty() || req.behavior.gen_output;
         // A request with staged images usually encodes them before prefill.
         // Context-image requests prefill the text before each image position,
         // then encode the image into that marker gap.
-        let phase0 = if req.mm_items.is_empty() || req.uses_feedback_ingest() {
-            Phase::Prefill
-        } else {
-            Phase::Encode
-        };
+        let phase0 = Phase::Prefill;
         // A lifecycle trace keyed by trace/request/op ids.
         let trace = crate::trace::RequestTrace::new(
             req.request_id,
@@ -1329,8 +1500,8 @@ impl Scheduler {
         );
         let st = ReqState {
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
-            worker_registered: false,
-            blocks_sent: 0,
+            context,
+            event_tx,
             queued_at: now(),
             cancelled: false,
             aborted: false,
@@ -1353,7 +1524,7 @@ impl Scheduler {
     }
 
     fn num_vae(&self, ip: &uniserve_core::ImageParams) -> u64 {
-        let dl = self.caps.latent_downsample as u64;
+        let dl = u64::from(self.caps.latent_downsample).max(1);
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
@@ -1365,20 +1536,38 @@ impl Scheduler {
         }
     }
 
-    fn cap_max_vit_grid_tokens(&self) -> usize {
-        self.caps.max_vit_grid_tokens as usize
-    }
-
     fn cap_commit_marker_tokens(&self) -> usize {
         self.caps.commit_marker_tokens.max(1) as usize
     }
 
-    fn cap_gen_rope_advance(&self) -> u32 {
-        self.caps.gen_rope_advance.max(1)
+    fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
+        let mut supported_ops = self.caps.supported_ops.clone();
+        supported_ops.sort();
+        supported_ops.dedup();
+        GenerationRuntimeCapabilities {
+            supported_ops,
+            max_latent_units: u64::from(self.caps.max_latent_size),
+            latent_downsample: self.caps.latent_downsample,
+            max_vae_grid_tokens: self.cap_max_vae_grid_tokens() as u32,
+            max_vit_grid_tokens: self.caps.max_vit_grid_tokens,
+            commit_marker_tokens: self.caps.commit_marker_tokens,
+            max_cfg_branches: self.caps.max_cfg_branches,
+            scratch_capacity_tokens: self.caps.scratch_capacity_tokens,
+            encoder_cache_entries: self.caps.encoder_cache_budget,
+            generated_image_commit: self.executor.generated_image_commit_capabilities(),
+        }
     }
 
-    fn cap_max_cfg_branches(&self) -> u64 {
-        self.caps.max_cfg_branches.max(1) as u64
+    fn missing_required_operation(&self, request: &GenerationRequest) -> Option<OpKind> {
+        let context_steps = request.context.iter().flat_map(|segment| match segment {
+            uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
+            uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
+        });
+        request
+            .behavior
+            .required_operations(&request.policy, context_steps)
+            .into_iter()
+            .find(|operation| !self.caps.supported_ops.contains(operation))
     }
 
     fn worker_tracks_image_latent(&self) -> bool {
@@ -1392,14 +1581,17 @@ impl Scheduler {
     fn worker_image_latent_used(&self) -> u64 {
         self.running
             .values()
-            .map(|st| st.worker_image_latent_units)
+            .map(|st| st.resources.worker_image_latent_units)
             .sum()
     }
 
     fn worker_image_latent_units_for(&self, st: &ReqState) -> u64 {
         let downsample = (self.caps.latent_downsample as u64).max(1);
-        let (height, width) = if st.req.uses_feedback_ingest() && st.gen_h > 0 && st.gen_w > 0 {
-            (st.gen_h, st.gen_w)
+        let (height, width) = if st.has_context_images()
+            && st.image_gen.image_hw.0 > 0
+            && st.image_gen.image_hw.1 > 0
+        {
+            (st.image_gen.image_hw.0, st.image_gen.image_hw.1)
         } else {
             (st.req.image.height, st.req.image.width)
         };
@@ -1412,7 +1604,7 @@ impl Scheduler {
             return Some(0);
         }
         let st = self.running.get(&id)?;
-        if st.worker_image_latent_units > 0 {
+        if st.resources.worker_image_latent_units > 0 {
             Some(0)
         } else {
             Some(self.worker_image_latent_units_for(st).max(1))
@@ -1423,110 +1615,137 @@ impl Scheduler {
         let Some(additional) = self.denoise_worker_image_latent_additional(id) else {
             return false;
         };
-        if additional == 0 {
-            return true;
-        }
-        self.worker_image_latent_used().saturating_add(additional)
-            <= self.caps.max_latent_size as u64
+        let worker_capacity_ok = additional == 0
+            || self.worker_image_latent_used().saturating_add(additional)
+                <= self.caps.max_latent_size as u64;
+        let host_scratch_ok = self.running.get(&id).is_some_and(|st| {
+            st.resources.host_scratch_tokens > 0
+                || self.bm.can_reserve_scratch(
+                    self.num_vae(&st.req.image)
+                        .saturating_mul(u64::from(st.req.image.cfg_branch_count())),
+                )
+        });
+        worker_capacity_ok && host_scratch_ok
     }
 
-    fn reserve_worker_image_latent_for_denoise(&mut self, id: RequestId) {
-        let Some(additional) = self.denoise_worker_image_latent_additional(id) else {
-            return;
+    fn reserve_transition_resources(&mut self, transition: &PlannedTransition) -> bool {
+        let id = transition.op.req_id;
+        let resources = &transition.resources;
+        let cached_encoder_key = match transition.delta {
+            crate::generation::TransitionDelta::IngestImageStep {
+                encoder_cache_key: Some(key),
+                cache_hit: true,
+                ..
+            } => Some(key),
+            _ => None,
         };
-        if additional == 0 {
-            return;
+        if let Some(key) = cached_encoder_key {
+            let Some(handle) = self.enc_cache.acquire(key) else {
+                return false;
+            };
+            if transition.image_in != Some(handle) {
+                if let Some(freed) = self.enc_cache.release(key, handle) {
+                    self.gated_control(ControlOp::FreeEncoder(vec![freed]));
+                }
+                return false;
+            }
+            let Some(st) = self.running.get_mut(&id) else {
+                if let Some(freed) = self.enc_cache.release(key, handle) {
+                    self.gated_control(ControlOp::FreeEncoder(vec![freed]));
+                }
+                return false;
+            };
+            st.ingest
+                .acquired_encoder_pins
+                .push(EncoderCachePin { key, handle });
         }
-        debug_assert!(
-            self.worker_image_latent_used().saturating_add(additional)
-                <= self.caps.max_latent_size as u64,
-            "denoise latent reservation must be checked before op assembly"
-        );
+        let needs_host_scratch = self
+            .running
+            .get(&id)
+            .is_some_and(|st| st.resources.host_scratch_tokens == 0)
+            && resources.host_scratch_tokens > 0;
+        if needs_host_scratch && !self.bm.reserve_scratch(id, resources.host_scratch_tokens) {
+            if let Some(key) = cached_encoder_key {
+                let pin = self
+                    .running
+                    .get_mut(&id)
+                    .and_then(|st| st.ingest.acquired_encoder_pins.pop());
+                if let Some(pin) = pin {
+                    debug_assert_eq!(pin.key, key);
+                    if let Some(freed) = self.enc_cache.release(pin.key, pin.handle) {
+                        self.gated_control(ControlOp::FreeEncoder(vec![freed]));
+                    }
+                }
+            }
+            return false;
+        }
+        if resources.latent_units > 0 {
+            self.ledger.ensure(
+                id,
+                uniserve_worker_wire::ResourceClass::ImageLatent,
+                resources.latent_units,
+                uniserve_worker_wire::LeasePolicy::Pinned,
+            );
+        }
+        if resources.scratch_units > 0 {
+            self.ledger.ensure(
+                id,
+                uniserve_worker_wire::ResourceClass::Scratch,
+                resources.scratch_units,
+                uniserve_worker_wire::LeasePolicy::PerRequest,
+            );
+        }
         if let Some(st) = self.running.get_mut(&id) {
-            st.worker_image_latent_units = additional;
+            st.resources.worker_image_latent_units = st
+                .resources
+                .worker_image_latent_units
+                .max(resources.latent_units);
+            st.resources.scratch_units = st.resources.scratch_units.max(resources.scratch_units);
+            st.resources.host_scratch_tokens = st
+                .resources
+                .host_scratch_tokens
+                .max(resources.host_scratch_tokens);
         }
+        true
     }
 
-    fn generated_image_span(&self, ip: &uniserve_core::ImageParams) -> usize {
-        if ip.retain_images {
-            self.num_vae(ip) as usize + self.cap_commit_marker_tokens()
-        } else {
-            0
+    fn release_transition_resources(&mut self, id: RequestId, transition: &PlannedTransition) {
+        for class in &transition.resources.release_on_apply {
+            self.ledger.release_class(id, *class);
+            match class {
+                uniserve_worker_wire::ResourceClass::ImageLatent => {
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.resources.worker_image_latent_units = 0;
+                    }
+                }
+                uniserve_worker_wire::ResourceClass::Scratch => {
+                    self.bm.release_scratch(id);
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.resources.scratch_units = 0;
+                        st.resources.host_scratch_tokens = 0;
+                    }
+                }
+                _ => {}
+            }
         }
-    }
-
-    fn default_remaining_image_span(&self, st: &ReqState) -> usize {
-        if !st.req.uses_default_generation() {
-            return 0;
-        }
-        let remaining_images = (st.req.image.max_images as usize).saturating_sub(st.images_done);
-        self.generated_image_span(&st.req.image)
-            .saturating_mul(remaining_images)
     }
 
     fn decode_capacity_target(
         &self,
-        id: RequestId,
+        _id: RequestId,
         pos: usize,
         decode_len: usize,
         spec_len: usize,
     ) -> usize {
-        let base = pos.saturating_add(decode_len).saturating_add(spec_len);
-        let slack = self
-            .running
-            .get(&id)
-            .map(|st| self.default_remaining_image_span(st))
-            .unwrap_or(0);
-        base.saturating_add(slack)
-    }
-
-    fn worstcase(&self, req: &GenerateRequest, prompt_len: usize) -> usize {
-        let bs = self.caps.block_size as usize;
-        let toks = if req.is_plain_und() {
-            prompt_len + req.max_tokens
-        } else if req.is_gen_only() {
-            prompt_len + self.generated_image_span(&req.image) * req.image.max_images as usize
-        } else if req.uses_default_generation() {
-            // Deadlock-freedom invariant: the complete worst case (full
-            // text budget + retained-image envelope) is physically
-            // allocated at admission, so a resident default request can
-            // always reach EOS/max_tokens/its image boundaries without
-            // taking blocks from — or waiting on — any other resident.
-            // default generation is not preemptible (committed image KV cannot
-            // be replayed from generated_ids), so reserving less than this
-            // deadlocks the engine once concurrent residents exhaust the
-            // free pool mid-decode: every request needs one more block,
-            // none can be evicted, none can finish. Concurrency scales
-            // with --kv-token-capacity, not with optimistic admission.
-            prompt_len
-                + req.max_tokens
-                + self.generated_image_span(&req.image) * req.image.max_images as usize
-        } else {
-            // Exact image token counts come back from the worker's encode ops;
-            // reserve generously up front for the input image + each generated
-            // reasoning image. The VAE half of the dual-encode budgets only
-            // when the worker implements it.
-            let vae_tokens = if self.supports_vae_encode() {
-                self.cap_max_vae_grid_tokens()
-            } else {
-                0
-            };
-            let per_image =
-                vae_tokens + self.cap_max_vit_grid_tokens() + 2 * self.cap_commit_marker_tokens();
-            prompt_len + req.max_tokens + per_image * (1 + req.image.max_images as usize)
-        };
-        toks.div_ceil(bs)
-    }
-
-    /// num_vae for an explicit (h, w) — the generated reasoning image size the
-    /// worker reports, distinct from the request's `ImageParams`.
-    fn num_vae_hw(&self, h: u32, w: u32) -> u64 {
-        let dl = self.caps.latent_downsample as u64;
-        (h as u64 / dl) * (w as u64 / dl)
+        pos.saturating_add(decode_len).saturating_add(spec_len)
     }
 
     fn image_prompt_for(st: &ReqState) -> Option<String> {
-        st.req.image.image_prompts.get(st.images_done).cloned()
+        st.req
+            .image
+            .image_prompts
+            .get(st.image_gen.images_done)
+            .cloned()
     }
 
     /// One loop iteration of the schedule-ahead loop. Returns true if any work
@@ -1563,6 +1782,13 @@ impl Scheduler {
 
         // 2. reap cancellations before assembling.
         self.reap_cancellations();
+
+        // A reset transaction drains already-submitted work and admits no new
+        // operations until request ownership has been rewound or rejected.
+        progressed |= self.progress_prefix_cache_reset();
+        if self.pending_prefix_reset.is_some() {
+            return progressed;
+        }
 
         // 3. submit as many batches as pipeline capacity allows.
         while self.executor.can_submit() {
@@ -1670,9 +1896,11 @@ impl Scheduler {
     /// prompts wait (decode fills the slot) and merge into the next prefill
     /// batch, so bursts cost one sweep instead of one sweep per arrival.
     fn any_prefill_inflight(&self) -> bool {
-        self.inflight_ops
-            .values()
-            .any(|items| items.iter().any(|op| op.kind == OpKind::PrefillUnd))
+        self.inflight_ops.values().any(|items| {
+            items
+                .iter()
+                .any(|op| op.transition.kind == OpKind::PrefillUnd)
+        })
     }
 
     fn has_inflight(&self, id: RequestId) -> bool {
@@ -1687,7 +1915,7 @@ impl Scheduler {
             .map(|items| {
                 items
                     .iter()
-                    .filter(|op| op.kind == OpKind::DecodeUnd)
+                    .filter(|op| op.transition.kind == OpKind::DecodeUnd)
                     .count()
             })
             .unwrap_or(0)
@@ -1718,28 +1946,31 @@ impl Scheduler {
     /// Whether any in-flight op for `id` is something other than a plain decode
     /// (a prefill chunk, an image op, …). Used to gate decode-lookahead.
     fn inflight_has_non_decode(&self, id: RequestId) -> bool {
-        self.inflight_ops
-            .get(&id)
-            .is_some_and(|items| items.iter().any(|op| op.kind != OpKind::DecodeUnd))
+        self.inflight_ops.get(&id).is_some_and(|items| {
+            items
+                .iter()
+                .any(|op| op.transition.kind != OpKind::DecodeUnd)
+        })
     }
 
-    fn register_inflight(&mut self, op: &ForwardOp, started: Instant) {
-        let transition = self.planner.plan(op);
+    fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
+        let request_id = transition.op.req_id;
+        let op_id = transition.op.op_id;
+        let spec_tokens = transition.op.spec_token_ids.clone().unwrap_or_default();
+        let decode_token_count = transition.op.decode_token_count.unwrap_or(1).max(1);
         self.inflight_ops
-            .entry(op.req_id)
+            .entry(request_id)
             .or_default()
             .push_back(InflightOp {
-                kind: op.kind,
                 transition,
-                op_id: op.op_id,
-                spec_tokens: op.spec_token_ids.clone().unwrap_or_default(),
-                decode_token_count: op.decode_token_count.unwrap_or(1).max(1),
+                op_id,
+                spec_tokens,
+                decode_token_count,
                 started,
             });
     }
 
-    /// Resolve one in-flight op for `id`, matching the worker's echoed `op_id`
-    /// and falling back to FIFO order when it is absent/unknown.
+    /// Resolve one in-flight op for `id` by the worker's echoed `op_id`.
     fn pop_inflight(
         &mut self,
         id: RequestId,
@@ -1762,7 +1993,7 @@ impl Scheduler {
     /// A typed non-fatal [`WorkerExecError`] fails the in-flight requests but
     /// keeps the engine alive to serve subsequent requests; anything else (a
     /// fatal worker error, ring/transport death) latches the engine fatal.
-
+    ///
     /// The typed taxonomy's `code` and `retryable` drive
     /// real policy rather than being log-only. The worker's `fatal` bit is the
     /// baseline, but the host *escalates* host-bug classes to fatal even when
@@ -1847,6 +2078,18 @@ impl Scheduler {
             // op_id-correlated completion: resolve the exact op the
             // worker echoed, not merely the FIFO-oldest one.
             let (transition, draft_token_ids, started) = self.pop_inflight(id, sr.op_id);
+            if transition.is_none() {
+                self.trace_record(json!({
+                    "event": "unknown_result_op_id",
+                    "at_s": now(),
+                    "request_id": id.0,
+                    "op_id": sr.op_id,
+                }));
+                if self.running.contains_key(&id) {
+                    self.finish(id, FinishReason::Error);
+                }
+                continue;
+            }
             let kind = transition.as_ref().map(|transition| transition.kind);
             let draft_tokens = draft_token_ids.len();
             // fold this op's host-side round-trip latency into the history.
@@ -1936,6 +2179,25 @@ impl Scheduler {
                     }
                     continue;
                 }
+                let cursor_result = self
+                    .running
+                    .get_mut(&id)
+                    .map(|state| state.cursor.apply_transition(&transition, &sr));
+                if let Some(Err(error)) = cursor_result {
+                    self.trace_record(json!({
+                        "event": "cursor_transition_failed",
+                        "at_s": now(),
+                        "request_id": id.0,
+                        "op_id": transition.op_id,
+                        "op_kind": opkind_str(transition.kind),
+                        "error": cursor_apply_error_str(&error),
+                    }));
+                    if self.running.contains_key(&id) {
+                        self.finish(id, FinishReason::Error);
+                    }
+                    continue;
+                }
+                self.release_transition_resources(id, &transition);
                 let kind = transition.kind;
                 let priority = match kind {
                     OpKind::DenoiseGen | OpKind::CommitGen | OpKind::CommitWriteback => 0,
@@ -1952,17 +2214,17 @@ impl Scheduler {
             if let Some(st) = self.running.get(&id) {
                 progress_ops.push(json!({
                     "request_id": id.0,
-                    "phase": phase_str(st.phase),
-                    "generated_tokens": st.n_generated,
-                    "images_done": st.images_done,
-                    "image_id": st.image_id,
-                    "steps_done": st.steps_done,
-                    "pos": st.pos,
-                    "kvlen": st.kvlen,
-                    "next_token": st.next_token,
-                    "text_since_image": st.text_since_image,
-                    "default_image_pending": st.default_image_pending,
-                    "context_round_closing": st.context_round_closing,
+                    "phase": phase_str(st.lifecycle.phase),
+                    "generated_tokens": st.und.tokens_emitted,
+                    "images_done": st.image_gen.images_done,
+                    "image_id": st.image_gen.image_id,
+                    "steps_done": st.image_gen.steps_done,
+                    "pos": st.und.logical_pos,
+                    "kvlen": st.und.physical_kv_len,
+                    "next_token": st.und.next_token,
+                    "text_since_image": st.und.text_since_image,
+                    "gen_branch_pending": st.image_gen.branch_pending,
+                    "context_round_closing": st.ingest.round_closing,
                 }));
             }
         }
@@ -2159,9 +2421,18 @@ impl Scheduler {
         }
         // Open the structured-output gate for grammars that finished compiling.
         for (id, compiled) in self.grammar_compiler.drain_ready() {
-            if let Some(mut st) = self.skipped_waiting.remove(&id) {
-                st.grammar = Some(GrammarMatcher::new(compiled));
-                self.pending.add_request(st);
+            let Some(mut st) = self.skipped_waiting.remove(&id) else {
+                continue;
+            };
+            match compiled.and_then(|grammar| self.grammar_compiler.create_matcher(grammar)) {
+                Ok(matcher) => {
+                    st.grammar = Some(matcher);
+                    self.pending.add_request(st);
+                }
+                Err(message) => {
+                    tracing::error!(request_id = id.0, %message, "grammar admission failed");
+                    let _ = st.event_tx.send(GenEvent::Rejected { message });
+                }
             }
         }
         let bs = self.caps.block_size as usize;
@@ -2173,18 +2444,13 @@ impl Scheduler {
                 break;
             };
 
-            if head.reserve_worstcase {
-                let need = head.worstcase_blocks;
-                let scratch_ok = if head.req.is_gen_only() || head.req.uses_default_generation() {
-                    self.bm.can_reserve_scratch(
-                        self.num_vae(&head.req.image) * self.cap_max_cfg_branches(),
-                    )
-                } else if head.req.uses_feedback_ingest() {
-                    self.bm
-                        .can_reserve_scratch(self.cap_max_vae_grid_tokens() as u64)
-                } else {
-                    true
-                };
+            if head.resources.reserve_worstcase {
+                let need = head.resources.worstcase_blocks;
+                let encoder_entries = head.req.resources.encoder_cache_keys.len();
+                let encoder_ok = self
+                    .reserved_encoder_entries
+                    .saturating_add(encoder_entries)
+                    <= self.enc_cache.budget();
                 if need > self.usable_blocks {
                     let st = self.pending.pop_request().unwrap();
                     self.record_decision(
@@ -2199,15 +2465,15 @@ impl Scheduler {
                         "reason": "too_large",
                         "needed_blocks": need,
                         "usable_blocks": self.usable_blocks,
-                        "generation": generation_str(&st.req),
-                        "prompt_tokens": st.req.prompt_ids.len(),
+                        "generation": behavior_str(&st.req),
+                        "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.req.event_tx.send(GenEvent::Rejected {
+                    let _ = st.event_tx.send(GenEvent::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
                 }
-                if self.bm.free_blocks() >= need && scratch_ok {
+                if self.bm.free_blocks() >= need && encoder_ok {
                     let st = self.pending.pop_request().unwrap();
                     let id = st.req.request_id;
                     self.admit_running(st);
@@ -2219,7 +2485,7 @@ impl Scheduler {
                     continue;
                 }
             } else {
-                let n = head.req.prompt_ids.len();
+                let n = head.context.prompt_ids.len();
                 let text_usable_blocks = self.bm.group_capacity(0);
                 let (cached_prefix_blocks, cached_prefix_free_blocks) = self
                     .prefix_cache
@@ -2249,10 +2515,10 @@ impl Scheduler {
                         "reason": "too_large",
                         "needed_blocks": first_chunk_blocks,
                         "usable_blocks": text_usable_blocks,
-                        "generation": generation_str(&st.req),
-                        "prompt_tokens": st.req.prompt_ids.len(),
+                        "generation": behavior_str(&st.req),
+                        "prompt_tokens": st.context.prompt_ids.len(),
                     }));
-                    let _ = st.req.event_tx.send(GenEvent::Rejected {
+                    let _ = st.event_tx.send(GenEvent::Rejected {
                         message: "request exceeds total KV capacity".into(),
                     });
                     continue;
@@ -2309,14 +2575,15 @@ impl Scheduler {
         // ResourceRuntime accounts (`len(new_blocks)` against `num_blocks`).
         // Capacity is counted in blocks, not tokens multiplied by `block_size`.
         // `resources.rs` (ResourceLease::capacity) is the unit authority: KvBlock is blocks.
-        let kv_capacity = st.worstcase_blocks as u64;
-        let generation = generation_str(&st.req);
-        let phase = phase_str(st.phase);
-        let prompt_tokens = st.req.prompt_ids.len();
-        let max_tokens = st.req.max_tokens;
+        let kv_capacity = st.resources.worstcase_blocks as u64;
+        let generation = behavior_str(&st.req);
+        let phase = phase_str(st.lifecycle.phase);
+        let prompt_tokens = st.context.prompt_ids.len();
+        let max_tokens = st.req.max_und_tokens;
         let priority = st.req.priority;
-        let reserve_worstcase = st.reserve_worstcase;
-        let worstcase_blocks = st.worstcase_blocks;
+        let reserve_worstcase = st.resources.reserve_worstcase;
+        let worstcase_blocks = st.resources.worstcase_blocks;
+        let encoder_entries = st.req.resources.encoder_cache_keys.len();
         self.emit_st(
             &mut st,
             GenEvent::Scheduled {
@@ -2329,6 +2596,9 @@ impl Scheduler {
         ));
         self.running.insert(id, st);
         self.order.push(id);
+        self.reserved_encoder_entries = self
+            .reserved_encoder_entries
+            .saturating_add(encoder_entries);
         self.trace_record(json!({
             "event": "request_admitted",
             "at_s": scheduled_at,
@@ -2346,6 +2616,7 @@ impl Scheduler {
             "pending": self.pending.len(),
             "free_blocks": self.bm.free_blocks(),
             "reserved_blocks": self.reserved_blocks,
+            "reserved_encoder_entries": self.reserved_encoder_entries,
         }));
         // lease this request's KV residency (released at finish/drop/preempt).
         self.ledger.issue(
@@ -2363,7 +2634,7 @@ impl Scheduler {
     /// Assemble the per-step batch: walk the priority order, ask each request for
     /// at most one op, clip prefill chunks to the remaining token budget, and
     /// pair first-dispatch requests with their `NewRequestData` record.
-    fn assemble(&mut self) -> (Vec<NewRequestData>, Vec<ForwardOp>) {
+    fn assemble(&mut self) -> (Vec<NewRequestData>, Vec<PlannedTransition>) {
         let ids = self.assembly_order();
         let lane = self.select_assembly_lane(&ids);
         let (new_reqs, ops) = self.assemble_pass(&ids, lane);
@@ -2382,9 +2653,9 @@ impl Scheduler {
         &mut self,
         ids: &[RequestId],
         lane: Option<AssemblyLane>,
-    ) -> (Vec<NewRequestData>, Vec<ForwardOp>) {
+    ) -> (Vec<NewRequestData>, Vec<PlannedTransition>) {
         let mut new_reqs: Vec<NewRequestData> = Vec::new();
-        let mut ops: Vec<ForwardOp> = Vec::new();
+        let mut ops: Vec<PlannedTransition> = Vec::new();
         let mut selected: HashSet<RequestId> = HashSet::new();
         // vLLM's per-step token budget with the clip rule: the budget, not the
         // chunk threshold, is the binding constraint.
@@ -2402,16 +2673,13 @@ impl Scheduler {
         } else {
             0
         };
-        let mut mixed_ops: Vec<ForwardOp> = Vec::new();
+        let mut mixed_ops: Vec<PlannedTransition> = Vec::new();
         for id in ids.iter().copied() {
             if ops.len() + mixed_ops.len() >= self.config.max_batch {
                 break;
             }
             if budget == 0 {
                 break;
-            }
-            if !self.has_inflight(id) {
-                self.resolve_cached_input_images(id);
             }
             if self.has_inflight(id)
                 && !self.can_decode_lookahead(id)
@@ -2439,10 +2707,9 @@ impl Scheduler {
                 mixed_prefill = target == AssemblyLane::Decode
                     && kind == OpKind::PrefillUnd
                     && mixed_left > 0
-                    && self
-                        .running
-                        .get(&id)
-                        .is_some_and(|st| st.req.is_plain_und());
+                    && self.running.get(&id).is_some_and(|st| {
+                        st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
+                    });
                 if !mixed_prefill {
                     continue;
                 }
@@ -2459,7 +2726,7 @@ impl Scheduler {
                 } else {
                     budget
                 };
-                match self.next_op(id, op_budget) {
+                match self.next_transition(id, op_budget) {
                     Some(mut op) => {
                         // bound encode work per step; defer if over budget.
                         if op.kind == OpKind::VitEncode || op.kind == OpKind::VaeEncode {
@@ -2476,11 +2743,11 @@ impl Scheduler {
                         // initial block allocation cross once, ahead of its
                         // first op; the op then carries only deltas.
                         if let Some(st) = self.running.get_mut(&id)
-                            && !st.worker_registered
+                            && !st.resources.worker_registered
                         {
-                            st.worker_registered = true;
-                            let neg = (!st.req.neg_prompt_ids.is_empty())
-                                .then(|| st.req.neg_prompt_ids.clone());
+                            st.resources.worker_registered = true;
+                            let neg = (!st.context.negative_prompt_ids.is_empty())
+                                .then(|| st.context.negative_prompt_ids.clone());
                             new_reqs.push(NewRequestData {
                                 sampling: Some(st.req.sampling.clone()),
                                 image: Some(st.req.image.clone()),
@@ -2491,8 +2758,13 @@ impl Scheduler {
                                 ..NewRequestData::new(id)
                             });
                         }
-                        if op.kind == OpKind::DenoiseGen {
-                            self.reserve_worker_image_latent_for_denoise(id);
+                        if !self.reserve_transition_resources(&op) {
+                            tracing::error!(
+                                request_id = id.0,
+                                "planned resource reservation failed after readiness check"
+                            );
+                            self.finish(id, FinishReason::Error);
+                            break;
                         }
                         selected.insert(id);
                         if mixed_prefill {
@@ -2506,7 +2778,7 @@ impl Scheduler {
                         if self
                             .running
                             .get(&id)
-                            .map(|st| st.default_image_pending)
+                            .map(|st| st.image_gen.branch_pending)
                             .unwrap_or(false)
                         {
                             break;
@@ -2528,33 +2800,6 @@ impl Scheduler {
         }
         ops.extend(mixed_ops);
         (new_reqs, ops)
-    }
-
-    fn resolve_cached_input_images(&mut self, id: RequestId) {
-        let Some(st) = self.running.get(&id) else {
-            return;
-        };
-        if st.phase != Phase::Encode || st.req.uses_feedback_ingest() {
-            return;
-        }
-        let (mm_items, mut cursor) = (st.req.mm_items.clone(), st.mm_cursor);
-        while cursor < mm_items.len() {
-            let hash = mm_items[cursor].hash;
-            if self.enc_cache.lookup(hash).is_none() {
-                break;
-            }
-            self.enc_cache.acquire(hash);
-            if let Some(st) = self.running.get_mut(&id) {
-                st.mm_acquired.push(hash);
-                st.mm_cursor = cursor + 1;
-            }
-            cursor += 1;
-        }
-        if cursor >= mm_items.len()
-            && let Some(st) = self.running.get_mut(&id)
-        {
-            st.phase = Phase::Prefill;
-        }
     }
 
     fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
@@ -2638,8 +2883,9 @@ impl Scheduler {
             return false;
         };
         if st.cancelled
-            || !st.req.is_plain_und()
-            || st.phase != Phase::DecodeUnd
+            || !st.is_replayable_text()
+            || st.req.behavior.gen_output
+            || st.lifecycle.phase != Phase::DecodeUnd
             || st.grammar.is_some()
         {
             return false;
@@ -2660,9 +2906,9 @@ impl Scheduler {
         greedy
             && sp.ignore_eos
             && st.req.stop_token_ids.is_empty()
-            && st.n_generated >= sp.min_tokens
-            && st.n_generated.saturating_add(depth) < st.req.max_tokens
-            && sp.n_logprobs == 0
+            && st.und.tokens_emitted >= sp.min_tokens
+            && st.und.tokens_emitted.saturating_add(depth) < st.req.max_und_tokens
+            && !sp.generated_logprobs_requested()
             && sp.bad_words_ids.is_empty()
             && !penalties
     }
@@ -2682,8 +2928,9 @@ impl Scheduler {
             return false;
         };
         if st.cancelled
-            || !st.req.is_plain_und()
-            || st.phase != Phase::Prefill
+            || !st.is_replayable_text()
+            || st.req.behavior.gen_output
+            || st.lifecycle.phase != Phase::Prefill
             || st.grammar.is_some()
         {
             return false;
@@ -2692,14 +2939,18 @@ impl Scheduler {
         // transition, i.e. the final prefill is running.
         if self
             .projected_cursor(id)
-            .is_none_or(|cursor| (cursor.prompt_cursor as usize) < Self::effective_prompt(st).len())
+            .is_none_or(|cursor| (cursor.prompt_cursor as usize) < st.effective_prompt().len())
         {
             return false;
         }
         let Some(items) = self.inflight_ops.get(&id) else {
             return false;
         };
-        if items.len() != 1 || items.iter().any(|op| op.kind != OpKind::PrefillUnd) {
+        if items.len() != 1
+            || items
+                .iter()
+                .any(|op| op.transition.kind != OpKind::PrefillUnd)
+        {
             return false;
         }
         let sp = &st.req.sampling;
@@ -2710,30 +2961,16 @@ impl Scheduler {
         greedy
             && sp.ignore_eos
             && st.req.stop_token_ids.is_empty()
-            && st.n_generated >= sp.min_tokens
+            && st.und.tokens_emitted >= sp.min_tokens
             // prefill samples one token, the lookahead decode a second.
-            && st.n_generated.saturating_add(2) <= st.req.max_tokens
-            && sp.n_logprobs == 0
+            && st.und.tokens_emitted.saturating_add(2) <= st.req.max_und_tokens
+            && !sp.generated_logprobs_requested()
             && sp.bad_words_ids.is_empty()
             && !penalties
     }
 
     fn supports_spec_decode(&self) -> bool {
-        self.caps
-            .supported_ops
-            .iter()
-            .any(|kind| kind == opkind_str(OpKind::TargetVerifyUnd))
-    }
-
-    /// Whether the worker implements the VAE half of context-image dual-encode.
-    /// Models without a VAE (e.g. patch-space denoisers) declare
-    /// only `vit_encode`; their input images single-encode and budget no VAE
-    /// grid tokens.
-    fn supports_vae_encode(&self) -> bool {
-        self.caps
-            .supported_ops
-            .iter()
-            .any(|kind| kind == opkind_str(OpKind::VaeEncode))
+        self.caps.supported_ops.contains(&OpKind::TargetVerifyUnd)
     }
 
     fn decode_burst_plan(
@@ -2750,8 +2987,7 @@ impl Scheduler {
         if self.decode_token_burst <= 1
             || use_last_sampled
             || budget <= 1
-            || st.phase != Phase::DecodeUnd
-            || st.req.uses_feedback_ingest()
+            || st.lifecycle.phase != Phase::DecodeUnd
             || st.grammar.is_some()
             || allowed.is_some()
         {
@@ -2762,15 +2998,15 @@ impl Scheduler {
             || sp.frequency_penalty != 0.0
             || sp.presence_penalty != 0.0;
         if sp.temperature > 0.0
-            || sp.n_logprobs != 0
+            || sp.generated_logprobs_requested()
             || !sp.bad_words_ids.is_empty()
             || penalties
-            || st.n_generated < sp.min_tokens
+            || st.und.tokens_emitted < sp.min_tokens
         {
             return (1, None, false);
         }
 
-        let remaining = st.req.max_tokens.saturating_sub(st.n_generated);
+        let remaining = st.req.max_und_tokens.saturating_sub(st.und.tokens_emitted);
         let count = self
             .decode_token_burst
             .min(remaining.min(u16::MAX as usize).max(1) as u16)
@@ -2786,23 +3022,28 @@ impl Scheduler {
         }
 
         let mut stop_ids = Vec::new();
-        if !sp.ignore_eos {
+        if !sp.ignore_eos && st.req.policy.termination.eos_finishes {
             stop_ids.extend(self.ctrl.eos.iter().copied());
         }
-        stop_ids.extend(st.req.stop_token_ids.iter().copied());
-        if st.req.uses_default_generation() && st.images_done < st.req.image.max_images as usize {
-            if self.ctrl.start_of_image != 0 {
-                stop_ids.push(self.ctrl.start_of_image);
-            }
-            // Literal multi-token image triggers are host-detected by suffix.
+        if st.req.policy.termination.stop_finishes {
+            stop_ids.extend(st.req.stop_token_ids.iter().copied());
+        }
+        stop_ids.extend(st.req.policy.trigger.round_close_token_ids());
+        if st.can_open_gen_branch() {
+            // Multi-token triggers are host-detected by suffix.
             // Stopping on any member is conservative: it may shorten a burst,
             // but it cannot decode past a trigger that the host would need to
             // observe before scheduling the image phase.
-            stop_ids.extend(self.ctrl.image_start_ids.iter().copied());
+            if let Some(trigger) = st.req.policy.trigger.generated_suffix() {
+                stop_ids.extend(trigger.iter().copied());
+            }
         }
         stop_ids.sort_unstable();
         stop_ids.dedup();
-        let terminal = !stop_ids.is_empty() && !st.req.uses_default_generation();
+        let terminal = !stop_ids.is_empty()
+            && !st.can_open_gen_branch()
+            && st.req.policy.termination.eos_finishes
+            && st.req.policy.termination.stop_finishes;
         (count, (!stop_ids.is_empty()).then_some(stop_ids), terminal)
     }
 
@@ -2810,20 +3051,19 @@ impl Scheduler {
         let Some(st) = self.running.get(&id) else {
             return 1;
         };
-        if !st.req.uses_default_generation() {
+        if !st.continues_after_gen_commit() {
             return usize::MAX;
         }
         let bs = self.caps.block_size as usize;
-        let image_slack = self.default_remaining_image_span(st);
         let allocated_token_cap = self.bm.blocks_for(id).len().saturating_mul(bs);
-        let in_allocated = allocated_token_cap.saturating_sub(pos.saturating_add(image_slack));
+        let in_allocated = allocated_token_cap.saturating_sub(pos);
         let decode_waiters = self
             .running
             .values()
             .filter(|candidate| {
-                candidate.req.uses_default_generation()
-                    && candidate.phase == Phase::DecodeUnd
-                    && !candidate.default_image_pending
+                candidate.continues_after_gen_commit()
+                    && candidate.lifecycle.phase == Phase::DecodeUnd
+                    && !candidate.image_gen.branch_pending
                     && !candidate.cancelled
             })
             .count()
@@ -2834,51 +3074,57 @@ impl Scheduler {
 
     fn peek_next_kind(&self, id: RequestId) -> Option<OpKind> {
         let st = self.running.get(&id)?;
-        if st.default_image_pending {
+        if st.image_gen.branch_pending {
             return None;
         }
-        if st.req.uses_feedback_ingest()
-            && st.phase == Phase::Prefill
+        if st.has_context_images()
+            && st.lifecycle.phase == Phase::Prefill
             && self.projected_cursor(id).is_some_and(|cursor| {
-                st.req
-                    .mm_items
-                    .get(st.mm_cursor)
+                st.context
+                    .images
+                    .get(st.ingest.mm_cursor)
                     .is_some_and(|item| item.position as usize == cursor.prompt_cursor as usize)
             })
         {
-            return if st.context_encode_step == 0 && self.supports_vae_encode() {
-                Some(OpKind::VaeEncode)
-            } else {
-                Some(OpKind::VitEncode)
-            };
+            return st.pending_image_step().map(|step| match step {
+                ImageIngestStep::VaeEncode => OpKind::VaeEncode,
+                ImageIngestStep::VitEncode => OpKind::VitEncode,
+            });
         }
-        Some(match st.phase {
-            Phase::Encode
-                if st.req.uses_feedback_ingest()
-                    && st.context_encode_step == 0
-                    && self.supports_vae_encode() =>
-            {
-                OpKind::VaeEncode
-            }
-            Phase::Encode => OpKind::VitEncode,
+        Some(match st.lifecycle.phase {
+            Phase::Encode => match st.pending_image_step()? {
+                ImageIngestStep::VaeEncode => OpKind::VaeEncode,
+                ImageIngestStep::VitEncode => OpKind::VitEncode,
+            },
             Phase::Prefill if self.can_prefill_decode_lookahead(id) => OpKind::DecodeUnd,
             Phase::Prefill => OpKind::PrefillUnd,
             Phase::DecodeUnd => OpKind::DecodeUnd,
             Phase::DenoiseGen => OpKind::DenoiseGen,
             Phase::CommitGen => OpKind::CommitGen,
             Phase::CommitWriteback => OpKind::CommitWriteback,
+            Phase::FeedbackIngest => {
+                let feedback = st.req.policy.feedback.as_ref()?;
+                let uniserve_core::FeedbackWriteback::Reingest { ingest } = &feedback.writeback
+                else {
+                    return None;
+                };
+                match ingest.steps.get(st.feedback.ingest_step)? {
+                    ImageIngestStep::VaeEncode => OpKind::VaeEncode,
+                    ImageIngestStep::VitEncode => OpKind::VitEncode,
+                }
+            }
         })
     }
 
     fn preemptible(&self, id: RequestId) -> bool {
         self.running.get(&id).is_some_and(|st| {
-            if st.reserve_worstcase {
+            if st.resources.reserve_worstcase || !st.is_replayable_text() {
                 return false;
             }
-            // default generation replay is too expensive under high concurrency: even
+            // generated branch replay is too expensive under high concurrency: even
             // prompt-only victims can quickly become prompt++generated victims and
             // churn the same long prefix forever. Keep these requests resident.
-            if st.req.uses_default_generation() {
+            if st.continues_after_gen_commit() {
                 return false;
             }
             true
@@ -2949,15 +3195,32 @@ impl Scheduler {
     /// `prompt ++ generated`), and re-queue it so it restarts promptly. The
     /// worker's control record is dropped; resumption re-registers.
     fn do_preempt(&mut self, victim: RequestId) {
-        let st = match self.running.remove(&victim) {
+        self.requeue_for_recompute(victim);
+    }
+
+    fn requeue_for_recompute(&mut self, victim: RequestId) {
+        let mut st = match self.running.remove(&victim) {
             Some(s) => s,
             None => return,
         };
-        debug_assert!(
-            !st.reserve_worstcase,
-            "reserving requests are preemption-exempt"
-        );
         self.order.retain(|x| *x != victim);
+        self.reserved_encoder_entries = self
+            .reserved_encoder_entries
+            .saturating_sub(st.req.resources.encoder_cache_keys.len());
+        if st.resources.reserve_worstcase {
+            self.reserved_blocks = self
+                .reserved_blocks
+                .saturating_sub(st.resources.worstcase_blocks);
+        }
+        let mut free_encoder_handles = std::mem::take(&mut st.ingest.transient_encoder_handles);
+        for pin in &st.ingest.acquired_encoder_pins {
+            if let Some(handle) = self.enc_cache.release(pin.key, pin.handle) {
+                free_encoder_handles.push(handle);
+            }
+        }
+        if !free_encoder_handles.is_empty() {
+            self.gated_control(ControlOp::FreeEncoder(free_encoder_handles));
+        }
         self.bm.release(victim);
         // a preempted request is re-queued and re-admitted (which re-issues
         // its lease), so release its current leases now to avoid a stale double.
@@ -2972,24 +3235,21 @@ impl Scheduler {
                 "preemption drop_request control failed"
             );
         }
-        let mut st = st;
-        st.worker_image_latent_units = 0;
-        let mut recompute = st.req.prompt_ids.clone();
-        recompute.extend_from_slice(&st.generated_ids);
-        st.recompute_ids = Some(recompute);
-        st.phase = Phase::Prefill;
-        st.pos = 0;
-        st.prompt_cursor = 0;
-        st.prefix_cached_blocks = 0;
-        st.blocks_cached = false;
-        st.image_id = 0;
-        st.images_done = 0;
-        st.text_since_image = 0;
-        st.cond_pos = 0;
-        st.steps_done = 0;
-        st.preempted = true;
-        st.worker_registered = false;
-        st.blocks_sent = 0;
+        let mut recompute = st.context.prompt_ids.clone();
+        recompute.extend_from_slice(&st.replay.generated_ids);
+        let generated_ids = std::mem::take(&mut st.replay.generated_ids);
+        let generated_count = st.und.tokens_emitted;
+        let text_since_image = st.und.text_since_image;
+        let prompt_logprobs_emitted = st.ingest.prompt_logprobs_emitted;
+        let worstcase_blocks = st.resources.worstcase_blocks;
+        let reserve_worstcase = st.resources.reserve_worstcase;
+        st.cursor = GenerationCursor::new(Phase::Prefill, worstcase_blocks, reserve_worstcase);
+        st.replay.generated_ids = generated_ids;
+        st.replay.recompute_ids = Some(recompute);
+        st.replay.preempted = true;
+        st.und.tokens_emitted = generated_count;
+        st.und.text_since_image = text_since_image;
+        st.ingest.prompt_logprobs_emitted = prompt_logprobs_emitted;
         st.trace.push(crate::trace::TraceEvent::at(
             crate::trace::TraceEventKind::Preempted,
         ));
@@ -2997,9 +3257,9 @@ impl Scheduler {
             "event": "request_preempted",
             "at_s": now(),
             "request_id": victim.0,
-            "generated_tokens": st.generated_ids.len(),
-            "prompt_tokens": st.req.prompt_ids.len(),
-            "reset_phase": phase_str(st.phase),
+            "generated_tokens": st.replay.generated_ids.len(),
+            "prompt_tokens": st.context.prompt_ids.len(),
+            "reset_phase": phase_str(st.lifecycle.phase),
             "pending_before_requeue": self.pending.len(),
             "running": self.running.len(),
             "free_blocks": self.bm.free_blocks(),
@@ -3012,20 +3272,26 @@ impl Scheduler {
         self.record_decision(victim, crate::policy::PolicyReason::Preempted, 0);
     }
 
-    fn submit_batch(&mut self, new_reqs: Vec<NewRequestData>, mut ops: Vec<ForwardOp>) {
-        let _span = tracing::trace_span!("scheduler.submit_batch", ops = ops.len()).entered();
+    fn submit_batch(
+        &mut self,
+        new_reqs: Vec<NewRequestData>,
+        mut transitions: Vec<PlannedTransition>,
+    ) {
+        let _span =
+            tracing::trace_span!("scheduler.submit_batch", ops = transitions.len()).entered();
         self.step_id += 1;
         let step = self.step_id;
         // /10: stamp each op's submit time (round-trip latency) + assign its
         // op_id (lifecycle correlation), and record an OpSubmitted trace event.
         let submit_at = Instant::now();
-        for op in &mut ops {
+        for transition in &mut transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
-            op.op_id = Some(oid);
-            self.register_inflight(op, submit_at);
-            let opk = opkind_str(op.kind);
-            if let Some(st) = self.running.get_mut(&op.req_id) {
+            transition.assign_op_id(oid);
+            let request_id = transition.op.req_id;
+            let opk = opkind_str(transition.op.kind);
+            self.register_inflight(transition.clone(), submit_at);
+            if let Some(st) = self.running.get_mut(&request_id) {
                 let mut ev =
                     crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpSubmitted);
                 ev.op_id = Some(oid);
@@ -3034,11 +3300,11 @@ impl Scheduler {
                 st.trace.push(ev);
             }
         }
-        self.peak_ops_in_batch = self.peak_ops_in_batch.max(ops.len());
+        self.peak_ops_in_batch = self.peak_ops_in_batch.max(transitions.len());
         self.stats
             .general
             .peak_ops
-            .fetch_max(ops.len(), Ordering::Relaxed);
+            .fetch_max(transitions.len(), Ordering::Relaxed);
         self.stats.general.steps.fetch_add(1, Ordering::Relaxed);
         self.stats
             .general
@@ -3056,15 +3322,16 @@ impl Scheduler {
             .kv_cache
             .free_blocks
             .store(self.bm.free_blocks(), Ordering::Relaxed);
-        let mixed = ops
+        let mixed = transitions
             .first()
-            .is_some_and(|first| ops.iter().any(|op| op.kind != first.kind));
-        let op_kinds: Vec<&'static str> = ops.iter().map(|op| opkind_str(op.kind)).collect();
-        let req_ids: Vec<u64> = ops.iter().map(|op| op.req_id.0).collect();
-        let trace_ops: Vec<_> = ops
+            .is_some_and(|first| transitions.iter().any(|op| op.kind != first.kind));
+        let op_kinds: Vec<&'static str> =
+            transitions.iter().map(|op| opkind_str(op.kind)).collect();
+        let req_ids: Vec<u64> = transitions.iter().map(|op| op.req_id.0).collect();
+        let trace_ops: Vec<_> = transitions
             .iter()
             .map(|op| {
-                let phase = self.running.get(&op.req_id).map(|st| phase_str(st.phase));
+                let phase = self.running.get(&op.req_id).map(|st| phase_str(st.lifecycle.phase));
                 json!({
                     "request_id": op.req_id.0,
                     "op_id": op.op_id,
@@ -3085,6 +3352,19 @@ impl Scheduler {
                     "cond_pos": op.cond_pos,
                     "image_in": op.image_in,
                     "mm_hash": op.mm_hash,
+                    "transition": op.delta.as_str(),
+                    "resources": {
+                        "new_blocks": op.resources.new_blocks,
+                        "kv_target_tokens": op.resources.kv_target_tokens,
+                        "scratch_units": op.resources.scratch_units,
+                        "latent_units": op.resources.latent_units,
+                        "encoder_pins": op.resources.encoder_pins,
+                        "replayability_after_apply": op.resources.replayability_after_apply.as_str(),
+                    },
+                    "visibility": {
+                        "und_tokens": format!("{:?}", op.visibility.und_tokens),
+                        "generated_image": op.visibility.generated_image,
+                    },
                 })
             })
             .collect();
@@ -3094,7 +3374,7 @@ impl Scheduler {
             "event": "batch_submitted",
             "at_s": now(),
             "step_id": step,
-            "batch_size": ops.len(),
+            "batch_size": transitions.len(),
             "mixed": mixed,
             "op_kinds": op_kinds.clone(),
             "request_ids": req_ids.clone(),
@@ -3122,10 +3402,14 @@ impl Scheduler {
                 "submitting mixed forward batch"
             );
         }
+        let wire_ops = transitions
+            .iter()
+            .map(|transition| transition.op.clone())
+            .collect();
         let batch = ForwardBatch {
             step_id: self.step_id,
             new_reqs,
-            ops,
+            ops: wire_ops,
         };
         let spec_draft_counts: Vec<usize> = batch
             .ops
@@ -3162,20 +3446,65 @@ impl Scheduler {
         }
     }
 
-    /// Effective prefill sequence: `prompt ++ generated` while recomputing after
-    /// Preemption, else the bare prompt.
-    fn effective_prompt(st: &ReqState) -> &[u32] {
-        st.recompute_ids.as_deref().unwrap_or(&st.req.prompt_ids)
+    fn generated_trigger_matches(st: &ReqState) -> bool {
+        st.req
+            .policy
+            .trigger
+            .matches_generated(&st.replay.generated_ids)
     }
 
-    fn prefilled_default_image_start(&self, id: RequestId) -> bool {
+    fn direct_trigger_matches(st: &ReqState, token_id: u32) -> bool {
+        st.req.policy.trigger.direct_token() == Some(token_id)
+    }
+
+    fn feedback_next_token(&self, id: RequestId) -> Option<u32> {
+        let next = self
+            .running
+            .get(&id)?
+            .req
+            .policy
+            .feedback
+            .as_ref()?
+            .next_und_token;
+        match next {
+            uniserve_core::FeedbackNextToken::None => None,
+            uniserve_core::FeedbackNextToken::Bos => Some(self.ctrl.bos),
+            uniserve_core::FeedbackNextToken::EndOfImage => Some(self.ctrl.end_of_image),
+            uniserve_core::FeedbackNextToken::Token { token_id } => Some(token_id),
+        }
+    }
+
+    fn commit_requires_writeback(st: &ReqState) -> bool {
+        st.req.behavior.generated_image_feedback
+            && st.req.policy.feedback.as_ref().is_some_and(|feedback| {
+                feedback.commit == uniserve_core::CommitRecipe::CommitGenThenWriteback
+                    && matches!(
+                        feedback.writeback,
+                        uniserve_core::FeedbackWriteback::DirectKv
+                    )
+            })
+    }
+
+    fn reingests_generated_image(st: &ReqState) -> bool {
+        st.req.behavior.generated_image_feedback
+            && st.req.policy.feedback.as_ref().is_some_and(|feedback| {
+                matches!(
+                    feedback.writeback,
+                    uniserve_core::FeedbackWriteback::Reingest { .. }
+                )
+            })
+    }
+
+    fn prefilled_gen_trigger(&self, id: RequestId) -> bool {
         let Some(st) = self.running.get(&id) else {
             return false;
         };
-        st.req.uses_default_generation()
-            && self.ctrl.start_of_image != 0
-            && st.images_done < st.req.image.max_images as usize
-            && Self::effective_prompt(st).last().copied() == Some(self.ctrl.start_of_image)
+        st.can_open_gen_branch()
+            && st
+                .req
+                .policy
+                .trigger
+                .matches_generated(st.effective_prompt())
     }
 
     /// The block-id delta since the last op for this request (the stateful-diff
@@ -3185,9 +3514,9 @@ impl Scheduler {
         let Some(st) = self.running.get_mut(&id) else {
             return Vec::new();
         };
-        let sent = st.blocks_sent.min(all.len());
+        let sent = st.resources.blocks_sent.min(all.len());
         let new = all[sent..].to_vec();
-        st.blocks_sent = all.len();
+        st.resources.blocks_sent = all.len();
         new
     }
 
@@ -3204,20 +3533,44 @@ impl Scheduler {
         self.executor.stage_ready(id)
     }
 
-    fn next_op(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
+    fn plan_intent(
+        &mut self,
+        id: RequestId,
+        cursor: CursorProjection,
+        intent: TransitionIntent,
+    ) -> Option<PlannedTransition> {
+        let planned = {
+            let request = &self.running.get(&id)?.req;
+            self.planner.plan(request, cursor, intent)
+        };
+        match planned {
+            Ok(transition) => Some(transition),
+            Err(error) => {
+                tracing::error!(request_id = id.0, ?error, "generation planning failed");
+                self.finish(id, FinishReason::Error);
+                None
+            }
+        }
+    }
+
+    fn next_transition(&mut self, id: RequestId, budget: usize) -> Option<PlannedTransition> {
         if !self.stage_ready(id) {
             return None;
         }
-        if self.running.get(&id)?.req.uses_feedback_ingest() {
-            return self.next_op_context_image(id, budget);
+        let projection = self.projected_cursor(id)?;
+        let context_pending = self.running.get(&id).is_some_and(|st| {
+            projection.prompt_cursor < st.context.prompt_ids.len() as u32
+                || st.ingest.mm_cursor < st.context.images.len()
+        });
+        if context_pending {
+            return self.next_context_ingest_transition(id, budget, projection);
         }
-        if self.running.get(&id)?.default_image_pending {
-            self.begin_image(id);
-            if self.running.get(&id)?.default_image_pending {
-                return None;
-            }
+        if self.running.get(&id)?.image_gen.branch_pending
+            && !self.promote_gen_branch_reservation(id)
+        {
+            return None;
         }
-        let phase = self.running.get(&id)?.phase;
+        let phase = self.running.get(&id)?.lifecycle.phase;
         // Final-prefill-in-flight requests build their first decode op early
         // (cross-boundary lookahead); the committed phase advances at resolve.
         let phase = if phase == Phase::Prefill && self.can_prefill_decode_lookahead(id) {
@@ -3226,63 +3579,47 @@ impl Scheduler {
             phase
         };
         match phase {
-            Phase::Encode => {
-                // Emit a VitEncode for the first uncached image. The embedding
-                // never crosses the wire: the op carries the content hash and a
-                // staged-image handle, and the result returns an encoder handle.
-                let (mm_items, cursor) = {
-                    let st = self.running.get(&id)?;
-                    (st.req.mm_items.clone(), st.mm_cursor)
-                };
-                if cursor >= mm_items.len() {
-                    return None;
-                }
-                let item = mm_items[cursor].clone();
-                let staged = ((id.0) << 20) | (cursor as u64); // StagedImageId
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::VitEncode,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (item.position, item.position + item.num_tokens),
-                    mm_hash: Some(item.hash),
-                    image_in: Some(staged),
-                    ..Default::default()
-                })
-            }
+            Phase::Encode => None,
             Phase::Prefill => {
                 let st = self.running.get(&id)?;
-                let prompt = Self::effective_prompt(st).to_vec();
+                let prompt = st.effective_prompt().to_vec();
                 let n = prompt.len();
-                let cursor = self.projected_cursor(id)?.prompt_cursor as usize;
+                let projection = self.projected_cursor(id)?;
+                let cursor = projection.prompt_cursor as usize;
+                let (segment_index, segment_end) =
+                    st.context.token_segment_at(cursor).unwrap_or((0, n));
                 // Chunked prefill with the clip rule: the chunk is bounded by
                 // the remaining step budget and the long-prefill threshold.
                 let chunk_cap = (n - cursor)
                     .min(self.config.long_prefill_threshold)
                     .min(budget.max(1));
-                let end = (cursor + chunk_cap.max(1)).min(n);
+                let end = (cursor + chunk_cap.max(1))
+                    .min(n)
+                    .min(segment_end.max(cursor + 1));
                 if !self.bm.ensure_capacity(id, end) {
                     return None;
                 }
                 let chunk: Vec<u32> = prompt[cursor..end].to_vec();
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::PrefillUnd,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (cursor as u32, end as u32),
-                    token_ids: Some(chunk),
-                    recent_tokens: recent,
-                    allowed_tokens: allowed,
-                    suppress_tokens: suppress,
-                    ..Default::default()
-                })
+                let new_blocks = self.take_new_blocks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::IngestText {
+                        segment_index,
+                        prompt_start: cursor as u32,
+                        token_ids: chunk,
+                        new_blocks,
+                        recent_tokens: recent,
+                        allowed_tokens: allowed,
+                        suppress_tokens: suppress,
+                    },
+                )
             }
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
-                let prefill_lookahead = st.phase == Phase::Prefill;
+                let prefill_lookahead = st.lifecycle.phase == Phase::Prefill;
                 let lookahead_depth = self.inflight_decode_count(id);
                 let use_last_sampled = lookahead_depth > 0 || prefill_lookahead;
                 if use_last_sampled
@@ -3291,8 +3628,13 @@ impl Scheduler {
                 {
                     return None;
                 }
-                let pos = self.projected_cursor(id)?.logical_pos;
-                let tok = if use_last_sampled { 0 } else { st.next_token };
+                let projection = self.projected_cursor(id)?;
+                let pos = projection.logical_pos;
+                let tok = if use_last_sampled {
+                    0
+                } else {
+                    st.und.next_token
+                };
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
                 let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) = self
@@ -3327,31 +3669,32 @@ impl Scheduler {
                 if !self.bm.ensure_capacity(id, capacity_target) {
                     return None;
                 }
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::DecodeUnd,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (pos, pos + 1),
-                    token_ids: Some(vec![tok]),
-                    token_source: if use_last_sampled {
-                        TokenSource::LastSampled
-                    } else {
-                        TokenSource::Wire
+                let new_blocks = self.take_new_blocks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::DecodeUnd {
+                        position: pos,
+                        token_id: tok,
+                        token_source: if use_last_sampled {
+                            TokenSource::LastSampled
+                        } else {
+                            TokenSource::Wire
+                        },
+                        new_blocks,
+                        spec_token_ids,
+                        token_count: decode_len as u16,
+                        stop_token_ids: decode_stop_token_ids,
+                        stop_terminal: decode_stop_terminal,
+                        recent_tokens: recent,
+                        allowed_tokens: allowed,
+                        suppress_tokens: suppress,
                     },
-                    spec_token_ids,
-                    decode_token_count: (decode_len > 1).then_some(decode_len as u16),
-                    decode_stop_token_ids,
-                    decode_stop_terminal,
-                    recent_tokens: recent,
-                    allowed_tokens: allowed,
-                    suppress_tokens: suppress,
-                    ..Default::default()
-                })
+                )
             }
             Phase::DenoiseGen => {
                 let st = self.running.get(&id)?;
-                let cond_pos = st.cond_pos;
+                let cond_pos = st.image_gen.cond_pos;
                 let nvae = self.num_vae(&st.req.image) as usize;
                 if st.req.image.retain_images
                     && !self.bm.ensure_capacity(
@@ -3361,488 +3704,257 @@ impl Scheduler {
                 {
                     return None;
                 }
-                let timestep = st.steps_done;
+                let timestep = st.image_gen.steps_done;
                 let remaining = st.req.image.steps.saturating_sub(timestep).max(1);
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
+                let latent_units = self.worker_image_latent_units_for(st).max(1);
+                let scratch_units = u64::from(cfg.branch_count);
+                let host_scratch_tokens = self.num_vae(&st.req.image).saturating_mul(scratch_units);
                 let image_prompt = Self::image_prompt_for(st);
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::DenoiseGen,
-                    modality: Modality::Gen,
-                    new_block_ids: Vec::new(),
-                    pos_range: (cond_pos, cond_pos + 1),
-                    timestep_idx: Some(timestep),
-                    denoise_step_count: Some(denoise_step_count),
-                    cond_pos: Some(cond_pos),
-                    cfg: Some(cfg),
-                    image_prompt,
-                    ..Default::default()
-                })
+                let image_id = st.image_gen.image_id;
+                let projection = self.projected_cursor(id)?;
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::DenoiseGen {
+                        image_id,
+                        position: cond_pos,
+                        start_step: timestep,
+                        step_count: denoise_step_count,
+                        cfg,
+                        image_prompt,
+                        latent_units,
+                        scratch_units,
+                        host_scratch_tokens,
+                    },
+                )
             }
             Phase::CommitGen => {
                 let st = self.running.get(&id)?;
-                let cond_pos = st.cond_pos;
+                let cond_pos = st.image_gen.cond_pos;
+                let image_id = st.image_gen.image_id;
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::CommitGen,
-                    modality: Modality::Gen,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (cond_pos, cond_pos + 1),
-                    cond_pos: Some(cond_pos),
-                    recent_tokens: recent,
-                    allowed_tokens: allowed,
-                    suppress_tokens: suppress,
-                    ..Default::default()
-                })
+                let projection = self.projected_cursor(id)?;
+                let new_blocks = self.take_new_blocks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::CommitGen {
+                        image_id,
+                        position: cond_pos,
+                        new_blocks,
+                        recent_tokens: recent,
+                        allowed_tokens: allowed,
+                        suppress_tokens: suppress,
+                    },
+                )
             }
             Phase::CommitWriteback => {
                 let st = self.running.get(&id)?;
-                let cond_pos = st.cond_pos;
+                let cond_pos = st.image_gen.cond_pos;
+                let image_id = st.image_gen.image_id;
+                let locator = st.feedback.locator.clone();
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::CommitWriteback,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (cond_pos, cond_pos + 1),
-                    cond_pos: Some(cond_pos),
-                    recent_tokens: recent,
-                    allowed_tokens: allowed,
-                    suppress_tokens: suppress,
-                    ..Default::default()
-                })
-            }
-        }
-    }
-
-    // ====================== context-image feedback path ======================
-    // ThinkMorph-style context path: prefill [SYS], dual-encode the input image (VAE clean
-    // ⊕ ViT) at its in-prompt position, prefill [question], decode text; on the
-    // literal `<image_start>` in a finished round, 3-branch-CFG denoise a reasoning
-    // image, dual re-encode it back, and continue. KV length (`kvlen`) and rope
-    // (`pos`) diverge once an image block (N+2 KV positions, 1 rope position) is
-    // spliced in.
-
-    /// Build the next op for a context-image request. Block addressing uses the
-    /// full worst-case mapping (exact image token counts come from the worker),
-    /// which the reservation allocated at admission.
-    /// Burst plan for context-image text decode. Rounds always close on
-    /// <|im_end|>, so eos is unconditionally a burst stop; the KV capacity is
-    /// pre-reserved worst-case at admission, so no per-token block gating is
-    /// needed beyond the step budget.
-    fn context_decode_burst_plan(&self, id: RequestId, budget: usize) -> (u16, Option<Vec<u32>>) {
-        let Some(st) = self.running.get(&id) else {
-            return (1, None);
-        };
-        let sp = &st.req.sampling;
-        let penalties = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        if self.decode_token_burst <= 1
-            || budget <= 1
-            || st.context_round_closing
-            || st.grammar.is_some()
-            || sp.temperature > 0.0
-            || sp.n_logprobs != 0
-            || !sp.bad_words_ids.is_empty()
-            || penalties
-            || st.n_generated < sp.min_tokens
-        {
-            return (1, None);
-        }
-        let remaining = st.req.max_tokens.saturating_sub(st.n_generated);
-        let count = self
-            .decode_token_burst
-            .min(remaining.min(u16::MAX as usize).max(1) as u16)
-            .min(budget.min(u16::MAX as usize) as u16)
-            .max(1);
-        if count <= 1 {
-            return (1, None);
-        }
-        let mut stop_ids: Vec<u32> = self.ctrl.eos.clone();
-        stop_ids.extend(st.req.stop_token_ids.iter().copied());
-        stop_ids.sort_unstable();
-        stop_ids.dedup();
-        (count, Some(stop_ids))
-    }
-
-    fn next_op_context_image(&mut self, id: RequestId, budget: usize) -> Option<ForwardOp> {
-        let projection = self.projected_cursor(id)?;
-        let (phase, wc) = {
-            let st = self.running.get(&id)?;
-            (st.phase, st.worstcase_blocks)
-        };
-        self.bm
-            .ensure_capacity(id, wc * self.caps.block_size as usize);
-        let phase = if phase == Phase::Prefill {
-            let st = self.running.get(&id)?;
-            let cursor = projection.prompt_cursor as usize;
-            let next_img = st
-                .req
-                .mm_items
-                .get(st.mm_cursor)
-                .map(|m| m.position as usize);
-            if next_img == Some(cursor) {
-                Phase::Encode
-            } else {
-                phase
-            }
-        } else {
-            phase
-        };
-        match phase {
-            Phase::Prefill => {
-                let st = self.running.get(&id)?;
-                let prompt = st.req.prompt_ids.clone();
-                let n = prompt.len();
-                let cursor = projection.prompt_cursor as usize;
-                let next_img = st
-                    .req
-                    .mm_items
-                    .get(st.mm_cursor)
-                    .map(|m| m.position as usize);
-                // chunk to the next image boundary, clipped by the step budget.
-                let boundary = match next_img {
-                    Some(p) if p > cursor => p,
-                    _ => n,
+                let Some(locator) = locator else {
+                    self.finish(id, FinishReason::Error);
+                    return None;
                 };
-                let end = boundary
-                    .min(cursor + budget.max(1))
-                    .min(n)
-                    .max(cursor + 1)
-                    .min(n);
-                let chunk = prompt[cursor..end].to_vec();
-                let pos = projection.logical_pos;
-                let dn = (end - cursor) as u32;
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::PrefillUnd,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (pos, pos + dn),
-                    token_ids: Some(chunk),
-                    ..Default::default()
-                })
+                let projection = self.projected_cursor(id)?;
+                let new_blocks = self.take_new_blocks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::Feedback {
+                        image_id,
+                        position: cond_pos,
+                        locator,
+                        new_blocks,
+                        recent_tokens: recent,
+                        allowed_tokens: allowed,
+                        suppress_tokens: suppress,
+                    },
+                )
             }
-            Phase::Encode => {
+            Phase::FeedbackIngest => {
                 let st = self.running.get(&id)?;
-                let item = st.req.mm_items.get(st.mm_cursor)?.clone();
-                let pos = projection.logical_pos;
-                let step = st.context_encode_step;
-                let (kind, modality) = if step == 0 && self.supports_vae_encode() {
-                    (OpKind::VaeEncode, Modality::Gen)
-                } else {
-                    (OpKind::VitEncode, Modality::Und)
+                let feedback = st.req.policy.feedback.as_ref()?;
+                let uniserve_core::FeedbackWriteback::Reingest { ingest } = &feedback.writeback
+                else {
+                    self.finish(id, FinishReason::Error);
+                    return None;
                 };
-                Some(ForwardOp {
-                    req_id: id,
-                    kind,
-                    modality,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (pos, pos + 1),
-                    cond_pos: Some(pos),
-                    image_b64: Some(item.b64.clone()),
-                    mm_hash: Some(item.hash),
-                    ..Default::default()
-                })
-            }
-            Phase::DecodeUnd => {
-                let st = self.running.get(&id)?;
-                let (pos, tok) = (projection.logical_pos, st.next_token);
-                let (burst_count, burst_stop_ids) = self.context_decode_burst_plan(id, budget);
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::DecodeUnd,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (pos, pos + 1),
-                    token_ids: Some(vec![tok]),
-                    decode_token_count: (burst_count > 1).then_some(burst_count),
-                    decode_stop_token_ids: burst_stop_ids,
-                    ..Default::default()
-                })
-            }
-            Phase::DenoiseGen => {
-                let st = self.running.get(&id)?;
-                let cond_pos = st.cond_pos;
-                let timestep = st.steps_done;
-                let remaining = st.req.image.steps.saturating_sub(timestep).max(1);
-                let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
-                let cfg = cfg_params(
-                    &st.req.image,
-                    self.caps.max_cfg_branches.max(1).min(u8::MAX as u32) as u8,
-                );
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::DenoiseGen,
-                    modality: Modality::Gen,
-                    new_block_ids: Vec::new(),
-                    pos_range: (cond_pos, cond_pos + 1),
-                    timestep_idx: Some(timestep),
-                    denoise_step_count: Some(denoise_step_count),
-                    cond_pos: Some(cond_pos),
-                    cfg: Some(cfg),
-                    ..Default::default()
-                })
-            }
-            Phase::CommitGen => {
-                let st = self.running.get(&id)?;
-                let cond_pos = st.cond_pos;
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::CommitGen,
-                    modality: Modality::Gen,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (cond_pos, cond_pos + 1),
-                    cond_pos: Some(cond_pos),
-                    ..Default::default()
-                })
-            }
-            Phase::CommitWriteback => {
-                let st = self.running.get(&id)?;
-                let cond_pos = st.cond_pos;
-                Some(ForwardOp {
-                    req_id: id,
-                    kind: OpKind::CommitWriteback,
-                    modality: Modality::Und,
-                    new_block_ids: self.take_new_blocks(id),
-                    pos_range: (cond_pos, cond_pos + 1),
-                    cond_pos: Some(cond_pos),
-                    ..Default::default()
-                })
+                let step_index = st.feedback.ingest_step;
+                let step = ingest.steps.get(step_index).copied()?;
+                let is_final_step = step_index + 1 == ingest.steps.len();
+                let image_id = st.image_gen.image_id;
+                let feedback_key =
+                    encoder_cache_key(id.0 ^ u64::from(image_id).rotate_left(17), step_index, step);
+                let worker_hash = transient_encoder_worker_key(feedback_key, id);
+                let image_b64 = st.feedback.image_b64.clone();
+                let staged_image = st.feedback.staged_image;
+                let logical_positions = ingest.logical_positions;
+                let physical_kv_tokens = ingest.physical_kv_tokens;
+                let Some(image_b64) = image_b64 else {
+                    self.finish(id, FinishReason::Error);
+                    return None;
+                };
+                let projection = self.projected_cursor(id)?;
+                let new_blocks = self.take_new_blocks(id);
+                self.plan_intent(
+                    id,
+                    projection,
+                    TransitionIntent::FeedbackIngest {
+                        image_id,
+                        step_index,
+                        step,
+                        worker_hash,
+                        is_final_step,
+                        position: projection.logical_pos,
+                        logical_positions,
+                        physical_kv_tokens,
+                        image_b64,
+                        staged_image,
+                        new_blocks,
+                    },
+                )
             }
         }
     }
 
-    fn resolve_context_image(
+    fn next_context_ingest_transition(
         &mut self,
         id: RequestId,
-        transition: PlannedTransition,
-        sr: uniserve_worker_wire::SeqResult,
-    ) {
-        let kind = transition.kind;
-        match kind {
-            OpKind::PrefillUnd => {
-                self.bm.activate(id);
-                if let crate::generation::TransitionDelta::IngestText { start, end } =
-                    transition.delta
-                {
-                    let dn = end.saturating_sub(start);
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.prompt_cursor = end;
-                        st.pos = transition.op.pos_range.1;
-                        st.kvlen = st.kvlen.saturating_add(dn);
-                    }
-                }
-                let (cursor, n) = {
-                    let st = self.running.get(&id).unwrap();
-                    (st.prompt_cursor as usize, st.req.prompt_ids.len())
-                };
-                if cursor >= n {
-                    // prompt fully prefilled -> open the assistant turn with <bos>.
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.next_token = self.ctrl.bos;
-                        st.round_tokens.clear();
-                        st.phase = Phase::DecodeUnd;
-                    }
-                }
-                // else: more prefill (the next op continues, or switches to Encode).
-            }
-            OpKind::VaeEncode | OpKind::VitEncode => {
-                let added = sr.num_tokens.unwrap_or(0);
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.pos = transition.op.pos_range.1;
-                    st.kvlen += added;
-                    if kind == OpKind::VaeEncode {
-                        if let Some((h, w)) = sr.image_hw {
-                            st.gen_h = h;
-                            st.gen_w = w;
-                            st.req.image.height = h;
-                            st.req.image.width = w;
-                        }
-                        st.context_encode_step = 1; // ViT next
-                    } else {
-                        st.mm_cursor += 1;
-                        st.context_encode_step = 0;
-                        st.phase = Phase::Prefill; // continue with the question
-                    }
-                }
-            }
-            OpKind::DecodeUnd => {
-                self.bm.activate(id);
-                let closing = self
-                    .running
-                    .get(&id)
-                    .map(|s| s.context_round_closing)
-                    .unwrap_or(false);
-                if closing {
-                    // the <|im_end|> is now committed; decide image vs finish.
-                    if let Some(s) = self.running.get_mut(&id) {
-                        s.pos = transition.op.pos_range.1;
-                        s.kvlen = s.kvlen.saturating_add(1);
-                        s.context_round_closing = false;
-                    }
-                    return self.close_context_round(id);
-                }
-                if let Some(tokens) = sr.sampled_token_ids.as_ref().filter(|t| !t.is_empty()) {
-                    // Worker-side decode burst: every committed token arrives at
-                    // once, and when the burst stopped on <|im_end|> the worker's
-                    // speculative stop-token forward already fed it into KV — the
-                    // round closes here directly instead of via a context_round_closing op.
-                    let tokens = tokens.clone();
-                    let count = tokens.len() as u32;
-                    let stopped_on_eos =
-                        tokens.last().is_some_and(|tok| self.ctrl.eos.contains(tok));
-                    // The worker appended one KV row per launched forward (`count` without a stop,
-                    // `count + 1` including the speculative stop-token feed).
-                    let advance = if stopped_on_eos {
-                        count.saturating_add(1)
-                    } else {
-                        count
-                    };
-                    if let Some(s) = self.running.get_mut(&id) {
-                        s.pos += advance;
-                        s.kvlen += advance;
-                    }
-                    for &tok in &tokens {
-                        if self.ctrl.eos.contains(&tok) {
-                            break;
-                        }
-                        self.emit_text(id, tok, None);
-                        let (n_gen, max_tokens) = {
-                            let st = self.running.get_mut(&id).unwrap();
-                            st.round_tokens.push(tok);
-                            st.n_generated += 1;
-                            st.next_token = tok;
-                            (st.n_generated, st.req.max_tokens)
-                        };
-                        if n_gen >= max_tokens {
-                            return self.finish(id, FinishReason::MaxTokens);
-                        }
-                    }
-                    if stopped_on_eos {
-                        return self.close_context_round(id);
-                    }
-                    return;
-                }
-                let tok = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
-                if let Some(s) = self.running.get_mut(&id) {
-                    s.pos = transition.op.pos_range.1;
-                    s.kvlen = s.kvlen.saturating_add(1);
-                }
-                if self.ctrl.eos.contains(&tok) {
-                    // close the round: feed <|im_end|> into KV, transition on its resolve.
-                    if let Some(s) = self.running.get_mut(&id) {
-                        s.next_token = self.ctrl.eos[0];
-                        s.context_round_closing = true;
-                    }
-                    return;
-                }
-                self.emit_text(id, tok, sr.sampled_logprob);
-                let (n_gen, max_tokens) = {
-                    let st = self.running.get_mut(&id).unwrap();
-                    st.round_tokens.push(tok);
-                    st.n_generated += 1;
-                    st.next_token = tok;
-                    (st.n_generated, st.req.max_tokens)
-                };
-                if n_gen >= max_tokens {
-                    self.finish(id, FinishReason::MaxTokens);
-                }
-            }
-            OpKind::DenoiseGen => {
-                let (image_id, h, w, steps, prev_sd) = {
-                    let st = self.running.get_mut(&id).unwrap();
-                    let prev = st.steps_done;
-                    st.steps_done = sr.num_steps_done.unwrap_or(st.steps_done + 1);
-                    (st.image_id, st.gen_h, st.gen_w, st.req.image.steps, prev)
-                };
-                let sd = self.running.get(&id).map(|s| s.steps_done).unwrap_or(0);
-                if prev_sd == 0 && sd >= 1 {
-                    self.emit(
-                        id,
-                        GenEvent::ImageBegin {
-                            image_id,
-                            height: h,
-                            width: w,
-                            steps,
-                        },
-                    );
-                }
-                for step in prev_sd.saturating_add(1)..=sd {
-                    self.emit(id, GenEvent::ImageStep { image_id, step });
-                }
-                if sr.denoise_done
-                    && let Some(st) = self.running.get_mut(&id)
-                {
-                    st.phase = Phase::CommitGen;
-                }
-            }
-            OpKind::CommitGen | OpKind::CommitWriteback => {
-                if kind == OpKind::CommitGen && sr.locator.is_some() {
-                    if let Some(st) = self.running.get_mut(&id) {
-                        st.phase = Phase::CommitWriteback;
-                    }
-                    if let Some(b64) = sr.image_png_b64 {
-                        let image_id = self.running.get(&id).map(|st| st.image_id).unwrap_or(0);
-                        self.emit(id, image_done_event(image_id, b64));
-                    }
-                    return;
-                }
-                self.bm.activate(id);
-                self.bm.release_scratch(id);
-                // the image committed — release its latent + scratch leases
-                // (the request continues; its KV lease persists until finish).
-                self.ledger
-                    .release_class(id, uniserve_worker_wire::ResourceClass::ImageLatent);
-                self.ledger
-                    .release_class(id, uniserve_worker_wire::ResourceClass::Scratch);
-                let (image_id, cond_pos) = {
-                    let st = self.running.get(&id).unwrap();
-                    (st.image_id, st.cond_pos)
-                };
-                if let Some(b64) = sr.image_png_b64 {
-                    self.emit(id, image_done_event(image_id, b64));
-                }
-                let added = sr.num_tokens.unwrap_or(0);
-                let gen_rope_advance = self.cap_gen_rope_advance();
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.worker_image_latent_units = 0;
-                    st.kvlen += added;
-                    st.pos = cond_pos + gen_rope_advance;
-                    st.images_done += 1;
-                    // resume text: a fresh assistant turn (<bos>), like native gen_text.
-                    st.next_token = self.ctrl.bos;
-                    st.round_tokens.clear();
-                    st.phase = Phase::DecodeUnd;
-                }
-            }
-            _ => {}
+        budget: usize,
+        projection: CursorProjection,
+    ) -> Option<PlannedTransition> {
+        let cursor = projection.prompt_cursor as usize;
+        let image = self
+            .running
+            .get(&id)?
+            .context
+            .images
+            .get(self.running.get(&id)?.ingest.mm_cursor)
+            .cloned();
+        if let Some(image) = image.as_ref()
+            && image.position as usize == cursor
+        {
+            let state = self.running.get(&id)?;
+            let step_index = state.ingest.pending_image_step;
+            let step = image.ingest.steps.get(step_index).copied()?;
+            let is_final_step = step_index + 1 == image.ingest.steps.len();
+            let staged_image = state.ingest.staged_image;
+            let cache_read = state.req.cache.read;
+            let cache_write = state.req.cache.write;
+            let cache_key = encoder_cache_key(image.hash, step_index, step);
+            let cached = if cache_read {
+                self.enc_cache.lookup_output(cache_key)
+            } else {
+                None
+            };
+            let cache_hit = cached.is_some();
+            let persistent_cache_key = (cache_hit || cache_write).then_some(cache_key);
+            let worker_hash = if cache_hit || cache_write {
+                cache_key
+            } else {
+                transient_encoder_worker_key(cache_key, id)
+            };
+            let encoder_input = cached.map(|output| output.handle).or(staged_image);
+            let new_blocks = self.take_new_blocks(id);
+            return self.plan_intent(
+                id,
+                projection,
+                TransitionIntent::IngestImage {
+                    segment_index: image.segment_index,
+                    step_index,
+                    step,
+                    is_final_step,
+                    position: projection.logical_pos,
+                    logical_positions: image.ingest.logical_positions,
+                    physical_kv_tokens: image.ingest.physical_kv_tokens,
+                    worker_hash,
+                    encoder_cache_key: persistent_cache_key,
+                    cache_hit,
+                    image_b64: image.b64.clone(),
+                    staged_image: encoder_input,
+                    new_blocks,
+                },
+            );
         }
+
+        let (prompt, segment_index, segment_end, next_image) = {
+            let st = self.running.get(&id)?;
+            let prompt = st.context.prompt_ids.clone();
+            let (segment_index, segment_end) = st
+                .context
+                .token_segment_at(cursor)
+                .unwrap_or((0, prompt.len()));
+            let next_image = image
+                .as_ref()
+                .map_or(prompt.len(), |image| image.position as usize);
+            (prompt, segment_index, segment_end, next_image)
+        };
+        if cursor >= prompt.len() {
+            return None;
+        }
+        let end = cursor
+            .saturating_add(budget.max(1).min(self.config.long_prefill_threshold))
+            .min(prompt.len())
+            .min(segment_end)
+            .min(next_image.max(cursor + 1));
+        if !self
+            .bm
+            .ensure_capacity(id, projection.physical_kv_len as usize + end - cursor)
+        {
+            return None;
+        }
+        let recent = self.recent_tokens(id);
+        let (allowed, suppress) = self.token_masks(id);
+        let new_blocks = self.take_new_blocks(id);
+        self.plan_intent(
+            id,
+            projection,
+            TransitionIntent::IngestText {
+                segment_index,
+                prompt_start: cursor as u32,
+                token_ids: prompt[cursor..end].to_vec(),
+                new_blocks,
+                recent_tokens: recent,
+                allowed_tokens: allowed,
+                suppress_tokens: suppress,
+            },
+        )
     }
 
-    /// Decide image-vs-finish once a round's <|im_end|> KV is committed.
-    /// The burst path may already have fed <|im_end|> through a speculative
-    /// stop-token forward.
-    fn close_context_round(&mut self, id: RequestId) {
-        let (triggered, images_done, max_images, n_gen, max_tokens) = {
+    /// Decide branch-vs-finish once a declared round-close token is committed.
+    fn close_context_round(&mut self, id: RequestId, close_token: u32) {
+        let (triggered, can_open_gen_branch, n_gen, max_tokens, eos_finishes) = {
             let Some(st) = self.running.get(&id) else {
                 return;
             };
             (
-                contains_subseq(&st.round_tokens, &self.ctrl.image_start_ids),
-                st.images_done,
-                st.req.image.max_images as usize,
-                st.n_generated,
-                st.req.max_tokens,
+                st.req
+                    .policy
+                    .trigger
+                    .matches_round_close(&st.und.round_tokens, close_token),
+                st.can_open_gen_branch(),
+                st.und.tokens_emitted,
+                st.req.max_und_tokens,
+                st.req.policy.termination.eos_finishes,
             )
         };
-        if triggered && images_done < max_images && n_gen < max_tokens {
-            return self.begin_image_iu(id);
+        if triggered && can_open_gen_branch && n_gen < max_tokens {
+            return self.begin_image(id);
+        }
+        if n_gen < max_tokens && !eos_finishes {
+            if let Some(st) = self.running.get_mut(&id) {
+                st.und.round_tokens.clear();
+                st.und.next_token = close_token;
+                st.lifecycle.phase = Phase::DecodeUnd;
+            }
+            return;
         }
         self.finish(
             id,
@@ -3854,37 +3966,6 @@ impl Scheduler {
         )
     }
 
-    fn begin_image_iu(&mut self, id: RequestId) {
-        let nvae = {
-            let st = self.running.get(&id).unwrap();
-            self.num_vae_hw(st.gen_h, st.gen_w)
-        };
-        self.bm.reserve_scratch(id, nvae);
-        // physical scratch reserved in latent tokens above; the observe-only
-        // ledger Scratch lease is in CFG branch slots to match the worker.
-        let scratch_branches = self.cap_max_cfg_branches();
-        // lease the reasoning-image latent + scratch (released at commit).
-        self.ledger.issue(
-            id,
-            uniserve_worker_wire::ResourceClass::ImageLatent,
-            nvae,
-            uniserve_worker_wire::LeasePolicy::Pinned,
-        );
-        self.ledger.issue(
-            id,
-            uniserve_worker_wire::ResourceClass::Scratch,
-            scratch_branches,
-            uniserve_worker_wire::LeasePolicy::PerRequest,
-        );
-        if let Some(st) = self.running.get_mut(&id) {
-            st.worker_image_latent_units = 0;
-            st.cond_pos = st.pos; // rope after the thinking text + <|im_end|>
-            st.steps_done = 0;
-            st.image_id += 1;
-            st.phase = Phase::DenoiseGen;
-        }
-    }
-
     /// bounded recent-output window for penalties (only carried when a
     /// penalty is active, to keep the op small — risk 4).
     fn recent_tokens(&self, id: RequestId) -> Option<Vec<u32>> {
@@ -3893,64 +3974,87 @@ impl Scheduler {
         let active = sp.repetition_penalty != 1.0
             || sp.frequency_penalty != 0.0
             || sp.presence_penalty != 0.0;
-        if !active || st.generated_ids.is_empty() {
+        if !active || st.replay.generated_ids.is_empty() {
             return None;
         }
-        let n = st.generated_ids.len();
+        let n = st.replay.generated_ids.len();
         let start = n.saturating_sub(self.penalty_window);
-        Some(st.generated_ids[start..].to_vec())
+        Some(st.replay.generated_ids[start..].to_vec())
     }
 
     /// run the host-side logits-processor pipeline to compute the op's
     /// allowed/suppress masks (min-tokens, bad-words, allowed-tokens).
-    fn token_masks(&self, id: RequestId) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
+    fn token_masks(&mut self, id: RequestId) -> (Option<Vec<u32>>, Option<Vec<u32>>) {
         let st = match self.running.get(&id) {
             Some(s) => s,
             None => return (None, None),
         };
         let ctx = crate::logits::ProcCtx {
-            n_generated: st.n_generated,
+            n_generated: st.und.tokens_emitted,
             eos: &self.ctrl.eos,
-            generated: &st.generated_ids,
+            generated: &st.replay.generated_ids,
             sampling: &st.req.sampling,
         };
         let (mut allowed, mut suppress) = crate::logits::run_pipeline(&self.logits_pipeline, &ctx);
-        // Image-budget enforcement (host-side mask): once a default-generation
-        // request has drawn its max_images, the image-start token is
+        // Image-budget enforcement: once a request has produced max_images, a
+        // direct branch-opening token is
         // suppressed, so an eager or positively-biased model must return to
-        // text/EOS instead of emitting un-actionable image triggers into its
+        // text/EOS instead of emitting an un-actionable trigger into its
         // own context forever. Suppression beats logit bias (bias skips
         // -inf'd logits on the worker).
-        if st.req.uses_default_generation()
-            && st.images_done >= st.req.image.max_images as usize
-            && self.ctrl.start_of_image != 0
+        if st.req.behavior.gen_output
+            && st.image_gen.images_done >= st.req.image.max_images as usize
+            && let Some(trigger) = st.req.policy.trigger.direct_token()
         {
-            suppress
-                .get_or_insert_with(Vec::new)
-                .push(self.ctrl.start_of_image);
+            suppress.get_or_insert_with(Vec::new).push(trigger);
         }
         // If the model's text turn is naturally complete while image budget
         // remains, resolve treats EOS as a clean image boundary instead of
         // making the model invent filler text.
         // Structured outputs: the grammar's per-step mask intersects whatever
-        // the pipeline allows. A completed grammar restricts to the stop set so
-        // the request terminates on the next step.
-        if let Some(matcher) = &st.grammar {
-            let g_allowed = if matcher.is_complete() {
-                let mut stops = self.ctrl.eos.clone();
-                stops.extend(st.req.stop_token_ids.iter().copied());
-                stops.sort();
-                stops.dedup();
-                stops
-            } else {
-                matcher.allowed_next()
+        // the pipeline allows. At a terminal trie node both termination and
+        // continuations into longer alternatives remain valid.
+        let grammar_stops = {
+            let mut stops = self.ctrl.eos.clone();
+            stops.extend(st.req.stop_token_ids.iter().copied());
+            stops.sort_unstable();
+            stops.dedup();
+            stops
+        };
+        let grammar_mask = self
+            .running
+            .get_mut(&id)
+            .and_then(|state| state.grammar.as_mut())
+            .map(|matcher| matcher.next_mask());
+        if let Some(mask) = grammar_mask {
+            let (complete, g_allowed) = match mask {
+                Ok(mask) => mask,
+                Err(error) => {
+                    tracing::error!(request_id = id.0, %error, "grammar mask computation failed");
+                    return (Some(Vec::new()), suppress);
+                }
             };
+            let g_allowed = grammar_allowed_tokens(complete, g_allowed, &grammar_stops);
             allowed = Some(match allowed {
                 Some(a) => a.into_iter().filter(|t| g_allowed.contains(t)).collect(),
                 None => g_allowed,
             });
         }
         (allowed, suppress)
+    }
+
+    fn advance_grammar(&mut self, id: RequestId, token_id: u32) -> bool {
+        let error = self
+            .running
+            .get_mut(&id)
+            .and_then(|state| state.grammar.as_mut())
+            .and_then(|matcher| matcher.advance(token_id).err());
+        if let Some(error) = error {
+            tracing::error!(request_id = id.0, token_id, %error, "grammar state rejected a committed token");
+            self.finish(id, FinishReason::Error);
+            return false;
+        }
+        true
     }
 
     fn resolve_spec_decode_text(
@@ -3963,8 +4067,7 @@ impl Scheduler {
         let accepted = (sr.num_accepted_tokens.unwrap_or(0) as usize).min(draft_token_ids.len());
         let sampled = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
         if let Some(st) = self.running.get_mut(&id) {
-            st.pos += 1 + accepted as u32;
-            st.phase = Phase::DecodeUnd;
+            st.lifecycle.phase = Phase::DecodeUnd;
         }
         let mut outputs: Vec<(u32, Option<f32>, bool)> = draft_token_ids
             .iter()
@@ -3974,63 +4077,41 @@ impl Scheduler {
         outputs.push((sampled, sr.sampled_logprob, true));
 
         for (tok, logprob, is_sampled) in outputs {
-            let (ignore_eos, min_tokens, max_tokens, n_generated) = match self.running.get_mut(&id)
-            {
-                Some(st) => (
-                    st.req.sampling.ignore_eos,
-                    st.req.sampling.min_tokens,
-                    st.req.max_tokens,
-                    {
-                        st.n_generated += 1;
-                        st.n_generated
-                    },
-                ),
-                None => return,
+            let Some(st) = self.running.get_mut(&id) else {
+                return;
             };
-            let under_floor = n_generated < min_tokens;
-            let stop_tok_hit = !under_floor
-                && self
-                    .running
-                    .get(&id)
-                    .map(|s| s.req.stop_token_ids.contains(&tok))
-                    .unwrap_or(false);
-            if stop_tok_hit {
-                return self.finish_with(id, FinishReason::Stop, Some(format!("token:{tok}")));
-            }
-            let hit_eos = self.ctrl.eos.contains(&tok) && !ignore_eos && !under_floor;
-            let hit_max = n_generated >= max_tokens;
-            if hit_eos || hit_max {
-                if !self.ctrl.eos.contains(&tok) {
-                    self.emit_text(id, tok, logprob);
-                }
-                return self.finish(
-                    id,
-                    if hit_max {
-                        FinishReason::MaxTokens
-                    } else {
-                        FinishReason::Eos
-                    },
-                );
-            }
-            self.emit_text(id, tok, logprob);
-            if is_sampled
-                && let Some(top) = sr.top_logprobs.clone()
-                && !top.is_empty()
-            {
-                self.emit(id, GenEvent::TokenLogprobs { id: tok, top });
+            st.und.tokens_emitted += 1;
+            let top_logprobs = is_sampled.then(|| sr.top_logprobs.clone()).flatten();
+            if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_sampled) {
+                return;
             }
             if let Some(st) = self.running.get_mut(&id) {
-                st.next_token = tok;
-                if let Some(matcher) = &mut st.grammar {
-                    matcher.advance(tok);
-                }
+                st.und.next_token = tok;
+            }
+            if !self.advance_grammar(id, tok) {
+                return;
             }
         }
     }
 
     fn resolve_decode_text(&mut self, id: RequestId, sr: uniserve_worker_wire::SeqResult) {
         self.bm.activate(id);
-        let burst_tokens = sr
+        if self
+            .running
+            .get(&id)
+            .is_some_and(|state| state.ingest.round_closing)
+        {
+            let close_token = self
+                .running
+                .get(&id)
+                .map(|state| state.und.next_token)
+                .unwrap_or_default();
+            if let Some(state) = self.running.get_mut(&id) {
+                state.ingest.round_closing = false;
+            }
+            return self.close_context_round(id, close_token);
+        }
+        let burst_result = sr
             .sampled_token_ids
             .as_ref()
             .is_some_and(|ids| !ids.is_empty());
@@ -4039,105 +4120,66 @@ impl Scheduler {
             .clone()
             .filter(|ids| !ids.is_empty())
             .unwrap_or_else(|| vec![sr.sampled_token_id.unwrap_or(self.ctrl.eos[0])]);
-        if let Some(st) = self.running.get_mut(&id) {
-            st.pos += tokens.len() as u32;
-        }
         for (idx, tok) in tokens.iter().copied().enumerate() {
             let is_last = idx + 1 == tokens.len();
             let logprob = is_last.then_some(sr.sampled_logprob).flatten();
-            let (
-                uses_default_generation,
-                max_tokens,
-                ignore_eos,
-                min_tokens,
-                images_done,
-                max_images,
-            ) = {
+            let is_round_close = self
+                .running
+                .get(&id)
+                .is_some_and(|st| st.req.policy.trigger.round_close_token_ids().contains(&tok));
+            if is_round_close {
+                if let Some(st) = self.running.get_mut(&id) {
+                    st.und.tokens_emitted += 1;
+                }
+                if burst_result {
+                    return self.close_context_round(id, tok);
+                }
+                if let Some(st) = self.running.get_mut(&id) {
+                    st.und.next_token = tok;
+                    st.ingest.round_closing = true;
+                }
+                return;
+            }
+            let (can_open_gen_branch, images_done, max_images) = {
                 let Some(st) = self.running.get_mut(&id) else {
                     return;
                 };
-                st.n_generated += 1;
+                st.und.tokens_emitted += 1;
                 (
-                    st.req.uses_default_generation(),
-                    st.req.max_tokens,
-                    st.req.sampling.ignore_eos,
-                    st.req.sampling.min_tokens,
-                    st.images_done,
+                    st.can_open_gen_branch(),
+                    st.image_gen.images_done,
                     st.req.image.max_images as usize,
                 )
             };
-            if tok == self.ctrl.start_of_image
-                && uses_default_generation
-                && images_done < max_images
-            {
-                if burst_tokens
-                    && is_last
-                    && let Some(st) = self.running.get_mut(&id)
-                {
-                    st.pos = st.pos.saturating_add(1);
-                }
+            let direct_trigger = self
+                .running
+                .get(&id)
+                .is_some_and(|st| Self::direct_trigger_matches(st, tok));
+            if direct_trigger && can_open_gen_branch && images_done < max_images {
                 self.begin_image(id);
                 return;
             }
-            let n_gen = self.running.get(&id).map(|s| s.n_generated).unwrap_or(0);
-            let under_floor = n_gen < min_tokens;
-            let stop_tok_hit = !under_floor
+            let top_logprobs = is_last.then(|| sr.top_logprobs.clone()).flatten();
+            if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_last) {
+                return;
+            }
+            if let Some(st) = self.running.get_mut(&id) {
+                st.und.next_token = tok;
+                st.lifecycle.phase = Phase::DecodeUnd;
+                st.und.round_tokens.push(tok);
+            }
+            if !self.advance_grammar(id, tok) {
+                return;
+            }
+            if can_open_gen_branch
+                && images_done < max_images
                 && self
                     .running
                     .get(&id)
-                    .map(|s| s.req.stop_token_ids.contains(&tok))
-                    .unwrap_or(false);
-            if stop_tok_hit {
-                return self.finish_with(id, FinishReason::Stop, Some(format!("token:{tok}")));
-            }
-            let hit_eos = self.ctrl.eos.contains(&tok) && !ignore_eos && !under_floor;
-            let hit_max = n_gen >= max_tokens;
-            if hit_eos || hit_max {
-                if !self.ctrl.eos.contains(&tok) {
-                    self.emit_text(id, tok, logprob);
-                }
-                return self.finish(
-                    id,
-                    if hit_max {
-                        FinishReason::MaxTokens
-                    } else {
-                        FinishReason::Eos
-                    },
-                );
-            }
-            self.emit_text(id, tok, logprob);
-            if is_last
-                && let Some(top) = sr.top_logprobs.clone()
-                && !top.is_empty()
+                    .is_some_and(Self::generated_trigger_matches)
             {
-                self.emit(id, GenEvent::TokenLogprobs { id: tok, top });
-            }
-            if let Some(st) = self.running.get_mut(&id) {
-                st.next_token = tok;
-                st.phase = Phase::DecodeUnd;
-                if let Some(matcher) = &mut st.grammar {
-                    matcher.advance(tok);
-                }
-            }
-            if uses_default_generation
-                && images_done < max_images
-                && !self.ctrl.image_start_ids.is_empty()
-            {
-                let triggered = self
-                    .running
-                    .get(&id)
-                    .map(|s| ends_with(&s.generated_ids, &self.ctrl.image_start_ids))
-                    .unwrap_or(false);
-                if triggered {
-                    if burst_tokens
-                        && is_last
-                        && let Some(st) = self.running.get_mut(&id)
-                    {
-                        st.pos = st.pos.saturating_add(1);
-                    }
-                    self.begin_image(id);
-                    return;
-                }
+                self.begin_image(id);
+                return;
             }
         }
     }
@@ -4146,16 +4188,12 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         transition: PlannedTransition,
-        sr: uniserve_worker_wire::SeqResult,
+        mut sr: uniserve_worker_wire::SeqResult,
         draft_token_ids: Vec<u32>,
     ) {
         let kind = transition.kind;
-        if self
-            .running
-            .get(&id)
-            .is_some_and(|s| s.req.uses_feedback_ingest())
-        {
-            return self.resolve_context_image(id, transition, sr);
+        if let Some(positions) = sr.prompt_logprobs.take() {
+            self.resolve_prompt_logprobs(id, positions);
         }
         if kind == OpKind::DecodeUnd && !draft_token_ids.is_empty() {
             return self.resolve_spec_decode_text(id, sr, draft_token_ids);
@@ -4169,42 +4207,46 @@ impl Scheduler {
                 // chunked prefill: a prefill op may only have consumed part of
                 // the prompt; if so, advance the cursor and stay in Prefill.
                 if kind == OpKind::PrefillUnd {
-                    if let crate::generation::TransitionDelta::IngestText { end, .. } =
-                        transition.delta
-                    {
-                        if let Some(st) = self.running.get_mut(&id) {
-                            st.prompt_cursor = end;
-                            st.pos = end;
-                        }
-                    }
                     let (cursor, prompt_len) = {
                         let st = self.running.get(&id).unwrap();
-                        (st.prompt_cursor as usize, Self::effective_prompt(st).len())
+                        (
+                            st.ingest.prompt_cursor as usize,
+                            st.effective_prompt().len(),
+                        )
                     };
                     if cursor < prompt_len {
                         return; // still prefilling; ignore the (partial) sampled token
                     }
+                    if self.running.get(&id).is_some_and(|st| {
+                        st.ingest.mm_cursor < st.context.images.len()
+                            || st.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
+                    }) {
+                        return;
+                    }
                 }
-                let (is_gen_only, uses_default_generation, max_tokens, ignore_eos, min_tokens) = {
+                let (starts_gen_after_context, can_open_gen_branch) = {
                     let st = self.running.get_mut(&id).unwrap();
                     if kind == OpKind::PrefillUnd {
                         // prompt (possibly prompt++generated on recompute) is done.
-                        st.pos = Self::effective_prompt(st).len() as u32;
-                        st.prompt_cursor = st.pos;
                         // recompute finished: future growth is plain decode again.
-                        st.recompute_ids = None;
-                    } else {
-                        st.pos += 1;
-                        st.n_generated += 1;
+                        st.replay.recompute_ids = None;
                     }
-                    (
-                        st.req.is_gen_only(),
-                        st.req.uses_default_generation(),
-                        st.req.max_tokens,
-                        st.req.sampling.ignore_eos,
-                        st.req.sampling.min_tokens,
-                    )
+                    st.und.tokens_emitted += 1;
+                    (st.starts_gen_after_context(), st.can_open_gen_branch())
                 };
+                if kind == OpKind::PrefillUnd
+                    && self.running.get(&id).is_some_and(|state| {
+                        state.req.sampling.prompt_logprobs_requested()
+                            && state.ingest.prompt_logprobs_emitted
+                                != state.context.prompt_ids.len().saturating_sub(1)
+                    })
+                {
+                    tracing::error!(
+                        request_id = id.0,
+                        "prompt logprob scoring ended before every prompt position was resolved"
+                    );
+                    return self.finish(id, FinishReason::Error);
+                }
                 // the prompt is fully prefilled now — publish its full
                 // blocks to the prefix cache for later requests to reuse.
                 if kind == OpKind::PrefillUnd {
@@ -4213,17 +4255,14 @@ impl Scheduler {
                         self.prefix_cache.cache_blocks(st, &mut self.bm, bs);
                     }
                 }
-                // Native callers may deliberately force the first image by
-                // ending an assistant prefix with the model's image-start
-                // control token. Treat that prefilled boundary the same as a
-                // sampled boundary so default generation is not left to sampling
-                // luck after an explicit prefix.
-                if kind == OpKind::PrefillUnd && self.prefilled_default_image_start(id) {
+                // A dialect-lowered prefix may already end at a branch trigger.
+                // Treat that boundary exactly like a sampled trigger.
+                if kind == OpKind::PrefillUnd && self.prefilled_gen_trigger(id) {
                     self.begin_image(id);
                     return;
                 }
-                // pure t2i: ignore the sampled token, jump straight to denoise
-                if is_gen_only && kind == OpKind::PrefillUnd {
+                // Immediate Gen-only profiles skip Und decode after context prep.
+                if starts_gen_after_context && kind == OpKind::PrefillUnd {
                     self.begin_image(id);
                     return;
                 }
@@ -4231,93 +4270,60 @@ impl Scheduler {
                 let logprob = sr.sampled_logprob;
                 let (images_done, max_images) = {
                     let st = self.running.get(&id).unwrap();
-                    (st.images_done, st.req.image.max_images as usize)
+                    (st.image_gen.images_done, st.req.image.max_images as usize)
                 };
                 // the model requested an image inline; honor it while the
                 // request is still under its image budget.
-                if tok == self.ctrl.start_of_image
-                    && uses_default_generation
-                    && images_done < max_images
-                {
+                let direct_trigger = self
+                    .running
+                    .get(&id)
+                    .is_some_and(|st| Self::direct_trigger_matches(st, tok));
+                if direct_trigger && can_open_gen_branch && images_done < max_images {
                     self.begin_image(id);
                     return;
                 }
-                let n_gen = self.running.get(&id).map(|s| s.n_generated).unwrap_or(0);
-                // min_tokens floor: suppress EOS/stop termination until met.
-                let under_floor = n_gen < min_tokens;
-                // explicit stop-token termination (distinct from model EOS).
-                let stop_tok_hit = !under_floor
+                if self.emit_or_finish_und_token(id, tok, logprob, sr.top_logprobs.clone(), true) {
+                    return;
+                }
+                if let Some(st) = self.running.get_mut(&id) {
+                    st.und.next_token = tok;
+                    st.lifecycle.phase = Phase::DecodeUnd;
+                }
+                if !self.advance_grammar(id, tok) {
+                    return;
+                }
+                if can_open_gen_branch
+                    && images_done < max_images
                     && self
                         .running
                         .get(&id)
-                        .map(|s| s.req.stop_token_ids.contains(&tok))
-                        .unwrap_or(false);
-                if stop_tok_hit {
-                    return self.finish_with(id, FinishReason::Stop, Some(format!("token:{tok}")));
-                }
-                let hit_eos = self.ctrl.eos.contains(&tok) && !ignore_eos && !under_floor;
-                let hit_max = n_gen >= max_tokens;
-                if hit_eos || hit_max {
-                    if !self.ctrl.eos.contains(&tok) {
-                        self.emit_text(id, tok, logprob);
-                    }
-                    return self.finish(
-                        id,
-                        if hit_max {
-                            FinishReason::MaxTokens
-                        } else {
-                            FinishReason::Eos
-                        },
-                    );
-                }
-                self.emit_text(id, tok, logprob);
-                if let Some(top) = sr.top_logprobs.clone()
-                    && !top.is_empty()
+                        .is_some_and(Self::generated_trigger_matches)
                 {
-                    self.emit(id, GenEvent::TokenLogprobs { id: tok, top });
-                }
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.next_token = tok;
-                    st.phase = Phase::DecodeUnd;
-                    if let Some(matcher) = &mut st.grammar {
-                        matcher.advance(tok);
-                    }
-                }
-                // ThinkMorph's literal visual-thinking trigger in generation
-                // mode: the fine-tune may signal the next image with the
-                // literal "<image_start>" text instead of BAGEL's
-                // <|vision_start|> token. Honor it the moment the trigger core
-                // completes (the context-image path matches the same ids at
-                // round close).
-                if uses_default_generation
-                    && images_done < max_images
-                    && !self.ctrl.image_start_ids.is_empty()
-                {
-                    let triggered = self
-                        .running
-                        .get(&id)
-                        .map(|s| ends_with(&s.generated_ids, &self.ctrl.image_start_ids))
-                        .unwrap_or(false);
-                    if triggered {
-                        self.begin_image(id);
-                        return;
-                    }
+                    self.begin_image(id);
                 }
             }
             OpKind::DenoiseGen => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
-                    let prev = st.steps_done;
-                    st.steps_done = sr.num_steps_done.unwrap_or(st.steps_done + 1);
+                    let prev = match transition.delta {
+                        crate::generation::TransitionDelta::DenoiseGen { start_step, .. } => {
+                            start_step
+                        }
+                        _ => st.image_gen.steps_done,
+                    };
                     (
-                        st.image_id,
+                        st.image_gen.image_id,
                         st.req.image.height,
                         st.req.image.width,
                         st.req.image.steps,
                         prev,
                     )
                 };
-                let sd = self.running.get(&id).map(|s| s.steps_done).unwrap_or(0);
+                let sd = self
+                    .running
+                    .get(&id)
+                    .map(|s| s.image_gen.steps_done)
+                    .unwrap_or(0);
                 if prev_sd == 0 && sd >= 1 {
                     self.emit(
                         id,
@@ -4335,186 +4341,332 @@ impl Scheduler {
                 if sr.denoise_done
                     && let Some(st) = self.running.get_mut(&id)
                 {
-                    st.phase = Phase::CommitGen;
+                    st.lifecycle.phase = Phase::CommitGen;
                 }
             }
             OpKind::CommitGen | OpKind::CommitWriteback => {
-                if kind == OpKind::CommitGen && sr.locator.is_some() {
+                if kind == OpKind::CommitWriteback
+                    && let Some(st) = self.running.get_mut(&id)
+                {
+                    sr.sampled_token_id = sr.sampled_token_id.or(st.feedback.sampled_token.take());
+                    sr.sampled_logprob = sr.sampled_logprob.or(st.feedback.sampled_logprob.take());
+                    sr.top_logprobs = sr.top_logprobs.or(st.feedback.top_logprobs.take());
+                }
+                if kind == OpKind::CommitGen {
+                    let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
+                    self.emit(id, GenEvent::ImageCommit { image_id });
+                }
+                if kind == OpKind::CommitGen
+                    && self
+                        .running
+                        .get(&id)
+                        .is_some_and(Self::reingests_generated_image)
+                {
+                    let Some(image_b64) = sr.image_png_b64 else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
+                    let Some(event) = image_done_event(image_id, image_b64.clone()) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    self.emit(id, event);
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.phase = Phase::CommitWriteback;
+                        st.feedback.image_b64 = Some(image_b64);
+                        st.feedback.ingest_step = 0;
+                        st.feedback.staged_image = None;
+                        st.lifecycle.phase = Phase::FeedbackIngest;
+                    }
+                    return;
+                }
+                if kind == OpKind::CommitGen
+                    && self
+                        .running
+                        .get(&id)
+                        .is_some_and(Self::commit_requires_writeback)
+                {
+                    let Some(locator) = sr.locator.clone().filter(|value| !value.is_empty()) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.feedback.locator = Some(locator);
+                        st.feedback.sampled_token = sr.sampled_token_id;
+                        st.feedback.sampled_logprob = sr.sampled_logprob;
+                        st.feedback.top_logprobs = sr.top_logprobs;
+                        st.lifecycle.phase = Phase::CommitWriteback;
                     }
                     if let Some(b64) = sr.image_png_b64 {
-                        let image_id = self.running.get(&id).map(|st| st.image_id).unwrap_or(0);
-                        self.emit(id, image_done_event(image_id, b64));
+                        let image_id = self
+                            .running
+                            .get(&id)
+                            .map(|st| st.image_gen.image_id)
+                            .unwrap_or(0);
+                        let Some(event) = image_done_event(image_id, b64) else {
+                            return self.finish(id, FinishReason::Error);
+                        };
+                        self.emit(id, event);
                     }
                     return;
                 }
                 self.bm.activate(id);
-                self.bm.release_scratch(id);
-                // the image committed — release its latent + scratch leases
-                // (the request continues; its KV lease persists until finish).
-                self.ledger
-                    .release_class(id, uniserve_worker_wire::ResourceClass::ImageLatent);
-                self.ledger
-                    .release_class(id, uniserve_worker_wire::ResourceClass::Scratch);
-                let (image_id, uses_default_generation, cond_pos) = {
+                let (image_id, continues_after_gen_commit) = {
                     let st = self.running.get(&id).unwrap();
-                    (st.image_id, st.req.uses_default_generation(), st.cond_pos)
+                    (st.image_gen.image_id, st.continues_after_gen_commit())
                 };
                 if let Some(b64) = sr.image_png_b64 {
-                    self.emit(id, image_done_event(image_id, b64));
+                    let Some(event) = image_done_event(image_id, b64) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    self.emit(id, event);
                 }
-                // Advance past the committed image's latent span (num_vae + the two
-                // boundary tokens), matching the worst-case footprint sizing.
-                let span = self
-                    .running
-                    .get(&id)
-                    .map(|s| self.generated_image_span(&s.req.image) as u32)
-                    .unwrap_or(1);
                 if let Some(st) = self.running.get_mut(&id) {
-                    st.worker_image_latent_units = 0;
-                    st.images_done += 1;
-                    st.text_since_image = 0;
-                    st.pos = cond_pos + span;
+                    st.image_gen.images_done += 1;
+                    st.und.text_since_image = 0;
                 }
-                // pure t2i finishes after one image; default generation round-trips
+                // pure t2i finishes after one image; generated branch round-trips
                 // back to text (text → image → text → image …). Termination then
                 // happens in DecodeUnd on a genuine terminal condition (EOS or
                 // max_tokens) or from a commit-side EOS reported by the worker.
-                if uses_default_generation {
+                if continues_after_gen_commit {
                     if let Some(tok) = sr.sampled_token_id {
-                        let (images_done, max_images, n_gen, max_tokens, hit_eos, start_image) = {
-                            let st = self.running.get(&id).unwrap();
+                        let (can_open_gen_branch, images_done, max_images) = {
+                            let st = self.running.get_mut(&id).unwrap();
+                            st.und.tokens_emitted += 1;
                             (
-                                st.images_done,
+                                st.can_open_gen_branch(),
+                                st.image_gen.images_done,
                                 st.req.image.max_images as usize,
-                                st.n_generated,
-                                st.req.max_tokens,
-                                self.ctrl.eos.contains(&tok),
-                                tok == self.ctrl.start_of_image,
                             )
                         };
-                        if start_image && images_done < max_images {
+                        if self
+                            .running
+                            .get(&id)
+                            .is_some_and(|state| Self::direct_trigger_matches(state, tok))
+                            && can_open_gen_branch
+                            && images_done < max_images
+                        {
                             self.begin_image(id);
                             return;
                         }
-                        if hit_eos {
-                            return self.finish(id, FinishReason::Eos);
+                        if self.emit_or_finish_und_token(
+                            id,
+                            tok,
+                            sr.sampled_logprob,
+                            sr.top_logprobs.clone(),
+                            true,
+                        ) {
+                            return;
                         }
-                        self.emit_text(id, tok, sr.sampled_logprob);
                         if let Some(st) = self.running.get_mut(&id) {
-                            st.n_generated += 1;
-                            st.next_token = tok;
-                            st.phase = Phase::DecodeUnd;
+                            st.und.next_token = tok;
+                            st.lifecycle.phase = Phase::DecodeUnd;
+                            st.und.round_tokens.push(tok);
                         }
-                        if n_gen + 1 >= max_tokens {
-                            return self.finish(id, FinishReason::MaxTokens);
+                        if !self.advance_grammar(id, tok) {
+                            return;
+                        }
+                        if can_open_gen_branch
+                            && images_done < max_images
+                            && self
+                                .running
+                                .get(&id)
+                                .is_some_and(Self::generated_trigger_matches)
+                        {
+                            self.begin_image(id);
                         }
                         return;
                     }
+                    let next_token = self.feedback_next_token(id);
+                    let Some(next_token) = next_token else {
+                        return self.finish(id, FinishReason::Error);
+                    };
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.phase = Phase::DecodeUnd;
-                        st.next_token = self.ctrl.end_of_image;
+                        st.lifecycle.phase = Phase::DecodeUnd;
+                        st.und.next_token = next_token;
                     }
                 } else {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            OpKind::VitEncode | OpKind::VaeEncode => {
-                // store the worker-side encoder handle in the cache, pin it
-                // for this request, and advance to the next image (or prefill).
-                let handle = sr.encoder_handle.unwrap_or(0);
-                let (hash, total) = {
-                    let st = self.running.get(&id).unwrap();
-                    let cur = st.mm_cursor.min(st.req.mm_items.len().saturating_sub(1));
-                    (
-                        st.req.mm_items.get(cur).map(|m| m.hash).unwrap_or(0),
-                        st.req.mm_items.len(),
-                    )
-                };
-                if let Some(freed) = self.enc_cache.insert(hash, handle) {
-                    self.gated_control(ControlOp::FreeEncoder(vec![freed]));
-                }
-                self.enc_cache.acquire(hash);
-                if let Some(st) = self.running.get_mut(&id) {
-                    st.mm_acquired.push(hash);
-                    st.mm_cursor += 1;
-                    if st.mm_cursor >= total {
-                        st.phase = Phase::Prefill;
+            OpKind::VitEncode | OpKind::VaeEncode => match &transition.delta {
+                crate::generation::TransitionDelta::IngestImageStep {
+                    is_final_step,
+                    encoder_cache_key,
+                    cache_hit,
+                    ..
+                } => {
+                    let Some(result_handle) = sr.encoder_handle.filter(|handle| *handle != 0)
+                    else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    let mut active_handle = result_handle;
+                    let mut free_handles = Vec::new();
+                    if !cache_hit {
+                        if let Some(cache_key) = encoder_cache_key {
+                            if let Some(freed) = self.enc_cache.insert_output(
+                                *cache_key,
+                                result_handle,
+                                sr.num_tokens.unwrap_or_default(),
+                            ) {
+                                free_handles.push(freed);
+                            }
+                            let Some(handle) = self.enc_cache.acquire(*cache_key) else {
+                                return self.finish(id, FinishReason::Error);
+                            };
+                            active_handle = handle;
+                            if let Some(st) = self.running.get_mut(&id) {
+                                st.ingest.acquired_encoder_pins.push(EncoderCachePin {
+                                    key: *cache_key,
+                                    handle,
+                                });
+                            }
+                        } else if let Some(st) = self.running.get_mut(&id) {
+                            st.ingest.transient_encoder_handles.push(result_handle);
+                        }
+                    }
+                    let bos = self.ctrl.bos;
+                    if let Some(st) = self.running.get_mut(&id) {
+                        if let Some((height, width)) = sr.image_hw {
+                            st.image_gen.image_hw = (height, width);
+                            st.req.image.height = height;
+                            st.req.image.width = width;
+                        }
+                        if *is_final_step {
+                            st.ingest.staged_image = None;
+                            free_handles.append(&mut st.ingest.transient_encoder_handles);
+                            if st.ingest.mm_cursor >= st.context.images.len()
+                                && st.ingest.prompt_cursor >= st.context.prompt_ids.len() as u32
+                            {
+                                st.und.next_token = bos;
+                                st.und.round_tokens.clear();
+                                st.lifecycle.phase = Phase::DecodeUnd;
+                            }
+                        } else {
+                            st.ingest.staged_image = Some(active_handle);
+                        }
+                    }
+                    if !free_handles.is_empty() {
+                        self.gated_control(ControlOp::FreeEncoder(free_handles));
                     }
                 }
-            }
+                crate::generation::TransitionDelta::FeedbackIngestStep {
+                    is_final_step, ..
+                } => {
+                    let Some(handle) = sr.encoder_handle.filter(|handle| *handle != 0) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    let mut free_handles = Vec::new();
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.ingest.transient_encoder_handles.push(handle);
+                        if *is_final_step {
+                            st.feedback.staged_image = None;
+                            free_handles.append(&mut st.ingest.transient_encoder_handles);
+                        } else {
+                            st.feedback.staged_image = Some(handle);
+                        }
+                    }
+                    if !free_handles.is_empty() {
+                        self.gated_control(ControlOp::FreeEncoder(free_handles));
+                    }
+                    if !is_final_step {
+                        return;
+                    }
+                    let Some(next_token) = self.feedback_next_token(id) else {
+                        return self.finish(id, FinishReason::Error);
+                    };
+                    if let Some(st) = self.running.get_mut(&id) {
+                        st.image_gen.images_done += 1;
+                        st.und.text_since_image = 0;
+                        st.und.next_token = next_token;
+                        st.und.round_tokens.clear();
+                        st.lifecycle.phase = Phase::DecodeUnd;
+                    }
+                }
+                _ => self.finish(id, FinishReason::Error),
+            },
             _ => {}
         }
     }
 
-    fn record_default_image_trigger_for_replay(&mut self, id: RequestId) {
-        let start = self.ctrl.start_of_image;
-        if start == 0 {
+    fn resolve_prompt_logprobs(
+        &mut self,
+        id: RequestId,
+        positions: Vec<Vec<uniserve_worker_wire::TokenLogprob>>,
+    ) {
+        let total = positions.len();
+        let Some(state) = self.running.get_mut(&id) else {
+            return;
+        };
+        let processed_before = state.ingest.prompt_logprobs_processed;
+        let emitted_before = state.ingest.prompt_logprobs_emitted;
+        let expected_total = state.context.prompt_ids.len().saturating_sub(1);
+        state.ingest.prompt_logprobs_processed = processed_before.saturating_add(total);
+        let skip = emitted_before.saturating_sub(processed_before);
+        let remaining = expected_total.saturating_sub(emitted_before);
+        let selected: Vec<_> = positions.into_iter().skip(skip).take(remaining).collect();
+        state.ingest.prompt_logprobs_emitted = emitted_before.saturating_add(selected.len());
+        if selected.is_empty() {
             return;
         }
+        self.emit(
+            id,
+            GenEvent::PromptLogprobs {
+                positions: selected
+                    .into_iter()
+                    .map(|entries| uniserve_engine_api::PositionLogprobs {
+                        entries: ranked_logprobs(entries),
+                    })
+                    .collect(),
+            },
+        );
+    }
+
+    fn record_gen_trigger_for_replay(&mut self, id: RequestId) {
+        let Some(start) = self
+            .running
+            .get(&id)
+            .and_then(|st| st.req.policy.trigger.direct_token())
+        else {
+            return;
+        };
         if let Some(st) = self.running.get_mut(&id)
-            && st.req.uses_default_generation()
-            && st.n_generated > st.generated_ids.len()
-            && st.generated_ids.last().copied() != Some(start)
+            && st.continues_after_gen_commit()
+            && st.und.tokens_emitted > st.replay.generated_ids.len()
+            && st.replay.generated_ids.last().copied() != Some(start)
         {
-            st.generated_ids.push(start);
+            st.replay.generated_ids.push(start);
         }
     }
 
-    fn promote_default_image_reservation(&mut self, id: RequestId) -> bool {
-        let Some((is_default, pos, remaining_image_span)) = self.running.get(&id).map(|st| {
+    fn promote_gen_branch_reservation(&mut self, id: RequestId) -> bool {
+        let Some((required_blocks, reserves_envelope)) = self.running.get(&id).map(|st| {
             (
-                st.req.uses_default_generation(),
-                st.pos as usize,
-                self.default_remaining_image_span(st),
+                st.resources.worstcase_blocks,
+                st.resources.reserve_worstcase,
             )
         }) else {
             return false;
         };
-        if !is_default {
-            return true;
-        }
-        let bs = self.caps.block_size as usize;
-        let target_tokens = pos.saturating_add(remaining_image_span);
-        let need_blocks = target_tokens.div_ceil(bs);
-        if need_blocks > self.usable_blocks {
+        let allocated_blocks = self.bm.blocks_for(id).len();
+        if !reserves_envelope || allocated_blocks < required_blocks {
             self.trace_record(json!({
-                "event": "default_generation_reservation_rejected",
+                "event": "gen_branch_reservation_rejected",
                 "at_s": now(),
                 "request_id": id.0,
-                "needed_blocks": need_blocks,
-                "usable_blocks": self.usable_blocks,
+                "required_blocks": required_blocks,
+                "allocated_blocks": allocated_blocks,
             }));
             self.finish(id, FinishReason::Error);
             return false;
         }
-
-        if !self.bm.ensure_capacity(id, target_tokens) {
-            self.trace_record(json!({
-                "event": "default_generation_reservation_deferred",
-                "at_s": now(),
-                "request_id": id.0,
-                "needed_blocks": need_blocks,
-                "free_blocks": self.bm.free_blocks(),
-                "running": self.running.len(),
-                "pending": self.pending.len(),
-            }));
-            if let Some(st) = self.running.get_mut(&id) {
-                st.default_image_pending = true;
-            }
-            return false;
-        }
-
         if let Some(st) = self.running.get_mut(&id) {
-            st.default_image_pending = false;
+            st.image_gen.branch_pending = false;
         }
         self.trace_record(json!({
-            "event": "default_generation_image_capacity_ready",
+            "event": "gen_branch_capacity_ready",
             "at_s": now(),
             "request_id": id.0,
-            "needed_blocks": need_blocks,
-            "target_tokens": target_tokens,
+            "required_blocks": required_blocks,
+            "allocated_blocks": allocated_blocks,
             "free_blocks": self.bm.free_blocks(),
             "reserved_blocks": self.reserved_blocks,
         }));
@@ -4522,70 +4674,138 @@ impl Scheduler {
     }
 
     fn begin_image(&mut self, id: RequestId) {
-        if let Some(st) = self.running.get_mut(&id)
-            && st.req.uses_default_generation()
-        {
-            st.default_image_pending = true;
-        }
-        self.record_default_image_trigger_for_replay(id);
-        if !self.promote_default_image_reservation(id) {
-            return;
-        }
-        let nvae = {
-            let st = self.running.get(&id).unwrap();
-            self.num_vae(&st.req.image) * self.cap_max_cfg_branches()
-        };
-        self.bm.reserve_scratch(id, nvae);
-        // the physical scratch pool is reserved in latent tokens above
-        // (`reserve_scratch`), but the observe-only *ledger* Scratch lease is in
-        // CFG BRANCH SLOTS — the same unit the worker's ResourceRuntime accounts
-        // (`_scratch_units`) — so the host lease magnitude and worker `used`
-        // agree.
-        let scratch_branches = {
-            let st = self.running.get(&id).unwrap();
-            cfg_params(&st.req.image, cfg_branch_count(&st.req.image)).branch_count as u64
-        };
-        // lease the denoise latent (pinned — evicting discards diffusion
-        // work) + the CFG scratch; both released when the image commits.
-        self.ledger.issue(
-            id,
-            uniserve_worker_wire::ResourceClass::ImageLatent,
-            nvae,
-            uniserve_worker_wire::LeasePolicy::Pinned,
-        );
-        self.ledger.issue(
-            id,
-            uniserve_worker_wire::ResourceClass::Scratch,
-            scratch_branches,
-            uniserve_worker_wire::LeasePolicy::PerRequest,
-        );
+        self.record_gen_trigger_for_replay(id);
         if let Some(st) = self.running.get_mut(&id) {
-            st.worker_image_latent_units = 0;
-            st.cond_pos = st.pos;
-            st.steps_done = 0;
-            st.image_id += 1;
-            st.text_since_image = 0;
-            st.phase = Phase::DenoiseGen;
+            st.image_gen.cond_pos = st.und.logical_pos;
+            st.image_gen.steps_done = 0;
+            st.image_gen.image_id += 1;
+            st.und.text_since_image = 0;
+            st.lifecycle.phase = Phase::DenoiseGen;
+            st.image_gen.branch_pending = true;
         }
+        self.promote_gen_branch_reservation(id);
     }
 
     fn emit(&mut self, id: RequestId, ev: GenEvent) {
         if let Some(st) = self.running.get_mut(&id)
-            && st.req.event_tx.send(ev).is_err()
+            && st.event_tx.send(ev).is_err()
         {
             st.cancelled = true; // receiver dropped == cancel
         }
     }
     /// Emit a text token and record it for preemption-recompute.
-    fn emit_text(&mut self, id: RequestId, tok: u32, logprob: Option<f32>) {
-        if let Some(st) = self.running.get_mut(&id) {
-            st.generated_ids.push(tok);
-            st.text_since_image = st.text_since_image.saturating_add(1);
+    fn emit_text(&mut self, id: RequestId, tok: u32, logprob: Option<f32>) -> bool {
+        let action = if let Some(st) = self.running.get_mut(&id) {
+            st.replay.generated_ids.push(tok);
+            st.und.text_since_image = st.und.text_since_image.saturating_add(1);
+            st.req.behavior.und_tokens
+        } else {
+            return false;
+        };
+        match action {
+            uniserve_core::UndTokenAction::Emit => {
+                self.emit(id, GenEvent::TextToken { id: tok, logprob });
+                true
+            }
+            uniserve_core::UndTokenAction::KeepInternal => false,
+            uniserve_core::UndTokenAction::Reject => {
+                self.finish(id, FinishReason::Error);
+                false
+            }
         }
-        self.emit(id, GenEvent::TextToken { id: tok, logprob });
     }
+
+    fn emit_sampled_text(
+        &mut self,
+        id: RequestId,
+        tok: u32,
+        logprob: Option<f32>,
+        top_logprobs: Option<Vec<uniserve_worker_wire::TokenLogprob>>,
+    ) {
+        if self.emit_text(id, tok, logprob)
+            && let Some(top_logprobs) = top_logprobs.filter(|entries| !entries.is_empty())
+        {
+            self.emit(
+                id,
+                GenEvent::TokenLogprobs {
+                    id: tok,
+                    candidates: ranked_logprobs(top_logprobs),
+                },
+            );
+        }
+    }
+
+    fn emit_terminal_stop_token(
+        &mut self,
+        id: RequestId,
+        token_id: u32,
+        logprob: Option<f32>,
+        top_logprobs: Option<Vec<uniserve_worker_wire::TokenLogprob>>,
+    ) {
+        if self
+            .running
+            .get(&id)
+            .is_some_and(|state| state.req.policy.termination.emit_stop_token)
+        {
+            self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+        }
+    }
+
+    fn emit_or_finish_und_token(
+        &mut self,
+        id: RequestId,
+        token_id: u32,
+        logprob: Option<f32>,
+        top_logprobs: Option<Vec<uniserve_worker_wire::TokenLogprob>>,
+        sampled: bool,
+    ) -> bool {
+        let Some(state) = self.running.get(&id) else {
+            return true;
+        };
+        let generated = state.und.tokens_emitted;
+        let under_floor = generated < state.req.sampling.min_tokens;
+        let stop_hit = state.req.policy.termination.stop_finishes
+            && !under_floor
+            && state.req.stop_token_ids.contains(&token_id);
+        let eos_hit = state.req.policy.termination.eos_finishes
+            && self.ctrl.eos.contains(&token_id)
+            && !state.req.sampling.ignore_eos
+            && !under_floor;
+        let max_hit = generated >= state.req.max_und_tokens;
+
+        if stop_hit {
+            self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
+            self.finish_with(id, FinishReason::Stop, Some(format!("token:{token_id}")));
+            return true;
+        }
+        if eos_hit || max_hit {
+            if !self.ctrl.eos.contains(&token_id) {
+                if sampled {
+                    self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+                } else {
+                    self.emit_text(id, token_id, logprob);
+                }
+            }
+            self.finish(
+                id,
+                if max_hit {
+                    FinishReason::MaxTokens
+                } else {
+                    FinishReason::Eos
+                },
+            );
+            return true;
+        }
+        if sampled {
+            self.emit_sampled_text(id, token_id, logprob, top_logprobs);
+        } else {
+            self.emit_text(id, token_id, logprob);
+        }
+        !self.running.contains_key(&id)
+    }
+
     fn emit_st(&self, st: &mut ReqState, ev: GenEvent) {
-        if st.req.event_tx.send(ev).is_err() {
+        if st.event_tx.send(ev).is_err() {
             st.cancelled = true;
         }
     }
@@ -4595,14 +4815,39 @@ impl Scheduler {
     }
 
     fn finish_with(&mut self, id: RequestId, reason: FinishReason, stop_reason: Option<String>) {
+        if reason == FinishReason::Error
+            && let Some(state) = self.running.get(&id)
+        {
+            tracing::error!(
+                request_id = id.0,
+                phase = phase_str(state.lifecycle.phase),
+                generated_tokens = state.und.tokens_emitted,
+                images_done = state.image_gen.images_done,
+                image_id = state.image_gen.image_id,
+                denoise_steps_done = state.image_gen.steps_done,
+                logical_position = state.und.logical_pos,
+                physical_kv_len = state.und.physical_kv_len,
+                "scheduler request terminated with an internal error"
+            );
+        }
         if let Some(mut st) = self.running.remove(&id) {
             self.order.retain(|x| *x != id);
-            if st.reserve_worstcase {
-                self.reserved_blocks = self.reserved_blocks.saturating_sub(st.worstcase_blocks);
+            self.reserved_encoder_entries = self
+                .reserved_encoder_entries
+                .saturating_sub(st.req.resources.encoder_cache_keys.len());
+            if st.resources.reserve_worstcase {
+                self.reserved_blocks = self
+                    .reserved_blocks
+                    .saturating_sub(st.resources.worstcase_blocks);
             }
-            // release this request's encoder-cache references (evictable now).
-            for h in &st.mm_acquired {
-                self.enc_cache.release(*h);
+            let mut free_encoder_handles = std::mem::take(&mut st.ingest.transient_encoder_handles);
+            for pin in &st.ingest.acquired_encoder_pins {
+                if let Some(handle) = self.enc_cache.release(pin.key, pin.handle) {
+                    free_encoder_handles.push(handle);
+                }
+            }
+            if !free_encoder_handles.is_empty() {
+                self.gated_control(ControlOp::FreeEncoder(free_encoder_handles));
             }
             // close + archive the lifecycle trace (reconstructable post-finish).
             let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::Finished);
@@ -4616,17 +4861,18 @@ impl Scheduler {
                 id,
                 &reason,
                 stop_reason.as_deref(),
-                st.req.prompt_ids.len(),
-                st.n_generated,
-                st.images_done,
+                st.context.prompt_ids.len(),
+                st.und.tokens_emitted,
+                st.image_gen.images_done,
                 "running",
             );
-            let _ = st.req.event_tx.send(GenEvent::Finished {
+            let _ = st.event_tx.send(GenEvent::Finished {
                 reason,
                 stop_reason,
-                prompt_tokens: st.req.prompt_ids.len(),
-                completion_tokens: st.n_generated,
-                images: st.images_done,
+                prompt_tokens: st.context.prompt_ids.len(),
+                completion_tokens: st.und.tokens_emitted,
+                images: st.image_gen.images_done,
+                kv_transfer_params: None,
             });
         }
         self.bm.release(id);
@@ -4698,22 +4944,6 @@ fn worker_forward_stats_trace(stats: &WorkerForwardStats) -> serde_json::Value {
     })
 }
 
-/// Does `hay` contain `needle` as a contiguous subsequence? Used to
-/// detect the literal `<image_start>` trigger (its stable "image_start" core) in
-/// a finished text round. Empty needle never matches (literal trigger disabled).
-fn contains_subseq(hay: &[u32], needle: &[u32]) -> bool {
-    if needle.is_empty() || needle.len() > hay.len() {
-        return false;
-    }
-    hay.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Does `hay` end with `needle`? (The literal image trigger fires on
-/// the token that completes the trigger core.) Empty needle never matches.
-fn ends_with(hay: &[u32], needle: &[u32]) -> bool {
-    !needle.is_empty() && hay.len() >= needle.len() && hay[hay.len() - needle.len()..] == *needle
-}
-
 fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
     let divisor = divisor.max(1);
     value.div_ceil(divisor)
@@ -4776,35 +5006,97 @@ fn cfg_params(image: &uniserve_core::ImageParams, branch_count: u8) -> CfgParams
     }
 }
 
-fn cfg_scale_approx(a: f32, b: f32) -> bool {
-    (a - b).abs() <= 1.0e-6_f32 * a.abs().max(b.abs()).max(1.0)
-}
-
 fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
-    let text_off = cfg_scale_approx(image.cfg_text_scale, 1.0);
-    let img_off = cfg_scale_approx(image.cfg_img_scale, 1.0);
-    if text_off && img_off {
-        1
-    } else if text_off || img_off || cfg_scale_approx(image.cfg_text_scale, image.cfg_img_scale) {
-        2
-    } else {
-        3
-    }
+    image.cfg_branch_count()
 }
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
+    fn test_png_b64(width: u32, height: u32) -> String {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer
+                .write_image_data(&vec![0; (width * height) as usize])
+                .expect("PNG pixels");
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn request_with_generation_behavior(
+        request: &mut GenerationRequest,
+        constraint: uniserve_core::GenerationConstraint,
+    ) {
+        request.constraint = constraint;
+        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
+        request.policy.feedback.get_or_insert({
+            uniserve_core::GeneratedImageFeedbackRecipe {
+                commit: uniserve_core::CommitRecipe::CommitGen,
+                writeback: uniserve_core::FeedbackWriteback::DirectKv,
+                next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
+                logical_positions: 2,
+                physical_kv_tokens: uniserve_core::ImageKvEffect::Bounded { max_tokens: 64 },
+            }
+        });
+        request.behavior =
+            uniserve_core::GenerationBehaviorDescriptor::resolve(constraint, &request.policy);
+        request.resources.generated_feedback_makes_non_replayable =
+            request.behavior.generated_image_feedback;
+    }
+
     fn inflight(kind: OpKind, op_id: Option<u64>) -> InflightOp {
-        let op = ForwardOp {
-            kind,
-            op_id,
-            ..Default::default()
+        let request = test_request(0, 1);
+        let cursor = CursorProjection {
+            phase: if kind == OpKind::PrefillUnd {
+                Phase::Prefill
+            } else {
+                Phase::DecodeUnd
+            },
+            prompt_cursor: 0,
+            logical_pos: 0,
+            physical_kv_len: 0,
+            replayability: crate::generation::Replayability::Replayable,
         };
+        let intent = if kind == OpKind::PrefillUnd {
+            TransitionIntent::IngestText {
+                segment_index: 0,
+                prompt_start: 0,
+                token_ids: vec![1],
+                new_blocks: Vec::new(),
+                recent_tokens: None,
+                allowed_tokens: None,
+                suppress_tokens: None,
+            }
+        } else {
+            TransitionIntent::DecodeUnd {
+                position: 0,
+                token_id: 1,
+                token_source: TokenSource::Wire,
+                new_blocks: Vec::new(),
+                spec_token_ids: None,
+                token_count: 1,
+                stop_token_ids: None,
+                stop_terminal: true,
+                recent_tokens: None,
+                allowed_tokens: None,
+                suppress_tokens: None,
+            }
+        };
+        let mut transition = GenerationPlanner::new()
+            .plan(&request, cursor, intent)
+            .expect("plan test transition");
+        if let Some(op_id) = op_id {
+            transition.assign_op_id(op_id);
+        }
         InflightOp {
-            kind,
-            transition: PlannedTransition::from_forward_op(&op),
+            transition,
             op_id,
             spec_tokens: Vec::new(),
             decode_token_count: 1,
@@ -4812,9 +5104,8 @@ mod tests {
         }
     }
 
-    // a result resolves the exact op the worker echoed by op_id, even when
-    // a request's ops complete out of submission order, and falls back to FIFO
-    // only when no op_id is echoed.
+    // A result resolves the exact op the worker echoed even when a request's
+    // operations complete out of submission order.
     #[test]
     fn take_inflight_resolves_by_op_id_out_of_order() {
         let mut q = VecDeque::from(vec![
@@ -4841,20 +5132,16 @@ mod tests {
     }
 
     #[test]
-    fn take_inflight_falls_back_to_fifo_without_op_id() {
+    fn take_inflight_rejects_absent_and_unknown_op_ids() {
         let mut q = VecDeque::from(vec![
             inflight(OpKind::DecodeUnd, Some(1)),
             inflight(OpKind::DecodeUnd, Some(2)),
         ]);
-        // No echoed op_id (sim-style transport before stamping, or a drift):
-        // resolve in FIFO order.
-        assert_eq!(take_inflight_by_op_id(&mut q, None).unwrap().op_id, Some(1));
-        // An unknown op_id also degrades to FIFO rather than dropping the result.
-        assert_eq!(
-            take_inflight_by_op_id(&mut q, Some(999)).unwrap().op_id,
-            Some(2)
-        );
+
         assert!(take_inflight_by_op_id(&mut q, None).is_none());
+        assert!(take_inflight_by_op_id(&mut q, Some(999)).is_none());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.front().and_then(|op| op.op_id), Some(1));
     }
 
     #[test]
@@ -4958,6 +5245,14 @@ mod tests {
         fn in_flight(&self) -> usize {
             self.in_flight
         }
+        fn generated_image_commit_capabilities(
+            &self,
+        ) -> uniserve_core::GeneratedImageCommitCapabilities {
+            uniserve_core::GeneratedImageCommitCapabilities {
+                inline: true,
+                separate_writeback: true,
+            }
+        }
         fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
             let _ = batch;
             self.in_flight += 1;
@@ -4981,25 +5276,395 @@ mod tests {
         }
     }
 
-    fn test_request(id: u64, prompt_len: usize) -> GenerateRequest {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        GenerateRequest::new(
-            RequestId(id),
-            vec![1u32; prompt_len],
-            uniserve_core::SamplingParams::default(),
-            uniserve_core::ImageParams::default(),
-            uniserve_core::GenerationConstraint::UndOnly,
-            16,
-            tx,
-        )
+    fn test_request(id: u64, prompt_len: usize) -> GenerationRequest {
+        let constraint = uniserve_core::GenerationConstraint::UndOnly;
+        let policy = uniserve_core::GenerationPolicyDescriptor::default();
+        GenerationRequest {
+            request_id: RequestId(id),
+            context: vec![uniserve_core::ContextSegment::UndTokens {
+                token_ids: vec![1u32; prompt_len],
+                visibility: uniserve_core::UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: uniserve_core::GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: uniserve_core::SamplingParams::default(),
+            image: uniserve_core::ImageParams::default(),
+            max_und_tokens: 16,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: uniserve_core::GenerationResourceBounds {
+                context_tokens: prompt_len,
+                max_kv_tokens: prompt_len + 16,
+                ..Default::default()
+            },
+        }
     }
 
     fn test_scheduler() -> Scheduler {
+        let mut caps = EngineCaps::default();
+        caps.supported_ops
+            .extend([OpKind::VitEncode, OpKind::CommitWriteback]);
+        caps.max_latent_size = 65_536;
+        caps.max_vae_grid_tokens = 65_536;
+        caps.max_vit_grid_tokens = 65_536;
+        caps.encoder_cache_budget = 256;
         Scheduler::new(
-            Box::new(NullExecutor::default()),
+            Box::new(NullExecutor { caps, in_flight: 0 }),
             ControlTokens::default(),
             DEFAULT_MAX_BATCH,
         )
+    }
+
+    fn compile_resources(scheduler: &Scheduler, request: &mut GenerationRequest) {
+        request.resources = uniserve_core::GenerationResourceBounds::conservative(
+            &request.context,
+            &request.behavior,
+            &request.policy,
+            &request.image,
+            request.max_und_tokens,
+            &request.cache,
+            &scheduler.generation_runtime_capabilities(),
+        )
+        .expect("test request resources");
+    }
+
+    #[test]
+    fn prefix_reset_without_replay_policy_preserves_active_requests() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        compile_resources(&scheduler, &mut request);
+        scheduler.submit_for_test(request);
+        scheduler.admit();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        scheduler.begin_prefix_cache_reset(false, reply_tx);
+
+        assert!(!reply_rx.recv().unwrap().unwrap());
+        assert!(scheduler.running.contains_key(&RequestId(1)));
+        assert!(scheduler.pending_prefix_reset.is_none());
+    }
+
+    #[test]
+    fn prefix_reset_requeues_replayable_request_with_generated_context() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        compile_resources(&scheduler, &mut request);
+        scheduler.submit_for_test(request);
+        scheduler.admit();
+        let state = scheduler.running.get_mut(&RequestId(1)).unwrap();
+        state.replay.generated_ids = vec![7, 8];
+        state.und.tokens_emitted = 2;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        scheduler.begin_prefix_cache_reset(true, reply_tx);
+
+        assert!(reply_rx.recv().unwrap().unwrap());
+        assert!(scheduler.running.is_empty());
+        let state = scheduler.pending.pop_request().expect("request requeued");
+        assert_eq!(state.effective_prompt(), &[1, 1, 1, 1, 7, 8]);
+        assert_eq!(state.und.tokens_emitted, 2);
+        assert!(state.replay.preempted);
+        assert_eq!(state.ingest.prompt_cursor, 0);
+    }
+
+    #[test]
+    fn prefix_reset_rejects_non_replayable_running_state() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        compile_resources(&scheduler, &mut request);
+        scheduler.submit_for_test(request);
+        scheduler.admit();
+        scheduler
+            .running
+            .get_mut(&RequestId(1))
+            .unwrap()
+            .replay
+            .replayability = crate::generation::Replayability::NotReplayable;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        scheduler.begin_prefix_cache_reset(true, reply_tx);
+
+        assert!(!reply_rx.recv().unwrap().unwrap());
+        assert!(scheduler.running.contains_key(&RequestId(1)));
+    }
+
+    #[test]
+    fn prefix_reset_waits_for_inflight_transition_resolution() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        compile_resources(&scheduler, &mut request);
+        scheduler.submit_for_test(request);
+        scheduler.admit();
+        scheduler.inflight_ops.insert(
+            RequestId(1),
+            VecDeque::from([inflight(OpKind::PrefillUnd, Some(1))]),
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+
+        scheduler.begin_prefix_cache_reset(true, reply_tx);
+
+        assert!(reply_rx.try_recv().is_err());
+        assert!(scheduler.pending_prefix_reset.is_some());
+        scheduler.inflight_ops.clear();
+        assert!(scheduler.progress_prefix_cache_reset());
+        assert!(reply_rx.recv().unwrap().unwrap());
+    }
+
+    #[test]
+    fn shutdown_resolves_a_pending_prefix_reset_reply() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        compile_resources(&scheduler, &mut request);
+        scheduler.submit_for_test(request);
+        scheduler.admit();
+        scheduler.inflight_ops.insert(
+            RequestId(1),
+            VecDeque::from([inflight(OpKind::PrefillUnd, Some(1))]),
+        );
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        scheduler.begin_prefix_cache_reset(true, reply_tx);
+
+        scheduler.abort_all_requests();
+
+        let error = reply_rx.recv().unwrap().expect_err("reset must fail");
+        assert!(error.contains("scheduler stopped"));
+    }
+
+    #[test]
+    fn prompt_logprobs_are_not_reemitted_after_preemption_recompute() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        request.sampling.return_prompt_logprobs = true;
+        compile_resources(&scheduler, &mut request);
+        let mut events = scheduler.submit_for_test(request);
+        scheduler.admit();
+        let state = scheduler.running.get_mut(&RequestId(1)).unwrap();
+        state.ingest.prompt_logprobs_processed = 2;
+        state.ingest.prompt_logprobs_emitted = 2;
+
+        scheduler.do_preempt(RequestId(1));
+        scheduler.admit();
+        scheduler.resolve_prompt_logprobs(
+            RequestId(1),
+            vec![
+                vec![uniserve_worker_wire::TokenLogprob(1, -0.1, 1)],
+                vec![uniserve_worker_wire::TokenLogprob(1, -0.2, 1)],
+                vec![uniserve_worker_wire::TokenLogprob(1, -0.3, 1)],
+            ],
+        );
+
+        let prompt_events = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                GenEvent::PromptLogprobs { positions } => Some(positions),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prompt_events.len(), 1);
+        assert_eq!(prompt_events[0].len(), 1);
+        assert_eq!(prompt_events[0][0].entries[0].logprob, -0.3);
+    }
+
+    #[test]
+    fn max_token_output_emits_logprobs_before_terminal_event() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        request.max_und_tokens = 1;
+        request.sampling.return_logprobs = true;
+        request.sampling.n_logprobs = 1;
+        compile_resources(&scheduler, &mut request);
+        let mut events = scheduler.submit_for_test(request);
+        scheduler.admit();
+
+        scheduler.resolve_decode_text(
+            RequestId(1),
+            uniserve_worker_wire::SeqResult {
+                req_id: RequestId(1),
+                sampled_token_id: Some(7),
+                sampled_logprob: Some(-0.25),
+                top_logprobs: Some(vec![uniserve_worker_wire::TokenLogprob(7, -0.25, 1)]),
+                ..Default::default()
+            },
+        );
+
+        let kinds = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                GenEvent::TextToken { .. } => Some("text"),
+                GenEvent::TokenLogprobs { .. } => Some("logprobs"),
+                GenEvent::Finished { .. } => Some("finished"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, ["text", "logprobs", "finished"]);
+    }
+
+    #[test]
+    fn final_prefill_token_obeys_the_output_token_cap() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        request.max_und_tokens = 1;
+        compile_resources(&scheduler, &mut request);
+        let mut events = scheduler.submit_for_test(request);
+        scheduler.admit();
+        let (_, mut transitions) = scheduler.assemble();
+        assert_eq!(transitions.len(), 1);
+        let transition = transitions.pop().expect("prefill transition");
+        assert_eq!(transition.kind, OpKind::PrefillUnd);
+
+        apply_and_resolve(
+            &mut scheduler,
+            RequestId(1),
+            transition,
+            uniserve_worker_wire::SeqResult {
+                req_id: RequestId(1),
+                sampled_token_id: Some(7),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        assert!(!scheduler.running.contains_key(&RequestId(1)));
+        let output = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                GenEvent::TextToken { id, .. } => Some(Ok(id)),
+                GenEvent::Finished { reason, .. } => Some(Err(reason)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output, [Ok(7), Err(FinishReason::MaxTokens)]);
+    }
+
+    #[test]
+    fn post_commit_stop_token_counts_toward_the_minimum() {
+        let mut scheduler = test_scheduler();
+        let mut request = test_request(1, 4);
+        request_with_generation_behavior(
+            &mut request,
+            uniserve_core::GenerationConstraint::Default,
+        );
+        request.sampling.min_tokens = 1;
+        request.stop_token_ids = vec![77];
+        request.image.height = 64;
+        request.image.width = 64;
+        request.image.max_images = 1;
+        compile_resources(&scheduler, &mut request);
+        let mut events = scheduler.submit_for_test(request);
+        scheduler.admit();
+        let id = RequestId(1);
+        if let Some(state) = scheduler.running.get_mut(&id) {
+            state.ingest.prompt_cursor = 4;
+            state.und.logical_pos = 4;
+            state.und.physical_kv_len = 4;
+            state.lifecycle.phase = Phase::CommitGen;
+            state.image_gen.cond_pos = 4;
+            state.image_gen.image_id = 1;
+        }
+        let transition = scheduler.next_transition(id, 8).expect("commit transition");
+        assert_eq!(transition.kind, OpKind::CommitGen);
+
+        apply_and_resolve(
+            &mut scheduler,
+            id,
+            transition,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(77),
+                image_hw: Some((64, 64)),
+                image_png_b64: Some(test_png_b64(64, 64)),
+                num_tokens: Some(1),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        assert!(!scheduler.running.contains_key(&id));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                event,
+                GenEvent::Finished {
+                    reason: FinishReason::Stop,
+                    ..
+                }
+            ))
+        );
+    }
+
+    fn add_context_image(request: &mut GenerationRequest, position: usize, dual_encode: bool) {
+        let tokens = request
+            .context
+            .iter()
+            .flat_map(|segment| match segment {
+                uniserve_core::ContextSegment::UndTokens { token_ids, .. } => token_ids.clone(),
+                uniserve_core::ContextSegment::Image { .. } => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let position = position.min(tokens.len());
+        let ingest = if dual_encode {
+            uniserve_core::ImageIngestRecipe::vae_then_vit(
+                1,
+                uniserve_core::ImageKvEffect::WorkerDefined,
+            )
+        } else {
+            uniserve_core::ImageIngestRecipe::vit_only(
+                1,
+                uniserve_core::ImageKvEffect::WorkerDefined,
+            )
+        };
+        let encoder_cache_keys = ingest.encoder_cache_keys(7);
+        request.context = vec![
+            uniserve_core::ContextSegment::UndTokens {
+                token_ids: tokens[..position].to_vec(),
+                visibility: uniserve_core::UndVisibility::Internal,
+            },
+            uniserve_core::ContextSegment::Image {
+                image: uniserve_core::ImageSegment {
+                    hash: 7,
+                    b64: "aGVsbG8=".to_string(),
+                    placement: uniserve_core::SegmentPlacement::AtToken {
+                        position: position as u32,
+                    },
+                },
+                ingest,
+            },
+            uniserve_core::ContextSegment::UndTokens {
+                token_ids: tokens[position..].to_vec(),
+                visibility: uniserve_core::UndVisibility::Internal,
+            },
+        ];
+        request.resources.encoder_cache_keys = encoder_cache_keys;
+    }
+
+    fn apply_and_resolve(
+        scheduler: &mut Scheduler,
+        id: RequestId,
+        mut transition: PlannedTransition,
+        mut result: uniserve_worker_wire::SeqResult,
+        draft_token_ids: Vec<u32>,
+    ) {
+        let op_id = transition.op_id.unwrap_or_else(|| {
+            let op_id = scheduler.next_op_id;
+            scheduler.next_op_id = scheduler.next_op_id.saturating_add(1);
+            op_id
+        });
+        transition.assign_op_id(op_id);
+        result.op_id = Some(op_id);
+        result.op_kind = Some(transition.kind);
+        transition
+            .validate_result(&result)
+            .expect("test result validates against transition");
+        scheduler
+            .running
+            .get_mut(&id)
+            .expect("request running")
+            .cursor
+            .apply_transition(&transition, &result)
+            .expect("apply test transition");
+        scheduler.resolve(id, transition, result, draft_token_ids);
     }
 
     #[test]
@@ -5012,13 +5677,13 @@ mod tests {
         sched.admit();
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.prompt_cursor = 5;
-            st.pos = 5;
-            st.next_token = 11;
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 5;
+            st.und.logical_pos = 5;
+            st.und.next_token = 11;
         }
 
-        let op = sched.next_op(id, 8).expect("decode op");
+        let op = sched.next_transition(id, 8).expect("decode op");
 
         assert_eq!(op.kind, OpKind::DecodeUnd);
         assert!(op.decode_token_count.unwrap_or(1) > 1);
@@ -5031,34 +5696,126 @@ mod tests {
     }
 
     #[test]
-    fn default_generation_decode_burst_keeps_transition_stops_nonterminal() {
+    fn termination_descriptor_controls_eos_and_explicit_stop_tokens() {
+        let mut sched = test_scheduler();
+        let mut req = test_request(1, 5);
+        req.max_und_tokens = 2;
+        req.stop_token_ids = vec![77];
+        req.policy.termination.eos_finishes = false;
+        req.policy.termination.stop_finishes = false;
+        req.behavior =
+            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+        let mut events = sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 5;
+            st.und.logical_pos = 5;
+            st.und.physical_kv_len = 5;
+        }
+
+        sched.resolve_decode_text(
+            id,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(77),
+                ..Default::default()
+            },
+        );
+        assert!(sched.running.contains_key(&id));
+
+        let eos = sched.ctrl.eos[0];
+        sched.resolve_decode_text(
+            id,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(eos),
+                ..Default::default()
+            },
+        );
+        assert!(!sched.running.contains_key(&id));
+        let mut tokens = Vec::new();
+        let mut terminal = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                GenEvent::TextToken { id, .. } => tokens.push(id),
+                GenEvent::Finished { reason, .. } => terminal = Some(reason),
+                _ => {}
+            }
+        }
+        assert_eq!(tokens, vec![77]);
+        assert_eq!(terminal, Some(FinishReason::MaxTokens));
+    }
+
+    #[test]
+    fn termination_descriptor_controls_terminal_stop_token_emission() {
+        let mut sched = test_scheduler();
+        let mut req = test_request(1, 5);
+        req.stop_token_ids = vec![77];
+        req.policy.termination.emit_stop_token = true;
+        req.behavior =
+            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+        let mut events = sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(state) = sched.running.get_mut(&id) {
+            state.lifecycle.phase = Phase::DecodeUnd;
+            state.ingest.prompt_cursor = 5;
+            state.und.logical_pos = 5;
+            state.und.physical_kv_len = 5;
+        }
+
+        sched.resolve_decode_text(
+            id,
+            uniserve_worker_wire::SeqResult {
+                req_id: id,
+                sampled_token_id: Some(77),
+                ..Default::default()
+            },
+        );
+
+        assert!(!sched.running.contains_key(&id));
+        let emitted = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                GenEvent::TextToken { id, .. } => Some(format!("token:{id}")),
+                GenEvent::Finished { reason, .. } => Some(format!("finish:{reason:?}")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(emitted, vec!["token:77", "finish:Stop"]);
+    }
+
+    #[test]
+    fn gen_branch_decode_burst_keeps_transition_stops_nonterminal() {
         let mut sched = test_scheduler();
         sched.decode_token_burst = 8;
         let mut req = test_request(1, 5);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
         req.image = uniserve_core::ImageParams {
             max_images: 1,
             ..Default::default()
         };
+        compile_resources(&sched, &mut req);
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.prompt_cursor = 5;
-            st.pos = 5;
-            st.next_token = 11;
-            st.images_done = 0;
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 5;
+            st.und.logical_pos = 5;
+            st.und.next_token = 11;
+            st.image_gen.images_done = 0;
         }
 
-        let op = sched.next_op(id, 8).expect("decode op");
+        let op = sched.next_transition(id, 8).expect("decode op");
 
         assert_eq!(op.kind, OpKind::DecodeUnd);
         assert!(op.decode_token_count.unwrap_or(1) > 1);
         assert!(
             op.decode_stop_token_ids
                 .as_ref()
-                .is_some_and(|ids| ids.contains(&sched.ctrl.start_of_image))
+                .is_some_and(|ids| ids.contains(&42))
         );
         assert!(!op.decode_stop_terminal);
     }
@@ -5071,65 +5828,64 @@ mod tests {
         sched.admit();
         let id = RequestId(1);
 
-        let op = sched.next_op(id, 3).expect("prefill op");
+        let op = sched.next_transition(id, 3).expect("prefill op");
 
         assert_eq!(op.kind, OpKind::PrefillUnd);
         assert_eq!(op.pos_range, (0, 3));
         let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.prompt_cursor, 0);
-        assert_eq!(st.pos, 0);
+        assert_eq!(st.ingest.prompt_cursor, 0);
+        assert_eq!(st.und.logical_pos, 0);
 
-        let transition = PlannedTransition::from_forward_op(&op);
-        sched.resolve(
+        apply_and_resolve(
+            &mut sched,
             id,
-            transition,
+            op,
             uniserve_worker_wire::SeqResult {
                 req_id: id,
+                sampled_token_id: Some(9),
                 ..Default::default()
             },
             Vec::new(),
         );
         let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.prompt_cursor, 3);
-        assert_eq!(st.pos, 3);
+        assert_eq!(st.ingest.prompt_cursor, 3);
+        assert_eq!(st.und.logical_pos, 3);
     }
 
     #[test]
     fn planning_context_prefill_does_not_advance_committed_cursor() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 5);
-        req.mm_items = vec![uniserve_engine_api::MmItem {
-            hash: 7,
-            position: 2,
-            num_tokens: 0,
-            b64: "aGVsbG8=".into(),
-        }];
+        add_context_image(&mut req, 2, false);
+        compile_resources(&sched, &mut req);
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);
 
-        let op = sched.next_op(id, 64).expect("context prefill op");
+        let op = sched.next_transition(id, 64).expect("context prefill op");
 
         assert_eq!(op.kind, OpKind::PrefillUnd);
         assert_eq!(op.pos_range, (0, 2));
         let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.prompt_cursor, 0);
-        assert_eq!(st.pos, 0);
-        assert_eq!(st.kvlen, 0);
+        assert_eq!(st.ingest.prompt_cursor, 0);
+        assert_eq!(st.und.logical_pos, 0);
+        assert_eq!(st.und.physical_kv_len, 0);
 
-        let transition = PlannedTransition::from_forward_op(&op);
-        sched.resolve_context_image(
+        apply_and_resolve(
+            &mut sched,
             id,
-            transition,
+            op,
             uniserve_worker_wire::SeqResult {
                 req_id: id,
+                sampled_token_id: Some(9),
                 ..Default::default()
             },
+            Vec::new(),
         );
         let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.prompt_cursor, 2);
-        assert_eq!(st.pos, 2);
-        assert_eq!(st.kvlen, 2);
+        assert_eq!(st.ingest.prompt_cursor, 2);
+        assert_eq!(st.und.logical_pos, 2);
+        assert_eq!(st.und.physical_kv_len, 2);
     }
 
     #[test]
@@ -5184,11 +5940,8 @@ mod tests {
         );
         let mut receivers = Vec::new();
         for id in 1..=4 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut req = test_request(id, 4);
-            req.event_tx = tx;
-            receivers.push(rx);
-            sched.submit_for_test(req);
+            let req = test_request(id, 4);
+            receivers.push(sched.submit_for_test(req));
         }
         sched.admit();
         assert_eq!(sched.running.len(), 4);
@@ -5243,12 +5996,9 @@ mod tests {
         );
         let mut receivers = Vec::new();
         for id in 1..=2 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut req = test_request(id, 4);
             req.sampling.ignore_eos = true;
-            req.event_tx = tx;
-            receivers.push(rx);
-            sched.submit_for_test(req);
+            receivers.push(sched.submit_for_test(req));
         }
         sched.admit();
         assert_eq!(sched.running.len(), 2);
@@ -5265,24 +6015,22 @@ mod tests {
             vec![OpKind::PrefillUnd, OpKind::PrefillUnd]
         );
         for op in prefill_ops {
-            let transition = PlannedTransition::from_forward_op(&op);
-            sched.resolve(
-                op.req_id,
-                transition,
+            let request_id = op.req_id;
+            apply_and_resolve(
+                &mut sched,
+                request_id,
+                op,
                 uniserve_worker_wire::SeqResult {
-                    req_id: op.req_id,
-                    sampled_token_id: Some(11 + op.req_id.0 as u32),
+                    req_id: request_id,
+                    sampled_token_id: Some(11 + request_id.0 as u32),
                     ..Default::default()
                 },
                 Vec::new(),
             );
         }
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(3, 4);
         req.sampling.ignore_eos = true;
-        req.event_tx = tx;
-        receivers.push(rx);
-        sched.submit_for_test(req);
+        receivers.push(sched.submit_for_test(req));
         sched.admit();
         let ids = sched.assembly_order();
         assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
@@ -5318,24 +6066,20 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
         req.sampling.ignore_eos = true;
-        req.event_tx = tx1;
-        sched.submit_for_test(req);
+        let _rx1 = sched.submit_for_test(req);
         sched.admit();
         let (_new_reqs, ops) = sched.assemble();
         assert_eq!(ops[0].kind, OpKind::PrefillUnd);
-        sched.register_inflight(&ops[0], Instant::now());
+        sched.register_inflight(ops[0].clone(), Instant::now());
 
         // A second prompt arrives while request 1's prefill is in flight:
         // decode work (request 1's lookahead decode) fills the slot and the
         // prompt coalesces into the next prefill batch.
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(2, 4);
         req.sampling.ignore_eos = true;
-        req.event_tx = tx2;
-        sched.submit_for_test(req);
+        let _rx2 = sched.submit_for_test(req);
         sched.admit();
         let (_new_reqs, ops2) = sched.assemble();
         assert_eq!(
@@ -5344,7 +6088,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(OpKind::DecodeUnd, RequestId(1))]
         );
-        sched.register_inflight(&ops2[0], Instant::now());
+        sched.register_inflight(ops2[0].clone(), Instant::now());
 
         // With no decode left to run, the waiting prompt proceeds even though
         // a prefill batch is still in flight (never idle the pipeline).
@@ -5376,11 +6120,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
         req.sampling.ignore_eos = true;
-        req.event_tx = tx;
-        sched.submit_for_test(req);
+        let _rx = sched.submit_for_test(req);
         sched.admit();
 
         // step 1: the whole prompt goes out as the final prefill chunk.
@@ -5389,7 +6131,7 @@ mod tests {
             ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
             vec![OpKind::PrefillUnd]
         );
-        sched.register_inflight(&ops[0], Instant::now());
+        sched.register_inflight(ops[0].clone(), Instant::now());
 
         // step 2: with the final prefill still in flight, the first decode op
         // is submitted early, reading its token from the device relay.
@@ -5402,7 +6144,7 @@ mod tests {
         assert_eq!(ops2[0].token_source, TokenSource::LastSampled);
 
         // both in flight: nothing further until a result resolves.
-        sched.register_inflight(&ops2[0], Instant::now());
+        sched.register_inflight(ops2[0].clone(), Instant::now());
         let (_new_reqs, ops3) = sched.assemble();
         assert!(ops3.is_empty(), "unexpected extra ops: {ops3:?}");
     }
@@ -5429,35 +6171,30 @@ mod tests {
         );
         let mut receivers = Vec::new();
         for id in 1..=2 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let mut req = test_request(id, 4);
             req.sampling.ignore_eos = true;
-            req.event_tx = tx;
-            receivers.push(rx);
-            sched.submit_for_test(req);
+            receivers.push(sched.submit_for_test(req));
         }
         sched.admit();
         let (_new_reqs, prefill_ops) = sched.assemble();
         assert_eq!(prefill_ops.len(), 2);
         for op in prefill_ops {
-            let transition = PlannedTransition::from_forward_op(&op);
-            sched.resolve(
-                op.req_id,
-                transition,
+            let request_id = op.req_id;
+            apply_and_resolve(
+                &mut sched,
+                request_id,
+                op,
                 uniserve_worker_wire::SeqResult {
-                    req_id: op.req_id,
-                    sampled_token_id: Some(11 + op.req_id.0 as u32),
+                    req_id: request_id,
+                    sampled_token_id: Some(11 + request_id.0 as u32),
                     ..Default::default()
                 },
                 Vec::new(),
             );
         }
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(3, 4);
         req.sampling.ignore_eos = true;
-        req.event_tx = tx;
-        receivers.push(rx);
-        sched.submit_for_test(req);
+        receivers.push(sched.submit_for_test(req));
         sched.admit();
         let ids = sched.assembly_order();
         assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
@@ -5480,7 +6217,7 @@ mod tests {
     }
 
     #[test]
-    fn default_generation_ensures_current_image_capacity_before_first_image() {
+    fn gen_branch_ensures_current_image_capacity_before_first_image() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -5498,10 +6235,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
-        req.max_tokens = 8;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
+        req.max_und_tokens = 8;
         req.image = uniserve_core::ImageParams {
             height: 64,
             width: 64,
@@ -5509,22 +6245,22 @@ mod tests {
             retain_images: true,
             ..Default::default()
         };
-        req.event_tx = tx;
-        sched.submit_for_test(req);
+        compile_resources(&sched, &mut req);
+        let _rx = sched.submit_for_test(req);
         sched.admit();
 
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 4;
-            st.n_generated = 1;
-            st.generated_ids.clear();
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.und.logical_pos = 4;
+            st.und.tokens_emitted = 1;
+            st.replay.generated_ids.clear();
         }
         sched.begin_image(id);
 
         let (
             reserve_worstcase,
-            default_image_pending,
+            gen_branch_pending,
             phase,
             generated_ids,
             reserved_blocks,
@@ -5533,31 +6269,33 @@ mod tests {
             image_boundary_blocks,
         ) = {
             let st = sched.running.get(&id).expect("request remains running");
-            let image_boundary_blocks = (st.pos as usize
-                + sched.generated_image_span(&st.req.image))
-            .div_ceil(sched.caps.block_size as usize);
+            let image_boundary_blocks = st
+                .req
+                .resources
+                .max_kv_tokens
+                .div_ceil(sched.caps.block_size as usize);
             (
-                st.reserve_worstcase,
-                st.default_image_pending,
-                st.phase,
-                st.generated_ids.clone(),
+                st.resources.reserve_worstcase,
+                st.image_gen.branch_pending,
+                st.lifecycle.phase,
+                st.replay.generated_ids.clone(),
                 sched.reserved_blocks,
                 sched.bm.blocks_for(id).len(),
-                st.worstcase_blocks,
+                st.resources.worstcase_blocks,
                 image_boundary_blocks,
             )
         };
         assert!(reserve_worstcase);
-        assert!(!default_image_pending);
+        assert!(!gen_branch_pending);
         assert_eq!(reserved_blocks, worstcase_blocks);
         assert_eq!(allocated_blocks, worstcase_blocks);
         assert!(allocated_blocks >= image_boundary_blocks);
-        assert_eq!(generated_ids, vec![sched.ctrl.start_of_image]);
+        assert_eq!(generated_ids, vec![42]);
         assert_eq!(phase, Phase::DenoiseGen);
     }
 
     #[test]
-    fn default_generation_burst_image_trigger_advances_speculative_feed() {
+    fn deferred_gen_reservation_retry_does_not_advance_image_cursor() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -5575,10 +6313,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
-        req.max_tokens = 8;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
         req.image = uniserve_core::ImageParams {
             height: 64,
             width: 64,
@@ -5586,47 +6322,99 @@ mod tests {
             retain_images: true,
             ..Default::default()
         };
-        req.event_tx = tx;
-        sched.submit_for_test(req);
+        compile_resources(&sched, &mut req);
+        let _rx = sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.lifecycle.phase = Phase::DenoiseGen;
+            st.ingest.prompt_cursor = 4;
+            st.und.logical_pos = 4;
+            st.und.physical_kv_len = 4;
+            st.image_gen.cond_pos = 4;
+            st.image_gen.image_id = 1;
+            st.image_gen.steps_done = 0;
+            st.image_gen.branch_pending = true;
+        }
+
+        let transition = sched.next_transition(id, 8).expect("denoise transition");
+        let st = sched.running.get(&id).expect("request remains running");
+        assert_eq!(transition.kind, OpKind::DenoiseGen);
+        assert_eq!(st.lifecycle.phase, Phase::DenoiseGen);
+        assert_eq!(st.image_gen.cond_pos, 4);
+        assert_eq!(st.image_gen.image_id, 1);
+        assert_eq!(st.image_gen.steps_done, 0);
+        assert!(!st.image_gen.branch_pending);
+    }
+
+    #[test]
+    fn gen_branch_burst_image_trigger_advances_speculative_feed() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            latent_downsample: 16,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 16,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                ..Default::default()
+            },
+        );
+        let mut req = test_request(1, 4);
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
+        req.max_und_tokens = 8;
+        req.image = uniserve_core::ImageParams {
+            height: 64,
+            width: 64,
+            max_images: 1,
+            retain_images: true,
+            ..Default::default()
+        };
+        compile_resources(&sched, &mut req);
+        let _rx = sched.submit_for_test(req);
+        sched.decode_token_burst = 3;
         sched.admit();
 
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 10;
-            st.next_token = 77;
-            st.n_generated = 0;
-            st.generated_ids.clear();
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 4;
+            st.und.logical_pos = 10;
+            st.und.physical_kv_len = 10;
+            st.und.next_token = 77;
+            st.und.tokens_emitted = 0;
+            st.replay.generated_ids.clear();
         }
-        let transition = PlannedTransition::from_forward_op(&ForwardOp {
-            req_id: id,
-            kind: OpKind::DecodeUnd,
-            modality: Modality::Und,
-            pos_range: (10, 11),
-            decode_token_count: Some(3),
-            ..Default::default()
-        });
-        sched.resolve(
+        let transition = sched.next_transition(id, 3).expect("decode transition");
+        let image_trigger = 42;
+        apply_and_resolve(
+            &mut sched,
             id,
             transition,
             uniserve_worker_wire::SeqResult {
                 req_id: id,
-                sampled_token_id: Some(sched.ctrl.start_of_image),
-                sampled_token_ids: Some(vec![5, sched.ctrl.start_of_image]),
+                sampled_token_id: Some(image_trigger),
+                sampled_token_ids: Some(vec![5, image_trigger]),
                 ..Default::default()
             },
             Vec::new(),
         );
 
         let st = sched.running.get(&id).expect("request enters image phase");
-        assert_eq!(st.phase, Phase::DenoiseGen);
-        assert_eq!(st.pos, 13);
-        assert_eq!(st.cond_pos, 13);
-        assert_eq!(st.generated_ids, vec![5, sched.ctrl.start_of_image]);
+        assert_eq!(st.lifecycle.phase, Phase::DenoiseGen);
+        assert_eq!(st.und.logical_pos, 13);
+        assert_eq!(st.image_gen.cond_pos, 13);
+        assert_eq!(st.replay.generated_ids, vec![5, image_trigger]);
     }
 
     #[test]
-    fn default_generation_burst_literal_image_trigger_advances_speculative_feed() {
+    fn gen_branch_burst_literal_image_trigger_advances_speculative_feed() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -5636,7 +6424,6 @@ mod tests {
         let mut sched = Scheduler::with_config(
             Box::new(NullExecutor { caps, in_flight: 0 }),
             ControlTokens {
-                image_start_ids: vec![21, 22],
                 ..Default::default()
             },
             SchedulerConfig {
@@ -5647,10 +6434,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
-        req.max_tokens = 8;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
+        req.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Suffix {
+            token_ids: vec![21, 22],
+        };
+        req.behavior =
+            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+        req.max_und_tokens = 8;
         req.image = uniserve_core::ImageParams {
             height: 64,
             width: 64,
@@ -5658,27 +6449,24 @@ mod tests {
             retain_images: true,
             ..Default::default()
         };
-        req.event_tx = tx;
-        sched.submit_for_test(req);
+        compile_resources(&sched, &mut req);
+        let _rx = sched.submit_for_test(req);
+        sched.decode_token_burst = 3;
         sched.admit();
 
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 10;
-            st.next_token = 77;
-            st.n_generated = 0;
-            st.generated_ids.clear();
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 4;
+            st.und.logical_pos = 10;
+            st.und.physical_kv_len = 10;
+            st.und.next_token = 77;
+            st.und.tokens_emitted = 0;
+            st.replay.generated_ids.clear();
         }
-        let transition = PlannedTransition::from_forward_op(&ForwardOp {
-            req_id: id,
-            kind: OpKind::DecodeUnd,
-            modality: Modality::Und,
-            pos_range: (10, 11),
-            decode_token_count: Some(3),
-            ..Default::default()
-        });
-        sched.resolve(
+        let transition = sched.next_transition(id, 3).expect("decode transition");
+        apply_and_resolve(
+            &mut sched,
             id,
             transition,
             uniserve_worker_wire::SeqResult {
@@ -5691,20 +6479,14 @@ mod tests {
         );
 
         let st = sched.running.get(&id).expect("request enters image phase");
-        assert_eq!(st.phase, Phase::DenoiseGen);
-        assert_eq!(st.pos, 13);
-        assert_eq!(st.cond_pos, 13);
-        assert_eq!(st.generated_ids, vec![21, 22]);
+        assert_eq!(st.lifecycle.phase, Phase::DenoiseGen);
+        assert_eq!(st.und.logical_pos, 13);
+        assert_eq!(st.image_gen.cond_pos, 13);
+        assert_eq!(st.replay.generated_ids, vec![21, 22]);
     }
 
     #[test]
-    fn default_generation_admission_reserves_full_worstcase_and_never_deadlocks() {
-        // Deadlock regression (2026-07-07 benchmark stall): default generation is
-        // not preemptible, so admitting it with less than its complete KV worst
-        // case (prompt + max_tokens + retained-image envelope) lets concurrent
-        // requests exhaust the free pool mid-decode where none can grow, none
-        // can be evicted, and none can finish. Admission must reserve the full
-        // worst case; excess concurrency queues instead of wedging the engine.
+    fn gen_branch_admission_reserves_full_worstcase_and_never_deadlocks() {
         let make_scheduler = |num_blocks| {
             Scheduler::with_config(
                 Box::new(NullExecutor {
@@ -5727,10 +6509,12 @@ mod tests {
             )
         };
         let make_request = |id| {
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut req = test_request(id, 10);
-            req.constraint = uniserve_core::GenerationConstraint::Default;
-            req.max_tokens = 16;
+            request_with_generation_behavior(
+                &mut req,
+                uniserve_core::GenerationConstraint::Default,
+            );
+            req.max_und_tokens = 16;
             req.image = uniserve_core::ImageParams {
                 height: 32,
                 width: 32,
@@ -5738,21 +6522,27 @@ mod tests {
                 retain_images: true,
                 ..Default::default()
             };
-            req.event_tx = tx;
+            req.policy
+                .feedback
+                .as_mut()
+                .expect("feedback recipe")
+                .physical_kv_tokens = uniserve_core::ImageKvEffect::Exact { tokens: 4 };
             req
         };
 
-        // worstcase = prompt(10) + max_tokens(16) + image span(4) = 30 tokens
-        // = 8 blocks at block_size 4.
-        let mut sched = make_scheduler(12); // 11 usable blocks: one request fits.
-        sched.submit_for_test(make_request(1));
-        sched.submit_for_test(make_request(2));
+        let mut sched = make_scheduler(12);
+        let mut first = make_request(1);
+        let mut second = make_request(2);
+        compile_resources(&sched, &mut first);
+        compile_resources(&sched, &mut second);
+        sched.submit_for_test(first);
+        sched.submit_for_test(second);
         sched.admit();
 
         let id = RequestId(1);
         let st = sched.running.get(&id).expect("first request admitted");
-        assert!(st.reserve_worstcase);
-        assert_eq!(st.worstcase_blocks, 8);
+        assert!(st.resources.reserve_worstcase);
+        assert_eq!(st.resources.worstcase_blocks, 8);
         assert_eq!(
             sched.bm.blocks_for(id).len(),
             8,
@@ -5768,11 +6558,12 @@ mod tests {
         // its own allocation, with the retained-image envelope intact — no
         // dependency on any other request freeing blocks.
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = st.req.prompt_ids.len() as u32;
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.und.logical_pos = st.context.prompt_ids.len() as u32;
+            st.ingest.prompt_cursor = st.context.prompt_ids.len() as u32;
         }
         let op = sched
-            .next_op(id, 16)
+            .next_transition(id, 16)
             .expect("decode proceeds from the preallocated envelope");
         assert_eq!(op.kind, OpKind::DecodeUnd);
         assert_eq!(
@@ -5781,9 +6572,7 @@ mod tests {
             "decode does not allocate beyond the admission worst case"
         );
         let st = sched.running.get(&id).unwrap();
-        let target = st.pos as usize
-            + op.decode_token_count.unwrap_or(1) as usize
-            + sched.default_remaining_image_span(st);
+        let target = st.req.resources.max_kv_tokens;
         assert!(sched.bm.blocks_for(id).len() * sched.caps.block_size as usize >= target);
 
         // Finishing the resident request frees its envelope and unblocks the
@@ -5822,11 +6611,13 @@ mod tests {
             },
         );
 
-        // Request 1: an default generation request at an image boundary -> DenoiseGen.
-        let (tx1, _rx1) = tokio::sync::mpsc::unbounded_channel();
+        // Request 1: a continuation-capable request at an image boundary.
         let mut gen_req = test_request(1, 4);
-        gen_req.constraint = uniserve_core::GenerationConstraint::Default;
-        gen_req.max_tokens = 64;
+        request_with_generation_behavior(
+            &mut gen_req,
+            uniserve_core::GenerationConstraint::Default,
+        );
+        gen_req.max_und_tokens = 64;
         gen_req.image = uniserve_core::ImageParams {
             height: 64,
             width: 64,
@@ -5834,32 +6625,33 @@ mod tests {
             retain_images: true,
             ..Default::default()
         };
-        gen_req.event_tx = tx1;
-        sched.submit_for_test(gen_req);
+        compile_resources(&sched, &mut gen_req);
+        let _rx1 = sched.submit_for_test(gen_req);
         // Request 2: a plain text-decode request -> DecodeUnd.
-        let (tx2, _rx2) = tokio::sync::mpsc::unbounded_channel();
         let mut und_req = test_request(2, 4);
-        und_req.max_tokens = 64;
-        und_req.event_tx = tx2;
-        sched.submit_for_test(und_req);
+        und_req.max_und_tokens = 64;
+        compile_resources(&sched, &mut und_req);
+        let _rx2 = sched.submit_for_test(und_req);
         sched.admit();
 
         if let Some(st) = sched.running.get_mut(&RequestId(1)) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 4;
-            st.n_generated = 1;
-            st.generated_ids.clear();
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.und.logical_pos = 4;
+            st.ingest.prompt_cursor = 4;
+            st.und.tokens_emitted = 1;
+            st.replay.generated_ids.clear();
         }
         sched.begin_image(RequestId(1));
         assert_eq!(
-            sched.running.get(&RequestId(1)).map(|s| s.phase),
+            sched.running.get(&RequestId(1)).map(|s| s.lifecycle.phase),
             Some(Phase::DenoiseGen),
             "request 1 must be denoising"
         );
         if let Some(st) = sched.running.get_mut(&RequestId(2)) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 4;
-            st.next_token = 7;
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.und.logical_pos = 4;
+            st.ingest.prompt_cursor = 4;
+            st.und.next_token = 7;
         }
 
         let (_new, ops) = sched.assemble();
@@ -5885,20 +6677,40 @@ mod tests {
     #[test]
     fn spec_decode_commits_accepted_and_sampled_tokens() {
         let mut sched = test_scheduler();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut req = test_request(1, 4);
-        req.event_tx = tx;
-        sched.submit_for_test(req);
+        let req = test_request(1, 4);
+        let mut rx = sched.submit_for_test(req);
         sched.admit();
 
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 4;
-            st.next_token = 10;
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.und.logical_pos = 4;
+            st.ingest.prompt_cursor = 4;
+            st.und.next_token = 10;
         }
-        sched.resolve_spec_decode_text(
+        let transition = sched
+            .plan_intent(
+                id,
+                sched.projected_cursor(id).expect("cursor projection"),
+                TransitionIntent::DecodeUnd {
+                    position: 4,
+                    token_id: 10,
+                    token_source: TokenSource::Wire,
+                    new_blocks: Vec::new(),
+                    spec_token_ids: Some(vec![11, 12]),
+                    token_count: 1,
+                    stop_token_ids: None,
+                    stop_terminal: true,
+                    recent_tokens: None,
+                    allowed_tokens: None,
+                    suppress_tokens: None,
+                },
+            )
+            .expect("speculative decode transition");
+        apply_and_resolve(
+            &mut sched,
             id,
+            transition,
             uniserve_worker_wire::SeqResult {
                 req_id: id,
                 sampled_token_id: Some(13),
@@ -5909,10 +6721,10 @@ mod tests {
         );
 
         let st = sched.running.get(&id).expect("request still running");
-        assert_eq!(st.pos, 7);
-        assert_eq!(st.n_generated, 3);
-        assert_eq!(st.generated_ids, vec![11, 12, 13]);
-        assert_eq!(st.next_token, 13);
+        assert_eq!(st.und.logical_pos, 7);
+        assert_eq!(st.und.tokens_emitted, 3);
+        assert_eq!(st.replay.generated_ids, vec![11, 12, 13]);
+        assert_eq!(st.und.next_token, 13);
         assert_eq!(drain_text_tokens(&mut rx), vec![11, 12, 13]);
     }
 
@@ -5927,10 +6739,8 @@ mod tests {
         sched.submit_for_test(test_request(2, 4));
         assert_eq!(sched.pending.len(), 2);
         // The third overflows and must be rejected (not queued).
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut over = test_request(3, 4);
-        over.event_tx = tx;
-        sched.submit_for_test(over);
+        let over = test_request(3, 4);
+        let mut rx = sched.submit_for_test(over);
         assert_eq!(
             sched.pending.len(),
             2,
@@ -5952,12 +6762,9 @@ mod tests {
         let id = RequestId(1);
         assert!(sched.running.contains_key(&id));
         // Simulate an op in flight for this request.
-        let op = ForwardOp {
-            req_id: id,
-            kind: OpKind::PrefillUnd,
-            ..Default::default()
-        };
-        sched.register_inflight(&op, Instant::now());
+        let mut op = sched.next_transition(id, 4).expect("prefill transition");
+        op.assign_op_id(1);
+        sched.register_inflight(op, Instant::now());
         assert!(sched.has_inflight(id));
         // Cancel, then reap: the request must survive while its op is in flight.
         sched.mark_cancelled(id, false);
@@ -5967,13 +6774,133 @@ mod tests {
             "cancelled request with an in-flight op must not be reaped yet"
         );
         // Once the op drains, the next reap finishes it.
-        let _ = sched.pop_inflight(id, None);
+        let _ = sched.pop_inflight(id, Some(1));
         assert!(!sched.has_inflight(id));
         sched.reap_cancellations();
         assert!(
             !sched.running.contains_key(&id),
             "cancelled request must be reaped after its op resolves"
         );
+    }
+
+    #[test]
+    fn cancellation_defers_cleanup_for_every_transition_class() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            TextIngest,
+            ImageIngest,
+            UndDecode,
+            GenDenoise,
+            GenCommit,
+            Feedback,
+        }
+
+        for (index, case) in [
+            Case::TextIngest,
+            Case::ImageIngest,
+            Case::UndDecode,
+            Case::GenDenoise,
+            Case::GenCommit,
+            Case::Feedback,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut sched = test_scheduler();
+            let id = RequestId(index as u64 + 1);
+            let mut request = test_request(id.0, 4);
+            if matches!(case, Case::ImageIngest) {
+                add_context_image(&mut request, 2, false);
+            }
+            if matches!(case, Case::GenDenoise | Case::GenCommit | Case::Feedback) {
+                if matches!(case, Case::Feedback) {
+                    request.policy.feedback = Some(uniserve_core::GeneratedImageFeedbackRecipe {
+                        commit: uniserve_core::CommitRecipe::CommitGenThenWriteback,
+                        writeback: uniserve_core::FeedbackWriteback::DirectKv,
+                        next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
+                        logical_positions: 1,
+                        physical_kv_tokens: uniserve_core::ImageKvEffect::Exact { tokens: 1 },
+                    });
+                }
+                request_with_generation_behavior(
+                    &mut request,
+                    uniserve_core::GenerationConstraint::Default,
+                );
+            }
+            compile_resources(&sched, &mut request);
+            let mut events = sched.submit_for_test(request);
+            sched.admit();
+
+            if let Some(state) = sched.running.get_mut(&id) {
+                match case {
+                    Case::TextIngest => {}
+                    Case::ImageIngest => {
+                        state.ingest.prompt_cursor = 2;
+                        state.und.logical_pos = 2;
+                        state.und.physical_kv_len = 2;
+                    }
+                    Case::UndDecode => {
+                        state.ingest.prompt_cursor = 4;
+                        state.und.logical_pos = 4;
+                        state.und.physical_kv_len = 4;
+                        state.lifecycle.phase = Phase::DecodeUnd;
+                    }
+                    Case::GenDenoise => {
+                        state.ingest.prompt_cursor = 4;
+                        state.und.logical_pos = 4;
+                        state.und.physical_kv_len = 4;
+                        state.image_gen.cond_pos = 4;
+                        state.image_gen.image_id = 1;
+                        state.lifecycle.phase = Phase::DenoiseGen;
+                    }
+                    Case::GenCommit => {
+                        state.ingest.prompt_cursor = 4;
+                        state.und.logical_pos = 4;
+                        state.und.physical_kv_len = 4;
+                        state.image_gen.cond_pos = 4;
+                        state.image_gen.image_id = 1;
+                        state.lifecycle.phase = Phase::CommitGen;
+                    }
+                    Case::Feedback => {
+                        state.ingest.prompt_cursor = 4;
+                        state.und.logical_pos = 4;
+                        state.und.physical_kv_len = 4;
+                        state.image_gen.cond_pos = 4;
+                        state.image_gen.image_id = 1;
+                        state.feedback.locator = Some("locator".to_string());
+                        state.lifecycle.phase = Phase::CommitWriteback;
+                    }
+                }
+            }
+
+            let mut transition = sched
+                .next_transition(id, 8)
+                .unwrap_or_else(|| panic!("{case:?} must produce a transition"));
+            transition.assign_op_id(index as u64 + 1);
+            sched.register_inflight(transition, Instant::now());
+            sched.mark_cancelled(id, false);
+            sched.reap_cancellations();
+            assert!(
+                sched.running.contains_key(&id),
+                "{case:?} cancellation released state while its op was in flight"
+            );
+
+            let _ = sched.pop_inflight(id, Some(index as u64 + 1));
+            sched.reap_cancellations();
+            assert!(
+                !sched.running.contains_key(&id),
+                "{case:?} cancellation did not clean up after result ownership ended"
+            );
+            let terminal = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| {
+                if let GenEvent::Finished { reason, .. } = event {
+                    Some(reason)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(terminal, Some(FinishReason::Cancelled), "{case:?}");
+            assert_eq!(sched.ledger.total_active(), 0, "{case:?} leaked leases");
+        }
     }
 
     // A context-image decode burst commits every returned token; a burst
@@ -5983,32 +6910,34 @@ mod tests {
     fn context_decode_burst_commits_tokens_and_closes_round_on_eos() {
         let mut sched = test_scheduler();
         sched.ctrl.eos = vec![99];
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::UndOnly;
-        req.max_tokens = 64;
-        req.event_tx = tx;
-        sched.submit_for_test(req);
+        add_context_image(&mut req, 2, false);
+        req.policy.trigger = uniserve_core::TriggerPolicyDescriptor::RoundCloseThenSuffix {
+            close_token_ids: vec![99],
+            trigger_token_ids: vec![21, 22],
+        };
+        req.behavior =
+            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
+        req.max_und_tokens = 64;
+        compile_resources(&sched, &mut req);
+        let mut rx = sched.submit_for_test(req);
+        sched.decode_token_burst = 2;
         sched.admit();
         let id = RequestId(1);
         if let Some(st) = sched.running.get_mut(&id) {
-            st.phase = Phase::DecodeUnd;
-            st.pos = 10;
-            st.kvlen = 10;
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 4;
+            st.ingest.mm_cursor = 1;
+            st.und.logical_pos = 10;
+            st.und.physical_kv_len = 10;
         }
 
-        let decode_transition = PlannedTransition::from_forward_op(&ForwardOp {
-            req_id: id,
-            kind: OpKind::DecodeUnd,
-            modality: Modality::Und,
-            pos_range: (10, 11),
-            decode_token_count: Some(2),
-            ..Default::default()
-        });
+        let decode_transition = sched.next_transition(id, 2).expect("decode transition");
 
         // Full burst, no stop: every token commits and resolution applies the
         // full position/KV advance.
-        sched.resolve_context_image(
+        apply_and_resolve(
+            &mut sched,
             id,
             decode_transition,
             uniserve_worker_wire::SeqResult {
@@ -6017,28 +6946,23 @@ mod tests {
                 sampled_token_ids: Some(vec![5, 6]),
                 ..Default::default()
             },
+            Vec::new(),
         );
         {
             let st = sched.running.get(&id).expect("still running");
-            assert_eq!(st.n_generated, 2);
-            assert_eq!(st.round_tokens, vec![5, 6]);
-            assert_eq!(st.next_token, 6);
-            assert_eq!(st.pos, 12);
-            assert_eq!(st.kvlen, 12);
+            assert_eq!(st.und.tokens_emitted, 2);
+            assert_eq!(st.und.round_tokens, vec![5, 6]);
+            assert_eq!(st.und.next_token, 6);
+            assert_eq!(st.und.logical_pos, 12);
+            assert_eq!(st.und.physical_kv_len, 12);
         }
         assert_eq!(drain_text_tokens(&mut rx), vec![5, 6]);
 
         // Burst tail hits eos: the committed tokens emit, the round closes
         // without a context_round_closing hop, and (no image trigger) the request ends.
-        let decode_transition = PlannedTransition::from_forward_op(&ForwardOp {
-            req_id: id,
-            kind: OpKind::DecodeUnd,
-            modality: Modality::Und,
-            pos_range: (12, 13),
-            decode_token_count: Some(2),
-            ..Default::default()
-        });
-        sched.resolve_context_image(
+        let decode_transition = sched.next_transition(id, 2).expect("decode transition");
+        apply_and_resolve(
+            &mut sched,
             id,
             decode_transition,
             uniserve_worker_wire::SeqResult {
@@ -6047,6 +6971,7 @@ mod tests {
                 sampled_token_ids: Some(vec![7, 99]),
                 ..Default::default()
             },
+            Vec::new(),
         );
         assert!(
             !sched.running.contains_key(&id),
@@ -6055,85 +6980,161 @@ mod tests {
         assert_eq!(drain_text_tokens(&mut rx), vec![7]);
     }
 
-    // Context images dual-encode (VAE then ViT) only
-    // when the worker declares `vae_encode`; a VAE-less model single-encodes
-    // straight through ViT at the image's in-prompt position.
+    // Context ingest follows the profile recipe exactly; capability validation
+    // rejects a recipe the worker cannot execute.
     #[test]
     fn context_encode_respects_vae_capability() {
         for (has_vae, expected_first) in [(false, OpKind::VitEncode), (true, OpKind::VaeEncode)] {
             let mut sched = test_scheduler();
             if has_vae {
-                sched.caps.supported_ops.push("vae_encode".into());
+                sched.caps.supported_ops.push(OpKind::VaeEncode);
             }
             let mut req = test_request(1, 5);
-            req.constraint = uniserve_core::GenerationConstraint::UndOnly;
-            req.mm_items = vec![uniserve_engine_api::MmItem {
-                hash: 7,
-                position: 2,
-                num_tokens: 0,
-                b64: "aGVsbG8=".into(),
-            }];
+            add_context_image(&mut req, 2, has_vae);
+            compile_resources(&sched, &mut req);
             sched.submit_for_test(req);
             sched.admit();
             let id = RequestId(1);
 
             // Prefill chunks to the image boundary...
-            let op = sched.next_op(id, 64).expect("prefill op");
+            let op = sched.next_transition(id, 64).expect("prefill op");
             assert_eq!(op.kind, OpKind::PrefillUnd);
             assert_eq!(op.pos_range, (0, 2));
-            let transition = PlannedTransition::from_forward_op(&op);
-            sched.resolve_context_image(
+            apply_and_resolve(
+                &mut sched,
                 id,
-                transition,
+                op,
                 uniserve_worker_wire::SeqResult {
                     req_id: id,
+                    sampled_token_id: Some(9),
                     ..Default::default()
                 },
+                Vec::new(),
             );
             // ...then the encode fires at the in-prompt marker gap.
-            let op = sched.next_op(id, 64).expect("encode op");
+            let op = sched.next_transition(id, 64).expect("encode op");
             assert_eq!(op.kind, expected_first, "has_vae={has_vae}");
             assert_eq!(op.cond_pos, Some(2));
             assert_eq!(op.image_b64.as_deref(), Some("aGVsbG8="));
         }
     }
 
-    // default generation stays resident. Replaying prompt++generated under load is a
+    #[test]
+    fn encoder_cache_hit_plans_worker_attach_and_no_store_uses_transient_residency() {
+        let mut cached = test_scheduler();
+        let mut cached_request = test_request(1, 4);
+        add_context_image(&mut cached_request, 2, false);
+        compile_resources(&cached, &mut cached_request);
+        let cache_key = cached_request.resources.encoder_cache_keys[0];
+        cached.enc_cache.insert_output(cache_key, 77, 1);
+        cached.submit_for_test(cached_request);
+        cached.admit();
+        let id = RequestId(1);
+        if let Some(state) = cached.running.get_mut(&id) {
+            state.ingest.prompt_cursor = 2;
+            state.und.logical_pos = 2;
+            state.und.physical_kv_len = 2;
+        }
+
+        let hit = cached.next_transition(id, 64).expect("cached attach");
+        assert_eq!(hit.kind, OpKind::VitEncode);
+        assert_eq!(hit.image_b64, None);
+        assert_eq!(hit.image_in, Some(77));
+        assert_eq!(hit.mm_hash, Some(cache_key));
+        assert!(matches!(
+            hit.delta,
+            crate::generation::TransitionDelta::IngestImageStep {
+                encoder_cache_key: Some(key),
+                cache_hit: true,
+                ..
+            } if key == cache_key
+        ));
+        assert!(cached.reserve_transition_resources(&hit));
+        assert_eq!(
+            cached
+                .running
+                .get(&id)
+                .expect("cached request")
+                .ingest
+                .acquired_encoder_pins,
+            vec![EncoderCachePin {
+                key: cache_key,
+                handle: 77,
+            }]
+        );
+        cached.finish(id, FinishReason::Cancelled);
+
+        let mut transient = test_scheduler();
+        let mut transient_request = test_request(2, 4);
+        add_context_image(&mut transient_request, 2, false);
+        transient_request.cache.read = false;
+        transient_request.cache.write = false;
+        compile_resources(&transient, &mut transient_request);
+        transient.submit_for_test(transient_request);
+        transient.admit();
+        let id = RequestId(2);
+        if let Some(state) = transient.running.get_mut(&id) {
+            state.ingest.prompt_cursor = 2;
+            state.und.logical_pos = 2;
+            state.und.physical_kv_len = 2;
+        }
+
+        let miss = transient.next_transition(id, 64).expect("transient encode");
+        assert_eq!(miss.kind, OpKind::VitEncode);
+        assert!(miss.image_b64.is_some());
+        assert_ne!(miss.mm_hash, Some(cache_key));
+        assert!(matches!(
+            miss.delta,
+            crate::generation::TransitionDelta::IngestImageStep {
+                encoder_cache_key: None,
+                cache_hit: false,
+                ..
+            }
+        ));
+    }
+
+    // generated branch stays resident. Replaying prompt++generated under load is a
     // performance cliff.
     #[test]
-    fn default_generation_is_not_preemptible() {
+    fn gen_branch_is_not_preemptible() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
+        compile_resources(&sched, &mut req);
         sched.submit_for_test(req);
         sched.admit();
+        assert!(sched.running.contains_key(&RequestId(1)));
         assert!(!sched.preemptible(RequestId(1)));
     }
 
     #[test]
-    fn default_generation_with_generated_output_is_not_preemptible() {
+    fn gen_branch_with_generated_output_is_not_preemptible() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
+        compile_resources(&sched, &mut req);
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);
+        assert!(sched.running.contains_key(&id));
         if let Some(st) = sched.running.get_mut(&id) {
-            st.generated_ids.push(11);
+            st.replay.generated_ids.push(11);
         }
         assert!(!sched.preemptible(id));
     }
 
     #[test]
-    fn default_generation_with_committed_image_is_not_preemptible() {
+    fn gen_branch_with_committed_image_is_not_preemptible() {
         let mut sched = test_scheduler();
         let mut req = test_request(1, 4);
-        req.constraint = uniserve_core::GenerationConstraint::Default;
+        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
+        compile_resources(&sched, &mut req);
         sched.submit_for_test(req);
         sched.admit();
         let id = RequestId(1);
+        assert!(sched.running.contains_key(&id));
         if let Some(st) = sched.running.get_mut(&id) {
-            st.images_done = 1;
+            st.image_gen.images_done = 1;
         }
         assert!(!sched.preemptible(id));
     }

@@ -3,7 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::time::{Duration, Instant};
 
-use uniserve_core::{BlockId, CommandWaker, RequestId};
+use uniserve_core::{BlockId, CommandWaker, GeneratedImageCommitCapabilities, RequestId};
 use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind, WorkerRequest};
 
 /// Synchronous model-engine seam used by deterministic local implementations.
@@ -394,6 +394,15 @@ pub trait Executor: Send {
 
     fn can_submit(&self) -> bool {
         self.in_flight() < self.pipeline_depth()
+    }
+
+    /// Generated-image commit shapes executable on this topology.
+    /// Non-disaggregated pools append image KV inside `commit_gen`.
+    fn generated_image_commit_capabilities(&self) -> GeneratedImageCommitCapabilities {
+        GeneratedImageCommitCapabilities {
+            inline: true,
+            separate_writeback: false,
+        }
     }
 
     fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()>;

@@ -107,9 +107,11 @@ class _FakeOwner:
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.feature_calls = 0
 
     def interleaved_image_features(self, image_input, *, grid_hw, gen_model=False):
         assert not gen_model
+        self.feature_calls += 1
         merge = 2
         tokens = int(grid_hw[0, 0]) * int(grid_hw[0, 1]) // (merge * merge)
         return torch.zeros(tokens, self.hidden)
@@ -146,3 +148,25 @@ def test_ingest_appends_patch_block_at_shared_t_index():
     mask = call["attention_mask"]["full_attention"]
     assert mask.shape == (1, 1, num_tokens, 7 + num_tokens)
     assert torch.all(mask == 0), "patches attend to the full prefix and each other"
+
+
+def test_reusable_embeddings_attach_to_each_request_cache_without_reencoding():
+    owner = _FakeOwner()
+    driver = InputImageIngestDriver(owner)
+    grid_hw = torch.tensor([[4, 6]])
+    flattened = torch.zeros(24, 3 * 16 * 16)
+    embeddings = driver.encode_understanding_image(flattened, grid_hw)
+
+    for t_index in (3, 9):
+        cache = TextCache()
+        cache.past = _FakePast()
+        assert driver.ingest_understanding_embeddings(
+            cache,
+            embeddings,
+            grid_hw,
+            t_index=t_index,
+        ) == 6
+        assert cache.t_index == t_index
+
+    assert owner.feature_calls == 1
+    assert len(owner.calls) == 2

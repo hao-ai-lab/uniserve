@@ -6,6 +6,7 @@ the shared layer library so commit and final image decode use one code path.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from einops import rearrange
@@ -155,6 +156,28 @@ class Upsample(nn.Module):
         return self.conv(x)
 
 
+class _EncoderLevel(nn.Module):
+    def __init__(self, block: nn.ModuleList, downsample: Downsample | None) -> None:
+        super().__init__()
+        self.block = block
+        self.downsample = downsample
+
+
+class _DecoderLevel(nn.Module):
+    def __init__(self, block: nn.ModuleList, upsample: Upsample | None) -> None:
+        super().__init__()
+        self.block = block
+        self.upsample = upsample
+
+
+class _MiddleBlocks(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.block_1 = ResnetBlock(channels, channels)
+        self.attn_1 = AttnBlock(channels)
+        self.block_2 = ResnetBlock(channels, channels)
+
+
 class Encoder(nn.Module):
     def __init__(self, resolution, in_channels, ch, ch_mult, num_res_blocks, z_channels):
         super().__init__()
@@ -171,26 +194,23 @@ class Encoder(nn.Module):
             for _ in range(self.num_res_blocks):
                 block.append(ResnetBlock(block_in, block_out))
                 block_in = block_out
-            down = nn.Module()
-            down.block = block
-            if i_level != self.num_resolutions - 1:
-                down.downsample = Downsample(block_in)
-            self.down.append(down)
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(block_in, block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(block_in, block_in)
+            downsample = Downsample(block_in) if i_level != self.num_resolutions - 1 else None
+            self.down.append(_EncoderLevel(block, downsample))
+        self.mid = _MiddleBlocks(block_in)
         self.norm_out = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=block_in, eps=_GN_EPS, affine=True)
         self.conv_out = nn.Conv2d(block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x):
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
+            level = cast(_EncoderLevel, self.down[i_level])
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](hs[-1])
+                h = level.block[i_block](hs[-1])
                 hs.append(h)
             if i_level != self.num_resolutions - 1:
-                hs.append(self.down[i_level].downsample(hs[-1]))
+                if level.downsample is None:
+                    raise RuntimeError("encoder level is missing its downsample module")
+                hs.append(level.downsample(hs[-1]))
         h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(hs[-1])))
         return self.conv_out(nn.functional.silu(self.norm_out(h)))
 
@@ -202,10 +222,7 @@ class Decoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         block_in = ch * ch_mult[self.num_resolutions - 1]
         self.conv_in = nn.Conv2d(z_channels, block_in, kernel_size=3, stride=1, padding=1)
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(block_in, block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(block_in, block_in)
+        self.mid = _MiddleBlocks(block_in)
         self.up = nn.ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
@@ -213,11 +230,8 @@ class Decoder(nn.Module):
             for _ in range(self.num_res_blocks + 1):
                 block.append(ResnetBlock(block_in, block_out))
                 block_in = block_out
-            up = nn.Module()
-            up.block = block
-            if i_level != 0:
-                up.upsample = Upsample(block_in)
-            self.up.insert(0, up)
+            upsample = Upsample(block_in) if i_level != 0 else None
+            self.up.insert(0, _DecoderLevel(block, upsample))
         self.norm_out = nn.GroupNorm(num_groups=_GN_GROUPS, num_channels=block_in, eps=_GN_EPS, affine=True)
         self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
 
@@ -225,10 +239,13 @@ class Decoder(nn.Module):
         h = self.conv_in(z)
         h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h)))
         for i_level in reversed(range(self.num_resolutions)):
+            level = cast(_DecoderLevel, self.up[i_level])
             for i_block in range(self.num_res_blocks + 1):
-                h = self.up[i_level].block[i_block](h)
+                h = level.block[i_block](h)
             if i_level != 0:
-                h = self.up[i_level].upsample(h)
+                if level.upsample is None:
+                    raise RuntimeError("decoder level is missing its upsample module")
+                h = level.upsample(h)
         return self.conv_out(nn.functional.silu(self.norm_out(h)))
 
 

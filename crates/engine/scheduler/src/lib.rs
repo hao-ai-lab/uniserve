@@ -4,6 +4,7 @@
 pub(crate) mod bench_trace;
 pub mod generation;
 pub mod grammar;
+pub(crate) mod image_artifact;
 pub mod logits;
 pub mod policy;
 pub(crate) mod prefix_cache;

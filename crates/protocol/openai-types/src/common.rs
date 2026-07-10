@@ -79,7 +79,6 @@ pub fn validate_top_p_value(top_p: f32) -> Result<(), validator::ValidationError
 // ============================================================================
 
 /// One OpenAI completions prompt.
-
 /// The API accepts either raw prompt text or a pre-tokenized token-ID sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -355,7 +354,7 @@ pub enum MessageContent {
 // Usage and Logging
 // ============================================================================
 
-/// Mirrors the `UsageInfo` class.
+/// OpenAI usage fields plus optional generated-image lifecycle accounting.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize)]
 pub struct Usage {
@@ -364,6 +363,8 @@ pub struct Usage {
     pub completion_tokens: Option<u32>,
     pub prompt_tokens_details: Option<PromptTokenUsageInfo>,
     pub completion_tokens_details: Option<CompletionTokenUsageInfo>,
+    pub image_count: Option<u32>,
+    pub image_steps: Option<u32>,
 }
 
 impl Usage {
@@ -378,6 +379,22 @@ impl Usage {
             completion_tokens: Some(completion_tokens),
             prompt_tokens_details: None,
             completion_tokens_details: None,
+            image_count: None,
+            image_steps: None,
+        }
+    }
+
+    /// Create usage for a response that includes generated images.
+    pub fn from_generation_counts(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        image_count: u32,
+        image_steps: u32,
+    ) -> Self {
+        Self {
+            image_count: Some(image_count),
+            image_steps: Some(image_steps),
+            ..Self::from_counts(prompt_tokens, completion_tokens)
         }
     }
 }
@@ -390,7 +407,6 @@ pub struct PromptTokenUsageInfo {
 }
 
 /// Mirrors the `CompletionTokenUsageInfo` class.
-
 /// Breakdown of completion-token usage required by the current OpenAI spec,
 /// notably `reasoning_tokens` for reasoning-capable models.
 #[serde_with::skip_serializing_none]

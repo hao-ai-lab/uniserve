@@ -7,15 +7,11 @@ shared-memory transport through `Server`.
 from __future__ import annotations
 
 try:
-    from .. import _uniserve_ipc as _native
+    from .._uniserve_ipc import Server
 except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "_uniserve_ipc is not installed; reinstall the package (pip install -e .) to build it."
     ) from exc
-
-Server = _native.Server
-
-
 class EndpointBusyError(Exception):
     """The IPC server endpoint is already bound (a startup race).
 

@@ -142,6 +142,38 @@ impl ResourceLedger {
         self.active.values().map(|v| v.len()).sum()
     }
 
+    /// Capacity currently leased for one request and resource class.
+    pub fn capacity_for(&self, req: RequestId, class: ResourceClass) -> Option<u64> {
+        self.active
+            .get(&req)?
+            .iter()
+            .find(|lease| lease.handle.class == class)
+            .map(|lease| lease.capacity)
+    }
+
+    /// Issue a class lease once for a request. Repeated denoise transitions
+    /// retain the existing image-scoped lease until the commit transition releases it.
+    pub fn ensure(
+        &mut self,
+        req: RequestId,
+        class: ResourceClass,
+        capacity: u64,
+        policy: LeasePolicy,
+    ) -> ResourceHandle {
+        if let Some(lease) = self
+            .active
+            .get(&req)
+            .and_then(|leases| leases.iter().find(|lease| lease.handle.class == class))
+        {
+            debug_assert_eq!(
+                lease.capacity, capacity,
+                "resource lease capacity changed mid-lifecycle"
+            );
+            return lease.handle;
+        }
+        self.issue(req, class, capacity, policy)
+    }
+
     /// Assert `req` holds no leases (call AFTER `release_request`). A violation is
     /// counted + logged, never panicked, so the live serving loop is unaffected.
     pub fn assert_released(&mut self, req: RequestId) -> bool {

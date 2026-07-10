@@ -5,12 +5,38 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-test-util = ["uniserve-engine-client/test-util"]
+test-util = []
 
 [dependencies]
-async-trait.workspace = true
-uniserve-engine-client.workspace = true
-uniserve-llm.workspace = true
+anyhow.workspace = true
+arc-swap.workspace = true
+bytes.workspace = true
+easy-ext.workspace = true
+enum-as-inner.workspace = true
+futures.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+rmpv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+task-local.workspace = true
+thiserror.workspace = true
+thiserror-ext.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zeromq.workspace = true
+uniserve-core.workspace = true
+uniserve-engine-api.workspace = true
+uniserve-engine-wire.workspace = true
+uniserve-observability.workspace = true
+uniserve-worker-wire.workspace = true
+
+[dev-dependencies]
+clap.workspace = true
+expect-test.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

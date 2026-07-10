@@ -55,7 +55,13 @@ class SamplerDriver(BaseWorkerDriver):
             supported_ops=("sample",),
         )
 
-    def execute(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        defer_text_cpu_results: bool = False,
+    ) -> dict[str, Any]:
+        del defer_text_cpu_results
         for nr in batch.get("new_reqs") or ():
             self._register(nr)
         ops = batch.get("ops") or []
@@ -102,7 +108,10 @@ class SamplerDriver(BaseWorkerDriver):
             sampled_token_id=int(sample.token_id),
             sampled_logprob=sample.logprob,
             top_logprobs=(
-                [(int(tid), float(lp)) for tid, lp in sample.top_logprobs]
+                [
+                    (int(item[0]), float(item[1]), int(item[2]))
+                    for item in sample.top_logprobs
+                ]
                 if sample.top_logprobs is not None
                 else None
             ),

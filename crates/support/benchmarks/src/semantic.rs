@@ -1,5 +1,6 @@
 use uniserve_serving::{
-    CachePolicy, ExecutionPlan, GenerationPolicy, PlanInspection, ServeEvent, ServeRequest,
+    CachePolicy, ExecutionPlan, FinishStatus, GenerationPolicy, PlanInspection, ServeEvent,
+    ServeRequest,
 };
 
 pub fn text_fixture(request_id: &str, prompt: &str, max_tokens: u32) -> ServeRequest {
@@ -31,14 +32,31 @@ pub fn visible_text(events: &[ServeEvent]) -> String {
 }
 
 pub fn has_terminal_success(events: &[ServeEvent]) -> bool {
-    events
-        .iter()
-        .any(|event| matches!(event, ServeEvent::Finished { .. }))
+    let mut terminals = events.iter().filter(|event| {
+        matches!(
+            event,
+            ServeEvent::Finished { .. }
+                | ServeEvent::Rejected { .. }
+                | ServeEvent::Cancelled { .. }
+                | ServeEvent::Aborted { .. }
+                | ServeEvent::Failed { .. }
+        )
+    });
+    matches!(
+        (terminals.next(), terminals.next()),
+        (
+            Some(ServeEvent::Finished {
+                reason: FinishStatus::Stop { .. } | FinishStatus::Length | FinishStatus::Repetition,
+                ..
+            }),
+            None
+        )
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use uniserve_serving::FinishStatus;
+    use uniserve_serving::{CandidateId, FinishStatus};
 
     use super::*;
 
@@ -53,22 +71,21 @@ mod tests {
     fn event_helpers_collect_visible_text_and_terminal() {
         let events = vec![
             ServeEvent::TextDelta {
-                candidate_id: 0,
+                candidate_id: CandidateId::PRIMARY,
                 text: "he".to_string(),
                 token_ids: vec![1],
                 logprobs: None,
             },
             ServeEvent::TextDelta {
-                candidate_id: 0,
+                candidate_id: CandidateId::PRIMARY,
                 text: "llo".to_string(),
                 token_ids: vec![2],
                 logprobs: None,
             },
             ServeEvent::Finished {
-                candidate_id: 0,
-                reason: FinishStatus::Stop { stop_reason: None },
+                candidate_id: CandidateId::PRIMARY,
+                reason: FinishStatus::Stop { cause: None },
                 finish_detail: None,
-                kv_transfer_params: None,
             },
         ];
         assert_eq!(visible_text(&events), "hello");

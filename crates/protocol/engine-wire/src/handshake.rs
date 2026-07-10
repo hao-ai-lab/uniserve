@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{ModelDtype, OpaqueValue};
+use uniserve_core::GenerationRuntimeCapabilities;
 
 /// Decoded engine startup-handshake payload sent on the handshake socket.
-
+///
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReadyMessage {
     #[serde(default)]
@@ -20,11 +21,11 @@ pub struct ReadyMessage {
 
 /// Post-initialization configuration sent from each engine on the input socket
 /// registration message, after the handshake completes.
-
+///
 /// Contains values that may differ from the original config (e.g.
 /// `max_model_len` after KV cache auto-fitting, `num_gpu_blocks` after
 /// profiling).
-
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineCoreReadyResponse {
     /// Engine-reported maximum model context length (auto-fitted after
@@ -38,11 +39,14 @@ pub struct EngineCoreReadyResponse {
     pub dtype: ModelDtype,
     /// the reference version reported by the engine process.
     pub uniserve_version: String,
+    /// Post-load worker limits used by serving-time capability and resource
+    /// validation.
+    pub generation_capabilities: GenerationRuntimeCapabilities,
 }
 
 /// Frontend-owned ZMQ addresses that are sent to the engine during startup
 /// handshake initialization.
-
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeAddresses {
     pub inputs: Vec<String>,
@@ -54,14 +58,12 @@ pub struct HandshakeAddresses {
 
 /// Startup handshake payload sent from the frontend to initialize an engine
 /// after receiving `HELLO`.
-
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeInitMessage {
     pub addresses: HandshakeAddresses,
     pub parallel_config: BTreeMap<String, OpaqueValue>,
-    /// UniServe extension: model control-token ids resolved by the frontend's
-    /// tokenizer (the engine process has no tokenizer but its scheduler lifecycle
-    /// decisions need them). Absent on the upstream wire.
-    #[serde(default)]
-    pub native_controls: Option<crate::native::NativeControlTokens>,
+    /// Model control-token ids resolved by the frontend tokenizer for scheduler
+    /// lifecycle decisions.
+    pub generation_controls: Option<crate::generation::GenerationControlTokens>,
 }

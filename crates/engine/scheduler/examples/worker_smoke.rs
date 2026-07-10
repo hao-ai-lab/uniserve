@@ -2,8 +2,12 @@
 //! and drive a few requests through the scheduler over the shared-memory ring.
 use std::collections::HashMap;
 
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
-use uniserve_engine_api::{GenEvent, GenerateRequest};
+use uniserve_core::{
+    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
+    TriggerPolicyDescriptor, UndVisibility,
+};
+use uniserve_engine_api::GenEvent;
 use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_worker_ipc::{UniprocExecutor, WorkerLaunchConfig};
@@ -32,7 +36,6 @@ fn main() -> anyhow::Result<()> {
     println!("caps from worker: {:?}", engine.caps());
 
     let ctrl = ControlTokens {
-        image_start_ids: vec![],
         ..ControlTokens::default()
     };
     let mut sched = Scheduler::new(Box::new(engine), ctrl, 32);
@@ -41,32 +44,14 @@ fn main() -> anyhow::Result<()> {
         HashMap::new();
     // we drive step directly here instead of the run thread
     let mut reqs = Vec::new();
-    let mk = |id: u64,
-              constraint: GenerationConstraint,
-              kind: &'static str,
-              rxs: &mut HashMap<RequestId, (&'static str, _)>| {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        rxs.insert(RequestId(id), (kind, rx));
-        GenerateRequest::new(
-            RequestId(id),
-            vec![1, 2, 3],
-            SamplingParams::default(),
-            ImageParams {
-                steps: 4,
-                height: 128,
-                width: 128,
-                ..Default::default()
-            },
-            constraint,
-            20,
-            tx,
-        )
-    };
-    reqs.push(mk(1, GenerationConstraint::UndOnly, "text", &mut rxs));
-    reqs.push(mk(2, GenerationConstraint::UndOnly, "text", &mut rxs));
-    reqs.push(mk(3, GenerationConstraint::GenOnly, "image", &mut rxs));
-    for r in reqs {
-        sched.submit_for_test(r);
+    let mk = |id: u64, constraint: GenerationConstraint| generation_request(id, constraint);
+    reqs.push((mk(1, GenerationConstraint::UndOnly), "text"));
+    reqs.push((mk(2, GenerationConstraint::UndOnly), "text"));
+    reqs.push((mk(3, GenerationConstraint::GenOnly), "image"));
+    for (request, kind) in reqs {
+        let id = request.request_id;
+        let rx = sched.submit_for_test(request);
+        rxs.insert(id, (kind, rx));
     }
     for _ in 0..400 {
         if !sched.step() {
@@ -103,4 +88,42 @@ fn main() -> anyhow::Result<()> {
         if ok { "PASS" } else { "FAIL" }
     );
     Ok(())
+}
+
+fn generation_request(id: u64, constraint: GenerationConstraint) -> GenerationRequest {
+    let policy = GenerationPolicyDescriptor {
+        trigger: TriggerPolicyDescriptor::Token { token_id: 1 },
+        gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
+        ..GenerationPolicyDescriptor::default()
+    };
+    GenerationRequest {
+        request_id: RequestId(id),
+        context: vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3],
+            visibility: UndVisibility::Internal,
+        }],
+        negative_context: Vec::new(),
+        constraint,
+        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+        sampling: SamplingParams::default(),
+        image: ImageParams {
+            steps: 4,
+            height: 128,
+            width: 128,
+            ..Default::default()
+        },
+        max_und_tokens: 20,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache: Default::default(),
+        policy,
+        resources: GenerationResourceBounds {
+            context_tokens: 3,
+            max_kv_tokens: 23,
+            ..GenerationResourceBounds::default()
+        },
+    }
 }

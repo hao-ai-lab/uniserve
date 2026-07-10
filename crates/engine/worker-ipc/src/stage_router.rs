@@ -174,19 +174,28 @@ impl StageRouter {
     /// Build a router from `(WorkerKind, Executor)` pools. Each pool's
     /// `WorkerKind::supported_ops` defines which op kinds route to it. A kind
     /// claimed by two pools routes to the first (declaration order).
-    pub fn new(pools: Vec<(WorkerKind, Box<dyn Executor>)>) -> Self {
-        assert!(!pools.is_empty(), "StageRouter needs >= 1 pool");
+    #[cfg(test)]
+    fn new(pools: Vec<(WorkerKind, Box<dyn Executor>)>) -> Self {
+        Self::try_new(pools).expect("invalid StageRouter pool capabilities")
+    }
+
+    /// Build a staged router after validating the cross-pool capability contract.
+    pub fn try_new(pools: Vec<(WorkerKind, Box<dyn Executor>)>) -> anyhow::Result<Self> {
+        anyhow::ensure!(!pools.is_empty(), "StageRouter needs at least one pool");
         let mut routing: HashMap<OpKind, usize> = HashMap::new();
-        for (idx, (kind, _)) in pools.iter().enumerate() {
+        for (idx, (kind, exec)) in pools.iter().enumerate() {
+            let caps = exec.caps();
             for op in kind.supported_ops() {
-                routing.entry(*op).or_insert(idx);
+                if caps.supported_ops.contains(op) {
+                    routing.entry(*op).or_insert(idx);
+                }
             }
         }
         let pools: Vec<PoolEntry> = pools
             .into_iter()
             .map(|(kind, exec)| PoolEntry { kind, exec })
             .collect();
-        let caps = Self::merge_caps(&pools);
+        let caps = Self::merge_caps(&pools, &routing)?;
         let depth = pools
             .iter()
             .map(|p| p.exec.pipeline_depth())
@@ -206,7 +215,7 @@ impl StageRouter {
             _ => None,
         };
         let commit_edge = tower_edge.map(|(u, g)| (g, u));
-        Self {
+        Ok(Self {
             routing,
             pools,
             caps,
@@ -223,56 +232,115 @@ impl StageRouter {
             // Synthesized sample op_ids live in a high range so they never
             // collide with scheduler-assigned op_ids on the wire echo.
             next_sample_op_id: 1 << 56,
+        })
+    }
+
+    fn merge_caps(
+        pools: &[PoolEntry],
+        routing: &HashMap<OpKind, usize>,
+    ) -> anyhow::Result<EngineCaps> {
+        let routed_caps = |kind: OpKind| routing.get(&kind).map(|index| pools[*index].exec.caps());
+        let mut kv_pool_indices = [
+            OpKind::PrefillUnd,
+            OpKind::DecodeUnd,
+            OpKind::TargetVerifyUnd,
+            OpKind::CommitWriteback,
+        ]
+        .into_iter()
+        .filter_map(|kind| routing.get(&kind).copied())
+        .collect::<Vec<_>>();
+        kv_pool_indices.sort_unstable();
+        kv_pool_indices.dedup();
+        let seed_index = kv_pool_indices.first().copied().unwrap_or(0);
+        let mut acc = pools[seed_index].exec.caps();
+
+        if let Some(first_index) = kv_pool_indices.first().copied() {
+            let first = pools[first_index].exec.caps();
+            for index in kv_pool_indices.iter().copied().skip(1) {
+                let other = pools[index].exec.caps();
+                anyhow::ensure!(
+                    other.block_size == first.block_size,
+                    "staged KV pools disagree on block_size: {} versus {}",
+                    first.block_size,
+                    other.block_size
+                );
+                anyhow::ensure!(
+                    other.num_layers == first.num_layers
+                        && other.kv_dtype == first.kv_dtype
+                        && other.quantization == first.quantization
+                        && other.groups == first.groups,
+                    "staged KV pools expose incompatible cache layouts"
+                );
+            }
+            acc.block_size = first.block_size;
+            acc.num_blocks = kv_pool_indices
+                .iter()
+                .map(|index| pools[*index].exec.caps().num_blocks)
+                .min()
+                .unwrap_or(first.num_blocks);
+            acc.num_layers = first.num_layers;
+            acc.groups = first.groups;
+            acc.kv_dtype = first.kv_dtype;
+            acc.quantization = first.quantization;
+            acc.bytes_per_token = kv_pool_indices
+                .iter()
+                .map(|index| pools[*index].exec.caps().bytes_per_token)
+                .max()
+                .unwrap_or(first.bytes_per_token);
         }
-    }
 
-    /// Single-pool router: every op kind routes to the one pool. Behavior-
-    /// identical to driving `exec` directly; used as the degenerate
-    /// non-disaggregated path.
-    pub fn single(kind: WorkerKind, exec: Box<dyn Executor>) -> Self {
-        let mut router = Self::new(vec![(kind, exec)]);
-        // A single pool owns every kind, even those outside its declared subset,
-        // so a stray op kind never hits a routing gap.
-        for op in all_op_kinds() {
-            router.routing.insert(op, 0);
+        acc.supported_ops = all_op_kinds()
+            .into_iter()
+            .filter(|kind| routing.contains_key(kind))
+            .collect();
+        acc.supported_controls.clear();
+        acc.resource_classes.clear();
+        for pool in pools {
+            let caps = pool.exec.caps();
+            extend_unique(&mut acc.supported_controls, caps.supported_controls);
+            extend_unique(&mut acc.resource_classes, caps.resource_classes);
         }
-        router
-    }
-
-    /// The Understanding/Generation 2-role split. Understanding ops (text +
-    /// vision-encode) route to `und`; generation ops (`denoise_gen`/`commit_gen`)
-    /// route to `gen_worker`.
-    pub fn two_role(und: Box<dyn Executor>, gen_worker: Box<dyn Executor>) -> Self {
-        // The Und/Gen WorkerKind op-subsets encode the understanding-vs-generation
-        // split directly, so the generic `new` router produces exactly this
-        // routing — no manual override. A `--workers und:1,gen:1` topology
-        // composes the same thing through `spawn_staged`.
-        Self::new(vec![(WorkerKind::Und, und), (WorkerKind::Gen, gen_worker)])
-    }
-
-    fn merge_caps(pools: &[PoolEntry]) -> EngineCaps {
-        // Fold the secondary pools' caps into the first pool's (which seeds the
-        // non-merged fields). Op/control/class unions are order-preserving and
-        // O(n)-deduped via a HashSet of the already-seen values.
-        pools[1..]
+        acc.pipeline_depth = pools
             .iter()
-            .fold(pools[0].exec.caps(), |mut acc, pool| {
-                let other = pool.exec.caps();
-                extend_unique(&mut acc.supported_ops, other.supported_ops);
-                extend_unique(&mut acc.supported_controls, other.supported_controls);
-                extend_unique(&mut acc.resource_classes, other.resource_classes);
-                acc.max_latent_size = acc.max_latent_size.max(other.max_latent_size);
-                acc.max_vae_grid_tokens = acc.max_vae_grid_tokens.max(other.max_vae_grid_tokens);
-                acc.max_vit_grid_tokens = acc.max_vit_grid_tokens.max(other.max_vit_grid_tokens);
-                acc.commit_marker_tokens = acc.commit_marker_tokens.max(other.commit_marker_tokens);
-                acc.gen_rope_advance = acc.gen_rope_advance.max(other.gen_rope_advance);
-                acc.max_cfg_branches = acc.max_cfg_branches.max(other.max_cfg_branches);
-                acc.scratch_capacity_tokens = acc
-                    .scratch_capacity_tokens
-                    .saturating_add(other.scratch_capacity_tokens);
-                acc.pipeline_depth = acc.pipeline_depth.min(other.pipeline_depth).max(1);
-                acc
-            })
+            .map(|pool| pool.exec.caps().pipeline_depth.max(1))
+            .min()
+            .unwrap_or(1);
+        let batch_limits = pools
+            .iter()
+            .map(|pool| pool.exec.caps().execution_constraints.max_batch_ops)
+            .filter(|limit| *limit > 0)
+            .collect::<Vec<_>>();
+        acc.execution_constraints.max_batch_ops = batch_limits.into_iter().min().unwrap_or(0);
+
+        let denoise = routed_caps(OpKind::DenoiseGen);
+        acc.max_latent_size = denoise.as_ref().map_or(0, |caps| caps.max_latent_size);
+        acc.latent_downsample = denoise.as_ref().map_or(0, |caps| caps.latent_downsample);
+        acc.max_cfg_branches = denoise.as_ref().map_or(0, |caps| caps.max_cfg_branches);
+        acc.scratch_capacity_tokens = denoise
+            .as_ref()
+            .map_or(0, |caps| caps.scratch_capacity_tokens);
+        acc.max_vae_grid_tokens = routed_caps(OpKind::VaeEncode)
+            .as_ref()
+            .map_or(0, |caps| caps.max_vae_grid_tokens);
+        acc.max_vit_grid_tokens = routed_caps(OpKind::VitEncode)
+            .as_ref()
+            .map_or(0, |caps| caps.max_vit_grid_tokens);
+        let commit = routed_caps(OpKind::CommitGen);
+        acc.commit_marker_tokens = commit
+            .as_ref()
+            .map_or(acc.commit_marker_tokens, |caps| caps.commit_marker_tokens);
+        acc.gen_rope_advance = commit
+            .as_ref()
+            .map_or(acc.gen_rope_advance, |caps| caps.gen_rope_advance);
+        acc.encoder_cache_budget = [OpKind::VaeEncode, OpKind::VitEncode]
+            .into_iter()
+            .filter_map(|kind| routed_caps(kind).map(|caps| caps.encoder_cache_budget))
+            .min()
+            .unwrap_or(0);
+        if let Some(decode) = routed_caps(OpKind::DecodeUnd) {
+            acc.adapter_mode = decode.adapter_mode;
+        }
+        Ok(acc)
     }
 
     fn route_for(&self, op: &ForwardOp) -> anyhow::Result<usize> {
@@ -367,10 +435,11 @@ impl StageRouter {
                     if let Some(locator) = &seq.locator {
                         to_record.push((seq.req_id, locator.clone()));
                     }
-                } else if commit_gen_pool == Some(pool_idx) && seq.logits_handle.is_none() {
-                    if let Some(locator) = &seq.locator {
-                        to_record_commit.push((seq.req_id, locator.clone()));
-                    }
+                } else if commit_gen_pool == Some(pool_idx)
+                    && seq.logits_handle.is_none()
+                    && let Some(locator) = &seq.locator
+                {
+                    to_record_commit.push((seq.req_id, locator.clone()));
                 }
                 step.outputs[slot] = Some(seq);
             }
@@ -474,7 +543,7 @@ impl StageRouter {
         let step = self
             .pending
             .remove(&step_id)
-            .expect("pending step vanished during completion");
+            .ok_or_else(|| anyhow::anyhow!("pending step {step_id} vanished during completion"))?;
         let mut merged = Vec::with_capacity(step.outputs.len());
         for slot in step.outputs {
             merged.push(slot.ok_or_else(|| {
@@ -502,6 +571,22 @@ impl Executor for StageRouter {
 
     fn in_flight(&self) -> usize {
         self.pending.len() + self.ready.len()
+    }
+
+    fn generated_image_commit_capabilities(
+        &self,
+    ) -> uniserve_core::GeneratedImageCommitCapabilities {
+        if self.commit_edge.is_some() {
+            uniserve_core::GeneratedImageCommitCapabilities {
+                inline: false,
+                separate_writeback: true,
+            }
+        } else {
+            uniserve_core::GeneratedImageCommitCapabilities {
+                inline: true,
+                separate_writeback: false,
+            }
+        }
     }
 
     fn can_submit(&self) -> bool {
@@ -538,24 +623,25 @@ impl Executor for StageRouter {
             // into this request's `denoise_gen` op so the gen pool fetches the
             // text KV it never produced (read-driven crossing, §4.2). Inert when
             // there is no und→gen edge or nothing was recorded.
-            if Some(idx) == gen_pool && op.kind == OpKind::DenoiseGen && op.locator.is_none() {
-                if let Some(locator) = self.mover.take_conditioning(op.req_id) {
-                    op.locator = Some(locator);
-                    // First denoise step for this request (the step that consumes
-                    // the locator): replay its admission new_req so the gen worker
-                    // registers the request's image params it never saw.
-                    if let Some(nr) = self.req_sampling.get(&op.req_id) {
-                        gen_new_reqs.push(nr.clone());
-                    }
+            if Some(idx) == gen_pool
+                && op.kind == OpKind::DenoiseGen
+                && op.locator.is_none()
+                && let Some(locator) = self.mover.take_conditioning(op.req_id)
+            {
+                op.locator = Some(locator);
+                // First denoise step for this request (the step that consumes
+                // the locator): replay its admission new_req so the gen worker
+                // registers the request's image params it never saw.
+                if let Some(nr) = self.req_sampling.get(&op.req_id) {
+                    gen_new_reqs.push(nr.clone());
                 }
             }
             if Some(idx) == commit_und_pool
                 && op.kind == OpKind::CommitWriteback
                 && op.locator.is_none()
+                && let Some(locator) = self.mover.take_commit_latent(op.req_id)
             {
-                if let Some(locator) = self.mover.take_commit_latent(op.req_id) {
-                    op.locator = Some(locator);
-                }
+                op.locator = Some(locator);
             }
             partitions[idx].push(op);
         }
@@ -736,12 +822,20 @@ mod tests {
 
     impl PoolExec {
         fn new() -> Self {
-            let mut caps = EngineCaps::default();
-            caps.pipeline_depth = 4;
+            let caps = EngineCaps {
+                pipeline_depth: 4,
+                ..Default::default()
+            };
             Self {
                 caps,
                 queued: VecDeque::new(),
             }
+        }
+
+        fn for_kind(kind: WorkerKind) -> Self {
+            let mut exec = Self::new();
+            exec.caps.supported_ops = kind.supported_ops().to_vec();
+            exec
         }
     }
 
@@ -797,6 +891,103 @@ mod tests {
         }
     }
 
+    #[test]
+    fn staged_capabilities_follow_the_pool_that_executes_each_resource_op() {
+        let mut und_caps = EngineCaps {
+            supported_ops: vec![
+                OpKind::PrefillUnd,
+                OpKind::DecodeUnd,
+                OpKind::TargetVerifyUnd,
+                OpKind::CommitWriteback,
+                OpKind::VaeEncode,
+                OpKind::VitEncode,
+                OpKind::Sample,
+            ],
+            max_latent_size: 0,
+            latent_downsample: 0,
+            max_vae_grid_tokens: 321,
+            max_vit_grid_tokens: 654,
+            scratch_capacity_tokens: 10_000,
+            encoder_cache_budget: 12,
+            ..EngineCaps::default()
+        };
+        und_caps.pipeline_depth = 5;
+        let mut gen_caps = EngineCaps {
+            supported_ops: vec![OpKind::DenoiseGen, OpKind::CommitGen, OpKind::EncodeFrame],
+            max_latent_size: 4_096,
+            latent_downsample: 16,
+            max_cfg_branches: 2,
+            scratch_capacity_tokens: 777,
+            commit_marker_tokens: 3,
+            gen_rope_advance: 4,
+            ..EngineCaps::default()
+        };
+        gen_caps.pipeline_depth = 3;
+        let router = StageRouter::try_new(vec![
+            (
+                WorkerKind::Und,
+                Box::new(PoolExec {
+                    caps: und_caps,
+                    queued: VecDeque::new(),
+                }),
+            ),
+            (
+                WorkerKind::Gen,
+                Box::new(PoolExec {
+                    caps: gen_caps,
+                    queued: VecDeque::new(),
+                }),
+            ),
+        ])
+        .expect("compatible staged pools");
+
+        let caps = router.caps();
+        assert_eq!(caps.max_latent_size, 4_096);
+        assert_eq!(caps.latent_downsample, 16);
+        assert_eq!(caps.max_cfg_branches, 2);
+        assert_eq!(caps.scratch_capacity_tokens, 777);
+        assert_eq!(caps.max_vae_grid_tokens, 321);
+        assert_eq!(caps.max_vit_grid_tokens, 654);
+        assert_eq!(caps.encoder_cache_budget, 12);
+        assert_eq!(caps.commit_marker_tokens, 3);
+        assert_eq!(caps.gen_rope_advance, 4);
+        assert_eq!(caps.pipeline_depth, 3);
+    }
+
+    #[test]
+    fn staged_kv_pools_reject_incompatible_block_geometry() {
+        let prefill_caps = EngineCaps {
+            block_size: 16,
+            supported_ops: vec![OpKind::PrefillUnd],
+            ..EngineCaps::default()
+        };
+        let decode_caps = EngineCaps {
+            block_size: 32,
+            supported_ops: vec![OpKind::DecodeUnd, OpKind::TargetVerifyUnd],
+            ..EngineCaps::default()
+        };
+
+        let error = StageRouter::try_new(vec![
+            (
+                WorkerKind::Prefill,
+                Box::new(PoolExec {
+                    caps: prefill_caps,
+                    queued: VecDeque::new(),
+                }),
+            ),
+            (
+                WorkerKind::Decode,
+                Box::new(PoolExec {
+                    caps: decode_caps,
+                    queued: VecDeque::new(),
+                }),
+            ),
+        ])
+        .err()
+        .expect("incompatible block sizes must fail");
+        assert!(error.to_string().contains("block_size"));
+    }
+
     fn op(req_id: u64, kind: OpKind, modality: Modality) -> ForwardOp {
         ForwardOp {
             req_id: RequestId(req_id),
@@ -839,9 +1030,23 @@ mod tests {
 
     impl Executor for CommitEdgeExec {
         fn caps(&self) -> EngineCaps {
-            let mut c = EngineCaps::default();
-            c.pipeline_depth = 4;
-            c
+            EngineCaps {
+                pipeline_depth: 4,
+                supported_ops: if self.role == "gen" {
+                    vec![OpKind::DenoiseGen, OpKind::CommitGen, OpKind::EncodeFrame]
+                } else {
+                    vec![
+                        OpKind::PrefillUnd,
+                        OpKind::DecodeUnd,
+                        OpKind::TargetVerifyUnd,
+                        OpKind::CommitWriteback,
+                        OpKind::VaeEncode,
+                        OpKind::VitEncode,
+                        OpKind::Sample,
+                    ]
+                },
+                ..Default::default()
+            }
         }
         fn pipeline_depth(&self) -> usize {
             4
@@ -910,9 +1115,21 @@ mod tests {
 
     impl Executor for RoleExec {
         fn caps(&self) -> EngineCaps {
-            let mut c = EngineCaps::default();
-            c.pipeline_depth = 4;
-            c
+            EngineCaps {
+                pipeline_depth: 4,
+                supported_ops: if self.role == "sampler" {
+                    vec![OpKind::Sample]
+                } else {
+                    vec![
+                        OpKind::DecodeUnd,
+                        OpKind::TargetVerifyUnd,
+                        OpKind::DenoiseGen,
+                        OpKind::CommitGen,
+                        OpKind::CommitWriteback,
+                    ]
+                },
+                ..Default::default()
+            }
         }
         fn pipeline_depth(&self) -> usize {
             4
@@ -1033,10 +1250,10 @@ mod tests {
 
     #[test]
     fn single_pool_is_pass_through_in_order() {
-        let mut router = StageRouter::single(
+        let mut router = StageRouter::new(vec![(
             WorkerKind::Full,
             Box::new(uniserve_testkit::StubExecutor::new().with_pipeline_depth(4)),
-        );
+        )]);
         router
             .submit(ForwardBatch {
                 step_id: 5,
@@ -1056,8 +1273,10 @@ mod tests {
 
     #[test]
     fn two_role_merges_in_original_op_order() {
-        let mut router =
-            StageRouter::two_role(Box::new(PoolExec::new()), Box::new(PoolExec::new()));
+        let mut router = StageRouter::new(vec![
+            (WorkerKind::Und, Box::new(PoolExec::new())),
+            (WorkerKind::Gen, Box::new(PoolExec::new())),
+        ]);
         router
             .submit(ForwardBatch {
                 step_id: 7,
@@ -1080,9 +1299,18 @@ mod tests {
     fn three_pool_epd_routes_by_op_kind() {
         // Encoder + Prefill + Decode pools; ops fan to the owning pool and merge.
         let mut router = StageRouter::new(vec![
-            (WorkerKind::Encoder, Box::new(PoolExec::new())),
-            (WorkerKind::Prefill, Box::new(PoolExec::new())),
-            (WorkerKind::Decode, Box::new(PoolExec::new())),
+            (
+                WorkerKind::Encoder,
+                Box::new(PoolExec::for_kind(WorkerKind::Encoder)),
+            ),
+            (
+                WorkerKind::Prefill,
+                Box::new(PoolExec::for_kind(WorkerKind::Prefill)),
+            ),
+            (
+                WorkerKind::Decode,
+                Box::new(PoolExec::for_kind(WorkerKind::Decode)),
+            ),
         ]);
         router
             .submit(ForwardBatch {
@@ -1107,9 +1335,22 @@ mod tests {
         // `--workers und:1,gen:1` composes) routes understanding ops to the und
         // pool and generation ops to the gen pool, merging in original order.
         let mut router = StageRouter::new(vec![
-            (WorkerKind::Und, Box::new(PoolExec::new())),
-            (WorkerKind::Gen, Box::new(PoolExec::new())),
+            (
+                WorkerKind::Und,
+                Box::new(PoolExec::for_kind(WorkerKind::Und)),
+            ),
+            (
+                WorkerKind::Gen,
+                Box::new(PoolExec::for_kind(WorkerKind::Gen)),
+            ),
         ]);
+        assert_eq!(
+            router.generated_image_commit_capabilities(),
+            uniserve_core::GeneratedImageCommitCapabilities {
+                inline: false,
+                separate_writeback: true,
+            }
+        );
         router
             .submit(ForwardBatch {
                 step_id: 11,
@@ -1158,8 +1399,10 @@ mod tests {
 
     #[test]
     fn control_wait_acks_have_distinct_ranks() {
-        let mut router =
-            StageRouter::two_role(Box::new(PoolExec::new()), Box::new(PoolExec::new()));
+        let mut router = StageRouter::new(vec![
+            (WorkerKind::Und, Box::new(PoolExec::new())),
+            (WorkerKind::Gen, Box::new(PoolExec::new())),
+        ]);
         let acks = router
             .control_wait(ControlOp::ResetPrefixCache, None)
             .unwrap();
@@ -1190,9 +1433,10 @@ mod tests {
 
     impl Executor for RecordingExec {
         fn caps(&self) -> EngineCaps {
-            let mut caps = EngineCaps::default();
-            caps.pipeline_depth = 4;
-            caps
+            EngineCaps {
+                pipeline_depth: 4,
+                ..Default::default()
+            }
         }
         fn pipeline_depth(&self) -> usize {
             4
@@ -1255,9 +1499,12 @@ mod tests {
         // the text KV it never produced.
         let und_ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let gen_ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let und = RecordingExec::new(und_ops.clone(), Some("cond-7".to_string()));
-        let gen_exec = RecordingExec::new(gen_ops.clone(), None);
-        let mut router = StageRouter::two_role(Box::new(und), Box::new(gen_exec));
+        let und = RecordingExec::new(std::sync::Arc::clone(&und_ops), Some("cond-7".to_string()));
+        let gen_exec = RecordingExec::new(std::sync::Arc::clone(&gen_ops), None);
+        let mut router = StageRouter::new(vec![
+            (WorkerKind::Und, Box::new(und)),
+            (WorkerKind::Gen, Box::new(gen_exec)),
+        ]);
 
         // Step 1: und decode for req 7 → its result carries the conditioning locator.
         router

@@ -6,8 +6,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+futures.workspace = true
 serde_json.workspace = true
-uniserve-server-app.workspace = true
+uniserve-core.workspace = true
+uniserve-protocol-adapters.workspace = true
+uniserve-server.workspace = true
 uniserve-serving.workspace = true
 
 [lints]

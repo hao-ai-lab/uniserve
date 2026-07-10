@@ -47,7 +47,7 @@ fn main() {
         caps: Some(EngineCaps {
             num_blocks: 1000,
             scratch_capacity_tokens: 100000,
-            supported_ops: vec!["prefill_und".into()],
+            supported_ops: vec![OpKind::PrefillUnd],
             ..Default::default()
         }),
         result: None,

@@ -8,16 +8,20 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-use uniserve_engine_client::protocol::{
-    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
+use uniserve_core::{
+    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
+    GenerationRuntimeCapabilities, ImageParams, RequestId, SamplingParams, TriggerPolicyDescriptor,
+    UndVisibility,
 };
-use uniserve_engine_client::{
-    EngineCoreClient, EngineSamplingParams, GenEvent, ImageParams, NativeGenerateRequest,
-    TransportMode, ZmqClientConfig,
+use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
+use uniserve_engine_gateway::transport::{
+    EngineCoreClient, GenEvent, GenerationSubmission, TransportMode, ZmqClientConfig,
 };
 use uniserve_engine_process::{EngineProcConfig, run_engine_proc};
 use uniserve_engine_runtime::EngineCoreConfig;
-use uniserve_engine_wire::native::NativeControlTokens;
+use uniserve_engine_wire::generation::GenerationControlTokens;
 
 /// Unique ipc:// endpoint for one test.
 fn ipc_endpoint(tag: &str) -> String {
@@ -59,8 +63,96 @@ fn client_config(handshake_address: &str, engine_count: usize) -> ZmqClientConfi
         },
         model_name: "sim-model".to_string(),
         client_index: 0,
-        native_controls: None,
+        generation_controls: None,
     }
+}
+
+fn generation_request(
+    constraint: GenerationConstraint,
+    sampling: SamplingParams,
+    image: ImageParams,
+    max_und_tokens: usize,
+    trigger_token_id: u32,
+) -> GenerationRequest {
+    let policy = GenerationPolicyDescriptor {
+        trigger: TriggerPolicyDescriptor::Token {
+            token_id: trigger_token_id,
+        },
+        gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
+        feedback: Some(GeneratedImageFeedbackRecipe {
+            commit: CommitRecipe::CommitGenThenWriteback,
+            writeback: FeedbackWriteback::DirectKv,
+            next_und_token: FeedbackNextToken::EndOfImage,
+            logical_positions: 2,
+            physical_kv_tokens: uniserve_core::ImageKvEffect::WorkerDefined,
+        }),
+        ..GenerationPolicyDescriptor::default()
+    };
+    GenerationRequest {
+        request_id: RequestId(0),
+        context: vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3],
+            visibility: UndVisibility::Internal,
+        }],
+        negative_context: Vec::new(),
+        constraint,
+        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+        sampling,
+        image,
+        max_und_tokens,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache: Default::default(),
+        policy,
+        resources: GenerationResourceBounds {
+            context_tokens: 3,
+            max_kv_tokens: 3usize.saturating_add(max_und_tokens),
+            ..GenerationResourceBounds::default()
+        },
+    }
+}
+
+fn declare_resources(
+    mut request: GenerationRequest,
+    capabilities: &GenerationRuntimeCapabilities,
+) -> GenerationRequest {
+    request.resources = GenerationResourceBounds::conservative(
+        &request.context,
+        &request.behavior,
+        &request.policy,
+        &request.image,
+        request.max_und_tokens,
+        &request.cache,
+        capabilities,
+    )
+    .expect("request resources must fit the connected runtime");
+    request
+}
+
+fn text_engine_request(
+    request_id: impl Into<String>,
+    max_tokens: u32,
+    data_parallel_rank: Option<u32>,
+) -> EngineCoreRequest {
+    let sampling = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let mut request = EngineCoreRequest::new(
+        request_id.into(),
+        generation_request(
+            GenerationConstraint::UndOnly,
+            sampling,
+            ImageParams::default(),
+            max_tokens as usize,
+            1000,
+        ),
+    );
+    request.data_parallel_rank = data_parallel_rank;
+    request
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -78,18 +170,7 @@ async fn socket_mode_text_generation() {
     assert_eq!(client.ready_responses().len(), 1);
     assert!(client.total_num_gpu_blocks() > 0);
 
-    let request = EngineCoreRequest {
-        request_id: "req-1".to_string(),
-        prompt_token_ids: Some(vec![1, 2, 3, 4]),
-        sampling_params: Some(EngineCoreSamplingParams {
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            max_tokens: 64,
-            ..EngineCoreSamplingParams::for_test()
-        }),
-        ..Default::default()
-    };
+    let request = text_engine_request("req-1", 64, None);
 
     let mut stream = client.call(request).await.expect("submit request");
 
@@ -129,29 +210,28 @@ async fn socket_mode_native_image_generation() {
         .await
         .expect("connect zmq client");
 
-    // Pure text->image diffusion over the wire: the image events ride the
-    // UniServe `native` protocol extension.
-    let request = NativeGenerateRequest {
-        prompt_ids: vec![1, 2, 3],
-        neg_prompt_ids: vec![],
-        sampling: EngineSamplingParams::default(),
-        image: ImageParams {
-            steps: 4,
-            ..ImageParams::default()
-        },
-        constraint: uniserve_core::GenerationConstraint::GenOnly,
-        max_tokens: 0,
-        mm_items: vec![],
-        stop_token_ids: vec![],
-    };
+    let request = declare_resources(
+        generation_request(
+            GenerationConstraint::GenOnly,
+            SamplingParams::default(),
+            ImageParams {
+                steps: 4,
+                ..ImageParams::default()
+            },
+            0,
+            1000,
+        ),
+        &client.generation_capabilities(),
+    );
 
     let mut stream = client
-        .generate_native(request)
+        .submit_generation(GenerationSubmission::new("req-image", request))
         .await
         .expect("submit native request");
 
     let mut begins = 0usize;
     let mut steps = 0usize;
+    let mut commits = 0usize;
     let mut dones = 0usize;
     let mut png = String::new();
     let mut finished = false;
@@ -159,6 +239,7 @@ async fn socket_mode_native_image_generation() {
         match ev {
             GenEvent::ImageBegin { .. } => begins += 1,
             GenEvent::ImageStep { .. } => steps += 1,
+            GenEvent::ImageCommit { .. } => commits += 1,
             GenEvent::ImageDone { pixels_png_b64, .. } => {
                 dones += 1;
                 png = pixels_png_b64;
@@ -168,6 +249,7 @@ async fn socket_mode_native_image_generation() {
                 finished = true;
                 break;
             }
+            GenEvent::Rejected { message } => panic!("request rejected: {message}"),
             GenEvent::Error { message } => panic!("engine error: {message}"),
             _ => {}
         }
@@ -178,6 +260,7 @@ async fn socket_mode_native_image_generation() {
         (1..=4).contains(&steps),
         "expected per-step diffusion progress, got {steps}"
     );
+    assert_eq!(commits, 1, "expected one ImageCommit");
     assert_eq!(dones, 1, "expected one ImageDone");
     assert!(!png.is_empty(), "expected PNG bytes to cross the wire");
     assert!(finished, "expected a terminal Finished event");
@@ -194,57 +277,62 @@ async fn socket_mode_default_generation() {
     let proc_task = spawn_sim_proc(&handshake, 0, shutdown.clone());
 
     let mut cfg = client_config(&handshake, 1);
-    cfg.native_controls = Some(NativeControlTokens {
-        start_of_image: 2222,
+    cfg.generation_controls = Some(GenerationControlTokens {
         ..Default::default()
     });
     let client = EngineCoreClient::connect_zmq(cfg)
         .await
         .expect("connect zmq client");
 
-    // Mixed text+image over the wire: text rounds and two images.
-    let request = NativeGenerateRequest {
-        prompt_ids: vec![1, 2, 3],
-        neg_prompt_ids: vec![],
-        sampling: EngineSamplingParams {
-            logit_bias: vec![(2222, 1000.0)],
-            ..EngineSamplingParams::default()
-        },
-        image: ImageParams {
-            steps: 2,
-            max_images: 2,
-            ..ImageParams::default()
-        },
-        constraint: uniserve_core::GenerationConstraint::Default,
-        max_tokens: 64,
-        mm_items: vec![],
-        stop_token_ids: vec![],
-    };
+    let request = declare_resources(
+        generation_request(
+            GenerationConstraint::Default,
+            SamplingParams {
+                logit_bias: vec![(2222, 1000.0)],
+                ..SamplingParams::default()
+            },
+            ImageParams {
+                steps: 2,
+                max_images: 2,
+                ..ImageParams::default()
+            },
+            64,
+            2222,
+        ),
+        &client.generation_capabilities(),
+    );
 
     let mut stream = client
-        .generate_native(request)
+        .submit_generation(GenerationSubmission::new("req-mixed", request))
         .await
         .expect("submit native request");
 
     let mut text_tokens = 0usize;
+    let mut commits = 0usize;
     let mut dones = 0usize;
     let mut finished_images = 0usize;
     let mut finished = false;
     while let Some(ev) = stream.next().await {
         match ev {
             GenEvent::TextToken { .. } => text_tokens += 1,
+            GenEvent::ImageCommit { .. } => commits += 1,
             GenEvent::ImageDone { .. } => dones += 1,
             GenEvent::Finished { images, .. } => {
                 finished_images = images;
                 finished = true;
                 break;
             }
+            GenEvent::Rejected { message } => panic!("request rejected: {message}"),
             GenEvent::Error { message } => panic!("engine error: {message}"),
             _ => {}
         }
     }
 
     assert!(finished, "expected a terminal Finished event");
+    assert_eq!(
+        commits, dones,
+        "every completed image must commit exactly once"
+    );
     assert!(
         text_tokens >= 1,
         "expected mixed-output text, got {text_tokens} tokens"
@@ -304,17 +392,7 @@ async fn socket_mode_two_engines_distribute_and_route() {
     identities.sort();
     assert_eq!(identities, vec![&[0u8, 0u8][..], &[1u8, 0u8][..]]);
 
-    let request = |id: &str, rank: Option<u32>| EngineCoreRequest {
-        request_id: id.to_string(),
-        prompt_token_ids: Some(vec![1, 2, 3]),
-        sampling_params: Some(EngineCoreSamplingParams {
-            temperature: 0.0,
-            max_tokens: 32,
-            ..EngineCoreSamplingParams::for_test()
-        }),
-        data_parallel_rank: rank,
-        ..Default::default()
-    };
+    let request = |id: &str, rank: Option<u32>| text_engine_request(id, 32, rank);
 
     // Load-balanced distribution: submit 6 concurrent requests; the
     // least-loaded score alternates them across both engines.
@@ -386,10 +464,10 @@ fn rand_tag() -> u32 {
 /// and new requests must fail fast.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn engine_dead_sentinel_latches_health() {
-    use uniserve_engine_client::protocol::handshake::{
+    use uniserve_engine_gateway::transport::protocol::handshake::{
         EngineCoreReadyResponse, HandshakeInitMessage, ReadyMessage,
     };
-    use uniserve_engine_client::protocol::{
+    use uniserve_engine_gateway::transport::protocol::{
         ENGINE_CORE_DEAD_SENTINEL, ModelDtype, decode_msgpack, encode_msgpack,
     };
     use zeromq::prelude::{Socket, SocketRecv, SocketSend};
@@ -436,6 +514,7 @@ async fn engine_dead_sentinel_latches_health() {
             dp_stats_address: None,
             dtype: ModelDtype::BFloat16,
             uniserve_version: "test".into(),
+            generation_capabilities: uniserve_core::GenerationRuntimeCapabilities::default(),
         };
         input
             .send(ZmqMessage::from(encode_msgpack(&ready).unwrap()))
@@ -467,15 +546,7 @@ async fn engine_dead_sentinel_latches_health() {
         .expect("connect to fake engine");
     assert!(client.is_healthy());
 
-    let request = EngineCoreRequest {
-        request_id: "req-dead".to_string(),
-        prompt_token_ids: Some(vec![1, 2, 3]),
-        sampling_params: Some(EngineCoreSamplingParams {
-            max_tokens: 8,
-            ..EngineCoreSamplingParams::for_test()
-        }),
-        ..Default::default()
-    };
+    let request = text_engine_request("req-dead", 8, None);
     let mut stream = client.call(request).await.expect("submit request");
 
     // The in-flight stream resolves with an error once the sentinel lands.
@@ -497,12 +568,7 @@ async fn engine_dead_sentinel_latches_health() {
         "health latch must record engine death"
     );
     assert!(client.health_error().is_some());
-    let request = EngineCoreRequest {
-        request_id: "req-after-death".to_string(),
-        prompt_token_ids: Some(vec![1]),
-        sampling_params: Some(EngineCoreSamplingParams::for_test()),
-        ..Default::default()
-    };
+    let request = text_engine_request("req-after-death", 1, None);
     assert!(
         client.call(request).await.is_err(),
         "new requests must fail fast after engine death"

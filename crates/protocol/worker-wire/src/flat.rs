@@ -11,8 +11,8 @@ use crate::resources::{ResourceClass, ResourcePressure};
 use crate::schema::uniserve::wire as fbs;
 use crate::{
     AdapterMode, EngineCaps, ExecutionConstraints, ForwardBatch, ForwardOp, ForwardResult,
-    NewRequestData, OpKind, RequestKind, SeqResult, TokenSource, WorkerForwardStats, WorkerMetrics,
-    WorkerRequest, WorkerResponse,
+    NewRequestData, OpKind, RequestKind, SeqResult, TokenLogprob, TokenSource, WorkerForwardStats,
+    WorkerMetrics, WorkerRequest, WorkerResponse,
 };
 
 pub fn encode_request(req: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
@@ -230,6 +230,7 @@ fn op_to_fb(op: &ForwardOp) -> anyhow::Result<fbs::ForwardOpT> {
         decode_token_count: op.decode_token_count,
         decode_stop_token_ids: op.decode_stop_token_ids.clone(),
         decode_stop_terminal: op.decode_stop_terminal,
+        return_all_logits: op.return_all_logits,
         op_id: op.op_id,
         logits_handle: op.logits_handle,
         locator: op.locator.clone(),
@@ -266,6 +267,7 @@ fn op_from_fb(op: fbs::ForwardOpT) -> anyhow::Result<ForwardOp> {
         decode_token_count: op.decode_token_count,
         decode_stop_token_ids: op.decode_stop_token_ids,
         decode_stop_terminal: op.decode_stop_terminal,
+        return_all_logits: op.return_all_logits,
         op_id: op.op_id,
         logits_handle: op.logits_handle,
         locator: op.locator,
@@ -275,7 +277,13 @@ fn op_from_fb(op: fbs::ForwardOpT) -> anyhow::Result<ForwardOp> {
 fn result_to_fb(result: &ForwardResult) -> anyhow::Result<fbs::ForwardResultT> {
     Ok(fbs::ForwardResultT {
         step_id: result.step_id,
-        per_seq: Some(result.per_seq.iter().map(seq_result_to_fb).collect()),
+        per_seq: Some(
+            result
+                .per_seq
+                .iter()
+                .map(seq_result_to_fb)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        ),
         worker_exec_us: result.worker_exec_us,
         forward_stats: result
             .forward_stats
@@ -293,7 +301,7 @@ fn result_from_fb(result: fbs::ForwardResultT) -> anyhow::Result<ForwardResult> 
             .unwrap_or_default()
             .into_iter()
             .map(seq_result_from_fb)
-            .collect(),
+            .collect::<anyhow::Result<Vec<_>>>()?,
         worker_exec_us: result.worker_exec_us,
         forward_stats: result
             .forward_stats
@@ -371,8 +379,9 @@ fn forward_stats_from_fb(stats: fbs::WorkerForwardStatsT) -> WorkerForwardStats 
     }
 }
 
-fn seq_result_to_fb(sr: &SeqResult) -> fbs::SeqResultT {
-    fbs::SeqResultT {
+fn seq_result_to_fb(sr: &SeqResult) -> anyhow::Result<fbs::SeqResultT> {
+    validate_seq_result_logprobs(sr)?;
+    Ok(fbs::SeqResultT {
         req_id: sr.req_id.0,
         sampled_token_id: sr.sampled_token_id,
         denoise_done: sr.denoise_done,
@@ -386,9 +395,27 @@ fn seq_result_to_fb(sr: &SeqResult) -> fbs::SeqResultT {
         top_logprobs: sr.top_logprobs.as_ref().map(|items| {
             items
                 .iter()
-                .map(|(token_id, logprob)| fbs::TokenLogprobT {
-                    token_id: *token_id,
-                    logprob: *logprob,
+                .map(|item| fbs::TokenLogprobT {
+                    token_id: item.0,
+                    logprob: item.1,
+                    rank: item.2,
+                })
+                .collect()
+        }),
+        prompt_logprobs: sr.prompt_logprobs.as_ref().map(|positions| {
+            positions
+                .iter()
+                .map(|entries| fbs::PositionLogprobsT {
+                    entries: Some(
+                        entries
+                            .iter()
+                            .map(|item| fbs::TokenLogprobT {
+                                token_id: item.0,
+                                logprob: item.1,
+                                rank: item.2,
+                            })
+                            .collect(),
+                    ),
                 })
                 .collect()
         }),
@@ -399,12 +426,21 @@ fn seq_result_to_fb(sr: &SeqResult) -> fbs::SeqResultT {
         op_id: sr.op_id,
         logits_handle: sr.logits_handle,
         locator: sr.locator.clone(),
-    }
+        op_kind: sr
+            .op_kind
+            .map(op_kind_to_fb)
+            .unwrap_or(fbs::OpKind::PrefillUnd),
+        has_op_kind: sr.op_kind.is_some(),
+    })
 }
 
-fn seq_result_from_fb(sr: fbs::SeqResultT) -> SeqResult {
-    SeqResult {
+fn seq_result_from_fb(sr: fbs::SeqResultT) -> anyhow::Result<SeqResult> {
+    let result = SeqResult {
         req_id: RequestId(sr.req_id),
+        op_kind: sr
+            .has_op_kind
+            .then(|| op_kind_from_fb(sr.op_kind))
+            .transpose()?,
         sampled_token_id: sr.sampled_token_id,
         denoise_done: sr.denoise_done,
         num_steps_done: sr.num_steps_done,
@@ -418,7 +454,20 @@ fn seq_result_from_fb(sr: fbs::SeqResultT) -> SeqResult {
         top_logprobs: sr.top_logprobs.map(|items| {
             items
                 .into_iter()
-                .map(|item| (item.token_id, item.logprob))
+                .map(|item| crate::TokenLogprob(item.token_id, item.logprob, item.rank))
+                .collect()
+        }),
+        prompt_logprobs: sr.prompt_logprobs.map(|positions| {
+            positions
+                .into_iter()
+                .map(|position| {
+                    position
+                        .entries
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|item| crate::TokenLogprob(item.token_id, item.logprob, item.rank))
+                        .collect()
+                })
                 .collect()
         }),
         sampled_token_ids: sr.sampled_token_ids,
@@ -428,7 +477,41 @@ fn seq_result_from_fb(sr: fbs::SeqResultT) -> SeqResult {
         op_id: sr.op_id,
         logits_handle: sr.logits_handle,
         locator: sr.locator,
+    };
+    validate_seq_result_logprobs(&result)?;
+    Ok(result)
+}
+
+fn validate_seq_result_logprobs(result: &SeqResult) -> anyhow::Result<()> {
+    if result
+        .sampled_logprob
+        .is_some_and(|value| !value.is_finite())
+    {
+        bail!("sampled_logprob must be finite");
     }
+    if let Some(entries) = &result.top_logprobs {
+        for (index, entry) in entries.iter().enumerate() {
+            validate_token_logprob(entry, &format!("top_logprobs[{index}]"))?;
+        }
+    }
+    if let Some(positions) = &result.prompt_logprobs {
+        for (position, entries) in positions.iter().enumerate() {
+            for (index, entry) in entries.iter().enumerate() {
+                validate_token_logprob(entry, &format!("prompt_logprobs[{position}][{index}]"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_token_logprob(entry: &TokenLogprob, where_: &str) -> anyhow::Result<()> {
+    if !entry.1.is_finite() {
+        bail!("{where_}.logprob must be finite");
+    }
+    if entry.2 == 0 {
+        bail!("{where_}.rank must be at least 1");
+    }
+    Ok(())
 }
 
 fn token_source_to_fb(source: TokenSource) -> fbs::TokenSource {
@@ -455,8 +538,9 @@ fn caps_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
         supported_ops: Some(
             caps.supported_ops
                 .iter()
-                .map(|op| op_kind_name_to_fb(op))
-                .collect::<anyhow::Result<_>>()?,
+                .copied()
+                .map(op_kind_to_fb)
+                .collect(),
         ),
         max_latent_size: caps.max_latent_size,
         latent_downsample: caps.latent_downsample,
@@ -507,7 +591,7 @@ fn caps_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
             .supported_ops
             .unwrap_or_default()
             .into_iter()
-            .map(|op| Ok(op_kind_wire_name(op_kind_from_fb(op)?).to_string()))
+            .map(op_kind_from_fb)
             .collect::<anyhow::Result<_>>()?,
         max_latent_size: caps.max_latent_size,
         latent_downsample: caps.latent_downsample,
@@ -584,7 +668,11 @@ fn sampling_to_fb(s: &SamplingParams) -> anyhow::Result<fbs::SamplingParamsT> {
                 .collect(),
         ),
         min_tokens: s.min_tokens as u64,
+        return_logprobs: s.return_logprobs,
         n_logprobs: s.n_logprobs,
+        return_prompt_logprobs: s.return_prompt_logprobs,
+        n_prompt_logprobs: s.n_prompt_logprobs,
+        logprob_token_ids: Some(s.logprob_token_ids.clone()),
         bad_words_ids: Some(
             s.bad_words_ids
                 .iter()
@@ -627,7 +715,11 @@ fn sampling_from_fb(s: fbs::SamplingParamsT) -> anyhow::Result<SamplingParams> {
             .map(|item| (item.token_id, item.bias))
             .collect(),
         min_tokens: usize::try_from(s.min_tokens).context("min_tokens does not fit usize")?,
+        return_logprobs: s.return_logprobs,
         n_logprobs: s.n_logprobs,
+        return_prompt_logprobs: s.return_prompt_logprobs,
+        n_prompt_logprobs: s.n_prompt_logprobs,
+        logprob_token_ids: s.logprob_token_ids.unwrap_or_default(),
         bad_words_ids: s
             .bad_words_ids
             .unwrap_or_default()
@@ -881,21 +973,6 @@ fn op_kind_to_fb(kind: OpKind) -> fbs::OpKind {
     }
 }
 
-fn op_kind_wire_name(kind: OpKind) -> &'static str {
-    match kind {
-        OpKind::PrefillUnd => "prefill_und",
-        OpKind::DecodeUnd => "decode_und",
-        OpKind::TargetVerifyUnd => "target_verify_und",
-        OpKind::DenoiseGen => "denoise_gen",
-        OpKind::CommitGen => "commit_gen",
-        OpKind::CommitWriteback => "commit_writeback",
-        OpKind::VaeEncode => "vae_encode",
-        OpKind::VitEncode => "vit_encode",
-        OpKind::Sample => "sample",
-        OpKind::EncodeFrame => "encode_frame",
-    }
-}
-
 fn op_kind_from_fb(kind: fbs::OpKind) -> anyhow::Result<OpKind> {
     if kind == fbs::OpKind::PrefillUnd {
         Ok(OpKind::PrefillUnd)
@@ -920,22 +997,6 @@ fn op_kind_from_fb(kind: fbs::OpKind) -> anyhow::Result<OpKind> {
     } else {
         bail!("unknown op kind {}", kind.0)
     }
-}
-
-fn op_kind_name_to_fb(kind: &str) -> anyhow::Result<fbs::OpKind> {
-    Ok(match kind {
-        "prefill_und" => fbs::OpKind::PrefillUnd,
-        "decode_und" => fbs::OpKind::DecodeUnd,
-        "target_verify_und" => fbs::OpKind::TargetVerifyUnd,
-        "denoise_gen" => fbs::OpKind::DenoiseGen,
-        "commit_gen" => fbs::OpKind::CommitGen,
-        "commit_writeback" => fbs::OpKind::CommitWriteback,
-        "vae_encode" => fbs::OpKind::VaeEncode,
-        "vit_encode" => fbs::OpKind::VitEncode,
-        "sample" => fbs::OpKind::Sample,
-        "encode_frame" => fbs::OpKind::EncodeFrame,
-        other => bail!("unknown supported op kind {other:?}"),
-    })
 }
 
 fn modality_to_fb(modality: Modality) -> fbs::Modality {
@@ -989,7 +1050,7 @@ const RESPONSE_KINDS: &[(&str, fbs::RespKind)] = &[
 ];
 
 /// The canonical request-kind names accepted by the wire, in declaration order.
-
+///
 /// Exposed so the lower-level header codec (`worker-ipc-core`) can pin its own
 /// `request_kind_code` table against this single source rather than maintaining
 /// an independent, drift-prone copy.
@@ -1105,14 +1166,35 @@ mod tests {
             ..Default::default()
         };
 
-        let fb = seq_result_to_fb(&native);
+        let fb = seq_result_to_fb(&native).expect("valid sequence result");
         // The schema field named `image_hw_h` must carry the height component,
         // and `image_hw_w` the width component.
         assert_eq!(fb.image_hw_h, Some(height));
         assert_eq!(fb.image_hw_w, Some(width));
 
-        let back = seq_result_from_fb(fb);
+        let back = seq_result_from_fb(fb).expect("valid sequence result");
         assert_eq!(back.image_hw, Some((height, width)));
+    }
+
+    #[test]
+    fn seq_result_rejects_non_finite_logprobs_and_zero_ranks() {
+        let non_finite = SeqResult {
+            req_id: RequestId(1),
+            sampled_logprob: Some(f32::NAN),
+            ..Default::default()
+        };
+        assert!(seq_result_to_fb(&non_finite).is_err());
+
+        let zero_rank = fbs::SeqResultT {
+            req_id: 1,
+            top_logprobs: Some(vec![fbs::TokenLogprobT {
+                token_id: 7,
+                logprob: -0.5,
+                rank: 0,
+            }]),
+            ..Default::default()
+        };
+        assert!(seq_result_from_fb(zero_rank).is_err());
     }
 
     #[test]
@@ -1142,23 +1224,31 @@ mod tests {
 
     #[test]
     fn sampling_from_fb_rejects_non_finite_floats() {
-        let mut s = fbs::SamplingParamsT::default();
-        s.temperature = f32::NAN;
+        let s = fbs::SamplingParamsT {
+            temperature: f32::NAN,
+            ..Default::default()
+        };
         assert!(sampling_from_fb(s).is_err());
 
-        let mut s = fbs::SamplingParamsT::default();
-        s.top_p = f32::INFINITY;
+        let s = fbs::SamplingParamsT {
+            top_p: f32::INFINITY,
+            ..Default::default()
+        };
         assert!(sampling_from_fb(s).is_err());
     }
 
     #[test]
     fn cfg_from_fb_rejects_non_finite_floats() {
-        let mut cfg = fbs::CfgParamsT::default();
-        cfg.text_scale = f32::NAN;
+        let cfg = fbs::CfgParamsT {
+            text_scale: f32::NAN,
+            ..Default::default()
+        };
         assert!(cfg_from_fb(cfg).is_err());
 
-        let mut cfg = fbs::CfgParamsT::default();
-        cfg.interval_hi = f32::NEG_INFINITY;
+        let cfg = fbs::CfgParamsT {
+            interval_hi: f32::NEG_INFINITY,
+            ..Default::default()
+        };
         assert!(cfg_from_fb(cfg).is_err());
 
         // A fully-finite cfg still decodes.

@@ -69,7 +69,7 @@ class ErrorPolicy(NamedTuple):
 # traceback" so request-handling code never re-lists that set by hand.
 _DEFAULT_POLICY = ErrorPolicy(retryable=False, fatal=False, capture_trace=False)
 
-_POLICY: dict[ErrorCode, ErrorPolicy] = {
+_POLICY: dict[str, ErrorPolicy] = {
     ErrorCode.UNSUPPORTED_OPERATION: ErrorPolicy(False, False, False),
     ErrorCode.UNSUPPORTED_CONTROL: ErrorPolicy(False, False, False),
     ErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False, False),
@@ -233,7 +233,7 @@ def distributed_setup_error(message: str, **kw: Any) -> WorkerError:
 #   - the typed checks (NotImplementedError / wire-decode errors / AssertionError)
 #     follow the text/hierarchy heuristics.
 # An exception matching no rule falls through to MODEL_EXECUTION_ERROR below.
-_CLASSIFY_RULES: list[tuple[Any, str]] = [
+_CLASSIFY_RULES: list[tuple[Any, ErrorCode]] = [
     (lambda exc, lowered: _looks_like_fatal_cuda(lowered), ErrorCode.FATAL_WORKER_FAILURE),
     (lambda exc, lowered: _looks_like_oom(exc, lowered), ErrorCode.WORKER_OOM),
     (lambda exc, lowered: isinstance(exc, NotImplementedError), ErrorCode.UNSUPPORTED_OPERATION),

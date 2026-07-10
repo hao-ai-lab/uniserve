@@ -58,7 +58,7 @@ def test_text_token_output_with_logprobs_roundtrips_and_validates():
         req_id=7,
         sampled_token_id=42,
         sampled_logprob=-0.5,
-        top_logprobs=[(7, -0.1), (8, -0.2)],
+        top_logprobs=[(7, -0.1, 1), (8, -0.2, 2)],
         num_accepted_tokens=2,
     )
 
@@ -68,10 +68,27 @@ def test_text_token_output_with_logprobs_roundtrips_and_validates():
         "req_id": 7,
         "sampled_token_id": 42,
         "sampled_logprob": -0.5,
-        "top_logprobs": [(7, -0.1), (8, -0.2)],
+        "top_logprobs": [(7, -0.1, 1), (8, -0.2, 2)],
         "num_accepted_tokens": 2,
     }
     validate_seq_result(seq_result, {"req_id": 7, "kind": DECODE_UND}, 0)
+
+
+@pytest.mark.parametrize(
+    "non_finite_fields",
+    [
+        {"sampled_logprob": float("nan")},
+        {"top_logprobs": [(7, float("inf"), 1)]},
+        {"prompt_logprobs": [[(7, float("-inf"), 1)]]},
+    ],
+)
+def test_text_logprob_contract_rejects_non_finite_values(non_finite_fields):
+    seq_result = {"req_id": 7, "sampled_token_id": 42, **non_finite_fields}
+
+    with pytest.raises(WorkerError) as exc:
+        validate_seq_result(seq_result, {"req_id": 7, "kind": DECODE_UND}, 0)
+
+    assert exc.value.code == ErrorCode.INVALID_DESCRIPTOR
 
 
 def test_text_token_output_omits_absent_optional_fields():

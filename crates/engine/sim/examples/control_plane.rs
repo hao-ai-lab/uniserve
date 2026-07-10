@@ -4,14 +4,19 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::Duration;
 
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
-use uniserve_engine_api::{EngineHandle, GenEvent, GenerateRequest, Prompt};
+use uniserve_core::{
+    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+    GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
+    GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
+    GenerationRuntimeCapabilities, ImageParams, OpKind, RequestId, SamplingParams,
+    TriggerPolicyDescriptor, UndVisibility,
+};
+use uniserve_engine_api::{EngineHandle, GenEvent};
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_sim::SimEngine;
 use uniserve_sim::SimExecutor;
 
 fn main() {
-    let _ = Prompt::default();
     let ctrl = ControlTokens::default();
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
     let sched = Scheduler::new(executor, ctrl, 32);
@@ -22,35 +27,91 @@ fn main() {
     let mut rxs: HashMap<RequestId, (String, tokio::sync::mpsc::UnboundedReceiver<GenEvent>)> =
         HashMap::new();
     let mut next_id = 1u64;
-    let mut mk = |constraint: GenerationConstraint, kind: &str, rxs: &mut HashMap<_, _>| {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut mk = |constraint: GenerationConstraint| {
         let id = RequestId(next_id);
         next_id += 1;
-        let req = GenerateRequest::new(
-            id,
-            vec![1, 2, 3],
-            SamplingParams::default(),
-            ImageParams {
-                steps: 6,
-                ..Default::default()
-            },
-            constraint,
+        let policy = GenerationPolicyDescriptor {
+            trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
+            gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
+            feedback: Some(GeneratedImageFeedbackRecipe {
+                commit: CommitRecipe::CommitGenThenWriteback,
+                writeback: FeedbackWriteback::DirectKv,
+                next_und_token: FeedbackNextToken::EndOfImage,
+                logical_positions: 2,
+                physical_kv_tokens: uniserve_core::ImageKvEffect::WorkerDefined,
+            }),
+            ..GenerationPolicyDescriptor::default()
+        };
+        let context = vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3],
+            visibility: UndVisibility::Internal,
+        }];
+        let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
+        let image = ImageParams {
+            steps: 6,
+            ..Default::default()
+        };
+        let cache = Default::default();
+        let resources = GenerationResourceBounds::conservative(
+            &context,
+            &behavior,
+            &policy,
+            &image,
             20,
-            tx,
-        );
-        rxs.insert(id, (kind.to_string(), rx));
-        req
+            &cache,
+            &GenerationRuntimeCapabilities {
+                supported_ops: vec![
+                    OpKind::PrefillUnd,
+                    OpKind::DecodeUnd,
+                    OpKind::DenoiseGen,
+                    OpKind::CommitGen,
+                    OpKind::CommitWriteback,
+                ],
+                max_latent_units: 64,
+                latent_downsample: 16,
+                max_vae_grid_tokens: 64,
+                max_vit_grid_tokens: 64,
+                commit_marker_tokens: 2,
+                max_cfg_branches: 3,
+                scratch_capacity_tokens: 1 << 20,
+                encoder_cache_entries: 256,
+                generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
+                    inline: true,
+                    separate_writeback: true,
+                },
+            },
+        )
+        .expect("bounded simulation request");
+        let request = GenerationRequest {
+            request_id: id,
+            context,
+            negative_context: Vec::new(),
+            constraint,
+            behavior,
+            sampling: SamplingParams::default(),
+            image,
+            max_und_tokens: 20,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache,
+            policy,
+            resources,
+        };
+        (id, request)
     };
 
     for _ in 0..3 {
-        handle
-            .submit(mk(GenerationConstraint::UndOnly, "text", &mut rxs))
-            .unwrap();
+        let (id, request) = mk(GenerationConstraint::UndOnly);
+        let rx = handle.submit(request).unwrap();
+        rxs.insert(id, ("text".to_string(), rx));
     }
     for _ in 0..2 {
-        handle
-            .submit(mk(GenerationConstraint::GenOnly, "image", &mut rxs))
-            .unwrap();
+        let (id, request) = mk(GenerationConstraint::GenOnly);
+        let rx = handle.submit(request).unwrap();
+        rxs.insert(id, ("image".to_string(), rx));
     }
 
     // collect until every request is Finished

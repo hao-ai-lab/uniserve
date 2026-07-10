@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 import numpy as np
 from PIL import Image
@@ -10,7 +11,7 @@ from ..contracts.batch_policy import BatchPolicy
 from ..contracts.batches import UniForwardBatch
 from ..contracts.caps import Caps, ExecutionConstraints
 from ..contracts.forward_mode import ForwardMode
-from ..contracts.op_kinds import COMMIT_GEN, DECODE_UND, DENOISE_GEN, PREFILL_UND
+from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (
     CommitOutput,
     DenoiseOutput,
@@ -41,7 +42,7 @@ STUB_TEXT_EOS_STEP = 8
 STUB_NUM_BLOCKS = 4096
 STUB_NUM_LAYERS = 28
 STUB_SCRATCH_TOKENS = 1 << 20
-STUB_MAX_LATENT_SIZE = 64
+STUB_MAX_LATENT_SIZE = 1024
 STUB_LATENT_DOWNSAMPLE = 16
 STUB_BYTES_PER_TOKEN = 57344
 STUB_MAX_BATCH_OPS = DEFAULT_MAX_BATCH_OPS
@@ -68,9 +69,15 @@ def _synthetic_png_b64(width: int, height: int) -> str:
 class StubUniModel(UniModelBase):
     """Deterministic fake model for sim/stub worker paths."""
 
-    architectures = ("UniServeStubForUnifiedGeneration",)
-    supported_ops = (PREFILL_UND, DECODE_UND, DENOISE_GEN, COMMIT_GEN)
-    supported_controls = (
+    architectures: tuple[str, ...] = ("UniServeStubForUnifiedGeneration",)
+    supported_ops: tuple[str, ...] = (
+        PREFILL_UND,
+        DECODE_UND,
+        DENOISE_GEN,
+        COMMIT_GEN,
+        COMMIT_WRITEBACK,
+    )
+    supported_controls: tuple[str, ...] = (
         "copy_blocks",
         "load_lora",
         "unload_lora",
@@ -102,6 +109,9 @@ class StubUniModel(UniModelBase):
 
     def on_new_request(self, req_id: int, state: RequestState) -> None:
         self.images[req_id] = dict(state.image or {})
+
+    def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
+        return {str(name) for name, _tensor in weights}
 
     def drop_request(self, req_id: int) -> None:
         self.emitted.pop(req_id, None)
@@ -146,7 +156,7 @@ class StubUniModel(UniModelBase):
         handler = self._FORWARD_BY_MODE.get(batch.mode)
         if handler is None:
             raise RuntimeError(f"unsupported stub forward mode {batch.mode}")
-        return handler(self, batch)
+        return cast(list[ForwardOutput], handler(self, batch))
 
     def _text(self, batch: UniForwardBatch) -> list[TextTokenOutput]:
         out = []
@@ -245,8 +255,16 @@ class StubEngine(BaseWorkerDriver):
             resource_classes=tuple(self.resource_plan.classes()),
         )
 
-    def execute(self, batch: dict[str, Any]) -> dict[str, Any]:
-        return self.runner.execute(batch)
+    def execute(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        defer_text_cpu_results: bool = False,
+    ) -> dict[str, Any]:
+        return self.runner.execute(
+            dict(batch),
+            defer_text_cpu_results=defer_text_cpu_results,
+        )
 
     def drop_request(self, rid: int) -> None:
         self.runner.drop_request(int(rid))

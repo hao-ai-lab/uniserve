@@ -1,43 +1,36 @@
 //! Wire DTO ↔ engine type translation, shared by the in-process client adapter
 //! and the headless engine process.
 //!
-//! Northbound, a per-request `GenEvent` stream is adapted into
-//! [`EngineCoreOutput`]s: text tokens (with the sampled/top-k logprob fusion),
-//! `Scheduled` timestamps as `EngineCoreEvent`s, and — for native
-//! generation requests — typed image events and finish statistics on the
-//! UniServe `native` extension. Southbound, an [`EngineCoreRequest`] (plus its
-//! optional `native` extension) becomes an `uniserve_engine_api::GenerateRequest`.
+//! Northbound, a per-request `GenEvent` stream becomes engine output DTOs.
+//! Southbound, each engine request contains one canonical generation request.
 
+use std::future::Future;
+
+use crate::generation::{GenerationFinish, GenerationOutput, WireImageEvent};
 use crate::logprobs::{Logprobs, MaybeWireLogprobs, PositionLogprobs, TokenLogprob};
-use crate::native::{NativeFinishExt, NativeOutputExt, WireImageEvent};
 use crate::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
     EngineCoreRequest, EngineCoreSamplingParams, StopReason,
 };
 use tokio::sync::mpsc;
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams as USampling};
-use uniserve_engine_api::{EventTx, FinishReason, GenEvent, GenerateRequest, MmItem};
+use uniserve_core::{GenerationRequest, RequestId, SamplingParams as USampling};
+use uniserve_engine_api::{
+    FinishReason, GenEvent, PositionLogprobs as SemanticPositionLogprobs,
+    TokenLogprob as SemanticTokenLogprob,
+};
 
-/// Translate the wire sampling DTO into UniServe sampling params.
-
-/// Disposition of the wire fields this engine does **not** carry into
-/// `uniserve_core::SamplingParams`:
-/// - `prompt_logprobs`: accepted as advisory (the OpenAI `echo` path and the
-/// chat/completions surfaces deliberately tolerate it), but the worker emits
-/// only per-token sampled/top-k logprobs, so prompt-position logprobs are not
-/// produced. Plumbing them end-to-end is a worker (batched prompt-logprobs)
-/// change tracked in the deferred-rewrites doc, not a bounded translation fix.
-/// - `logprob_token_ids` and the parallel `WireLogprobs` ndarray form: a dead
-/// representation modeled after the upstream Python engine that no component
-/// here populates; reserved for the same future worker support.
-/// - `structured_outputs`: only the guided-`choice` form is enforced (compiled
-/// into a `GrammarSpec::Choice` in `to_generate_request`); `json`/`regex`/
-/// `grammar`/`json_object`/`structural_tag` are accepted as advisory.
-/// - `skip_reading_prefix_cache`: honored — plumbed via `to_generate_request`.
+/// Normalize frontend sampling values into the canonical scheduler shape.
+/// Grammar and cache policy are lowered into their dedicated request fields.
 pub fn to_uniserve_sampling(sp: Option<&EngineCoreSamplingParams>) -> USampling {
     let Some(sp) = sp else {
         return USampling::default();
     };
+    let mut logit_bias = sp
+        .logit_bias
+        .as_ref()
+        .map(|biases| biases.iter().map(|(&token, &bias)| (token, bias)).collect())
+        .unwrap_or_else(Vec::new);
+    logit_bias.sort_by_key(|(token, _)| *token);
     USampling {
         temperature: sp.temperature,
         top_k: sp.top_k,
@@ -48,12 +41,9 @@ pub fn to_uniserve_sampling(sp: Option<&EngineCoreSamplingParams>) -> USampling 
         repetition_penalty: sp.repetition_penalty,
         frequency_penalty: sp.frequency_penalty,
         presence_penalty: sp.presence_penalty,
-        logit_bias: sp
-            .logit_bias
-            .as_ref()
-            .map(|m| m.iter().map(|(k, v)| (*k, *v)).collect())
-            .unwrap_or_default(),
+        logit_bias,
         min_tokens: sp.min_tokens as usize,
+        return_logprobs: sp.logprobs.is_some() || sp.logprob_token_ids.is_some(),
         // `logprobs` is `None` (disabled), a positive count, or `-1` (the full
         // vocabulary). `n_logprobs` is a `u32` count with no "all" sentinel, and
         // the worker clamps it with `min(n_logprobs, vocab_size)`, so map the
@@ -64,6 +54,13 @@ pub fn to_uniserve_sampling(sp: Option<&EngineCoreSamplingParams>) -> USampling 
             Some(n) => n as u32,
             None => 0,
         },
+        return_prompt_logprobs: sp.prompt_logprobs.is_some(),
+        n_prompt_logprobs: match sp.prompt_logprobs {
+            Some(n) if n < 0 => u32::MAX,
+            Some(n) => n as u32,
+            None => 0,
+        },
+        logprob_token_ids: sp.logprob_token_ids.clone().unwrap_or_default(),
         bad_words_ids: sp.bad_words_token_ids.clone().unwrap_or_default(),
         allowed_token_ids: sp.allowed_token_ids.clone(),
     }
@@ -77,75 +74,19 @@ pub fn stop_token_ids(sp: Option<&EngineCoreSamplingParams>) -> Vec<u32> {
     sp.map(|s| s.stop_token_ids.clone()).unwrap_or_default()
 }
 
-/// Translate one wire request (text or native generation) into an
-/// `uniserve_engine_api::GenerateRequest` bound to the scheduler id `rid`.
-pub fn to_generate_request(
+/// Extract the canonical generation request from its transport envelope.
+pub fn to_generation_request(
     req: &EngineCoreRequest,
     rid: RequestId,
-    event_tx: EventTx,
-) -> GenerateRequest {
-    let sampling = to_uniserve_sampling(req.sampling_params.as_ref());
-    let max_tokens = req
-        .sampling_params
-        .as_ref()
-        .map(|s| s.max_tokens as usize)
-        .unwrap_or(0);
-    let stop = stop_token_ids(req.sampling_params.as_ref());
-    let prompt_ids = req.prompt_token_ids.clone().unwrap_or_default();
-
-    let (constraint, image, neg_prompt_ids, mm_items) = match &req.native {
-        Some(ext) => {
-            let mm_items = ext
-                .mm_items
-                .iter()
-                .map(|m| MmItem {
-                    hash: m.hash,
-                    position: m.position,
-                    num_tokens: m.num_tokens,
-                    b64: m.b64.clone(),
-                })
-                .collect();
-            (
-                ext.constraint,
-                ext.image.clone(),
-                ext.neg_prompt_ids.clone(),
-                mm_items,
-            )
-        }
-        None => (
-            GenerationConstraint::UndOnly,
-            ImageParams::default(),
-            Vec::new(),
-            Vec::new(),
-        ),
-    };
-    let mut generate = GenerateRequest::new(
-        rid, prompt_ids, sampling, image, constraint, max_tokens, event_tx,
-    );
-    generate.stop_token_ids = stop;
-    generate.neg_prompt_ids = neg_prompt_ids;
-    generate.mm_items = mm_items;
-    generate.priority = req.priority;
-    // `lora_int_id` is u64 on the reference-shaped wire struct, but the
-    // registry guarantees it fits u32 at allocation (LoraManager id-space guard),
-    // so this narrowing is lossless.
-    generate.lora_id = req.lora_request.as_ref().map(|l| l.lora_int_id as u32);
-    // Structured outputs: the frontend tokenized the guided choices; the engine
-    // compiles them into a per-step token-mask grammar.
-    generate.grammar = req
-        .sampling_params
-        .as_ref()
-        .and_then(|s| s.choice_token_ids.clone())
-        .filter(|c| !c.is_empty())
-        .map(uniserve_engine_api::GrammarSpec::Choice);
-    // honor the per-request prefix-cache read opt-out (
-    // field the engine silently dropped) so `bypass_prefix_cache` is real.
-    generate.skip_reading_prefix_cache = req
-        .sampling_params
-        .as_ref()
-        .and_then(|s| s.skip_reading_prefix_cache)
-        .unwrap_or(false);
-    generate
+) -> crate::Result<GenerationRequest> {
+    let mut request = req.generation.clone();
+    request.request_id = rid;
+    request
+        .validate()
+        .map_err(|error| crate::Error::InvalidGenerationRequest {
+            message: error.to_string(),
+        })?;
+    Ok(request)
 }
 
 /// Map a UniServe finish reason onto the wire finish reason and stop reason.
@@ -160,14 +101,16 @@ pub fn map_finish(
             stop_reason.map(StopReason::Text),
         ),
         FinishReason::MaxTokens => (EngineCoreFinishReason::Length, None),
-        FinishReason::Cancelled | FinishReason::Aborted => (EngineCoreFinishReason::Abort, None),
+        FinishReason::Cancelled => (EngineCoreFinishReason::Cancelled, None),
+        FinishReason::Aborted => (EngineCoreFinishReason::Aborted, None),
+        FinishReason::Repetition => (EngineCoreFinishReason::Repetition, None),
         FinishReason::ImageDone => (EngineCoreFinishReason::Stop, None),
         FinishReason::Error => (EngineCoreFinishReason::Error, None),
     }
 }
 
-/// The native finish-reason string carried on the wire extension.
-pub fn native_reason_str(reason: &FinishReason) -> &'static str {
+/// Stable finish-reason string carried on the wire.
+pub fn generation_reason_str(reason: &FinishReason) -> &'static str {
     match reason {
         FinishReason::Eos => "eos",
         FinishReason::MaxTokens => "max_tokens",
@@ -175,12 +118,13 @@ pub fn native_reason_str(reason: &FinishReason) -> &'static str {
         FinishReason::ImageDone => "image_done",
         FinishReason::Cancelled => "cancelled",
         FinishReason::Aborted => "aborted",
+        FinishReason::Repetition => "repetition",
         FinishReason::Error => "error",
     }
 }
 
-/// Parse the wire reason string back into the native finish reason.
-pub fn parse_native_reason(reason: &str) -> FinishReason {
+/// Parse the wire reason string back into the canonical finish reason.
+pub fn parse_generation_reason(reason: &str) -> FinishReason {
     match reason {
         "eos" => FinishReason::Eos,
         "max_tokens" => FinishReason::MaxTokens,
@@ -188,6 +132,7 @@ pub fn parse_native_reason(reason: &str) -> FinishReason {
         "image_done" => FinishReason::ImageDone,
         "cancelled" => FinishReason::Cancelled,
         "aborted" => FinishReason::Aborted,
+        "repetition" => FinishReason::Repetition,
         _ => FinishReason::Error,
     }
 }
@@ -197,31 +142,50 @@ pub fn parse_native_reason(reason: &str) -> FinishReason {
 pub fn build_logprobs(
     token_id: u32,
     sampled: Option<f32>,
-    top: Option<Vec<(u32, f32)>>,
+    candidates: Option<Vec<SemanticTokenLogprob>>,
 ) -> Option<MaybeWireLogprobs> {
     let sampled = sampled?;
-    // The sampler returns the sampled token's logprob but not its true vocab
-    // rank (it does not count how many masked logits outrank it), so emit rank
-    // `0` ("rank unknown") rather than fabricating `1`. A fabricated `1` would
-    // both lie about the sampled token's position and collide with the first
-    // top-k alternative's rank, which is the genuine 1-based candidate rank.
-    let mut entries = vec![TokenLogprob {
-        token_id,
-        logprob: sampled,
-        rank: 0,
-    }];
-    if let Some(top) = top {
-        for (rank, (tid, lp)) in top.into_iter().enumerate() {
-            entries.push(TokenLogprob {
-                token_id: tid,
-                logprob: lp,
-                rank: (rank + 1) as u32,
-            });
-        }
+    let mut entries: Vec<TokenLogprob> = candidates
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| TokenLogprob {
+            token_id: entry.token_id,
+            logprob: entry.logprob,
+            rank: entry.rank,
+        })
+        .collect();
+    if !entries.iter().any(|entry| entry.token_id == token_id) {
+        entries.insert(
+            0,
+            TokenLogprob {
+                token_id,
+                logprob: sampled,
+                rank: 0,
+            },
+        );
     }
     Some(MaybeWireLogprobs::Direct(Logprobs {
         positions: vec![PositionLogprobs { entries }],
     }))
+}
+
+fn prompt_logprobs_to_wire(positions: Vec<SemanticPositionLogprobs>) -> MaybeWireLogprobs {
+    MaybeWireLogprobs::Direct(Logprobs {
+        positions: positions
+            .into_iter()
+            .map(|position| PositionLogprobs {
+                entries: position
+                    .entries
+                    .into_iter()
+                    .map(|entry| TokenLogprob {
+                        token_id: entry.token_id,
+                        logprob: entry.logprob,
+                        rank: entry.rank,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    })
 }
 
 /// Adapter parameters for one request's event stream.
@@ -230,25 +194,23 @@ pub struct AdapterParams {
     pub request_id: String,
     /// Emit per-token logprobs (`sampling_params.logprobs > 0`).
     pub want_logprobs: bool,
-    /// The request is a native generation request: image events and
-    /// finish statistics ride the wire `native` extension, and `Scheduled`
-    /// timestamps are surfaced as `EngineCoreEvent`s.
-    pub native: bool,
 }
 
 /// Drive one request's `GenEvent` stream into wire outputs.
-
+///
 /// `emit` returns `false` when the consumer is gone, which stops adaptation.
 /// Returns when the stream reaches a terminal event or the consumer drops.
-pub async fn run_event_adapter(
+pub async fn run_event_adapter<Emit, EmitFuture>(
     params: AdapterParams,
     mut events: mpsc::UnboundedReceiver<GenEvent>,
-    mut emit: impl FnMut(EngineCoreOutput) -> bool,
-) {
+    mut emit: Emit,
+) where
+    Emit: FnMut(EngineCoreOutput) -> EmitFuture,
+    EmitFuture: Future<Output = bool>,
+{
     let AdapterParams {
         request_id,
         want_logprobs,
-        native,
     } = params;
 
     // A `TextToken` is held until its `TokenLogprobs` arrives so the sampled
@@ -260,20 +222,22 @@ pub async fn run_event_adapter(
     // inflating streaming TTFT; so in that case we emit immediately.
     let mut pending: Option<(u32, Option<f32>)> = None;
 
-    let token_output = |id: u32, lp: Option<f32>, top: Option<Vec<(u32, f32)>>| EngineCoreOutput {
-        request_id: request_id.clone(),
-        new_token_ids: vec![id],
-        new_logprobs: if want_logprobs {
-            build_logprobs(id, lp, top)
-        } else {
-            None
-        },
-        ..Default::default()
+    let token_output = |id: u32, lp: Option<f32>, candidates: Option<Vec<SemanticTokenLogprob>>| {
+        EngineCoreOutput {
+            request_id: request_id.clone(),
+            new_token_ids: vec![id],
+            new_logprobs: if want_logprobs {
+                build_logprobs(id, lp, candidates)
+            } else {
+                None
+            },
+            ..Default::default()
+        }
     };
     macro_rules! flush_pending {
         () => {
             if let Some((pid, plp)) = pending.take()
-                && !emit(token_output(pid, plp, None))
+                && !emit(token_output(pid, plp, None)).await
             {
                 break;
             }
@@ -287,20 +251,32 @@ pub async fn run_event_adapter(
                 if want_logprobs {
                     // Coalesce with the TokenLogprobs emitted in this same step.
                     pending = Some((id, logprob));
-                } else if !emit(token_output(id, logprob, None)) {
+                } else if !emit(token_output(id, logprob, None)).await {
                     break;
                 }
             }
-            GenEvent::TokenLogprobs { id, top } => {
+            GenEvent::TokenLogprobs { id, candidates } => {
                 let (pid, plp) = pending.take().unwrap_or((id, None));
-                if !emit(token_output(pid, plp, Some(top))) {
+                if !emit(token_output(pid, plp, Some(candidates))).await {
+                    break;
+                }
+            }
+            GenEvent::PromptLogprobs { positions } => {
+                flush_pending!();
+                if !emit(EngineCoreOutput {
+                    request_id: request_id.clone(),
+                    new_prompt_logprobs_tensors: Some(prompt_logprobs_to_wire(positions)),
+                    ..Default::default()
+                })
+                .await
+                {
                     break;
                 }
             }
             GenEvent::Scheduled {
                 queued_at,
                 scheduled_at,
-            } if native => {
+            } => {
                 flush_pending!();
                 let output = EngineCoreOutput {
                     request_id: request_id.clone(),
@@ -316,7 +292,7 @@ pub async fn run_event_adapter(
                     ]),
                     ..Default::default()
                 };
-                if !emit(output) {
+                if !emit(output).await {
                     break;
                 }
             }
@@ -325,11 +301,11 @@ pub async fn run_event_adapter(
                 height,
                 width,
                 steps,
-            } if native => {
+            } => {
                 // Flush the held text token first: image events must not
                 // overtake the text that preceded them in a mixed-output stream.
                 flush_pending!();
-                let output = native_image_output(
+                let output = generation_image_output(
                     &request_id,
                     WireImageEvent::Begin {
                         image_id,
@@ -338,15 +314,23 @@ pub async fn run_event_adapter(
                         steps,
                     },
                 );
-                if !emit(output) {
+                if !emit(output).await {
                     break;
                 }
             }
-            GenEvent::ImageStep { image_id, step } if native => {
+            GenEvent::ImageStep { image_id, step } => {
                 flush_pending!();
                 let output =
-                    native_image_output(&request_id, WireImageEvent::Step { image_id, step });
-                if !emit(output) {
+                    generation_image_output(&request_id, WireImageEvent::Step { image_id, step });
+                if !emit(output).await {
+                    break;
+                }
+            }
+            GenEvent::ImageCommit { image_id } => {
+                flush_pending!();
+                let output =
+                    generation_image_output(&request_id, WireImageEvent::Commit { image_id });
+                if !emit(output).await {
                     break;
                 }
             }
@@ -357,9 +341,9 @@ pub async fn run_event_adapter(
                 bytes,
                 sha256,
                 pixels_png_b64,
-            } if native => {
+            } => {
                 flush_pending!();
-                let output = native_image_output(
+                let output = generation_image_output(
                     &request_id,
                     WireImageEvent::Done {
                         image_id,
@@ -370,7 +354,7 @@ pub async fn run_event_adapter(
                         png_b64: pixels_png_b64,
                     },
                 );
-                if !emit(output) {
+                if !emit(output).await {
                     break;
                 }
             }
@@ -380,6 +364,7 @@ pub async fn run_event_adapter(
                 prompt_tokens,
                 completion_tokens,
                 images,
+                kv_transfer_params,
             } => {
                 flush_pending!();
                 let (finish_reason, stop) = map_finish(&reason, stop_reason);
@@ -387,10 +372,11 @@ pub async fn run_event_adapter(
                     request_id: request_id.clone(),
                     finish_reason: Some(finish_reason),
                     stop_reason: stop,
-                    native: native.then(|| NativeOutputExt {
+                    kv_transfer_params,
+                    generation: Some(GenerationOutput {
                         image: None,
-                        finish: Some(NativeFinishExt {
-                            reason: native_reason_str(&reason).to_string(),
+                        finish: Some(GenerationFinish {
+                            reason: generation_reason_str(&reason).to_string(),
                             prompt_tokens: prompt_tokens as u64,
                             completion_tokens: completion_tokens as u64,
                             images: images as u64,
@@ -398,7 +384,8 @@ pub async fn run_event_adapter(
                         }),
                     }),
                     ..Default::default()
-                });
+                })
+                .await;
                 break;
             }
             GenEvent::Rejected { ref message } | GenEvent::Error { ref message } => {
@@ -407,32 +394,27 @@ pub async fn run_event_adapter(
                 let _ = emit(EngineCoreOutput {
                     request_id: request_id.clone(),
                     finish_reason: Some(EngineCoreFinishReason::Error),
-                    native: native.then(|| NativeOutputExt {
+                    generation: Some(GenerationOutput {
                         image: None,
-                        finish: Some(NativeFinishExt {
+                        finish: Some(GenerationFinish {
                             reason: if rejected { "rejected" } else { "error" }.to_string(),
                             message: Some(message.clone()),
                             ..Default::default()
                         }),
                     }),
                     ..Default::default()
-                });
+                })
+                .await;
                 break;
             }
-            // Non-native requests have no wire shape for these; drop them, as
-            // the in-process text path always has.
-            GenEvent::Scheduled { .. }
-            | GenEvent::ImageBegin { .. }
-            | GenEvent::ImageStep { .. }
-            | GenEvent::ImageDone { .. } => {}
         }
     }
 }
 
-fn native_image_output(request_id: &str, image: WireImageEvent) -> EngineCoreOutput {
+fn generation_image_output(request_id: &str, image: WireImageEvent) -> EngineCoreOutput {
     EngineCoreOutput {
         request_id: request_id.to_string(),
-        native: Some(NativeOutputExt {
+        generation: Some(GenerationOutput {
             image: Some(image),
             finish: None,
         }),
@@ -441,7 +423,7 @@ fn native_image_output(request_id: &str, image: WireImageEvent) -> EngineCoreOut
 }
 
 /// Reverse adaptation (client side): one wire output back into the typed
-/// `GenEvent`s a native stream consumer expects. Text token logprobs are
+/// canonical `GenEvent`s. Text token logprobs are
 /// reconstructed from the sampled-first logprobs encoding of
 /// [`build_logprobs`].
 pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
@@ -471,18 +453,43 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
         let pos = positions.get(i);
         let logprob = pos.and_then(|p| p.entries.first()).map(|e| e.logprob);
         events.push(GenEvent::TextToken { id, logprob });
-        if let Some(p) = pos
-            && p.entries.len() > 1
-        {
-            let top: Vec<(u32, f32)> = p.entries[1..]
-                .iter()
-                .map(|e| (e.token_id, e.logprob))
-                .collect();
-            events.push(GenEvent::TokenLogprobs { id, top });
+        if let Some(position) = pos {
+            events.push(GenEvent::TokenLogprobs {
+                id,
+                candidates: position
+                    .entries
+                    .iter()
+                    .map(|entry| SemanticTokenLogprob {
+                        token_id: entry.token_id,
+                        logprob: entry.logprob,
+                        rank: entry.rank,
+                    })
+                    .collect(),
+            });
         }
     }
 
-    if let Some(ext) = &output.native
+    if let Some(MaybeWireLogprobs::Direct(prompt)) = &output.new_prompt_logprobs_tensors {
+        events.push(GenEvent::PromptLogprobs {
+            positions: prompt
+                .positions
+                .iter()
+                .map(|position| SemanticPositionLogprobs {
+                    entries: position
+                        .entries
+                        .iter()
+                        .map(|entry| SemanticTokenLogprob {
+                            token_id: entry.token_id,
+                            logprob: entry.logprob,
+                            rank: entry.rank,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        });
+    }
+
+    if let Some(ext) = &output.generation
         && let Some(image) = &ext.image
     {
         events.push(match image.clone() {
@@ -498,6 +505,7 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
                 steps,
             },
             WireImageEvent::Step { image_id, step } => GenEvent::ImageStep { image_id, step },
+            WireImageEvent::Commit { image_id } => GenEvent::ImageCommit { image_id },
             WireImageEvent::Done {
                 image_id,
                 height,
@@ -517,8 +525,8 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
     }
 
     if let Some(finish_reason) = output.finish_reason {
-        let native_finish = output.native.as_ref().and_then(|n| n.finish.as_ref());
-        match native_finish {
+        let generation_finish = output.generation.as_ref().and_then(|n| n.finish.as_ref());
+        match generation_finish {
             Some(f) if f.reason == "rejected" => events.push(GenEvent::Rejected {
                 message: f.message.clone().unwrap_or_default(),
             }),
@@ -526,7 +534,7 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
                 message: f.message.clone().unwrap_or_default(),
             }),
             Some(f) => events.push(GenEvent::Finished {
-                reason: parse_native_reason(&f.reason),
+                reason: parse_generation_reason(&f.reason),
                 stop_reason: match &output.stop_reason {
                     Some(StopReason::Text(s)) => Some(s.clone()),
                     Some(StopReason::TokenId(id)) => Some(format!("token:{id}")),
@@ -535,26 +543,13 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
                 prompt_tokens: f.prompt_tokens as usize,
                 completion_tokens: f.completion_tokens as usize,
                 images: f.images as usize,
+                kv_transfer_params: output.kv_transfer_params.clone(),
             }),
-            None => {
-                // A native stream should always carry the finish extension;
-                // fall back to a coarse mapping if it is missing.
-                let reason = match finish_reason {
-                    EngineCoreFinishReason::Stop => FinishReason::Eos,
-                    EngineCoreFinishReason::Length => FinishReason::MaxTokens,
-                    EngineCoreFinishReason::Abort => FinishReason::Aborted,
-                    EngineCoreFinishReason::Error | EngineCoreFinishReason::Repetition => {
-                        FinishReason::Error
-                    }
-                };
-                events.push(GenEvent::Finished {
-                    reason,
-                    stop_reason: None,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    images: 0,
-                });
-            }
+            None => events.push(GenEvent::Error {
+                message: format!(
+                    "terminal engine output {finish_reason:?} omitted generation finish statistics"
+                ),
+            }),
         }
     }
 
@@ -564,27 +559,88 @@ pub fn wire_output_to_gen_events(output: &EngineCoreOutput) -> Vec<GenEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::NativeRequestExt;
+    use uniserve_core::{
+        CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+        GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
+        GenerationPolicyDescriptor, GenerationResourceBounds, ImageKvEffect, ImageParams,
+        UndVisibility,
+    };
+
+    fn canonical_generation_request() -> GenerationRequest {
+        let constraint = GenerationConstraint::Default;
+        let policy = GenerationPolicyDescriptor {
+            trigger: uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 },
+            feedback: Some(GeneratedImageFeedbackRecipe {
+                commit: CommitRecipe::CommitGenThenWriteback,
+                writeback: FeedbackWriteback::DirectKv,
+                next_und_token: FeedbackNextToken::EndOfImage,
+                logical_positions: 2,
+                physical_kv_tokens: ImageKvEffect::Bounded { max_tokens: 64 },
+            }),
+            ..GenerationPolicyDescriptor::default()
+        };
+        GenerationRequest {
+            request_id: RequestId(99),
+            context: vec![ContextSegment::UndTokens {
+                token_ids: vec![5],
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: vec![ContextSegment::UndTokens {
+                token_ids: vec![9],
+                visibility: UndVisibility::Internal,
+            }],
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: USampling::default(),
+            image: ImageParams {
+                steps: 7,
+                ..ImageParams::default()
+            },
+            max_und_tokens: 16,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: GenerationResourceBounds {
+                context_tokens: 1,
+                max_kv_tokens: 128,
+                generated_feedback_makes_non_replayable: true,
+                ..GenerationResourceBounds::default()
+            },
+        }
+    }
 
     #[test]
-    fn build_logprobs_sampled_entry_has_no_fabricated_rank() {
-        // The sampled token's true vocab rank is unknown to the sampler, so it
-        // is emitted as `0` ("unknown") and must not collide with the first
-        // top-k alternative's genuine 1-based rank.
-        let lp = build_logprobs(7, Some(-0.5), Some(vec![(7, -0.5), (9, -1.2)]))
-            .expect("sampled logprob present");
+    fn build_logprobs_preserves_measured_candidate_ranks() {
+        let lp = build_logprobs(
+            7,
+            Some(-0.5),
+            Some(vec![
+                SemanticTokenLogprob {
+                    token_id: 7,
+                    logprob: -0.5,
+                    rank: 3,
+                },
+                SemanticTokenLogprob {
+                    token_id: 9,
+                    logprob: -1.2,
+                    rank: 5,
+                },
+            ]),
+        )
+        .expect("sampled logprob present");
         let positions = match lp {
             MaybeWireLogprobs::Direct(l) => l.positions,
             other => panic!("expected Direct logprobs, got {other:?}"),
         };
         assert_eq!(positions.len(), 1);
         let entries = &positions[0].entries;
-        assert_eq!(entries.len(), 3);
-        // Sampled token first, rank unknown.
-        assert_eq!((entries[0].token_id, entries[0].rank), (7, 0));
-        // Alternatives carry 1-based candidate ranks.
-        assert_eq!(entries[1].rank, 1);
-        assert_eq!(entries[2].rank, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!((entries[0].token_id, entries[0].rank), (7, 3));
+        assert_eq!((entries[1].token_id, entries[1].rank), (9, 5));
     }
 
     #[test]
@@ -604,102 +660,24 @@ mod tests {
     }
 
     #[test]
-    fn text_request_translates_with_stop_set() {
-        let mut sp = EngineCoreSamplingParams::for_test();
-        sp.max_tokens = 16;
-        sp.stop_token_ids = vec![42];
-        sp.all_stop_token_ids = [151645u32, 151643].into_iter().collect();
-        let req = EngineCoreRequest {
-            request_id: "r1".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(sp),
-            ..Default::default()
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let g = to_generate_request(&req, RequestId(7), tx);
-        assert_eq!(g.request_id, RequestId(7));
-        assert_eq!(g.prompt_ids, vec![1, 2, 3]);
-        assert_eq!(g.max_tokens, 16);
-        assert_eq!(g.constraint, GenerationConstraint::UndOnly);
-        assert_eq!(g.stop_token_ids, vec![42]);
-    }
-
-    #[test]
-    fn skip_reading_prefix_cache_is_plumbed_to_generate_request() {
-        // the wire opt-out is honored at this boundary.
-        let mut sp = EngineCoreSamplingParams::for_test();
-        sp.skip_reading_prefix_cache = Some(true);
-        let req = EngineCoreRequest {
-            request_id: "r1".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(sp),
-            ..Default::default()
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        assert!(to_generate_request(&req, RequestId(7), tx).skip_reading_prefix_cache);
-
-        // Absent / false defaults to reading the cache (the common case).
-        let mut sp = EngineCoreSamplingParams::for_test();
-        sp.skip_reading_prefix_cache = None;
-        let req = EngineCoreRequest {
-            request_id: "r1".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(sp),
-            ..Default::default()
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        assert!(!to_generate_request(&req, RequestId(7), tx).skip_reading_prefix_cache);
-    }
-
-    #[test]
-    fn text_request_translates_ignore_eos_for_lookahead() {
-        let mut sp = EngineCoreSamplingParams::for_test();
-        sp.temperature = 0.0;
-        sp.ignore_eos = true;
-        sp.stop_token_ids = Vec::new();
-        sp.all_stop_token_ids = [151645u32, 151643].into_iter().collect();
-        let req = EngineCoreRequest {
-            request_id: "r1".into(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(sp),
-            ..Default::default()
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let g = to_generate_request(&req, RequestId(7), tx);
-
-        assert!(g.sampling.ignore_eos);
-        assert_eq!(g.stop_token_ids, Vec::<u32>::new());
-    }
-
-    #[test]
-    fn native_request_translates_constraint_and_items() {
-        let req = EngineCoreRequest {
-            request_id: "r2".into(),
-            prompt_token_ids: Some(vec![5]),
-            sampling_params: Some(EngineCoreSamplingParams::for_test()),
-            native: Some(NativeRequestExt {
-                constraint: GenerationConstraint::Default,
-                image: ImageParams {
-                    steps: 7,
-                    ..Default::default()
-                },
-                neg_prompt_ids: vec![9],
-                mm_items: vec![],
-            }),
-            ..Default::default()
-        };
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let g = to_generate_request(&req, RequestId(1), tx);
+    fn canonical_request_translates_constraint_and_items() {
+        let req = EngineCoreRequest::new("r2".into(), canonical_generation_request());
+        let g = to_generation_request(&req, RequestId(1)).expect("canonical request");
         assert_eq!(g.constraint, GenerationConstraint::Default);
-        assert_eq!(g.constraint, GenerationConstraint::Default);
+        assert_eq!(g.request_id, RequestId(1));
         assert_eq!(g.image.steps, 7);
-        assert_eq!(g.neg_prompt_ids, vec![9]);
+        assert_eq!(
+            g.negative_context,
+            vec![ContextSegment::UndTokens {
+                token_ids: vec![9],
+                visibility: UndVisibility::Internal,
+            }]
+        );
     }
 
-    /// GenEvents adapted onto the wire and back arrive intact (the socket-mode
-    /// native stream roundtrip).
+    /// GenEvents adapted onto the wire and back arrive intact.
     #[tokio::test]
-    async fn native_event_wire_roundtrip() {
+    async fn generation_event_wire_roundtrip() {
         let (tx, rx) = mpsc::unbounded_channel();
         let events = vec![
             GenEvent::TextToken {
@@ -716,6 +694,7 @@ mod tests {
                 image_id: 1,
                 step: 1,
             },
+            GenEvent::ImageCommit { image_id: 1 },
             GenEvent::ImageDone {
                 image_id: 1,
                 height: 2,
@@ -730,6 +709,7 @@ mod tests {
                 prompt_tokens: 3,
                 completion_tokens: 1,
                 images: 1,
+                kv_transfer_params: Some(serde_json::json!({"connector": "x"})),
             },
         ];
         for ev in events {
@@ -742,12 +722,11 @@ mod tests {
             AdapterParams {
                 request_id: "r".into(),
                 want_logprobs: false,
-                native: true,
             },
             rx,
             |o| {
                 outputs.push(o);
-                true
+                std::future::ready(true)
             },
         )
         .await;
@@ -760,22 +739,31 @@ mod tests {
                 GenEvent::TextToken { .. } => "text",
                 GenEvent::ImageBegin { .. } => "begin",
                 GenEvent::ImageStep { .. } => "step",
+                GenEvent::ImageCommit { .. } => "commit",
                 GenEvent::ImageDone { .. } => "done",
                 GenEvent::Finished { .. } => "finished",
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, vec!["text", "begin", "step", "done", "finished"]);
-        match &roundtripped[4] {
+        assert_eq!(
+            kinds,
+            vec!["text", "begin", "step", "commit", "done", "finished"]
+        );
+        match &roundtripped[5] {
             GenEvent::Finished {
                 reason,
                 prompt_tokens,
                 completion_tokens,
                 images,
+                kv_transfer_params,
                 ..
             } => {
                 assert_eq!(*reason, FinishReason::Eos);
                 assert_eq!((*prompt_tokens, *completion_tokens, *images), (3, 1, 1));
+                assert_eq!(
+                    kv_transfer_params.as_ref(),
+                    Some(&serde_json::json!({"connector": "x"}))
+                );
             }
             other => panic!("expected Finished, got {other:?}"),
         }

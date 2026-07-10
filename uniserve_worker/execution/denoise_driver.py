@@ -398,6 +398,20 @@ class DenoiseDriver:
         ):
             for branch_id, branch in enumerate(branches):
                 velocities[DenoiseBranchKey(int(row_index), int(branch_id))] = outputs[branch]
+
+            def combine_step_velocity(
+                values: Mapping[Any, torch.Tensor],
+                current_step: TextImageDenoiseStep = step,
+            ) -> torch.Tensor:
+                return combine_text_image_velocity(current_step, values)
+
+            def accept_step_update(
+                latent: torch.Tensor,
+                current_model: Any = model,
+                current_step: TextImageDenoiseStep = step,
+            ) -> None:
+                _accept_denoise_update(current_model, current_step, latent)
+
             updates[int(row_index)] = DenoisePostprocessEntry(
                 row_index=int(row_index),
                 req_id=int(step.req_id),
@@ -407,12 +421,8 @@ class DenoiseDriver:
                 latent=step.latent,
                 t=step.t,
                 t_next=step.t_next,
-                combine_velocity=lambda values, step=step: combine_text_image_velocity(step, values),
-                accept_update=lambda latent, model=model, step=step: _accept_denoise_update(
-                    model,
-                    step,
-                    latent,
-                ),
+                combine_velocity=combine_step_velocity,
+                accept_update=accept_step_update,
             )
         return velocities, updates
 
@@ -451,6 +461,12 @@ class DenoiseDriver:
                     f"velocity shape {tuple(velocity.shape)} does not match latent {tuple(latent.shape)}"
                 )
             velocities[DenoiseBranchKey(int(row_index), int(branch_id))] = velocity
+        def combine_generic_velocity(values: Mapping[Any, torch.Tensor]) -> torch.Tensor:
+            return combine_cfg([values[branch] for branch in branch_names], cfg)
+
+        def accept_generic_update(latent_value: torch.Tensor) -> None:
+            _accept_denoise_update(model, prepared, latent_value)
+
         entry = DenoisePostprocessEntry(
             row_index=int(row_index),
             req_id=int(req_id),
@@ -460,15 +476,8 @@ class DenoiseDriver:
             latent=latent,
             t=t,
             t_next=t_next,
-            combine_velocity=lambda values, cfg=cfg, branch_names=branch_names: combine_cfg(
-                [values[branch] for branch in branch_names],
-                cfg,
-            ),
-            accept_update=lambda latent, model=model, prepared=prepared: _accept_denoise_update(
-                model,
-                prepared,
-                latent,
-            ),
+            combine_velocity=combine_generic_velocity,
+            accept_update=accept_generic_update,
         )
         return entry, velocities
 

@@ -200,8 +200,10 @@ def capture_tensor_policy(tensor: ParamLike) -> dict[str, object]:
 def restore_tensor_policy(tensor: ParamLike, captured: dict[str, object]) -> None:
     for name, value in captured.items():
         if name == "_uniserve_shard":
-            from ..placement import set_shard_plan
+            from ..placement import ShardPlan, set_shard_plan
 
+            if not isinstance(value, ShardPlan):
+                raise TypeError("captured shard policy must be a ShardPlan")
             set_shard_plan(tensor, value)
         else:
             setattr(tensor, name, value)

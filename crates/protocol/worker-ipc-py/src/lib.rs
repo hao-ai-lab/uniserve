@@ -7,11 +7,11 @@
 //! reflective conversion to drop:
 //!
 //! 1. The shared-memory wire boundary (iceoryx2), which carries flatbuffer
-//! bytes. `Frame::decode_request` / `ServerEndpoint::respond` handle this
-//! via the zero-copy-friendly flatbuffer codec in `worker-wire::flat`.
+//!    bytes. `Frame::decode_request` / `ServerEndpoint::respond` handle this
+//!    via the zero-copy-friendly flatbuffer codec in `worker-wire::flat`.
 //! 2. The Rust↔Python FFI boundary, crossed by a single `pythonize` on the
-//! inbound path ([`PyServer::recv`] / [`PyServer::try_recv`]) and a single
-//! `depythonize` on the outbound path ([`PyServer::respond`]).
+//!    inbound path ([`PyServer::recv`] / [`PyServer::try_recv`]) and a single
+//!    `depythonize` on the outbound path ([`PyServer::respond`]).
 //!
 //! So per IPC round-trip the bridge does one reflective serde conversion *per
 //! direction* (not two on the same value): the inbound `pythonize` produces the

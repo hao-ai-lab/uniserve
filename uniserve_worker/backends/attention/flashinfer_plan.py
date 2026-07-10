@@ -283,7 +283,7 @@ def _fast_decode_plan_with_cpu_metadata(
     global_override_last_page_len_cpu: torch.Tensor | None = None,
 ) -> bool:
     imports = _fast_decode_plan_imports(wrapper, global_override_last_page_len_cpu)
-    if imports is None:
+    if imports is None or global_override_last_page_len_cpu is None:
         return False
     cached_module = getattr(wrapper, "_cached_module", None)
     if cached_module is None or not callable(getattr(cached_module, "plan", None)):
@@ -334,7 +334,7 @@ def _fast_decode_plan_imports(
     if global_override_last_page_len_cpu is None:
         return None
     try:
-        from flashinfer.decode import _get_range_buf, get_seq_lens  # type: ignore
+        from flashinfer.decode import _get_range_buf, get_seq_lens
     except Exception:
         return None
     return _FastDecodePlanImports(_get_range_buf, get_seq_lens)

@@ -2,6 +2,8 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 mod config;
+pub mod grpc;
+pub mod http;
 mod lora;
 mod runtime_client;
 mod scheduler_stats;
@@ -16,21 +18,65 @@ pub use config::{
     Config, EngineBackendKind, EngineConnection, EngineSettings, HttpListenerMode, TokenizerMode,
 };
 use tracing::info;
-use uniserve_chat::{ChatLlm, LoadModelBackendsOptions, load_model_backends};
-pub use uniserve_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
-use uniserve_engine_client::protocol::native::NativeControlTokens;
-use uniserve_engine_client::{EngineCoreClient, TransportMode, ZmqClientConfig};
+use uniserve_engine_gateway::EngineGateway;
+use uniserve_engine_gateway::transport::protocol::generation::GenerationControlTokens;
+use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
 pub use uniserve_engine_runtime::SchedulingPolicy;
 use uniserve_engine_runtime::{EngineBackend, EngineCoreConfig};
-use uniserve_llm::Llm;
+use uniserve_model_profile::ModelProfile;
+use uniserve_serving::ServingRuntime;
+pub use uniserve_serving::chat::{
+    ChatTemplateContentFormatOption, ParserSelection, RendererSelection,
+};
+use uniserve_serving::chat::{LoadModelBackendsOptions, load_model_backends};
 use uniserve_sim::{SimEngine, SimExecutor};
-use uniserve_text::TextLlm;
 
+pub use crate::http::{ApiError, build_router, serve, serve_with_router_extension};
 pub use crate::lora::{LoadLoraError, LoraModelResolution, UnloadLoraError};
 use crate::runtime_client::RuntimeEngineClient;
 pub use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 pub use crate::state::AppState;
-use uniserve_native_api::resolve_native_profile_for_model;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeControlTokens {
+    bos: u32,
+    eos: Vec<u32>,
+    start_of_image: u32,
+    end_of_image: u32,
+}
+
+fn runtime_control_tokens(
+    profile: &ModelProfile,
+    backend: EngineBackendKind,
+) -> RuntimeControlTokens {
+    let dialect = profile.generation_dialect.as_ref();
+    let bos = dialect.map_or(0, |value| value.controls.bos);
+    let start_of_image = dialect.map_or(0, |value| value.controls.start_of_image);
+    let end_of_image = dialect.map_or(0, |value| value.controls.end_of_image);
+    let primary_eos = dialect
+        .map(|value| value.controls.eos)
+        .filter(|value| *value != 0)
+        .or(profile.stop_tokens.primary_eos_token_id);
+    let mut eos = profile
+        .stop_tokens
+        .eos_token_ids
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    if let Some(primary_eos) = primary_eos {
+        eos.retain(|value| *value != primary_eos);
+        eos.insert(0, primary_eos);
+    }
+    if backend == EngineBackendKind::Sim && eos.is_empty() {
+        eos.push(151645);
+    }
+    RuntimeControlTokens {
+        bos,
+        eos,
+        start_of_image,
+        end_of_image,
+    }
+}
 
 /// Build the shared application state for one configured model and one engine
 /// client.
@@ -51,6 +97,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     )
     .await
     .context("failed to create chat/text backends")?;
+    let mut profile = loaded.profile;
     let text_backend = loaded.text_backend;
     let chat_backend = loaded.chat_backend;
 
@@ -68,27 +115,20 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .or(model_max_model_len)
         .unwrap_or(EngineSettings::DEFAULT_MAX_MODEL_LEN);
 
-    // Resolve the model's image control tokens once from the
-    // tokenizer; they drive both the scheduler's image lifecycle decisions and native-surface
-    // prompt ingest.
-    let native_profile =
-        resolve_native_profile_for_model(&config.model, &*text_backend.tokenizer());
-    let native_controls = &native_profile.controls;
+    // Resolve scheduler control tokens once from the profile. Text-only models
+    // contribute their repository EOS set without requiring an image dialect.
+    profile.context_limits.max_model_tokens = Some(effective_max_model_len);
+    profile.parsers.tools = config.tool_call_parser.to_string();
+    profile.parsers.reasoning = config.uniserve_reasoning_parser.to_string();
+    let control_tokens = runtime_control_tokens(&profile, config.engine.backend);
 
     // UniServe owns the engine + scheduler in Rust; Python (or the sim) only
     // runs the model forward pass. The engine runs either on a thread inside
     // this process (the zero-hop default) or as one or more headless
     // `uniserve engine` processes behind the wire protocol.
     let (backend, eos) = match config.engine.backend {
-        EngineBackendKind::Sim => (EngineBackend::Sim, vec![151645]),
-        EngineBackendKind::Worker => (
-            EngineBackend::Worker,
-            if native_controls.eos != 0 {
-                vec![native_controls.eos]
-            } else {
-                Vec::new()
-            },
-        ),
+        EngineBackendKind::Sim => (EngineBackend::Sim, control_tokens.eos.clone()),
+        EngineBackendKind::Worker => (EngineBackend::Worker, control_tokens.eos.clone()),
     };
     let client = match &config.engine.connection {
         EngineConnection::InProcess => {
@@ -124,16 +164,27 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 // Text generation terminates model EOS via scheduler control
                 // tokens; explicit request stop tokens stay per request. The
                 // sim backend gets its fabricated EOS so it terminates too.
-                bos: native_controls.bos,
+                bos: control_tokens.bos,
                 eos,
-                start_of_image: native_controls.start_of_image,
-                end_of_image: native_controls.end_of_image,
-                image_start_ids: native_controls.image_start_ids.clone(),
+                end_of_image: control_tokens.end_of_image,
             };
             let runtime_client = if backend == EngineBackend::Sim {
+                let mut sim = SimEngine::new();
+                let special_tokens = [
+                    control_tokens.bos,
+                    control_tokens.start_of_image,
+                    control_tokens.end_of_image,
+                ]
+                .into_iter()
+                .filter(|token| *token != 0)
+                .collect::<Vec<_>>();
+                sim.configure_control_tokens(
+                    engine_config.eos.first().copied().unwrap_or(151645),
+                    &special_tokens,
+                );
                 RuntimeEngineClient::connect_with_executor(
                     engine_config,
-                    Box::new(SimExecutor::new(Box::new(SimEngine::new()))),
+                    Box::new(SimExecutor::new(Box::new(sim))),
                 )
             } else {
                 RuntimeEngineClient::connect(engine_config)
@@ -142,15 +193,12 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             EngineCoreClient::from_in_process(runtime_client)
         }
         connection => {
-            // Socket modes: ship the tokenizer-resolved control tokens to the
-            // engines over the handshake INIT extension; sim engines keep
-            // their fabricated EOS (see EngineCoreConfig::apply_native_controls).
-            let controls = NativeControlTokens {
-                bos: native_controls.bos,
+            // Socket modes ship tokenizer-resolved control tokens to engines
+            // during startup; sim engines retain their configured EOS.
+            let controls = GenerationControlTokens {
+                bos: control_tokens.bos,
                 eos,
-                start_of_image: native_controls.start_of_image,
-                end_of_image: native_controls.end_of_image,
-                image_start_ids: native_controls.image_start_ids.clone(),
+                end_of_image: control_tokens.end_of_image,
             };
             let transport_mode = match connection.clone() {
                 EngineConnection::Handshake {
@@ -198,17 +246,17 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
                 transport_mode,
                 model_name: config.model.clone(),
                 client_index: 0,
-                native_controls: Some(controls),
+                generation_controls: Some(controls),
             })
             .await
             .context("failed to connect to the UniServe engine cores")?
         }
     };
 
-    let llm = Llm::new(client).with_log_stats(!config.disable_log_stats);
-    let text = TextLlm::new(llm, text_backend);
-
-    let chat = ChatLlm::new(text, chat_backend)
+    let gateway = EngineGateway::new(client).with_log_stats(!config.disable_log_stats);
+    let engine_control = gateway.app_control();
+    let runtime = ServingRuntime::new(profile, gateway, text_backend, chat_backend)
+        .with_max_model_len(effective_max_model_len)
         .with_tool_call_parser(config.tool_call_parser.clone())
         .with_reasoning_parser(config.uniserve_reasoning_parser.clone());
 
@@ -221,7 +269,7 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     };
 
     Ok(Arc::new(
-        AppState::new(served_model_names, chat)
+        AppState::new(served_model_names, runtime, engine_control)
             .with_log_requests(config.enable_log_requests)
             .with_request_id_headers(config.enable_request_id_headers)
             .with_api_key(config.api_key.clone())
@@ -231,7 +279,6 @@ pub async fn build_state(config: &Config) -> Result<Arc<AppState>> {
             .with_server_dev_mode(config.server_dev_mode)
             .with_runtime_lora_updating(config.enable_lora)
             .with_runtime_lora_allowed_path_prefixes(config.lora_allowed_path_prefixes.clone())
-            .with_native_profile(native_profile)
             .with_server_info(ServerInfoSnapshot::from_config(config)),
     ))
 }
@@ -252,7 +299,12 @@ fn default_served_model_names(model: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_served_model_names;
+    use std::collections::BTreeSet;
+
+    use uniserve_model_profile::ModelProfile;
+
+    use super::{default_served_model_names, runtime_control_tokens};
+    use crate::EngineBackendKind;
 
     #[test]
     fn local_model_path_defaults_to_basename_alias_then_full_path() {
@@ -271,5 +323,19 @@ mod tests {
             default_served_model_names("Qwen/Qwen3-0.6B-Base"),
             vec!["Qwen/Qwen3-0.6B-Base".to_string()],
         );
+    }
+
+    #[test]
+    fn text_only_profile_resolves_engine_controls_without_generation_dialect() {
+        let mut profile = ModelProfile::text_only("qwen");
+        profile.stop_tokens.primary_eos_token_id = Some(2);
+        profile.stop_tokens.eos_token_ids = BTreeSet::from([2, 3]);
+
+        let controls = runtime_control_tokens(&profile, EngineBackendKind::Worker);
+
+        assert_eq!(controls.bos, 0);
+        assert_eq!(controls.eos, vec![2, 3]);
+        assert_eq!(controls.start_of_image, 0);
+        assert_eq!(controls.end_of_image, 0);
     }
 }

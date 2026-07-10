@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -125,16 +126,24 @@ class _TimeConditionedMLPAdaLN(nn.Module):
                     nn.init.constant_(module.bias, 0)
 
         self.apply(_basic_init)
-        nn.init.normal_(self.time_embed.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.time_embed.mlp[2].weight, std=0.02)
+        time_input = cast(nn.Linear, self.time_embed.mlp[0])
+        time_output = cast(nn.Linear, self.time_embed.mlp[2])
+        nn.init.normal_(time_input.weight, std=0.02)
+        nn.init.normal_(time_output.weight, std=0.02)
 
-        for block in self.res_blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        for block_module in self.res_blocks:
+            block = cast(ResBlock, block_module)
+            modulation = cast(LinearBase, block.adaLN_modulation[-1])
+            nn.init.constant_(modulation.weight, 0)
+            if modulation.bias is not None:
+                nn.init.constant_(modulation.bias, 0)
+        final_modulation = cast(LinearBase, self.final_layer.adaLN_modulation[-1])
+        nn.init.constant_(final_modulation.weight, 0)
+        if final_modulation.bias is not None:
+            nn.init.constant_(final_modulation.bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        if self.final_layer.linear.bias is not None:
+            nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         h = self.input_proj(x)

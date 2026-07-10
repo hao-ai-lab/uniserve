@@ -113,7 +113,6 @@ impl ManagedEngineHandle {
     }
 
     /// Wait until the managed engine exits.
-
     /// Event-driven: awaits `tokio::process::Child::wait` (which registers for
     /// the child's SIGCHLD) rather than busy-polling `try_wait`. The lock is
     /// held across the await, but signalling reads the cached `pid` instead of

@@ -259,12 +259,12 @@ impl MultiprocExecutor {
             let pos = buffer
                 .iter()
                 .position(|result| result.step_id == step_id)
-                .expect("joinable step disappeared from rank buffer");
-            per_rank.push(
-                buffer
-                    .remove(pos)
-                    .expect("joinable step index disappeared from rank buffer"),
-            );
+                .ok_or_else(|| {
+                    anyhow::anyhow!("joinable step {step_id} disappeared from rank buffer")
+                })?;
+            per_rank.push(buffer.remove(pos).ok_or_else(|| {
+                anyhow::anyhow!("joinable step {step_id} index disappeared from rank buffer")
+            })?);
         }
 
         let mut out = per_rank.remove(0);

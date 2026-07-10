@@ -29,6 +29,8 @@ class I2TTask(BenchmarkTask):
             ],
             "modalities": ["text"],
             "temperature": self.spec.temperature,
+            "top_p": self.spec.top_p,
+            "ignore_eos": self.spec.ignore_eos,
             "max_completion_tokens": max_tokens,
         }
         if streamed:

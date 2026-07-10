@@ -100,7 +100,7 @@ class BagelImageProcessor(MultimodalProcessor):
 
     @staticmethod
     def decode_image_b64(image_b64: str) -> Image.Image:
-        image = Image.open(io.BytesIO(base64.b64decode(image_b64)))
+        image: Image.Image = Image.open(io.BytesIO(base64.b64decode(image_b64)))
         if image.mode == "RGBA" or image.info.get("transparency", None) is not None:
             image = image.convert("RGBA")
             rgb = Image.new("RGB", image.size, (255, 255, 255))

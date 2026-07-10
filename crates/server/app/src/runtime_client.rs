@@ -4,16 +4,16 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use uniserve_core::RequestId;
-use uniserve_engine_api::{EngineHandle, GenEvent, GenerateRequest as UGenerateRequest};
-use uniserve_engine_client::protocol::lora::LoraRequest;
-use uniserve_engine_client::protocol::{EngineCoreRequest, ModelDtype};
-use uniserve_engine_client::{
-    AbortRequest, EngineCoreOutputStream, EngineCoreStreamOutput, Error, InProcessEngineClient,
-    NativeEventStream, NativeGenerateRequest, Result,
+use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, RequestId};
+use uniserve_engine_api::{EngineHandle, GenEvent};
+use uniserve_engine_gateway::transport::protocol::EngineCoreRequest;
+use uniserve_engine_gateway::transport::protocol::lora::LoraRequest;
+use uniserve_engine_gateway::transport::{
+    EngineCoreOutputStream, EngineCoreStreamOutput, Error, GenerationEventStream,
+    GenerationSubmission, InProcessEngineClient, Result, StreamCancelRequest,
 };
 use uniserve_engine_runtime::EngineCore;
-use uniserve_engine_wire::translate::{AdapterParams, run_event_adapter, to_generate_request};
+use uniserve_engine_wire::translate::{AdapterParams, run_event_adapter, to_generation_request};
 use uniserve_executor::Executor;
 
 /// Current unix timestamp in fractional seconds, matching the wire timestamps
@@ -29,7 +29,7 @@ fn now_secs() -> f64 {
 pub(crate) struct RuntimeEngineClient {
     core: Arc<EngineCore>,
     active: SharedActiveRequests,
-    abort_tx: mpsc::UnboundedSender<AbortRequest>,
+    cancel_tx: mpsc::UnboundedSender<StreamCancelRequest>,
     _stats_guard: Arc<()>,
 }
 
@@ -69,16 +69,16 @@ impl RuntimeEngineClient {
         let core = Arc::new(core);
 
         let active: SharedActiveRequests = Arc::new(Mutex::new(HashMap::new()));
-        let (abort_tx, mut abort_rx) = mpsc::unbounded_channel::<AbortRequest>();
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<StreamCancelRequest>();
 
         {
             let handle = core.handle();
             let active = Arc::clone(&active);
             tokio::spawn(async move {
-                while let Some(req) = abort_rx.recv().await {
+                while let Some(req) = cancel_rx.recv().await {
                     let rid = lock_active(&active).get(&req.request_id).copied();
                     if let Some(rid) = rid {
-                        debug!(request_id = req.request_id, ?req.cause, "aborting request");
+                        debug!(request_id = req.request_id, ?req.cause, "cancelling request");
                         handle.cancel(rid);
                     }
                 }
@@ -101,7 +101,7 @@ impl RuntimeEngineClient {
                         return;
                     }
                     let wire = reporter.snapshot(&stats, block_size);
-                    uniserve_engine_client::metrics::record_scheduler_stats(
+                    uniserve_engine_gateway::transport::metrics::record_scheduler_stats(
                         &uniserve_observability::METRICS.scheduler,
                         &model_name,
                         0,
@@ -114,7 +114,7 @@ impl RuntimeEngineClient {
         Ok(Self {
             core,
             active,
-            abort_tx,
+            cancel_tx,
             _stats_guard: stats_guard,
         })
     }
@@ -135,6 +135,10 @@ impl InProcessEngineClient for RuntimeEngineClient {
 
     fn max_model_len(&self) -> u32 {
         self.core.max_model_len()
+    }
+
+    fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
+        self.core.generation_capabilities()
     }
 
     fn model_dtype(&self) -> ModelDtype {
@@ -161,36 +165,40 @@ impl InProcessEngineClient for RuntimeEngineClient {
 
         let params = AdapterParams {
             request_id: request_id.clone(),
-            want_logprobs: req
-                .sampling_params
-                .as_ref()
-                .and_then(|s| s.logprobs)
-                .unwrap_or(0)
-                > 0,
-            native: req.native.is_some(),
+            want_logprobs: req.generation.sampling.n_logprobs > 0,
         };
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<GenEvent>();
-        let generate = to_generate_request(&req, rid, event_tx);
-        if let Err(e) = self.core.submit(generate) {
+        let generate = to_generation_request(&req, rid).map_err(|error| {
             lock_active(&self.active).remove(&request_id);
-            return Err(Error::ClientClosed {
+            Error::ClientClosed {
+                message: error.to_string(),
+            }
+        })?;
+        let event_rx = self.core.submit(generate).map_err(|e| {
+            lock_active(&self.active).remove(&request_id);
+            Error::ClientClosed {
                 message: e.to_string(),
-            });
-        }
+            }
+        })?;
 
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<Result<EngineCoreStreamOutput>>();
+        let (out_tx, out_rx) = mpsc::channel::<Result<EngineCoreStreamOutput>>(
+            EngineCoreOutputStream::BUFFER_CAPACITY,
+        );
         let active = Arc::clone(&self.active);
         tokio::spawn(async move {
             let request_id = params.request_id.clone();
             run_event_adapter(params, event_rx, |output| {
-                out_tx
-                    .send(Ok(EngineCoreStreamOutput {
-                        engine_index: 0,
-                        timestamp: now_secs(),
-                        output,
-                    }))
-                    .is_ok()
+                let out_tx = out_tx.clone();
+                async move {
+                    out_tx
+                        .send(Ok(EngineCoreStreamOutput {
+                            engine_index: 0,
+                            timestamp: now_secs(),
+                            output,
+                        }))
+                        .await
+                        .is_ok()
+                }
             })
             .await;
             lock_active(&active).remove(&request_id);
@@ -198,34 +206,49 @@ impl InProcessEngineClient for RuntimeEngineClient {
 
         Ok(EngineCoreOutputStream::new(
             request_id,
-            self.abort_tx.clone(),
+            self.cancel_tx.clone(),
             out_rx,
         ))
     }
 
-    fn generate_native(&self, req: NativeGenerateRequest) -> Result<NativeEventStream> {
+    fn submit_generation(&self, submission: GenerationSubmission) -> Result<GenerationEventStream> {
+        let GenerationSubmission {
+            external_request_id,
+            mut request,
+            ..
+        } = submission;
         let rid = self.core.next_request_id();
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<GenEvent>();
-        let mut generate = UGenerateRequest::new(
-            rid,
-            req.prompt_ids,
-            req.sampling,
-            req.image,
-            req.constraint,
-            req.max_tokens,
-            event_tx,
-        );
-        generate.neg_prompt_ids = req.neg_prompt_ids;
-        generate.mm_items = req.mm_items;
-        generate.stop_token_ids = req.stop_token_ids;
-        self.core
-            .submit(generate)
-            .map_err(|e| Error::ClientClosed {
+        request.request_id = rid;
+        lock_active(&self.active).insert(external_request_id.clone(), rid);
+        let mut scheduler_rx = self.core.submit(request).map_err(|e| {
+            lock_active(&self.active).remove(&external_request_id);
+            Error::ClientClosed {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
+        let (event_tx, event_rx) = mpsc::channel::<GenEvent>(
+            uniserve_engine_gateway::generation::GENERATION_EVENT_BUFFER_CAPACITY,
+        );
+        let active = Arc::clone(&self.active);
+        let active_id = external_request_id.clone();
+        tokio::spawn(async move {
+            while let Some(event) = scheduler_rx.recv().await {
+                let terminal = matches!(
+                    event,
+                    GenEvent::Finished { .. } | GenEvent::Rejected { .. } | GenEvent::Error { .. }
+                );
+                if event_tx.send(event).await.is_err() || terminal {
+                    break;
+                }
+            }
+            lock_active(&active).remove(&active_id);
+        });
         let handle = self.handle();
-        Ok(NativeEventStream::with_cancel(event_rx, move || {
+        let active = Arc::clone(&self.active);
+        let active_id = external_request_id;
+        Ok(GenerationEventStream::with_cancel(event_rx, move || {
             handle.cancel(rid);
+            lock_active(&active).remove(&active_id);
         }))
     }
 
@@ -240,12 +263,27 @@ impl InProcessEngineClient for RuntimeEngineClient {
         Ok(())
     }
 
+    fn cancel(&self, ids: &[String]) -> Result<()> {
+        let handle = self.handle();
+        let active = lock_active(&self.active);
+        for id in ids {
+            if let Some(rid) = active.get(id).copied() {
+                handle.cancel(rid);
+            }
+        }
+        Ok(())
+    }
+
     fn reset_prefix_cache(
         &self,
-        _reset_running_requests: bool,
-        _reset_connector: bool,
+        reset_running_requests: bool,
+        reset_connector: bool,
     ) -> Result<bool> {
-        Ok(self.core.reset_prefix_cache())
+        self.core
+            .reset_prefix_cache(reset_running_requests, reset_connector)
+            .map_err(|error| uniserve_engine_gateway::Error::UnsupportedControl {
+                control: error.to_string(),
+            })
     }
 
     fn reset_mm_cache(&self) -> Result<()> {
@@ -307,12 +345,14 @@ impl InProcessEngineClient for RuntimeEngineClient {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt as _;
-    use uniserve_engine_client::protocol::{
-        EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
+    use uniserve_core::{
+        CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+        GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
+        GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds, ImageParams,
+        RequestId, SamplingParams, TriggerPolicyDescriptor, UndVisibility,
     };
-    use uniserve_engine_client::{
-        EngineCoreClient, EngineSamplingParams, GenEvent, ImageParams, NativeGenerateRequest,
-    };
+    use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
+    use uniserve_engine_gateway::transport::{EngineCoreClient, GenEvent, GenerationSubmission};
     use uniserve_engine_runtime::EngineCoreConfig;
 
     use super::RuntimeEngineClient;
@@ -329,18 +369,34 @@ mod tests {
             .expect("connect in-process sim engine"),
         );
 
-        let request = EngineCoreRequest {
-            request_id: "req-1".to_string(),
-            prompt_token_ids: Some(vec![1, 2, 3, 4]),
-            sampling_params: Some(EngineCoreSamplingParams {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 0,
-                max_tokens: 64,
-                ..EngineCoreSamplingParams::for_test()
-            }),
-            ..Default::default()
+        let constraint = GenerationConstraint::UndOnly;
+        let policy = GenerationPolicyDescriptor::default();
+        let generation = GenerationRequest {
+            request_id: RequestId(0),
+            context: vec![ContextSegment::UndTokens {
+                token_ids: vec![1, 2, 3, 4],
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: SamplingParams::default(),
+            image: ImageParams::default(),
+            max_und_tokens: 64,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: GenerationResourceBounds {
+                context_tokens: 4,
+                max_kv_tokens: 68,
+                ..Default::default()
+            },
         };
+        let request = EngineCoreRequest::new("req-1".to_string(), generation);
 
         let mut stream = client.call(request).await.expect("submit request");
 
@@ -380,22 +436,60 @@ mod tests {
             .expect("connect in-process sim engine"),
         );
 
-        let request = NativeGenerateRequest {
-            prompt_ids: vec![1, 2, 3],
-            neg_prompt_ids: vec![],
-            sampling: EngineSamplingParams::default(),
+        let constraint = GenerationConstraint::GenOnly;
+        let policy = GenerationPolicyDescriptor {
+            trigger: TriggerPolicyDescriptor::Token { token_id: 1000 },
+            gen_only_start: uniserve_core::GenOnlyStartPolicyDescriptor::Immediate,
+            feedback: Some(GeneratedImageFeedbackRecipe {
+                commit: CommitRecipe::CommitGenThenWriteback,
+                writeback: FeedbackWriteback::DirectKv,
+                next_und_token: FeedbackNextToken::EndOfImage,
+                logical_positions: 2,
+                physical_kv_tokens: uniserve_core::ImageKvEffect::WorkerDefined,
+            }),
+            ..GenerationPolicyDescriptor::default()
+        };
+        let mut request = GenerationRequest {
+            request_id: RequestId(0),
+            context: vec![ContextSegment::UndTokens {
+                token_ids: vec![1, 2, 3],
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: SamplingParams::default(),
             image: ImageParams {
                 steps: 4,
                 ..ImageParams::default()
             },
-            constraint: uniserve_core::GenerationConstraint::GenOnly,
-            max_tokens: 0,
-            mm_items: vec![],
-            stop_token_ids: vec![],
+            max_und_tokens: 0,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: GenerationResourceBounds {
+                context_tokens: 3,
+                max_kv_tokens: 3,
+                ..GenerationResourceBounds::default()
+            },
         };
+        request.resources = GenerationResourceBounds::conservative(
+            &request.context,
+            &request.behavior,
+            &request.policy,
+            &request.image,
+            request.max_und_tokens,
+            &request.cache,
+            &client.generation_capabilities(),
+        )
+        .expect("request resources must fit the in-process runtime");
 
         let mut stream = client
-            .generate_native(request)
+            .submit_generation(GenerationSubmission::new("req-image", request))
             .await
             .expect("submit native request");
 
@@ -413,6 +507,7 @@ mod tests {
                     finished = true;
                     break;
                 }
+                GenEvent::Rejected { message } => panic!("request rejected: {message}"),
                 GenEvent::Error { message } => panic!("engine error: {message}"),
                 _ => {}
             }
