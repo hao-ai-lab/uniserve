@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import json
 import math
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--guidance-scale", type=float)
+    parser.add_argument("--image-guidance-scale", type=float)
+    parser.add_argument("--cfg-norm")
+    parser.add_argument("--cfg-interval", help="comma-separated inclusive CFG interval")
+    parser.add_argument("--timestep-shift", type=float)
     parser.add_argument(
         "--max-images",
         type=int,
@@ -83,6 +89,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sharegpt-output-len", type=int)
     parser.add_argument("--sharegpt-context-len", type=int)
 
+    parser.add_argument("--runtime-profile-id", default="unspecified")
+    parser.add_argument("--measurement-interface", default="public_protocol_adapter")
+    parser.add_argument("--cache-read-policy", default="enabled")
+    parser.add_argument("--cache-write-policy", default="enabled")
+    parser.add_argument("--adapter-selection", default="base")
+    parser.add_argument("--structured-output-policy", default="none")
+    parser.add_argument("--output-constraint", default="default")
+    parser.add_argument("--preprocessing", default="dataset_default")
+    parser.add_argument("--measured-runs", type=int, default=1)
+    parser.add_argument("--server-topology", default="single_server")
+    parser.add_argument(
+        "--plan-evidence-policy",
+        default="declared_contract",
+        choices=["declared_contract", "runtime_inspection", "reference_protocol"],
+    )
+    parser.add_argument("--acceptance-min-success", type=int, default=1)
+    parser.add_argument("--acceptance-max-failed", type=int, default=0)
+    parser.add_argument("--acceptance-min-images-per-success", type=float, default=0.0)
+
     parser.add_argument("--smoke", action="store_true", help="1 prompt, no warmup (CI smoke)")
     return parser
 
@@ -105,6 +130,12 @@ def _rate_slug(rate: float) -> str:
 
 def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -> BenchmarkSpec:
     task = TaskName(args.task)
+    cfg_interval: tuple[float, float] | None = None
+    if args.cfg_interval:
+        interval_values = tuple(float(value.strip()) for value in args.cfg_interval.split(","))
+        if len(interval_values) != 2:
+            raise ValueError("cfg interval must contain exactly two values")
+        cfg_interval = (interval_values[0], interval_values[1])
     return BenchmarkSpec(
         task=task,
         model=args.model,
@@ -123,6 +154,11 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         height=args.height,
         steps=args.steps,
         max_images=args.max_images,
+        guidance_scale=args.guidance_scale,
+        image_guidance_scale=args.image_guidance_scale,
+        cfg_norm=args.cfg_norm,
+        cfg_interval=cfg_interval,
+        timestep_shift=args.timestep_shift,
         wire=args.wire or "",
         i2t_question=args.i2t_question,
         sample_gpu_memory=not args.no_gpu_memory,
@@ -130,7 +166,36 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         sharegpt_output_len=args.sharegpt_output_len,
         sharegpt_context_len=args.sharegpt_context_len,
         dataset_path=args.dataset_path,
+        runtime_profile_id=args.runtime_profile_id,
+        measurement_interface=args.measurement_interface,
+        cache_read_policy=args.cache_read_policy,
+        cache_write_policy=args.cache_write_policy,
+        adapter_selection=args.adapter_selection,
+        structured_output_policy=args.structured_output_policy,
+        output_constraint=args.output_constraint,
+        preprocessing=args.preprocessing,
+        measured_runs=args.measured_runs,
+        server_topology=args.server_topology,
+        plan_evidence_policy=args.plan_evidence_policy,
+        acceptance_min_success=args.acceptance_min_success,
+        acceptance_max_failed=args.acceptance_max_failed,
+        acceptance_min_images_per_success=args.acceptance_min_images_per_success,
     )
+
+
+def spec_from_cli_args(argv: Sequence[str]) -> BenchmarkSpec:
+    args = build_parser().parse_args(list(argv))
+    if args.request_rates or args.max_concurrencies:
+        raise ValueError("a canonical artifact contract describes exactly one operating point")
+    return _make_spec(args, parse_rate(args.request_rate), args.max_concurrency)
+
+
+def spec_from_harness_command(command: Sequence[str]) -> BenchmarkSpec:
+    try:
+        module_index = list(command).index("uniserve_eval.harness.cli")
+    except ValueError as error:
+        raise ValueError("command does not invoke uniserve_eval.harness.cli") from error
+    return spec_from_cli_args(command[module_index + 1 :])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -160,7 +225,16 @@ def main(argv: list[str] | None = None) -> int:
         else:
             out_dir = output_root
         result = asyncio.run(BenchmarkRunner(args.base_url, spec, out_dir).run())
-        ok = result.summary["failed_count"] == 0 and result.summary["ok_count"] > 0
+        artifact = result.summary.get("artifact", {})
+        checks = artifact.get("checks", {})
+        ok = bool(
+            artifact.get("schema_version") == 2
+            and artifact.get("valid") is True
+            and artifact.get("valid_marker") == "canonical-valid-v2"
+            and isinstance(checks, dict)
+            and checks
+            and all(value is True for value in checks.values())
+        )
         failures += 0 if ok else 1
         index.append(
             {

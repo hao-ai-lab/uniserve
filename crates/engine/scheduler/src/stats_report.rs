@@ -34,7 +34,7 @@ pub struct SchedStatsReporter {
 
 impl SchedStatsReporter {
     /// Snapshot the live counters into one wire `SchedulerStats` update.
-
+    ///
     /// `block_size` converts block-granular prefix-cache query counts into the
     /// token-granular counts the wire shape documents.
     pub fn snapshot(&mut self, stats: &SchedStats, block_size: u32) -> SchedulerStats {
@@ -64,11 +64,9 @@ impl SchedStatsReporter {
             queue_wait_us_total.saturating_sub(self.last_queue_wait_us_total);
         self.last_queue_wait_count = queue_wait_count;
         self.last_queue_wait_us_total = queue_wait_us_total;
-        let avg_queue_wait_us = if delta_queue_wait_count > 0 {
-            delta_queue_wait_us_total / delta_queue_wait_count
-        } else {
-            0
-        };
+        let avg_queue_wait_us = delta_queue_wait_us_total
+            .checked_div(delta_queue_wait_count)
+            .unwrap_or(0);
 
         // per-update deltas of the directly-measured batch timing.
         let worker_exec_us_total = stats.timing.worker_exec_us_total.load(Ordering::Relaxed);
@@ -289,7 +287,6 @@ fn worker_forward_stats_snapshot(stats: &SchedStats) -> WorkerForwardStats {
             .spec_verify_committed_tokens
             .load(Ordering::Relaxed),
         spec_verify_path_counts,
-        ..Default::default()
     }
 }
 
@@ -382,7 +379,6 @@ fn delta_worker_forward_stats(
             &current.spec_verify_path_counts,
             &previous.spec_verify_path_counts,
         ),
-        ..Default::default()
     }
 }
 

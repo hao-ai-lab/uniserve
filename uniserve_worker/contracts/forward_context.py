@@ -38,7 +38,8 @@ class KVPool(Protocol):
     concrete implementer; it satisfies this without an explicit subclass edge.
     """
 
-    block_size: int
+    @property
+    def block_size(self) -> int: ...
 
     def layer_cache(self, layer: int) -> "tuple[torch.Tensor, torch.Tensor]": ...
 
@@ -55,9 +56,14 @@ class AttentionCache(Protocol):
     caches satisfy it structurally.
     """
 
-    pool: KVPool
-    base_len: int
-    base_lens: "Sequence[int]"
+    @property
+    def pool(self) -> KVPool: ...
+
+    @property
+    def base_len(self) -> int: ...
+
+    @property
+    def base_lens(self) -> "Sequence[int]": ...
 
     def block_table(self, *, device: "torch.device | str | None" = ...) -> "torch.Tensor": ...
 
@@ -195,7 +201,10 @@ class TextAttentionMetadataBuilder:
 
 
 def _metadata_setter(name: str):
-    def setter(self: TextAttentionMetadataBuilder, value: object) -> "Self":
+    def setter(
+        self: TextAttentionMetadataBuilder,
+        value: object,
+    ) -> TextAttentionMetadataBuilder:
         return self.set(name, value)
 
     setter.__name__ = name

@@ -17,6 +17,7 @@ from .trace import trace_items
 from .ueval import load_ueval
 
 __all__ = [
+    "load_benchmark_inputs",
     "load_dataset_rows",
     "load_image_dir",
     "load_mjhq",
@@ -29,6 +30,26 @@ __all__ = [
 
 _PIE_BENCH_ALIASES = {"pie-bench", "pie_bench", "piebench", "pie"}
 _SYNTHETIC_IMAGE_ALIASES = {"synthetic-images", "synthetic_images", "synthetic"}
+
+
+def load_benchmark_inputs(spec: BenchmarkSpec) -> tuple[list[dict[str, Any]], Any | None]:
+    tokenizer: Any | None = None
+    if spec.task == TaskName.TEXT:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            spec.tokenizer or spec.model,
+            trust_remote_code=True,
+        )
+    rows = load_dataset_rows(spec, tokenizer=tokenizer)
+    if len(rows) > spec.num_prompts:
+        rows = rows[: spec.num_prompts]
+    if len(rows) != spec.num_prompts:
+        raise ValueError(
+            f"dataset resolved {len(rows)} rows; benchmark contract requires "
+            f"exactly {spec.num_prompts}"
+        )
+    return rows, tokenizer
 
 
 def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> list[dict[str, Any]]:

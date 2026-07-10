@@ -17,7 +17,7 @@ use uniserve_engine_runtime::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS,
 };
-use uniserve_server_app::{
+use uniserve_server::{
     ChatTemplateContentFormatOption, Config, EngineBackendKind, EngineSettings, HttpListenerMode,
     ParserSelection, RendererSelection, SchedulingPolicy, TokenizerMode,
 };
@@ -57,7 +57,7 @@ pub(crate) enum Command {
     /// Run one headless engine process: dial a frontend's handshake
     /// endpoint, host the Rust scheduler + forward-only worker behind the
     /// engine wire protocol.
-    Engine(EngineArgs),
+    Engine(Box<EngineArgs>),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -188,15 +188,15 @@ pub(crate) struct EngineArgs {
 
 impl EngineArgs {
     fn resolved_model(&self) -> String {
-        self.model_path
-            .clone()
-            .or_else(|| self.model.clone())
-            .expect("clap requires either MODEL or --model-path")
+        match self.model_path.clone().or_else(|| self.model.clone()) {
+            Some(model) => model,
+            None => panic!("clap requires either MODEL or --model-path"),
+        }
     }
 
     /// Build the engine-proc configuration. Control tokens default to the
     /// sim-compatible values and are overridden by the frontend's INIT
-    /// `native_controls` extension during the handshake.
+    /// generation control tokens during the handshake.
     pub(crate) fn to_proc_config(&self) -> uniserve_engine_process::EngineProcConfig {
         let mut core = uniserve_engine_runtime::EngineCoreConfig::sim(self.resolved_model());
         core.backend = if self.sim {
@@ -276,7 +276,7 @@ impl ServeArgs {
     /// modes: managed subprocesses or external engines).
     pub(crate) fn to_uniserve_config_with_connection(
         &self,
-        connection: uniserve_server_app::EngineConnection,
+        connection: uniserve_server::EngineConnection,
     ) -> Config {
         let mut config = self.to_uniserve_config();
         config.engine.connection = connection;
@@ -473,10 +473,10 @@ pub(crate) struct SharedRuntimeArgs {
 
 impl SharedRuntimeArgs {
     pub(crate) fn resolved_model(&self) -> String {
-        self.model_path
-            .clone()
-            .or_else(|| self.model.clone())
-            .expect("clap requires either MODEL or --model-path")
+        match self.model_path.clone().or_else(|| self.model.clone()) {
+            Some(model) => model,
+            None => panic!("clap requires either MODEL or --model-path"),
+        }
     }
 
     fn grpc_port(&self) -> Option<u16> {
@@ -504,7 +504,7 @@ impl SharedRuntimeArgs {
     /// Build the UniServe Rust-engine settings from these CLI arguments.
     pub(crate) fn engine_settings(&self) -> EngineSettings {
         EngineSettings {
-            connection: uniserve_server_app::EngineConnection::InProcess,
+            connection: uniserve_server::EngineConnection::InProcess,
             backend: if self.sim {
                 EngineBackendKind::Sim
             } else {

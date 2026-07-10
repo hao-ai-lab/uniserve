@@ -618,6 +618,34 @@ class ForwardGraphPagedKVView:
         self._target_device(device)
         return self._block_table
 
+    @property
+    def base_lens(self) -> tuple[int, ...]:
+        return tuple(int(seg.base_len) for seg in self.segments)
+
+    @property
+    def base_len(self) -> int:
+        return max(self.base_lens, default=0)
+
+    def cache_seqlens(self, *, device: torch.device | str | None = None) -> torch.Tensor:
+        return self.cache_seqlens_before(device=device)
+
+    def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        self.append_packed(layer, k, v)
+
+    def append_varlen(
+        self,
+        layer: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_lens: Sequence[int],
+        *,
+        block_table: torch.Tensor | None = None,
+        cache_seqlens: torch.Tensor | None = None,
+        cu_seqlens_q: torch.Tensor | None = None,
+    ) -> None:
+        del query_lens, block_table, cache_seqlens, cu_seqlens_q
+        self.append_packed(layer, k, v)
+
     def cache_seqlens_before(self, *, device: torch.device | str | None = None) -> torch.Tensor:
         self._target_device(device)
         return self._cache_seqlens_before

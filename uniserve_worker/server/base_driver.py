@@ -57,7 +57,12 @@ class BaseWorkerDriver(ABC):
         pass
 
     @abstractmethod
-    def execute(self, batch: Mapping[str, Any]) -> dict[str, Any]: ...
+    def execute(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        defer_text_cpu_results: bool = False,
+    ) -> dict[str, Any]: ...
 
     @abstractmethod
     def drop_request(self, req_id: int) -> None: ...

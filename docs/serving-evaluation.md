@@ -36,6 +36,8 @@ Server specs may either declare a UniServe model plus `serve_args`, or an
 explicit command for another backend. Environment variables in profile values
 are expanded at launch; unresolved variables fail before a server starts.
 
+The typed native serving boundary is `POST /inference/v1/native/generate`. It accepts ordered text, token-ID, and image context segments and streams canonical native lifecycle events over SSE. The retired compatibility path `POST /generate` remains unmounted; OpenAI clients use `/v1/chat/completions`, `/v1/completions`, or `/v1/images/generations`.
+
 ## Namespaces
 
 - `benchmark/server/...`: servers used by the official benchmark matrix.

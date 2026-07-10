@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 
 pytestmark = [pytest.mark.e2e]
 
-MODEL = Path("/home/hal-ysun/models/SenseNova-U1-8B-MoT-Default-local")
+MODEL_ENV = "UNISERVE_SENSENOVA_MODEL"
 
 
 def chat_sse_text(events: list[dict[str, object]]) -> str:
@@ -71,15 +72,21 @@ def sim_server(tmp_path: Path):
         binary = require_uniserve_binary()
     except FileNotFoundError as error:
         pytest.skip(str(error))
-    if not MODEL.exists():
-        pytest.skip(f"local SenseNova checkpoint is missing: {MODEL}")
+    model_value = os.environ.get(MODEL_ENV)
+    if not model_value:
+        pytest.skip(f"{MODEL_ENV} is required for the native sim HTTP gate")
+    model = Path(model_value)
+    if not model.exists():
+        pytest.fail(f"configured SenseNova checkpoint is missing: {model}")
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     args = [
         str(binary),
         "serve",
         "--model-path",
-        str(MODEL),
+        str(model),
+        "--served-model-name",
+        "SenseNova-U1",
         "--host",
         "127.0.0.1",
         "--port",
@@ -90,7 +97,7 @@ def sim_server(tmp_path: Path):
         "--device",
         "cpu",
         "--max-model-len",
-        "4096",
+        "8192",
         "--max-running-requests",
         "8",
         "--max-num-batched-tokens",
@@ -105,18 +112,11 @@ def sim_server(tmp_path: Path):
 
 
 def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
-    # CPU sim mode drives the worker with runtime/stub.StubUniModel, which
-    # fabricates deterministic outputs (synthetic gradient PNG at the requested
-    # geometry, sequential text tokens with a forced EOS). The image dimension
-    # and PNG assertions below therefore validate the HTTP/IPC contract and the
-    # geometry plumbing end-to-end, NOT any real model inference -- real-output
-    # correctness is covered by the GPU e2e tests, which this stub-driven smoke
-    # test intentionally substitutes for so the contract path runs without a GPU.
+    # CPU simulation emits deterministic text and image fixtures through the
+    # production HTTP, scheduler, worker IPC, and geometry contracts.
     with sim_server(tmp_path) as base_url:
-        # The stub forces an EOS token once a request has emitted >= 8 tokens
-        # (runtime/stub.py:_text). Request more than that so the natural
-        # EOS-driven finish path is actually exercised, rather than always
-        # terminating on the max_tokens length cap.
+        # The deterministic model emits EOS after eight tokens; this request
+        # exercises the runtime's EOS completion contract.
         text_events = post_sse(
             base_url,
             "/v1/chat/completions",
@@ -160,6 +160,7 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
                     }
                 ],
                 "max_completion_tokens": 8,
+                "logit_bias": {"151670": 100.0},
                 "image_config": {"num_images": 1},
             },
             timeout_s=300,
@@ -220,9 +221,33 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
             num_prompts=1,
             warmup_requests=0,
             max_tokens=8,
+            runtime_profile_id="sensenova-u1",
+            plan_evidence_policy="runtime_inspection",
         )
         result = asyncio.run(BenchmarkRunner(base_url, spec, tmp_path / "bench").run())
         assert result.summary["harness_status"] == "completed"
         assert result.summary["failed_count"] == 0
         assert result.summary["ok_count"] == 1
+        assert result.summary["artifact"]["plan_evidence"]["source"] == "runtime_inspection"
+        plan = result.summary["artifact"]["plan_summary"]
+        assert plan["dialect_id"] == "sensenova-u1"
+        assert plan["profile_id"].startswith("neo_chat:")
+        assert plan["generation"]["temperature"] == 0.0
+        assert plan["generation"]["top_p"] == 1.0
+        assert plan["generation"]["ignore_eos"] is True
+        assert plan["generation"]["image"] == {
+            "width": 2048,
+            "height": 1152,
+            "steps": 50,
+            "cfg_text_scale": 4.0,
+            "cfg_img_scale": 1.0,
+            "cfg_renorm_type": "none",
+            "cfg_renorm_min": 0.0,
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+            "seed": 42,
+            "max_images": 4,
+            "image_prompt_count": 0,
+            "retain_images": True,
+        }
         assert (tmp_path / "bench" / "summary.json").exists()

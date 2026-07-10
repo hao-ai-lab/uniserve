@@ -12,6 +12,7 @@ import logging
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from ..contracts.caps import CONTROL_KINDS, Caps, validate_caps, validate_forward_result
+from ..contracts.outputs import FinalizableSeqResult
 from ..foundation.errors import (
     WorkerError,
     classify,
@@ -45,9 +46,10 @@ RESPONSE_OPTIONAL_FIELDS = (
     "fatal",
 )
 
-# Optional per-seq result keys in wire completion order. ``op_id`` is stamped
-# by the runtime in ``WorkerRuntime.handle``, not by output dataclasses.
+# Optional per-seq result keys in wire completion order. ``op_id`` and
+# ``op_kind`` are stamped by the runtime, not by output dataclasses.
 SEQ_RESULT_FIELDS = (
+    "op_kind",
     "sampled_token_id",
     "sampled_token_ids",
     "denoise_done",
@@ -56,6 +58,7 @@ SEQ_RESULT_FIELDS = (
     "image_hw",
     "sampled_logprob",
     "top_logprobs",
+    "prompt_logprobs",
     "encoder_handle",
     "num_tokens",
     "num_accepted_tokens",
@@ -326,11 +329,6 @@ def _add_deferred_cuda_ready_component(resp: dict) -> None:
 
 
 @runtime_checkable
-class FinalizableSeqResult(Protocol):
-    def finalize(self) -> Mapping[str, Any]: ...
-
-
-@runtime_checkable
 class WorkerDriver(Protocol):
     """The adapter contract the runtime shell drives.
 
@@ -500,12 +498,14 @@ class WorkerRuntime:
             self.metrics.record_forward_stats(result.get("forward_stats"))
 
     def _annotate_execute_result(self, result: dict, dur: int, ops: list) -> None:
-        # Stamp worker compute time and echo per-op op_id (per_seq aligns with ops).
+        # Stamp worker compute time and echo the submitted operation identity.
         result["worker_exec_us"] = dur // 1000
         for op, sr in zip(ops, result.get("per_seq") or []):
-            oid = op.get("op_id")
-            if oid is not None and isinstance(sr, dict):
-                sr["op_id"] = oid
+            if isinstance(sr, dict):
+                sr["op_kind"] = op.get("kind")
+                oid = op.get("op_id")
+                if oid is not None:
+                    sr["op_id"] = oid
 
     def _prepare_response_for_send(self, pending: PendingResult) -> dict:
         resp = pending.response
@@ -519,9 +519,11 @@ class WorkerRuntime:
                     owner=self.driver.__class__.__name__,
                 )
                 for op, sr in zip(pending.batch.get("ops") or [], result.get("per_seq") or []):
-                    oid = op.get("op_id")
-                    if oid is not None and isinstance(sr, dict):
-                        sr["op_id"] = oid
+                    if isinstance(sr, dict):
+                        sr["op_kind"] = op.get("kind")
+                        oid = op.get("op_id")
+                        if oid is not None:
+                            sr["op_id"] = oid
         return resp
 
     def _respond(self, pending: dict | PendingResult) -> None:

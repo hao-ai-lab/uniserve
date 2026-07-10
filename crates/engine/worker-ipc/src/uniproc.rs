@@ -451,10 +451,10 @@ impl UniprocExecutor {
                 uniserve_worker_ipc_core::EVENT_DRIVEN_ENV,
                 if event_driven { "1" } else { "0" },
             );
-        if tp_size > 1 {
-            if let Some(init_method) = tp_init_method {
-                cmd.arg("--tp-init-method").arg(init_method);
-            }
+        if tp_size > 1
+            && let Some(init_method) = tp_init_method
+        {
+            cmd.arg("--tp-init-method").arg(init_method);
         }
         if let Some(c) = kv_token_capacity {
             cmd.arg("--kv-token-capacity").arg(c.to_string());
@@ -617,10 +617,9 @@ impl UniprocExecutor {
             let Some(frame) = self.client.try_recv_response(&record.pending)? else {
                 continue;
             };
-            let record = self
-                .pending
-                .remove(&call_id)
-                .expect("pending record disappeared while routing response");
+            let record = self.pending.remove(&call_id).ok_or_else(|| {
+                anyhow::anyhow!("pending record {call_id} disappeared while routing response")
+            })?;
             self.route(call_id, record.kind, frame)?;
             drained += 1;
         }

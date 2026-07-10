@@ -20,6 +20,17 @@ class I2ITask(BenchmarkTask):
             image_config["height"] = int(height)
         if self.spec.steps is not None:
             image_config["steps"] = int(self.spec.steps)
+        image_config["seed"] = int(item.get("seed", self.spec.seed))
+        if self.spec.guidance_scale is not None:
+            image_config["guidance_scale"] = self.spec.guidance_scale
+        if self.spec.image_guidance_scale is not None:
+            image_config["image_guidance_scale"] = self.spec.image_guidance_scale
+        if self.spec.cfg_norm is not None:
+            image_config["cfg_norm"] = self.spec.cfg_norm
+        if self.spec.cfg_interval is not None:
+            image_config["cfg_interval"] = list(self.spec.cfg_interval)
+        if self.spec.timestep_shift is not None:
+            image_config["timestep_shift"] = self.spec.timestep_shift
         payload: dict[str, Any] = {
             "model": self.spec.model,
             "modalities": ["image"],
@@ -37,6 +48,9 @@ class I2ITask(BenchmarkTask):
                     ],
                 }
             ],
+            "temperature": self.spec.temperature,
+            "top_p": self.spec.top_p,
+            "ignore_eos": self.spec.ignore_eos,
             "image_config": image_config,
         }
         if self.spec.extra_request_body:

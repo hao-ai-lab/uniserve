@@ -6,7 +6,7 @@ use crate::utility::UtilityCallId;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors produced while encoding/decoding the engine wire protocol.
-
+///
 /// Transport- and client-lifecycle errors (handshake timeouts, dead engines,
 /// closed registries) live with the code that owns sockets and registries; this
 /// crate only reports protocol-shape problems.
@@ -28,11 +28,8 @@ pub enum Error {
     ExtValueDecode { message: String },
     #[error("unsupported auxiliary frame(s): expected 1 frame, got {frame_count}")]
     UnsupportedAuxFrames { frame_count: usize },
-    #[error("unsupported field `{field}` in {context}")]
-    UnsupportedField {
-        context: &'static str,
-        field: &'static str,
-    },
+    #[error("invalid canonical generation request: {message}")]
+    InvalidGenerationRequest { message: String },
     #[error("utility call `{method}` (id {call_id}) failed: {message}")]
     UtilityCallFailed {
         method: String,

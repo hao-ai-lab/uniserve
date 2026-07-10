@@ -34,7 +34,18 @@ class InputImageIngestOwner(Protocol):
 
     device: Any
 
-    def interleaved_text_forward(self, **kwargs: Any) -> Any: ...
+    def interleaved_text_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        indexes: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        attention_mask: Any = None,
+        past_key_values: Any = None,
+        use_cache: bool = True,
+        text_only_rope: bool = False,
+        causal_paged_update: bool = False,
+    ) -> Any: ...
     def interleaved_image_features(
         self, image_input: torch.Tensor, *, grid_hw: torch.Tensor, gen_model: bool = ...
     ) -> torch.Tensor: ...
@@ -62,16 +73,42 @@ class InputImageIngestDriver:
         to the whole existing prefix, matching the block-causal semantics the
         reference pipeline builds from its expanded placeholder stream.
         """
+        vit_embeds = self.encode_understanding_image(flattened_patches, grid_hw)
+        return self.ingest_understanding_embeddings(
+            cache,
+            vit_embeds,
+            grid_hw,
+            t_index=t_index,
+        )
+
+    def encode_understanding_image(
+        self,
+        flattened_patches: torch.Tensor,
+        grid_hw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Produce the reusable vision-encoder output for one image."""
+        owner = self.owner
+        return owner.interleaved_image_features(
+            flattened_patches.to(owner.device),
+            grid_hw=grid_hw.to(owner.device),
+        )
+
+    def ingest_understanding_embeddings(
+        self,
+        cache: TextCache,
+        vit_embeds: torch.Tensor,
+        grid_hw: torch.Tensor,
+        *,
+        t_index: int,
+    ) -> int:
+        """Append reusable vision embeddings into one request's paged text cache."""
         owner = self.owner
         if cache.past is None:
             raise model_execution_error(
                 "input-image ingest requires an initialized paged text cache"
             )
         device = owner.device
-        vit_embeds = owner.interleaved_image_features(
-            flattened_patches.to(device),
-            grid_hw=grid_hw.to(device),
-        ).unsqueeze(0)
+        vit_embeds = vit_embeds.to(device).unsqueeze(0)
         num_tokens = int(vit_embeds.shape[1])
 
         merge = int(1 / owner.interleaved_image_downsample_ratio())

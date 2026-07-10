@@ -110,7 +110,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             if args.runtime.engine_count == 0 {
                 // The deliberate single-node default: the engine runs
                 // on a thread inside the server with no serialized hop.
-                uniserve_server_http::serve(args.to_uniserve_config(), shutdown_signal()).await
+                uniserve_server::serve(args.to_uniserve_config(), shutdown_signal()).await
             } else {
                 serve_with_engines(*args).await
             }
@@ -191,7 +191,7 @@ async fn serve_with_engines(args: ServeArgs) -> Result<()> {
         );
     }
 
-    let connection = uniserve_server_app::EngineConnection::Handshake {
+    let connection = uniserve_server::EngineConnection::Handshake {
         handshake_address,
         advertised_host: args.runtime.advertised_host.clone(),
         engine_count,
@@ -204,7 +204,7 @@ async fn serve_with_engines(args: ServeArgs) -> Result<()> {
     let mut serve_task = {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let result = uniserve_server_http::serve(config, shutdown).await;
+            let result = uniserve_server::serve(config, shutdown).await;
             if result.is_ok() {
                 info!("OpenAI server shut down gracefully");
             }

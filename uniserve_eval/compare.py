@@ -18,6 +18,15 @@ import argparse
 import json
 from typing import Any
 
+from .harness.cli import spec_from_harness_command
+from .harness.datasets import load_benchmark_inputs
+from .harness.report import (
+    benchmark_contract,
+    benchmark_parity_contract,
+    canonical_artifact_bundle_matches,
+    canonical_digest,
+)
+from .perf import perf_profile_contract_fingerprint, resolved_perf_command
 from .profiles import artifact_root, load_config, workload_dir
 
 # (display label, dotted path into the summary, higher-is-better)
@@ -60,7 +69,28 @@ def _load_summaries(config: dict[str, Any], names: list[str]) -> dict[str, dict[
                 f"no summary for workload {name!r} at {path}; "
                 f"run the point first: uniserve-eval perf {name}"
             )
-        summaries[name] = json.loads(path.read_text(encoding="utf-8"))
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        command, workload, server = resolved_perf_command(config, name)
+        spec = spec_from_harness_command(command)
+        rows, _ = load_benchmark_inputs(spec)
+        expected_contract = benchmark_contract(spec, rows)
+        profile_fingerprint = perf_profile_contract_fingerprint(
+            command,
+            workload,
+            server,
+            expected_contract,
+            config=config,
+        )
+        if not canonical_artifact_bundle_matches(
+            path.parent,
+            summary,
+            expected_contract,
+            profile_contract_fingerprint=profile_fingerprint,
+        ):
+            raise SystemExit(
+                f"refusing to compare benchmark artifact outside the current contract: {path}"
+            )
+        summaries[name] = summary
     return summaries
 
 
@@ -83,6 +113,32 @@ def compare_workloads(
     if len(names) < 2:
         raise SystemExit("compare needs at least two workloads")
     summaries = _load_summaries(config, names)
+    parity = {}
+    for name in names:
+        artifact = summaries[name]["artifact"]
+        harness_parity = benchmark_parity_contract(artifact["contract"])
+        profile_contract = artifact.get("profile_contract")
+        model_contract = (
+            profile_contract.get("model_contract")
+            if isinstance(profile_contract, dict)
+            else None
+        )
+        if not isinstance(model_contract, dict):
+            raise SystemExit(f"benchmark {name!r} has no model-content provenance")
+        payload = {
+            "schema_version": 1,
+            "harness": harness_parity,
+            "model": model_contract,
+        }
+        parity[name] = {**payload, "fingerprint": canonical_digest(payload)}
+    parity_fingerprints = {
+        name: contract["fingerprint"] for name, contract in parity.items()
+    }
+    if len(set(parity_fingerprints.values())) != 1:
+        raise SystemExit(
+            "refusing to compare workloads with different protocol or workload contracts: "
+            f"{parity_fingerprints}"
+        )
     families = {name: summaries[name].get("metric_family") for name in names}
     if len(set(families.values())) != 1:
         raise SystemExit(f"refusing to compare mixed metric families: {families}")
@@ -137,6 +193,7 @@ def compare_workloads(
         "metric_family": family,
         "baseline": baseline,
         "workloads": names,
+        "parity_contract_fingerprint": parity[names[0]]["fingerprint"],
         "rows": rows,
         "ratio_semantics": "candidate/baseline for higher-is-better metrics, baseline/candidate for latency metrics; >1.0 means the candidate is better",
     }

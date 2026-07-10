@@ -7,8 +7,9 @@ top-k, top-p, sample, logprobs. Seeded requests use a per-request
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple, TypeGuard, cast, overload
 
 import torch
 
@@ -25,6 +26,8 @@ __all__ = [
     'TokenSample',
     'BatchedSamplingResult',
     'DeferredBatchedSamplingResult',
+    'is_deferred_sampling_result',
+    'finalize_sampling_result',
     'sample_one_from_logits',
     'apply_sampling_batched',
     'apply_sampling_batched_with_device_tokens',
@@ -95,7 +98,9 @@ class Strategy:
     min_p: float
     truncation: Truncation
     penalties: Penalties
+    return_logprobs: bool
     n_logprobs: int
+    logprob_token_ids: tuple[int, ...]
 
     @property
     def is_greedy(self) -> bool:
@@ -104,6 +109,10 @@ class Strategy:
     @property
     def has_min_p(self) -> bool:
         return self.min_p > 0.0
+
+    @property
+    def logprobs_requested(self) -> bool:
+        return self.return_logprobs or self.n_logprobs > 0 or bool(self.logprob_token_ids)
 
 
 def resolve_sampling_strategy(sp: dict[str, Any]) -> Strategy:
@@ -130,14 +139,18 @@ def resolve_sampling_strategy(sp: dict[str, Any]) -> Strategy:
         min_p=min_p,
         truncation=truncation,
         penalties=penalties,
-        n_logprobs=int(sp.get("n_logprobs", 0) or 0),
+        return_logprobs=bool(sp.get("return_logprobs", False)),
+        n_logprobs=max(0, int(sp.get("n_logprobs", 0) or 0)),
+        logprob_token_ids=tuple(
+            dict.fromkeys(int(token_id) for token_id in (sp.get("logprob_token_ids") or ()))
+        ),
     )
 
 
 class TokenSample(NamedTuple):
     """One sampled token plus optional logprob detail.
 
-    ``top_logprobs`` is the ``[token_id, logprob]`` list-of-lists carried in the
+    ``top_logprobs`` is the ``[token_id, logprob, rank]`` list-of-lists carried in the
     output protocol; positional unpacking ``token, logprob, top = sample`` and
     index access stay valid because this is a tuple subtype.
     """
@@ -156,6 +169,116 @@ class BatchedSamplingResult:
 
     samples: list[TokenSample]
     device_tokens: torch.Tensor
+
+
+def _competition_rank_from_top_values(values: Sequence[float], value: float) -> int:
+    """Rank by one plus the number of candidates with a strictly greater score."""
+
+    return sum(candidate > value for candidate in values) + 1
+
+
+def score_prompt_token_logprobs(
+    logits: torch.Tensor,
+    target_token_ids: Sequence[int],
+    *,
+    n_logprobs: int,
+    logprob_token_ids: Sequence[int] = (),
+) -> list[list[tuple[int, float, int]]]:
+    """Score prompt targets against their left-context logits.
+
+    Each position starts with its actual target token, then adds the highest-ranked
+    requested candidates and explicit token IDs without duplication.
+    """
+
+    if logits.ndim != 2:
+        raise invalid_descriptor("prompt-scoring logits must be shaped [positions, vocab]")
+    position_count, vocab = int(logits.shape[0]), int(logits.shape[1])
+    targets = [int(token_id) for token_id in target_token_ids]
+    if len(targets) != position_count:
+        raise invalid_descriptor("prompt-scoring target count must match logits positions")
+    if any(token_id < 0 or token_id >= vocab for token_id in targets):
+        raise invalid_descriptor("prompt-scoring target token is outside the model vocabulary")
+    if position_count == 0:
+        return []
+
+    requested_ids = list(
+        dict.fromkeys(
+            int(token_id)
+            for token_id in logprob_token_ids
+            if 0 <= int(token_id) < vocab
+        )
+    )
+    top_count = min(max(0, int(n_logprobs)), vocab)
+    logprobs = torch.log_softmax(logits.float(), dim=-1)
+    target_indices = torch.tensor(targets, dtype=torch.long, device=logits.device)
+    selected = logprobs.gather(1, target_indices[:, None]).squeeze(1)
+    selected_ranks = (logprobs > selected[:, None]).sum(dim=-1) + 1
+    top_values = top_indices = None
+    if top_count > 0:
+        top_values, top_indices = torch.topk(logprobs, top_count, dim=-1)
+    requested_values = requested_ranks = None
+    if requested_ids:
+        requested_indices = torch.tensor(
+            requested_ids, dtype=torch.long, device=logits.device
+        ).expand(position_count, -1)
+        requested_values = logprobs.gather(1, requested_indices)
+        requested_ranks = torch.empty_like(requested_indices)
+        for offset in range(len(requested_ids)):
+            requested_ranks[:, offset] = (
+                logprobs > requested_values[:, offset, None]
+            ).sum(dim=-1) + 1
+
+    selected_cpu = selected.detach().to("cpu")
+    selected_ranks_cpu = selected_ranks.detach().to("cpu")
+    top_values_cpu = top_values.detach().to("cpu") if top_values is not None else None
+    top_indices_cpu = top_indices.detach().to("cpu") if top_indices is not None else None
+    requested_values_cpu = (
+        requested_values.detach().to("cpu") if requested_values is not None else None
+    )
+    requested_ranks_cpu = (
+        requested_ranks.detach().to("cpu") if requested_ranks is not None else None
+    )
+
+    positions: list[list[tuple[int, float, int]]] = []
+    for row, target in enumerate(targets):
+        entries = [
+            (
+                target,
+                float(selected_cpu[row].item()),
+                int(selected_ranks_cpu[row].item()),
+            )
+        ]
+        seen = {target}
+        if top_values_cpu is not None and top_indices_cpu is not None:
+            row_top_values = [float(value) for value in top_values_cpu[row].tolist()]
+            for token_id, logprob in zip(
+                top_indices_cpu[row].tolist(), row_top_values
+            ):
+                token_id = int(token_id)
+                if token_id not in seen:
+                    entries.append(
+                        (
+                            token_id,
+                            logprob,
+                            _competition_rank_from_top_values(
+                                row_top_values, logprob
+                            ),
+                        )
+                    )
+                    seen.add(token_id)
+        if requested_values_cpu is not None and requested_ranks_cpu is not None:
+            for offset, token_id in enumerate(requested_ids):
+                if token_id not in seen:
+                    entries.append(
+                        (
+                            token_id,
+                            float(requested_values_cpu[row, offset].item()),
+                            int(requested_ranks_cpu[row, offset].item()),
+                        )
+                    )
+                    seen.add(token_id)
+        positions.append(entries)
+    return positions
 
 
 @dataclass(frozen=True)
@@ -197,19 +320,29 @@ class DeferredBatchedSamplingResult:
         device_tokens: torch.Tensor,
         copy_event: torch.cuda.Event | None,
         ready_start_event: torch.cuda.Event | None = None,
+        return_logprobs: list[bool] | None = None,
         n_logprobs: list[int] | None = None,
+        logprob_token_ids: list[list[int]] | None = None,
         selected_cpu: torch.Tensor | None = None,
         top_values_cpu: torch.Tensor | None = None,
         top_indices_cpu: torch.Tensor | None = None,
+        selected_ranks_cpu: torch.Tensor | None = None,
+        requested_values_cpu: torch.Tensor | None = None,
+        requested_ranks_cpu: torch.Tensor | None = None,
     ) -> None:
         self._tokens_cpu = tokens_cpu
         self.device_tokens = device_tokens
         self._copy_event = copy_event
         self._ready_start_event = ready_start_event
+        self._return_logprobs = return_logprobs
         self._n_logprobs = n_logprobs
+        self._logprob_token_ids = logprob_token_ids
         self._selected_cpu = selected_cpu
         self._top_values_cpu = top_values_cpu
         self._top_indices_cpu = top_indices_cpu
+        self._selected_ranks_cpu = selected_ranks_cpu
+        self._requested_values_cpu = requested_values_cpu
+        self._requested_ranks_cpu = requested_ranks_cpu
         self._finalized: BatchedSamplingResult | None = None
         self._token_ids: list[int] | None = None
 
@@ -262,23 +395,83 @@ class DeferredBatchedSamplingResult:
     def _sample_for_row(self, row: int) -> TokenSample:
         token_id = self._ensure_token_ids()[int(row)]
         n = int(self._n_logprobs[row]) if self._n_logprobs is not None else 0
-        if n <= 0:
+        requested_ids = (
+            self._logprob_token_ids[row]
+            if self._logprob_token_ids is not None
+            else []
+        )
+        return_logprobs = (
+            bool(self._return_logprobs[row])
+            if self._return_logprobs is not None
+            else False
+        )
+        if not return_logprobs and n <= 0 and not requested_ids:
             return TokenSample(token_id, None, None)
         logprob = (
             float(self._selected_cpu[row].item())
             if self._selected_cpu is not None
             else None
         )
-        top = None
+        top = []
+        existing: set[int] = set()
+        if logprob is not None and self._selected_ranks_cpu is not None:
+            top.append(
+                [
+                    token_id,
+                    logprob,
+                    int(self._selected_ranks_cpu[row].item()),
+                ]
+            )
+            existing.add(token_id)
         if self._top_values_cpu is not None and self._top_indices_cpu is not None:
-            top = [
-                [int(token), float(value)]
-                for token, value in zip(
-                    self._top_indices_cpu[row, :n].tolist(),
-                    self._top_values_cpu[row, :n].tolist(),
-                )
+            row_top_values = [
+                float(value) for value in self._top_values_cpu[row, :n].tolist()
             ]
-        return TokenSample(token_id, logprob, top)
+            for token, value in zip(
+                self._top_indices_cpu[row, :n].tolist(), row_top_values
+            ):
+                token = int(token)
+                if token not in existing:
+                    top.append(
+                        [
+                            token,
+                            value,
+                            _competition_rank_from_top_values(
+                                row_top_values, value
+                            ),
+                        ]
+                    )
+                    existing.add(token)
+        if (
+            requested_ids
+            and self._requested_values_cpu is not None
+            and self._requested_ranks_cpu is not None
+        ):
+            for offset, requested_id in enumerate(requested_ids):
+                if requested_id not in existing:
+                    top.append(
+                        [
+                            int(requested_id),
+                            float(self._requested_values_cpu[row, offset].item()),
+                            int(self._requested_ranks_cpu[row, offset].item()),
+                        ]
+                    )
+                    existing.add(requested_id)
+        return TokenSample(token_id, logprob, top or None)
+
+
+def is_deferred_sampling_result(result: object) -> TypeGuard[DeferredBatchedSamplingResult]:
+    """Identify deferred results without coupling consumers to class identity."""
+    return callable(getattr(result, "finalize", None)) and hasattr(result, "device_tokens")
+
+
+def finalize_sampling_result(result: object) -> BatchedSamplingResult:
+    """Return an immediate sampling result across module reload boundaries."""
+    finalize = getattr(result, "finalize", None)
+    resolved = finalize() if is_deferred_sampling_result(result) and callable(finalize) else result
+    if not hasattr(resolved, "samples") or not hasattr(resolved, "device_tokens"):
+        raise invalid_descriptor("sampler returned an invalid batched result")
+    return cast(BatchedSamplingResult, resolved)
 
 
 def _seed_generator(
@@ -338,6 +531,45 @@ def apply_sampling_batched(
         allowed,
         suppress,
     ).samples
+
+
+@overload
+def apply_sampling_batched_with_device_tokens(
+    logits: torch.Tensor,
+    sampling_params: list[dict[str, Any]],
+    recent: list[list[int] | tuple[int, ...]],
+    allowed: list[list[int] | tuple[int, ...] | None],
+    suppress: list[list[int] | tuple[int, ...] | None],
+    *,
+    defer_cpu: Literal[False] = False,
+    enable_cuda_timing: bool = False,
+) -> BatchedSamplingResult: ...
+
+
+@overload
+def apply_sampling_batched_with_device_tokens(
+    logits: torch.Tensor,
+    sampling_params: list[dict[str, Any]],
+    recent: list[list[int] | tuple[int, ...]],
+    allowed: list[list[int] | tuple[int, ...] | None],
+    suppress: list[list[int] | tuple[int, ...] | None],
+    *,
+    defer_cpu: Literal[True],
+    enable_cuda_timing: bool = False,
+) -> BatchedSamplingResult | DeferredBatchedSamplingResult: ...
+
+
+@overload
+def apply_sampling_batched_with_device_tokens(
+    logits: torch.Tensor,
+    sampling_params: list[dict[str, Any]],
+    recent: list[list[int] | tuple[int, ...]],
+    allowed: list[list[int] | tuple[int, ...] | None],
+    suppress: list[list[int] | tuple[int, ...] | None],
+    *,
+    defer_cpu: bool,
+    enable_cuda_timing: bool = False,
+) -> BatchedSamplingResult | DeferredBatchedSamplingResult: ...
 
 
 def apply_sampling_batched_with_device_tokens(
@@ -422,6 +654,10 @@ class _BatchLogprobs:
     selected: torch.Tensor | None
     top_values: torch.Tensor | None
     top_indices: torch.Tensor | None
+    selected_ranks: torch.Tensor | None
+    requested_values: torch.Tensor | None
+    requested_ranks: torch.Tensor | None
+    requested_token_ids: list[list[int]]
 
 
 def _draw_greedy_fast_path(
@@ -552,16 +788,49 @@ def _logprobs_stage(
 
     Returns all-``None`` detail when no row requested logprobs.
     """
-    max_top = max(
-        (int(sp.get("n_logprobs", 0) or 0) for sp in state.sampling_params),
-        default=0,
+    strategies = [resolve_sampling_strategy(sp) for sp in state.sampling_params]
+    requested_token_ids = [
+        [token_id for token_id in strategy.logprob_token_ids if 0 <= token_id < state.vocab]
+        for strategy in strategies
+    ]
+    max_top = min(
+        max((strategy.n_logprobs for strategy in strategies), default=0),
+        state.vocab,
     )
-    if max_top <= 0:
-        return _BatchLogprobs(None, None, None)
+    if not any(strategy.logprobs_requested for strategy in strategies):
+        return _BatchLogprobs(None, None, None, None, None, None, requested_token_ids)
     logprobs = torch.log_softmax(work, dim=-1)
     selected = logprobs.gather(1, tokens[:, None]).squeeze(1)
-    top_values, top_indices = torch.topk(logprobs, min(max_top, state.vocab), dim=-1)
-    return _BatchLogprobs(selected, top_values, top_indices)
+    selected_ranks = (logprobs > selected[:, None]).sum(dim=-1) + 1
+    top_values = top_indices = None
+    if max_top > 0:
+        top_values, top_indices = torch.topk(logprobs, max_top, dim=-1)
+    max_requested = max((len(token_ids) for token_ids in requested_token_ids), default=0)
+    requested_values = requested_ranks = None
+    if max_requested > 0:
+        requested_indices = torch.zeros(
+            (state.batch, max_requested), dtype=torch.long, device=work.device
+        )
+        for row, token_ids in enumerate(requested_token_ids):
+            if token_ids:
+                requested_indices[row, : len(token_ids)] = torch.tensor(
+                    token_ids, dtype=torch.long, device=work.device
+                )
+        requested_values = logprobs.gather(1, requested_indices)
+        requested_ranks = torch.empty_like(requested_indices)
+        for offset in range(max_requested):
+            requested_ranks[:, offset] = (
+                logprobs > requested_values[:, offset, None]
+            ).sum(dim=-1) + 1
+    return _BatchLogprobs(
+        selected,
+        top_values,
+        top_indices,
+        selected_ranks,
+        requested_values,
+        requested_ranks,
+        requested_token_ids,
+    )
 
 
 def _device_to_host_stage(
@@ -582,9 +851,12 @@ def _device_to_host_stage(
     behind the next batch's GPU launch; otherwise the event is synchronized inline
     and the samples are assembled here.
     """
-    n_logprobs = [int(sp.get("n_logprobs", 0) or 0) for sp in state.sampling_params]
+    strategies = [resolve_sampling_strategy(sp) for sp in state.sampling_params]
+    return_logprobs = [strategy.return_logprobs for strategy in strategies]
+    n_logprobs = [min(strategy.n_logprobs, state.vocab) for strategy in strategies]
     copy_stream = _cuda_copy_stream(work.device)
     selected_cpu = top_values_cpu = top_indices_cpu = None
+    selected_ranks_cpu = requested_values_cpu = requested_ranks_cpu = None
     copy_event: torch.cuda.Event | None = None
     if copy_stream is not None:
         copy_stream.wait_stream(torch.cuda.current_stream(work.device))
@@ -595,6 +867,12 @@ def _device_to_host_stage(
             if logprobs.top_values is not None and logprobs.top_indices is not None:
                 top_values_cpu = _copy_to_pinned_cpu(logprobs.top_values)
                 top_indices_cpu = _copy_to_pinned_cpu(logprobs.top_indices)
+            if logprobs.selected_ranks is not None:
+                selected_ranks_cpu = _copy_to_pinned_cpu(logprobs.selected_ranks)
+            if logprobs.requested_values is not None:
+                requested_values_cpu = _copy_to_pinned_cpu(logprobs.requested_values)
+            if logprobs.requested_ranks is not None:
+                requested_ranks_cpu = _copy_to_pinned_cpu(logprobs.requested_ranks)
             copy_event = torch.cuda.Event(enable_timing=enable_cuda_timing)
             copy_event.record(copy_stream)
     else:
@@ -604,15 +882,26 @@ def _device_to_host_stage(
         if logprobs.top_values is not None and logprobs.top_indices is not None:
             top_values_cpu = logprobs.top_values.detach().to("cpu")
             top_indices_cpu = logprobs.top_indices.detach().to("cpu")
+        if logprobs.selected_ranks is not None:
+            selected_ranks_cpu = logprobs.selected_ranks.detach().to("cpu")
+        if logprobs.requested_values is not None:
+            requested_values_cpu = logprobs.requested_values.detach().to("cpu")
+        if logprobs.requested_ranks is not None:
+            requested_ranks_cpu = logprobs.requested_ranks.detach().to("cpu")
 
     deferred = DeferredBatchedSamplingResult(
         tokens_cpu=tokens_cpu,
         device_tokens=tokens.detach(),
         copy_event=copy_event,
+        return_logprobs=return_logprobs,
         n_logprobs=n_logprobs,
+        logprob_token_ids=logprobs.requested_token_ids,
         selected_cpu=selected_cpu,
         top_values_cpu=top_values_cpu,
         top_indices_cpu=top_indices_cpu,
+        selected_ranks_cpu=selected_ranks_cpu,
+        requested_values_cpu=requested_values_cpu,
+        requested_ranks_cpu=requested_ranks_cpu,
     )
     if defer_cpu and copy_event is not None:
         return deferred
@@ -631,7 +920,7 @@ _INDEX_TENSOR_CACHE_MAX = 512
 
 
 def _valid_index_tensor(
-    values: list[int] | tuple[int, ...],
+    values: Sequence[int],
     vocab: int,
     *,
     device: torch.device,
@@ -653,7 +942,7 @@ def _valid_index_tensor(
 
 def apply_allowed_mask_(
     logits: torch.Tensor,
-    allowed: list[int] | tuple[int, ...] | None,
+    allowed: Sequence[int] | None,
     vocab: int,
 ) -> None:
     """Restrict a 1-D logits row to ``allowed`` token ids in place.
@@ -673,7 +962,7 @@ def apply_allowed_mask_(
 
 def apply_suppress_(
     logits: torch.Tensor,
-    suppress: list[int] | tuple[int, ...] | None,
+    suppress: Sequence[int] | None,
     vocab: int,
 ) -> None:
     """Force ``suppress`` token ids in a 1-D logits row to ``-inf`` in place.
@@ -749,7 +1038,7 @@ def _greedy_device_fast_path_logits(
 def _can_use_greedy_device_fast_path(sampling_params: list[dict[str, Any]]) -> bool:
     for sp in sampling_params:
         strategy = resolve_sampling_strategy(sp)
-        if strategy.n_logprobs > 0:
+        if strategy.logprobs_requested:
             return False
         if not strategy.is_greedy:
             return False
@@ -835,9 +1124,9 @@ def shape_logits_for_sampling(
     logits: torch.Tensor,
     sp: dict[str, Any],
     *,
-    recent: list[int] | tuple[int, ...],
-    allowed: list[int] | tuple[int, ...] | None,
-    suppress: list[int] | tuple[int, ...] | None,
+    recent: Sequence[int],
+    allowed: Sequence[int] | None,
+    suppress: Sequence[int] | None,
     vocab: int,
 ) -> None:
     """Apply the full single-row logits-shaping pipeline in place.

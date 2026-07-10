@@ -12,17 +12,17 @@ __all__ = [
 ]
 
 try:  # pragma: no cover - optional CUDA package.
-    from flash_attn import flash_attn_func as _flash_attn_func  # type: ignore
+    from flash_attn import flash_attn_func as _flash_attn_func
 except ImportError:  # pragma: no cover
     _flash_attn_func = None
 
 try:  # pragma: no cover - optional CUDA package/version.
-    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func  # type: ignore
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
 except ImportError:  # pragma: no cover
     _flash_attn_varlen_func = None
 
 try:  # pragma: no cover - optional CUDA package/version.
-    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache  # type: ignore
+    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
 except ImportError:  # pragma: no cover
     _flash_attn_with_kvcache = None
 

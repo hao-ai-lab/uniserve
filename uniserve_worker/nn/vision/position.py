@@ -43,8 +43,8 @@ def get_2d_sincos_pos_embed(
 ) -> np.ndarray:
     grid_h = np.arange(grid_size, dtype=np.float32) / pe_interpolation
     grid_w = np.arange(grid_size, dtype=np.float32) / pe_interpolation
-    grid = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
+    grid_axes = np.meshgrid(grid_w, grid_h)
+    grid = np.stack(grid_axes, axis=0).reshape([2, 1, grid_size, grid_size])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token and extra_tokens > 0:
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)

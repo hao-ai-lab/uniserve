@@ -37,10 +37,13 @@ from .flashinfer_pool import WrapperKey, _WrapperPool
 from .layout import QKVLayout, normalize_kv, normalize_to
 from .registry import register_attention_backend
 
+_flashinfer: Any | None
 try:  # pragma: no cover - depends on optional CUDA package availability.
-    import flashinfer as _flashinfer
+    import flashinfer as _flashinfer_module
 except Exception:  # pragma: no cover
     _flashinfer = None
+else:  # pragma: no cover
+    _flashinfer = _flashinfer_module
 
 _BatchDecodeWithPagedKVCacheWrapper = (
     getattr(_flashinfer, "BatchDecodeWithPagedKVCacheWrapper", None) if _flashinfer is not None else None
@@ -727,12 +730,16 @@ class FlashInferAttentionBackend(_WrapperPool):
             num_kv_heads=int(num_kv_heads),
             kv_dtype=kv_dtype,
         )
+        cpu_indptr = _cpu_paged_indptr(metadata, int(batch_size), int(page_size))
+        cpu_last_page_len = _cpu_last_page_len(metadata, int(batch_size), int(page_size))
+        if cpu_indptr is None or cpu_last_page_len is None:
+            raise ValueError("decode graph planning requires complete CPU KV lengths")
         return _DecodeGraphPlanInputs(
             block_table=block_table,
             cache_seqlens=cache_seqlens,
             effective_seqlens=cache_seqlens + 1,
-            cpu_indptr=_cpu_paged_indptr(metadata, int(batch_size), int(page_size)),
-            cpu_last_page_len=_cpu_last_page_len(metadata, int(batch_size), int(page_size)),
+            cpu_indptr=cpu_indptr,
+            cpu_last_page_len=cpu_last_page_len,
             wrapper_key=wrapper_key,
             wrapper=wrapper,
         )

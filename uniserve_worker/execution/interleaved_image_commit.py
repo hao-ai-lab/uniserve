@@ -19,6 +19,7 @@ from typing import Any, Protocol
 import torch
 
 from ..foundation.errors import invalid_descriptor, model_execution_error
+from ..nn.diffusion import FlowMatchSchedule
 from ..nn.vision import build_abs_positions_from_grid_hw
 from ..runtime.image_utils import tensor_to_png_b64
 from ..runtime.masks import build_commit_attention_mask
@@ -49,8 +50,33 @@ class GeneratedImageCommitOwner(InterleavedModelOwner, Protocol):
     latent_downsample: int
     residency: Any                 # ResidencyManager; .latent backs ImageState.x_t
     _dataplane_handoff: Any | None
+    img_end_id: int
+    denoise_schedule_direction: Any
+    denoise_schedule_shift_domain: Any
 
     def _parse_image_params(self, ip: dict) -> Any: ...
+    def _state(self, op: dict[str, Any]) -> Any: ...
+    def _extend_cache_blocks(self, cache: TextCache, op: dict[str, Any]) -> None: ...
+    def _ensure_host_cache(self, cache: TextCache) -> None: ...
+    def _release_image_state_caches(self, image_state: Any) -> None: ...
+    def _prepare_generated_image_for_commit(self, image_state: Any) -> torch.Tensor: ...
+    def interleaved_image_patch_size(self) -> int: ...
+    def interleaved_image_downsample_ratio(self) -> float: ...
+    def interleaved_image_features(
+        self,
+        image_input: torch.Tensor,
+        *,
+        grid_hw: torch.Tensor,
+        gen_model: bool = False,
+    ) -> torch.Tensor: ...
+    def interleaved_image_indexes(
+        self,
+        token_h: int,
+        token_w: int,
+        text_len: int,
+        *,
+        device: Any,
+    ) -> torch.Tensor: ...
     def publish_generated_latent_for_commit(self, image_state: Any) -> Any: ...
     def fetch_commit_latent(self, locator: Any) -> torch.Tensor: ...
     def encode_commit_locator(self, locator: Any) -> str: ...
@@ -62,7 +88,7 @@ class GeneratedImageCommitDriver:
     def __init__(self, owner: GeneratedImageCommitOwner) -> None:
         self.owner = owner
 
-    def append_generated_image(self, cache: TextCache, image_state: Any) -> None:
+    def append_generated_image(self, cache: TextCache, image_state: Any) -> int:
         if cache.past is None:
             raise model_execution_error("cannot append generated image without an initialized text cache")
         pred_img = self.owner._prepare_generated_image_for_commit(image_state)
@@ -123,6 +149,7 @@ class GeneratedImageCommitDriver:
         cache.t_index += 2
         cache.last_logits = outputs.logits
         cache.last_token_id = int(self.owner.img_end_id)
+        return int(target_len)
 
     def commit_generated_image(self, op: dict[str, Any]) -> dict[str, Any]:
         st = self.owner._state(op)
@@ -151,6 +178,7 @@ class GeneratedImageCommitDriver:
                 "locator": self.owner.encode_commit_locator(locator),
             }
         retain_images = bool(st.image.get("retain_images", True))
+        num_tokens = 0
         if retain_images:
             self.owner._extend_cache_blocks(st.cond, op)
             self.owner._ensure_host_cache(st.cond)
@@ -158,13 +186,13 @@ class GeneratedImageCommitDriver:
                 st.cond.past.allocate_blocks = self.owner.residency.allocator_for_cache(
                     st.cond.past
                 )
-            self.append_generated_image(st.cond, image_state)
+            num_tokens = self.append_generated_image(st.cond, image_state)
             if st.tu.past is not None:
                 st.tu.past.allocate_blocks = self.owner.residency.allocator_for_cache(
                     st.tu.past
                 )
                 self.append_generated_image(st.tu, image_state)
-        return self._finalize_commit(op, st, image_state, png_b64)
+        return self._finalize_commit(op, st, image_state, png_b64, num_tokens)
 
     def commit_writeback(self, op: dict[str, Any]) -> dict[str, Any]:
         st = self.owner._state(op)
@@ -178,6 +206,7 @@ class GeneratedImageCommitDriver:
             st.image_state = image_state
         image_state.x_t = latent
         retain_images = bool(st.image.get("retain_images", True))
+        num_tokens = 0
         if retain_images:
             self.owner._extend_cache_blocks(st.cond, op)
             self.owner._ensure_host_cache(st.cond)
@@ -185,13 +214,13 @@ class GeneratedImageCommitDriver:
                 st.cond.past.allocate_blocks = self.owner.residency.allocator_for_cache(
                     st.cond.past
                 )
-            self.append_generated_image(st.cond, image_state)
+            num_tokens = self.append_generated_image(st.cond, image_state)
             if st.tu.past is not None:
                 st.tu.past.allocate_blocks = self.owner.residency.allocator_for_cache(
                     st.tu.past
                 )
                 self.append_generated_image(st.tu, image_state)
-        return self._finalize_commit(op, st, image_state, None)
+        return self._finalize_commit(op, st, image_state, None, num_tokens)
 
     def _writeback_image_state(self, st: Any, op: dict[str, Any], latent: torch.Tensor) -> ImageState:
         ip = st.image or {}
@@ -206,20 +235,52 @@ class GeneratedImageCommitDriver:
         device = self.owner.device
         latent_handle = int(op["req_id"])
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
+        schedule = FlowMatchSchedule(
+            num_steps=int(params.steps),
+            shift=float(params.timestep_shift),
+            direction=self.owner.denoise_schedule_direction,
+            shift_domain=self.owner.denoise_schedule_shift_domain,
+        )
+        indexes_cond = self.owner.interleaved_image_indexes(
+            token_h,
+            token_w,
+            st.cond.t_index + 1,
+            device=device,
+        )
+        indexes_tu = (
+            self.owner.interleaved_image_indexes(
+                token_h,
+                token_w,
+                st.tu.t_index + 1,
+                device=device,
+            )
+            if st.tu.past is not None
+            else None
+        )
+        indexes_iu = (
+            self.owner.interleaved_image_indexes(
+                token_h,
+                token_w,
+                st.iu.t_index + 1,
+                device=device,
+            )
+            if st.iu.past is not None
+            else None
+        )
         self.owner.residency.latent.set(latent_handle, latent)
         return ImageState(
             latent_pool=self.owner.residency.latent,
             latent_handle=latent_handle,
-            schedule=None,
-            timesteps=torch.empty(0, device=device),
+            schedule=schedule,
+            timesteps=schedule.timesteps(device=device),
             token_h=token_h,
             token_w=token_w,
             grid_h=grid_h,
             grid_w=grid_w,
             grid_hw=grid_hw,
-            indexes_cond=None,
-            indexes_tu=None,
-            indexes_iu=None,
+            indexes_cond=indexes_cond,
+            indexes_tu=indexes_tu,
+            indexes_iu=indexes_iu,
             cond_cache=st.cond.past,
             tu_cache=st.tu.past,
             iu_cache=st.iu.past,
@@ -239,6 +300,7 @@ class GeneratedImageCommitDriver:
         st: Any,
         image_state: Any,
         png_b64: str | None,
+        num_tokens: int,
     ) -> dict[str, Any]:
         logits = st.cond.last_logits[:, -1, :].float()
         st.image_state = None
@@ -249,6 +311,7 @@ class GeneratedImageCommitDriver:
             "req_id": op["req_id"],
             "image_hw": [image_state.height, image_state.width],
             "logits": logits,
+            "num_tokens": int(num_tokens),
         }
         if png_b64 is not None:
             out["image_png_b64"] = png_b64

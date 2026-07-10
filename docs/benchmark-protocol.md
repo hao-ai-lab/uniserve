@@ -9,6 +9,7 @@ This document defines the benchmark matrix and diagnostic protocol for UniServe,
 - Load is expressed as open-loop request arrival rate unless a workload is explicitly labeled as a correctness gate or a diagnostic.
 - Server command lines are part of the audited spec.
 - Backend comparisons use the declared production-facing server profiles.
+- Every UniServe point records the sanitized `ExecutionPlan` compiled from the measured public request shape; reference points record the fixed reference protocol contract.
 
 ## Required Environment
 
@@ -82,7 +83,7 @@ SGLang runs through the declared benchmark server profile. Cache-mode evidence f
 | prompts per point | 32 |
 | load axis | arrival rate 1,2,4,8,16 |
 | max tokens | 8192 |
-| image cap | none |
+| image cap | 4 |
 | image size | 2048x1152 |
 | steps | 50 |
 | wire | openai_chat (/v1/chat/completions SSE with modalities ["text","image"] + image_config) |
@@ -109,8 +110,10 @@ The runner must:
 - Load servers, benchmark groups, load axes, and point templates from `uniserve_eval/profiles.json`.
 - Run at most one server and one harness process at a time.
 - Write `COMMANDS.md` from the same resolved specs used for execution.
-- Write `command.txt`, `run.log`, `summary.json`, `preflight.txt`, and
-  `postflight.txt` per point.
+- Write `command.txt`, `run.log`, `summary.json`, `preflight.txt`, and `postflight.txt` per point, plus harness-owned `run.json`, `requests.jsonl`, `artifact_manifest.json`, and `summary.md`.
+- Probe `/v1/chat/completions/plan` before UniServe measurements and mark the artifact invalid when runtime plan inspection fails.
+- Bind each matrix or profile artifact to sanitized execution provenance covering the complete inherited process environment, content hashes for invoked executables, and Git revisions plus tracked and untracked source-state digests for participating checkouts; environment values remain fingerprint-only in artifacts.
+- Mark artifacts canonical only when every acceptance, plan-evidence, exact-request-count, and contract-fingerprint check passes; resume and comparison paths require `canonical-valid-v2` and an exact match with the current resolved protocol and selected workload rows.
 - Refuse to start if another benchmark/server process is active.
 - Require zero visible GPU memory only when `--require-clean-gpu` is passed.
 - Preserve `--resume`, `--only`, `--only-bench`, and `--skip-bench` semantics.

@@ -58,19 +58,20 @@ impl SpecDecodeAccounting {
         if !self.ngram_enabled_for(st) {
             return None;
         }
-        let remaining_output = st.req.max_tokens.saturating_sub(st.n_generated);
+        let remaining_output = st.req.max_und_tokens.saturating_sub(st.und.tokens_emitted);
         let max_draft = self
             .spec_ngram_max_tokens
             .min(remaining_output.saturating_sub(1));
         if max_draft == 0 {
             return None;
         }
-        let mut seq = Vec::with_capacity(st.req.prompt_ids.len() + st.generated_ids.len() + 1);
-        if let Some(recompute) = st.recompute_ids.as_ref() {
+        let mut seq =
+            Vec::with_capacity(st.context.prompt_ids.len() + st.replay.generated_ids.len() + 1);
+        if let Some(recompute) = st.replay.recompute_ids.as_ref() {
             seq.extend_from_slice(recompute);
         } else {
-            seq.extend_from_slice(&st.req.prompt_ids);
-            seq.extend_from_slice(&st.generated_ids);
+            seq.extend_from_slice(&st.context.prompt_ids);
+            seq.extend_from_slice(&st.replay.generated_ids);
         }
         if seq.last().copied() != Some(current_token) {
             seq.push(current_token);
@@ -93,10 +94,11 @@ impl SpecDecodeAccounting {
         // penalties, logit bias, and static allowed-token masks. Keep drafts off
         // for controls whose legal set can change inside the drafted prefix or
         // whose per-token response semantics are not yet represented.
-        st.req.is_plain_und()
+        st.is_replayable_text()
+            && !st.req.behavior.gen_output
             && st.grammar.is_none()
-            && st.n_generated >= sp.min_tokens
-            && sp.n_logprobs == 0
+            && st.und.tokens_emitted >= sp.min_tokens
+            && !sp.generated_logprobs_requested()
             && sp.bad_words_ids.is_empty()
     }
 }

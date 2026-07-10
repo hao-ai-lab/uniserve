@@ -7,11 +7,47 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use uniserve_engine_client::protocol::{
-    EngineCoreFinishReason, EngineCoreRequest, EngineCoreSamplingParams,
+use uniserve_core::{
+    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
+    UndVisibility,
 };
-use uniserve_engine_client::{EngineCoreClient, TransportMode, ZmqClientConfig};
+use uniserve_engine_gateway::transport::protocol::{EngineCoreFinishReason, EngineCoreRequest};
+use uniserve_engine_gateway::transport::{EngineCoreClient, TransportMode, ZmqClientConfig};
 use uniserve_managed_engine::{ManagedEngineConfig, ManagedEngineHandle, allocate_handshake_port};
+
+fn text_generation_request() -> GenerationRequest {
+    let constraint = GenerationConstraint::UndOnly;
+    let policy = GenerationPolicyDescriptor::default();
+    GenerationRequest {
+        request_id: RequestId(0),
+        context: vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3, 4],
+            visibility: UndVisibility::Internal,
+        }],
+        negative_context: Vec::new(),
+        constraint,
+        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+        sampling: SamplingParams {
+            temperature: 0.0,
+            ..SamplingParams::default()
+        },
+        image: ImageParams::default(),
+        max_und_tokens: 64,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache: Default::default(),
+        policy,
+        resources: GenerationResourceBounds {
+            context_tokens: 4,
+            max_kv_tokens: 68,
+            ..GenerationResourceBounds::default()
+        },
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn managed_sim_engine_serves_and_shuts_down() {
@@ -40,7 +76,7 @@ async fn managed_sim_engine_serves_and_shuts_down() {
         },
         model_name: "sim-model".to_string(),
         client_index: 0,
-        native_controls: None,
+        generation_controls: None,
     })
     .await
     .expect("connect to managed engine");
@@ -50,16 +86,7 @@ async fn managed_sim_engine_serves_and_shuts_down() {
     assert!(client.total_num_gpu_blocks() > 0);
 
     // One text generation through the real subprocess.
-    let request = EngineCoreRequest {
-        request_id: "req-managed".to_string(),
-        prompt_token_ids: Some(vec![1, 2, 3, 4]),
-        sampling_params: Some(EngineCoreSamplingParams {
-            temperature: 0.0,
-            max_tokens: 64,
-            ..EngineCoreSamplingParams::for_test()
-        }),
-        ..Default::default()
-    };
+    let request = EngineCoreRequest::new("req-managed".to_string(), text_generation_request());
     let mut stream = client.call(request).await.expect("submit request");
     let mut tokens = 0usize;
     let mut finish = None;

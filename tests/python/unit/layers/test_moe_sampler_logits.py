@@ -21,6 +21,7 @@ from uniserve_worker.nn.sampler import (
     _apply_min_p_top_k_top_p_in_place,
     apply_sampling_batched,
     sample_one_from_logits,
+    score_prompt_token_logprobs,
 )
 
 pytestmark = pytest.mark.unit
@@ -129,6 +130,7 @@ def test_sampler_wraps_shared_sampling_pipeline():
     assert [entry[1] for entry in top] == pytest.approx(
         [float(ref_logprobs[3]), float(ref_logprobs[1])]
     )
+    assert [entry[2] for entry in top] == [1, 2]
 
 
 def test_batched_sampler_matches_scalar_greedy_rows():
@@ -186,7 +188,106 @@ def test_batched_sampler_omits_unrequested_logprobs_per_row():
     assert got[0][2] is None
     assert got[1][0] == 2
     assert got[1][1] is not None
-    assert got[1][2] == [[2, got[1][1]]]
+    assert got[1][2] == [[2, got[1][1], 1]]
+
+
+def test_batched_sampler_returns_sampled_logprob_without_top_alternatives():
+    logits = torch.tensor([[0.1, 2.0, -1.0]])
+
+    got = apply_sampling_batched(
+        logits,
+        [{"temperature": 0.0, "return_logprobs": True, "n_logprobs": 0}],
+        [[]],
+        [None],
+        [None],
+    )[0]
+
+    assert got.token_id == 1
+    assert got.logprob == pytest.approx(float(torch.log_softmax(logits[0], dim=-1)[1]))
+    assert got.top_logprobs == [[1, got.logprob, 1]]
+
+
+def test_batched_sampler_appends_requested_token_logprobs_without_duplicates():
+    logits = torch.tensor([[0.1, 2.0, -1.0, 0.5]])
+    expected = torch.log_softmax(logits[0], dim=-1)
+
+    got = apply_sampling_batched(
+        logits,
+        [{"temperature": 0.0, "n_logprobs": 2, "logprob_token_ids": [3, 1, 3, 99]}],
+        [[]],
+        [None],
+        [None],
+    )[0]
+
+    assert got.token_id == 1
+    assert [item[0] for item in got.top_logprobs] == [1, 3]
+    assert [item[1] for item in got.top_logprobs] == pytest.approx(
+        [float(expected[1]), float(expected[3])]
+    )
+    assert [item[2] for item in got.top_logprobs] == [1, 2]
+
+
+def test_batched_sampler_clamps_all_vocabulary_logprobs_request():
+    logits = torch.tensor([[0.1, 2.0, -1.0]])
+
+    got = apply_sampling_batched(
+        logits,
+        [{"temperature": 0.0, "n_logprobs": 2**32 - 1}],
+        [[]],
+        [None],
+        [None],
+    )[0]
+
+    assert [item[0] for item in got.top_logprobs] == [1, 0, 2]
+
+
+def test_prompt_scorer_returns_actual_top_and_explicit_ranked_candidates():
+    logits = torch.tensor(
+        [
+            [0.0, 3.0, 2.0, 1.0],
+            [4.0, 1.0, 3.0, 2.0],
+        ]
+    )
+
+    got = score_prompt_token_logprobs(
+        logits,
+        [2, 3],
+        n_logprobs=2,
+        logprob_token_ids=[0, 2],
+    )
+
+    assert [[entry[0] for entry in position] for position in got] == [
+        [2, 1, 0],
+        [3, 0, 2],
+    ]
+    assert [[entry[2] for entry in position] for position in got] == [
+        [2, 1, 4],
+        [3, 1, 2],
+    ]
+
+
+def test_generated_and_prompt_logprobs_use_competition_ranks_for_ties():
+    logits = torch.tensor([[2.0, 2.0, 1.0]])
+
+    generated = apply_sampling_batched(
+        logits,
+        [{"temperature": 0.0, "n_logprobs": 3}],
+        [[]],
+        [None],
+        [None],
+    )[0]
+    prompt = score_prompt_token_logprobs(logits, [1], n_logprobs=3)[0]
+
+    assert [(entry[0], entry[2]) for entry in generated.top_logprobs] == [
+        (0, 1),
+        (1, 1),
+        (2, 3),
+    ]
+    assert [(entry[0], entry[2]) for entry in prompt] == [
+        (1, 1),
+        (0, 1),
+        (2, 3),
+    ]
 
 
 def test_tp_sampler_sync_broadcasts_rank0_tokens(monkeypatch):

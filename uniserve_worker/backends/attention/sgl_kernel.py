@@ -12,14 +12,14 @@ __all__ = [
 
 try:  # pragma: no cover - optional CUDA package.
     from sgl_kernel.flash_attn import (
-        flash_attn_varlen_func as _flash_attn_varlen_func,  # type: ignore
+        flash_attn_varlen_func as _flash_attn_varlen_func,
     )
 except Exception:  # pragma: no cover
     _flash_attn_varlen_func = None
 
 try:  # pragma: no cover - optional CUDA package.
     from sgl_kernel.flash_attn import (
-        flash_attn_with_kvcache as _flash_attn_with_kvcache,  # type: ignore
+        flash_attn_with_kvcache as _flash_attn_with_kvcache,
     )
 except Exception:  # pragma: no cover
     _flash_attn_with_kvcache = None
@@ -125,6 +125,8 @@ class SglKernelAttentionBackend:
         if (k_blh is None) != (v_blh is None):
             raise ValueError("sgl_kernel paged update requires both k and v")
         if k_blh is not None:
+            if v_blh is None:
+                raise ValueError("sgl_kernel paged update requires a value tensor")
             if k_blh.shape != v_blh.shape:
                 raise ValueError("current paged K/V tensors must have matching shapes")
             if k_blh.shape[0] != q_blh.shape[0]:

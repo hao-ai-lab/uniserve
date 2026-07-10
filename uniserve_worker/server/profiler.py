@@ -14,15 +14,18 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 from ..foundation.env import flag_from_value, int_from_value
 from ..foundation.profiling import _parse_activities, profile_range
 
+torch: Any | None
 try:  # torch is an optional import for CPU-only control-plane tests.
-    import torch
+    import torch as _torch_module
 except Exception:  # pragma: no cover - exercised only in torch-free envs.
-    torch = None  # type: ignore[assignment]
+    torch = None
+else:  # pragma: no cover
+    torch = _torch_module
 
 __all__ = ["WorkerProfiler", "WorkerProfileConfig"]
 
@@ -61,7 +64,7 @@ class WorkerProfiler:
         self._start_step = 0
         self._active = False
         self._finished = False
-        self._torch_profiler = None
+        self._torch_profiler: Any | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "WorkerProfiler":
@@ -128,7 +131,7 @@ class WorkerProfiler:
         self._active = True
         try:
             torch_activities = _torch_profiler_activities(self.config.activities)
-            if torch_activities:
+            if torch_activities and torch is not None:
                 kwargs = {
                     "activities": torch_activities,
                     "with_stack": self.config.with_stack,
@@ -136,8 +139,9 @@ class WorkerProfiler:
                 }
                 if _accepts_torch_profiler_arg("acc_events"):
                     kwargs["acc_events"] = True
-                self._torch_profiler = torch.profiler.profile(**kwargs)  # type: ignore[union-attr]
-                self._torch_profiler.start()
+                profiler = torch.profiler.profile(**kwargs)
+                profiler.start()
+                self._torch_profiler = profiler
             if self.config.cuda_profiler:
                 _cuda_profiler_start()
         except Exception:

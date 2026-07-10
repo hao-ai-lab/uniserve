@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, RwLock};
-use uniserve_engine_client::EngineCoreClient;
-use uniserve_engine_client::protocol::lora::LoraRequest;
-pub use uniserve_openai_api::LoraModelResolution;
+use uniserve_engine_gateway::EngineAppControl;
+use uniserve_engine_gateway::transport::protocol::lora::LoraRequest;
+pub use uniserve_protocol_adapters::openai::LoraModelResolution;
+use uniserve_serving::AdapterSelection;
 
 /// Runtime registry for dynamically loaded LoRA adapters.
 pub(crate) struct LoraManager {
@@ -24,7 +25,7 @@ pub enum LoadLoraError {
     BaseModelName {
         lora_name: String,
     },
-    Engine(uniserve_engine_client::Error),
+    Engine(uniserve_engine_gateway::transport::Error),
     NotLoaded {
         lora_name: String,
     },
@@ -45,7 +46,7 @@ pub enum UnloadLoraError {
         expected: u64,
         actual: u64,
     },
-    Engine(uniserve_engine_client::Error),
+    Engine(uniserve_engine_gateway::transport::Error),
     NotRemoved {
         lora_name: String,
         lora_int_id: u64,
@@ -79,18 +80,27 @@ impl LoraManager {
         let requests = self.requests.read().await;
         let mut model_names = base_model_names.to_vec();
         model_names.extend(requests.keys().cloned());
-        let lora_request = model_name.and_then(|name| requests.get(name).cloned());
+        let adapter = model_name.and_then(|name| requests.get(name)).map_or(
+            AdapterSelection::Base,
+            |request| AdapterSelection::Adapter {
+                name: request.lora_name.clone(),
+                internal_id: request.lora_int_id,
+                path: request.lora_path.clone(),
+                load_inplace: request.load_inplace,
+                is_3d_lora_weight: request.is_3d_lora_weight,
+            },
+        );
 
         LoraModelResolution {
             model_names,
-            lora_request,
+            adapter,
         }
     }
 
     /// Load one dynamic LoRA adapter and register it as a public model name.
     pub(crate) async fn load_lora(
         &self,
-        uniserve_engine_client: &EngineCoreClient,
+        engine_control: &EngineAppControl,
         base_model_names: &[String],
         lora_name: String,
         lora_path: String,
@@ -112,7 +122,7 @@ impl LoraManager {
         // resident adapter from the engine first so the subsequent `add_lora`
         // sees no resident deltas.
         if load_inplace && let Some(resident) = resident.as_ref() {
-            uniserve_engine_client
+            engine_control
                 .remove_lora(resident.lora_int_id)
                 .await
                 .map_err(LoadLoraError::Engine)?;
@@ -135,7 +145,7 @@ impl LoraManager {
             is_3d_lora_weight,
         );
 
-        let loaded = uniserve_engine_client
+        let loaded = engine_control
             .add_lora(&lora_request)
             .await
             .map_err(LoadLoraError::Engine)?;
@@ -153,7 +163,7 @@ impl LoraManager {
     /// registry.
     pub(crate) async fn unload_lora(
         &self,
-        uniserve_engine_client: &EngineCoreClient,
+        engine_control: &EngineAppControl,
         lora_name: &str,
         requested_lora_int_id: Option<u64>,
     ) -> Result<LoraRequest, UnloadLoraError> {
@@ -178,7 +188,7 @@ impl LoraManager {
             });
         }
 
-        let removed = uniserve_engine_client
+        let removed = engine_control
             .remove_lora(lora_request.lora_int_id)
             .await
             .map_err(UnloadLoraError::Engine)?;

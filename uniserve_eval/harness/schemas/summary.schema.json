@@ -11,7 +11,8 @@
     "failed_count",
     "metric_family",
     "metrics",
-    "load"
+    "load",
+    "artifact"
   ],
   "properties": {
     "harness_status": {"type": "string"},
@@ -40,6 +41,70 @@
     "failed_count": {"type": "integer", "minimum": 0},
     "classifiers": {"type": "object"},
     "metric_family": {"type": "string", "enum": ["stream", "image"]},
-    "metrics": {"type": "object"}
+    "metrics": {"type": "object"},
+    "artifact": {
+      "type": "object",
+      "required": ["schema_version", "valid", "valid_marker", "checks", "contract", "declared_contract", "plan_summary", "plan_evidence"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 2},
+        "valid": {"type": "boolean"},
+        "valid_marker": {"type": ["string", "null"]},
+        "checks": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "boolean"}},
+        "contract": {
+          "type": "object",
+          "required": ["schema_version", "spec", "selected_rows", "fingerprint"],
+          "properties": {
+            "schema_version": {"type": "integer", "const": 1},
+            "spec": {"type": "object"},
+            "selected_rows": {
+              "type": "object",
+              "required": ["count", "sha256"],
+              "properties": {
+                "count": {"type": "integer", "minimum": 1},
+                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            },
+            "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "declared_contract": {"type": "object"},
+        "plan_summary": {"type": ["object", "null"]},
+        "plan_evidence": {
+          "type": "object",
+          "required": ["source"],
+          "properties": {
+            "source": {"type": "string", "enum": ["declared_contract", "runtime_inspection", "reference_protocol"]},
+            "plan": {"type": ["object", "null"]},
+            "request": {"type": "object"},
+            "endpoint": {"type": "string"},
+            "error": {"type": "string"}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"source": {"const": "reference_protocol"}}},
+              "then": {
+                "anyOf": [
+                  {"required": ["request"]},
+                  {"required": ["plan", "error"]}
+                ]
+              },
+              "else": {"required": ["plan"]}
+            }
+          ]
+        },
+        "profile_contract": {"$ref": "#/$defs/executionContract"},
+        "matrix_contract": {"$ref": "#/$defs/executionContract"}
+      }
+    }
+  },
+  "$defs": {
+    "executionContract": {
+      "type": "object",
+      "required": ["schema_version", "fingerprint"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 2},
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
   }
 }

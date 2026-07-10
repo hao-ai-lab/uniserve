@@ -21,11 +21,21 @@ from .artifacts import ArtifactWriter
 from .core.arrival import run_load
 from .core.client import send_request
 from .core.gpu_sampler import GpuMemorySampler
-from .datasets import load_dataset_rows
+from .datasets import load_benchmark_inputs
 from .metrics.common import RequestRecord
-from .report import build_summary, render_markdown, spec_to_dict
-from .spec import BenchmarkSpec, TaskName
+from .report import (
+    attach_execution_contract,
+    benchmark_contract,
+    build_summary,
+    plan_summary,
+    record_collection_contract,
+    render_markdown,
+    spec_to_dict,
+    write_summary_artifacts,
+)
+from .spec import BenchmarkSpec
 from .tasks import TASKS
+from .tasks.base import TaskRequest
 
 
 @dataclass
@@ -47,14 +57,14 @@ class BenchmarkRunner:
         self.writer = ArtifactWriter(output_dir)
         self.timeout_s = timeout_s
         self.task = TASKS[spec.task.value](spec)
-        self._tokenizer: Any = None
 
     async def run(self) -> RunResult:
-        tokenizer = self._load_tokenizer()
-        rows = load_dataset_rows(self.spec, tokenizer=tokenizer)
-        if self.spec.num_prompts and len(rows) > self.spec.num_prompts:
-            rows = rows[: self.spec.num_prompts]
+        for commit_marker in ("summary.json", "artifact_manifest.json", "summary.md"):
+            (self.writer.output_dir / commit_marker).unlink(missing_ok=True)
+        rows, tokenizer = load_benchmark_inputs(self.spec)
+        contract = benchmark_contract(self.spec, rows)
 
+        started_at = time.time()
         self.writer.write_json(
             "run.json",
             {
@@ -62,17 +72,18 @@ class BenchmarkRunner:
                 "spec": spec_to_dict(self.spec),
                 "base_url": self.base_url,
                 "items": len(rows),
-                "started_at": time.time(),
+                "started_at": started_at,
             },
         )
-        (self.writer.output_dir / "requests.jsonl").write_text("", encoding="utf-8")
-        (self.writer.output_dir / "gpu_samples.jsonl").write_text("", encoding="utf-8")
+        self.writer.write_jsonl("requests.jsonl", [])
+        self.writer.write_jsonl("gpu_samples.jsonl", [])
 
         # Deterministic Poisson arrivals (matches sglang's np.random.seed(seed)).
         np.random.seed(self.spec.seed)
 
         limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
         async with httpx.AsyncClient(timeout=self.timeout_s, limits=limits) as client:
+            plan_evidence = await self._collect_plan_evidence(client, rows)
 
             async def submit(row: dict[str, Any]) -> RequestRecord:
                 return await self._submit(client, row)
@@ -117,16 +128,41 @@ class BenchmarkRunner:
             dur_s,
             tokenizer=tokenizer,
             server_info=server_info,
+            plan_evidence=plan_evidence,
+            contract=contract,
         )
+        gpu_samples: list[dict[str, Any]] = []
         if sampler is not None:
             summary["gpu_memory"] = sampler.summary()
-            for sample in sampler.sample_records:
-                self.writer.append_jsonl("gpu_samples.jsonl", sample)
+            gpu_samples = list(sampler.sample_records)
 
-        self.writer.write_json("summary.json", summary)
-        for record in records:
-            self.writer.append_jsonl("requests.jsonl", record.record_dict())
+        request_records = [record.record_dict() for record in records]
+        attach_execution_contract(
+            summary,
+            "request_records",
+            record_collection_contract(request_records),
+        )
+        attach_execution_contract(
+            summary,
+            "gpu_samples",
+            record_collection_contract(gpu_samples),
+        )
+        self.writer.write_jsonl("requests.jsonl", request_records)
+        self.writer.write_jsonl("gpu_samples.jsonl", gpu_samples)
+        self.writer.write_json(
+            "run.json",
+            {
+                "harness_status": "completed",
+                "artifact_valid": summary["artifact"]["valid"],
+                "spec": spec_to_dict(self.spec),
+                "base_url": self.base_url,
+                "items": len(rows),
+                "started_at": started_at,
+                "completed_at": time.time(),
+            },
+        )
         (self.writer.output_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
+        write_summary_artifacts(self.writer.output_dir, summary)
         return RunResult(summary=summary, output_dir=self.writer.output_dir)
 
     async def _submit(self, client: httpx.AsyncClient, row: dict[str, Any]) -> RequestRecord:
@@ -147,17 +183,6 @@ class BenchmarkRunner:
             ),
         )
 
-    def _load_tokenizer(self) -> Any | None:
-        if self.spec.task != TaskName.TEXT:
-            return None
-        if self._tokenizer is not None:
-            return self._tokenizer
-        from transformers import AutoTokenizer
-
-        tokenizer_id = self.spec.tokenizer or self.spec.model
-        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
-        return self._tokenizer
-
     async def _fetch_server_info(self, client: httpx.AsyncClient) -> dict[str, Any] | None:
         try:
             response = await client.get(self.base_url + "/version", timeout=5.0)
@@ -166,3 +191,131 @@ class BenchmarkRunner:
         except Exception:  # noqa: BLE001 - server_info is best-effort context only.
             return None
         return None
+
+    async def _collect_plan_evidence(
+        self,
+        client: httpx.AsyncClient,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        policy = self.spec.plan_evidence_policy
+        if policy == "declared_contract":
+            return {"source": policy, "plan": plan_summary(self.spec)}
+        if not rows:
+            return {
+                "source": policy,
+                "plan": None,
+                "error": "the dataset produced no request for plan inspection",
+            }
+        request = self.task.build_request(rows[0])
+        if policy == "reference_protocol":
+            return {
+                "source": policy,
+                "request": reference_request_summary(request),
+            }
+        plan_endpoints = {
+            "/v1/chat/completions": "/v1/chat/completions/plan",
+            "/v1/images/generations": "/v1/images/generations/plan",
+        }
+        endpoint = plan_endpoints.get(request.endpoint)
+        if endpoint is None:
+            return {
+                "source": "runtime_inspection",
+                "plan": None,
+                "error": f"no runtime plan endpoint is defined for {request.endpoint}",
+            }
+        try:
+            response = await client.post(
+                self.base_url + endpoint,
+                json=request.payload,
+                headers={"x-request-id": "plan-inspection"},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            plan = response.json()
+            if not isinstance(plan, dict) or not isinstance(plan.get("profile_id"), str):
+                raise ValueError("runtime plan response is not a PlanInspection object")
+            return {
+                "source": "runtime_inspection",
+                "endpoint": endpoint,
+                "plan": plan,
+            }
+        except Exception as error:  # noqa: BLE001 - the artifact records inspection failure.
+            return {
+                "source": "runtime_inspection",
+                "endpoint": endpoint,
+                "plan": None,
+                "error": str(error),
+            }
+
+
+def reference_request_summary(request: TaskRequest) -> dict[str, Any]:
+    """Return a prompt-free semantic summary derived from one emitted request."""
+    payload = request.payload
+    image = payload.get("image_config")
+    image_config = image if isinstance(image, dict) else {}
+    width = image_config.get("width")
+    height = image_config.get("height")
+    size = payload.get("size")
+    if (width is None or height is None) and isinstance(size, str) and "x" in size:
+        width_text, height_text = size.lower().split("x", maxsplit=1)
+        if width_text.isdigit() and height_text.isdigit():
+            width, height = int(width_text), int(height_text)
+    steps = image_config.get("steps", payload.get("steps"))
+    alternate_steps = payload.get("num_inference_steps")
+    steps_consistent = alternate_steps is None or steps is None or alternate_steps == steps
+    messages = payload.get("messages")
+    return {
+        "endpoint": request.endpoint,
+        "kind": request.kind,
+        "model": payload.get("model"),
+        "stream": payload.get("stream", False),
+        "modalities": payload.get("modalities"),
+        "message_count": len(messages) if isinstance(messages, list) else 0,
+        "input_image_count": _count_input_images(messages),
+        "generation": {
+            "max_tokens": payload.get("max_completion_tokens", payload.get("max_tokens")),
+            "temperature": payload.get("temperature"),
+            "top_p": payload.get("top_p"),
+            "ignore_eos": payload.get("ignore_eos"),
+            "structured_outputs": payload.get("structured_outputs"),
+            "response_format": payload.get("response_format"),
+        },
+        "image": {
+            "width": width,
+            "height": height,
+            "steps": steps,
+            "steps_consistent": steps_consistent,
+            "max_images": image_config.get("num_images", payload.get("n")),
+            "seed": image_config.get("seed", payload.get("seed")),
+            "guidance_scale": image_config.get(
+                "guidance_scale", payload.get("guidance_scale")
+            ),
+            "image_guidance_scale": image_config.get(
+                "image_guidance_scale", payload.get("image_guidance_scale")
+            ),
+            "cfg_norm": image_config.get("cfg_norm", payload.get("cfg_norm")),
+            "cfg_interval": image_config.get("cfg_interval", payload.get("cfg_interval")),
+            "timestep_shift": image_config.get(
+                "timestep_shift", payload.get("timestep_shift")
+            ),
+        },
+        "adapter": "base" if payload.get("lora_request") is None else "lora",
+    }
+
+
+def _count_input_images(messages: Any) -> int:
+    if not isinstance(messages, list):
+        return 0
+    count = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        count += sum(
+            1
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}
+        )
+    return count

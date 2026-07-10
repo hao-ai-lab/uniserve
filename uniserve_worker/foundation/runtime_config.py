@@ -8,7 +8,7 @@ modules.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from .env import DEFAULT_ATTENTION_BACKEND, DEFAULT_COMPILE_BACKEND
 
@@ -240,7 +240,7 @@ def _none_if_empty(value: object | None) -> str | None:
 def _positive_optional_int(value: object | None) -> int | None:
     if value is None:
         return None
-    parsed = int(value)
+    parsed = int(cast(Any, value))
     if parsed <= 0:
         raise ValueError("optional integer tuning values must be positive when set")
     return parsed

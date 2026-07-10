@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
-use uniserve_core::{ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling};
+use uniserve_core::{
+    ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling, score_token_logprobs,
+};
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
 use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind, SeqResult};
 
@@ -19,8 +21,9 @@ const DEFAULT_TEXT_LEN: usize = 8;
 /// Synthetic end-of-sequence token id. Matches Qwen-family `<|im_end|>`
 /// (151645) so fixtures exercising real control tokens line up with the sim.
 const FAKE_EOS_TOKEN: u32 = 151645;
-/// Synthetic vocab size: large enough to cover the fabricated token ids
-/// (`1000 + (.. % 5000)`) plus [`FAKE_EOS_TOKEN`] itself.
+/// Initial synthetic vocab size: large enough to cover the fabricated token ids
+/// (`1000 + (.. % 5000)`) plus [`FAKE_EOS_TOKEN`] itself. Runtime profile
+/// controls can extend it through [`SimEngine::configure_control_tokens`].
 const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
 /// Denoise steps assumed when a request carries no [`ImageParams::steps`].
 const DEFAULT_DENOISE_STEPS: u16 = 50;
@@ -88,7 +91,7 @@ impl SimExecutor {
     }
 
     /// Apply a control op against the in-process engine.
-
+    ///
     /// Only [`ControlOp::DropRequest`] has observable engine state in the sim:
     /// it forwards a [`Job::Drop`] so the worker thread evicts the request's
     /// records (mirroring the real worker's stateful-diff contract). The
@@ -125,6 +128,15 @@ impl Executor for SimExecutor {
 
     fn in_flight(&self) -> usize {
         self.in_flight
+    }
+
+    fn generated_image_commit_capabilities(
+        &self,
+    ) -> uniserve_core::GeneratedImageCommitCapabilities {
+        uniserve_core::GeneratedImageCommitCapabilities {
+            inline: true,
+            separate_writeback: true,
+        }
     }
 
     fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
@@ -251,7 +263,11 @@ impl SimEngine {
         if (alt2 as usize) < self.vocab && alt2 != nat {
             v[alt2 as usize] = 6.0;
         }
-        v[self.fake_eos as usize] = if n >= self.text_len { 12.0 } else { 1.0 };
+        // Once the fabricated sequence reaches its configured length, EOS is a
+        // deterministic control outcome even under stochastic frontend defaults.
+        // Other logits remain finite so min-token suppression can still force
+        // continued generation when the scheduler masks EOS.
+        v[self.fake_eos as usize] = if n >= self.text_len { 100.0 } else { 1.0 };
         v
     }
 }
@@ -261,13 +277,18 @@ impl SimEngine {
         Self {
             caps: EngineCaps {
                 supported_ops: vec![
-                    "prefill_und".into(),
-                    "decode_und".into(),
-                    "denoise_gen".into(),
-                    "commit_gen".into(),
-                    "vit_encode".into(),
-                    "vae_encode".into(),
+                    OpKind::PrefillUnd,
+                    OpKind::DecodeUnd,
+                    OpKind::DenoiseGen,
+                    OpKind::CommitGen,
+                    OpKind::CommitWriteback,
+                    OpKind::VitEncode,
+                    OpKind::VaeEncode,
                 ],
+                max_latent_size: 65_536,
+                max_vae_grid_tokens: 1_024,
+                max_vit_grid_tokens: 64,
+                encoder_cache_budget: 256,
                 ..Default::default()
             },
             text_len: DEFAULT_TEXT_LEN,
@@ -312,6 +333,21 @@ impl SimEngine {
     /// Number of fabricated text tokens before a synthetic EOS (test knob).
     pub fn set_text_len(&mut self, n: usize) {
         self.text_len = n;
+    }
+    /// Match the simulator's EOS and vocabulary to one resolved model profile.
+    pub fn configure_control_tokens(&mut self, eos: u32, control_tokens: &[u32]) {
+        self.fake_eos = eos;
+        let max_token = control_tokens
+            .iter()
+            .copied()
+            .chain(std::iter::once(eos))
+            .max()
+            .unwrap_or(eos);
+        self.vocab = self.vocab.max(
+            usize::try_from(max_token)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+        );
     }
     /// Synthetic sampled token to return from commit_gen (test knob).
     pub fn set_commit_token(&mut self, token: Option<u32>) {
@@ -403,19 +439,67 @@ impl ModelEngine for SimEngine {
                     }
                     per_seq.push(SeqResult {
                         req_id: r,
+                        op_kind: Some(op.kind),
                         op_id,
                         sampled_token_id: Some(out.token),
-                        sampled_logprob: Some(out.logprob),
+                        sampled_logprob: sampling
+                            .as_ref()
+                            .is_some_and(SamplingParams::generated_logprobs_requested)
+                            .then_some(out.logprob),
                         top_logprobs: if out.top.is_empty() {
                             None
                         } else {
-                            Some(out.top)
+                            Some(
+                                out.top
+                                    .into_iter()
+                                    .map(|(token, logprob, rank)| {
+                                        uniserve_worker_wire::TokenLogprob(token, logprob, rank)
+                                    })
+                                    .collect(),
+                            )
                         },
+                        prompt_logprobs: sampling.as_ref().and_then(|sampling| {
+                            (op.kind == OpKind::PrefillUnd && sampling.prompt_logprobs_requested())
+                                .then(|| {
+                                    let tokens = op.token_ids.as_deref().unwrap_or_default();
+                                    let skip = usize::from(op.pos_range.0 == 0);
+                                    tokens
+                                        .iter()
+                                        .enumerate()
+                                        .skip(skip)
+                                        .map(|(offset, token)| {
+                                            let logits = self.synth_logits(
+                                                r,
+                                                (op.pos_range.0 as usize)
+                                                    .saturating_add(offset)
+                                                    .saturating_sub(1),
+                                            );
+                                            score_token_logprobs(
+                                                &logits,
+                                                *token,
+                                                sampling.n_prompt_logprobs as usize,
+                                                &sampling.logprob_token_ids,
+                                            )
+                                            .into_iter()
+                                            .map(|(token, logprob, rank)| {
+                                                uniserve_worker_wire::TokenLogprob(
+                                                    token, logprob, rank,
+                                                )
+                                            })
+                                            .collect()
+                                        })
+                                        .collect()
+                                })
+                        }),
                         ..Default::default()
                     });
                 }
                 OpKind::DenoiseGen => {
-                    let s = self.steps.get(&r).unwrap_or(&0) + 1;
+                    let s = self
+                        .steps
+                        .get(&r)
+                        .unwrap_or(&0)
+                        .saturating_add(op.denoise_step_count.unwrap_or(1).max(1));
                     self.steps.insert(r, s);
                     let total = self
                         .records
@@ -425,6 +509,7 @@ impl ModelEngine for SimEngine {
                         .unwrap_or(DEFAULT_DENOISE_STEPS);
                     per_seq.push(SeqResult {
                         req_id: r,
+                        op_kind: Some(op.kind),
                         op_id,
                         denoise_done: s >= total,
                         num_steps_done: Some(s),
@@ -442,14 +527,38 @@ impl ModelEngine for SimEngine {
                         .and_then(|rec| rec.image.as_ref())
                         .map(|i| (i.height, i.width))
                         .unwrap_or(DEFAULT_IMAGE_HW);
+                    let committed_kv_tokens = self
+                        .records
+                        .get(&r)
+                        .and_then(|rec| rec.image.as_ref())
+                        .filter(|image| image.retain_images)
+                        .map(|image| {
+                            let downsample = self.caps.latent_downsample.max(1);
+                            (image.height / downsample)
+                                .saturating_mul(image.width / downsample)
+                                .saturating_add(self.caps.commit_marker_tokens.max(1))
+                        })
+                        .unwrap_or(0);
                     let png = synthetic_png_b64(hw.1, hw.0)?;
                     per_seq.push(SeqResult {
                         req_id: r,
+                        op_kind: Some(op.kind),
                         op_id,
                         sampled_token_id: self.commit_token,
                         sampled_logprob: self.commit_token.map(|_| 0.0),
                         image_png_b64: Some(png),
                         image_hw: Some(hw),
+                        num_tokens: Some(committed_kv_tokens),
+                        locator: Some(format!("sim-image-{}", r.0)),
+                        ..Default::default()
+                    });
+                }
+                OpKind::CommitWriteback => {
+                    per_seq.push(SeqResult {
+                        req_id: r,
+                        op_kind: Some(op.kind),
+                        op_id,
+                        num_tokens: Some(1),
                         ..Default::default()
                     });
                 }
@@ -464,6 +573,7 @@ impl ModelEngine for SimEngine {
                         .map(|i| (i.height, i.width));
                     per_seq.push(SeqResult {
                         req_id: r,
+                        op_kind: Some(op.kind),
                         op_id,
                         encoder_handle: Some(handle),
                         num_tokens: Some(1),
@@ -473,6 +583,7 @@ impl ModelEngine for SimEngine {
                 }
                 _ => per_seq.push(SeqResult {
                     req_id: r,
+                    op_kind: Some(op.kind),
                     op_id,
                     ..Default::default()
                 }),
@@ -522,5 +633,13 @@ mod tests {
             assert!(acks[0].ok);
         }
         exec.shutdown();
+    }
+
+    #[test]
+    fn default_capabilities_admit_public_image_geometry() {
+        let caps = SimEngine::new().caps();
+        let latent_units = (2_048 / caps.latent_downsample) * (1_152 / caps.latent_downsample);
+
+        assert!(latent_units <= caps.max_latent_size);
     }
 }

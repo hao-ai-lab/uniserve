@@ -12,8 +12,12 @@ use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
-use uniserve_engine_api::{Command, EngineHandle, GenEvent, GenerateRequest};
+use uniserve_core::{
+    ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
+    GenerationRequest, GenerationResourceBounds, ImageParams, RequestId, SamplingParams,
+    UndVisibility,
+};
+use uniserve_engine_api::{Command, EngineHandle, GenEvent};
 use uniserve_executor::Executor;
 use uniserve_scheduler::{ControlTokens, Scheduler};
 use uniserve_worker_ipc::{UniprocExecutor, WorkerLaunchConfig};
@@ -21,18 +25,36 @@ use uniserve_worker_ipc::{UniprocExecutor, WorkerLaunchConfig};
 type Rxs = HashMap<RequestId, tokio::sync::mpsc::UnboundedReceiver<GenEvent>>;
 
 fn submit_text(handle: &EngineHandle, rxs: &mut Rxs, id: u64) -> anyhow::Result<()> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let constraint = GenerationConstraint::UndOnly;
+    let policy = GenerationPolicyDescriptor::default();
+    let request = GenerationRequest {
+        request_id: RequestId(id),
+        context: vec![ContextSegment::UndTokens {
+            token_ids: vec![1, 2, 3],
+            visibility: UndVisibility::Internal,
+        }],
+        negative_context: Vec::new(),
+        constraint,
+        behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+        sampling: SamplingParams::default(),
+        image: ImageParams::default(),
+        max_und_tokens: 16,
+        stop_strings: Vec::new(),
+        stop_token_ids: Vec::new(),
+        priority: 0,
+        lora_id: None,
+        grammar: None,
+        cache: Default::default(),
+        policy,
+        resources: GenerationResourceBounds {
+            context_tokens: 3,
+            max_kv_tokens: 19,
+            ..GenerationResourceBounds::default()
+        },
+    };
+    let rx = handle.submit(request).map_err(|e| anyhow::anyhow!(e))?;
     rxs.insert(RequestId(id), rx);
-    let req = GenerateRequest::new(
-        RequestId(id),
-        vec![1, 2, 3],
-        SamplingParams::default(),
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        16,
-        tx,
-    );
-    handle.submit(req).map_err(|e| anyhow::anyhow!(e))
+    Ok(())
 }
 
 /// Drain events until every request in `ids` has emitted `Finished`, or until

@@ -3,7 +3,7 @@
 //!
 //! Startup composes the two handshakes exactly as the plan requires: the
 //! frontend handshake (dial `HELLO` → receive `INIT` with the data-plane
-//! addresses and the UniServe `native_controls` extension) and the
+//! addresses and resolved generation control tokens) and the
 //! engine↔worker handshake (`EngineCore::new` waits on the worker's
 //! `get_caps`, i.e. model load), with `get_caps` completing **before** `READY`
 //! is sent — READY carries the post-load truth reported by the runtime.
@@ -40,11 +40,11 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
+use uniserve_core::ModelDtype;
 use uniserve_engine_runtime::{EngineCore, EngineCoreConfig};
-use uniserve_engine_wire::ModelDtype;
+use uniserve_engine_wire::generation::GenerationControlTokens;
 use uniserve_engine_wire::handshake::EngineCoreReadyResponse;
-use uniserve_engine_wire::native::NativeControlTokens;
-use uniserve_engine_wire::translate::{AdapterParams, run_event_adapter, to_generate_request};
+use uniserve_engine_wire::translate::{AdapterParams, run_event_adapter, to_generation_request};
 use uniserve_sim::{SimEngine, SimExecutor};
 
 /// Configuration for one headless engine process.
@@ -81,11 +81,9 @@ fn status_message(status: &str) -> ReadyMessage {
     }
 }
 
-fn apply_native_controls(config: &mut EngineCoreConfig, ctrl: &NativeControlTokens) {
+fn apply_generation_controls(config: &mut EngineCoreConfig, ctrl: &GenerationControlTokens) {
     config.bos = ctrl.bos;
-    config.start_of_image = ctrl.start_of_image;
     config.end_of_image = ctrl.end_of_image;
-    config.image_start_ids = ctrl.image_start_ids.clone();
     if config.backend != uniserve_engine_runtime::EngineBackend::Sim {
         config.eos = ctrl.eos.clone();
     }
@@ -97,12 +95,14 @@ fn model_dtype(core: &EngineCore) -> ModelDtype {
 }
 
 fn ready_response(core: &EngineCore) -> EngineCoreReadyResponse {
+    let caps = core.caps();
     EngineCoreReadyResponse {
         max_model_len: core.max_model_len() as u64,
-        num_gpu_blocks: core.caps().num_blocks as u64,
+        num_gpu_blocks: caps.num_blocks as u64,
         dp_stats_address: None,
         dtype: model_dtype(core),
         uniserve_version: env!("CARGO_PKG_VERSION").to_string(),
+        generation_capabilities: core.generation_capabilities(),
     }
 }
 
@@ -214,8 +214,8 @@ pub async fn run_engine_proc(cfg: EngineProcConfig, shutdown: CancellationToken)
         .first()
         .cloned()
         .context("INIT carried no output address")?;
-    if let Some(ctrl) = &init.native_controls {
-        apply_native_controls(&mut core_cfg, ctrl);
+    if let Some(ctrl) = &init.generation_controls {
+        apply_generation_controls(&mut core_cfg, ctrl);
     }
 
     // ---- 3. Build the runtime: spawns the worker/sim and waits on the
@@ -359,6 +359,15 @@ async fn run_input_loop(
                 let active = lock_active(active);
                 for id in &ids {
                     if let Some(rid) = active.get(id) {
+                        handle.abort(*rid);
+                    }
+                }
+            }
+            EngineCoreControlRequest::Cancel(ids) => {
+                let handle = core.handle();
+                let active = lock_active(active);
+                for id in &ids {
+                    if let Some(rid) = active.get(id) {
                         handle.cancel(*rid);
                     }
                 }
@@ -384,36 +393,44 @@ fn handle_add(
 ) {
     let request_id = req.request_id.clone();
     let rid = core.next_request_id();
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
     lock_active(active).insert(request_id.clone(), rid);
 
     let params = AdapterParams {
         request_id: request_id.clone(),
-        want_logprobs: req
-            .sampling_params
-            .as_ref()
-            .and_then(|s| s.logprobs)
-            .unwrap_or(0)
-            > 0,
-        native: req.native.is_some(),
+        want_logprobs: req.generation.sampling.generated_logprobs_requested(),
     };
-    let generate = to_generate_request(&req, rid, event_tx);
-    if let Err(e) = core.submit(generate) {
-        warn!(request_id, error = %e, "submit failed");
-        lock_active(active).remove(&request_id);
-        let _ = out_tx.send(OutMsg::Output(Box::new(EngineCoreOutput {
-            request_id,
-            finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
-            ..Default::default()
-        })));
-        return;
-    }
+    let generate = match to_generation_request(&req, rid) {
+        Ok(request) => request,
+        Err(error) => {
+            warn!(request_id, %error, "canonical generation request rejected");
+            lock_active(active).remove(&request_id);
+            let _ = out_tx.send(OutMsg::Output(Box::new(EngineCoreOutput {
+                request_id,
+                finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
+                ..Default::default()
+            })));
+            return;
+        }
+    };
+    let event_rx = match core.submit(generate) {
+        Ok(event_rx) => event_rx,
+        Err(e) => {
+            warn!(request_id, error = %e, "submit failed");
+            lock_active(active).remove(&request_id);
+            let _ = out_tx.send(OutMsg::Output(Box::new(EngineCoreOutput {
+                request_id,
+                finish_reason: Some(uniserve_engine_wire::EngineCoreFinishReason::Error),
+                ..Default::default()
+            })));
+            return;
+        }
+    };
 
     let out_tx = out_tx.clone();
     let active = Arc::clone(active);
     tokio::spawn(async move {
         run_event_adapter(params, event_rx, |o| {
-            out_tx.send(OutMsg::Output(Box::new(o))).is_ok()
+            std::future::ready(out_tx.send(OutMsg::Output(Box::new(o))).is_ok())
         })
         .await;
         lock_active(&active).remove(&request_id);
@@ -426,7 +443,12 @@ fn execute_utility(core: &Arc<EngineCore>, req: EngineCoreUtilityRequest) -> Uti
     let result: Result<Value> = (|| {
         Ok(match method {
             "is_sleeping" => Value::Boolean(core.is_sleeping()),
-            "reset_prefix_cache" => Value::Boolean(core.reset_prefix_cache()),
+            "reset_prefix_cache" => {
+                let (reset_running_requests, reset_connector): (bool, bool) =
+                    rmpv::ext::from_value(req.args.clone())
+                        .context("reset_prefix_cache expects (bool, bool)")?;
+                Value::Boolean(core.reset_prefix_cache(reset_running_requests, reset_connector)?)
+            }
             "reset_mm_cache" | "reset_encoder_cache" => {
                 core.reset_encoder_cache();
                 Value::Nil

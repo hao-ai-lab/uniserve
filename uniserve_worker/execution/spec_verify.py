@@ -72,19 +72,22 @@ def verify_speculative_tokens(
         grouped.setdefault(length, []).append((idx, extended, tuple(int(token) for token in spec)))
 
     results: list[dict[str, Any] | None] = [None] * len(text.ops)
+    builder, kv_pool = driver._system_forward_runtime()
     for length, rows in grouped.items():
         extended_ops = [op for _, op, _ in rows]
         verify_text = UniForwardBatch.from_ops(extended_ops).as_text()
-        fb = driver.builder.build_text(
+        fb = builder.build_text(
             verify_text,
             device=device,
-            kv_pool=driver.kv_pool,
+            kv_pool=kv_pool,
             request_states=request_states,
         )
+        if fb.input_ids is None or fb.positions is None:
+            raise invalid_descriptor("speculative verification batch is missing text inputs")
         input_ids = fb.input_ids.reshape(len(rows), length)
         positions = fb.positions.reshape(len(rows), length)
         with use_forward_context(
-            replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=driver.kv_pool)
+            replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=kv_pool)
         ):
             logits = model.forward(input_ids, positions, fb)
         for row, (original_idx, op, spec) in enumerate(rows):
@@ -327,7 +330,7 @@ def _can_use_greedy_spec_verify_fast_path(
 ) -> bool:
     if allowed or suppress or sampling.get("logit_bias"):
         return False
-    if int(sampling.get("n_logprobs", 0) or 0) > 0:
+    if _generated_logprobs_requested(sampling):
         return False
     if float(sampling.get("temperature", 0.0) or 0.0) > 0.0:
         return False
@@ -344,9 +347,17 @@ def _can_use_greedy_spec_verify_fast_path(
 
 
 def _can_use_sglang_target_only_spec_verify(sampling: dict[str, Any]) -> bool:
-    if int(sampling.get("n_logprobs", 0) or 0) > 0:
+    if _generated_logprobs_requested(sampling):
         return False
     return float(sampling.get("temperature", 0.0) or 0.0) > 0.0
+
+
+def _generated_logprobs_requested(sampling: dict[str, Any]) -> bool:
+    return (
+        bool(sampling.get("return_logprobs", False))
+        or int(sampling.get("n_logprobs", 0) or 0) > 0
+        or bool(sampling.get("logprob_token_ids"))
+    )
 
 
 def _record_spec_verify_stats(

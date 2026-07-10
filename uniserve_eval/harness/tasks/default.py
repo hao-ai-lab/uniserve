@@ -20,6 +20,17 @@ class DefaultTask(BenchmarkTask):
             image["height"] = int(height)
         if self.spec.steps is not None:
             image["steps"] = int(self.spec.steps)
+        image["seed"] = int(item.get("seed", self.spec.seed))
+        if self.spec.guidance_scale is not None:
+            image["guidance_scale"] = self.spec.guidance_scale
+        if self.spec.image_guidance_scale is not None:
+            image["image_guidance_scale"] = self.spec.image_guidance_scale
+        if self.spec.cfg_norm is not None:
+            image["cfg_norm"] = self.spec.cfg_norm
+        if self.spec.cfg_interval is not None:
+            image["cfg_interval"] = list(self.spec.cfg_interval)
+        if self.spec.timestep_shift is not None:
+            image["timestep_shift"] = self.spec.timestep_shift
         max_tokens = item.get("max_tokens", self.spec.max_tokens or 512)
 
         image_config = dict(image)
@@ -34,6 +45,7 @@ class DefaultTask(BenchmarkTask):
             "max_completion_tokens": int(max_tokens),
             "temperature": self.spec.temperature,
             "top_p": self.spec.top_p,
+            "ignore_eos": self.spec.ignore_eos,
             "image_config": image_config,
         }
         if self.spec.extra_request_body:

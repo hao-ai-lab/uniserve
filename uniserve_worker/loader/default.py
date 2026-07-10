@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Type
+from typing import Any, Type, cast
 
 from ..contracts.model_protocols import UniModel
 from ..nn.quant import QuantizationConfig, use_quantization_config
@@ -35,11 +35,12 @@ class DefaultModelLoader(BaseModelLoader):
         start = time.perf_counter()
         quant_config = QuantizationConfig.from_model_config(config)
         with use_quantization_config(quant_config):
-            model = model_cls(config=config)  # type: ignore[call-arg]
+            model = cast(Any, model_cls)(config=config)
         files = resolve_weight_files(model_path)
         summary = strict_load_weights(model, iter_weights(files))
-        if hasattr(model, "modules"):
-            process_quantized_modules(model.modules())  # type: ignore[attr-defined]
+        modules = getattr(model, "modules", None)
+        if callable(modules):
+            process_quantized_modules(modules())
         # Fold weights to the model's serving dtype on CPU before the device
         # move so only the serving-dtype weights are copied to the GPU. Without
         # this, a model materialized in fp32 would transfer the full fp32 copy
@@ -48,10 +49,12 @@ class DefaultModelLoader(BaseModelLoader):
         prepare_dtype = getattr(model, "prepare_serving_dtype", None)
         if callable(prepare_dtype):
             prepare_dtype()
-        if hasattr(model, "to"):
-            model.to(device)  # type: ignore[attr-defined]
-        if hasattr(model, "eval"):
-            model.eval()  # type: ignore[attr-defined]
+        move_to = getattr(model, "to", None)
+        if callable(move_to):
+            move_to(device)
+        evaluate = getattr(model, "eval", None)
+        if callable(evaluate):
+            evaluate()
         dtype, real_device = _first_parameter_dtype_device(model)
         loaded = summary.loaded_count if summary.loaded_count is not None else summary.tensors_seen
         elapsed = time.perf_counter() - start

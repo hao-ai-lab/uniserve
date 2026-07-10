@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
-use uniserve_chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
 use uniserve_engine_runtime::{
     DEFAULT_LONG_PREFILL_THRESHOLD, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedulingPolicy,
 };
+use uniserve_serving::chat::{ChatTemplateContentFormatOption, ParserSelection, RendererSelection};
 use uniserve_worker_ipc::WorkerLaunchConfig;
 
 /// How the HTTP server obtains its listening socket.
@@ -261,7 +261,7 @@ impl Config {
     /// Validate frontend configuration that can be checked before engine
     /// startup.
     pub fn validate(&self) -> Result<()> {
-        uniserve_chat::validate_parser_overrides(
+        uniserve_serving::chat::validate_parser_overrides(
             &self.tool_call_parser,
             &self.uniserve_reasoning_parser,
         )?;

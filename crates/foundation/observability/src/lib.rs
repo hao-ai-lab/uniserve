@@ -27,7 +27,6 @@ pub type F64Gauge = Gauge<f64, AtomicU64>;
 pub(crate) type HistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
 
 /// Shared Prometheus registry for frontend metrics.
-
 pub struct Metrics {
     registry: Registry,
     pub scheduler: SchedulerMetrics,

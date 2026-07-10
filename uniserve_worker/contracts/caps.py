@@ -143,7 +143,7 @@ class Caps:
         }
 
 
-def validate_caps(raw: Mapping[str, Any], *, owner: str = "driver") -> Caps:
+def validate_caps(raw: Mapping[str, Any] | Caps, *, owner: str = "driver") -> Caps:
     if isinstance(raw, Caps):
         return raw
     caps = wire_mapping(raw, f"{owner}.caps")

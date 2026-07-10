@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// JSON schema specification nested inside a `json_schema` response format.
-
 /// Mirrors the `JsonSchemaResponseFormat` class.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -18,10 +17,8 @@ pub struct JsonSchemaFormat {
 }
 
 /// Supported `response_format` types for chat and completion requests.
-
 /// This is our own definition (rather than the `openai-protocol` crate's) so
 /// that we can support the `structural_tag` variant.
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseFormat {

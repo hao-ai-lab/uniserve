@@ -4,9 +4,10 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..backends.attention import (
     get_attention_backend,
@@ -180,12 +181,12 @@ class RunnerDriver(BaseWorkerDriver):
 
     def execute(
         self,
-        batch: dict[str, Any],
+        batch: Mapping[str, Any],
         *,
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
         return self.runner.execute(
-            batch,
+            dict(batch),
             defer_text_cpu_results=defer_text_cpu_results,
         )
 
@@ -288,7 +289,7 @@ def load_runner_engine(
         # Registry loaders return LoadResult; tokenizer is configured below.
         loader_override = None if str(load_format).lower() == "default" else load_format
         model = get_loader_for_descriptor(descriptor, override=loader_override).load_model(
-            model_cls,
+            cast(type[UniModel], model_cls),
             read_config(model_path),
             device=device,
             model_path=model_path,
@@ -309,7 +310,7 @@ def load_runner_engine(
 
 
 def _bring_up_via_model(
-    model_cls: type[UniModel],
+    model_cls: type[ModelBringUp],
     model_path: str,
     *,
     device: str,

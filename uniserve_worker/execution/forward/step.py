@@ -13,7 +13,7 @@ from ...contracts.batches import ExecuteBatch, UniForwardBatch
 from ...contracts.forward_context import ForwardContext, use_forward_context
 from ...contracts.forward_mode import ForwardMode, mode_for_op
 from ...contracts.forward_stats import ForwardStats
-from ...contracts.outputs import ForwardOutput, ForwardOutputBase
+from ...contracts.outputs import DeferredForwardOutput, ForwardOutput, ForwardOutputBase
 from ...foundation.env import env_flag
 from ...foundation.errors import invalid_descriptor
 from ...foundation.profiling import profile_range
@@ -236,6 +236,8 @@ class ForwardStepExecutor:
 
 def _to_seq_result(output: ForwardOutput | Mapping[str, Any]) -> Any:
     if isinstance(output, ForwardOutputBase):
+        return output.to_seq_result()
+    if isinstance(output, DeferredForwardOutput):
         return output.to_seq_result()
     if isinstance(output, Mapping):
         return dict(output)

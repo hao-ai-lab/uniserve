@@ -35,7 +35,6 @@ pub enum ConfigError {
 }
 
 /// Read and deserialize one JSON config file.
-
 /// This performs only *structural* validation: the file must exist, be valid
 /// UTF-8 JSON, and match the shape of `T` (returning [`ConfigError::ReadFile`]
 /// or [`ConfigError::ParseJson`] respectively). It does **not** perform any
@@ -58,7 +57,6 @@ where
 }
 
 /// Parse an optional boolean environment flag.
-
 /// Accepted true values are `1`, `true`, `yes`, and `on`; accepted false values
 /// are `0`, `false`, `no`, and `off`. Integer values other than zero are also
 /// treated as true for compatibility with existing UniServe flags.

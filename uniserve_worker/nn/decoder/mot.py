@@ -11,7 +11,7 @@ import enum
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -85,6 +85,8 @@ def route_by_modality(
     for modality, (mask, fn) in routes.items():
         target_device = _tower_target_device(transport, coords, modality)
         if target_device is not None and target_device != src.device:
+            if transport is None or coords is None:
+                raise RuntimeError("tower-routed modality is missing transport coordinates")
             piece = transport.copy_to(src[mask], coord=int(coords[modality]))
             dst[mask] = fn(piece).to(dst.device)
         else:
@@ -148,7 +150,11 @@ class KVCache:
         n = self._len[layer]
         if n == 0:
             return None, None
-        return self._k_buf[layer][:n], self._v_buf[layer][:n]
+        k_buffer = self._k_buf[layer]
+        v_buffer = self._v_buf[layer]
+        if k_buffer is None or v_buffer is None:
+            raise RuntimeError("non-empty KV cache layer is missing its backing buffers")
+        return k_buffer[:n], v_buffer[:n]
 
     def append(self, layer: int, k: torch.Tensor, v: torch.Tensor):
         add = k.shape[0]
@@ -163,12 +169,20 @@ class KVCache:
             new_k = k.new_empty((new_cap, *k.shape[1:]))
             new_v = v.new_empty((new_cap, *v.shape[1:]))
             if n:
-                new_k[:n] = self._k_buf[layer][:n]
-                new_v[:n] = self._v_buf[layer][:n]
+                old_k = self._k_buf[layer]
+                old_v = self._v_buf[layer]
+                if old_k is None or old_v is None:
+                    raise RuntimeError("non-empty KV cache layer is missing its backing buffers")
+                new_k[:n] = old_k[:n]
+                new_v[:n] = old_v[:n]
             self._k_buf[layer] = new_k
             self._v_buf[layer] = new_v
-        self._k_buf[layer][n : n + add] = k
-        self._v_buf[layer][n : n + add] = v
+        k_buffer = self._k_buf[layer]
+        v_buffer = self._v_buf[layer]
+        if k_buffer is None or v_buffer is None:
+            raise RuntimeError("KV cache allocation did not create backing buffers")
+        k_buffer[n : n + add] = k
+        v_buffer[n : n + add] = v
         self._len[layer] = n + add
 
 
@@ -384,8 +398,11 @@ class MoTDecoderLayer(nn.Module):
         # (byte-identical to a single-device model).
         mesh = get_current_mesh()
         self._tower_coords = tower_modality_coords(mesh)
+        tower_axis = mesh.axis("tower")
         self._tower_transport = (
-            mesh.axis("tower").transport if self._tower_coords is not None else None
+            tower_axis.transport
+            if self._tower_coords is not None and tower_axis is not None
+            else None
         )
         gen_coord = self._tower_coords[Modality.GEN] if self._tower_coords is not None else 1
         for module in (
@@ -482,6 +499,8 @@ class MoTDecoderLayer(nn.Module):
             normed.index_copy_(0, text_idx, normed_text)
         q, k, v = gen.project_qkv(normed, cos, sin)
         if text_idx is not None:
+            if normed_text is None:
+                raise RuntimeError("text expert rows are missing normalized inputs")
             tq, tk, tv = text.project_qkv(
                 normed_text,
                 cos.index_select(0, text_idx),
@@ -510,6 +529,8 @@ class MoTDecoderLayer(nn.Module):
             normed_text = text.post_norm(hidden_states.index_select(0, text_idx))
         mlp_out = gen.mlp(normed.to(torch.bfloat16))
         if text_idx is not None:
+            if normed_text is None:
+                raise RuntimeError("text expert rows are missing post-attention inputs")
             mlp_out.index_copy_(0, text_idx, text.mlp(normed_text.to(torch.bfloat16)))
         return hidden_states + mlp_out
 
@@ -677,8 +698,11 @@ class MoTModel(nn.Module):
         # routing uses the same transport/coords as the layers (None when trivial).
         mesh = get_current_mesh()
         self._tower_coords = tower_modality_coords(mesh)
+        tower_axis = mesh.axis("tower")
         self._tower_transport = (
-            mesh.axis("tower").transport if self._tower_coords is not None else None
+            tower_axis.transport
+            if self._tower_coords is not None and tower_axis is not None
+            else None
         )
         if self._tower_coords is not None:
             set_tower_coord(self.norm_moe_gen, self._tower_coords[Modality.GEN])
@@ -700,7 +724,8 @@ class MoTModel(nn.Module):
         """
         cos, sin = self.rotary.cos_sin_1d(positions)
         hidden_states = inputs_embeds
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx, layer_module in enumerate(self.layers):
+            layer = cast(MoTDecoderLayer, layer_module)
             hidden_states = layer.forward_paged_text(
                 layer_idx, hidden_states, cos, sin, past_key_values
             )
@@ -740,7 +765,8 @@ class MoTModel(nn.Module):
             text_idx = (row_offsets.unsqueeze(1) + text_base.unsqueeze(0)).reshape(-1)
         else:
             text_idx = None
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx, layer_module in enumerate(self.layers):
+            layer = cast(MoTDecoderLayer, layer_module)
             hidden_states = layer.forward_paged_gen_batch(
                 layer_idx,
                 hidden_states,
@@ -783,7 +809,8 @@ class MoTModel(nn.Module):
         any_gen = bool(gen_mask.any())
         seg_is_gen = [bool(seg.is_gen.any()) for seg in segs]
 
-        for li, layer in enumerate(self.layers):
+        for li, layer_module in enumerate(self.layers):
+            layer = cast(MoTDecoderLayer, layer_module)
             H = layer.forward(
                 li, H, text_mask, gen_mask, cos, sin, segs, slices,
                 any_text=any_text, any_gen=any_gen, seg_is_gen=seg_is_gen,

@@ -16,6 +16,7 @@ and reports frames (degraded muxing), so the stage is exercisable without it.
 from __future__ import annotations
 
 import base64
+import binascii
 import logging
 import shutil
 from typing import Any, Mapping
@@ -57,7 +58,13 @@ class PostProcessDriver(BaseWorkerDriver):
             supported_ops=("encode_frame",),
         )
 
-    def execute(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        defer_text_cpu_results: bool = False,
+    ) -> dict[str, Any]:
+        del defer_text_cpu_results
         ops = batch.get("ops") or []
         per_seq = [self._encode_frame(op) for op in ops]
         return {"step_id": batch.get("step_id"), "per_seq": per_seq}
@@ -77,7 +84,7 @@ class PostProcessDriver(BaseWorkerDriver):
         if isinstance(b64, str) and b64:
             try:
                 return base64.b64decode(b64)
-            except (ValueError, base64.binascii.Error):
+            except (ValueError, binascii.Error):
                 logger.debug("post-process frame had undecodable base64; storing empty frame")
         return b""
 

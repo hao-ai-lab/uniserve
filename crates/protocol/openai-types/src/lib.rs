@@ -9,6 +9,7 @@
 pub mod chat_completions;
 pub mod common;
 pub mod completions;
+pub mod images;
 pub mod structured_outputs;
 
 pub use chat_completions::{
@@ -26,5 +27,9 @@ pub use common::{
 pub use completions::{
     CompletionChoice, CompletionRequest, CompletionResponse, CompletionSseChunk,
     CompletionStreamChoice, CompletionStreamResponse,
+};
+pub use images::{
+    GeneratedImageData, ImageGenerationRequest, ImageGenerationResponse, ImageOutputFormat,
+    ImageResponseFormat,
 };
 pub use structured_outputs::{JsonSchemaFormat, ResponseFormat};

@@ -19,8 +19,10 @@ from .resource_plan import ResourcePlan
 if TYPE_CHECKING:
     import torch
 
+    from ..execution.denoise_driver import TextImageDenoiseStep
     from ..runtime.compile import CompileTarget
     from ..runtime.request_state import RequestStateTable
+    from .batch_policy import BatchPolicy
     from .caps import Caps
     from .forward_batch import ForwardBatch
     from .resource_plan import ResourcePlan
@@ -67,9 +69,29 @@ class UniModel(Protocol):
 
     architectures: tuple[str, ...]
     supported_ops: tuple[str, ...]
+    supported_controls: tuple[str, ...]
+    adapter_mode: str
     resource_plan: "ResourcePlan"
 
-    def load_weights(self, weights: "Iterable[tuple[str, torch.Tensor]]") -> set[str]: ...
+    def load_weights(self, weights: "Iterable[tuple[str, torch.Tensor]]") -> object: ...
+    def caps(
+        self,
+        *,
+        block_size: int | None = None,
+        kv_token_capacity: int | None = None,
+    ) -> "Caps": ...
+    def batch_policy(self) -> "BatchPolicy": ...
+    def configure_runtime(self, **kwargs: Any) -> None: ...
+    def bind_data_plane_handoff(self, handoff: Any) -> None: ...
+    def kv_cache_spec(self) -> Any | None: ...
+    def on_new_request(self, req_id: int, state: Any) -> None: ...
+    def drop_request(self, req_id: int) -> None: ...
+    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None: ...
+    def copy_blocks(self, copies: Any) -> None: ...
+    def load_lora(self, lora_id: int, lora_path: str) -> None: ...
+    def unload_lora(self, lora_id: int) -> None: ...
+    def free_encoder(self, handles: Any) -> None: ...
+    def reset_prefix_cache(self) -> None: ...
 
 
 @runtime_checkable
@@ -122,17 +144,26 @@ class EncodeCapable(Protocol):
 class DenoiseCapable(Protocol):
     """Flow-matching surface required by ``denoise_gen``/``commit_gen`` ops."""
 
-    def prepare_denoise(self, state: Any, op: Mapping[str, Any]) -> DenoiseContext: ...
+    def prepare_denoise(
+        self, state: Any, op: Mapping[str, Any]
+    ) -> DenoiseContext | TextImageDenoiseStep: ...
 
     def predict_velocity(
         self,
-        ctx: DenoiseContext,
+        ctx: Any,
         t: "torch.Tensor",
         latent: "torch.Tensor",
         branch: str,
     ) -> "torch.Tensor": ...
 
-    def decode_image(self, latent: "torch.Tensor") -> Any: ...
+    def decode_image(
+        self,
+        latent: Any,
+        *,
+        req_id: int | None = None,
+        state: Any = None,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any: ...
 
 
 class ModelHooks:
@@ -210,6 +241,10 @@ class ModelHooks:
     def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
         return None
 
+    def prompt_predecessor_logits(self, req_id: int) -> Any | None:
+        """Return worker-resident logits that predict the next prompt token."""
+        return None
+
     def accept_denoise_update(self, ctx: Any, latent: Any) -> None:
         state = getattr(ctx, "state", None)
         if state is not None:
@@ -233,7 +268,9 @@ class ModelHooks:
             "model's run_text_logits[_batch]"
         )
 
-    def prepare_denoise(self, state: Any, op: Mapping[str, Any]) -> DenoiseContext:
+    def prepare_denoise(
+        self, state: Any, op: Mapping[str, Any]
+    ) -> DenoiseContext | TextImageDenoiseStep:
         return DenoiseContext(state=state, op=op)
 
     def predict_velocity(self, ctx: Any, t: Any, latent: Any, branch: str) -> Any:

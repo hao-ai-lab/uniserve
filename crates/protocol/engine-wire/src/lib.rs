@@ -1,15 +1,6 @@
-//! Frontend ↔ engine wire protocol.
-//!
-//! These DTOs are inherited from the vllm-rs frontend (the shared ancestry) and
-//! keep its msgpack encodings — tuple-encoded request/output structs, the
-//! single-byte request-type frame, the HELLO/INIT/READY handshake messages —
-//! so vllm-rs protocol tests port over as conformance tests. The deliberate
-//! UniServe fork is the [`native`] module: native generation events
-//! and request parameters the upstream protocol cannot express.
-//!
-//! Both sides of the boundary use this crate: `uniserve-engine-client`
-//! serializes it over ZMQ in socket mode, and `uniserve-engine-process` hosts
-//! the headless `uniserve engine` process.
+//! Typed frontend-to-engine transport. The engine gateway serializes these DTOs
+//! over ZMQ, and the headless engine process decodes the same canonical request,
+//! control, output, handshake, and statistics shapes.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 use std::any::type_name;
@@ -24,11 +15,11 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use thiserror_ext::AsReport;
 
+use crate::generation::GenerationOutput;
 use crate::logprobs::MaybeWireLogprobs;
-use crate::multimodal::MmFeatures;
-use crate::native::{NativeOutputExt, NativeRequestExt};
 use crate::stats::{PrefillStats, SchedulerStats};
 use crate::utility::UtilityOutput;
+use uniserve_core::{GenerationRequest, GrammarSpec};
 
 /// Dynamic msgpack value used for schema positions that are preserved but not
 /// yet strongly typed.
@@ -51,13 +42,11 @@ fn default_repetition_penalty() -> f32 {
 }
 
 mod classified_outputs;
-pub mod dtype;
 pub mod error;
+pub mod generation;
 pub mod handshake;
 pub mod logprobs;
 pub mod lora;
-pub mod multimodal;
-pub mod native;
 pub mod stats;
 pub mod tensor;
 pub mod translate;
@@ -65,9 +54,9 @@ pub mod utility;
 pub use classified_outputs::{
     ClassifiedEngineCoreOutputs, DpControlMessage, RequestBatchOutputs, UtilityCallOutput,
 };
-pub use dtype::ModelDtype;
 pub use error::{Error, Result};
 pub use logprobs::decode_engine_outputs;
+pub use uniserve_core::ModelDtype;
 
 /// Dedicated single-frame sentinel emitted by a headless engine process when the
 /// engine dies, so the frontend can fail all in-flight requests fast.
@@ -75,7 +64,7 @@ pub const ENGINE_CORE_DEAD_SENTINEL: &[u8] = b"ENGINE_CORE_DEAD";
 
 /// Request types are encoded as single-byte protocol constants so they can be
 /// sent over the ZMQ socket without an extra encoding step.
-
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EngineCoreRequestType {
@@ -86,6 +75,7 @@ pub enum EngineCoreRequestType {
     /// lockstep; the discriminant is reserved so the protocol never reuses it.
     StartDpWave = 2,
     Utility = 3,
+    Cancel = 4,
 }
 
 impl EngineCoreRequestType {
@@ -103,9 +93,15 @@ impl EngineCoreRequestType {
             return None;
         };
 
-        [Self::Add, Self::Abort, Self::StartDpWave, Self::Utility]
-            .into_iter()
-            .find(|variant| variant.as_byte() == *value)
+        [
+            Self::Add,
+            Self::Abort,
+            Self::StartDpWave,
+            Self::Utility,
+            Self::Cancel,
+        ]
+        .into_iter()
+        .find(|variant| variant.as_byte() == *value)
     }
 
     /// Encode the request type as the single-byte frame used on the engine
@@ -131,6 +127,8 @@ pub enum EngineCoreControlRequest {
     Add(Box<EngineCoreRequest>),
     /// Abort the listed request IDs; payload is a msgpack array of strings.
     Abort(Vec<String>),
+    /// Cancel the listed request IDs because their owner no longer needs them.
+    Cancel(Vec<String>),
     /// Invoke an engine utility method; payload is the
     /// [`EngineCoreUtilityRequest`](crate::utility::EngineCoreUtilityRequest)
     /// tuple.
@@ -145,6 +143,7 @@ impl EngineCoreControlRequest {
         match self {
             Self::Add(_) => EngineCoreRequestType::Add,
             Self::Abort(_) => EngineCoreRequestType::Abort,
+            Self::Cancel(_) => EngineCoreRequestType::Cancel,
             Self::Utility(_) => EngineCoreRequestType::Utility,
             Self::StartDpWave => EngineCoreRequestType::StartDpWave,
         }
@@ -157,6 +156,7 @@ impl EngineCoreControlRequest {
         let payload = match self {
             Self::Add(request) => encode_msgpack(request.as_ref())?,
             Self::Abort(request_ids) => encode_msgpack(request_ids)?,
+            Self::Cancel(request_ids) => encode_msgpack(request_ids)?,
             Self::Utility(request) => encode_msgpack(request.as_ref())?,
             Self::StartDpWave => Vec::new(),
         };
@@ -173,6 +173,9 @@ impl EngineCoreControlRequest {
                 decode_msgpack::<EngineCoreRequest>(payload).map(|r| Self::Add(Box::new(r)))
             }
             EngineCoreRequestType::Abort => decode_msgpack::<Vec<String>>(payload).map(Self::Abort),
+            EngineCoreRequestType::Cancel => {
+                decode_msgpack::<Vec<String>>(payload).map(Self::Cancel)
+            }
             EngineCoreRequestType::Utility => {
                 decode_msgpack::<crate::utility::EngineCoreUtilityRequest>(payload)
                     .map(|r| Self::Utility(Box::new(r)))
@@ -183,10 +186,9 @@ impl EngineCoreControlRequest {
 }
 
 /// Reason a request finished: stop, length, abort, error, or repetition.
-
-/// This mirrors the Python enum and uses integer encoding for compact wire
-/// representation.
-
+///
+/// The Rust and Python endpoints share this compact integer encoding.
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum EngineCoreFinishReason {
@@ -194,16 +196,20 @@ pub enum EngineCoreFinishReason {
     Stop = 0,
     /// `max_tokens` or `max_model_len` was reached.
     Length = 1,
-    /// The request was aborted by the client.
+    /// Abort without request-owner or administrator attribution.
     Abort = 2,
     /// A retryable request-level internal error occurred.
     Error = 3,
     /// A repetitive token pattern was detected.
     Repetition = 4,
+    /// The request owner cancelled or dropped the output stream.
+    Cancelled = 5,
+    /// The runtime or an administrator aborted the request.
+    Aborted = 6,
 }
 
 /// Event types emitted by the engine for one request.
-
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum EngineCoreEventType {
@@ -213,7 +219,7 @@ pub enum EngineCoreEventType {
 }
 
 /// A timestamped engine event associated with one request.
-
+///
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineCoreEvent {
     pub r#type: EngineCoreEventType,
@@ -221,9 +227,9 @@ pub struct EngineCoreEvent {
 }
 
 /// Controls how intermediate outputs are returned to the frontend.
-
+///
 /// `Cumulative = 0` is intentionally not supported in Rust frontend.
-
+///
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum RequestOutputKind {
@@ -235,10 +241,10 @@ pub enum RequestOutputKind {
 }
 
 /// The stop reason associated with a finished output.
-
+///
 /// Python models this as the union-typed `stop_reason: int | str | None`
 /// field on `EngineCoreOutput`; the Rust client narrows it into a tagged enum.
-
+///
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum StopReason {
@@ -247,12 +253,12 @@ pub enum StopReason {
 }
 
 /// Parameters for configuring structured outputs (guided decoding).
-
+///
 /// Exactly one constraint field (`json`, `regex`, `choice`, `grammar`,
 /// `json_object`, or `structural_tag`) should be set. The engine backend
 /// selects the appropriate grammar compiler based on which field
 /// is present.
-
+///
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -280,12 +286,12 @@ pub struct StructuredOutputsParams {
 }
 
 /// Engine-facing sampling parameters for text generation.
-
+///
 /// This is the normalized southbound subset used by the frontend when it talks
 /// to the engine over the wire. User-facing request semantics such as
 /// `stop` strings, `n`, and output aggregation mode are intentionally handled
 /// by higher layers before values reach this DTO.
-
+///
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineCoreSamplingParams {
@@ -309,11 +315,11 @@ pub struct EngineCoreSamplingParams {
     #[serde(default)]
     pub ignore_eos: bool,
     /// Number of log probabilities to return per generated token.
-
+    ///
     /// `None` disables sample logprobs. `-1` requests the full vocabulary.
     pub logprobs: Option<i32>,
     /// Number of log probabilities to return per prompt token.
-
+    ///
     /// `None` disables prompt logprobs. `-1` requests the full vocabulary.
     pub prompt_logprobs: Option<i32>,
     /// Minimum probability threshold for token sampling.
@@ -329,14 +335,14 @@ pub struct EngineCoreSamplingParams {
     /// Token IDs that stop generation.
     pub stop_token_ids: Vec<u32>,
     /// Primary EOS token ID used by the engine's dedicated EOS stop path.
-
+    ///
     /// This mirrors Python's internal `_eos_token_id` field and is derived by
     /// the frontend from tokenizer/model metadata rather than supplied directly
     /// by end users.
     #[serde(rename = "_eos_token_id")]
     pub eos_token_id: Option<u32>,
     /// Complete stop-token set used by the engine for `min_tokens` masking.
-
+    ///
     /// This mirrors Python's internal `_all_stop_token_ids` field and should
     /// contain explicit `stop_token_ids` plus any frontend-derived EOS token
     /// IDs.
@@ -352,18 +358,13 @@ pub struct EngineCoreSamplingParams {
     /// Tokenized bad words to avoid during generation.
     #[serde(default, rename = "_bad_words_token_ids")]
     pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
-    /// UniServe extension (frontend-derived, like `_bad_words_token_ids`):
-    /// guided-choice alternatives tokenized by the frontend, since the engine
-    /// process has no tokenizer. Compiled engine-side into a token-trie
-    /// grammar that masks each step.
-    #[serde(default, rename = "_choice_token_ids")]
-    pub choice_token_ids: Option<Vec<Vec<u32>>>,
-    /// Parameters for configuring structured outputs (guided decoding).
+    /// Tokenizer-specific structured-output constraint compiled by the serving
+    /// runtime before this engine boundary.
     #[serde(default)]
-    pub structured_outputs: Option<StructuredOutputsParams>,
+    pub grammar: Option<GrammarSpec>,
     /// Specific token IDs for which log probabilities should be returned at
     /// each position.
-
+    ///
     /// When set, the engine returns logprobs for exactly these tokens in
     /// addition to the sampled/scored token. Mutually exclusive with the
     /// `logprobs` count field in practice.
@@ -374,9 +375,6 @@ pub struct EngineCoreSamplingParams {
     /// defers to engine defaults.
     #[serde(default)]
     pub skip_reading_prefix_cache: Option<bool>,
-    /// Additional request parameters for custom extensions (from `uniserve_xargs`).
-    #[serde(default)]
-    pub extra_args: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl EngineCoreSamplingParams {
@@ -402,94 +400,61 @@ impl EngineCoreSamplingParams {
             logit_bias: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
-            choice_token_ids: None,
-            structured_outputs: None,
+            grammar: None,
             logprob_token_ids: None,
             skip_reading_prefix_cache: None,
-            extra_args: None,
         }
     }
 }
 
-/// Engine-core add-request payload sent from frontend to engine.
-
-#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
+/// Engine-core add-request payload sent from frontend to engine. Generation
+/// semantics live exclusively in `generation`; the remaining fields route and
+/// correlate that canonical request across engine processes.
+#[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct EngineCoreRequest {
     pub request_id: String,
-    pub prompt_token_ids: Option<Vec<u32>>,
-    /// Multimodal features attached to the request.
-    pub mm_features: Option<MmFeatures>,
-    pub sampling_params: Option<EngineCoreSamplingParams>,
-    /// Pooling parameters are preserved in the schema but not yet strongly
-    /// typed.
-    pub pooling_params: Option<OpaqueValue>,
     pub arrival_time: f64,
-    #[serde(default)]
-    pub lora_request: Option<lora::LoraRequest>,
-    #[serde(default)]
-    pub cache_salt: Option<String>,
-    #[serde(default)]
     pub data_parallel_rank: Option<u32>,
-    /// Unsupported in the Rust client because Python uses a custom tensor/aux-
-    /// frame encoding path for this field.
-    #[serde(default)]
-    pub prompt_embeds: Option<OpaqueValue>,
-    /// Per-position mask for mixed-mode inputs (e.g. chat completion with
-    /// `prompt_embeds` content parts). `Some(true)` means real token id;
-    /// `Some(false)` means the position uses a pre-computed entry from
-    /// `prompt_embeds`. `None` for pure-tokens and pure-embeds requests.
-    #[serde(default)]
-    pub prompt_is_token_ids: Option<Vec<bool>>,
     /// Index of the client, used to ensure outputs are sent back to the same
     /// client when scaling out the frontend.
-    #[serde(default)]
     pub client_index: u32,
     /// In DP mode, indicates which wave this request is expected to belong to.
-    #[serde(default)]
     pub current_wave: u32,
-    #[serde(default)]
-    pub priority: i32,
-    #[serde(default)]
     pub trace_headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
     pub resumable: bool,
-    /// Original user-provided request ID, used for output reporting and aborts.
-    #[serde(default)]
-    pub external_req_id: Option<String>,
-    #[serde(default)]
-    pub reasoning_ended: Option<bool>,
-    /// Opaque reasoning-parser kwargs forwarded from the frontend to the
-    /// structured-output backend.
-    #[serde(default)]
-    pub reasoning_parser_kwargs: Option<OpaqueValue>,
     /// If `true`, the request should be added to the scheduler's waiting queue
     /// and immediately aborted, so connector-side cleanup runs via the
     /// standard `request_finished` hook.
-    #[serde(default)]
     pub abort_immediately: bool,
-    /// UniServe protocol extension (appended; absent on the upstream wire):
-    /// native generation parameters. `None` for plain text
-    /// requests — the request then matches the upstream encoding except for the
-    /// extra trailing nil.
-    #[serde(default)]
-    pub native: Option<NativeRequestExt>,
+    pub generation: GenerationRequest,
 }
 
 impl EngineCoreRequest {
-    /// Validate fields intentionally not supported in the Rust client.
-    pub fn validate(&self) -> Result<()> {
-        if self.prompt_embeds.is_some() {
-            return Err(Error::UnsupportedField {
-                context: "EngineCoreRequest",
-                field: "prompt_embeds",
-            });
+    pub fn new(request_id: String, generation: GenerationRequest) -> Self {
+        Self {
+            request_id,
+            arrival_time: uniserve_core::now_unix_secs(),
+            data_parallel_rank: None,
+            client_index: 0,
+            current_wave: 0,
+            trace_headers: None,
+            resumable: false,
+            abort_immediately: false,
+            generation,
         }
-        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.generation
+            .validate()
+            .map_err(|error| Error::InvalidGenerationRequest {
+                message: error.to_string(),
+            })
     }
 }
 
 /// Engine-core output for a single request.
-
+///
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreOutput {
     pub request_id: String,
@@ -523,11 +488,10 @@ pub struct EngineCoreOutput {
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
     pub num_nans_in_logits: u32,
-    /// UniServe protocol extension (appended; absent on the upstream wire):
-    /// typed image events and native finish statistics for native generation
-    /// requests. `None` on the plain text path.
+    /// Typed image events and generation finish statistics when this output
+    /// carries either payload.
     #[serde(default)]
-    pub native: Option<NativeOutputExt>,
+    pub generation: Option<GenerationOutput>,
 }
 
 impl EngineCoreOutput {
@@ -538,7 +502,7 @@ impl EngineCoreOutput {
 }
 
 /// Batch of engine outputs returned to a frontend client.
-
+///
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple, DefaultFromSerde)]
 pub struct EngineCoreOutputs {
     #[serde(default)]
@@ -607,20 +571,47 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use uniserve_core::{
+        ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
+        GenerationPolicyDescriptor, GenerationResourceBounds, ImageParams, RequestId,
+        SamplingParams, UndVisibility,
+    };
+
+    fn generation_request() -> GenerationRequest {
+        let constraint = GenerationConstraint::UndOnly;
+        let policy = GenerationPolicyDescriptor::default();
+        GenerationRequest {
+            request_id: RequestId(1),
+            context: vec![ContextSegment::UndTokens {
+                token_ids: vec![1, 2, 3],
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: SamplingParams::default(),
+            image: ImageParams::default(),
+            max_und_tokens: 8,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: GenerationResourceBounds {
+                context_tokens: 3,
+                max_kv_tokens: 11,
+                ..GenerationResourceBounds::default()
+            },
+        }
+    }
 
     #[test]
     fn engine_request_serializes_as_full_array() {
-        let request = EngineCoreRequest {
-            request_id: "req-1".to_string(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(EngineCoreSamplingParams {
-                max_tokens: 8,
-                ..EngineCoreSamplingParams::for_test()
-            }),
-            arrival_time: 1234.5,
-            client_index: 7,
-            ..EngineCoreRequest::default()
-        };
+        let mut request = EngineCoreRequest::new("req-1".to_string(), generation_request());
+        request.arrival_time = 1234.5;
+        request.client_index = 7;
 
         let encoded = encode_msgpack(&request).unwrap();
         let value = decode_value(&encoded).unwrap();
@@ -629,36 +620,15 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         };
 
-        // 20 upstream positions + the trailing UniServe `native` extension.
-        assert_eq!(array.len(), 21);
+        assert_eq!(array.len(), 9);
         assert_eq!(array[0], Value::from("req-1"));
         assert_eq!(array[2], Value::Nil);
-        assert_eq!(array[4], Value::Nil);
-        assert_eq!(array[10], Value::Nil);
-        assert_eq!(array[11], Value::from(7));
-        assert_eq!(array[20], Value::Nil);
-    }
+        assert_eq!(array[3], Value::from(7));
+        assert_ne!(array[8], Value::Nil);
 
-    /// A 20-element upstream-shaped request (no `native` slot) still decodes:
-    /// the UniServe extension defaults to `None`.
-    #[test]
-    fn upstream_shaped_request_decodes_with_default_native() {
-        let request = EngineCoreRequest {
-            request_id: "req-up".to_string(),
-            ..EngineCoreRequest::default()
-        };
-        let encoded = encode_msgpack(&request).unwrap();
-        let Value::Array(mut array) = decode_value(&encoded).unwrap() else {
-            panic!("expected array");
-        };
-        array.pop(); // drop the trailing `native` slot -> upstream shape
-        assert_eq!(array.len(), 20);
-        let mut upstream = Vec::new();
-        rmpv::encode::write_value(&mut upstream, &Value::Array(array)).unwrap();
-
-        let decoded: EngineCoreRequest = decode_msgpack(&upstream).unwrap();
-        assert_eq!(decoded.request_id, "req-up");
-        assert!(decoded.native.is_none());
+        let decoded: EngineCoreRequest = decode_msgpack(&encoded).unwrap();
+        decoded.validate().expect("canonical request roundtrip");
+        assert_eq!(decoded, request);
     }
 
     #[test]
@@ -700,6 +670,7 @@ mod tests {
             b"\x02"
         );
         assert_eq!(EngineCoreRequestType::Utility.to_frame().as_ref(), b"\x03");
+        assert_eq!(EngineCoreRequestType::Cancel.to_frame().as_ref(), b"\x04");
 
         assert_eq!(
             EngineCoreRequestType::from_frame(b"\x00"),
@@ -717,25 +688,19 @@ mod tests {
             EngineCoreRequestType::from_frame(b"\x03"),
             Some(EngineCoreRequestType::Utility)
         );
-        assert_eq!(EngineCoreRequestType::from_frame(b"\x04"), None);
+        assert_eq!(
+            EngineCoreRequestType::from_frame(b"\x04"),
+            Some(EngineCoreRequestType::Cancel)
+        );
         assert_eq!(EngineCoreRequestType::from_frame(b"\x00\x00"), None);
     }
 
-    /// `Add` frames are byte-identical to the prior `(type_frame, msgpack(EngineCoreRequest))`
-    /// pair, and round-trip back to the same value.
+    /// `Add` frames carry the typed request payload and round-trip losslessly.
     #[test]
     fn control_request_add_frames_match_reference_bytes() {
-        let request = EngineCoreRequest {
-            request_id: "req-1".to_string(),
-            prompt_token_ids: Some(vec![1, 2, 3]),
-            sampling_params: Some(EngineCoreSamplingParams {
-                max_tokens: 8,
-                ..EngineCoreSamplingParams::for_test()
-            }),
-            arrival_time: 1234.5,
-            client_index: 7,
-            ..EngineCoreRequest::default()
-        };
+        let mut request = EngineCoreRequest::new("req-1".to_string(), generation_request());
+        request.arrival_time = 1234.5;
+        request.client_index = 7;
 
         let reference_type = EngineCoreRequestType::Add.to_frame();
         let reference_payload = encode_msgpack(&request).unwrap();
@@ -768,6 +733,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded, EngineCoreControlRequest::Abort(request_ids));
+    }
+
+    /// `Cancel` has a distinct tag and the same typed request-id payload shape as `Abort`.
+    #[test]
+    fn control_request_cancel_frames_match_reference_bytes() {
+        let request_ids = vec!["a".to_string(), "b".to_string()];
+
+        let reference_type = EngineCoreRequestType::Cancel.to_frame();
+        let reference_payload = encode_msgpack(&request_ids).unwrap();
+
+        let control = EngineCoreControlRequest::Cancel(request_ids.clone());
+        let (type_frame, payload) = control.encode_frames().unwrap();
+        assert_eq!(type_frame, reference_type);
+        assert_ne!(type_frame, EngineCoreRequestType::Abort.to_frame());
+        assert_eq!(payload, reference_payload);
+
+        let decoded = EngineCoreControlRequest::decode_frames(&type_frame, &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, EngineCoreControlRequest::Cancel(request_ids));
     }
 
     /// `Utility` frames are byte-identical to `(type_frame, msgpack(EngineCoreUtilityRequest))`.

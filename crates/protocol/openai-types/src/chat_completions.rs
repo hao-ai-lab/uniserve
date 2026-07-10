@@ -14,7 +14,6 @@ use crate::common::{
 use crate::structured_outputs::ResponseFormat;
 
 /// Request type for the Chat Completions API.
-
 /// Mirrors the `ChatCompletionRequest` class with UniServe extension fields.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]

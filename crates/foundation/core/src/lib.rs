@@ -10,12 +10,15 @@ pub mod generation;
 pub mod sampling;
 pub use generation::{
     CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
-    GeneratedImageFeedbackRecipe, GenerationConstraint, GenerationConstraintParseError,
-    GenerationPolicyDescriptor, ImageIngestRecipe, ImageIngestStep, ImageKvEffect, ImageSegment,
-    SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor, UndTokenAction,
-    UndVisibility, VisibilityPolicyDescriptor,
+    GenOnlyStartPolicyDescriptor, GeneratedImageCommitCapabilities, GeneratedImageFeedbackRecipe,
+    GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor, GenerationConstraint,
+    GenerationConstraintParseError, GenerationPolicyDescriptor, GenerationRequest,
+    GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
+    GenerationRuntimeCapabilities, GrammarSpec, ImageIngestRecipe, ImageIngestStep, ImageKvEffect,
+    ImageSegment, OpKind, SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor,
+    UndTokenAction, UndVisibility, VisibilityPolicyDescriptor, encoder_cache_key,
 };
-pub use sampling::{SampleOutput, apply_sampling};
+pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs};
 
 /// A cloneable, thread-safe wake the command ingress fires after enqueuing a
 /// command, so a parked event-driven executor wakes immediately instead of
@@ -112,6 +115,36 @@ pub enum Modality {
     Gen, // generation / image latents
 }
 
+/// Effective model dtype reported after runtime configuration resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelDtype {
+    #[serde(rename = "float16")]
+    Float16,
+    #[serde(rename = "bfloat16")]
+    BFloat16,
+    #[serde(rename = "float32")]
+    Float32,
+}
+
+impl ModelDtype {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Float16 => "float16",
+            Self::BFloat16 => "bfloat16",
+            Self::Float32 => "float32",
+        }
+    }
+
+    /// Resolve worker dtype aliases into the semantic runtime vocabulary.
+    pub fn from_kv_str(kv_dtype: &str) -> Self {
+        match kv_dtype {
+            "fp16" | "float16" | "f16" => Self::Float16,
+            "fp32" | "float32" | "f32" => Self::Float32,
+            _ => Self::BFloat16,
+        }
+    }
+}
+
 /// Text sampling parameters.
 ///
 /// Worker-side math (temperature, top_k, top_p, min_p, penalties, logit_bias)
@@ -120,7 +153,7 @@ pub enum Modality {
 /// small id/weight lists — never tensors — so they can ride on `ForwardOp.sampling`
 /// without crossing large payloads. New fields carry `#[serde(default)]` for
 /// backward-compatible decoding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_k: u32,
@@ -145,9 +178,21 @@ pub struct SamplingParams {
     /// Floor on generated tokens before EOS/stop may fire.
     #[serde(default)]
     pub min_tokens: usize,
-    /// How many logprobs to return per step (0 == none).
+    /// Whether to return the sampled token's log probability.
+    #[serde(default)]
+    pub return_logprobs: bool,
+    /// How many highest-probability alternatives to return per generated step.
     #[serde(default)]
     pub n_logprobs: u32,
+    /// Whether to score prompt positions during prefill.
+    #[serde(default)]
+    pub return_prompt_logprobs: bool,
+    /// How many highest-probability alternatives to return per scored prompt position.
+    #[serde(default)]
+    pub n_prompt_logprobs: u32,
+    /// Token IDs whose log probabilities are returned at every scored position.
+    #[serde(default)]
+    pub logprob_token_ids: Vec<u32>,
     /// Bad-word token sequences: generation may not complete any of these.
     /// Enforced host-side by masking the completing token.
     #[serde(default)]
@@ -159,6 +204,83 @@ pub struct SamplingParams {
 fn default_repetition_penalty() -> f32 {
     1.0
 }
+
+/// Why [`SamplingParams`] were rejected before worker execution.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SamplingParamsError {
+    #[error("{field} must be finite, got {got}")]
+    NonFinite { field: &'static str, got: f32 },
+    #[error("temperature must be non-negative, got {got}")]
+    NegativeTemperature { got: f32 },
+    #[error("top_p must be in (0, 1], got {got}")]
+    TopP { got: f32 },
+    #[error("min_p must be in [0, 1], got {got}")]
+    MinP { got: f32 },
+    #[error("repetition_penalty must be positive, got {got}")]
+    RepetitionPenalty { got: f32 },
+    #[error("allowed_token_ids must contain at least one token when present")]
+    EmptyAllowedTokenIds,
+    #[error("bad_words_ids[{index}] must contain at least one token")]
+    EmptyBadWord { index: usize },
+}
+
+impl SamplingParams {
+    pub fn generated_logprobs_requested(&self) -> bool {
+        self.return_logprobs || self.n_logprobs > 0 || !self.logprob_token_ids.is_empty()
+    }
+
+    pub fn prompt_logprobs_requested(&self) -> bool {
+        self.return_prompt_logprobs || self.n_prompt_logprobs > 0
+    }
+
+    /// Validate sampling math inputs before they reach a worker or simulator.
+    pub fn validate(&self) -> Result<(), SamplingParamsError> {
+        for (field, value) in [
+            ("temperature", self.temperature),
+            ("top_p", self.top_p),
+            ("min_p", self.min_p),
+            ("repetition_penalty", self.repetition_penalty),
+            ("frequency_penalty", self.frequency_penalty),
+            ("presence_penalty", self.presence_penalty),
+        ] {
+            if !value.is_finite() {
+                return Err(SamplingParamsError::NonFinite { field, got: value });
+            }
+        }
+        for &(_, bias) in &self.logit_bias {
+            if !bias.is_finite() {
+                return Err(SamplingParamsError::NonFinite {
+                    field: "logit_bias",
+                    got: bias,
+                });
+            }
+        }
+        if self.temperature < 0.0 {
+            return Err(SamplingParamsError::NegativeTemperature {
+                got: self.temperature,
+            });
+        }
+        if !(0.0 < self.top_p && self.top_p <= 1.0) {
+            return Err(SamplingParamsError::TopP { got: self.top_p });
+        }
+        if !(0.0..=1.0).contains(&self.min_p) {
+            return Err(SamplingParamsError::MinP { got: self.min_p });
+        }
+        if self.repetition_penalty <= 0.0 {
+            return Err(SamplingParamsError::RepetitionPenalty {
+                got: self.repetition_penalty,
+            });
+        }
+        if self.allowed_token_ids.as_ref().is_some_and(Vec::is_empty) {
+            return Err(SamplingParamsError::EmptyAllowedTokenIds);
+        }
+        if let Some(index) = self.bad_words_ids.iter().position(Vec::is_empty) {
+            return Err(SamplingParamsError::EmptyBadWord { index });
+        }
+        Ok(())
+    }
+}
+
 impl Default for SamplingParams {
     /// Default `temperature` is `0.0`, which `sampling::apply_sampling` treats
     /// as greedy (argmax). The production frontend resolves an unset user
@@ -178,7 +300,11 @@ impl Default for SamplingParams {
             presence_penalty: 0.0,
             logit_bias: Vec::new(),
             min_tokens: 0,
+            return_logprobs: false,
             n_logprobs: 0,
+            return_prompt_logprobs: false,
+            n_prompt_logprobs: 0,
+            logprob_token_ids: Vec::new(),
             bad_words_ids: Vec::new(),
             allowed_token_ids: None,
         }
@@ -205,6 +331,26 @@ pub struct ImageParams {
     pub image_prompts: Vec<String>,
     #[serde(default = "default_retain_images")]
     pub retain_images: bool,
+}
+
+impl ImageParams {
+    /// Number of active classifier-free-guidance branches implied by the two
+    /// guidance axes. This is the authoritative scratch branch-slot bound.
+    pub fn cfg_branch_count(&self) -> u8 {
+        let text_off = scale_approx(self.cfg_text_scale, 1.0);
+        let image_off = scale_approx(self.cfg_img_scale, 1.0);
+        if text_off && image_off {
+            1
+        } else if text_off || image_off || scale_approx(self.cfg_text_scale, self.cfg_img_scale) {
+            2
+        } else {
+            3
+        }
+    }
+}
+
+fn scale_approx(left: f32, right: f32) -> bool {
+    (left - right).abs() <= 1.0e-6_f32 * left.abs().max(right.abs()).max(1.0)
 }
 fn default_timestep_shift() -> f32 {
     1.0
@@ -242,6 +388,12 @@ pub enum ImageParamsError {
     },
     #[error("max_images must be in 1..={max}, got {got}")]
     MaxImages { got: u16, max: u16 },
+    #[error("{field} must be finite, got {got}")]
+    NonFinite { field: &'static str, got: f32 },
+    #[error("cfg_interval must be an ordered pair, got ({lo}, {hi})")]
+    CfgIntervalOrder { lo: f32, hi: f32 },
+    #[error("cfg_renorm_type must not be empty")]
+    EmptyCfgRenormType,
 }
 
 impl ImageParams {
@@ -268,7 +420,7 @@ impl ImageParams {
         let check_dim = |got: u32| -> bool {
             got != 0
                 && (Self::MIN_DIM..=Self::MAX_DIM).contains(&got)
-                && got % Self::DIM_MULTIPLE == 0
+                && got.is_multiple_of(Self::DIM_MULTIPLE)
         };
         if !check_dim(self.height) {
             return Err(ImageParamsError::Height {
@@ -290,13 +442,32 @@ impl ImageParams {
             ("cfg_text_scale", self.cfg_text_scale),
             ("cfg_img_scale", self.cfg_img_scale),
         ] {
-            if !scale.is_finite() || scale < 0.0 || scale > Self::MAX_CFG_SCALE {
+            if !scale.is_finite() || !(0.0..=Self::MAX_CFG_SCALE).contains(&scale) {
                 return Err(ImageParamsError::CfgScale {
                     field,
                     got: scale,
                     max: Self::MAX_CFG_SCALE,
                 });
             }
+        }
+        for (field, value) in [
+            ("cfg_renorm_min", self.cfg_renorm_min),
+            ("cfg_interval.0", self.cfg_interval.0),
+            ("cfg_interval.1", self.cfg_interval.1),
+            ("timestep_shift", self.timestep_shift),
+        ] {
+            if !value.is_finite() {
+                return Err(ImageParamsError::NonFinite { field, got: value });
+            }
+        }
+        if self.cfg_interval.0 > self.cfg_interval.1 {
+            return Err(ImageParamsError::CfgIntervalOrder {
+                lo: self.cfg_interval.0,
+                hi: self.cfg_interval.1,
+            });
+        }
+        if self.cfg_renorm_type.trim().is_empty() {
+            return Err(ImageParamsError::EmptyCfgRenormType);
         }
         if self.max_images == 0 || self.max_images > Self::MAX_IMAGES {
             return Err(ImageParamsError::MaxImages {
@@ -384,7 +555,7 @@ pub enum KvGroupKind {
 
 /// One KV-cache group: a logical block subspace with its own layout and kind.
 /// Reported by the worker at handshake.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvCacheGroupSpec {
     pub group_id: u32,
     /// First logical block id owned by this group (groups partition the id space).
@@ -589,5 +760,16 @@ mod tests {
             zero_images.validate(),
             Err(ImageParamsError::MaxImages { .. })
         ));
+    }
+
+    #[test]
+    fn model_dtype_uses_canonical_strings_and_worker_aliases() {
+        assert_eq!(
+            serde_json::to_value(ModelDtype::Float16).unwrap(),
+            serde_json::json!("float16")
+        );
+        assert_eq!(ModelDtype::from_kv_str("bf16"), ModelDtype::BFloat16);
+        assert_eq!(ModelDtype::from_kv_str("fp32"), ModelDtype::Float32);
+        assert_eq!(ModelDtype::from_kv_str("fp8_e4m3"), ModelDtype::BFloat16);
     }
 }

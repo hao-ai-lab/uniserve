@@ -16,7 +16,6 @@ fn default_completion_max_tokens() -> Option<u32> {
 }
 
 /// Request type for the Completions API.
-
 /// Mirrors the `CompletionRequest` class with UniServe extension fields.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]

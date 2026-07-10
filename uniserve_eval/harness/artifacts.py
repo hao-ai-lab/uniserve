@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -16,9 +18,25 @@ class ArtifactWriter:
 
     def write_json(self, name: str, payload: Any) -> Path:
         path = self.output_dir / name
-        with path.open("w", encoding="utf-8") as handle:
-            json.dump(_jsonable(payload), handle, indent=2, sort_keys=True)
-            handle.write("\n")
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(_jsonable(payload), handle, indent=2, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return path
 
     def append_jsonl(self, name: str, payload: Any) -> Path:
@@ -26,6 +44,30 @@ class ArtifactWriter:
         with path.open("a", encoding="utf-8") as handle:
             json.dump(_jsonable(payload), handle, sort_keys=True)
             handle.write("\n")
+        return path
+
+    def write_jsonl(self, name: str, payloads: list[Any]) -> Path:
+        path = self.output_dir / name
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                for payload in payloads:
+                    json.dump(_jsonable(payload), handle, sort_keys=True)
+                    handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return path
 
     def write_sample(self, request_id: str, suffix: str, data: bytes | str) -> Path:

@@ -7,7 +7,7 @@ to fight a dense weight that was already registered by ``LinearBase``.
 from __future__ import annotations
 
 import abc
-from typing import ClassVar, Iterable
+from typing import ClassVar, Iterable, cast
 
 import torch
 import torch.nn as nn
@@ -64,7 +64,10 @@ class UnquantizedLinearMethod(QuantizeMethodBase):
         )
 
     def apply(self, module: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, module.weight, module.bias)
+        from ..linear import LinearBase
+
+        linear = cast(LinearBase, module)
+        return F.linear(x, linear.weight, linear.bias)
 
 
 def process_quantized_modules(modules: Iterable[nn.Module]) -> None:

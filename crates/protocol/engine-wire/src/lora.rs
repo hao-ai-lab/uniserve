@@ -3,10 +3,10 @@ use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 use crate::OpaqueValue;
 
 /// Request for a LoRA adapter.
-
+///
 /// Mirrors the reference `LoRARequest`, which is a msgspec
 /// `array_like=True` struct. Keep the field order aligned with Python.
-
+///
 /// `base_model_name` and `tensorizer_config_dict` are reference-shape
 /// compatibility fields that no backend honors and that the public
 /// `/v1/load_lora_adapter` route does not even accept, so they are always

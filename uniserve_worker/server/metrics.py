@@ -14,7 +14,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, cast
 
 __all__ = [
     'MetricsService',
@@ -58,7 +58,7 @@ def _coerce_int(value: object) -> int:
     if value is None:
         return 0
     try:
-        return int(value)
+        return int(cast(Any, value))
     except (TypeError, ValueError, OverflowError):
         _warn_bad_stats_once(type(value).__name__)
         return 0
@@ -303,7 +303,9 @@ class MetricsService:
         }
         for name in _TOP_LEVEL_CUDA_GRAPH_SCALARS:
             snap[name] = int(getattr(self, name))
-        snap["cuda_graph_runtime_mode_counts"] = dict(self.cuda_graph_runtime_mode_counts)
+        snap["cuda_graph_runtime_mode_counts"] = dict(
+            getattr(self, "cuda_graph_runtime_mode_counts")
+        )
         snap["forward"] = forward
         snap["pipeline_us"] = {k: v // 1000 for k, v in self.pipeline_ns.items()}
         snap["pipeline_counts"] = dict(self.pipeline_counts)

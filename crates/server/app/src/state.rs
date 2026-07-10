@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
-use uniserve_chat::ChatLlm;
-use uniserve_engine_client::EngineCoreClient;
-use uniserve_engine_client::protocol::lora::LoraRequest;
+use uniserve_engine_gateway::EngineAppControl;
+use uniserve_engine_gateway::transport::protocol::lora::LoraRequest;
 use uniserve_serving::ServingRuntime;
 
 use crate::lora::{LoadLoraError, LoraManager, LoraModelResolution, UnloadLoraError};
-use uniserve_native_api::NativeModelProfile;
+use uniserve_model_profile::dialect::GenerationDialectProfile;
 
 use crate::server_info::{ServerInfoConfigFormat, ServerInfoSnapshot};
 
@@ -24,6 +23,8 @@ pub struct AppState {
     served_model_names: Vec<String>,
     /// Canonical semantic serving runtime used by inference requests.
     runtime: ServingRuntime,
+    /// Application-owned engine lifecycle and administration capability.
+    engine_control: EngineAppControl,
     /// Whether to log a summary line for each completed request.
     enable_log_requests: bool,
     /// Whether to set X-Request-Id on every HTTP response.
@@ -49,8 +50,6 @@ pub struct AppState {
     server_load: AtomicU64,
     /// Dynamic LoRA adapter registry.
     lora_manager: LoraManager,
-    /// Model-family profile for the native generation surface.
-    native_profile: NativeModelProfile,
 }
 
 impl AppState {
@@ -62,14 +61,19 @@ impl AppState {
     /// # Panics
     ///
     /// Panics if `served_model_names` is empty.
-    pub fn new(served_model_names: Vec<String>, chat: ChatLlm) -> Self {
+    pub fn new(
+        served_model_names: Vec<String>,
+        runtime: ServingRuntime,
+        engine_control: EngineAppControl,
+    ) -> Self {
         assert!(
             !served_model_names.is_empty(),
             "served_model_names must not be empty"
         );
         Self {
             served_model_names,
-            runtime: ServingRuntime::from_chat_runtime(chat),
+            runtime,
+            engine_control,
             enable_log_requests: false,
             enable_request_id_headers: false,
             api_key: None,
@@ -82,14 +86,12 @@ impl AppState {
             server_info: None,
             server_load: AtomicU64::new(0),
             lora_manager: LoraManager::new(),
-            native_profile: NativeModelProfile::default(),
         }
     }
 
-    /// Attach the native generation profile resolved from the model
-    /// tokenizer.
-    pub fn with_native_profile(mut self, profile: NativeModelProfile) -> Self {
-        self.native_profile = profile;
+    /// Attach a generation dialect to an embedded/test runtime profile.
+    pub fn with_generation_dialect(mut self, profile: GenerationDialectProfile) -> Self {
+        self.runtime = self.runtime.with_generation_dialect(profile);
         self
     }
 
@@ -153,19 +155,9 @@ impl AppState {
         self
     }
 
-    /// Shared chat facade used by HTTP and gRPC requests.
-    pub fn chat(&self) -> &ChatLlm {
-        self.runtime.chat()
-    }
-
-    /// Canonical semantic runtime used by migrated adapters.
+    /// Canonical semantic runtime used by protocol adapters.
     pub fn runtime(&self) -> &ServingRuntime {
         &self.runtime
-    }
-
-    /// Return the model-family profile for the native generation surface.
-    pub fn native_profile(&self) -> &NativeModelProfile {
-        &self.native_profile
     }
 
     /// Whether request completion summaries should be logged.
@@ -259,7 +251,7 @@ impl AppState {
     ) -> Result<LoraRequest, LoadLoraError> {
         self.lora_manager
             .load_lora(
-                self.uniserve_engine_client(),
+                self.engine_control(),
                 &self.served_model_names,
                 lora_name,
                 lora_path,
@@ -277,14 +269,13 @@ impl AppState {
         lora_int_id: Option<u64>,
     ) -> Result<LoraRequest, UnloadLoraError> {
         self.lora_manager
-            .unload_lora(self.uniserve_engine_client(), lora_name, lora_int_id)
+            .unload_lora(self.engine_control(), lora_name, lora_int_id)
             .await
     }
 
-    /// Return a reference to the underlying engine core client for utility
-    /// calls.
-    pub fn uniserve_engine_client(&self) -> &EngineCoreClient {
-        self.runtime.chat().uniserve_engine_client()
+    /// Typed engine lifecycle and administration capability.
+    pub fn engine_control(&self) -> &EngineAppControl {
+        &self.engine_control
     }
 
     /// Return the current in-flight inference request count for the `/load`

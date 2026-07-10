@@ -61,6 +61,10 @@ def default_weight_loader(
 
 
 class LinearBase(nn.Module):
+    weight: nn.Parameter
+    bias: nn.Parameter | None
+    weight_scale: nn.Parameter
+
     def __init__(
         self,
         input_size: int,

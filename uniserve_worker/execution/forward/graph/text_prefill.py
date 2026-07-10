@@ -347,6 +347,8 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
 
         def replay(state: TextInitialPrefillGraphState) -> torch.Tensor:
             state.graph.replay()
+            if state.logits is None:
+                raise RuntimeError("captured prefill graph has no logits buffer")
             return _slice_prefill_graph_logits(state.logits, batch_size)
 
         def record(event: GraphEvent) -> None:
@@ -907,9 +909,7 @@ def _resolve_graph_prefill_backend(ctx: Any) -> Any:
     return None
 
 
-def _slice_prefill_graph_logits(logits: torch.Tensor | None, batch_size: int) -> torch.Tensor | None:
-    if logits is None:
-        return None
+def _slice_prefill_graph_logits(logits: torch.Tensor, batch_size: int) -> torch.Tensor:
     batch_size = int(batch_size)
     if batch_size <= 0 or int(logits.shape[0]) == batch_size:
         return logits

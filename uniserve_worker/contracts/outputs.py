@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 __all__ = [
     "ForwardOutputBase",
+    "DeferredForwardOutput",
+    "FinalizableSeqResult",
     "TextTokenOutput",
     "DenoiseOutput",
     "CommitOutput",
@@ -14,6 +16,22 @@ __all__ = [
     "FrameOutput",
     "ForwardOutput",
 ]
+
+
+@runtime_checkable
+class FinalizableSeqResult(Protocol):
+    """Response-time result whose device-backed values can be materialized later."""
+
+    def finalize(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class DeferredForwardOutput(Protocol):
+    """Forward output that defers device-backed response materialization."""
+
+    req_id: int
+
+    def to_seq_result(self) -> FinalizableSeqResult: ...
 
 
 @dataclass(frozen=True)
@@ -48,13 +66,15 @@ class TextTokenOutput(ForwardOutputBase):
 
     sampled_token_id: int
     sampled_logprob: float | None = None
-    top_logprobs: list[tuple[int, float]] | None = None
+    top_logprobs: list[tuple[int, float, int]] | None = None
+    prompt_logprobs: list[list[tuple[int, float, int]]] | None = None
     num_accepted_tokens: int | None = None
 
     _required_fields: ClassVar[tuple[str, ...]] = ("sampled_token_id",)
     _optional_fields: ClassVar[tuple[str, ...]] = (
         "sampled_logprob",
         "top_logprobs",
+        "prompt_logprobs",
         "num_accepted_tokens",
     )
 
@@ -77,7 +97,7 @@ class CommitOutput(ForwardOutputBase):
     image_hw: tuple[int, int] | None = None
     sampled_token_id: int | None = None
     sampled_logprob: float | None = None
-    top_logprobs: list[tuple[int, float]] | None = None
+    top_logprobs: list[tuple[int, float, int]] | None = None
     num_tokens: int | None = None
     locator: str | None = None
 
@@ -119,4 +139,11 @@ class FrameOutput(ForwardOutputBase):
     _optional_fields: ClassVar[tuple[str, ...]] = ("num_tokens", "image_png_b64")
 
 
-ForwardOutput = TextTokenOutput | DenoiseOutput | CommitOutput | EncodeOutput | FrameOutput
+ForwardOutput = (
+    TextTokenOutput
+    | DenoiseOutput
+    | CommitOutput
+    | EncodeOutput
+    | FrameOutput
+    | DeferredForwardOutput
+)

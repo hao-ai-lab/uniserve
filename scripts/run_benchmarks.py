@@ -32,13 +32,28 @@ from typing import Any
 # points at a sibling checkout. Re-exec once with PYTHONPATH pinned so the
 # import below and all subprocesses agree.
 _REPO_ROOT = str(Path(__file__).resolve().parents[1])
-if os.environ.get("UNISERVE_BENCH_PYTHONPATH_PINNED") != _REPO_ROOT:
+if __name__ == "__main__" and os.environ.get("UNISERVE_BENCH_PYTHONPATH_PINNED") != _REPO_ROOT:
     existing = os.environ.get("PYTHONPATH")
     os.environ["PYTHONPATH"] = f"{_REPO_ROOT}:{existing}" if existing else _REPO_ROOT
     os.environ["UNISERVE_BENCH_PYTHONPATH_PINNED"] = _REPO_ROOT
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 from uniserve_eval.backends import build_serve_cmd, resolve_cuda_visible_devices  # noqa: E402
+from uniserve_eval.harness.cli import spec_from_harness_command  # noqa: E402
+from uniserve_eval.harness.datasets import load_benchmark_inputs  # noqa: E402
+from uniserve_eval.harness.provenance import (  # noqa: E402
+    effective_environment,
+    execution_provenance,
+    input_path_contract,
+)
+from uniserve_eval.harness.report import (  # noqa: E402
+    attach_execution_contract,
+    benchmark_contract,
+    benchmark_parity_contract,
+    canonical_artifact_bundle_matches,
+    canonical_digest,
+    write_summary_artifacts,
+)
 from uniserve_eval.profiles import (  # noqa: E402
     DEFAULT_CONFIG,
     ROOT,
@@ -71,6 +86,25 @@ HARNESS_FLAGS = {
     "i2t_question": "--i2t-question",
     "sharegpt_output_len": "--sharegpt-output-len",
     "sharegpt_context_len": "--sharegpt-context-len",
+    "guidance_scale": "--guidance-scale",
+    "image_guidance_scale": "--image-guidance-scale",
+    "cfg_norm": "--cfg-norm",
+    "cfg_interval": "--cfg-interval",
+    "timestep_shift": "--timestep-shift",
+    "runtime_profile_id": "--runtime-profile-id",
+    "measurement_interface": "--measurement-interface",
+    "cache_read_policy": "--cache-read-policy",
+    "cache_write_policy": "--cache-write-policy",
+    "adapter_selection": "--adapter-selection",
+    "structured_output_policy": "--structured-output-policy",
+    "output_constraint": "--output-constraint",
+    "preprocessing": "--preprocessing",
+    "measured_runs": "--measured-runs",
+    "server_topology": "--server-topology",
+    "plan_evidence_policy": "--plan-evidence-policy",
+    "acceptance_min_success": "--acceptance-min-success",
+    "acceptance_max_failed": "--acceptance-max-failed",
+    "acceptance_min_images_per_success": "--acceptance-min-images-per-success",
 }
 
 
@@ -83,6 +117,8 @@ class ServerRunSpec:
     port: int
     command: tuple[str, ...]
     env: dict[str, str]
+    process_environment: dict[str, str]
+    model_contract: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -91,6 +127,11 @@ class BenchRunSpec:
     group: str
     command: tuple[str, ...]
     output_dir: Path
+    process_environment: dict[str, str]
+    harness_contract: dict[str, Any] | None
+    parity_group: str | None
+    parity_contract: dict[str, Any] | None
+    matrix_contract: dict[str, Any] | None
 
 
 def shell_join(command: tuple[str, ...] | list[str]) -> str:
@@ -121,9 +162,7 @@ def run_command(
     check: bool = True,
 ) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    full_env = os.environ.copy()
-    if env:
-        full_env.update(env)
+    full_env = effective_environment() if env is None else dict(env)
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n[{now()}] $ {shell_join(command)}\n")
         log.flush()
@@ -279,7 +318,10 @@ def wait_for_port(host: str, port: int, proc: subprocess.Popen[str], timeout_s: 
     raise RuntimeError(f"server did not become ready on {host}:{port}: {last_error}")
 
 
-def summary_ok(output_dir: Path) -> bool:
+def summary_ok(bench: BenchRunSpec) -> bool:
+    if bench.harness_contract is None or bench.matrix_contract is None:
+        return False
+    output_dir = bench.output_dir
     path = output_dir / "summary.json"
     if not path.exists():
         return False
@@ -287,7 +329,25 @@ def summary_ok(output_dir: Path) -> bool:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return False
-    return data.get("failed_count") == 0 and int(data.get("ok_count", 0)) > 0
+    if not canonical_artifact_bundle_matches(output_dir, data, bench.harness_contract):
+        return False
+    matrix_contract = data["artifact"].get("matrix_contract")
+    return matrix_contract == bench.matrix_contract
+
+
+def attach_matrix_contract(bench: BenchRunSpec) -> None:
+    if bench.harness_contract is None or bench.matrix_contract is None:
+        raise RuntimeError(f"benchmark {bench.name} has no resolved artifact contract")
+    summary_path = bench.output_dir / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not canonical_artifact_bundle_matches(
+        bench.output_dir,
+        summary,
+        bench.harness_contract,
+    ):
+        raise RuntimeError(f"benchmark {bench.name} produced a mismatched harness contract")
+    attach_execution_contract(summary, "matrix_contract", bench.matrix_contract)
+    write_summary_artifacts(bench.output_dir, summary)
 
 
 def materialize_datasets(output_root: Path, benchmark: dict[str, Any]) -> dict[str, Path]:
@@ -348,6 +408,9 @@ def harness_command(
     num_prompts = int(harness.pop("num_prompts"))
     warmup = int(harness.pop("warmup_requests", defaults.get("warmup_requests", 1)))
     seed = int(harness.pop("seed", defaults.get("seed", 42)))
+    for key in HARNESS_FLAGS:
+        if key not in harness and key in defaults:
+            harness[key] = defaults[key]
 
     cmd = [
         python,
@@ -373,7 +436,10 @@ def harness_command(
     for key, flag in HARNESS_FLAGS.items():
         if key not in harness or harness[key] is None:
             continue
-        cmd.extend([flag, str(harness.pop(key))])
+        value = harness.pop(key)
+        if key == "cfg_interval" and isinstance(value, list):
+            value = ",".join(str(part) for part in value)
+        cmd.extend([flag, str(value)])
     if harness:
         unknown = ", ".join(sorted(harness))
         raise SystemExit(f"unknown harness key(s): {unknown}")
@@ -412,6 +478,9 @@ def build_servers(
         if strict_env:
             require_resolved_profile_value(command, context=f"server {profile_name}")
             require_resolved_profile_value(env, context=f"server env {profile_name}")
+        model_contract = None
+        if spec.get("model") is not None and strict_env:
+            model_contract = input_path_contract(str(spec["model"]), cwd=ROOT)
         servers[group_name] = ServerRunSpec(
             name=group_name,
             profile=profile_name,
@@ -419,6 +488,8 @@ def build_servers(
             port=int(spec["port"]),
             command=command,
             env=env,
+            process_environment=effective_environment(env),
+            model_contract=model_contract,
         )
     return servers
 
@@ -428,6 +499,7 @@ def build_benches(
     benchmark: dict[str, Any],
     output_root: Path,
     datasets: dict[str, Path],
+    servers: dict[str, ServerRunSpec],
     *,
     strict_env: bool,
 ) -> dict[str, list[BenchRunSpec]]:
@@ -436,6 +508,22 @@ def build_benches(
     axes = dict(benchmark.get("load_axes") or {})
     point_specs = dict(benchmark.get("points") or {})
     groups: dict[str, list[BenchRunSpec]] = {}
+    selected_rows_cache: dict[str, list[dict[str, Any]]] = {}
+    harness_environment = effective_environment()
+    server_execution: dict[str, dict[str, Any]] = {}
+    declared_parity_groups: dict[str, list[str]] = {}
+    for point_name, point in point_specs.items():
+        parity_group = point.get("parity_group")
+        if parity_group is not None:
+            declared_parity_groups.setdefault(str(parity_group), []).append(point_name)
+    invalid_groups = {
+        group: members
+        for group, members in declared_parity_groups.items()
+        if len(members) < 2
+    }
+    if invalid_groups:
+        raise SystemExit(f"benchmark parity groups need at least two points: {invalid_groups}")
+    resolved_parity: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
 
     for group_name, group in dict(benchmark["groups"]).items():
         server = expand_profile_value(server_spec(config, str(group["server"])))
@@ -443,6 +531,9 @@ def build_benches(
         benches: list[BenchRunSpec] = []
         for point_name in list(group.get("points", [])):
             point = dict(point_specs[str(point_name)])
+            parity_group = (
+                str(point["parity_group"]) if point.get("parity_group") is not None else None
+            )
             axis = str(point.get("axis", "arrival_rate"))
             if axis not in axes:
                 raise SystemExit(f"point {point_name} references unknown axis {axis!r}")
@@ -463,7 +554,88 @@ def build_benches(
                 )
                 if strict_env:
                     require_resolved_profile_value(command, context=f"benchmark {name}")
-                benches.append(BenchRunSpec(name=name, group=group_name, command=command, output_dir=output_dir))
+                    spec = spec_from_harness_command(command)
+                    row_key = canonical_digest(
+                        {
+                            "task": spec.task.value,
+                            "model": spec.model,
+                            "dataset": spec.dataset,
+                            "dataset_path": spec.dataset_path,
+                            "num_prompts": spec.num_prompts,
+                            "seed": spec.seed,
+                            "tokenizer": spec.tokenizer,
+                            "sharegpt_context_len": spec.sharegpt_context_len,
+                            "sharegpt_output_len": spec.sharegpt_output_len,
+                            "i2t_question": spec.i2t_question,
+                            "preprocessing": spec.preprocessing,
+                        }
+                    )
+                    if row_key not in selected_rows_cache:
+                        selected_rows_cache[row_key], _ = load_benchmark_inputs(spec)
+                    harness_contract = benchmark_contract(spec, selected_rows_cache[row_key])
+                    server_run = servers[group_name]
+                    harness_parity_contract = benchmark_parity_contract(harness_contract)
+                    parity_payload = {
+                        "schema_version": 1,
+                        "harness": harness_parity_contract,
+                        "model": server_run.model_contract,
+                    }
+                    parity_contract = {
+                        **parity_payload,
+                        "fingerprint": canonical_digest(parity_payload),
+                    }
+                    if parity_group is not None:
+                        parity_key = (parity_group, str(rate))
+                        previous = resolved_parity.get(parity_key)
+                        if previous is not None and previous[1] != parity_contract:
+                            raise SystemExit(
+                                f"benchmark parity mismatch for {parity_group!r} at rate {rate}: "
+                                f"{previous[0]!r} and {name!r} do not share one protocol/workload contract"
+                            )
+                        resolved_parity[parity_key] = (name, parity_contract)
+                    if group_name not in server_execution:
+                        server_execution[group_name] = execution_provenance(
+                            server_run.command,
+                            server_run.process_environment,
+                            cwd=ROOT,
+                            workspace_root=ROOT,
+                        )
+                    matrix_payload = {
+                        "schema_version": 2,
+                        "benchmark": name,
+                        "server_profile": server_run.profile,
+                        "server_execution": server_execution[group_name],
+                        "harness_execution": execution_provenance(
+                            command,
+                            harness_environment,
+                            cwd=ROOT,
+                            workspace_root=ROOT,
+                        ),
+                        "harness_contract_fingerprint": harness_contract["fingerprint"],
+                        "parity_group": parity_group,
+                        "parity_contract": parity_contract,
+                    }
+                    matrix_contract = {
+                        **matrix_payload,
+                        "fingerprint": canonical_digest(matrix_payload),
+                    }
+                else:
+                    harness_contract = None
+                    parity_contract = None
+                    matrix_contract = None
+                benches.append(
+                    BenchRunSpec(
+                        name=name,
+                        group=group_name,
+                        command=command,
+                        output_dir=output_dir,
+                        process_environment=harness_environment,
+                        harness_contract=harness_contract,
+                        parity_group=parity_group,
+                        parity_contract=parity_contract,
+                        matrix_contract=matrix_contract,
+                    )
+                )
         groups[group_name] = benches
     return groups
 
@@ -516,15 +688,13 @@ def write_runbook(
 def launch_server(server: ServerRunSpec, group_dir: Path, timeout_s: float) -> subprocess.Popen[str]:
     group_dir.mkdir(parents=True, exist_ok=True)
     (group_dir / "server_command.txt").write_text(shell_join(server.command) + "\n", encoding="utf-8")
-    env = os.environ.copy()
-    env.update(server.env)
     log = (group_dir / "server.log").open("w", encoding="utf-8")
     log.write(f"[{now()}] $ {shell_join(server.command)}\n")
     log.flush()
     proc = subprocess.Popen(
         list(server.command),
         cwd=ROOT,
-        env=env,
+        env=server.process_environment,
         stdout=log,
         stderr=subprocess.STDOUT,
         text=True,
@@ -601,16 +771,21 @@ def run_group(
         proc = launch_server(server, group_dir, server_timeout_s)
         print(f"[{now()}] ready {group_name} port={server.port}", flush=True)
         for bench in benches:
-            if resume and summary_ok(bench.output_dir):
+            if resume and summary_ok(bench):
                 print(f"[{now()}] skip complete {bench.name}", flush=True)
                 continue
             bench.output_dir.mkdir(parents=True, exist_ok=True)
             (bench.output_dir / "command.txt").write_text(shell_join(bench.command) + "\n", encoding="utf-8")
             write_snapshot(bench.output_dir / "preflight.txt", label=f"{bench.name} preflight")
             print(f"[{now()}] run {bench.name}", flush=True)
-            run_command(list(bench.command), log_path=bench.output_dir / "run.log")
+            run_command(
+                list(bench.command),
+                log_path=bench.output_dir / "run.log",
+                env=bench.process_environment,
+            )
             write_snapshot(bench.output_dir / "postflight.txt", label=f"{bench.name} postflight")
-            if not summary_ok(bench.output_dir):
+            attach_matrix_contract(bench)
+            if not summary_ok(bench):
                 raise RuntimeError(f"benchmark did not produce a clean summary: {bench.output_dir}")
             print(f"[{now()}] done {bench.name}", flush=True)
     finally:
@@ -668,7 +843,14 @@ def main(argv: list[str] | None = None) -> int:
             datasets[name] = output_root / str(spec["output_dir"])
 
     servers = build_servers(config, benchmark, strict_env=not args.dry_run)
-    groups = build_benches(config, benchmark, output_root, datasets, strict_env=not args.dry_run)
+    groups = build_benches(
+        config,
+        benchmark,
+        output_root,
+        datasets,
+        servers,
+        strict_env=not args.dry_run,
+    )
     write_runbook(output_root, args.benchmark, servers, groups, benchmark)
 
     all_bench_names = {bench.name for benches in groups.values() for bench in benches}

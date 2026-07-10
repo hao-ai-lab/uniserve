@@ -1,44 +1,13 @@
-//! Northbound engine contract: submit a [`GenerateRequest`] and receive a stream
+//! Northbound engine contract: submit a [`GenerationSubmission`] and receive a stream
 //! of [`GenEvent`]s over a per-request channel. Supports text and image events.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
+use uniserve_core::RequestId;
 
 pub use uniserve_core::{
-    GenerationConstraint as Constraint, ImageParams as ImgParams, SamplingParams as SampParams,
+    GenerationConstraint as Constraint, GenerationRequest, GrammarSpec, ImageParams as ImgParams,
+    SamplingParams as SampParams,
 };
-
-/// A staged multimodal input item: an image (or audio/video) referenced by content
-/// hash that occupies `num_tokens` positions in the AR sequence once its encoder
-/// embeddings are spliced in. The bytes go in over HTTP and to the worker as
-/// input; the embedding never returns to the host — only the content `hash` and
-/// a worker-side `encoder_handle` are retained on the host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MmItem {
-    /// Content hash (encoder-cache key).
-    pub hash: u64,
-    /// Start position of this item's span within the flattened `prompt_ids`.
-    pub position: u32,
-    /// Number of AR positions the encoder output occupies.
-    pub num_tokens: u32,
-    /// Input-image bytes (base64), shipped to the worker encode ops. Empty for
-    /// items already resolved to an encoder handle on the host.
-    pub b64: String,
-}
-
-/// One prompt part, as the chat layer produces it.
-#[derive(Debug, Clone)]
-pub enum PromptPart {
-    Text(String),
-    Image { hash: u64, num_tokens: u32 },
-}
-
-/// Prompt text plus staged input-image references.
-#[derive(Debug, Clone, Default)]
-pub struct Prompt {
-    pub text: String,
-    pub parts: Vec<PromptPart>,
-}
 
 /// Finish reasons using the `STOP`/`LENGTH`/`ABORT`/`ERROR` split.
 /// `Stop` is a stop-string or stop-token hit (distinct from model `Eos`);
@@ -54,7 +23,23 @@ pub enum FinishReason {
     Cancelled,
     /// Server-side abort (admin / lifecycle).
     Aborted,
+    /// A repetition guard terminated generation.
+    Repetition,
     Error,
+}
+
+/// One ranked vocabulary candidate at a generated or prompt token position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprob {
+    pub token_id: u32,
+    pub logprob: f32,
+    pub rank: u32,
+}
+
+/// Ranked candidates for one scored token position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionLogprobs {
+    pub entries: Vec<TokenLogprob>,
 }
 
 /// Typed text and image event stream emitted to callers.
@@ -68,10 +53,14 @@ pub enum GenEvent {
         id: u32,
         logprob: Option<f32>,
     },
-    /// Top-k logprob alternatives for the just-emitted token, when requested.
+    /// Ranked candidates for the just-emitted token, including the sampled token.
     TokenLogprobs {
         id: u32,
-        top: Vec<(u32, f32)>,
+        candidates: Vec<TokenLogprob>,
+    },
+    /// Prompt positions scored by one prefill chunk, in prompt order.
+    PromptLogprobs {
+        positions: Vec<PositionLogprobs>,
     },
     ImageBegin {
         image_id: u32,
@@ -82,6 +71,9 @@ pub enum GenEvent {
     ImageStep {
         image_id: u32,
         step: u16,
+    },
+    ImageCommit {
+        image_id: u32,
     },
     ImageDone {
         image_id: u32,
@@ -98,6 +90,7 @@ pub enum GenEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
         images: usize,
+        kv_transfer_params: Option<serde_json::Value>,
     },
     Rejected {
         message: String,
@@ -111,101 +104,19 @@ pub enum GenEvent {
 pub type EventTx = tokio::sync::mpsc::UnboundedSender<GenEvent>;
 pub type EventRx = tokio::sync::mpsc::UnboundedReceiver<GenEvent>;
 
-/// A structured-output constraint attached to a request. Compiled engine-side
-/// into a per-step token mask via the `allowed_tokens` descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GrammarSpec {
-    /// The output must be exactly one of these token-id sequences (the
-    /// guided-choice form; the frontend tokenized the choice strings).
-    Choice(Vec<Vec<u32>>),
+pub fn event_channel() -> (EventTx, EventRx) {
+    tokio::sync::mpsc::unbounded_channel()
 }
 
-/// A submitted request. The prompt arrives already tokenized by the server's
-/// ingest stage; the scheduler and worker speak token ids only.
-pub struct GenerateRequest {
-    pub request_id: RequestId,
-    pub prompt_ids: Vec<u32>,
-    pub neg_prompt_ids: Vec<u32>, // CFG text-unconditional prompt (may be empty)
-    pub sampling: SamplingParams,
-    pub image: ImageParams,
-    pub constraint: GenerationConstraint,
-    pub max_tokens: usize,
-    /// Stop strings (matched on the detokenized suffix) and explicit stop token
-    /// ids — the request terminates with `FinishReason::Stop` on a hit.
-    pub stop_strings: Vec<String>,
-    pub stop_token_ids: Vec<u32>,
-    /// Priority for the `Priority` scheduling policy (lower = sooner).
-    pub priority: i32,
-    /// Optional LoRA adapter id applied to this request's ops.
-    pub lora_id: Option<u32>,
-    /// Staged multimodal input items (encoded before prefill).
-    pub mm_items: Vec<MmItem>,
-    /// Structured-output constraint (compiled engine-side).
-    pub grammar: Option<GrammarSpec>,
-    /// When `true`, the scheduler will not read this request's prompt prefix
-    /// from the prefix cache (newly computed blocks may still populate it).
-    /// Surfaced by the gRPC `bypass_prefix_cache` flag and the wire
-    /// `skip_reading_prefix_cache` sampling field.
-    pub skip_reading_prefix_cache: bool,
+/// Submission plumbing kept separate from the pure generation request value.
+pub struct GenerationSubmission {
+    pub request: GenerationRequest,
     pub event_tx: EventTx,
 }
 
-impl GenerateRequest {
-    pub fn uses_default_generation(&self) -> bool {
-        self.constraint == GenerationConstraint::Default
-    }
-
-    pub fn is_gen_only(&self) -> bool {
-        self.constraint == GenerationConstraint::GenOnly
-    }
-
-    pub fn is_und_only(&self) -> bool {
-        self.constraint == GenerationConstraint::UndOnly
-    }
-
-    pub fn has_context_images(&self) -> bool {
-        !self.mm_items.is_empty()
-    }
-
-    pub fn uses_feedback_ingest(&self) -> bool {
-        self.is_und_only() && self.has_context_images()
-    }
-
-    pub fn is_plain_und(&self) -> bool {
-        self.is_und_only() && !self.has_context_images()
-    }
-
-    pub fn reserves_worstcase_kv(&self) -> bool {
-        self.is_gen_only() || self.uses_default_generation() || self.uses_feedback_ingest()
-    }
-
-    /// A minimal request for tests / internal construction (no stops, default priority).
-    pub fn new(
-        request_id: RequestId,
-        prompt_ids: Vec<u32>,
-        sampling: SamplingParams,
-        image: ImageParams,
-        constraint: GenerationConstraint,
-        max_tokens: usize,
-        event_tx: EventTx,
-    ) -> Self {
-        Self {
-            request_id,
-            prompt_ids,
-            neg_prompt_ids: Vec::new(),
-            sampling,
-            image,
-            constraint,
-            max_tokens,
-            stop_strings: Vec::new(),
-            stop_token_ids: Vec::new(),
-            priority: 0,
-            lora_id: None,
-            mm_items: Vec::new(),
-            grammar: None,
-            skip_reading_prefix_cache: false,
-            event_tx,
-        }
+impl GenerationSubmission {
+    pub fn new(request: GenerationRequest, event_tx: EventTx) -> Self {
+        Self { request, event_tx }
     }
 }
 
@@ -213,15 +124,21 @@ impl GenerateRequest {
 pub type CollectiveRpcReply =
     std::sync::mpsc::Sender<Result<Vec<(u32, bool, Option<String>)>, String>>;
 
+/// Reply channel for one acknowledged prefix-cache reset transaction.
+pub type PrefixCacheResetReply = std::sync::mpsc::Sender<Result<bool, String>>;
+
 /// Command sent from a frontend handler to the scheduler thread.
 pub enum Command {
-    Submit(Box<GenerateRequest>),
+    Submit(Box<GenerationSubmission>),
     /// Client-side cancel → `FinishReason::Cancelled`.
     Cancel(RequestId),
     /// Server-side abort → `FinishReason::Aborted`.
     Abort(RequestId),
-    /// Clear the prefix cache (the `/reset_prefix_cache` endpoint).
-    ResetPrefixCache,
+    /// Clear the prefix cache after applying the requested running-request policy.
+    ResetPrefixCache {
+        reset_running_requests: bool,
+        reply: PrefixCacheResetReply,
+    },
     /// Clear the encoder cache (`/reset_encoder_cache`, `/reset_mm_cache`).
     ResetEncoderCache,
     /// Pause/resume admission (the `/sleep` and `/wake_up` endpoints).
@@ -285,9 +202,13 @@ impl EngineHandle {
         r
     }
 
-    pub fn submit(&self, req: GenerateRequest) -> Result<(), String> {
-        self.send(Command::Submit(Box::new(req)))
-            .map_err(|e| e.to_string())
+    pub fn submit(&self, request: GenerationRequest) -> Result<EventRx, String> {
+        let (event_tx, event_rx) = event_channel();
+        self.send(Command::Submit(Box::new(GenerationSubmission::new(
+            request, event_tx,
+        ))))
+        .map_err(|e| e.to_string())?;
+        Ok(event_rx)
     }
     pub fn cancel(&self, id: RequestId) {
         let _ = self.send(Command::Cancel(id));
@@ -296,9 +217,17 @@ impl EngineHandle {
     pub fn abort(&self, id: RequestId) {
         let _ = self.send(Command::Abort(id));
     }
-    /// Clear the prefix cache.
-    pub fn reset_prefix_cache(&self) {
-        let _ = self.send(Command::ResetPrefixCache);
+    /// Clear the prefix cache and wait for the scheduler to acknowledge the transaction.
+    pub fn reset_prefix_cache(&self, reset_running_requests: bool) -> Result<bool, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(Command::ResetPrefixCache {
+            reset_running_requests,
+            reply: reply_tx,
+        })
+        .map_err(|error| error.to_string())?;
+        reply_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .map_err(|error| format!("prefix-cache reset reply channel: {error}"))?
     }
     /// Clear the encoder cache.
     pub fn reset_encoder_cache(&self) {
@@ -338,41 +267,64 @@ impl EngineHandle {
 
 #[cfg(test)]
 mod tests {
-    use uniserve_core::{GenerationConstraint, ImageParams, RequestId, SamplingParams};
+    use uniserve_core::{
+        ContextSegment, GenerationBehaviorDescriptor, GenerationConstraint,
+        GenerationPolicyDescriptor, GenerationResourceBounds, ImageParams, RequestId,
+        SamplingParams, UndVisibility,
+    };
 
     use super::*;
 
-    fn test_request(request_id: u64) -> GenerateRequest {
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        GenerateRequest::new(
-            RequestId(request_id),
-            vec![1, 2, 3],
-            SamplingParams::default(),
-            ImageParams::default(),
-            GenerationConstraint::UndOnly,
-            32,
-            event_tx,
-        )
+    fn test_request(request_id: u64) -> GenerationRequest {
+        let constraint = GenerationConstraint::UndOnly;
+        let policy = GenerationPolicyDescriptor::default();
+        GenerationRequest {
+            request_id: RequestId(request_id),
+            context: vec![ContextSegment::UndTokens {
+                token_ids: vec![1, 2, 3],
+                visibility: UndVisibility::Internal,
+            }],
+            negative_context: Vec::new(),
+            constraint,
+            behavior: GenerationBehaviorDescriptor::resolve(constraint, &policy),
+            sampling: SamplingParams::default(),
+            image: ImageParams::default(),
+            max_und_tokens: 32,
+            stop_strings: Vec::new(),
+            stop_token_ids: Vec::new(),
+            priority: 0,
+            lora_id: None,
+            grammar: None,
+            cache: Default::default(),
+            policy,
+            resources: GenerationResourceBounds {
+                context_tokens: 3,
+                max_kv_tokens: 35,
+                ..GenerationResourceBounds::default()
+            },
+        }
     }
 
-    /// The convenience constructor fills the request-shaping defaults: no stops,
-    /// zero priority, no LoRA, and empty multimodal/grammar fields.
+    /// The canonical request is pure value data with explicit context, policy,
+    /// behavior, and resource declarations.
     #[test]
-    fn generate_request_new_applies_minimal_defaults() {
+    fn generation_request_is_canonical_pure_data() {
         let request = test_request(7);
 
         assert_eq!(request.request_id, RequestId(7));
-        assert_eq!(request.prompt_ids, vec![1, 2, 3]);
-        assert_eq!(request.max_tokens, 32);
+        assert_eq!(request.prompt_token_count(), 3);
+        assert_eq!(request.max_und_tokens, 32);
         assert_eq!(request.constraint, GenerationConstraint::UndOnly);
-        assert!(request.neg_prompt_ids.is_empty());
+        assert!(request.negative_context.is_empty());
         assert!(request.stop_strings.is_empty());
         assert!(request.stop_token_ids.is_empty());
         assert_eq!(request.priority, 0);
         assert_eq!(request.lora_id, None);
-        assert!(request.mm_items.is_empty());
+        assert_eq!(request.context_image_count(), 0);
         assert_eq!(request.grammar, None);
-        assert!(!request.skip_reading_prefix_cache);
+        assert!(request.cache.read);
+        assert!(request.cache.write);
+        assert!(request.validate().is_ok());
     }
 
     /// `submit` enqueues a `Command::Submit` carrying the request, and the
@@ -382,10 +334,12 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::new(tx);
 
-        handle.submit(test_request(11)).unwrap();
+        let _events = handle.submit(test_request(11)).unwrap();
 
         match rx.recv().unwrap() {
-            Command::Submit(request) => assert_eq!(request.request_id, RequestId(11)),
+            Command::Submit(submission) => {
+                assert_eq!(submission.request.request_id, RequestId(11));
+            }
             _ => panic!("expected Submit command"),
         }
     }
@@ -461,7 +415,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = EngineHandle::with_waker(tx, waker);
 
-        handle.reset_prefix_cache();
+        handle.reset_encoder_cache();
         handle.set_sleeping(true);
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
 
@@ -469,6 +423,25 @@ mod tests {
         drop(rx);
         handle.reset_encoder_cache();
         assert_eq!(wakes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn prefix_cache_reset_round_trips_policy_and_result() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let handle = EngineHandle::new(tx);
+        let scheduler = std::thread::spawn(move || match rx.recv().unwrap() {
+            Command::ResetPrefixCache {
+                reset_running_requests,
+                reply,
+            } => {
+                assert!(reset_running_requests);
+                reply.send(Ok(true)).unwrap();
+            }
+            _ => panic!("expected ResetPrefixCache command"),
+        });
+
+        assert!(handle.reset_prefix_cache(true).unwrap());
+        scheduler.join().unwrap();
     }
 
     /// `collective_rpc` delivers the method to the scheduler side and returns
@@ -532,6 +505,7 @@ mod tests {
             prompt_tokens: 4,
             completion_tokens: 9,
             images: 0,
+            kv_transfer_params: None,
         };
 
         match event {
@@ -541,12 +515,14 @@ mod tests {
                 prompt_tokens,
                 completion_tokens,
                 images,
+                kv_transfer_params,
             } => {
                 assert_eq!(reason, FinishReason::Stop);
                 assert_eq!(stop_reason, Some("</s>".to_string()));
                 assert_eq!(prompt_tokens, 4);
                 assert_eq!(completion_tokens, 9);
                 assert_eq!(images, 0);
+                assert_eq!(kv_transfer_params, None);
             }
             other => panic!("expected Finished, got {other:?}"),
         }

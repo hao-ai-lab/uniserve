@@ -134,7 +134,7 @@ fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
                     if init.is_some() {
                         return Err(Error::new(value.span(), "duplicate `init` in #[metric]"));
                     }
-                    init = Some(value);
+                    init = Some(*value);
                 }
             }
         }
@@ -161,7 +161,7 @@ fn parse_field(field: &syn::Field) -> syn::Result<MetricField> {
 enum MetricArg {
     Name(LitStr),
     Help(LitStr),
-    Init(Expr),
+    Init(Box<Expr>),
 }
 
 impl syn::parse::Parse for MetricArg {
@@ -173,7 +173,7 @@ impl syn::parse::Parse for MetricArg {
         } else if key == "help" {
             Ok(MetricArg::Help(input.parse()?))
         } else if key == "init" {
-            Ok(MetricArg::Init(input.parse()?))
+            Ok(MetricArg::Init(Box::new(input.parse()?)))
         } else {
             Err(Error::new(
                 key.span(),

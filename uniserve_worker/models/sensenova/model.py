@@ -10,7 +10,7 @@ import copy
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -107,9 +107,9 @@ from ...nn.quant import (
     use_quantization_config,
 )
 from ...nn.sampler import (
-    BatchedSamplingResult,
-    DeferredBatchedSamplingResult,
     apply_sampling_batched_with_device_tokens,
+    finalize_sampling_result,
+    is_deferred_sampling_result,
 )
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...processors.registry import get_processor_for_model
@@ -507,8 +507,16 @@ class SenseNovaPackedRope:
 
     def select_indices(self, positions: torch.Tensor) -> "SenseNovaPackedRope":
         return SenseNovaPackedRope(
-            tuple(axis.index_select(0, positions) for axis in self.cos),
-            tuple(axis.index_select(0, positions) for axis in self.sin),
+            (
+                self.cos[0].index_select(0, positions),
+                self.cos[1].index_select(0, positions),
+                self.cos[2].index_select(0, positions),
+            ),
+            (
+                self.sin[0].index_select(0, positions),
+                self.sin[1].index_select(0, positions),
+                self.sin[2].index_select(0, positions),
+            ),
             hw_identity=self.hw_identity,
         )
 
@@ -516,8 +524,8 @@ class SenseNovaPackedRope:
         start = int(start)
         end = int(end)
         return SenseNovaPackedRope(
-            tuple(axis[start:end] for axis in self.cos),
-            tuple(axis[start:end] for axis in self.sin),
+            (self.cos[0][start:end], self.cos[1][start:end], self.cos[2][start:end]),
+            (self.sin[0][start:end], self.sin[1][start:end], self.sin[2][start:end]),
             hw_identity=self.hw_identity,
         )
 
@@ -594,7 +602,7 @@ class NeoVisionModel(nn.Module):
         if pixel_values is None and pixel_embeds is None:
             raise ValueError("pixel_values or pixel_embeds is required")
         hidden = pixel_embeds if pixel_embeds is not None else self.embeddings(pixel_values, grid_hw)
-        return BaseModelOutputWithPast(last_hidden_state=hidden)
+        return BaseModelOutputWithPast(last_hidden_state=cast(Any, hidden))
 
 
 def _resolve_tower(mesh: Any | None = None) -> tuple[Any | None, dict[Modality, int] | None]:
@@ -607,7 +615,8 @@ def _resolve_tower(mesh: Any | None = None) -> tuple[Any | None, dict[Modality, 
     Router instead of model-private routing)."""
     mesh = mesh if mesh is not None else get_current_mesh()
     coords = tower_modality_coords(mesh)
-    transport = mesh.axis("tower").transport if coords is not None else None
+    tower_axis = mesh.axis("tower")
+    transport = tower_axis.transport if coords is not None and tower_axis is not None else None
     return transport, coords
 
 
@@ -711,8 +720,9 @@ class _SenseNovaAttention(nn.Module):
         split_sizes = [int(size) for size in qkv_proj.output_sizes]
         if gen_branch and int(hidden_states.shape[-2]) == 1:
             q_w, k_w, v_w = qkv_proj.weight.split(split_sizes, dim=0)
-            if getattr(qkv_proj, "bias", None) is not None:
-                q_b, k_b, v_b = qkv_proj.bias.split(split_sizes, dim=0)
+            bias = qkv_proj.bias
+            if bias is not None:
+                q_b, k_b, v_b = bias.split(split_sizes, dim=0)
             else:
                 q_b = k_b = v_b = None
             # One-token autoregressive image decode is numerically sensitive to
@@ -1011,9 +1021,10 @@ class _SenseNovaAttention(nn.Module):
         # max_seqlen_k is identical for every layer of the packed forward; derive
         # it on the host from the segment metadata (Python ints) instead of
         # forcing a per-layer device->host sync via cache_after.max().item().
+        max_seqlen_k_hook = getattr(kv_view, "max_seqlen_k", None)
         max_seqlen_k = (
-            kv_view.max_seqlen_k()
-            if callable(getattr(kv_view, "max_seqlen_k", None))
+            int(max_seqlen_k_hook())
+            if callable(max_seqlen_k_hook)
             else max((seg.base_len + seg.q_len for seg in kv_view.segments), default=0)
         )
         if forward_stream.fully_visible:
@@ -1515,6 +1526,8 @@ class _SenseNovaDecoderLayer(nn.Module):
                 packed_rope=packed_rope,
                 **kwargs,
             )
+            if residual is None:
+                raise RuntimeError("single-modality layer did not return a residual")
             return hidden_states + residual
 
         text_mask = ~image_gen_indicators
@@ -1572,7 +1585,7 @@ class _SenseNovaDecoderLayer(nn.Module):
         past_key_values: Any = None,
         packed_rope: SenseNovaPackedRope | None = None,
         **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             return self._forward_single_modality_with_residual(
                 hidden_states,
@@ -1866,7 +1879,9 @@ class _SenseNovaDecoderModel(nn.Module):
         )
         flat_indexes = _flatten_3d_indexes(indexes, inputs_embeds.shape[0], inputs_embeds.shape[1])
         packed_rope = (
-            self.layers[0].self_attn._packed_rope(flat_indexes, hw_identity=bool(text_only_rope))
+            cast(_SenseNovaDecoderLayer, self.layers[0]).self_attn._packed_rope(
+                flat_indexes, hw_identity=bool(text_only_rope)
+            )
             if self.layers
             else None
         )
@@ -1899,7 +1914,7 @@ class _SenseNovaDecoderModel(nn.Module):
                 **kwargs,
             )
         return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+            last_hidden_state=cast(Any, hidden_states),
             past_key_values=past_key_values if use_cache else None,
         )
 
@@ -1982,7 +1997,8 @@ class _SenseNovaDecoderModel(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         residual = None
-        for layer in self.layers:
+        for layer_module in self.layers:
+            layer = cast(_SenseNovaDecoderLayer, layer_module)
             hidden_states, residual = layer.forward_with_residual(
                 hidden_states,
                 residual,
@@ -2023,7 +2039,8 @@ class _SenseNovaDecoderModel(nn.Module):
         packed_rope: SenseNovaPackedRope | None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        for layer in self.layers:
+        for layer_module in self.layers:
+            layer = cast(_SenseNovaDecoderLayer, layer_module)
             hidden_states = layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
@@ -2072,7 +2089,11 @@ class _SenseNovaDecoderModel(nn.Module):
         exist_image_gen_tokens = any(
             seg.modality == "gen" and int(seg.q_len) > 0 for seg in forward_stream.segments
         )
-        packed_rope = self.layers[0].self_attn._packed_rope(indexes) if self.layers else None
+        packed_rope = (
+            cast(_SenseNovaDecoderLayer, self.layers[0]).self_attn._packed_rope(indexes)
+            if self.layers
+            else None
+        )
         und_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "und")
         gen_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "gen")
         modality_split = (
@@ -2093,7 +2114,8 @@ class _SenseNovaDecoderModel(nn.Module):
         # the masks/exist flags once here and thread them into every layer
         # instead of re-deriving them per layer (each bool(.any()) on a CUDA
         # tensor forces a host sync, serializing the kernel chain).
-        for layer in self.layers:
+        for layer_module in self.layers:
+            layer = cast(_SenseNovaDecoderLayer, layer_module)
             hidden_states = layer.forward_packed_visible(
                 hidden_states,
                 gen=gen,
@@ -2154,12 +2176,16 @@ class _SenseNovaLanguageModel(nn.Module):
         return self.model.embed_tokens
 
     def set_input_embeddings(self, value: nn.Module) -> None:
+        if not isinstance(value, VocabParallelEmbedding):
+            raise TypeError("SenseNova input embeddings must be VocabParallelEmbedding")
         self.model.embed_tokens = value
 
     def get_output_embeddings(self) -> nn.Module:
         return self.lm_head
 
     def set_output_embeddings(self, value: nn.Module) -> None:
+        if not isinstance(value, ParallelLMHead):
+            raise TypeError("SenseNova output embeddings must be ParallelLMHead")
         self.lm_head = value
 
     def forward(
@@ -2493,7 +2519,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         scratch=PerBranch(),
     )
     checkpoint_layout = CheckpointLayout(stacked=_SENSENOVA_STACKED_PARAMS)
-    velocity_parameterization = "velocity"
+    def velocity_parameterization(self) -> str:
+        return "velocity"
     # Denoise configuration consumed by the system TextImageDenoiseOps engine.
     denoise_schedule_direction = ScheduleDirection.ASCENDING
     denoise_schedule_shift_domain = ScheduleShiftDomain.SIGMA
@@ -2563,8 +2590,11 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # leaves coords/transport unset and ``gen_device == device``.
         self.mesh = get_current_mesh()
         self._tower_coords = tower_modality_coords(self.mesh)
+        tower_axis = self.mesh.axis("tower")
         self._tower_transport = (
-            self.mesh.axis("tower").transport if self._tower_coords is not None else None
+            tower_axis.transport
+            if self._tower_coords is not None and tower_axis is not None
+            else None
         )
         tower_devices = (
             getattr(self._tower_transport, "devices", None)
@@ -2785,8 +2815,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         # loader's partial-load filter and is threaded to the wrapper.
         from ...loader import get_loader
 
-        return get_loader("native").load_model(
-            cls,
+        loaded = get_loader("native").load_model(
+            cast(Any, cls),
             None,
             device=device,
             model_path=model_path,
@@ -2796,6 +2826,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             attention_backend=attention_backend,
             tower_role=tower_role,
         ).model
+        if not isinstance(loaded, cls):
+            raise TypeError("native loader returned the wrong SenseNova model type")
+        return loaded
 
     def _caps_descriptor(
         self,
@@ -3027,11 +3060,37 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     def try_run_text_graph_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor] | None:
         return self._text_driver().try_run_text_graph_logits_batch(ops)
 
-    def run_text_logits(self, op: dict[str, Any]):
+    def run_text_logits(self, op: Mapping[str, Any]) -> torch.Tensor:
         return self._text_driver().run_text_logits(dict(op))
 
-    def interleaved_text_forward(self, **kwargs: Any) -> CausalLMOutputWithPast:
-        return self.model.language_model(**kwargs)
+    def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
+        return self.interleaved_image_state(int(req_id)).cond.last_logits
+
+    def interleaved_text_forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        indexes: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        attention_mask: Any = None,
+        past_key_values: Any = None,
+        use_cache: bool = True,
+        text_only_rope: bool = False,
+        causal_paged_update: bool = False,
+        return_all_logits: bool = False,
+    ) -> CausalLMOutputWithPast:
+        return self.model.language_model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            indexes=indexes,
+            cache_position=cache_position,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            text_only_rope=text_only_rope,
+            causal_paged_update=causal_paged_update,
+            logits_to_keep=0 if return_all_logits else 1,
+        )
 
     def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.language_model.get_input_embeddings()(input_ids)
@@ -3234,7 +3293,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self._shared_understanding_processor = processor
         return processor
 
-    def encode_image(self, pixels=None, grid=None, *, op: dict[str, Any]) -> dict[str, Any]:
+    def encode_image(
+        self,
+        pixels: Any = None,
+        grid: Any = None,
+        *,
+        op: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Ingest an external understanding image (``vit_encode``).
 
         The engine hands the image bytes plus the shared temporal RoPE index
@@ -3243,13 +3308,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         and reports how many vision tokens it added.
         """
         del pixels, grid
+        if op is None:
+            raise invalid_descriptor("SenseNova image encode requires an op descriptor")
         if self.model is None:
             raise RuntimeError("SenseNova model weights are not loaded")
         op = dict(op)
         req_id = int(op["req_id"])
         image_b64 = op.get("image_b64")
-        if not image_b64:
-            raise invalid_descriptor("vit_encode requires image_b64 input bytes")
         cond_pos = op.get("cond_pos")
         if cond_pos is None:
             raise invalid_descriptor("vit_encode requires the shared temporal index (cond_pos)")
@@ -3259,20 +3324,58 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         text_driver.extend_cache_blocks(st.cond, op)
         text_driver.ensure_host_cache(st.cond)
 
-        processor = self._understanding_processor()
-        image = processor.decode_image_b64(str(image_b64))
-        image_hw = [int(image.height), int(image.width)]
-        flattened, grid_hw = processor.understanding_patches(image)
-        flattened = flattened.to(device=self.device, dtype=self.model.dtype)
+        driver = self._ingest_driver()
+        if image_b64:
+            processor = self._understanding_processor()
+            image = processor.decode_image_b64(str(image_b64))
+            image_hw = [int(image.height), int(image.width)]
+            flattened, grid_hw = processor.understanding_patches(image)
+            flattened = flattened.to(device=self.device, dtype=self.model.dtype)
+            vit_embeds = driver.encode_understanding_image(flattened, grid_hw).detach()
+            handle = encoder_handle_from_mm_hash(op.get("mm_hash"))
+            self.residency.encoder.put(
+                handle,
+                {
+                    "kind": "vit_encode",
+                    "vit_embeds": vit_embeds,
+                    "grid_hw": grid_hw.detach(),
+                    "image_hw": image_hw,
+                },
+            )
+        else:
+            cached_handle = op.get("image_in")
+            if not isinstance(cached_handle, int) or isinstance(cached_handle, bool):
+                raise invalid_descriptor("cached vit_encode requires an encoder handle")
+            cached = self.residency.encoder.get(cached_handle)
+            if not isinstance(cached, Mapping) or cached.get("kind") != "vit_encode":
+                raise invalid_descriptor("cached vit_encode handle is not resident")
+            cached_vit_embeds = cached.get("vit_embeds")
+            cached_grid_hw = cached.get("grid_hw")
+            cached_image_hw = cached.get("image_hw")
+            if not isinstance(cached_vit_embeds, torch.Tensor) or not isinstance(
+                cached_grid_hw, torch.Tensor
+            ):
+                raise invalid_descriptor("cached vit_encode payload is incomplete")
+            if (
+                not isinstance(cached_image_hw, list)
+                or len(cached_image_hw) != 2
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in cached_image_hw
+                )
+            ):
+                raise invalid_descriptor("cached vit_encode dimensions are invalid")
+            vit_embeds = cached_vit_embeds
+            grid_hw = cached_grid_hw
+            image_hw = [int(value) for value in cached_image_hw]
+            handle = cached_handle
 
-        num_tokens = self._ingest_driver().ingest_understanding_image(
+        num_tokens = driver.ingest_understanding_embeddings(
             st.cond,
-            flattened,
+            vit_embeds,
             grid_hw,
             t_index=int(cond_pos),
         )
-        handle = encoder_handle_from_mm_hash(op.get("mm_hash"))
-        self.residency.encoder.put(handle, {"kind": "vit_encode", "num_tokens": num_tokens})
         return {
             "req_id": req_id,
             "encoder_handle": handle,
@@ -3351,7 +3454,10 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         branch: str,
     ) -> torch.Tensor:
         del t, latent
-        return self.predict_denoise_velocity(ctx, branch)
+        velocity = self.predict_denoise_velocity(ctx, branch)
+        if not isinstance(velocity, torch.Tensor):
+            raise invalid_descriptor("SenseNova velocity prediction unexpectedly returned hidden state")
+        return velocity
 
     def predict_text_image_velocity_batch(self, steps, branches_by_step, *, graph_mode: str = "auto"):
         return TextImageDenoiseOps.predict_text_image_velocity_batch(
@@ -3876,8 +3982,8 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             ops,
             device=device,
         )
-        if isinstance(sampled, DeferredBatchedSamplingResult) and defer_cpu_results:
-            outputs: list[Any] = []
+        if is_deferred_sampling_result(sampled) and defer_cpu_results:
+            deferred_outputs: list[Any] = []
             for row, op in enumerate(ops):
                 req_id = int(op["req_id"])
                 state = request_states.get(req_id)
@@ -3889,19 +3995,19 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                     token_tensor=sampled.device_tokens[row:row + 1],
                     position_tensor=position_tensors[row],
                 )
-                outputs.append(
+                relay_token_tensor = sampled.device_tokens[row:row + 1]
+                deferred_outputs.append(
                     DeferredTextSeqResult(
                         req_id=req_id,
                         row=row,
                         state=state,
                         sampling_result=sampled,
-                        relay_token_tensor=state.decode_relay.token_tensor,
+                        relay_token_tensor=relay_token_tensor,
                     )
                 )
-            return outputs
-        if not isinstance(sampled, BatchedSamplingResult):
-            sampled = sampled.finalize()
-        outputs: list[Any] = []
+            return deferred_outputs
+        sampled = finalize_sampling_result(sampled)
+        immediate_outputs: list[Any] = []
         for row, op in enumerate(ops):
             req_id = int(op["req_id"])
             sample = sampled.samples[row]
@@ -3915,11 +4021,14 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                 position_tensor=position_tensors[row],
             )
             top_logprobs = (
-                [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
+                [
+                    (int(item[0]), float(item[1]), int(item[2]))
+                    for item in sample.top_logprobs
+                ]
                 if sample.top_logprobs is not None
                 else None
             )
-            outputs.append(
+            immediate_outputs.append(
                 {
                     "req_id": req_id,
                     "sampled_token_id": token_id,
@@ -3927,7 +4036,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                     "top_logprobs": top_logprobs,
                 }
             )
-        return outputs
+        return immediate_outputs
 
     def _complete_packed_denoise_bursts(
         self,
@@ -3965,11 +4074,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self,
         latent: Any,
         *,
-        req_id: int,
-        state: RunnerRequestState,
-        op: dict[str, Any] | Any,
+        req_id: int | None = None,
+        state: Any = None,
+        op: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         del latent, state
+        if req_id is None or op is None:
+            raise invalid_descriptor("SenseNova image commit requires req_id and op")
         return self.commit_generated_image(int(req_id), None, dict(op))
 
     @torch.inference_mode()

@@ -30,13 +30,13 @@ uniserve-engine-runtime.workspace = true
 uniserve-engine-process.workspace = true
 uniserve-worker-ipc.workspace = true
 uniserve-managed-engine.workspace = true
-uniserve-server-app.workspace = true
-uniserve-server-http.workspace = true
+uniserve-server.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-uniserve-engine-client.workspace = true
+uniserve-engine-gateway.workspace = true
+uniserve-core.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }

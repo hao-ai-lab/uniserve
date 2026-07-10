@@ -21,7 +21,7 @@ uniserve-sim.workspace = true
 [dev-dependencies]
 futures.workspace = true
 tracing-subscriber.workspace = true
-uniserve-engine-client.workspace = true
+uniserve-engine-gateway.workspace = true
 
 [lints]
 workspace = true

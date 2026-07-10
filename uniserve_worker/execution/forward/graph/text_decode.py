@@ -553,6 +553,8 @@ def _synthetic_decode_cache(kv_pool: PagedKVPool, batch_size: int) -> BatchedPag
 
 def _replay_decode_graph(state: TextDecodeGraphState, batch_size: int) -> torch.Tensor:
     state.graph.replay()
+    if state.logits is None:
+        raise RuntimeError("captured decode graph has no logits buffer")
     return state.logits[:batch_size]
 
 
@@ -966,6 +968,8 @@ def _copy_fused_long_host_inputs(
     if not row_values:
         return True
     start = 0 if include_input_ids else batch
+    if state.long_inputs is None:
+        raise RuntimeError("captured decode graph has no host-input buffer")
     target = state.long_inputs[start : start + len(row_values)]
     _copy_host_ints_to_device(
         row_values,

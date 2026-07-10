@@ -15,7 +15,11 @@ from ...contracts.forward_mode import ForwardMode
 from ...contracts.outputs import CommitOutput, DenoiseOutput, EncodeOutput, TextTokenOutput
 from ...foundation.errors import invalid_descriptor
 from ...nn.diffusion import euler_step
-from ...nn.sampler import DeferredBatchedSamplingResult, apply_sampling_batched_with_device_tokens
+from ...nn.sampler import (
+    apply_sampling_batched_with_device_tokens,
+    finalize_sampling_result,
+    is_deferred_sampling_result,
+)
 from ...runtime.image_utils import pil_image_to_png_b64, to_uint8_image
 from ...runtime.paged_text_cache import copy_paged_text_cache_spans
 from ..text_decode_relay import TextDecodeRelay
@@ -36,17 +40,17 @@ class ForwardPostprocessor:
     def apply(self, plan: ForwardPlan, result: ForwardResult) -> list[Any]:
         result.validate_for_plan(plan)
         if result.runtime_outputs is not None:
-            outputs = self._normalize_outputs(plan, result.runtime_outputs)
+            runtime_outputs = self._normalize_outputs(plan, result.runtime_outputs)
             side_effects = plan.runtime_handles.get("postprocess_side_effects")
             if callable(side_effects):
-                side_effects(outputs)
-            return outputs
+                side_effects(runtime_outputs)
+            return runtime_outputs
         if self._can_apply_text_batch(plan, result):
-            outputs = self._normalize_outputs(plan, self._apply_text_batch(plan, result))
+            batch_outputs = self._normalize_outputs(plan, self._apply_text_batch(plan, result))
             side_effects = plan.runtime_handles.get("postprocess_side_effects")
             if callable(side_effects):
-                side_effects(outputs)
-            return outputs
+                side_effects(batch_outputs)
+            return batch_outputs
         text_outputs = self._apply_text_entries(plan, result) if result.text_postprocess else {}
         outputs: list[Any] = []
         text_row = 0
@@ -99,9 +103,11 @@ class ForwardPostprocessor:
             allow_mixed_text=plan.forward_mode is ForwardMode.MIXED
         )
         req_ids = [int(row.req_id) for row in plan.rows]
+        if result.text_logits is None:
+            raise invalid_descriptor("text batch postprocess requires logits")
         logits_batch = self._text_logits_rows(result.text_logits, len(req_ids))
         if plan.runtime_handles.get("defer_sampling") and plan.runtime_handles.tensor_store is not None:
-            outputs = self._publish_logits(
+            published_outputs = self._publish_logits(
                 list(text.ops),
                 req_ids,
                 logits_batch,
@@ -109,8 +115,8 @@ class ForwardPostprocessor:
             )
             self._publish_decode_position_relays(text, logits_batch.device, plan)
             self._advance_text_kv_lengths(text, plan)
-            return outputs
-        outputs = self._sample_text_logits_batch(
+            return published_outputs
+        sampled_outputs = self._sample_text_logits_batch(
             plan,
             list(text.ops),
             req_ids,
@@ -120,7 +126,7 @@ class ForwardPostprocessor:
         )
         self._publish_decode_position_relays(text, logits_batch.device, plan)
         self._advance_text_kv_lengths(text, plan)
-        return outputs
+        return sampled_outputs
 
     @staticmethod
     def _text_logits_rows(logits: torch.Tensor, row_count: int) -> torch.Tensor:
@@ -174,7 +180,7 @@ class ForwardPostprocessor:
             defer_cpu=defer_cpu_results,
             enable_cuda_timing=cuda_ready_start_event is not None,
         )
-        if isinstance(sampling_result, DeferredBatchedSamplingResult):
+        if is_deferred_sampling_result(sampling_result):
             sampling_result.set_ready_start_event(cuda_ready_start_event)
             outputs: list[TextTokenOutput | DeferredTextSeqResult] = []
             for row, req_id in enumerate(req_ids):
@@ -191,25 +197,32 @@ class ForwardPostprocessor:
                         row=row,
                         state=state,
                         sampling_result=sampling_result,
-                        relay_token_tensor=state.decode_relay.token_tensor,
+                        relay_token_tensor=relay_token_tensor,
                     )
                 )
             record_component_elapsed(stats, "text_sample", start)
             return outputs
 
+        immediate_result = finalize_sampling_result(sampling_result)
         outputs = []
-        for row, (req_id, (tok, lp, top)) in enumerate(zip(req_ids, sampling_result.samples, strict=True)):
+        for row, (req_id, (tok, lp, top)) in enumerate(
+            zip(req_ids, immediate_result.samples, strict=True)
+        ):
             _DECODE_RELAY.publish_sample(
                 request_states.get(int(req_id)),
                 token_id=int(tok),
-                token_tensor=sampling_result.device_tokens[row:row + 1],
+                token_tensor=immediate_result.device_tokens[row:row + 1],
             )
             outputs.append(
                 TextTokenOutput(
                     req_id=int(req_id),
                     sampled_token_id=int(tok),
                     sampled_logprob=lp,
-                    top_logprobs=top or None,
+                    top_logprobs=(
+                        [(int(item[0]), float(item[1]), int(item[2])) for item in top]
+                        if top
+                        else None
+                    ),
                 )
             )
         record_component_elapsed(stats, "text_sample", start)
@@ -305,12 +318,16 @@ class ForwardPostprocessor:
             suppress,
             defer_cpu=bool(plan.runtime_handles.get("defer_text_cpu_results")),
         )
-        deferred: DeferredBatchedSamplingResult | None = None
-        sampled = sampling_result
-        if isinstance(sampled, DeferredBatchedSamplingResult):
-            deferred = sampled
+        deferred: Any | None
+        if is_deferred_sampling_result(sampling_result):
+            deferred = sampling_result
+            samples = []
+            device_tokens = sampling_result.device_tokens
         else:
-            sampled = sampling_result
+            deferred = None
+            immediate_result = finalize_sampling_result(sampling_result)
+            samples = immediate_result.samples
+            device_tokens = immediate_result.device_tokens
         promotions = [entry.kv_promotion for entry in entries_by_index if entry.kv_promotion is not None]
         if promotions:
             num_layers = max(int(entry.num_layers) for entry in entries_by_index)
@@ -319,12 +336,6 @@ class ForwardPostprocessor:
                 num_layers=num_layers,
                 missing_message="forward text K/V span is missing from staged cache",
             )
-        if deferred is None:
-            samples = sampled.samples
-            device_tokens = sampled.device_tokens
-        else:
-            samples = []
-            device_tokens = deferred.device_tokens
         outputs: dict[int, Any] = {}
         for sample_index, entry in enumerate(entries_by_index):
             row = plan.rows[int(entry.row_index)]
@@ -348,6 +359,7 @@ class ForwardPostprocessor:
                     position_id=int(entry.position_id),
                     position_tensor=position_tensor,
                 )
+            output: Any
             if deferred is not None:
                 if state is None:
                     raise invalid_descriptor("deferred text postprocess requires request state")
@@ -356,12 +368,15 @@ class ForwardPostprocessor:
                     row=sample_index,
                     state=state,
                     sampling_result=deferred,
-                    relay_token_tensor=state.decode_relay.token_tensor,
+                    relay_token_tensor=token_tensor,
                 )
             else:
                 sample = samples[sample_index]
                 top_logprobs = (
-                    [(int(item[0]), float(item[1])) for item in sample.top_logprobs]
+                    [
+                        (int(item[0]), float(item[1]), int(item[2]))
+                        for item in sample.top_logprobs
+                    ]
                     if sample.top_logprobs is not None
                     else None
                 )

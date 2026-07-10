@@ -27,12 +27,11 @@ class TextTask(BenchmarkTask):
             "stream": True,
             "stream_options": {"include_usage": True},
             "temperature": self.spec.temperature,
+            "top_p": self.spec.top_p,
             "ignore_eos": self.spec.ignore_eos,
         }
         if output_len is not None:
             payload["max_completion_tokens"] = int(output_len)
-        if self.spec.top_p < 1.0:
-            payload["top_p"] = self.spec.top_p
         if self.spec.extra_request_body:
             payload.update(self.spec.extra_request_body)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat")

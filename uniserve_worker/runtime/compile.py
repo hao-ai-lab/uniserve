@@ -161,8 +161,8 @@ def _prepare_compile_toolchain(module: nn.Module, *, label: str) -> None:
 def _first_module_device(module: nn.Module) -> torch.device | None:
     for tensor in module.parameters(recurse=True):
         return tensor.device
-    for tensor in module.buffers(recurse=True):
-        return tensor.device
+    for buffer in module.buffers(recurse=True):
+        return buffer.device
     return None
 
 

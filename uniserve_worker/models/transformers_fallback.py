@@ -165,6 +165,8 @@ class _HFTextPath:
         state.past_key_values = getattr(outputs, "past_key_values", None)
         state.last_token_id = int(tokens[-1])
         state.cached_tokens = projected
+        if bool(op.get("return_all_logits")):
+            return outputs.logits
         return outputs.logits[:, -1, :]
 
 

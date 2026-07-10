@@ -8,7 +8,7 @@ from importlib import import_module
 import torch
 
 from ..foundation.env import env_flag
-from .core import Capabilities, CommDispatcher, Dispatcher, Handoff
+from .core import Capabilities, CommDispatcher, Dispatcher, Handoff, Provider
 from .requests import (
     AddRmsNormReq,
     AttentionRegime,
@@ -54,12 +54,12 @@ def _sgl_silu_and_mul_kernel():
 @lru_cache(maxsize=1)
 def weak_ref_tensor_provider():
     try:  # pragma: no cover - optional SGLang kernel package.
-        from sgl_kernel import weak_ref_tensor  # type: ignore
+        from sgl_kernel import weak_ref_tensor
 
         return weak_ref_tensor
     except Exception:
         try:  # pragma: no cover - optional NPU runtime.
-            from torch_npu._C import _weak_ref_tensor as weak_ref_tensor  # type: ignore
+            from torch_npu._C import _weak_ref_tensor as weak_ref_tensor
 
             return weak_ref_tensor
         except Exception:
@@ -132,6 +132,10 @@ class _SglRmsNormKernel:
         n = import_module("uniserve_worker.nn.norm")
         coerced = n._sgl_rms_norm_input(hidden_states)
         if coerced is None:
+            return False
+        if coerced.dtype not in {torch.float16, torch.bfloat16}:
+            return False
+        if weight.dtype != coerced.dtype:
             return False
         return n._norm_inputs_eligible(coerced, weight)
 
@@ -407,18 +411,24 @@ class _TritonQKNormRopeProvider:
         fused kernel preserves each group's exact rounding order, so this is a
         launch-count optimization, not a numerics change.
         """
-        if req.identity_axes is None or len(req.axis_dims) < 2:
+        axis_dims = req.axis_dims
+        if req.identity_axes is None or axis_dims is None or len(axis_dims) < 2:
             return None
-        if tuple(req.identity_axes) != tuple(range(1, len(req.axis_dims))):
+        if not all(
+            isinstance(value, tuple)
+            for value in (req.q_weight, req.k_weight, req.cos, req.sin)
+        ):
+            return None
+        if tuple(req.identity_axes) != tuple(range(1, len(axis_dims))):
             return None
         if _EagerQKNormRopeProvider._shared_norm_group_end(req, 0) != 1:
             return None
-        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 1) != len(req.axis_dims):
+        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 1) != len(axis_dims):
             return None
         if req.q.ndim != 3 or req.k.ndim != 3:
             return None
         rope = import_module("uniserve_worker.nn.rope")
-        rope_dim = int(req.axis_dims[0])
+        rope_dim = int(axis_dims[0])
         tokens = int(req.q.shape[0])
         cos0, sin0 = req.cos[0], req.sin[0]
         if not (self._can_repeat_rope(cos0, tokens) and self._can_repeat_rope(sin0, tokens)):
@@ -452,13 +462,19 @@ class _TritonQKNormRopeProvider:
         a launch-count/traffic optimization, not a numerics change. Anything
         that does not match falls back to the general multi-axis pipeline.
         """
-        if len(req.axis_dims) != 3:
+        axis_dims = req.axis_dims
+        if axis_dims is None or len(axis_dims) != 3:
+            return None
+        if not all(
+            isinstance(value, tuple)
+            for value in (req.q_weight, req.k_weight, req.cos, req.sin)
+        ):
             return None
         if req.q.ndim != 3 or req.k.ndim != 3:
             return None
         if _EagerQKNormRopeProvider._shared_norm_group_end(req, 0) != 1:
             return None
-        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 1) != len(req.axis_dims):
+        if _EagerQKNormRopeProvider._shared_norm_group_end(req, 1) != len(axis_dims):
             return None
         tokens = int(req.q.shape[0])
         cos_tables: list[torch.Tensor] = []
@@ -481,7 +497,7 @@ class _TritonQKNormRopeProvider:
             (sin_tables[0], sin_tables[1], sin_tables[2]),
             req.eps,
             req.eps,
-            axis_dims=tuple(int(v) for v in req.axis_dims),
+            axis_dims=tuple(int(v) for v in axis_dims),
         )
 
     @staticmethod
@@ -786,7 +802,7 @@ class _EagerQKNormRopeProvider:
         import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.validate_multi_axis(req)
 
     @staticmethod
-    def _shared_norm_group_end(req: QKNormRopeReq, start: int) -> int:
+    def _shared_norm_group_end(req: QKNormReq | QKNormRopeReq, start: int) -> int:
         return import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.shared_norm_group_end(req, start)
 
     @staticmethod
@@ -1117,7 +1133,7 @@ def attention_dispatcher():
 
     init_attention_backends()
     names = ("trtllm_mha", "sgl_kernel", "flashinfer", "flash_attn", "fa4_cute", "torch_sdpa")
-    providers = [_ContextAttentionProvider()]
+    providers: list[Provider[AttentionReq, torch.Tensor]] = [_ContextAttentionProvider()]
     for name in names:
         try:
             providers.append(_AttentionBackendProvider(get_attention_backend(name)))
@@ -1225,6 +1241,8 @@ class _SymmMemTpAllReduceProvider:
         del mesh
         symm_mem = self._runtime()
         transport = getattr(req.axis, "transport", None)
+        if transport is None:
+            raise RuntimeError("symmetric-memory all-reduce requires an axis transport")
         group_name = self._group_name(transport)
         tensor = req.tensor
         key = (str(tensor.device), tensor.dtype, int(tensor.numel()))

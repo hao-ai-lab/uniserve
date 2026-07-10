@@ -20,4 +20,4 @@ where = ["python"]
 include = ["uniserve_kernel*"]
 
 [tool.setuptools.package-data]
-uniserve_kernel = ["_fa4_overlay/flash_attn/cute/*.py"]
+uniserve_kernel = ["py.typed", "_fa4_overlay/flash_attn/cute/*.py"]

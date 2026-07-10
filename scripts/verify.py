@@ -1,8 +1,8 @@
 """Compatibility entrypoint for profile-driven serving verification."""
 from __future__ import annotations
 
-import sys
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 

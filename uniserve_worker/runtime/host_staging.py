@@ -18,10 +18,13 @@ import torch
 
 from ..foundation.torch_compat import torch_is_compiling
 
+_np: Any | None
 try:  # Optional fast host packing path; minimal environments may not carry numpy.
-    import numpy as _np
+    import numpy as _numpy_module
 except Exception:  # pragma: no cover - availability depends on worker image.
     _np = None
+else:  # pragma: no cover
+    _np = _numpy_module
 
 __all__ = [
     "canonical_device",

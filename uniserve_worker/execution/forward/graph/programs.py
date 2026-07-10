@@ -69,7 +69,7 @@ class ForwardGraphProgram(ABC):
         graph: CapturedForwardGraph,
         batch: ForwardBatch,
         plan: ForwardPlan,
-    ) -> ForwardResult:
+    ) -> ForwardResult | None:
         del plan
         if graph.replay_fn is not None:
             return graph.replay_fn(batch)
@@ -78,7 +78,7 @@ class ForwardGraphProgram(ABC):
         return graph.payload
 
 
-class _TextGraphProgramMixin:
+class _TextGraphProgramMixin(ForwardGraphProgram):
     def __init__(
         self,
         *,
@@ -166,7 +166,7 @@ class _TextGraphProgramMixin:
         forward_fn: Callable[[ForwardBatch], ForwardResult],
     ) -> CapturedForwardGraph | None:
         if not self._bound_text_graph:
-            return super().capture(key, batch, plan, forward_fn)  # type: ignore[misc]
+            return super().capture(key, batch, plan, forward_fn)
         result = self._run_text_graph(plan)
         if result is None:
             return None
@@ -179,11 +179,11 @@ class _TextGraphProgramMixin:
         plan: ForwardPlan,
     ) -> ForwardResult | None:
         if not self._bound_text_graph:
-            return super().replay(graph, batch, plan)  # type: ignore[misc]
+            return super().replay(graph, batch, plan)
         return self._run_text_graph(plan)
 
 
-class DecodeGraphProgram(_TextGraphProgramMixin, ForwardGraphProgram):
+class DecodeGraphProgram(_TextGraphProgramMixin):
     program_id = "decode"
 
     def can_run(self, batch: ForwardBatch, plan: ForwardPlan) -> GraphEligibility:
@@ -195,7 +195,7 @@ class DecodeGraphProgram(_TextGraphProgramMixin, ForwardGraphProgram):
         return GraphEligibility(False, "not a pure decode shape")
 
 
-class PrefillGraphProgram(_TextGraphProgramMixin, ForwardGraphProgram):
+class PrefillGraphProgram(_TextGraphProgramMixin):
     program_id = "prefill"
 
     def can_run(self, batch: ForwardBatch, plan: ForwardPlan) -> GraphEligibility:
@@ -205,7 +205,7 @@ class PrefillGraphProgram(_TextGraphProgramMixin, ForwardGraphProgram):
         return GraphEligibility(False, "not a text prefill shape")
 
 
-class ModelOwnedTextGraphProgram(_TextGraphProgramMixin, ForwardGraphProgram):
+class ModelOwnedTextGraphProgram(_TextGraphProgramMixin):
     program_id = "model_owned_text"
 
     def can_run(self, batch: ForwardBatch, plan: ForwardPlan) -> GraphEligibility:
@@ -290,7 +290,9 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
         return self._run_packed_visible_graph(plan)
 
     def _run_packed_visible_graph(self, plan: ForwardPlan) -> ForwardResult | None:
-        if not self._bound_packed_visible:
+        owner = self.owner
+        request_states = self.request_states
+        if not self._bound_packed_visible or owner is None or request_states is None:
             return None
         from ..programs.packed_visible import run_packed_visible_forward_result
 
@@ -301,8 +303,8 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
         for row in plan.rows:
             if row.mode is not ForwardMode.DENOISE:
                 continue
-            state = self.request_states.get(int(row.req_id))
-            step = self.owner.prepare_denoise(state, dict(row.op))
+            state = request_states.get(int(row.req_id))
+            step = owner.prepare_denoise(state, dict(row.op))
             denoise_steps.append((int(row.row_index), step))
             extra = getattr(step, "extra", None)
             img = extra.get("img") if isinstance(extra, dict) else None
@@ -310,9 +312,9 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
             if residual_state is not None:
                 residual_state.invalidate()
         return run_packed_visible_forward_result(
-            self.owner,
+            owner,
             dispatch_batch,
-            self.request_states,
+            request_states,
             denoise_steps,
             defer_text_cpu_results=bool(plan.runtime_handles.get("defer_text_cpu_results", False)),
             allow_graph=True,
@@ -383,17 +385,25 @@ class DenoiseStepGraphProgram(ForwardGraphProgram):
         return self._run_denoise_graph(plan)
 
     def _run_denoise_graph(self, plan: ForwardPlan) -> ForwardResult | None:
-        if not self._bound_denoise_graph:
+        denoise_driver = self.denoise_driver
+        model = self.model
+        request_states = self.request_states
+        if (
+            not self._bound_denoise_graph
+            or denoise_driver is None
+            or model is None
+            or request_states is None
+        ):
             return None
-        forward_result = self.denoise_driver.forward_result
+        forward_result = denoise_driver.forward_result
         kwargs: dict[str, Any] = {"row_indices": tuple(int(row.row_index) for row in plan.rows)}
         if _accepts_keyword(forward_result, "graph_mode"):
             kwargs["graph_mode"] = "require"
         items = [
-            (int(row.req_id), self.request_states.get(int(row.req_id)), row.op)
+            (int(row.req_id), request_states.get(int(row.req_id)), row.op)
             for row in plan.rows
         ]
-        return forward_result(items, self.model, **kwargs)
+        return forward_result(items, model, **kwargs)
 
 
 def _accepts_keyword(hook: Any, name: str) -> bool:

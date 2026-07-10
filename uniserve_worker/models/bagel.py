@@ -6,10 +6,11 @@ import logging
 import math
 import os
 import threading
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -42,7 +43,7 @@ from ..foundation.sizing import (
 )
 from ..loader.weight_utils import iter_weights, stacked_params_mapping_loop, tensor_shape
 from ..nn import LinearBase, MLPConnector, ParallelLMHead, local_kv_head_count
-from ..nn.decoder import KVCache, MoTModel, Segment
+from ..nn.decoder import KVCache, MoTDecoderLayer, MoTModel, Segment
 from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, TimestepEmbedder, init_latent
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.quant import (
@@ -461,7 +462,7 @@ class _BagelGraph(nn.Module):
             "time_embedder.mlp.2.bias": "time_embedder.mlp.2.bias",
             "latent_pos_embed.pos_embed": "latent_pos_embed.pos_embed",
         }
-        stacked = [
+        stacked: list[tuple[str, str, str | int]] = [
             ("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
             ("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
             ("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
@@ -532,6 +533,14 @@ def _load_bagel(model_dir: str, device: str = "cuda") -> _BagelGraph:
     return model
 
 
+@dataclass(frozen=True)
+class _LoadedBagelRuntime:
+    model: _BagelGraph
+    pool: PagedKVPool
+    image_processor: BagelImageProcessor
+
+
+@dataclass(slots=True)
 class GenState:
     """Mutable image-generation state for one BAGEL denoise/commit cycle.
 
@@ -541,12 +550,27 @@ class GenState:
     backend).
     """
 
-    __slots__ = ("x_t", "vae_pos_ids", "num_vae", "H", "W", "schedule",
-                 "cfg_cache", "cfg_pos", "cfg_text_scale", "cfg_img_scale",
-                 "cfg_renorm_type", "cfg_renorm_min", "cfg_interval", "cond_pos",
-                 "uses_context_image_feedback", "cond_branch_kvlen", "text_branch_pos", "text_branch_kvlen",
-                 "cfg_img_cache", "cfg_img_pos",
-                 "paged_branches")
+    x_t: torch.Tensor
+    vae_pos_ids: torch.Tensor
+    num_vae: int
+    H: int
+    W: int
+    schedule: FlowMatchSchedule
+    cfg_text_scale: float
+    cfg_img_scale: float
+    cfg_renorm_type: str
+    cfg_renorm_min: float
+    cfg_interval: tuple[float, float]
+    cond_pos: int
+    uses_context_image_feedback: bool
+    cond_branch_kvlen: int = 0
+    text_branch_pos: int = 0
+    text_branch_kvlen: int = 0
+    cfg_cache: KVCache | None = None
+    cfg_pos: int = 0
+    cfg_img_cache: KVCache | None = None
+    cfg_img_pos: int = 0
+    paged_branches: PagedDenoiseBranchSet | None = None
 
 
 # BAGEL's start-of-image marker string (token id 151652 in the Qwen2 vocab).
@@ -596,7 +620,8 @@ class BagelForUnifiedGeneration(UniModelBase):
         scratch=PerBranch(),
         adapter=AdapterResourcePolicy.PER_ADAPTER,
     )
-    velocity_parameterization = "velocity"
+    def velocity_parameterization(self) -> str:
+        return "velocity"
     # Encoder-output cache capacity reported to the host scheduler.
     ENCODER_CACHE_BUDGET = 256
 
@@ -611,8 +636,8 @@ class BagelForUnifiedGeneration(UniModelBase):
         self,
         config: Any | None = None,
         *,
-        model: Any | None = None,
-        image_processor: Any | None = None,
+        model: _BagelGraph | None = None,
+        image_processor: BagelImageProcessor | None = None,
         block_size: int = DEFAULT_BLOCK_SIZE,
         kv_token_capacity: int | None = None,
         attention_backend: str | None = None,
@@ -893,10 +918,13 @@ class BagelForUnifiedGeneration(UniModelBase):
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         indexes: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
         attention_mask: Any = None,
         past_key_values: Any = None,
         use_cache: bool = True,
         text_only_rope: bool = False,
+        causal_paged_update: bool = False,
+        return_all_logits: bool = False,
     ) -> CausalLMOutputWithPast:
         """Run the MoT understanding expert stack over the shared paged text KV.
 
@@ -908,17 +936,25 @@ class BagelForUnifiedGeneration(UniModelBase):
         ``Segment(causal=True)`` path this replaces computed — so
         ``attention_mask`` is intentionally not materialized.
         """
-        del attention_mask, use_cache, text_only_rope
+        del attention_mask, use_cache, text_only_rope, causal_paged_update
         m = self._ensure_loaded().model
-        if (input_ids is None) == (inputs_embeds is None):
+        if input_ids is None and inputs_embeds is None:
             raise invalid_descriptor(
                 "BAGEL interleaved text forward requires exactly one of input_ids or inputs_embeds"
             )
+        if input_ids is not None and inputs_embeds is not None:
+            raise invalid_descriptor(
+                "BAGEL interleaved text forward requires exactly one of input_ids or inputs_embeds"
+            )
+        if indexes is None and cache_position is not None:
+            indexes = cache_position.reshape(1, -1)
         if indexes is None or past_key_values is None:
             raise invalid_descriptor(
                 "BAGEL interleaved text forward requires indexes and a paged cache"
             )
         if inputs_embeds is None:
+            if input_ids is None:
+                raise invalid_descriptor("BAGEL text input ids are missing")
             inputs_embeds = m.embed_tokens(input_ids).to(torch.bfloat16)
         batch, seq_len = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
         hidden = m.lm.forward_paged_text(
@@ -926,12 +962,16 @@ class BagelForUnifiedGeneration(UniModelBase):
             indexes[0].reshape(-1),
             past_key_values,
         )
-        # Only the last token per row feeds sampling; keep the lm_head GEMM on
-        # exactly those rows (bitwise-identical to the eager
-        # ``logits(hidden[-1:])`` it replaces).
-        last_hidden = hidden.view(batch, seq_len, -1)[:, -1, :]
-        logits = m.logits(last_hidden).unsqueeze(1)
-        return CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values)
+        hidden = hidden.view(batch, seq_len, -1)
+        logits = (
+            m.logits(hidden.reshape(batch * seq_len, -1)).view(batch, seq_len, -1)
+            if return_all_logits
+            else m.logits(hidden[:, -1, :]).unsqueeze(1)
+        )
+        return CausalLMOutputWithPast(
+            logits=cast(Any, logits),
+            past_key_values=past_key_values,
+        )
 
     def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
         """Query-side geometry for the system decode-graph FlashInfer planner.
@@ -941,7 +981,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         text expert (tensor-parallel-local head count, softmax scale, and the
         bf16 dtype ``project_qkv`` emits).
         """
-        layer = self._ensure_loaded().model.lm.layers[0]
+        layer = cast(MoTDecoderLayer, self._ensure_loaded().model.lm.layers[0])
         return int(layer.n_heads), float(layer.scale), torch.bfloat16
 
     @staticmethod
@@ -949,8 +989,10 @@ class BagelForUnifiedGeneration(UniModelBase):
         return encoder_handle_from_mm_hash(mm_hash)
 
     def run_encode(self, op):
-        self._ensure_loaded()
-        m = self.model
+        loaded = self._ensure_loaded()
+        m = loaded.model
+        pool = loaded.pool
+        image_processor = loaded.image_processor
         r = int(op["req_id"])
         # Encode writes image KV into the same paged text cache the shared
         # driver serves text from: extend blocks / base length through the
@@ -960,44 +1002,117 @@ class BagelForUnifiedGeneration(UniModelBase):
         driver.extend_cache_blocks(st.cond, op)
         driver.ensure_host_cache(st.cond)
         base_len = int(st.cond.past.length)
-        view = self.pool.view(st.cond.block_ids, base_len)
+        view = pool.view(st.cond.block_ids, base_len)
         rope = int(op["cond_pos"])
-        pre = self.image_processor.prepare_from_b64(op["image_b64"])
-        image_hw = [pre.size[1], pre.size[0]]
-        if op["kind"] == "vae_encode":
-            clean_lat, vpos, _ = m.vae_encode_clean(self.image_processor.vae_tensor(pre))
+        kind = str(op["kind"])
+        image_b64 = op.get("image_b64")
+        if image_b64:
+            pre = image_processor.prepare_from_b64(image_b64)
+            image_hw = [pre.size[1], pre.size[0]]
+            handle = self._encoder_handle(op.get("mm_hash"))
+            if kind == "vae_encode":
+                clean_lat, vpos, _ = m.vae_encode_clean(image_processor.vae_tensor(pre))
+                cached_payload = {
+                    "kind": kind,
+                    "clean_lat": clean_lat.detach(),
+                    "vpos": vpos.detach(),
+                    "image_hw": image_hw,
+                }
+            elif kind == "vit_encode":
+                vemb = m.vit_encode(image_processor.vit_tensor(pre)).detach()
+                cached_payload = {
+                    "kind": kind,
+                    "vemb": vemb,
+                    "image_hw": image_hw,
+                }
+            else:
+                raise invalid_descriptor(f"unsupported image encode kind: {kind}")
+            self.residency.encoder.put(handle, cached_payload)
+        else:
+            cached_handle = op.get("image_in")
+            if not isinstance(cached_handle, int) or isinstance(cached_handle, bool):
+                raise invalid_descriptor("cached image encode requires an encoder handle")
+            cached_payload = self.residency.encoder.get(cached_handle)
+            if not isinstance(cached_payload, Mapping) or cached_payload.get("kind") != kind:
+                raise invalid_descriptor("cached image encode handle is not resident")
+            cached_image_hw = cached_payload.get("image_hw")
+            if (
+                not isinstance(cached_image_hw, list)
+                or len(cached_image_hw) != 2
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool)
+                    for value in cached_image_hw
+                )
+            ):
+                raise invalid_descriptor("cached image encode dimensions are invalid")
+            image_hw = [int(value) for value in cached_image_hw]
+            handle = cached_handle
+
+        if kind == "vae_encode":
+            clean_lat = cached_payload.get("clean_lat")
+            vpos = cached_payload.get("vpos")
+            if not isinstance(clean_lat, torch.Tensor) or not isinstance(vpos, torch.Tensor):
+                raise invalid_descriptor("cached VAE output is incomplete")
             n = clean_lat.shape[0]
             seg = m.build_gen_segment(n, vpos, clean_lat, 0.0, rope, view, update=True)
-            m.run([seg])
+            hidden = m.run([seg])[0]
+            added = n + 2
+        elif kind == "vit_encode":
+            cached_vemb = cached_payload.get("vemb")
+            if not isinstance(cached_vemb, torch.Tensor):
+                raise invalid_descriptor("cached ViT output is incomplete")
+            vemb = cached_vemb
+            n = vemb.shape[0]
+            hidden = m.run([m.build_und_image_segment(vemb, rope, view, update=True)])[0]
             added = n + 2
         else:
-            vemb = m.vit_encode(self.image_processor.vit_tensor(pre))
-            n = vemb.shape[0]
-            m.run([m.build_und_image_segment(vemb, rope, view, update=True)])
-            added = n + 2
+            raise invalid_descriptor(f"unsupported image encode kind: {kind}")
         new_len = base_len + added
         # The image span consumed `added` KV slots but a single rope position;
         # advance the driver's text cache for both so following text ops
         # continue from the right KV length and position.
         self._sync_text_cache_after_image(r, length=new_len, last_position=rope)
+        sampling = self._state(r).sampling
+        if (
+            sampling.get("return_prompt_logprobs")
+            or int(sampling.get("n_prompt_logprobs", 0) or 0) > 0
+        ):
+            st.cond.last_logits = m.logits(hidden[-1:]).unsqueeze(0)
         self._set_length(r, new_len)
         rec = self._record(r)
         rec["dims"] = image_hw
-        if op["kind"] == "vit_encode":
+        if kind == "vit_encode":
             rec["context_image_feedback"] = True
             rec["text_branch_kvlen"] = new_len
             rec["text_branch_pos"] = rope + 1
-        handle = self._encoder_handle(op.get("mm_hash"))
-        self.residency.encoder.put(handle, {"kind": op["kind"], "num_tokens": added})
         return {"req_id": r, "encoder_handle": handle, "num_tokens": added,
                 "image_hw": image_hw}
 
-    def encode_image(self, pixels=None, grid=None, *, op):
+    def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
+        return self.interleaved_image_state(int(req_id)).cond.last_logits
+
+    def encode_image(
+        self,
+        pixels: Any = None,
+        grid: Any = None,
+        *,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any:
         del pixels, grid
+        if op is None:
+            raise invalid_descriptor("BAGEL image encode requires an op descriptor")
         return self.run_encode(dict(op))
 
-    def encode_latents(self, pixels=None, grid=None, *, op):
+    def encode_latents(
+        self,
+        pixels: Any = None,
+        grid: Any = None,
+        *,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any:
         del pixels, grid
+        if op is None:
+            raise invalid_descriptor("BAGEL latent encode requires an op descriptor")
         return self.run_encode(dict(op))
 
     def run_text_logits_batch(self, ops):
@@ -1031,15 +1146,12 @@ class BagelForUnifiedGeneration(UniModelBase):
         return self.run_text_logits_batch([dict(op)])[0]
 
     def _init_gen(self, op):
-        self._ensure_loaded()
-        m = self.model
+        m = self._ensure_loaded().model
         state = self._state(int(op["req_id"]))
         rec = self._record(op["req_id"])
         ip = rec.get("image") or {}
         cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
-        gs = GenState()
-        gs.paged_branches = None
-        gs.cond_pos = op["cond_pos"]
+        cond_pos = int(op["cond_pos"])
         dims = rec.get("dims")
         parse_ip = dict(ip)
         if dims is not None:
@@ -1050,29 +1162,38 @@ class BagelForUnifiedGeneration(UniModelBase):
             cfg=cfg,
             timestep_shift_default=m.cfg.timestep_shift,
         )
-        gs.H = int(params.height)
-        gs.W = int(params.width)
-        h, w = m.latent_hw(gs.H, gs.W)
-        gs.num_vae = h * w
-        gs.vae_pos_ids = m.latent_position_ids(gs.H, gs.W).to(self.device)
+        height = int(params.height)
+        width = int(params.width)
+        h, w = m.latent_hw(height, width)
+        num_vae = h * w
+        vae_pos_ids = m.latent_position_ids(height, width).to(self.device)
         g = state.device_rng(self.device)
-        gs.x_t = init_latent(
-            (gs.num_vae, m.cfg.patch_latent_dim),
+        x_t = init_latent(
+            (num_vae, m.cfg.patch_latent_dim),
             rng=g,
             device=self.device,
             dtype=torch.bfloat16,
         )
-        gs.schedule = FlowMatchSchedule(
-            num_steps=int(params.steps),
-            shift=float(params.timestep_shift),
-            direction=ScheduleDirection.DESCENDING,
+        uses_context_image_feedback = bool(rec.get("context_image_feedback"))
+        gs = GenState(
+            x_t=x_t,
+            vae_pos_ids=vae_pos_ids,
+            num_vae=num_vae,
+            H=height,
+            W=width,
+            schedule=FlowMatchSchedule(
+                num_steps=int(params.steps),
+                shift=float(params.timestep_shift),
+                direction=ScheduleDirection.DESCENDING,
+            ),
+            cfg_text_scale=float(params.cfg_text),
+            cfg_img_scale=float(params.cfg_img),
+            cfg_renorm_type=str(params.cfg_norm),
+            cfg_renorm_min=float(params.cfg_renorm_min),
+            cfg_interval=(float(params.cfg_interval[0]), float(params.cfg_interval[1])),
+            cond_pos=cond_pos,
+            uses_context_image_feedback=uses_context_image_feedback,
         )
-        gs.cfg_text_scale = float(params.cfg_text)
-        gs.cfg_img_scale = float(params.cfg_img)
-        gs.cfg_renorm_type = str(params.cfg_norm)
-        gs.cfg_renorm_min = float(params.cfg_renorm_min)
-        gs.cfg_interval = tuple(params.cfg_interval)
-        gs.uses_context_image_feedback = bool(rec.get("context_image_feedback"))
         if gs.uses_context_image_feedback:
             gs.cond_branch_kvlen = int(self._length(op["req_id"]) or gs.cond_pos)
             gs.text_branch_pos = int(rec["text_branch_pos"])
@@ -1125,7 +1246,9 @@ class BagelForUnifiedGeneration(UniModelBase):
         allocate_blocks = self.residency.allocator_for_pool(self.scratch_pool)
         if not callable(allocate_blocks):
             return
-        m = self.model
+        loaded = self._ensure_loaded()
+        m = loaded.model
+        pool = loaded.pool
         total_gen = int(gs.num_vae) + 2
         cond_len = int(gs.cond_branch_kvlen)
         caches: dict[str, PagedTextCache] = {}
@@ -1149,7 +1272,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             cond_cache.ensure_capacity(cond_len + total_gen)
             if cond_len:
                 copy_paged_text_cache_span(
-                    self.pool.view(self._state(int(op["req_id"])).block_ids, cond_len),
+                    pool.view(self._state(int(op["req_id"])).block_ids, cond_len),
                     cond_cache,
                     start=0,
                     length=cond_len,
@@ -1217,7 +1340,11 @@ class BagelForUnifiedGeneration(UniModelBase):
             extra={"gs": gs},
         )
 
-    def prepare_denoise(self, state: RequestState, op: dict) -> TextImageDenoiseStep:
+    def prepare_denoise(
+        self,
+        state: Any,
+        op: Mapping[str, Any],
+    ) -> TextImageDenoiseStep:
         return self.prepare_denoise_step(int(op["req_id"]), state, dict(op))
 
     def predict_velocity(
@@ -1263,7 +1390,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         changes from the dense per-layer prefix gather to the batched
         transient paged-varlen read, and the branch GEMMs run once as rows.
         """
-        m = self.model
+        m = self._ensure_loaded().model
         paged_branches = gs.paged_branches
         if paged_branches is None:
             raise invalid_descriptor("paged denoise branches are not initialized")
@@ -1289,8 +1416,9 @@ class BagelForUnifiedGeneration(UniModelBase):
         return {branch: velocity[row] for row, branch in enumerate(branches)}
 
     def predict_denoise_velocity(self, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:
-        self._ensure_loaded()
-        m = self.model
+        loaded = self._ensure_loaded()
+        m = loaded.model
+        pool = loaded.pool
         gs = step.extra["gs"]
         paged_branches = gs.paged_branches
         if paged_branches is not None and paged_branches.has_all((branch,)):
@@ -1299,11 +1427,11 @@ class BagelForUnifiedGeneration(UniModelBase):
             # same substrate (B=1) rather than a diverging in-RAM copy.
             return self._predict_denoise_velocity_rows(step, gs, (branch,))[branch]
         if branch == "cond":
-            cache = self.pool.view(self._state(step.req_id).block_ids, gs.cond_branch_kvlen)
+            cache = pool.view(self._state(step.req_id).block_ids, gs.cond_branch_kvlen)
             position = gs.cond_pos
         elif branch == "text_uncond":
             if gs.uses_context_image_feedback:
-                cache = self.pool.view(self._state(step.req_id).block_ids, gs.text_branch_kvlen)
+                cache = pool.view(self._state(step.req_id).block_ids, gs.text_branch_kvlen)
                 position = gs.text_branch_pos
             else:
                 cache = gs.cfg_cache
@@ -1348,13 +1476,24 @@ class BagelForUnifiedGeneration(UniModelBase):
     def commit_generated_image(self, req_id: int, state, op) -> dict:
         return self._commit_generated_image(dict(op))
 
-    def decode_image(self, latent, *, req_id: int, state, op) -> dict:
+    def decode_image(
+        self,
+        latent: Any,
+        *,
+        req_id: int | None = None,
+        state: Any = None,
+        op: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         del latent, state
+        if req_id is None or op is None:
+            raise invalid_descriptor("BAGEL image commit requires req_id and op")
         return self._commit_generated_image(dict(op))
 
     def _commit_generated_image(self, op):
-        self._ensure_loaded()
-        m = self.model
+        loaded = self._ensure_loaded()
+        m = loaded.model
+        pool = loaded.pool
+        image_processor = loaded.image_processor
         r = op["req_id"]
         gs = self._gen_state(r)
         if gs is None:
@@ -1364,16 +1503,16 @@ class BagelForUnifiedGeneration(UniModelBase):
         if gs.uses_context_image_feedback:
             base = self._length(r) or gs.cond_branch_kvlen
             rope = gs.cond_pos
-            pre = self.image_processor.resize_for_vae(img)
-            clean_lat, vpos, _ = m.vae_encode_clean(self.image_processor.vae_tensor(pre))
+            pre = image_processor.resize_for_vae(img)
+            clean_lat, vpos, _ = m.vae_encode_clean(image_processor.vae_tensor(pre))
             nv = clean_lat.shape[0]
-            v1 = self.pool.view(self._state(r).block_ids, base)
+            v1 = pool.view(self._state(r).block_ids, base)
             s1 = m.build_gen_segment(nv, vpos, clean_lat, 0.0, rope, v1, update=True)
             m.run([s1])
             base += nv + 2
-            vemb = m.vit_encode(self.image_processor.vit_tensor(pre))
+            vemb = m.vit_encode(image_processor.vit_tensor(pre))
             nt = vemb.shape[0]
-            v2 = self.pool.view(self._state(r).block_ids, base)
+            v2 = pool.view(self._state(r).block_ids, base)
             m.run([m.build_und_image_segment(vemb, rope + 1, v2, update=True)])
             base += nt + 2
             self._set_length(r, base)
@@ -1388,12 +1527,13 @@ class BagelForUnifiedGeneration(UniModelBase):
                     "num_tokens": added}
         rec = self._record(r)
         retain_images = bool((rec.get("image") or {}).get("retain_images", True))
+        added = 0
         if retain_images:
             # Interleave continuation: persist the generated latents into the
             # request KV so following text conditions on the image. The engine
             # allocates these blocks only when retention is requested (pure
             # image mode ends at the commit and skips both).
-            view = self.pool.view(self._state(r).block_ids, gs.cond_pos)
+            view = pool.view(self._state(r).block_ids, gs.cond_pos)
             commit_seg = m.build_gen_segment(
                 gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True
             )
@@ -1403,9 +1543,15 @@ class BagelForUnifiedGeneration(UniModelBase):
             self._sync_text_cache_after_image(
                 r, length=gs.cond_pos + gs.num_vae + 2, last_position=gs.cond_pos + 1
             )
+            added = gs.num_vae + 2
         b64 = pil_image_to_png_b64(img)
         self._pop_gen_state(r)
-        return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W]}
+        return {
+            "req_id": r,
+            "image_png_b64": b64,
+            "image_hw": [gs.H, gs.W],
+            "num_tokens": added,
+        }
 
     @torch.no_grad()
     def forward(
@@ -1429,10 +1575,17 @@ class BagelForUnifiedGeneration(UniModelBase):
                 raise invalid_descriptor("BAGEL text forward requires the source op")
             return self.run_text_logits(dict(op))
 
-    def _ensure_loaded(self) -> "BagelForUnifiedGeneration":
-        if self.model is None or self.pool is None:
+    def _ensure_loaded(self) -> _LoadedBagelRuntime:
+        model = self.model
+        pool = self.pool
+        image_processor = self.image_processor
+        if model is None or pool is None or image_processor is None:
             raise capability_mismatch("BAGEL model weights are not loaded")
-        return self
+        return _LoadedBagelRuntime(
+            model=model,
+            pool=pool,
+            image_processor=image_processor,
+        )
 
     def _autocast(self):
         self._ensure_loaded()

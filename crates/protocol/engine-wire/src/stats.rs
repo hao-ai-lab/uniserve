@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::OpaqueValue;
 
 /// Stores cache hit statistics.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BaseCacheStats {
     /// Whether the cache was reset.
@@ -21,7 +21,7 @@ pub struct BaseCacheStats {
 /// Stores prefix cache hit statistics.
 /// - `reset`: Whether `reset_prefix_cache` was invoked.
 /// - `queries`: Refers to the number of tokens that were queried.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PrefixCacheStats {
     /// Embedded base cache counters and reset flag.
@@ -36,7 +36,7 @@ pub struct PrefixCacheStats {
 }
 
 /// Single KV cache block eviction sample.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvCacheEvictionEvent {
     /// Lifetime from allocation to eviction.
@@ -48,11 +48,11 @@ pub struct KvCacheEvictionEvent {
 }
 
 /// Per-step iteration decoding stats from scheduler.
-
+///
 /// Each scheduler step, statistics on spec decoding performance are aggregated
 /// across requests by the scheduler and returned to the frontend in
 /// `EngineCoreOutputs -> SchedulerStats`.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpecDecodingStats {
     /// Configured speculative token count for this scheduler.
@@ -68,11 +68,11 @@ pub struct SpecDecodingStats {
 }
 
 /// Breakdown of a scheduled prefill computation.
-
+///
 /// Python models this as a plain `@dataclass`, so it is serialized by msgspec
 /// as a map (named fields) rather than in the array-like form used by
 /// `EngineCoreOutput` itself.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrefillStats {
     /// Total number of tokens to be prefilled.
@@ -93,7 +93,7 @@ pub struct PrefillStats {
 }
 
 /// Stats for debugging the metrics calculation.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DebugPerfStats {
     /// Time spent calculating these stats.
@@ -137,7 +137,7 @@ pub struct CudagraphStat {
 }
 
 /// Worker-local forward/kernel counters folded into scheduler stats.
-
+///
 /// These are per-update deltas when carried in `SchedulerStats`, not lifetime
 /// totals. Field names intentionally mirror the Python worker metrics service.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -240,7 +240,7 @@ impl WorkerForwardStats {
 }
 
 /// Stats associated with the scheduler.
-
+///
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
     /// Number of requests in model execution batches.

@@ -1,7 +1,8 @@
 """Loader-owned config objects for checkpoints with custom HF config classes."""
 from __future__ import annotations
 
-from typing import Any
+from os import PathLike
+from typing import Any, Self
 
 from transformers import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
@@ -84,7 +85,23 @@ class NeoVisionConfig(PretrainedConfig):
         self.max_pixels = max_pixels
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | PathLike[Any],
+        cache_dir: str | PathLike[Any] | None = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: str | bool | None = None,
+        revision: str = "main",
+        **kwargs: Any,
+    ) -> Self:
+        kwargs.update(
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+        )
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
         if "vision_config" in config_dict:
             config_dict = config_dict["vision_config"]

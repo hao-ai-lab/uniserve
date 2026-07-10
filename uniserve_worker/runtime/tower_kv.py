@@ -71,27 +71,29 @@ def reshard_kv_snapshot(
         allocate_blocks=allocate_blocks,
     )
 
-    cross = transport is not None and int(src_coord) != int(dst_coord)
-    if cross:
+    active_transport = (
+        transport if transport is not None and int(src_coord) != int(dst_coord) else None
+    )
+    if active_transport is not None:
         # B1: the gen coordinate's stream waits for the primary's pending KV
         # writes so the copy never reads partially-written conditioning KV.
-        b1 = transport.record_ready(int(src_coord))
-        transport.wait_ready(b1, int(dst_coord))
+        b1 = active_transport.record_ready(int(src_coord))
+        active_transport.wait_ready(b1, int(dst_coord))
     if source_pool is not None and length > 0:
         for layer_idx in range(int(num_layers)):
             k, v = source_pool.read(layer_idx, source_blocks, start=0, length=length)
             if k is None or v is None:
                 continue
-            if cross:
-                k = transport.copy_to(k, coord=int(dst_coord))
-                v = transport.copy_to(v, coord=int(dst_coord))
+            if active_transport is not None:
+                k = active_transport.copy_to(k, coord=int(dst_coord))
+                v = active_transport.copy_to(v, coord=int(dst_coord))
             else:
                 k = k.to(target_device, non_blocking=True)
                 v = v.to(target_device, non_blocking=True)
             target_pool.write(layer_idx, out.block_ids, start=0, k=k, v=v)
-    if cross:
+    if active_transport is not None:
         # B2: record copy completion on the gen coordinate; the consumer waits it.
-        done = transport.record_ready(int(dst_coord))
+        done = active_transport.record_ready(int(dst_coord))
         if done is not None:
             setattr(out, _GEN_READY_ATTR, done)
     return out

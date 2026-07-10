@@ -28,7 +28,7 @@ pub(super) struct DecodedArray2<T> {
 }
 
 /// Decode a rank-2 token-id array, preserving the raw signed values.
-
+///
 /// Token-id arrays from the engine (e.g. vLLM `LogprobsTensors.logprob_token_ids`)
 /// right-pad ragged top-k rows with a `-1` sentinel. Those padding slots are not
 /// real token ids, so this decoder keeps the values signed and defers
@@ -307,14 +307,14 @@ where
 }
 
 /// The padding sentinel the engine writes into ragged top-k token-id rows.
-
+///
 /// vLLM (and the scheduler-sliced per-request payloads it produces) right-pad
 /// short rows of `logprob_token_ids` with `-1`; those slots carry no real token
 /// and must be dropped rather than decoded.
 pub(super) const TOKEN_ID_PADDING_SENTINEL: i64 = -1;
 
 /// Classify one raw signed token id from a decoded token-id array.
-
+///
 /// Returns `Ok(None)` for the [`TOKEN_ID_PADDING_SENTINEL`] padding slot,
 /// `Ok(Some(id))` for a valid token id, and an error for any other value that
 /// does not fit a non-negative `u32`.

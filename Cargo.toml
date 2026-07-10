@@ -41,27 +41,12 @@ uniserve-sim = { path = "crates/engine/sim" }
 uniserve-worker-ipc = { path = "crates/engine/worker-ipc" }
 
 # ---- frontend-tier crates ----
-uniserve-chat = { path = "crates/frontend/chat" }
-uniserve-chat-output = { path = "crates/frontend/chat-output" }
-uniserve-chat-protocol = { path = "crates/frontend/chat-protocol" }
-uniserve-chat-template = { path = "crates/frontend/chat-template" }
-uniserve-engine-client = { path = "crates/frontend/engine-client" }
 uniserve-engine-gateway = { path = "crates/frontend/engine-gateway" }
-uniserve-llm = { path = "crates/frontend/llm" }
 uniserve-model-profile = { path = "crates/frontend/model-profile" }
-uniserve-model-assets = { path = "crates/frontend/model-assets" }
-uniserve-native-api = { path = "crates/frontend/native-api" }
-uniserve-openai-api = { path = "crates/frontend/openai-api" }
 uniserve-protocol-adapters = { path = "crates/frontend/protocol-adapters" }
-uniserve-reasoning-parser = { path = "crates/frontend/reasoning-parser" }
 uniserve-serving = { path = "crates/frontend/serving" }
-uniserve-text = { path = "crates/frontend/text" }
-uniserve-tokenizer = { path = "crates/frontend/tokenizer" }
-uniserve-tool-parser = { path = "crates/frontend/tool-parser" }
 uniserve-managed-engine = { path = "crates/bin/managed-engine" }
-uniserve-server-app = { path = "crates/server/app" }
-uniserve-server-grpc = { path = "crates/server/grpc" }
-uniserve-server-http = { path = "crates/server/http" }
+uniserve-server = { path = "crates/server/app" }
 uniserve-examples = { path = "crates/support/examples" }
 uniserve-testkit = { path = "crates/support/testkit" }
 
@@ -163,6 +148,7 @@ trait-set = "0.3.0"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
 winnow = "1.0.2"
+xgrammar-rs = { version = "0.1.33", default-features = false }
 zeromq = { version = "0.6.0", default-features = false, features = [
     "tokio-runtime",
     "all-transport",

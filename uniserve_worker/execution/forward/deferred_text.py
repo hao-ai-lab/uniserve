@@ -1,12 +1,11 @@
 """Deferred text sampling result objects shared by text execution paths."""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ...contracts.outputs import ForwardOutputBase
 from ...foundation.errors import invalid_descriptor
 from ...nn.sampler import DeferredBatchedSamplingResult
 from ..text_decode_relay import TextDecodeRelay
@@ -23,8 +22,15 @@ __all__ = [
 _DECODE_RELAY = TextDecodeRelay()
 
 
-class DeferredTextSeqResult(ForwardOutputBase):
+class DeferredTextSeqResult:
     """One text seq-result whose CPU token id is finalized at response time."""
+
+    req_id: int
+    _row: int
+    _state: RequestState
+    _sampling_result: DeferredBatchedSamplingResult
+    _relay_token_tensor: torch.Tensor
+    _finalized: dict[str, Any] | None
 
     def __init__(
         self,
@@ -46,7 +52,8 @@ class DeferredTextSeqResult(ForwardOutputBase):
         return self
 
     def finalize(self) -> dict[str, Any]:
-        if self._finalized is None:
+        finalized = self._finalized
+        if finalized is None:
             sample = self._sampling_result.finalize().samples[self._row]
             tok, lp, top = sample
             _DECODE_RELAY.publish_deferred_sample_id_if_current(
@@ -63,7 +70,8 @@ class DeferredTextSeqResult(ForwardOutputBase):
             if top:
                 result["top_logprobs"] = top
             object.__setattr__(self, "_finalized", result)
-        return dict(self._finalized)
+            finalized = result
+        return dict(finalized)
 
     def materialize_sampled_token_id(self) -> int:
         if self._finalized is not None:
@@ -91,8 +99,13 @@ class DeferredTextSeqResult(ForwardOutputBase):
         return elapsed() if callable(elapsed) else None
 
 
-class DeferredDecodeBurstSeqResult(ForwardOutputBase):
+class DeferredDecodeBurstSeqResult:
     """Decode-burst result whose final sampled token is still event-backed."""
+
+    req_id: int
+    _prefix_token_ids: tuple[int, ...]
+    _pending: Any
+    _finalized: dict[str, Any] | None
 
     def __init__(
         self,
@@ -110,19 +123,17 @@ class DeferredDecodeBurstSeqResult(ForwardOutputBase):
         return self
 
     def finalize(self) -> dict[str, Any]:
-        if self._finalized is None:
+        finalized = self._finalized
+        if finalized is None:
             token_id = self._materialize_pending_token_id()
             token_ids = [*self._prefix_token_ids, token_id]
-            object.__setattr__(
-                self,
-                "_finalized",
-                {
-                    "req_id": self.req_id,
-                    "sampled_token_id": int(token_ids[-1]),
-                    "sampled_token_ids": [int(token) for token in token_ids],
-                },
-            )
-        return dict(self._finalized)
+            finalized = {
+                "req_id": self.req_id,
+                "sampled_token_id": int(token_ids[-1]),
+                "sampled_token_ids": [int(token) for token in token_ids],
+            }
+            object.__setattr__(self, "_finalized", finalized)
+        return dict(finalized)
 
     def _materialize_pending_token_id(self) -> int:
         return _materialize_pending_token_id(self._pending)
@@ -142,15 +153,20 @@ class DeferredDecodeBurstSeqResult(ForwardOutputBase):
         return elapsed() if callable(elapsed) else None
 
 
-class DeferredTerminalDecodeBurstSeqResult(ForwardOutputBase):
+class DeferredTerminalDecodeBurstSeqResult:
     """Terminal-stop decode-burst result with all sampled tokens deferred."""
+
+    req_id: int
+    _pending_tokens: tuple[Any, ...]
+    _stop_token_ids: frozenset[int]
+    _finalized: dict[str, Any] | None
 
     def __init__(
         self,
         *,
         req_id: int,
         pending_tokens: Sequence[Any],
-        stop_token_ids: Sequence[int],
+        stop_token_ids: Iterable[int],
     ) -> None:
         object.__setattr__(self, "req_id", int(req_id))
         object.__setattr__(self, "_pending_tokens", tuple(pending_tokens))
@@ -161,7 +177,8 @@ class DeferredTerminalDecodeBurstSeqResult(ForwardOutputBase):
         return self
 
     def finalize(self) -> dict[str, Any]:
-        if self._finalized is None:
+        finalized = self._finalized
+        if finalized is None:
             token_ids: list[int] = []
             for pending in self._pending_tokens:
                 token_id = _materialize_pending_token_id(pending)
@@ -170,16 +187,13 @@ class DeferredTerminalDecodeBurstSeqResult(ForwardOutputBase):
                     break
             if not token_ids:
                 raise invalid_descriptor("terminal decode burst did not produce a sampled token")
-            object.__setattr__(
-                self,
-                "_finalized",
-                {
-                    "req_id": self.req_id,
-                    "sampled_token_id": int(token_ids[-1]),
-                    "sampled_token_ids": [int(token) for token in token_ids],
-                },
-            )
-        return dict(self._finalized)
+            finalized = {
+                "req_id": self.req_id,
+                "sampled_token_id": int(token_ids[-1]),
+                "sampled_token_ids": [int(token) for token in token_ids],
+            }
+            object.__setattr__(self, "_finalized", finalized)
+        return dict(finalized)
 
     def ready(self) -> bool:
         if self._finalized is not None:
