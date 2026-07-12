@@ -141,7 +141,9 @@ def test_cuda_graph_runner_replays_same_shape_with_refreshed_runtime_values():
         def forward(self, batch):
             token = int(batch.input_ids.reshape(-1)[0].item())
             self.tokens.append(token)
-            return ForwardResult(runtime_outputs=({"req_id": int(batch.req_ids[0]), "token": token},))
+            return ForwardResult(
+                runtime_outputs=({"req_id": int(batch.req_ids[0]), "token": token},)
+            )
 
     stats = ForwardGraphStats()
     graph_runner = CudaGraphForwardRunner(
@@ -463,7 +465,11 @@ def test_denoise_step_graph_program_runs_required_graph_mode():
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
         graph_runner=CudaGraphForwardRunner(
-            programs=(DenoiseStepGraphProgram(denoise_driver=driver, model="model", request_states=states),)
+            programs=(
+                DenoiseStepGraphProgram(
+                    denoise_driver=driver, model="model", request_states=states
+                ),
+            )
         ),
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
@@ -727,12 +733,8 @@ def test_text_driver_scores_prompt_across_prefill_chunk_boundaries():
     class Model:
         def run_text_logits(self, op):
             if op["pos_range"] == [0, 2]:
-                return torch.tensor(
-                    [[[0.0, 1.0, 4.0, 2.0, -1.0], [0.0, 1.0, 2.0, 5.0, -1.0]]]
-                )
-            return torch.tensor(
-                [[[0.0, 1.0, 2.0, 3.0, 6.0], [0.0, 5.0, 2.0, 3.0, 1.0]]]
-            )
+                return torch.tensor([[[0.0, 1.0, 4.0, 2.0, -1.0], [0.0, 1.0, 2.0, 5.0, -1.0]]])
+            return torch.tensor([[[0.0, 1.0, 2.0, 3.0, 6.0], [0.0, 5.0, 2.0, 3.0, 1.0]]])
 
     driver = TextDriver()
     first = UniForwardBatch.from_ops(
@@ -777,7 +779,9 @@ def test_executor_strict_graph_policy_rejects_eager_fallback():
     executor = ForwardExecutor(graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True))
 
     with pytest.raises(StrictForwardGraphError):
-        executor.execute(batch, plan, forward_fn=lambda _batch: ForwardResult(runtime_outputs=({"req_id": 1},)))
+        executor.execute(
+            batch, plan, forward_fn=lambda _batch: ForwardResult(runtime_outputs=({"req_id": 1},))
+        )
 
 
 def test_executor_delegated_graph_policy_does_not_record_fallback():
@@ -986,7 +990,9 @@ def test_postprocessor_text_logits_samples_batched_relays_and_advances_kv_after_
     second_position = states[2].decode_relay.position_tensor
     torch.testing.assert_close(first_position, torch.tensor([1], dtype=torch.long))
     torch.testing.assert_close(second_position, torch.tensor([7], dtype=torch.long))
-    assert first_position.untyped_storage().data_ptr() == second_position.untyped_storage().data_ptr()
+    assert (
+        first_position.untyped_storage().data_ptr() == second_position.untyped_storage().data_ptr()
+    )
     assert second_position.data_ptr() - first_position.data_ptr() == first_position.element_size()
 
 
@@ -1040,14 +1046,18 @@ def test_worker_adapter_denoise_result_updates_latent_only_in_postprocess():
                         latent=torch.tensor([0.0]),
                         t=torch.tensor(0.0),
                         t_next=torch.tensor(1.0),
-                        combine_velocity=lambda velocities: velocities["cond"] - velocities["uncond"],
+                        combine_velocity=lambda velocities: (
+                            velocities["cond"] - velocities["uncond"]
+                        ),
                         accept_update=lambda updated: setattr(state, "updated", updated),
                     )
                 },
             )
 
         def step_many(self, *args, **kwargs):
-            raise AssertionError("typed denoise adapter path should not call DenoiseDriver.step_many")
+            raise AssertionError(
+                "typed denoise adapter path should not call DenoiseDriver.step_many"
+            )
 
     class Model(ModelHooks):
         device = "cpu"
@@ -1235,7 +1245,9 @@ def test_worker_adapter_private_mixed_hook_can_return_forward_result():
     class Model(ModelHooks):
         device = "cpu"
 
-        def _run_forward_adapter(self, batch, *, request_states, group, defer_text_cpu_results=False):
+        def _run_forward_adapter(
+            self, batch, *, request_states, group, defer_text_cpu_results=False
+        ):
             assert request_states is states
             assert [item[1] for item in group] == ops
             assert defer_text_cpu_results is False
@@ -1337,8 +1349,12 @@ def test_postprocessor_mixed_text_entry_samples_relays_and_advances_interleaved_
     torch.testing.assert_close(image_state.cond.last_logits, torch.tensor([[[0.0, 2.0, 9.0]]]))
     assert text_state.decode_relay.token_id == 2
     assert text_state.decode_relay.position_id == 7
-    torch.testing.assert_close(text_state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long))
-    torch.testing.assert_close(text_state.decode_relay.position_tensor, torch.tensor([7], dtype=torch.long))
+    torch.testing.assert_close(
+        text_state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long)
+    )
+    torch.testing.assert_close(
+        text_state.decode_relay.position_tensor, torch.tensor([7], dtype=torch.long)
+    )
     torch.testing.assert_close(denoise_state.updated, torch.tensor([1.0]))
 
 
@@ -1352,9 +1368,23 @@ class _FakeTextState:
             position_tensor=None,
         )
         self.kv_updates: list[tuple[str, int]] = []
+        self.device_rngs: dict[str, torch.Generator] = {}
 
     def set_kv_length(self, value: int, *, lane: str) -> None:
         self.kv_updates.append((str(lane), int(value)))
+
+    def device_rng(
+        self,
+        device: torch.device | str,
+        *,
+        stream: str = "model",
+    ) -> torch.Generator:
+        target = torch.device(device)
+        key = f"{stream}:{target}"
+        return self.device_rngs.setdefault(
+            key,
+            torch.Generator(device=target).manual_seed(0),
+        )
 
 
 class _FakeRequestStates:

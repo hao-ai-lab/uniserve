@@ -1,6 +1,8 @@
 """Per-request state owned by the shared runner."""
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -8,13 +10,25 @@ from typing import Any
 import torch
 
 __all__ = [
-    'append_new_block_ids',
-    'RequestLifecycle',
-    'ResidencyFlags',
-    'DecodeRelay',
-    'RequestState',
-    'RequestStateTable',
+    "append_new_block_ids",
+    "request_seed",
+    "RequestLifecycle",
+    "ResidencyFlags",
+    "DecodeRelay",
+    "RequestState",
+    "RequestStateTable",
 ]
+
+
+def request_seed(request: Mapping[str, Any], req_id: int) -> int:
+    sampling = request.get("sampling")
+    image = request.get("image")
+    candidates = (
+        request.get("seed"),
+        sampling.get("seed") if isinstance(sampling, Mapping) else None,
+        image.get("seed") if isinstance(image, Mapping) else None,
+    )
+    return next((int(value) for value in candidates if value is not None), int(req_id))
 
 
 def append_new_block_ids(
@@ -32,7 +46,7 @@ def append_new_block_ids(
     Mutates ``block_ids`` in place and returns ``True`` iff blocks were appended.
     """
     new_blocks = [int(block_id) for block_id in (new_block_ids or [])]
-    if new_blocks and block_ids[-len(new_blocks):] != new_blocks:
+    if new_blocks and block_ids[-len(new_blocks) :] != new_blocks:
         block_ids.extend(new_blocks)
         return True
     return False
@@ -114,9 +128,7 @@ class RequestState:
     def extend_block_ids(self, block_ids: list[int] | tuple[int, ...]) -> None:
         self.block_ids.extend(int(block_id) for block_id in block_ids)
 
-    def append_new_block_ids(
-        self, new_block_ids: list[int] | tuple[int, ...] | None
-    ) -> bool:
+    def append_new_block_ids(self, new_block_ids: list[int] | tuple[int, ...] | None) -> bool:
         """Tail-deduping ingest of a host ``new_block_ids`` payload.
 
         Thin wrapper over the shared :func:`append_new_block_ids` so the
@@ -131,9 +143,14 @@ class RequestState:
     def set_kv_length(self, value: int, lane: str = "default") -> None:
         self.kv_lengths[lane] = int(value)
 
-    def device_rng(self, device: torch.device | str) -> torch.Generator:
+    def device_rng(
+        self,
+        device: torch.device | str,
+        *,
+        stream: str = "model",
+    ) -> torch.Generator:
         dev = torch.device(device)
-        key = str(dev)
+        key = f"{stream}:{dev}"
         rng = self.device_rngs.get(key)
         if rng is None:
             seed = int(self.seed if self.seed is not None else 0)
@@ -177,7 +194,7 @@ class RequestStateTable:
         if state is None:
             state = RequestState()
             self._states[req_id] = state
-            seed = int(new_req.get("seed") or (new_req.get("image") or {}).get("seed") or req_id)
+            seed = request_seed(new_req, req_id)
             state.seed = seed
             state.rng = torch.Generator(device="cpu")
             state.rng.manual_seed(seed)

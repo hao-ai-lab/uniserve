@@ -1,4 +1,5 @@
 """Forward result postprocessing and request-state side effects."""
+
 from __future__ import annotations
 
 import base64
@@ -31,9 +32,7 @@ from .result import DenoiseBranchKey, ForwardResult, TextPostprocessEntry
 __all__ = ["ForwardPostprocessor"]
 
 _DECODE_RELAY = TextDecodeRelay()
-_TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
-)
+_TEXT_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY})
 
 
 class ForwardPostprocessor:
@@ -106,7 +105,10 @@ class ForwardPostprocessor:
         if result.text_logits is None:
             raise invalid_descriptor("text batch postprocess requires logits")
         logits_batch = self._text_logits_rows(result.text_logits, len(req_ids))
-        if plan.runtime_handles.get("defer_sampling") and plan.runtime_handles.tensor_store is not None:
+        if (
+            plan.runtime_handles.get("defer_sampling")
+            and plan.runtime_handles.tensor_store is not None
+        ):
             published_outputs = self._publish_logits(
                 list(text.ops),
                 req_ids,
@@ -165,18 +167,21 @@ class ForwardPostprocessor:
         recent: list[list[int] | tuple[int, ...]] = []
         allowed: list[list[int] | tuple[int, ...] | None] = []
         suppress: list[list[int] | tuple[int, ...] | None] = []
+        generators: list[torch.Generator] = []
         for op, req_id in zip(ops, req_ids, strict=True):
             state = request_states.get(int(req_id))
             params.append(dict(state.sampling or {}))
             recent.append(op.get("recent_tokens") or [])
             allowed.append(op.get("allowed_tokens"))
             suppress.append(op.get("suppress_tokens"))
+            generators.append(state.device_rng(logits_batch.device, stream="text_sampling"))
         sampling_result = apply_sampling_batched_with_device_tokens(
             logits_batch,
             params,
             recent,
             allowed,
             suppress,
+            generators=generators,
             defer_cpu=defer_cpu_results,
             enable_cuda_timing=cuda_ready_start_event is not None,
         )
@@ -185,7 +190,7 @@ class ForwardPostprocessor:
             outputs: list[TextTokenOutput | DeferredTextSeqResult] = []
             for row, req_id in enumerate(req_ids):
                 state = request_states.get(int(req_id))
-                relay_token_tensor = sampling_result.device_tokens[row:row + 1]
+                relay_token_tensor = sampling_result.device_tokens[row : row + 1]
                 _DECODE_RELAY.publish_sample(
                     state,
                     token_id=None,
@@ -211,7 +216,7 @@ class ForwardPostprocessor:
             _DECODE_RELAY.publish_sample(
                 request_states.get(int(req_id)),
                 token_id=int(tok),
-                token_tensor=immediate_result.device_tokens[row:row + 1],
+                token_tensor=immediate_result.device_tokens[row : row + 1],
             )
             outputs.append(
                 TextTokenOutput(
@@ -276,7 +281,9 @@ class ForwardPostprocessor:
             request_states.get(int(req_id)).set_kv_length(int(pos_range[1]), lane="text")
 
     @staticmethod
-    def _sample_text(plan: ForwardPlan, req_id: int, op: Any, logits: torch.Tensor) -> dict[str, Any]:
+    def _sample_text(
+        plan: ForwardPlan, req_id: int, op: Any, logits: torch.Tensor
+    ) -> dict[str, Any]:
         request_states = plan.runtime_handles.request_states
         if request_states is not None:
             state = request_states.get(int(req_id))
@@ -292,13 +299,16 @@ class ForwardPostprocessor:
             raise invalid_descriptor("text postprocess entries require text logits")
         logits_rows = self._text_logits_rows(result.text_logits, len(entries))
         entries_by_index = sorted(entries, key=lambda entry: int(entry.logits_index))
-        if [int(entry.logits_index) for entry in entries_by_index] != list(range(len(entries_by_index))):
+        if [int(entry.logits_index) for entry in entries_by_index] != list(
+            range(len(entries_by_index))
+        ):
             raise invalid_descriptor("text postprocess logits indices must be contiguous")
         request_states = plan.runtime_handles.request_states
         params: list[dict[str, Any]] = []
         recent: list[list[int] | tuple[int, ...]] = []
         allowed: list[list[int] | tuple[int, ...] | None] = []
         suppress: list[list[int] | tuple[int, ...] | None] = []
+        generators: list[torch.Generator | None] = []
         for entry in entries_by_index:
             row = plan.rows[int(entry.row_index)]
             state = request_states.get(int(entry.req_id)) if request_states is not None else None
@@ -306,12 +316,18 @@ class ForwardPostprocessor:
             recent.append(row.op.get("recent_tokens") or [])
             allowed.append(row.op.get("allowed_tokens"))
             suppress.append(row.op.get("suppress_tokens"))
+            generators.append(
+                None
+                if state is None
+                else state.device_rng(logits_rows.device, stream="text_sampling")
+            )
         sampling_result = apply_sampling_batched_with_device_tokens(
             logits_rows[: len(entries_by_index)],
             params,
             recent,
             allowed,
             suppress,
+            generators=generators,
             defer_cpu=bool(plan.runtime_handles.get("defer_text_cpu_results")),
         )
         deferred: Any | None
@@ -324,7 +340,9 @@ class ForwardPostprocessor:
             immediate_result = finalize_sampling_result(sampling_result)
             samples = immediate_result.samples
             device_tokens = immediate_result.device_tokens
-        promotions = [entry.kv_promotion for entry in entries_by_index if entry.kv_promotion is not None]
+        promotions = [
+            entry.kv_promotion for entry in entries_by_index if entry.kv_promotion is not None
+        ]
         if promotions:
             num_layers = max(int(entry.num_layers) for entry in entries_by_index)
             copy_paged_text_cache_spans(
@@ -336,9 +354,9 @@ class ForwardPostprocessor:
         for sample_index, entry in enumerate(entries_by_index):
             row = plan.rows[int(entry.row_index)]
             state = request_states.get(int(entry.req_id)) if request_states is not None else None
-            logits = logits_rows[int(entry.logits_index):int(entry.logits_index) + 1].unsqueeze(0)
+            logits = logits_rows[int(entry.logits_index) : int(entry.logits_index) + 1].unsqueeze(0)
             self._publish_text_entry_state(entry, logits)
-            token_tensor = device_tokens[sample_index:sample_index + 1]
+            token_tensor = device_tokens[sample_index : sample_index + 1]
             position_tensor = torch.tensor(
                 [int(entry.position_id)],
                 dtype=torch.long,
@@ -369,10 +387,7 @@ class ForwardPostprocessor:
             else:
                 sample = samples[sample_index]
                 top_logprobs = (
-                    [
-                        (int(item[0]), float(item[1]), int(item[2]))
-                        for item in sample.top_logprobs
-                    ]
+                    [(int(item[0]), float(item[1]), int(item[2])) for item in sample.top_logprobs]
                     if sample.top_logprobs is not None
                     else None
                 )
@@ -402,7 +417,9 @@ class ForwardPostprocessor:
             and entry.staged_cache is not persistent_cache
             and entry.mark_staging_advanced is not None
         ):
-            entry.mark_staging_advanced(entry.staged_cache, persistent_cache, int(entry.kv_new_length))
+            entry.mark_staging_advanced(
+                entry.staged_cache, persistent_cache, int(entry.kv_new_length)
+            )
 
     @staticmethod
     def _apply_denoise(plan: ForwardPlan, row_index: int, result: ForwardResult) -> DenoiseOutput:

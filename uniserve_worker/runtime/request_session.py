@@ -1,4 +1,5 @@
 """Request-session ownership for mutable per-request runtime state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -54,10 +55,16 @@ class RequestSession:
             return
         if self.state.block_ids == incoming:
             return
-        if len(incoming) > len(self.state.block_ids) and incoming[: len(self.state.block_ids)] == self.state.block_ids:
+        if (
+            len(incoming) > len(self.state.block_ids)
+            and incoming[: len(self.state.block_ids)] == self.state.block_ids
+        ):
             self.state.block_ids[:] = incoming
             return
-        if len(self.state.block_ids) >= len(incoming) and self.state.block_ids[: len(incoming)] == incoming:
+        if (
+            len(self.state.block_ids) >= len(incoming)
+            and self.state.block_ids[: len(incoming)] == incoming
+        ):
             return
         self.ingest_new_blocks(incoming)
 
@@ -98,8 +105,13 @@ class RequestSession:
     def finish_generation(self, *, committed: bool) -> None:
         self.state.clear_generation_state(reset_cursor=bool(committed))
 
-    def device_rng(self, device: torch.device | str) -> torch.Generator:
-        return self.state.device_rng(device)
+    def device_rng(
+        self,
+        device: torch.device | str,
+        *,
+        stream: str = "model",
+    ) -> torch.Generator:
+        return self.state.device_rng(device, stream=stream)
 
     def mark_active(self) -> None:
         self.state.lifecycle = RequestLifecycle.ACTIVE

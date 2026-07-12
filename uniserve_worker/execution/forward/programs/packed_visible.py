@@ -1,4 +1,5 @@
 """Packed mixed text/denoise forward driver."""
+
 from __future__ import annotations
 
 import json
@@ -284,9 +285,13 @@ def _run_packed_mixed_forward_impl(
                 return
             total_q = sum(int(row.q_len) for row in pending_text_rows)
             with profile_range("uniserve.packed_mixed.text_embed"):
-                input_ids = torch.cat([row.input_ids.reshape(-1) for row in pending_text_rows], dim=0)
+                input_ids = torch.cat(
+                    [row.input_ids.reshape(-1) for row in pending_text_rows], dim=0
+                )
                 if int(input_ids.numel()) != int(total_q):
-                    raise invalid_descriptor("packed mixed text input id count does not match row lengths")
+                    raise invalid_descriptor(
+                        "packed mixed text input id count does not match row lengths"
+                    )
                 text_embeds = owner.packed_text_embeddings(input_ids).reshape(total_q, -1)
             segment_base = _append_packed_chunk(
                 embed_chunks,
@@ -332,7 +337,9 @@ def _run_packed_mixed_forward_impl(
                     current_context.update(
                         {
                             "cache_blocks_before_sync": len(getattr(cache, "block_ids", []) or []),
-                            "past_blocks_before_sync": len(getattr(cache.past, "block_ids", []) or []),
+                            "past_blocks_before_sync": len(
+                                getattr(cache.past, "block_ids", []) or []
+                            ),
                             "past_length_before_sync": int(getattr(cache.past, "length", 0)),
                             "cache_t_index_before_sync": int(getattr(cache, "t_index", -1)),
                         }
@@ -341,7 +348,9 @@ def _run_packed_mixed_forward_impl(
                     current_context.update(
                         {
                             "cache_blocks_after_sync": len(getattr(cache, "block_ids", []) or []),
-                            "past_blocks_after_sync": len(getattr(cache.past, "block_ids", []) or []),
+                            "past_blocks_after_sync": len(
+                                getattr(cache.past, "block_ids", []) or []
+                            ),
                             "past_length_after_sync": int(getattr(cache.past, "length", 0)),
                             "cache_t_index_after_sync": int(getattr(cache, "t_index", -1)),
                         }
@@ -349,7 +358,9 @@ def _run_packed_mixed_forward_impl(
                     hydrate_cached_prefix_from_op(cache, op)
                     current_context.update(
                         {
-                            "past_blocks_after_hydrate": len(getattr(cache.past, "block_ids", []) or []),
+                            "past_blocks_after_hydrate": len(
+                                getattr(cache.past, "block_ids", []) or []
+                            ),
                             "past_length_after_hydrate": int(getattr(cache.past, "length", 0)),
                             "cache_t_index_after_hydrate": int(getattr(cache, "t_index", -1)),
                         }
@@ -357,7 +368,10 @@ def _run_packed_mixed_forward_impl(
                     tokens = list(op.get("token_ids") or [])
                     if not tokens:
                         tokens = [int(owner.eos_id or 0)]
-                    pos = op.get("pos_range") or [cache.t_index + 1, cache.t_index + 1 + len(tokens)]
+                    pos = op.get("pos_range") or [
+                        cache.t_index + 1,
+                        cache.t_index + 1 + len(tokens),
+                    ]
                     start = int(pos[0])
                     q_len = len(tokens)
                     cache.past.ensure_capacity(cache.past.length + q_len)
@@ -584,18 +598,31 @@ def _run_packed_mixed_forward_impl(
                 text_logits = owner.packed_text_logits(text_hidden.unsqueeze(0)).squeeze(0)
             with profile_range("uniserve.packed_mixed.text_logits_scatter"):
                 for offset, (row_index, *_rest) in enumerate(plan.text_result_slots):
-                    text_logits_by_row[int(row_index)] = text_logits[offset:offset + 1].unsqueeze(0)
+                    text_logits_by_row[int(row_index)] = text_logits[offset : offset + 1].unsqueeze(
+                        0
+                    )
             if return_forward_result:
                 text_logits_for_result = text_logits.reshape(len(plan.text_result_slots), -1)
             else:
                 sample_logits: list[torch.Tensor] = []
                 sampling_params: list[dict[str, Any]] = []
+                sampling_generators: list[torch.Generator] = []
                 with profile_range("uniserve.packed_mixed.text_sampling_inputs"):
                     for row_index, *_rest in plan.text_result_slots:
                         req_id = int(batch.ops[row_index]["req_id"])
                         state = request_states.get(req_id)
                         sampling_params.append(dict(state.sampling or {}))
-                        sample_logits.append(text_logits_by_row[int(row_index)].reshape(-1, text_logits.shape[-1])[-1])
+                        sampling_generators.append(
+                            state.device_rng(
+                                text_logits.device,
+                                stream="text_sampling",
+                            )
+                        )
+                        sample_logits.append(
+                            text_logits_by_row[int(row_index)].reshape(-1, text_logits.shape[-1])[
+                                -1
+                            ]
+                        )
                 can_defer_text_cpu = bool(defer_text_cpu_results)
                 with profile_range("uniserve.packed_mixed.text_sampling"):
                     sampled = apply_sampling_batched_with_device_tokens(
@@ -604,6 +631,7 @@ def _run_packed_mixed_forward_impl(
                         [[] for _ in sample_logits],
                         [None for _ in sample_logits],
                         [None for _ in sample_logits],
+                        generators=sampling_generators,
                         defer_cpu=can_defer_text_cpu,
                     )
                 if is_deferred_sampling_result(sampled) and can_defer_text_cpu:
@@ -611,7 +639,7 @@ def _run_packed_mixed_forward_impl(
                     for sample_index, (row_index, *_rest) in enumerate(plan.text_result_slots):
                         text_sample_indices_by_row[int(row_index)] = sample_index
                         text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
-                            sample_index:sample_index + 1
+                            sample_index : sample_index + 1
                         ]
                 else:
                     immediate_sampling = finalize_sampling_result(sampled)
@@ -633,7 +661,7 @@ def _run_packed_mixed_forward_impl(
                             top_logprobs=top_logprobs,
                         )
                         text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
-                            sample_index:sample_index + 1
+                            sample_index : sample_index + 1
                         ]
         with profile_range("uniserve.packed_mixed.burst_position_stage"):
             burst_position_tensors_by_row = _forward_burst_position_tensors(
@@ -742,7 +770,7 @@ def _run_packed_mixed_forward_impl(
                 img = step.extra["img"]
                 with profile_range("uniserve.packed_mixed.velocity_branch"):
                     velocity = owner.packed_hidden_to_velocity(
-                        hidden[start:start + q_len].unsqueeze(0),
+                        hidden[start : start + q_len].unsqueeze(0),
                         step.t,
                         step.latent,
                         image_token_num=img.token_h * img.token_w,
@@ -834,7 +862,6 @@ def _run_packed_mixed_forward_impl(
             "packed mixed forward failed for an admitted mixed batch",
             details={"cause_type": type(exc).__name__, "cause": str(exc)[:500]},
         ) from exc
-
 
 
 class _PackedMixedTiming:
@@ -1065,7 +1092,15 @@ def _forward_burst_position_tensors(
 ) -> dict[int, torch.Tensor]:
     rows: list[int] = []
     position_ids: list[int] = []
-    for row_index, _start, q_len, _persistent, _staged, base_len, _last_token in plan.text_result_slots:
+    for (
+        row_index,
+        _start,
+        q_len,
+        _persistent,
+        _staged,
+        base_len,
+        _last_token,
+    ) in plan.text_result_slots:
         op = plan.batch.ops[int(row_index)]
         if plan.batch.op_modes[int(row_index)] is not ForwardMode.DECODE:
             continue
@@ -1095,7 +1130,7 @@ def _forward_burst_position_tensors(
             device=device,
         )
         positions.copy_(cpu, non_blocking=is_pinned(cpu))
-    return {row: positions[offset:offset + 1] for offset, row in enumerate(rows)}
+    return {row: positions[offset : offset + 1] for offset, row in enumerate(rows)}
 
 
 def _forward_text_input_ids(

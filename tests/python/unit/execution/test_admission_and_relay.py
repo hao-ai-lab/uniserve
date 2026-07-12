@@ -1,4 +1,5 @@
 """Admission routing + deferred decode-relay finalize behavior."""
+
 from __future__ import annotations
 
 import pytest
@@ -153,6 +154,26 @@ def test_duplicate_new_request_merges_longer_registered_chain():
     assert same.block_ids == [10, 11, 12]
 
 
+def test_request_random_streams_are_persistent_and_domain_separated():
+    states = RequestStateTable()
+    state = states.create_or_update(6, {"req_id": 6, "sampling": {"seed": 0}})
+
+    text = state.device_rng("cpu", stream="text_sampling")
+    image = state.device_rng("cpu", stream="model")
+
+    assert state.device_rng("cpu", stream="text_sampling") is text
+    assert state.device_rng("cpu", stream="model") is image
+    assert text is not image
+    expected = torch.randint(
+        0,
+        1000,
+        (4,),
+        generator=torch.Generator(device="cpu").manual_seed(0),
+    ).tolist()
+    assert torch.randint(0, 1000, (4,), generator=text).tolist() == expected
+    assert torch.randint(0, 1000, (4,), generator=image).tolist() == expected
+
+
 # --- DeferredTextSeqResult.finalize ---------------------------------------
 
 
@@ -287,7 +308,9 @@ def test_deferred_decode_burst_result_finalizes_final_token():
     first = burst.finalize()
     second = burst.finalize()
 
-    assert first == second == {"req_id": 3, "sampled_token_id": 17, "sampled_token_ids": [11, 13, 17]}
+    assert (
+        first == second == {"req_id": 3, "sampled_token_id": 17, "sampled_token_ids": [11, 13, 17]}
+    )
     assert state.decode_relay.token_id == 17
 
 

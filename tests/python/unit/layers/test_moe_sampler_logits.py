@@ -1,4 +1,5 @@
 """Conformance for shared MoE, sampler, and logits helpers."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -51,7 +52,9 @@ def _reference_moe(x, logits, experts, top_k, *, norm_topk_prob: bool = True):
     for token in range(x.shape[0]):
         for slot in range(top_k):
             expert_idx = int(ids[token, slot])
-            out[token] += experts[expert_idx](x[token : token + 1]).squeeze(0) * weights[token, slot]
+            out[token] += (
+                experts[expert_idx](x[token : token + 1]).squeeze(0) * weights[token, slot]
+            )
     return out
 
 
@@ -159,10 +162,20 @@ def test_batched_sampler_matches_scalar_greedy_rows():
     got = apply_sampling_batched(logits, params, recent, allowed, suppress)
     expected = [
         sample_one_from_logits(
-            logits[0], params[0], recent=recent[0], allowed=allowed[0], suppress=suppress[0], n_logprobs=2
+            logits[0],
+            params[0],
+            recent=recent[0],
+            allowed=allowed[0],
+            suppress=suppress[0],
+            n_logprobs=2,
         ),
         sample_one_from_logits(
-            logits[1], params[1], recent=recent[1], allowed=allowed[1], suppress=suppress[1], n_logprobs=1
+            logits[1],
+            params[1],
+            recent=recent[1],
+            allowed=allowed[1],
+            suppress=suppress[1],
+            n_logprobs=1,
         ),
     ]
 
@@ -369,6 +382,42 @@ def test_plain_greedy_batched_sampler_syncs_tp_fast_path(monkeypatch):
     torch.testing.assert_close(got.device_tokens, torch.tensor([2, 0], dtype=torch.long))
 
 
+def test_seeded_sampling_is_independent_of_batch_membership_across_steps():
+    logits = torch.zeros((2, 11), dtype=torch.float32)
+    params = [{"temperature": 1.0, "seed": 42}, {"temperature": 1.0, "seed": 42}]
+    batched_generators = [
+        torch.Generator(device="cpu").manual_seed(42),
+        torch.Generator(device="cpu").manual_seed(42),
+    ]
+    batched_sequences = [[], []]
+    for _ in range(8):
+        result = sampler_mod.apply_sampling_batched_with_device_tokens(
+            logits,
+            params,
+            [[], []],
+            [None, None],
+            [None, None],
+            generators=batched_generators,
+        )
+        for row, sample in enumerate(result.samples):
+            batched_sequences[row].append(int(sample.token_id))
+
+    single_generator = torch.Generator(device="cpu").manual_seed(42)
+    single_sequence = []
+    for _ in range(8):
+        result = sampler_mod.apply_sampling_batched_with_device_tokens(
+            logits[:1],
+            params[:1],
+            [[]],
+            [None],
+            [None],
+            generators=[single_generator],
+        )
+        single_sequence.append(int(result.samples[0].token_id))
+
+    assert batched_sequences == [single_sequence, single_sequence]
+
+
 def test_greedy_sampler_fast_path_applies_argmax_processors(monkeypatch):
     def fail_fallback(*args, **kwargs):
         raise AssertionError("greedy masks and bias should stay on the device fast path")
@@ -471,11 +520,17 @@ def test_ops_qk_norm_rope_multi_axis_matches_reference():
     q_parts = q.split(axis_dims, dim=-1)
     k_parts = k.split(axis_dims, dim=-1)
     ref_q = torch.cat(
-        [apply_rotary_emb(_reference_rms_norm(part, weight, 1e-6), c, s) for part, weight, c, s in zip(q_parts, q_weights, cos, sin, strict=True)],
+        [
+            apply_rotary_emb(_reference_rms_norm(part, weight, 1e-6), c, s)
+            for part, weight, c, s in zip(q_parts, q_weights, cos, sin, strict=True)
+        ],
         dim=-1,
     )
     ref_k = torch.cat(
-        [apply_rotary_emb(_reference_rms_norm(part, weight, 1e-6), c, s) for part, weight, c, s in zip(k_parts, k_weights, cos, sin, strict=True)],
+        [
+            apply_rotary_emb(_reference_rms_norm(part, weight, 1e-6), c, s)
+            for part, weight, c, s in zip(k_parts, k_weights, cos, sin, strict=True)
+        ],
         dim=-1,
     )
     torch.testing.assert_close(got_q, ref_q)
@@ -537,11 +592,17 @@ def test_ops_qk_norm_rope_batched_multi_axis_preserves_batch_tables():
         return rotated.reshape(batch, seq_len, part.shape[1], part.shape[-1]).permute(0, 2, 1, 3)
 
     ref_q = torch.cat(
-        [rotate(part, c, s) for part, c, s in zip((q_t_ref, q_h_ref, q_w_ref), cos, sin, strict=True)],
+        [
+            rotate(part, c, s)
+            for part, c, s in zip((q_t_ref, q_h_ref, q_w_ref), cos, sin, strict=True)
+        ],
         dim=-1,
     )
     ref_k = torch.cat(
-        [rotate(part, c, s) for part, c, s in zip((k_t_ref, k_h_ref, k_w_ref), cos, sin, strict=True)],
+        [
+            rotate(part, c, s)
+            for part, c, s in zip((k_t_ref, k_h_ref, k_w_ref), cos, sin, strict=True)
+        ],
         dim=-1,
     )
     torch.testing.assert_close(got_q, ref_q)
@@ -651,14 +712,26 @@ def test_triton_qk_norm_rope_grouped_multi_axis_matches_eager_cuda():
     k_hw = torch.randn(axis_dims[1] + axis_dims[2], dtype=dtype, device=device)
     table_positions = torch.arange(batch * seq_len, dtype=torch.float32, device=device)
     cos = (
-        torch.cos(table_positions[:, None] + torch.arange(axis_dims[0] // 2, device=device)).to(dtype),
-        torch.cos(table_positions[:, None] + torch.arange(axis_dims[1] // 2, device=device)).to(dtype),
-        torch.cos(table_positions[:, None] + torch.arange(axis_dims[2] // 2, device=device)).to(dtype),
+        torch.cos(table_positions[:, None] + torch.arange(axis_dims[0] // 2, device=device)).to(
+            dtype
+        ),
+        torch.cos(table_positions[:, None] + torch.arange(axis_dims[1] // 2, device=device)).to(
+            dtype
+        ),
+        torch.cos(table_positions[:, None] + torch.arange(axis_dims[2] // 2, device=device)).to(
+            dtype
+        ),
     )
     sin = (
-        torch.sin(table_positions[:, None] + torch.arange(axis_dims[0] // 2, device=device)).to(dtype),
-        torch.sin(table_positions[:, None] + torch.arange(axis_dims[1] // 2, device=device)).to(dtype),
-        torch.sin(table_positions[:, None] + torch.arange(axis_dims[2] // 2, device=device)).to(dtype),
+        torch.sin(table_positions[:, None] + torch.arange(axis_dims[0] // 2, device=device)).to(
+            dtype
+        ),
+        torch.sin(table_positions[:, None] + torch.arange(axis_dims[1] // 2, device=device)).to(
+            dtype
+        ),
+        torch.sin(table_positions[:, None] + torch.arange(axis_dims[2] // 2, device=device)).to(
+            dtype
+        ),
     )
 
     with torch.inference_mode():
@@ -715,14 +788,18 @@ def test_ops_qk_norm_grouped_multi_axis_matches_reference():
     ref_q = torch.cat(
         [
             _reference_rms_norm(q_t_part, q_t, 1e-6),
-            *_reference_rms_norm(torch.cat([q_h_part, q_w_part], dim=-1), q_hw, 1e-6).split(axis_dims[1:], dim=-1),
+            *_reference_rms_norm(torch.cat([q_h_part, q_w_part], dim=-1), q_hw, 1e-6).split(
+                axis_dims[1:], dim=-1
+            ),
         ],
         dim=-1,
     )
     ref_k = torch.cat(
         [
             _reference_rms_norm(k_t_part, k_t, 1e-6),
-            *_reference_rms_norm(torch.cat([k_h_part, k_w_part], dim=-1), k_hw, 1e-6).split(axis_dims[1:], dim=-1),
+            *_reference_rms_norm(torch.cat([k_h_part, k_w_part], dim=-1), k_hw, 1e-6).split(
+                axis_dims[1:], dim=-1
+            ),
         ],
         dim=-1,
     )
