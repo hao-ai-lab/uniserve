@@ -30,6 +30,11 @@ from ..contracts.resource_plan import (
     active_latent_capacity_tokens,
 )
 from ..execution.denoise_driver import TextImageDenoiseStep, text_image_cfg_branch_count
+from ..execution.forward.graph.denoise_step import (
+    maybe_run_denoise_step_graph,
+    release_denoise_step_graphs,
+)
+from ..execution.interleaved_image_denoise import DenoiseRow
 from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
 from ..execution.model_base import UniModelBase
 from ..execution.paged_denoise import (
@@ -282,6 +287,9 @@ class _BagelGraph(nn.Module):
             self.vit_pos_embed = PositionEmbedding(
                 cfg.vit_max_num_patch_per_side, hidden, init_sincos=False
             )
+        self._gen_graph_layouts: dict[
+            tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     @property
     def num_layers(self) -> int:
@@ -344,6 +352,30 @@ class _BagelGraph(nn.Module):
         is_gen = torch.zeros(int(num_vae) + 2, dtype=torch.bool, device=self.device)
         is_gen[1 : 1 + int(num_vae)] = True
         return is_gen
+
+    def gen_segment_graph_layout(
+        self,
+        batch_size: int,
+        num_vae: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(batch_size)
+        num_vae = int(num_vae)
+        key = (batch_size, num_vae, str(self.device))
+        cached = self._gen_graph_layouts.get(key)
+        if cached is not None:
+            return cached
+        total = num_vae + _BAGEL_IMAGE_MARKER_TOKENS
+        is_gen = self.gen_segment_is_gen(num_vae)
+        row_offsets = torch.arange(batch_size, device=self.device, dtype=torch.long) * total
+        marker_offsets = torch.tensor(
+            [0, total - 1],
+            device=self.device,
+            dtype=torch.long,
+        )
+        text_idx = (row_offsets.unsqueeze(1) + marker_offsets.unsqueeze(0)).reshape(-1)
+        layout = (is_gen, text_idx)
+        self._gen_graph_layouts[key] = layout
+        return layout
 
     def build_gen_segment(
         self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False
@@ -586,6 +618,18 @@ class GenState:
     cfg_img_cache: KVCache | None = None
     cfg_img_pos: int = 0
     paged_branches: PagedDenoiseBranchSet | None = None
+    graph_image: _BagelDenoiseGraphImage | None = None
+
+
+@dataclass(slots=True)
+class _BagelDenoiseGraphImage:
+    token_h: int
+    token_w: int
+    height: int
+    width: int
+    cond_cache: PagedTextCache | None = None
+    tu_cache: PagedTextCache | None = None
+    iu_cache: PagedTextCache | None = None
 
 
 # BAGEL's start-of-image marker string (token id 151652 in the Qwen2 vocab).
@@ -900,6 +944,9 @@ class BagelForUnifiedGeneration(UniModelBase):
         return self.generation_session.release_generated_state(int(req_id))
 
     def _release_paged_denoise_branches(self, gs: GenState) -> None:
+        if gs.graph_image is not None:
+            release_denoise_step_graphs(self, gs.graph_image)
+            gs.graph_image = None
         self.generation_session.release_paged_branches(gs)
 
     def _extend_blocks(self, op) -> list[int]:
@@ -1165,19 +1212,36 @@ class BagelForUnifiedGeneration(UniModelBase):
         commit paths that read it.
         """
         self._ensure_loaded()
+        op_list = self._prepare_text_logits_batch(ops)
+        out = self._text_driver().run_text_logits_batch(op_list)
+        self._sync_text_cache_lengths(op_list)
+        return out
+
+    def try_run_text_graph_logits_batch(self, ops):
+        """Return text logits only when the shared CUDA graph covers the batch."""
+        self._ensure_loaded()
+        op_list = self._prepare_text_logits_batch(ops)
+        out = self._text_driver().try_run_text_graph_logits_batch(op_list)
+        if out is None:
+            return None
+        self._sync_text_cache_lengths(op_list)
+        return out
+
+    def _prepare_text_logits_batch(self, ops):
         op_list = [dict(op) for op in ops]
         for op in op_list:
             st = self.interleaved_image_state(int(op["req_id"]))
             pos_range = op.get("pos_range")
             if st.cond.past is not None and pos_range:
                 st.cond.t_index = int(pos_range[0]) - 1
-        out = self._text_driver().run_text_logits_batch(op_list)
-        for op in op_list:
+        return op_list
+
+    def _sync_text_cache_lengths(self, ops) -> None:
+        for op in ops:
             r = int(op["req_id"])
             st = self.interleaved_image_state(r)
             if st.cond.past is not None:
                 self._set_length(r, int(st.cond.past.length))
-        return out
 
     def run_text_logits(self, op):
         return self.run_text_logits_batch([dict(op)])[0]
@@ -1333,6 +1397,9 @@ class BagelForUnifiedGeneration(UniModelBase):
                 )
             cond_cache.length = cond_len
             positions["cond"] = int(gs.cond_pos)
+            if gs.cfg_img_scale > 1.0:
+                caches["img_uncond"] = cond_cache
+                positions["img_uncond"] = int(gs.cond_pos)
             if gs.cfg_text_scale > 1.0:
                 tu_cache = PagedTextCache(
                     self.scratch_pool,
@@ -1362,6 +1429,15 @@ class BagelForUnifiedGeneration(UniModelBase):
             )
             return
         gs.paged_branches = PagedDenoiseBranchSet(caches=caches, positions=positions)
+        gs.graph_image = _BagelDenoiseGraphImage(
+            token_h=1,
+            token_w=int(gs.num_vae) + _BAGEL_IMAGE_MARKER_TOKENS,
+            height=int(gs.H),
+            width=int(gs.W),
+            cond_cache=caches.get("cond"),
+            tu_cache=caches.get("text_uncond"),
+            iu_cache=caches.get("img_uncond"),
+        )
 
     def prepare_denoise_step(self, req_id: int, state, op: dict) -> TextImageDenoiseStep:
         r = int(req_id)
@@ -1410,7 +1486,13 @@ class BagelForUnifiedGeneration(UniModelBase):
         del t, latent
         return self.predict_denoise_velocity(ctx, branch)
 
-    def predict_text_image_velocity_batch(self, steps, branches_by_step):
+    def predict_text_image_velocity_batch(
+        self,
+        steps,
+        branches_by_step,
+        *,
+        graph_mode: str = "auto",
+    ):
         """Batch compatible request and CFG rows into shared gen forwards.
 
         Requests may have different prompts, timesteps, latents, positions, and
@@ -1420,6 +1502,12 @@ class BagelForUnifiedGeneration(UniModelBase):
         then results are restored to the original request/branch mapping.
         """
         self._ensure_loaded()
+        if graph_mode != "eager":
+            graphed = self._predict_text_image_velocity_graph(steps, branches_by_step)
+            if graphed is not None:
+                return graphed
+            if graph_mode == "require":
+                return None
         results: list[dict[str, torch.Tensor] | None] = [None] * len(steps)
         groups: dict[
             tuple[Any, ...],
@@ -1454,6 +1542,117 @@ class BagelForUnifiedGeneration(UniModelBase):
         if any(outputs is None for outputs in results):
             raise invalid_descriptor("BAGEL denoise batching did not produce every request row")
         return [outputs for outputs in results if outputs is not None]
+
+    def _predict_text_image_velocity_graph(
+        self,
+        steps,
+        branches_by_step,
+    ) -> list[dict[str, torch.Tensor]] | None:
+        m = self._ensure_loaded().model
+        results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
+        groups: dict[tuple[Any, ...], list[tuple[int, str, DenoiseRow]]] = {}
+        for step_index, (step, branches) in enumerate(
+            zip(steps, branches_by_step, strict=True)
+        ):
+            gs = step.extra["gs"]
+            paged_branches = gs.paged_branches
+            graph_image = getattr(gs, "graph_image", None)
+            names = tuple(str(getattr(branch, "value", branch)) for branch in branches)
+            if (
+                paged_branches is None
+                or graph_image is None
+                or not paged_branches.has_all(names)
+            ):
+                return None
+            total = int(gs.num_vae) + _BAGEL_IMAGE_MARKER_TOKENS
+            embeds = m.gen_segment_embeds(
+                int(gs.num_vae),
+                gs.vae_pos_ids,
+                step.latent,
+                float(step.t.detach().float().item()),
+            )
+            positions = paged_branches.positions_tensor(
+                names,
+                device=self.device,
+                width=total,
+            )
+            step.extra["image_embeds"] = embeds.unsqueeze(0)
+            step.extra["img"] = graph_image
+            first_cache = paged_branches.caches[names[0]]
+            signature = (
+                id(first_cache.pool),
+                tuple(int(dim) for dim in embeds.shape),
+                str(embeds.device),
+                str(embeds.dtype),
+                tuple(int(dim) for dim in step.latent.shape),
+                str(step.latent.device),
+                str(step.latent.dtype),
+                tuple(int(dim) for dim in positions.shape[1:]),
+                str(positions.dtype),
+            )
+            group = groups.setdefault(signature, [])
+            for branch_index, name in enumerate(names):
+                group.append(
+                    (
+                        step_index,
+                        name,
+                        DenoiseRow(
+                            step_index=step_index,
+                            step=step,
+                            branch=name,
+                            img=graph_image,
+                            indexes=positions[branch_index],
+                            cache=paged_branches.caches[name],
+                        ),
+                    )
+                )
+
+        for group in groups.values():
+            rows = [entry[2] for entry in group]
+            group_num_vae = int(rows[0].img.token_w) - _BAGEL_IMAGE_MARKER_TOKENS
+            m.gen_segment_graph_layout(len(rows), group_num_vae)
+            velocity = maybe_run_denoise_step_graph(self, rows)
+            if not isinstance(velocity, torch.Tensor):
+                return None
+            if int(velocity.shape[0]) != len(group):
+                raise invalid_descriptor("BAGEL denoise graph rows must align with CFG rows")
+            for row_index, (step_index, name, _row) in enumerate(group):
+                results[step_index][name] = velocity[row_index]
+        return results
+
+    def interleaved_image_predict_velocity(
+        self,
+        image_embeds: torch.Tensor,
+        indexes: torch.Tensor,
+        attention_mask: Any,
+        cache: Any,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        del attention_mask, t, z, image_size
+        m = self._ensure_loaded().model
+        num_vae = int(image_token_num) - _BAGEL_IMAGE_MARKER_TOKENS
+        if num_vae <= 0:
+            raise invalid_descriptor("BAGEL denoise graph requires latent tokens")
+        if indexes.ndim != 2:
+            raise invalid_descriptor("BAGEL denoise graph positions must be token-by-row")
+        positions = indexes.transpose(0, 1).contiguous()
+        is_gen, text_idx = m.gen_segment_graph_layout(int(image_embeds.shape[0]), num_vae)
+        hidden = m.lm.forward_paged_gen_batch(
+            image_embeds,
+            positions,
+            is_gen,
+            cache,
+            text_idx=text_idx,
+        )
+        velocity = m.llm2vae(hidden[:, 1 : 1 + num_vae].to(torch.bfloat16))
+        if return_hidden:
+            return velocity, hidden
+        return velocity
 
     def _predict_denoise_velocity_request_rows(
         self,

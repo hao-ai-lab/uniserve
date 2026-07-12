@@ -58,10 +58,10 @@ class ForwardExecutor:
                     ),
                     allow_capture=policy.allow_capture,
                 )
-            except Exception:
+            except Exception as exc:
                 warning = self._warning(EagerFallbackReason.REPLAY_FAILURE, plan)
                 if policy.strict:
-                    raise StrictForwardGraphError(warning) from None
+                    raise StrictForwardGraphError(warning) from exc
                 self.fallback_recorder.record(warning, stats=stats)
             else:
                 if graph_result is not None:

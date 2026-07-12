@@ -784,6 +784,29 @@ def test_executor_strict_graph_policy_rejects_eager_fallback():
         )
 
 
+def test_executor_strict_graph_policy_preserves_graph_failure_cause():
+    root_cause = RuntimeError("capture failed")
+
+    class FailingGraphRunner:
+        def run(self, *_args, **_kwargs):
+            raise root_cause
+
+    plan = ForwardPlanBuilder().build(
+        [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=FailingGraphRunner(),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    with pytest.raises(StrictForwardGraphError) as caught:
+        executor.execute(batch, plan)
+
+    assert caught.value.__cause__ is root_cause
+
+
 def test_executor_delegated_graph_policy_does_not_record_fallback():
     recorder = EagerFallbackRecorder()
     plan = ForwardPlanBuilder().build(
