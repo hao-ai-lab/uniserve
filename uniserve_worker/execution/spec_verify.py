@@ -7,6 +7,7 @@ returns per-position verify logits for the ``TARGET_VERIFY`` forward; the system
 groups the draft rows, runs one rectangular forward per draft length, and decides
 acceptance + the next KV length here.
 """
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -53,7 +54,9 @@ def verify_speculative_tokens(
     if any(len(tokens) != 1 for tokens in text.token_ids):
         raise invalid_descriptor("speculative decode requires one committed input token per op")
     if driver.builder is None or driver.kv_pool is None:
-        raise invalid_descriptor("speculative verify requires the system ForwardBatchBuilder and KV pool")
+        raise invalid_descriptor(
+            "speculative verify requires the system ForwardBatchBuilder and KV pool"
+        )
     ctx = get_forward_context()
     device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
 
@@ -116,7 +119,11 @@ def _finalize_row(
     position_tensor = result.pop(_SAMPLED_POSITION_DEVICE_KEY, None)
     req_id = result.get("req_id")
     token_id = result.get("sampled_token_id")
-    if isinstance(token_tensor, torch.Tensor) and isinstance(req_id, int) and isinstance(token_id, int):
+    if (
+        isinstance(token_tensor, torch.Tensor)
+        and isinstance(req_id, int)
+        and isinstance(token_id, int)
+    ):
         state = request_states.get(int(req_id))
         device_token = token_tensor.detach().reshape(1)
         if device_token.device.type == "cuda":
@@ -185,7 +192,7 @@ def _verify_spec_row_greedy(
 ) -> dict[str, Any]:
     chosen = torch.argmax(logits, dim=-1)
     accepted = _accepted_greedy_prefix(chosen, spec)
-    sampled_token_tensor = chosen[accepted:accepted + 1]
+    sampled_token_tensor = chosen[accepted : accepted + 1]
     sampled_token = int(sampled_token_tensor.detach().to("cpu").item())
     next_pos = _advance_spec_kv(state, op, accepted)
     _record_spec_verify_stats(stats, len(spec), accepted, "greedy_device")
@@ -260,6 +267,7 @@ def _verify_spec_row_sequential(
             [recent],
             [allowed],
             [suppress],
+            generators=[state.device_rng(logits.device, stream="text_sampling")],
         )
         token, logprob, top = sampling_result.samples[0]
         if pos < len(spec) and int(token) == int(spec[pos]):
@@ -286,7 +294,9 @@ def _verify_spec_row_sequential(
         result["top_logprobs"] = top_logprobs
     if sampled_token_tensor is not None:
         result[_SAMPLED_TOKEN_DEVICE_KEY] = sampled_token_tensor
-        result[_SAMPLED_POSITION_DEVICE_KEY] = sampled_token_tensor.new_full((1,), next_pos, dtype=torch.long)
+        result[_SAMPLED_POSITION_DEVICE_KEY] = sampled_token_tensor.new_full(
+            (1,), next_pos, dtype=torch.long
+        )
     return result
 
 

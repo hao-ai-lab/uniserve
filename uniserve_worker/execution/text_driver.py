@@ -5,6 +5,7 @@ attention path, runs the thin model neural forward, and returns logits for the
 unified forward postprocessor. ``step`` is the full text-step entry point for
 speculative verification and decode-burst control loops.
 """
+
 from __future__ import annotations
 
 import base64
@@ -46,11 +47,11 @@ if TYPE_CHECKING:
     from ..runtime.kv_pool import PagedKVPool
 
 __all__ = [
-    'DeferredTextSeqResult',
-    'sample_logits_result',
-    'text_input_id_replacements_from_relays',
-    'TextForwardLogits',
-    'TextDriver',
+    "DeferredTextSeqResult",
+    "sample_logits_result",
+    "text_input_id_replacements_from_relays",
+    "TextForwardLogits",
+    "TextDriver",
 ]
 
 _KV_LANE = "text"
@@ -115,6 +116,7 @@ def sample_logits_result(
         allowed=op.get("allowed_tokens"),
         suppress=op.get("suppress_tokens"),
         n_logprobs=int(sp.get("n_logprobs", 0) or 0),
+        generator=state.device_rng(vocab_logits.device, stream="text_sampling"),
     )
     result: dict[str, Any] = {"req_id": int(req_id), "sampled_token_id": tok}
     if lp is not None:
@@ -179,9 +181,7 @@ class TextDriver:
             from .spec_verify import verify_speculative_tokens
 
             with profile_range("uniserve.text.speculative_verify"):
-                return verify_speculative_tokens(
-                    self, model, text, request_states
-                )
+                return verify_speculative_tokens(self, model, text, request_states)
         if _can_decode_burst(text, ops, defer_sampling=defer_sampling):
             with profile_range("uniserve.text.decode_burst"):
                 return DecodeBurstExecutor(
@@ -429,13 +429,13 @@ class TextDriver:
     ) -> list[dict[str, Any]]:
         return DecodeBurstExecutor(
             self._step_once,
-                relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
-            ).run(
-                list(first_ops),
-                request_states,
-                model,
-                defer_cpu_results=defer_cpu_results,
-            )
+            relay_placeholder_token_id=_RELAY_PLACEHOLDER_TOKEN_ID,
+        ).run(
+            list(first_ops),
+            request_states,
+            model,
+            defer_cpu_results=defer_cpu_results,
+        )
 
     def _decode_burst_graph_many(
         self,
@@ -719,16 +719,22 @@ class TextDriver:
     ) -> tuple[torch.Tensor, list[int]] | None:
         stats = ctx.stats
         builder, kv_pool = self._system_forward_runtime()
-        active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        active_graph_runner = (
+            self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        )
         start = component_timer_start(stats)
         # Pure decode uses the contiguous-relay override (fast); a mixed
         # extend+decode batch replaces only its last_sampled decode rows by index.
         relay_input_ids = relay_positions = None
         relay_replacements = None
         if text.mode == ForwardMode.DECODE:
-            relay_input_ids, relay_positions = self._decode_relay_tensors(text, request_states, device)
+            relay_input_ids, relay_positions = self._decode_relay_tensors(
+                text, request_states, device
+            )
         elif text.mode == ForwardMode.MIXED:
-            relay_replacements = text_input_id_replacements_from_relays(text, request_states, device)
+            relay_replacements = text_input_id_replacements_from_relays(
+                text, request_states, device
+            )
         record_component_elapsed(stats, "text_decode_relay", start)
         start = component_timer_start(stats)
         padded = self._graph_padded_num_tokens(text, ctx, graph_runner=active_graph_runner)
@@ -825,7 +831,9 @@ class TextDriver:
     ) -> torch.Tensor | None:
         # System-owned CUDA graphs capture/replay around the graph-unaware model;
         # a miss (or graphs disabled) falls through to the eager forward.
-        active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        active_graph_runner = (
+            self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        )
         if active_graph_runner is not None:
             logits = active_graph_runner.maybe_run(model, input_ids, positions, fb, ctx)
             if logits is not None:
@@ -861,10 +869,14 @@ class TextDriver:
         *,
         graph_runner: Any = _GRAPH_RUNNER_UNSET,
     ) -> int | None:
-        active_graph_runner = self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        active_graph_runner = (
+            self.graph_runner if graph_runner is _GRAPH_RUNNER_UNSET else graph_runner
+        )
         if active_graph_runner is None:
             return None
-        return active_graph_runner.padded_num_tokens(text, attention_backend_name=ctx.attention_backend_name)
+        return active_graph_runner.padded_num_tokens(
+            text, attention_backend_name=ctx.attention_backend_name
+        )
 
     def _advance_kv_lengths(self, text: "TextBatch", request_states: RequestStateTable) -> None:
         for req_id, pos_range in zip(text.req_ids, text.pos_ranges):
@@ -955,6 +967,10 @@ class TextDriver:
                 allowed=op.get("allowed_tokens"),
                 suppress=op.get("suppress_tokens"),
                 n_logprobs=int(state.sampling.get("n_logprobs", 0) or 0),
+                generator=state.device_rng(
+                    logits_batch.device,
+                    stream="text_sampling",
+                ),
             )
             self._store_sampled_token_relay(
                 state,
@@ -1073,12 +1089,14 @@ class TextDriver:
         recent: list[list[int] | tuple[int, ...]] = []
         allowed: list[list[int] | tuple[int, ...] | None] = []
         suppress: list[list[int] | tuple[int, ...] | None] = []
+        generators: list[torch.Generator] = []
         for op, req_id in zip(ops, req_ids):
             state = request_states.get(req_id)
             params.append(dict(state.sampling or {}))
             recent.append(op.get("recent_tokens") or [])
             allowed.append(op.get("allowed_tokens"))
             suppress.append(op.get("suppress_tokens"))
+            generators.append(state.device_rng(logits_batch.device, stream="text_sampling"))
         with profile_range("uniserve.text.apply_sampling"):
             sampling_result = apply_sampling_batched_with_device_tokens(
                 logits_batch,
@@ -1086,6 +1104,7 @@ class TextDriver:
                 recent,
                 allowed,
                 suppress,
+                generators=generators,
                 defer_cpu=defer_cpu_results,
                 enable_cuda_timing=cuda_ready_start_event is not None,
             )
@@ -1094,8 +1113,10 @@ class TextDriver:
             out: list[TextTokenOutput | DeferredTextSeqResult] = []
             for row, req_id in enumerate(req_ids):
                 state = request_states.get(req_id)
-                relay_token_tensor = sampling_result.device_tokens[row:row + 1]
-                self._store_sampled_token_relay(state, token_id=None, token_tensor=relay_token_tensor)
+                relay_token_tensor = sampling_result.device_tokens[row : row + 1]
+                self._store_sampled_token_relay(
+                    state, token_id=None, token_tensor=relay_token_tensor
+                )
                 out.append(
                     DeferredTextSeqResult(
                         req_id=req_id,
@@ -1115,7 +1136,7 @@ class TextDriver:
             self._store_sampled_token_relay(
                 request_states.get(req_id),
                 token_id=int(tok),
-                token_tensor=immediate_result.device_tokens[row:row + 1],
+                token_tensor=immediate_result.device_tokens[row : row + 1],
             )
             out.append(
                 TextTokenOutput(
@@ -1190,7 +1211,7 @@ class TextDriver:
             self._store_position_relay(
                 request_states.get(int(req_id)),
                 position_id=int(pos_range[1]),
-                position_tensor=next_positions[row:row + 1],
+                position_tensor=next_positions[row : row + 1],
             )
 
     @staticmethod
@@ -1215,15 +1236,17 @@ class TextDriver:
             position_tensor=position_tensor,
         )
 
-def _can_decode_burst(text: "TextBatch", ops: list[Mapping[str, Any]], *, defer_sampling: bool) -> bool:
+
+def _can_decode_burst(
+    text: "TextBatch", ops: list[Mapping[str, Any]], *, defer_sampling: bool
+) -> bool:
     if defer_sampling or text.mode != ForwardMode.DECODE:
         return False
     if any(text.spec_token_ids):
         return False
     try:
         return any(
-            _positive_int(op.get("decode_token_count") or 1, "decode_token_count") > 1
-            for op in ops
+            _positive_int(op.get("decode_token_count") or 1, "decode_token_count") > 1 for op in ops
         )
     except Exception:
         raise
