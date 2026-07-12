@@ -52,6 +52,7 @@ class TextDecodeGraphState:
     input_ids: torch.Tensor
     positions: torch.Tensor
     block_table: torch.Tensor
+    sequence_lens: torch.Tensor
     cache_seqlens: torch.Tensor
     graph: torch.cuda.CUDAGraph
     cache: BatchedPagedRequestCache
@@ -566,11 +567,13 @@ def _synthetic_decode_metadata(
     max_context_len: int = 0,
 ) -> TextAttentionMetadata:
     batch_size = int(batch_size)
+    cache_seqlens = cache.cache_seqlens(device=device)
     return TextAttentionMetadata(
         cache=cache,
         block_table=cache.block_table(device=device),
-        cache_seqlens=cache.cache_seqlens(device=device),
+        cache_seqlens=cache_seqlens,
         cache_seqlens_cpu=tuple(0 for _ in range(batch_size)),
+        kv_seqlens=cache_seqlens + 1,
         query_lens=torch.ones(batch_size, dtype=torch.int32, device=device),
         query_lens_cpu=tuple(1 for _ in range(batch_size)),
         kv_seqlens_cpu=tuple(1 for _ in range(batch_size)),
@@ -613,15 +616,18 @@ def make_text_decode_graph_state(
         "text_decode.block_table",
         torch.empty((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device),
     )
-    cache_seqlens = share(
-        "text_decode.cache_seqlens",
-        torch.empty(batch_size, dtype=torch.int32, device=device),
+    sequence_lens = share(
+        "text_decode.sequence_lens",
+        torch.empty(2 * batch_size, dtype=torch.int32, device=device),
     )
+    cache_seqlens = sequence_lens[:batch_size]
+    kv_seqlens = sequence_lens[batch_size:]
     state = TextDecodeGraphState(
         batch_size=batch_size,
         input_ids=long_inputs[:batch_size].view(batch_size, 1),
         positions=long_inputs[batch_size : 2 * batch_size].view(batch_size, 1),
         block_table=block_table,
+        sequence_lens=sequence_lens,
         cache_seqlens=cache_seqlens,
         graph=torch.cuda.CUDAGraph(),
         cache=graph_cache,
@@ -630,6 +636,7 @@ def make_text_decode_graph_state(
             batch_size=batch_size,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
+            kv_seqlens=kv_seqlens,
             query_lens=share(
                 "text_decode.query_lens",
                 torch.ones(batch_size, dtype=torch.int32, device=device),
@@ -696,8 +703,23 @@ def copy_text_decode_graph_inputs(
     if int(cache_seqlens.shape[0]) != actual_batch:
         raise invalid_descriptor("decode CUDA graph cache length batch mismatch")
     state.cache_seqlens[:actual_batch].copy_(cache_seqlens.to(dtype=torch.int32), non_blocking=True)
+    graph_kv_seqlens = state.metadata.kv_seqlens
+    source_kv_seqlens = attention_metadata.kv_seqlens
+    if not isinstance(graph_kv_seqlens, torch.Tensor):
+        raise invalid_descriptor("decode CUDA graph KV lengths are missing")
+    if isinstance(source_kv_seqlens, torch.Tensor):
+        if int(source_kv_seqlens.shape[0]) != actual_batch:
+            raise invalid_descriptor("decode CUDA graph KV length batch mismatch")
+        graph_kv_seqlens[:actual_batch].copy_(
+            source_kv_seqlens.to(dtype=torch.int32),
+            non_blocking=True,
+        )
+    else:
+        graph_kv_seqlens[:actual_batch].copy_(state.cache_seqlens[:actual_batch], non_blocking=True)
+        graph_kv_seqlens[:actual_batch].add_(1)
     if actual_batch < state.batch_size:
         state.cache_seqlens[actual_batch:].zero_()
+        graph_kv_seqlens[actual_batch:].fill_(1)
     decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
     decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
     if (
@@ -751,6 +773,7 @@ def copy_text_decode_graph_host_inputs(
         raise invalid_descriptor("decode CUDA graph block-table width exceeded")
 
     cache_lens = rows["cache_seqlens_cpu"]
+    kv_lens = rows["kv_seqlens_cpu"]
     decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
     decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
     page_ids: list[int] = []
@@ -844,15 +867,17 @@ def copy_text_decode_graph_host_inputs(
             state.block_table[actual_batch:].zero_()
         state.block_table_rows = block_rows_key
 
+    sequence_lens = list(cache_lens)
+    sequence_lens.extend(0 for _ in range(state.batch_size - actual_batch))
+    sequence_lens.extend(kv_lens)
+    sequence_lens.extend(1 for _ in range(state.batch_size - actual_batch))
     _copy_host_ints_to_device(
-        cache_lens,
-        state.cache_seqlens[:actual_batch],
+        sequence_lens,
+        state.sequence_lens,
         dtype=torch.int32,
         slot=staging_slot,
-        name="text_decode.cache_seqlens",
+        name="text_decode.sequence_lens",
     )
-    if actual_batch < state.batch_size:
-        state.cache_seqlens[actual_batch:].zero_()
 
     if isinstance(state.cache, BatchedPagedRequestCache):
         graph_block_rows = [list(row) for row in block_rows]
@@ -863,7 +888,7 @@ def copy_text_decode_graph_host_inputs(
         state.cache.reset_rows(graph_block_rows, graph_base_lens)
 
     cache_cpu = tuple(int(x) for x in rows["cache_seqlens_cpu"])
-    kv_cpu = tuple(int(x) for x in rows["kv_seqlens_cpu"])
+    kv_cpu = tuple(int(x) for x in kv_lens)
     if actual_batch < state.batch_size:
         cache_cpu = cache_cpu + tuple(0 for _ in range(state.batch_size - actual_batch))
         kv_cpu = kv_cpu + tuple(1 for _ in range(state.batch_size - actual_batch))

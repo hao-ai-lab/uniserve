@@ -411,6 +411,7 @@ impl EngineCore {
             commit_marker_tokens: caps.commit_marker_tokens,
             max_cfg_branches: caps.max_cfg_branches,
             scratch_capacity_tokens: caps.scratch_capacity_tokens,
+            scratch_block_size: caps.block_size,
             encoder_cache_entries: caps.encoder_cache_budget,
             generated_image_commit: self.generated_image_commit,
         }

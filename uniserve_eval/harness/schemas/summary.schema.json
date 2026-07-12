@@ -44,7 +44,7 @@
     "metrics": {"type": "object"},
     "artifact": {
       "type": "object",
-      "required": ["schema_version", "valid", "valid_marker", "checks", "contract", "declared_contract", "plan_summary", "plan_evidence"],
+      "required": ["schema_version", "valid", "valid_marker", "checks", "contract", "declared_contract", "plan_summary", "plan_evidence", "image_samples"],
       "properties": {
         "schema_version": {"type": "integer", "const": 2},
         "valid": {"type": "boolean"},
@@ -93,7 +93,9 @@
           ]
         },
         "profile_contract": {"$ref": "#/$defs/executionContract"},
-        "matrix_contract": {"$ref": "#/$defs/executionContract"}
+        "matrix_contract": {"$ref": "#/$defs/executionContract"},
+        "execution_bundle_contract": {"$ref": "#/$defs/executionBundleContract"},
+        "image_samples": {"$ref": "#/$defs/imageSampleCollectionContract"}
       }
     }
   },
@@ -105,6 +107,75 @@
         "schema_version": {"type": "integer", "const": 2},
         "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
       }
+    },
+    "fileContentContract": {
+      "type": "object",
+      "required": ["size_bytes", "sha256"],
+      "properties": {
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "imageSampleMetadata": {
+      "type": "object",
+      "required": ["sha256", "byte_size", "mime", "width", "height", "sample_filename"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "byte_size": {"type": "integer", "minimum": 1},
+        "mime": {"type": "string", "pattern": "^image/"},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "sample_filename": {"type": "string", "pattern": "^[0-9a-f]{64}\\.[a-z0-9]+$"}
+      },
+      "additionalProperties": false
+    },
+    "imageSampleCollectionContract": {
+      "type": "object",
+      "required": ["schema_version", "reference_count", "file_count", "sha256", "files"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "reference_count": {"type": "integer", "minimum": 0},
+        "file_count": {"type": "integer", "minimum": 0},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "files": {"type": "array", "items": {"$ref": "#/$defs/imageSampleMetadata"}}
+      },
+      "additionalProperties": false
+    },
+    "executionBundleContract": {
+      "type": "object",
+      "required": ["schema_version", "benchmark", "server_group", "point_files", "server_files", "fingerprint"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 2},
+        "benchmark": {"type": "string", "minLength": 1},
+        "server_group": {"type": "string", "minLength": 1},
+        "point_files": {
+          "type": "object",
+          "required": ["command.txt", "preflight.txt", "postflight.txt", "run.json", "run.log"],
+          "properties": {
+            "command.txt": {"$ref": "#/$defs/fileContentContract"},
+            "preflight.txt": {"$ref": "#/$defs/fileContentContract"},
+            "postflight.txt": {"$ref": "#/$defs/fileContentContract"},
+            "run.json": {"$ref": "#/$defs/fileContentContract"},
+            "run.log": {"$ref": "#/$defs/fileContentContract"}
+          },
+          "additionalProperties": false
+        },
+        "server_files": {
+          "type": "object",
+          "required": ["server_command.txt", "server.log", "server.exit", "pre_server_snapshot.txt", "post_server_snapshot.txt"],
+          "properties": {
+            "server_command.txt": {"$ref": "#/$defs/fileContentContract"},
+            "server.log": {"$ref": "#/$defs/fileContentContract"},
+            "server.exit": {"$ref": "#/$defs/fileContentContract"},
+            "pre_server_snapshot.txt": {"$ref": "#/$defs/fileContentContract"},
+            "post_server_snapshot.txt": {"$ref": "#/$defs/fileContentContract"}
+          },
+          "additionalProperties": false
+        },
+        "fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
     }
   }
 }

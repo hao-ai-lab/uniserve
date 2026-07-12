@@ -41,15 +41,19 @@ class ForwardGroupPlanner:
         batch_policy: BatchPolicy,
         *,
         log_text_mixed_split: Callable[[list[Mapping[str, Any]], Any], None],
+        can_run_forward: Callable[[UniForwardBatch], bool] | None = None,
     ) -> None:
         self.batch_policy = batch_policy
         self._log_text_mixed_split = log_text_mixed_split
+        self._can_run_forward = can_run_forward
 
     def groups(self, ops: list[Mapping[str, Any]]) -> list[list[tuple[int, Mapping[str, Any]]]]:
         if self.batch_policy.supports_mixed_modes:
             decision = ForwardAdmissionRouter.from_runtime_config().decide(ops)
             if decision.use_forward:
-                return [list(enumerate(ops))]
+                batch = UniForwardBatch.from_ops(ops)
+                if self._can_run_forward is None or self._can_run_forward(batch):
+                    return [list(enumerate(ops))]
             self._log_text_mixed_split(ops, decision)
             return self._mode_ordered_groups(ops)
         return self._contiguous_groups(ops)

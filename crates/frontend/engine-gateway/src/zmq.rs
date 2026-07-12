@@ -309,6 +309,7 @@ impl ZmqEngineCoreClient {
             combined.scratch_capacity_tokens = combined
                 .scratch_capacity_tokens
                 .min(caps.scratch_capacity_tokens);
+            combined.scratch_block_size = combined.scratch_block_size.max(caps.scratch_block_size);
             combined.encoder_cache_entries = combined
                 .encoder_cache_entries
                 .min(caps.encoder_cache_entries);

@@ -104,6 +104,7 @@ fn generation_request(
         commit_marker_tokens: 2,
         max_cfg_branches: 3,
         scratch_capacity_tokens: 1 << 20,
+        scratch_block_size: 64,
         encoder_cache_entries: 256,
         generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
             inline: true,
@@ -112,6 +113,7 @@ fn generation_request(
     };
     let resources = GenerationResourceBounds::conservative(
         &context,
+        &[],
         &behavior,
         &policy,
         &image,

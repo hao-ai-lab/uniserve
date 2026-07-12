@@ -40,7 +40,7 @@ def test_drop_request_leaves_no_resident_state():
 def test_model_runner_default_resource_runtime_enforces_model_totals():
     from uniserve_worker.contracts.model_protocols import ModelHooks
     from uniserve_worker.contracts.resource_plan import ResourcePlan
-    from uniserve_worker.execution.runner import ModelRunner
+    from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 
     class TinyBlockModel(ModelHooks):
         resource_plan = ResourcePlan(kv_block="per_block")
@@ -50,7 +50,7 @@ def test_model_runner_default_resource_runtime_enforces_model_totals():
         def forward(self, batch):  # pragma: no cover - admission fails first.
             raise AssertionError("unreachable")
 
-    runner = ModelRunner(TinyBlockModel())
+    runner = ModelRunner(TinyBlockModel(), config=RunnerConfig(simulation=True))
     with pytest.raises(WorkerError) as exc:
         runner.execute(
             {
@@ -65,7 +65,7 @@ def test_model_runner_default_resource_runtime_enforces_model_totals():
 
 
 def test_model_runner_resource_runtime_tracks_blocks_latents_and_drop():
-    driver = RunnerDriver(StubUniModel(), block_size=256)
+    driver = RunnerDriver(StubUniModel(), block_size=256, simulation=True)
     driver.execute(
         {
             "step_id": 1,
@@ -117,7 +117,7 @@ def test_model_runner_resource_runtime_tracks_blocks_latents_and_drop():
 
 
 def test_model_runner_denoise_scratch_is_one_live_lease_per_cfg_branch():
-    driver = RunnerDriver(StubUniModel(), block_size=256)
+    driver = RunnerDriver(StubUniModel(), block_size=256, simulation=True)
     driver.execute(
         {
             "step_id": 1,
@@ -206,7 +206,7 @@ def test_model_runner_rejects_kv_blocks_beyond_declared_capacity():
 
 
 def test_model_runner_rolls_back_denoise_latent_if_scratch_admission_fails():
-    driver = RunnerDriver(StubUniModel(), block_size=256)
+    driver = RunnerDriver(StubUniModel(), block_size=256, simulation=True)
     driver.runner.resource_runtime.totals["image_latent"] = 64
     driver.runner.resource_runtime.totals["scratch"] = 0
 
@@ -249,7 +249,7 @@ def test_model_runner_rolls_back_denoise_latent_if_scratch_admission_fails():
 
 
 def test_model_runner_uses_resource_plan_latent_downsample_for_image_accounting():
-    driver = RunnerDriver(StubUniModel(), block_size=256)
+    driver = RunnerDriver(StubUniModel(), block_size=256, simulation=True)
     from uniserve_worker.contracts.resource_plan import LatentTokens, PerBranch, ResourcePlan
 
     driver.model.resource_plan = ResourcePlan(

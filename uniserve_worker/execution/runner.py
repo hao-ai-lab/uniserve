@@ -107,6 +107,7 @@ class RunnerConfig:
     multimodal_processor: Any | None = None
     defer_sampling: bool = False
     tensor_store: Any | None = None
+    simulation: bool = False
 
 
 @dataclass
@@ -120,6 +121,7 @@ class _ResolvedRunnerDeps:
     multimodal_processor: Any | None
     defer_sampling: bool
     tensor_store: Any | None
+    simulation: bool
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,7 @@ class ModelRunner:
         # Off = sample inline (default).
         self.defer_sampling = bool(deps.defer_sampling) and deps.tensor_store is not None
         self.tensor_store = deps.tensor_store
+        self.simulation = bool(deps.simulation)
         self.batch_policy = deps.batch_policy or self._model_batch_policy()
         self.attention_backend, self.attention_backend_name = self._resolve_attention_backend(
             deps.attention_backend
@@ -192,6 +195,7 @@ class ModelRunner:
         self._group_planner = ForwardGroupPlanner(
             self.batch_policy,
             log_text_mixed_split=self._log_text_mixed_split,
+            can_run_forward=self.forward_adapter.can_run_forward,
         )
         self._step_executor = ForwardStepExecutor(self, group_planner=self._group_planner)
 
@@ -211,7 +215,7 @@ class ModelRunner:
         )
         self.forward_graph_policy = ForwardGraphPolicy(
             prefer_graph=bool(get_worker_config().cuda_graph),
-            strict=env_flag("UNISERVE_STRICT_FORWARD_GRAPH"),
+            strict=not self.simulation,
         )
         self.forward_graph_runner = self._build_forward_graph_runner(model)
         self.forward_fallback_recorder = EagerFallbackRecorder()
@@ -269,6 +273,7 @@ class ModelRunner:
             PackedVisibleGraphProgram(
                 owner=model,
                 request_states=self.request_states,
+                image_decode_driver=self.image_decode_driver,
             )
         )
         if callable(getattr(model, "try_run_text_graph_logits_batch", None)):
@@ -368,6 +373,7 @@ class ModelRunner:
             ),
             defer_sampling=defer_sampling or config.defer_sampling,
             tensor_store=tensor_store if tensor_store is not None else config.tensor_store,
+            simulation=bool(config.simulation),
         )
 
     @staticmethod

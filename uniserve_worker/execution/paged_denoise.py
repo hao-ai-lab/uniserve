@@ -1,4 +1,5 @@
 """Shared capability probes for paged denoise attention."""
+
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
@@ -13,7 +14,23 @@ from ..contracts.forward_context import get_forward_context
 from ..nn.attention import RadixAttention
 from ..runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
-__all__ = ["PagedDenoiseBranchSet", "can_run_paged_denoise_attention"]
+__all__ = [
+    "PagedDenoiseBranchSet",
+    "batched_paged_denoise_cache",
+    "can_run_paged_denoise_attention",
+]
+
+
+def _branch_key(branch: Any) -> str:
+    return str(getattr(branch, "value", branch))
+
+
+def batched_paged_denoise_cache(
+    caches: Sequence[PagedTextCache],
+) -> BatchedPagedTextCache:
+    """Construct the system-owned batched view for compatible denoise rows."""
+
+    return BatchedPagedTextCache(list(caches))
 
 
 @dataclass
@@ -24,25 +41,25 @@ class PagedDenoiseBranchSet:
     positions: Mapping[str, int]
     _batched: dict[tuple[str, ...], BatchedPagedTextCache] = field(default_factory=dict)
 
-    def has_all(self, branches: Sequence[str]) -> bool:
-        return all(str(branch) in self.caches for branch in branches)
+    def has_all(self, branches: Sequence[Any]) -> bool:
+        return all(_branch_key(branch) in self.caches for branch in branches)
 
-    def batched_cache(self, branches: Sequence[str]) -> BatchedPagedTextCache:
-        key = tuple(str(branch) for branch in branches)
+    def batched_cache(self, branches: Sequence[Any]) -> BatchedPagedTextCache:
+        key = tuple(_branch_key(branch) for branch in branches)
         batched = self._batched.get(key)
         if batched is None:
-            batched = BatchedPagedTextCache([self.caches[branch] for branch in key])
+            batched = batched_paged_denoise_cache([self.caches[branch] for branch in key])
             self._batched[key] = batched
         return batched
 
     def positions_tensor(
         self,
-        branches: Sequence[str],
+        branches: Sequence[Any],
         *,
         device: torch.device | str,
         width: int,
     ) -> torch.Tensor:
-        key = tuple(str(branch) for branch in branches)
+        key = tuple(_branch_key(branch) for branch in branches)
         return (
             torch.tensor(
                 [int(self.positions[branch]) for branch in key],
@@ -69,6 +86,8 @@ def can_run_paged_denoise_attention(
     *,
     prototype: torch.Tensor,
     query_width: int | None = None,
+    query_tokens: int | None = None,
+    batch_size: int | None = None,
     attention_backend: str | None = None,
 ) -> bool:
     """Return whether the active backend can run transient paged-varlen denoise.
@@ -93,12 +112,18 @@ def can_run_paged_denoise_attention(
     request_cache = getattr(cache, "request_cache_for_transient", None)
     if not callable(request_cache):
         return False
-    n_tokens = int(prototype.shape[-2])
+    n_tokens = int(query_tokens if query_tokens is not None else prototype.shape[-2])
     if n_tokens <= 1:
         return False
     view = request_cache(0, n_tokens)
-    batch = int(prototype.shape[0])
-    width = int(query_width if query_width is not None else getattr(pool, "head_dim", 0) or prototype.shape[-1])
+    batch = int(batch_size if batch_size is not None else prototype.shape[0])
+    if batch <= 0:
+        return False
+    width = int(
+        query_width
+        if query_width is not None
+        else getattr(pool, "head_dim", 0) or prototype.shape[-1]
+    )
     q_shape_probe = prototype.new_empty((batch, 1, n_tokens, width))
     metadata = RadixAttention._transient_varlen_metadata(view, q_shape_probe)
     if metadata is None:

@@ -4,7 +4,7 @@
 comparison reproduces from a clean checkout with zero downloads; ``image-dir``
 loads real photos from a local directory when representativeness matters more
 than hermeticity. Both emit rows shaped for the i2t task:
-``{"id", "prompt", "input_image_b64", "width", "height"}``.
+``{"id", "prompt", "input_image_b64", "input_image_mime", "width", "height"}``.
 """
 from __future__ import annotations
 
@@ -64,6 +64,7 @@ def load_synthetic_images(
             "id": f"synthetic-{index}",
             "prompt": question,
             "input_image_b64": _synthetic_png_b64(index, seed, width, height),
+            "input_image_mime": "image/png",
             "width": width,
             "height": height,
         }
@@ -94,11 +95,24 @@ def load_image_dir(
         files = rng.sample(files, num_prompts)
     rows = []
     for index, file in enumerate(files):
+        image_bytes = file.read_bytes()
         rows.append(
             {
                 "id": f"image-dir-{index}-{file.stem}",
                 "prompt": question,
-                "input_image_b64": base64.b64encode(file.read_bytes()).decode(),
+                "input_image_b64": base64.b64encode(image_bytes).decode(),
+                "input_image_mime": _image_mime(image_bytes, file),
             }
         )
     return rows
+
+
+def _image_mime(image_bytes: bytes, path: Path) -> str:
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image_format = (image.format or "").upper()
+    mime = Image.MIME.get(image_format)
+    if not mime:
+        raise ValueError(f"unsupported image format for {path}")
+    return mime

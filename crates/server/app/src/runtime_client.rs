@@ -479,6 +479,7 @@ mod tests {
         };
         request.resources = GenerationResourceBounds::conservative(
             &request.context,
+            &request.negative_context,
             &request.behavior,
             &request.policy,
             &request.image,

@@ -13,6 +13,7 @@ reported numbers) match SGLang given the same seed, tokenizer, and
 * ``output_len = len(tokenizer.encode(completion))`` unless a fixed length is set;
 * prune ``prompt_len < 2`` or ``output_len < 2``; optional context-len upper cap.
 """
+
 from __future__ import annotations
 
 import json
@@ -43,6 +44,7 @@ def load_sharegpt(
     fixed_output_len: int | None = None,
     context_len: int | None = None,
     seed: int = 42,
+    revision: str | None = None,
 ) -> list[dict[str, Any]]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -55,6 +57,7 @@ def load_sharegpt(
             repo_id=SHAREGPT_REPO_ID,
             filename=SHAREGPT_FILENAME,
             repo_type="dataset",
+            revision=revision,
         )
 
     with open(path, encoding="utf-8") as handle:
@@ -101,7 +104,5 @@ def load_sharegpt(
         )
 
     if not rows:
-        raise ValueError(
-            f"ShareGPT source yielded no usable rows for num_prompts={num_requests}"
-        )
+        raise ValueError(f"ShareGPT source yielded no usable rows for num_prompts={num_requests}")
     return rows

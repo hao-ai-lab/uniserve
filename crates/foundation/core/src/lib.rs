@@ -16,7 +16,8 @@ pub use generation::{
     GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
     GenerationRuntimeCapabilities, GrammarSpec, ImageIngestRecipe, ImageIngestStep, ImageKvEffect,
     ImageSegment, OpKind, SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor,
-    UndTokenAction, UndVisibility, VisibilityPolicyDescriptor, encoder_cache_key,
+    UndTokenAction, UndVisibility, VisibilityPolicyDescriptor, denoise_scratch_tokens,
+    encoder_cache_key,
 };
 pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs};
 

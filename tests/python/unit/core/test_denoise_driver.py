@@ -10,7 +10,7 @@ from uniserve_worker.execution.denoise_driver import (
     TextImageDenoiseStep,
     text_image_cfg_branch_count,
 )
-from uniserve_worker.execution.runner import ModelRunner
+from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 from uniserve_worker.nn.diffusion import combine_text_image_cfg
 from uniserve_worker.runtime.request_state import RequestState
 
@@ -32,7 +32,7 @@ class VelocityOnlyModel(ModelHooks):
 
 def test_runner_denoise_driver_threads_rng_cfg_and_cursor():
     model = VelocityOnlyModel()
-    runner = ModelRunner(model)
+    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
     batch = {
         "step_id": 1,
         "new_reqs": [
@@ -176,7 +176,7 @@ class BatchedTextImageCapabilityModel(ModelHooks):
 
 def test_runner_denoise_group_uses_text_image_batch_hook_once():
     model = BatchedTextImageCapabilityModel()
-    runner = ModelRunner(model)
+    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
 
     result = runner.execute(
         {

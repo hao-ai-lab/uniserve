@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from .resources import ResourceRuntime
 
 __all__ = [
+    "DEFAULT_ENCODER_CACHE_BUDGET",
     "KvCacheSpec",
     "GenResidencySpec",
     "KvPool",
@@ -33,6 +34,8 @@ __all__ = [
     "ResidencyManager",
     "encoder_handle_from_mm_hash",
 ]
+
+DEFAULT_ENCODER_CACHE_BUDGET = 256
 
 # The system-facing name for the physical paged KV pool. The implementation is
 # ``PagedKVPool`` (paged, FP8-store-capable); the worker runtime constructs and
@@ -167,6 +170,7 @@ class GenResidencySpec:
     # Tower coordinate the gen-scratch pool is Pinned to (the gen tower); recorded
     # on the pool so the snapshot reshard knows its destination coordinate.
     gen_tower_coord: int | None = None
+    encoder_cache_budget: int = 0
 
 
 class ResidencyManager:
@@ -185,6 +189,7 @@ class ResidencyManager:
         scratch: Any | None = None,
         gen_scratch: Any | None = None,
         encoder: Any | None = None,
+        encoder_cache_budget: int = 0,
         ledger: "ResourceRuntime | None" = None,
     ) -> None:
         self.kv = kv
@@ -195,7 +200,9 @@ class ResidencyManager:
         self.latent = latent if latent is not None else LatentPool()      # image_latent class
         self.scratch = scratch        # ScratchKvPool: per-CFG-branch uncond KV (scratch class)
         self.gen_scratch = gen_scratch  # gen-device scratch (tower-axis generation pool)
-        self.encoder = encoder if encoder is not None else EncoderCache()  # encoder_output class
+        self.encoder = (
+            encoder if encoder is not None else EncoderCache(encoder_cache_budget)
+        )  # encoder_output class
         self.ledger = ledger
 
     @classmethod
@@ -280,7 +287,7 @@ class ResidencyManager:
             scratch=scratch,
             gen_scratch=gen_scratch,
             latent=LatentPool(),
-            encoder=EncoderCache(),
+            encoder_cache_budget=spec.encoder_cache_budget,
         )
 
     def kv_pool(self) -> PagedKVPool:

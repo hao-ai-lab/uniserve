@@ -8,7 +8,7 @@ import torch
 from ...contracts.forward_context import get_forward_context
 from ...foundation.runtime_config import get_worker_config
 from .base import AttentionCapabilities
-from .flashinfer_kernels import _write_decode_token
+from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
 from .registry import register_attention_backend
 
@@ -102,7 +102,12 @@ class TRTLLMMHAAttentionBackend:
             k,
             v,
         )
-        effective_seqlens = inputs.cache_seqlens + current_tokens
+        metadata = getattr(get_forward_context(), "attention_metadata", None)
+        effective_seqlens = _decode_effective_seqlens(
+            inputs.cache_seqlens,
+            current_tokens,
+            metadata,
+        )
         page_size = int(k_cache.shape[1])
         max_seq_len = _metadata_context_len(max(1, int(inputs.block_table.shape[1]) * page_size))
         out = _trtllm_decode(
@@ -215,8 +220,8 @@ class TRTLLMMHAAttentionBackend:
             return 0
         if k is None or v is None:
             raise ValueError("trtllm_mha paged update requires both k and v")
-        k_bhd = normalize_kv(k, QKVLayout.BHD)
-        v_bhd = normalize_kv(v, QKVLayout.BHD)
+        k_bhd = normalize_kv(k, QKVLayout.BHD, contiguous=False)
+        v_bhd = normalize_kv(v, QKVLayout.BHD, contiguous=False)
         if k_bhd.shape != v_bhd.shape:
             raise ValueError("current paged K/V tensors must have matching shapes")
         if k_bhd.shape[0] != q_bhd.shape[0]:

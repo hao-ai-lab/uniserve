@@ -1,15 +1,57 @@
-# Serving Evaluation (`uniserve-eval`)
+# Serving evaluation
 
-`uniserve_eval` owns profile-driven serving checks and small perf tripwires.
-The official benchmark matrix is defined in the same profile file and executed
-by `scripts/run_benchmarks.py`; see `docs/benchmark-protocol.md` for benchmark
-policy.
+`uniserve_eval` provides profile-driven correctness checks, serving workloads, and cross-runtime benchmark comparisons. [`uniserve_eval/profiles.json`](../uniserve_eval/profiles.json) is the executable configuration, and [`benchmark-protocol.md`](benchmark-protocol.md) defines the benchmark semantics.
 
-Everything tracked is declared in `uniserve_eval/profiles.json`. Local model,
-dataset, SGLang, and vllm-omni paths come from environment variables, not from
-tracked profile values.
+## Benchmark entry
 
-## Commands
+Run the configured 43-point matrix through one command:
+
+```bash
+.venv/bin/python scripts/run_benchmarks.py \
+  --benchmark main \
+  --output-root artifacts/benchmark
+```
+
+Select complete backend groups with `--only`, inspect generated commands with `--dry-run --no-build`, or continue a partially completed root with `--resume`. `--repeat N` wraps the selected matrix in serial child runs. `--text-canary` and `--image-smoke` add optional numerical diagnostics.
+
+`--formal` enables the repository, hardware, revision, process, GPU, build, and execution-identity checks defined by the canonical profile. It requires an explicit empty output root and complete comparison pairs.
+
+## Execution model
+
+The runner holds a host-wide lock. Each matrix point starts a fresh server, launches one harness against it, stops the server, validates the resulting artifact, and only then advances to the next point. Backend groups, workload points, load cases, and repeated matrices are never run concurrently.
+
+The runner writes `COMMANDS.md`, point-local artifacts, server logs and snapshots, `results.json`, and `results.md` beneath the selected root. Candidate/reference ratios are reported only when both point artifacts exist and the fixed-work comparison passes.
+
+## Configuration
+
+| Section | Contents |
+| --- | --- |
+| `shared` | Environment-variable descriptions |
+| `servers` | UniServe and reference launch specifications |
+| `workloads` | Correctness and small regression workloads |
+| `suites` | Ordered workload collections |
+| `benchmarks` | Workload points, backend roles, named load cases, datasets, and hardware requirements |
+
+Server profiles either declare a UniServe model plus `serve_args` or an explicit reference command. Environment variables expand at launch, unresolved required values fail before execution, and inherited server lists represent complete effective values.
+
+The main matrix uses these environment variables where applicable:
+
+- `UNISERVE_QWEN3_MODEL`
+- `UNISERVE_SENSENOVA_MODEL`
+- `UNISERVE_BAGEL_MODEL`
+- `UNISERVE_SGLANG_PYTHON`
+- `UNISERVE_OMNI_VLLM`
+- `UNISERVE_BENCH_CUDA_VISIBLE_DEVICES`
+
+## Artifact integrity
+
+Each harness point retains normalized request records, GPU samples, summary, manifest, command, log, and process snapshots. Generated images use content-addressed files bound to request metadata. Matrix artifacts also bind the active profile definition, named load case, selected rows, normalized request semantics, server and harness execution identity, model content, source revision where declared, selected accelerator, and support files.
+
+Only complete canonical artifacts are included in `results.json`. Interrupted, failed, or structurally inconsistent points remain in their point directories for diagnosis and are not incorporated into comparisons.
+
+## Focused checks
+
+The `uniserve-eval` command runs focused correctness and regression workloads:
 
 ```bash
 uniserve-eval list
@@ -17,101 +59,6 @@ uniserve-eval launch gate/server/sensenova
 uniserve-eval verify gate/sensenova/default-travel
 uniserve-eval perf perf/tripwire/bagel/i2t
 uniserve-eval run gate/all --manage-servers
-uniserve-eval clean --all
-
-.venv/bin/python scripts/run_benchmarks.py --benchmark main --dry-run --no-build
 ```
 
-## Profile Sections
-
-| section | purpose |
-|---|---|
-| `shared` | Documented environment variables, shared load axes, and common server knobs. |
-| `servers` | Launch specs. Namespace prefixes separate `benchmark/server/...` from `gate/server/...`. |
-| `workloads` | Correctness gates and small perf tripwires. |
-| `suites` | Ordered workload groups for `uniserve-eval run`. |
-| `benchmarks` | Official benchmark matrices consumed by `scripts/run_benchmarks.py`. |
-
-Server specs may either declare a UniServe model plus `serve_args`, or an
-explicit command for another backend. Environment variables in profile values
-are expanded at launch; unresolved variables fail before a server starts.
-
-The typed native serving boundary is `POST /inference/v1/native/generate`. It accepts ordered text, token-ID, and image context segments and streams canonical native lifecycle events over SSE. The retired compatibility path `POST /generate` remains unmounted; OpenAI clients use `/v1/chat/completions`, `/v1/completions`, or `/v1/images/generations`.
-
-## Namespaces
-
-- `benchmark/server/...`: servers used by the official benchmark matrix.
-- `gate/server/...`: servers for correctness gates and small tripwires.
-- `gate/...`: chat-completions correctness workloads.
-- `perf/tripwire/...`: small regression sentinels, not headline numbers.
-- `benchmarks.main`: the current benchmark matrix.
-
-The namespace is part of the contract. Official benchmark workloads are defined
-once in `benchmarks.main`.
-
-## Workload Types
-
-### `verify`
-
-Chat-completions correctness gates. The verifier posts OpenAI-compatible chat payloads to `/v1/chat/completions` and checks status, OpenAI error chunks, finish reasons, terminal `[DONE]` for streamed requests, generated text, generated-image count, decoded PNG dimensions, and response shape. I2T gates can inject a deterministic synthetic image through `input_image_synthetic`.
-
-### `perf`
-
-Small harness points run through `python -m uniserve_eval.harness.cli`.
-Tripwires use loose metric bounds to catch large regressions; they are not the
-official benchmark matrix. Current tripwire load is arrival-rate based.
-
-### `script`
-
-Generic repo-local Python escape hatch with an optional expected output file.
-
-## Suites
-
-| suite | contents |
-|---|---|
-| `gate/sensenova` | SenseNova T2I, I2T, and default-generation correctness gates. |
-| `gate/bagel` | BAGEL T2I and I2T correctness gates. |
-| `gate/all` | All correctness gates. |
-| `perf/tripwire` | UniServe SenseNova/BAGEL T2I/I2T regression sentinels. |
-
-## Benchmark Matrix
-
-Run the official benchmark matrix with:
-
-```bash
-.venv/bin/python scripts/run_benchmarks.py --benchmark main
-```
-
-The matrix is under `benchmarks.main` in `profiles.json`. It uses open-loop
-arrival rates `1,2,4,8,16`; server launch commands come from the benchmark
-profiles.
-
-Dry-run mode writes the audited command set without starting servers:
-
-```bash
-.venv/bin/python scripts/run_benchmarks.py --benchmark main --dry-run --no-build
-```
-
-## Required Environment
-
-See `docs/benchmark-protocol.md` for the full table. The short version:
-
-- `UNISERVE_QWEN3_MODEL`
-- `UNISERVE_SENSENOVA_MODEL`
-- `UNISERVE_BAGEL_MODEL`
-- `UNISERVE_SHAREGPT_PATH`
-- `UNISERVE_SGLANG_PYTHON`
-- `UNISERVE_OMNI_VLLM`
-
-## Artifacts
-
-`uniserve-eval` stores suite artifacts under the configured `artifact_root`.
-The benchmark runner writes to `benchmarks.main.artifact_root` unless
-`--output-root` overrides it. Each benchmark point gets:
-
-- `command.txt`
-- `run.log`
-- `summary.json`
-- `preflight.txt`
-- `postflight.txt`
-- `samples/` when the harness saves request samples
+These checks provide implementation feedback and are separate from the benchmark matrix.

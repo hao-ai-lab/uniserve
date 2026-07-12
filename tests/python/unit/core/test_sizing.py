@@ -1,6 +1,8 @@
 """KV block sizing snapshots for shared and model-specific semantics."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from uniserve_worker.foundation.sizing import (
@@ -153,10 +155,55 @@ def test_sensenova_latent_and_scratch_capacity_scale_for_concurrent_interleave()
     assert caps.scratch_capacity_tokens >= (4096 + (65536 // 16) * 4) * 16
 
 
-def test_bagel_num_blocks_snapshot_keeps_floor_semantics():
+def test_sensenova_caps_declare_worker_owned_encoder_residency():
+    from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
+
+    model = SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
+    )
+    caps = model.caps()
+
+    assert "encoder_output" in caps.resource_classes
+    assert caps.encoder_cache_budget == model.ENCODER_CACHE_BUDGET
+    assert model.residency.encoder.budget == caps.encoder_cache_budget
+
+
+def test_bagel_caps_reserve_decode_graph_padding_block():
     from uniserve_worker.models.bagel import BagelForUnifiedGeneration
 
     model = BagelForUnifiedGeneration(config=None, device="cpu", block_size=256)
+    pool = SimpleNamespace(num_blocks=model.num_blocks)
+    model.pool = pool
 
-    assert model.caps(block_size=256, kv_token_capacity=None).num_blocks == 4096
-    assert model.caps(block_size=256, kv_token_capacity=512).num_blocks == 64
+    assert model.num_blocks == 4096
+    assert model.caps(block_size=256, kv_token_capacity=None).num_blocks == 4095
+    assert model.caps(block_size=256, kv_token_capacity=512).num_blocks == 63
+    assert model.interleaved_decode_graph_padding_block_id(pool) == 4095
+    assert model.interleaved_decode_graph_padding_block_id(object()) is None
+
+
+def test_bagel_latent_capacity_scales_for_concurrent_generation():
+    from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
+
+    model = BagelForUnifiedGeneration(
+        config=BagelConfig(max_latent_size=64),
+        device="cpu",
+        block_size=16,
+        kv_token_capacity=65536,
+    )
+
+    caps = model.caps(block_size=16, kv_token_capacity=65536)
+
+    assert caps.max_latent_size == 65536
+    assert caps.max_vae_grid_tokens == model.cfg.latent_token_capacity + caps.commit_marker_tokens
+
+
+def test_bagel_caps_bound_maximum_image_ingest_kv_writes():
+    from uniserve_worker.models.bagel import BagelForUnifiedGeneration
+
+    model = BagelForUnifiedGeneration(config=None, device="cpu", block_size=256)
+    caps = model.caps(block_size=256, kv_token_capacity=None)
+
+    max_vit_patches = (model.cfg.vit_image_size // model.cfg.vit_patch_size) ** 2
+    assert caps.max_vit_grid_tokens == max_vit_patches + caps.commit_marker_tokens
+    assert caps.max_vae_grid_tokens == model.cfg.latent_token_capacity + caps.commit_marker_tokens

@@ -47,6 +47,10 @@ from uniserve_worker.runtime.request_state import RequestStateTable
 pytestmark = pytest.mark.unit
 
 
+def test_forward_graph_policy_fails_closed_by_default():
+    assert ForwardGraphPolicy().strict is True
+
+
 def test_plan_builder_represents_text_generation_and_output_order():
     plan = ForwardPlanBuilder().build(
         [
@@ -353,6 +357,80 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
     torch.testing.assert_close(result.text_logits, torch.tensor([[3.0]]))
     assert owner.prepared == [(states.states[2], ops[1])]
     assert owner.residual.invalidated is True
+
+
+def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(monkeypatch):
+    import uniserve_worker.execution.forward.programs.packed_visible as packed_visible_programs
+
+    class RequestStates:
+        def __init__(self) -> None:
+            self.states = {3: SimpleNamespace(latent="latent")}
+
+        def get(self, req_id: int):
+            return self.states[int(req_id)]
+
+    class Owner:
+        def prepare_denoise(self, state, op):
+            return SimpleNamespace(extra={})
+
+        def packed_decoder_forward(self):
+            raise AssertionError("fake packed runner owns the graph result")
+
+        def packed_text_embeddings(self):
+            raise AssertionError("fake packed runner owns the graph result")
+
+    class ImageDecodeDriver:
+        def forward_result(self, items, model, *, row_indices):
+            assert model is owner
+            assert items == ((3, states.states[3], ops[1]),)
+            assert row_indices == (1,)
+            return ForwardResult(commit_outputs={1: {"image_hw": [4, 5]}})
+
+    owner = Owner()
+    states = RequestStates()
+    ops = [
+        {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
+        {"req_id": 3, "kind": "commit_gen"},
+    ]
+
+    def fake_run(owner_arg, dispatch_batch, states_arg, denoise_steps, **kwargs):
+        assert owner_arg is owner
+        assert states_arg is states
+        assert [dict(op) for op in dispatch_batch.ops] == ops
+        assert denoise_steps == []
+        return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
+
+    monkeypatch.setattr(packed_visible_programs, "run_packed_visible_forward_result", fake_run)
+    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
+    plan = ForwardPlanBuilder().build(
+        ops,
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+        runtime_handles=handles,
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=CudaGraphForwardRunner(
+            programs=(
+                PackedVisibleGraphProgram(
+                    owner=owner,
+                    request_states=states,
+                    image_decode_driver=ImageDecodeDriver(),
+                ),
+            )
+        ),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    result = executor.execute(
+        batch,
+        plan,
+        forward_fn=lambda _batch: (_ for _ in ()).throw(
+            AssertionError("graph-backed commit batch must not invoke eager forward")
+        ),
+    )
+
+    assert result.graph is not None and result.graph.captured
+    assert result.commit_outputs == {1: {"image_hw": [4, 5]}}
 
 
 def test_denoise_step_graph_program_runs_required_graph_mode():
@@ -865,27 +943,51 @@ def test_worker_adapter_text_path_returns_logits_without_request_state_mutation(
     assert state.decode_relay.token_tensor is None
 
 
-def test_postprocessor_text_logits_samples_relays_and_advances_kv_after_validation():
-    op = {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}
-    state = _FakeTextState()
-    request_states = _FakeRequestStates({1: state})
+def test_postprocessor_text_logits_samples_batched_relays_and_advances_kv_after_validation():
+    ops = [
+        {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
+        {"req_id": 2, "kind": "decode_und", "token_ids": [11], "pos_range": [6, 7]},
+    ]
+    states = {1: _FakeTextState(), 2: _FakeTextState()}
+    request_states = _FakeRequestStates(states)
     handles = ForwardRuntimeHandles(
         request_states=request_states,
-        values={"dispatch_batch": UniForwardBatch.from_ops([op])},
+        values={"dispatch_batch": UniForwardBatch.from_ops(ops)},
     )
-    plan = ForwardPlanBuilder().build([op], request_states=request_states, runtime_handles=handles)
+    plan = ForwardPlanBuilder().build(ops, request_states=request_states, runtime_handles=handles)
 
     outputs = ForwardPostprocessor().apply(
         plan,
-        ForwardResult(text_logits=torch.tensor([[0.0, 1.0, 7.0]], dtype=torch.float32)),
+        ForwardResult(
+            text_logits=torch.tensor(
+                [[0.0, 1.0, 7.0], [9.0, 1.0, 0.0]],
+                dtype=torch.float32,
+            )
+        ),
     )
 
     assert outputs[0].sampled_token_id == 2
-    assert state.kv_updates == [("text", 1)]
-    assert state.decode_relay.token_id == 2
-    torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long))
-    assert state.decode_relay.position_id == 1
-    torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([1], dtype=torch.long))
+    assert outputs[1].sampled_token_id == 0
+    assert states[1].kv_updates == [("text", 1)]
+    assert states[2].kv_updates == [("text", 7)]
+    assert states[1].decode_relay.token_id == 2
+    assert states[2].decode_relay.token_id == 0
+    torch.testing.assert_close(
+        states[1].decode_relay.token_tensor,
+        torch.tensor([2], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        states[2].decode_relay.token_tensor,
+        torch.tensor([0], dtype=torch.long),
+    )
+    assert states[1].decode_relay.position_id == 1
+    assert states[2].decode_relay.position_id == 7
+    first_position = states[1].decode_relay.position_tensor
+    second_position = states[2].decode_relay.position_tensor
+    torch.testing.assert_close(first_position, torch.tensor([1], dtype=torch.long))
+    torch.testing.assert_close(second_position, torch.tensor([7], dtype=torch.long))
+    assert first_position.untyped_storage().data_ptr() == second_position.untyped_storage().data_ptr()
+    assert second_position.data_ptr() - first_position.data_ptr() == first_position.element_size()
 
 
 def test_postprocessor_text_validation_failure_leaves_request_state_unchanged():

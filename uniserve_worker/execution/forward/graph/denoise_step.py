@@ -28,9 +28,8 @@ Correctness rests on three pillars:
   last graph in the shared pool is destroyed. ``capture_pool`` therefore
   returns ``None`` so each capture owns a private pool.
 
-Env gate: ``UNISERVE_DENOISE_STEP_GRAPH`` (default **off**). Replay is a net
-win when the step is CPU-launch-bound (TP4); at TP1 the eager path is already
-GPU-bound and the gate should stay off.
+The production runner is always enabled. Unsupported shapes or capture failures
+are returned to the strict graph executor as misses and fail closed.
 """
 from __future__ import annotations
 
@@ -44,7 +43,6 @@ import uniserve_worker.ops as ops
 
 from ....contracts.forward_context import get_forward_context, use_forward_context
 from ....contracts.forward_mode import ForwardMode
-from ....foundation.env import env_flag
 from ....nn.attention import RadixAttention
 from ....runtime.paged_text_cache import BatchedPagedTextCache
 from .base import GraphEvent, _GraphRunnerBase, record_graph_stats
@@ -55,13 +53,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "DENOISE_STEP_GRAPH_ENV",
     "DenoiseStepGraphRunner",
     "maybe_run_denoise_step_graph",
     "release_denoise_step_graphs",
 ]
-
-DENOISE_STEP_GRAPH_ENV = "UNISERVE_DENOISE_STEP_GRAPH"
 
 # Consecutive capture/replay failures before the runner hard-disables itself.
 _MAX_FAILURES = 2
@@ -116,11 +111,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         logger: Any = logger,
     ) -> None:
         self.name = str(name)
-        self.default_enabled = (
-            env_flag(DENOISE_STEP_GRAPH_ENV, default=False)
-            if default_enabled is None
-            else bool(default_enabled)
-        )
+        self.default_enabled = True if default_enabled is None else bool(default_enabled)
         self.default_warmup = False
         self.metric_prefix = "denoise_"
         self.logger = logger
@@ -554,8 +545,6 @@ def maybe_run_denoise_step_graph(
 
     runner = getattr(owner, _RUNNER_ATTR, None)
     if runner is None:
-        if not env_flag(DENOISE_STEP_GRAPH_ENV, default=False):
-            return None
         runner = denoise_step_graph_runner(owner)
     return runner.maybe_run_rows(owner, rows, return_hidden=return_hidden)
 

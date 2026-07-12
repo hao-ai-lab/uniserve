@@ -226,8 +226,8 @@ class Qwen3Attention(nn.Module):
             batch = int(state_shape[0])
             return (
                 q.reshape(batch, self.num_heads, self.head_dim).contiguous(),
-                k.reshape(batch, self.num_kv_heads, self.head_dim).contiguous(),
-                v.reshape(batch, self.num_kv_heads, self.head_dim).contiguous(),
+                k.reshape(batch, self.num_kv_heads, self.head_dim),
+                v.reshape(batch, self.num_kv_heads, self.head_dim),
             )
         if batched:
             batch, seq = int(state_shape[0]), int(state_shape[1])

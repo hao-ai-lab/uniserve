@@ -97,13 +97,6 @@ def _owner_max_context_len(owner: Any, pool: Any) -> int:
             return parsed
     return max(0, int(getattr(pool, "num_blocks", 0) or 0) * int(getattr(pool, "block_size", 0) or 0))
 
-
-def _blocks_for_tokens(tokens: int, block_size: int) -> int:
-    tokens = max(0, int(tokens))
-    block_size = max(1, int(block_size))
-    return (tokens + block_size - 1) // block_size
-
-
 class _InterleavedDecodeGraphPast:
     """Native-language-model ``past_key_values`` bound to a shared graph cache.
 
@@ -128,7 +121,9 @@ class _InterleavedDecodeGraphPast:
 
     def request_cache_for_update(self, layer_idx: int, n_tokens: int) -> BatchedPagedRequestCache:
         if int(n_tokens) != 1:
-            raise invalid_descriptor("interleaved decode graph supports one-token decode only")
+            raise invalid_descriptor(
+                "interleaved decode graph requires exactly one token per row"
+            )
         return self.cache
 
     def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
@@ -215,7 +210,7 @@ class InterleavedTextPrefillGraphRunner:
             default_enabled=runtime.prefill_cuda_graph,
             default_warmup=False,
             default_warmup_token_buckets=runtime.prefill_cuda_graph_warmup_tokens,
-            default_warmup_batch_sizes=(1,),
+            default_warmup_batch_sizes=runtime.cuda_graph_warmup_batches,
             metric_prefix="text_",
             logger=logger,
         )
@@ -232,18 +227,18 @@ class InterleavedTextPrefillGraphRunner:
         prep = self._prepare(driver, ops)
         if prep is None:
             return None
-        row, inputs, prepare_backend = prep
+        rows, inputs, prepare_backend = prep
         logits = self._prefill.maybe_run(
-            kv_pool=row.past_cache.pool,
-            num_blocks=int(row.past_cache.pool.num_blocks),
+            kv_pool=rows[0].past_cache.pool,
+            num_blocks=int(rows[0].past_cache.pool.num_blocks),
             num_tokens=int(inputs["num_tokens"]),
             max_kv_tokens=int(inputs["max_kv_tokens"]),
-            batch_size=1,
+            batch_size=len(rows),
             input_ids=inputs["input_ids"],
             positions=inputs["positions"],
             attention_metadata=inputs["metadata"],
             last_token_indices=inputs["last_token_indices"],
-            raw_num_tokens=row.raw_len,
+            raw_num_tokens=sum(row.raw_len for row in rows),
             ctx=get_forward_context(),
             forward_fn=lambda state: self._forward(driver, state),
             prepare_backend=prepare_backend,
@@ -256,22 +251,16 @@ class InterleavedTextPrefillGraphRunner:
                 "interleaved text prefill CUDA graph active: captured bucket(s)=%s (shared PrefillCudaGraphRunner)",
                 sorted(self._prefill.states),
             )
-        return self._commit(row, logits)
+        return self._commit(rows, logits)
 
     def _prepare(
         self,
         driver: "InterleavedTextCacheDriver",
         ops: Sequence[Mapping[str, Any]],
-    ) -> tuple[_PrefillRow, dict[str, Any], Any] | None:
+    ) -> tuple[list[_PrefillRow], dict[str, Any], Any] | None:
         if not self._prefill.enabled() or not torch.cuda.is_available():
             return None
-        if len(ops) != 1:
-            return None
-        op = dict(ops[0])
-        if mode_for_op(str(op.get("kind"))) is not ForwardMode.EXTEND:
-            return None
-        tokens = resolve_op_token_ids(op)
-        if not tokens:
+        if not ops:
             return None
         owner = driver.owner
         pool = getattr(owner, "kv_pool", None)
@@ -293,67 +282,112 @@ class InterleavedTextPrefillGraphRunner:
         if prepare_backend is None:
             return None
 
-        cache = driver.state(op).cond
-        if cache.past is not None and getattr(cache.past, "pool", None) is not pool:
-            return None
-        driver.extend_cache_blocks(cache, op)
-        driver.ensure_host_cache(cache)
-        if cache.past is None:
-            return None
-        hydrate_cached_prefix_from_op(cache, op)
-        base_len = int(cache.past.length)
-        raw_len = len(tokens)
-        raw_end = base_len + raw_len
-        cache.past.ensure_capacity(raw_end)
-        num_tokens = self._prefill.bucket_num_tokens(raw_len)
-        if _blocks_for_tokens(base_len + num_tokens, int(pool.block_size)) > _blocks_for_tokens(
-            raw_end, int(pool.block_size)
-        ):
-            return None
+        validated: list[tuple[dict[str, Any], list[int], Any]] = []
+        for raw_op in ops:
+            op = dict(raw_op)
+            if mode_for_op(str(op.get("kind"))) is not ForwardMode.EXTEND:
+                return None
+            tokens = resolve_op_token_ids(op)
+            if not tokens:
+                return None
+            cache = driver.state(op).cond
+            if cache.past is not None and getattr(cache.past, "pool", None) is not pool:
+                return None
+            validated.append((op, list(tokens), cache))
+
+        rows: list[_PrefillRow] = []
+        for op, tokens, cache in validated:
+            driver.extend_cache_blocks(cache, op)
+            driver.ensure_host_cache(cache)
+            if cache.past is None:
+                return None
+            hydrate_cached_prefix_from_op(cache, op)
+            base_len = int(cache.past.length)
+            raw_len = len(tokens)
+            cache.past.ensure_capacity(base_len + raw_len)
+            rows.append(
+                _PrefillRow(
+                    text_cache=cache,
+                    past_cache=cache.past,
+                    tokens=tokens,
+                    base_len=base_len,
+                    raw_len=raw_len,
+                    block_ids=list(cache.past.block_ids),
+                )
+            )
+
+        raw_num_tokens = sum(row.raw_len for row in rows)
+        num_tokens = self._prefill.bucket_num_tokens(raw_num_tokens)
+        padding_tokens = num_tokens - raw_num_tokens
         max_kv_tokens = self._prefill.bucket_kv_tokens(
-            base_len + num_tokens,
+            max(
+                row.base_len + row.raw_len + (padding_tokens if index == len(rows) - 1 else 0)
+                for index, row in enumerate(rows)
+            ),
             max_context_len=_owner_max_context_len(owner, pool),
         )
-        row = _PrefillRow(
-            text_cache=cache,
-            past_cache=cache.past,
-            tokens=list(tokens),
-            base_len=base_len,
-            raw_len=raw_len,
-            block_ids=list(cache.past.block_ids),
+        graph_cache = BatchedPagedRequestCache(
+            pool,
+            [row.block_ids for row in rows],
+            [row.base_len for row in rows],
         )
-        graph_cache = BatchedPagedRequestCache(pool, [row.block_ids], [base_len])
-        input_ids = torch.tensor(row.tokens, dtype=torch.long, device=device)
-        positions = torch.arange(base_len, base_len + raw_len, dtype=torch.long, device=device)
-        query_lens = torch.tensor([raw_len], dtype=torch.int32, device=device)
+        input_ids = torch.tensor(
+            [token for row in rows for token in row.tokens],
+            dtype=torch.long,
+            device=device,
+        )
+        positions = torch.cat(
+            [
+                torch.arange(
+                    row.base_len,
+                    row.base_len + row.raw_len,
+                    dtype=torch.long,
+                    device=device,
+                )
+                for row in rows
+            ]
+        )
+        query_lens_cpu = tuple(row.raw_len for row in rows)
+        cache_seqlens_cpu = tuple(row.base_len for row in rows)
+        kv_seqlens_cpu = tuple(
+            row.base_len + row.raw_len for row in rows
+        )
+        query_lens = torch.tensor(query_lens_cpu, dtype=torch.int32, device=device)
         cache_seqlens = graph_cache.cache_seqlens(device=device)
-        kv_seqlens = torch.tensor([raw_end], dtype=torch.int32, device=device)
-        cu_seqlens_q = torch.tensor([0, raw_len], dtype=torch.int32, device=device)
-        cu_seqlens_k = torch.tensor([0, raw_end], dtype=torch.int32, device=device)
+        kv_seqlens = torch.tensor(kv_seqlens_cpu, dtype=torch.int32, device=device)
+        cu_seqlens_q = torch.zeros(len(rows) + 1, dtype=torch.int32, device=device)
+        torch.cumsum(query_lens, dim=0, out=cu_seqlens_q[1:])
+        cu_seqlens_k = torch.zeros(len(rows) + 1, dtype=torch.int32, device=device)
+        torch.cumsum(kv_seqlens, dim=0, out=cu_seqlens_k[1:])
+        offsets = []
+        offset = 0
+        for row in rows:
+            offsets.append(offset + row.raw_len - 1)
+            offset += row.raw_len
         inputs = {
             "num_tokens": num_tokens,
             "max_kv_tokens": max_kv_tokens,
             "input_ids": input_ids,
             "positions": positions,
-            "last_token_indices": torch.tensor([raw_len - 1], dtype=torch.long, device=device),
+            "last_token_indices": torch.tensor(offsets, dtype=torch.long, device=device),
             "metadata": TextAttentionMetadata(
                 cache=graph_cache,
                 block_table=graph_cache.block_table(device=device),
                 cache_seqlens=cache_seqlens,
-                cache_seqlens_cpu=(base_len,),
+                cache_seqlens_cpu=cache_seqlens_cpu,
                 query_lens=query_lens,
-                query_lens_cpu=(raw_len,),
+                query_lens_cpu=query_lens_cpu,
                 kv_seqlens=kv_seqlens,
-                kv_seqlens_cpu=(raw_end,),
+                kv_seqlens_cpu=kv_seqlens_cpu,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=raw_len,
-                max_seqlen_k=raw_end,
+                max_seqlen_q=max(query_lens_cpu),
+                max_seqlen_k=max(kv_seqlens_cpu),
                 max_context_len=_owner_max_context_len(owner, pool),
                 mode=ForwardMode.EXTEND,
             ),
         }
-        return row, inputs, prepare_backend
+        return rows, inputs, prepare_backend
 
     def _sidecar_for(self, state: TextInitialPrefillGraphState) -> _PrefillSidecar:
         sidecar = self._sidecars.get(id(state))
@@ -381,21 +415,20 @@ class InterleavedTextPrefillGraphRunner:
         if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
             raise invalid_descriptor("interleaved prefill graph must return batched logits")
         batch = int(state.batch_size)
-        row_ids = torch.arange(batch, dtype=torch.long, device=logits.device)
         indices = state.last_token_indices[:batch].to(device=logits.device, dtype=torch.long)
-        return logits.index_select(0, row_ids).gather(
-            1,
-            indices.view(batch, 1, 1).expand(batch, 1, int(logits.shape[-1])),
-        ).squeeze(1)
+        return logits.reshape(-1, int(logits.shape[-1])).index_select(0, indices)
 
     @staticmethod
-    def _commit(row: _PrefillRow, logits: torch.Tensor) -> list[torch.Tensor]:
-        row_logits = logits[:1]
-        row.past_cache.length = row.base_len + row.raw_len
-        row.text_cache.t_index = row.base_len + row.raw_len - 1
-        row.text_cache.last_token_id = int(row.tokens[-1])
-        row.text_cache.last_logits = row_logits.unsqueeze(1)
-        return [row.text_cache.last_logits[:, -1, :]]
+    def _commit(rows: list[_PrefillRow], logits: torch.Tensor) -> list[torch.Tensor]:
+        outputs: list[torch.Tensor] = []
+        for row_index, row in enumerate(rows):
+            row_logits = logits[row_index : row_index + 1]
+            row.past_cache.length = row.base_len + row.raw_len
+            row.text_cache.t_index = row.base_len + row.raw_len - 1
+            row.text_cache.last_token_id = int(row.tokens[-1])
+            row.text_cache.last_logits = row_logits.unsqueeze(1)
+            outputs.append(row.text_cache.last_logits[:, -1, :])
+        return outputs
 
 
 class InterleavedTextDecodeGraphRunner:

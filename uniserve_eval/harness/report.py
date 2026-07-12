@@ -1,4 +1,5 @@
 """Summary assembly + human-readable report for a single benchmark run."""
+
 from __future__ import annotations
 
 import hashlib
@@ -10,6 +11,11 @@ from pathlib import Path
 from typing import Any, cast
 
 from .artifacts import ArtifactWriter
+from .image_outputs import (
+    ImageOutputRequirements,
+    image_output_mismatch,
+    inspect_image_bytes,
+)
 from .metrics import RequestRecord, summarize_image, summarize_stream
 from .spec import BenchmarkSpec
 
@@ -62,7 +68,7 @@ def benchmark_contract(
 
 
 _PARITY_IDENTITY_FIELDS = frozenset(
-    {"model", "name", "runtime_profile_id", "plan_evidence_policy"}
+    {"dataset_path", "model", "name", "runtime_profile_id", "plan_evidence_policy"}
 )
 
 
@@ -75,6 +81,12 @@ def benchmark_parity_contract(contract: dict[str, Any]) -> dict[str, Any]:
     normalized_spec = {
         key: value for key, value in spec.items() if key not in _PARITY_IDENTITY_FIELDS
     }
+    # Some backends expose the number of scheduler points while others expose
+    # the number of actual denoiser updates.  The point-local harness contract
+    # still binds the raw ``steps`` value sent on each wire, but cross-backend
+    # parity is defined by the explicitly declared semantic work.
+    if normalized_spec.get("denoise_updates") is not None:
+        normalized_spec.pop("steps", None)
     payload = {
         "schema_version": 1,
         "spec": normalized_spec,
@@ -108,7 +120,7 @@ def benchmark_contract_is_valid(
     )
 
 
-def canonical_summary_matches(
+def artifact_summary_matches(
     summary: Any,
     expected_contract: dict[str, Any],
     *,
@@ -123,7 +135,7 @@ def canonical_summary_matches(
     if not (
         artifact.get("schema_version") == 2
         and artifact.get("valid") is True
-        and artifact.get("valid_marker") == "canonical-valid-v2"
+        and artifact.get("valid_marker") in {"artifact-valid-v2", "canonical-valid-v2"}
         and isinstance(checks, dict)
         and bool(checks)
         and all(value is True for value in checks.values())
@@ -140,6 +152,22 @@ def canonical_summary_matches(
     )
 
 
+def canonical_summary_matches(
+    summary: Any,
+    expected_contract: dict[str, Any],
+    *,
+    profile_contract_fingerprint: str | None = None,
+) -> bool:
+    if not artifact_summary_matches(
+        summary,
+        expected_contract,
+        profile_contract_fingerprint=profile_contract_fingerprint,
+    ):
+        return False
+    assert isinstance(summary, dict)
+    return summary["artifact"].get("valid_marker") == "canonical-valid-v2"
+
+
 def record_collection_contract(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
     payload = list(records)
     return {
@@ -149,15 +177,62 @@ def record_collection_contract(records: Sequence[dict[str, Any]]) -> dict[str, A
     }
 
 
-def canonical_artifact_bundle_matches(
+def image_sample_collection_contract(
+    request_records: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Bind every generated-image reference to its unique sample file."""
+    references: list[dict[str, Any]] = []
+    files: dict[str, dict[str, Any]] = {}
+    for request in request_records:
+        request_id = request.get("request_id")
+        outputs = request.get("image_outputs", [])
+        if not isinstance(request_id, str) or not isinstance(outputs, list):
+            raise ValueError("request record has invalid image output metadata")
+        for index, output in enumerate(outputs):
+            metadata = _normalized_image_metadata(output)
+            filename = metadata["sample_filename"]
+            existing = files.get(filename)
+            if existing is not None and existing != metadata:
+                raise ValueError("one image sample filename has conflicting metadata")
+            files[filename] = metadata
+            references.append(
+                {
+                    "request_id": request_id,
+                    "image_index": index,
+                    "sample_filename": filename,
+                }
+            )
+    ordered_files = [files[name] for name in sorted(files)]
+    payload = {"references": references, "files": ordered_files}
+    return {
+        "schema_version": 1,
+        "reference_count": len(references),
+        "file_count": len(ordered_files),
+        "sha256": canonical_digest(payload),
+        "files": ordered_files,
+    }
+
+
+def summary_payload_contract(summary: dict[str, Any]) -> dict[str, Any]:
+    """Bind every result field while excluding the artifact envelope itself."""
+    payload = {key: value for key, value in summary.items() if key != "artifact"}
+    return {
+        "schema_version": 1,
+        "sha256": canonical_digest(payload),
+    }
+
+
+def _artifact_bundle_matches(
     output_dir: str | Path,
     summary: Any,
     expected_contract: dict[str, Any],
     *,
     profile_contract_fingerprint: str | None = None,
+    require_canonical: bool,
 ) -> bool:
     """Validate every durable member of a committed benchmark point."""
-    if not canonical_summary_matches(
+    summary_matches = canonical_summary_matches if require_canonical else artifact_summary_matches
+    if not summary_matches(
         summary,
         expected_contract,
         profile_contract_fingerprint=profile_contract_fingerprint,
@@ -167,12 +242,11 @@ def canonical_artifact_bundle_matches(
     artifact = summary["artifact"]
     output_path = Path(output_dir)
     try:
-        manifest = json.loads(
-            (output_path / "artifact_manifest.json").read_text(encoding="utf-8")
-        )
+        manifest = json.loads((output_path / "artifact_manifest.json").read_text(encoding="utf-8"))
         run = json.loads((output_path / "run.json").read_text(encoding="utf-8"))
         requests = _read_jsonl(output_path / "requests.jsonl")
         gpu_samples = _read_jsonl(output_path / "gpu_samples.jsonl")
+        image_samples = image_sample_collection_contract(requests)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return False
     if manifest != artifact:
@@ -188,6 +262,42 @@ def canonical_artifact_bundle_matches(
     return bool(
         artifact.get("request_records") == record_collection_contract(requests)
         and artifact.get("gpu_samples") == record_collection_contract(gpu_samples)
+        and artifact.get("image_samples") == image_samples
+        and _image_sample_files_match(output_path / "samples", image_samples)
+        and artifact.get("summary_payload") == summary_payload_contract(summary)
+    )
+
+
+def artifact_bundle_matches(
+    output_dir: str | Path,
+    summary: Any,
+    expected_contract: dict[str, Any],
+) -> bool:
+    """Validate a harness-owned bundle before a profile or matrix canonicalizes it."""
+
+    return _artifact_bundle_matches(
+        output_dir,
+        summary,
+        expected_contract,
+        require_canonical=False,
+    )
+
+
+def canonical_artifact_bundle_matches(
+    output_dir: str | Path,
+    summary: Any,
+    expected_contract: dict[str, Any],
+    *,
+    profile_contract_fingerprint: str | None = None,
+) -> bool:
+    """Validate a bundle carrying its profile or matrix execution contract."""
+
+    return _artifact_bundle_matches(
+        output_dir,
+        summary,
+        expected_contract,
+        profile_contract_fingerprint=profile_contract_fingerprint,
+        require_canonical=True,
     )
 
 
@@ -204,6 +314,73 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _image_sample_files_match(samples_dir: Path, contract: dict[str, Any]) -> bool:
+    files = contract.get("files")
+    if not isinstance(files, list) or not samples_dir.is_dir() or samples_dir.is_symlink():
+        return False
+    try:
+        entries = list(samples_dir.iterdir())
+    except OSError:
+        return False
+    if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+        return False
+    expected_names = {
+        metadata.get("sample_filename") for metadata in files if isinstance(metadata, dict)
+    }
+    if len(expected_names) != len(files) or {entry.name for entry in entries} != expected_names:
+        return False
+    try:
+        for metadata in files:
+            normalized = _normalized_image_metadata(metadata)
+            data = (samples_dir / normalized["sample_filename"]).read_bytes()
+            decoded = inspect_image_bytes(data, declared_mime=normalized["mime"])
+            if decoded.metadata_dict() != normalized:
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _normalized_image_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("image output metadata is not an object")
+    metadata = {
+        "sha256": value.get("sha256"),
+        "byte_size": value.get("byte_size"),
+        "mime": value.get("mime"),
+        "width": value.get("width"),
+        "height": value.get("height"),
+        "sample_filename": value.get("sample_filename"),
+    }
+    digest = metadata["sha256"]
+    byte_size = metadata["byte_size"]
+    width = metadata["width"]
+    height = metadata["height"]
+    filename = metadata["sample_filename"]
+    if not (
+        isinstance(digest, str)
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and isinstance(byte_size, int)
+        and not isinstance(byte_size, bool)
+        and byte_size > 0
+        and isinstance(metadata["mime"], str)
+        and metadata["mime"].startswith("image/")
+        and isinstance(width, int)
+        and not isinstance(width, bool)
+        and width > 0
+        and isinstance(height, int)
+        and not isinstance(height, bool)
+        and height > 0
+        and isinstance(filename, str)
+        and filename.startswith(f"{digest}.")
+        and "/" not in filename
+        and "\\" not in filename
+    ):
+        raise ValueError("image output metadata is invalid")
+    return metadata
+
+
 def attach_execution_contract(
     summary: dict[str, Any],
     name: str,
@@ -218,10 +395,14 @@ def attach_execution_contract(
     checks = artifact.get("checks")
     if not isinstance(checks, dict):
         raise ValueError("benchmark artifact has no validity checks")
+    was_canonical = artifact.get("valid_marker") == "canonical-valid-v2"
     artifact[name] = contract
     checks[name] = valid
     artifact["valid"] = all(value is True for value in checks.values())
-    artifact["valid_marker"] = "canonical-valid-v2" if artifact["valid"] else None
+    canonical = was_canonical or name in {"matrix_contract", "profile_contract"}
+    artifact["valid_marker"] = (
+        ("canonical-valid-v2" if canonical else "artifact-valid-v2") if artifact["valid"] else None
+    )
 
 
 def write_summary_artifacts(output_dir: str | Path, summary: dict[str, Any]) -> None:
@@ -229,6 +410,18 @@ def write_summary_artifacts(output_dir: str | Path, summary: dict[str, Any]) -> 
     artifact = summary.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError("benchmark summary has no artifact contract")
+    if isinstance(artifact.get("checks"), dict):
+        if "image_samples" not in artifact:
+            requests_path = Path(output_dir) / "requests.jsonl"
+            requests = _read_jsonl(requests_path) if requests_path.is_file() else []
+            attach_execution_contract(
+                summary,
+                "image_samples",
+                image_sample_collection_contract(requests),
+            )
+        attach_execution_contract(summary, "summary_payload", summary_payload_contract(summary))
+    else:
+        artifact["summary_payload"] = summary_payload_contract(summary)
     writer = ArtifactWriter(output_dir)
     writer.write_json("artifact_manifest.json", artifact)
     writer.write_json("summary.json", summary)
@@ -258,6 +451,13 @@ def plan_summary(spec: BenchmarkSpec) -> dict[str, Any]:
             "max_tokens": spec.max_tokens,
             "temperature": spec.temperature,
             "top_p": spec.top_p,
+            "top_k": spec.top_k,
+            "min_p": spec.min_p,
+            "repetition_penalty": spec.repetition_penalty,
+            "frequency_penalty": spec.frequency_penalty,
+            "presence_penalty": spec.presence_penalty,
+            "seed": spec.sampling_seed,
+            "chat_template_kwargs": spec.chat_template_kwargs,
             "ignore_eos": spec.ignore_eos,
             "structured_output": spec.structured_output_policy,
         },
@@ -265,6 +465,7 @@ def plan_summary(spec: BenchmarkSpec) -> dict[str, Any]:
             "width": spec.width,
             "height": spec.height,
             "steps": spec.steps,
+            "denoise_updates": spec.denoise_updates,
             "max_images": spec.max_images,
             "seed": spec.seed,
             "guidance_scale": spec.guidance_scale,
@@ -272,6 +473,8 @@ def plan_summary(spec: BenchmarkSpec) -> dict[str, Any]:
             "cfg_norm": spec.cfg_norm,
             "cfg_interval": list(spec.cfg_interval) if spec.cfg_interval is not None else None,
             "timestep_shift": spec.timestep_shift,
+            "think": spec.image_think,
+            "t_eps": spec.image_t_eps,
         },
         "cache": {
             "read": spec.cache_read_policy,
@@ -290,6 +493,7 @@ def artifact_contract(
     total_images: int,
     plan_evidence: dict[str, Any] | None,
     contract: dict[str, Any] | None,
+    generation_conformance: dict[str, Any],
 ) -> dict[str, Any]:
     expected_plan_source = spec.plan_evidence_policy
     if plan_evidence is None:
@@ -298,19 +502,23 @@ def artifact_contract(
             "plan": plan_summary(spec),
         }
     plan = plan_evidence.get("plan")
-    plan_evidence_valid = (
-        plan_evidence.get("source") == expected_plan_source
-    )
+    plan_evidence_valid = plan_evidence.get("source") == expected_plan_source
     if plan_evidence_valid and expected_plan_source == "declared_contract":
         plan_evidence_valid = isinstance(plan, dict)
     elif plan_evidence_valid and expected_plan_source == "runtime_inspection":
-        plan_evidence_valid = isinstance(plan, dict) and _runtime_plan_matches_declared_contract(
-            plan, spec
+        request = plan_evidence.get("request")
+        plan_evidence_valid = (
+            isinstance(plan, dict)
+            and isinstance(request, dict)
+            and _reference_request_matches_contract(request, spec)
+            and _runtime_plan_matches_declared_contract(plan, spec, request=request)
         )
     elif plan_evidence_valid and expected_plan_source == "reference_protocol":
         request = plan_evidence.get("request")
-        plan_evidence_valid = isinstance(request, dict) and _reference_request_matches_contract(
-            request, spec
+        plan_evidence_valid = (
+            isinstance(request, dict)
+            and plan == plan_summary(spec)
+            and _reference_request_matches_contract(request, spec)
         )
     checks = {
         "declared_request_count": request_count == spec.num_prompts,
@@ -321,12 +529,13 @@ def artifact_contract(
         >= math.ceil(ok_count * spec.acceptance_min_images_per_success),
         "plan_evidence": plan_evidence_valid,
         "contract_fingerprint": benchmark_contract_is_valid(contract, spec, request_count),
+        "generation_conformance": generation_conformance.get("valid") is True,
     }
     valid = all(checks.values())
     return {
         "schema_version": 2,
         "valid": valid,
-        "valid_marker": "canonical-valid-v2" if valid else None,
+        "valid_marker": "artifact-valid-v2" if valid else None,
         "checks": checks,
         "acceptance": {
             "minimum_successful_requests": spec.acceptance_min_success,
@@ -339,11 +548,12 @@ def artifact_contract(
         "plan_summary": plan_evidence.get("plan", plan_evidence.get("request")),
         "plan_evidence": plan_evidence,
         "contract": contract,
+        "generation_conformance": generation_conformance,
     }
 
 
 def _runtime_plan_matches_declared_contract(
-    plan: dict[str, Any], spec: BenchmarkSpec
+    plan: dict[str, Any], spec: BenchmarkSpec, *, request: dict[str, Any] | None = None
 ) -> bool:
     expected_profile = spec.runtime_profile_id
     if expected_profile == "unspecified":
@@ -367,10 +577,34 @@ def _runtime_plan_matches_declared_contract(
         return False
     if spec.max_tokens is not None and generation.get("max_tokens") != spec.max_tokens:
         return False
+    if request is not None:
+        request_generation = request.get("generation")
+        if not isinstance(request_generation, dict):
+            return False
+        requested_max = request_generation.get("max_tokens")
+        if requested_max is not None and generation.get("max_tokens") != requested_max:
+            return False
     if not _same_float(generation.get("temperature"), spec.temperature):
         return False
     if not _same_float(generation.get("top_p"), spec.top_p):
         return False
+    optional_generation_fields: dict[str, float | int | None] = {
+        "top_k": spec.top_k,
+        "min_p": spec.min_p,
+        "repetition_penalty": spec.repetition_penalty,
+        "frequency_penalty": spec.frequency_penalty,
+        "presence_penalty": spec.presence_penalty,
+        "seed": spec.sampling_seed,
+    }
+    for key, optional_expected in optional_generation_fields.items():
+        if optional_expected is None:
+            continue
+        actual = generation.get(key)
+        if isinstance(optional_expected, float):
+            if not _same_float(actual, optional_expected):
+                return False
+        elif actual != optional_expected:
+            return False
     if generation.get("ignore_eos") is not spec.ignore_eos:
         return False
     if cache.get("read_enabled") is not (spec.cache_read_policy == "enabled"):
@@ -415,9 +649,7 @@ def _runtime_plan_matches_declared_contract(
     return True
 
 
-def _reference_request_matches_contract(
-    request: dict[str, Any], spec: BenchmarkSpec
-) -> bool:
+def _reference_request_matches_contract(request: dict[str, Any], spec: BenchmarkSpec) -> bool:
     if request.get("endpoint") != spec.endpoint or request.get("kind") != spec.wire:
         return False
     if request.get("model") != spec.model or request.get("adapter") != spec.adapter_selection:
@@ -440,6 +672,25 @@ def _reference_request_matches_contract(
         actual = generation.get(key)
         if actual is not None and not _same_float(actual, expected):
             return False
+    optional_generation_fields = {
+        "top_k": spec.top_k,
+        "min_p": spec.min_p,
+        "repetition_penalty": spec.repetition_penalty,
+        "frequency_penalty": spec.frequency_penalty,
+        "presence_penalty": spec.presence_penalty,
+        "seed": spec.sampling_seed,
+    }
+    for key, expected in optional_generation_fields.items():
+        if expected is None:
+            continue
+        actual = generation.get(key)
+        if isinstance(expected, float):
+            if not _same_float(actual, expected):
+                return False
+        elif actual != expected:
+            return False
+    if generation.get("chat_template_kwargs") != spec.chat_template_kwargs:
+        return False
     actual_ignore_eos = generation.get("ignore_eos")
     if actual_ignore_eos is not None and actual_ignore_eos is not spec.ignore_eos:
         return False
@@ -470,10 +721,13 @@ def _reference_request_matches_contract(
         "guidance_scale": spec.guidance_scale,
         "image_guidance_scale": spec.image_guidance_scale,
         "timestep_shift": spec.timestep_shift,
+        "t_eps": spec.image_t_eps,
     }
     for key, expected_float in float_fields.items():
         if expected_float is not None and not _same_float(image.get(key), expected_float):
             return False
+    if spec.image_think is not None and image.get("think") is not spec.image_think:
+        return False
     if spec.cfg_interval is not None:
         actual_interval = image.get("cfg_interval")
         if not isinstance(actual_interval, (list, tuple)) or len(actual_interval) != 2:
@@ -487,8 +741,10 @@ def _reference_request_matches_contract(
 
 
 def _same_float(actual: Any, expected: float) -> bool:
-    return isinstance(actual, (int, float)) and math.isclose(
-        float(actual), float(expected), rel_tol=1e-6, abs_tol=1e-6
+    return (
+        not isinstance(actual, bool)
+        and isinstance(actual, (int, float))
+        and math.isclose(float(actual), float(expected), rel_tol=1e-6, abs_tol=1e-6)
     )
 
 
@@ -562,8 +818,103 @@ def build_summary(
         ),
         plan_evidence=plan_evidence,
         contract=contract,
+        generation_conformance=_generation_conformance(spec, records),
+    )
+    if spec.runtime_profile_id != "unspecified":
+        server_info_valid = bool(
+            isinstance(server_info, dict)
+            and isinstance(server_info.get("source_endpoint"), str)
+            and server_info.get("source_endpoint")
+            and isinstance(server_info.get("payload"), dict)
+            and server_info.get("payload")
+        )
+        summary["artifact"]["checks"]["server_info"] = server_info_valid
+        summary["artifact"]["valid"] = all(
+            value is True for value in summary["artifact"]["checks"].values()
+        )
+        summary["artifact"]["valid_marker"] = (
+            "artifact-valid-v2" if summary["artifact"]["valid"] else None
+        )
+    summary["artifact"]["image_samples"] = image_sample_collection_contract(
+        [record.record_dict() for record in records]
     )
     return summary
+
+
+def _generation_conformance(
+    spec: BenchmarkSpec,
+    records: list[RequestRecord],
+) -> dict[str, Any]:
+    successful = [record for record in records if record.success]
+    image_output_required = spec.task.value in {"t2i", "i2i", "default"}
+    if image_output_required:
+        mismatches = [
+            record.request_id for record in records if not _image_record_conforms(record, spec)
+        ]
+        return {
+            "schema_version": 1,
+            "policy": (
+                "decoded_image_within_declared_cap"
+                if spec.task.value == "default"
+                else "decoded_image_exact_declared_work"
+            ),
+            "successful_requests": len(successful),
+            "checked_requests": len(records),
+            "mismatch_count": len(mismatches),
+            "mismatched_request_ids": mismatches,
+            "valid": bool(records) and not mismatches,
+        }
+    exact_length_required = spec.task.value in {"text", "i2t"} and spec.ignore_eos
+    checked = [record for record in successful if record.requested_output_len > 0]
+    mismatches = [
+        record.request_id
+        for record in checked
+        if record.output_len != record.requested_output_len
+        or (exact_length_required and record.finish_reason != "length")
+        or record.output_len_source != "server_usage"
+        or record.prompt_len_source != "server_usage"
+    ]
+    valid = bool(successful)
+    if exact_length_required:
+        valid = valid and len(checked) == len(successful) and not mismatches
+    return {
+        "schema_version": 1,
+        "policy": "server_usage_exact_length" if exact_length_required else "successful_response",
+        "successful_requests": len(successful),
+        "checked_requests": len(checked),
+        "mismatch_count": len(mismatches),
+        "mismatched_request_ids": mismatches,
+        "valid": valid,
+    }
+
+
+def _image_record_conforms(record: RequestRecord, spec: BenchmarkSpec) -> bool:
+    requirements = ImageOutputRequirements(
+        expected=True,
+        count=(
+            record.requested_image_count
+            if record.requested_image_count is not None
+            else spec.max_images
+        ),
+        count_is_cap=(
+            record.requested_image_count_is_cap
+            if record.requested_image_count is not None
+            else spec.task.value == "default"
+        ),
+        width=(
+            record.requested_image_width if record.requested_image_width is not None else spec.width
+        ),
+        height=(
+            record.requested_image_height
+            if record.requested_image_height is not None
+            else spec.height
+        ),
+    )
+    return bool(
+        record.success
+        and record.images == len(record.decoded_images)
+        and image_output_mismatch(record.decoded_images, requirements) is None
+    )
 
 
 def _observed_endpoint(records: list[RequestRecord]) -> str | None:
@@ -606,10 +957,38 @@ def _stream_markdown(metrics: dict[str, Any]) -> list[str]:
     lines = [
         "| metric | p50 | p90 | p95 | p99 | mean |",
         "|---|---|---|---|---|---|",
-        _row("TTFT (ms)", metrics["p50_ttft_ms"], metrics["p90_ttft_ms"], metrics["p95_ttft_ms"], metrics["p99_ttft_ms"], metrics["mean_ttft_ms"]),
-        _row("TPOT (ms)", metrics["p50_tpot_ms"], metrics["p90_tpot_ms"], metrics["p95_tpot_ms"], metrics["p99_tpot_ms"], metrics["mean_tpot_ms"]),
-        _row("ITL (ms)", metrics["p50_itl_ms"], metrics["p90_itl_ms"], metrics["p95_itl_ms"], metrics["p99_itl_ms"], metrics["mean_itl_ms"]),
-        _row("E2E (ms)", metrics["p50_e2e_latency_ms"], metrics["p90_e2e_latency_ms"], metrics["p95_e2e_latency_ms"], metrics["p99_e2e_latency_ms"], metrics["mean_e2e_latency_ms"]),
+        _row(
+            "TTFT (ms)",
+            metrics["p50_ttft_ms"],
+            metrics["p90_ttft_ms"],
+            metrics["p95_ttft_ms"],
+            metrics["p99_ttft_ms"],
+            metrics["mean_ttft_ms"],
+        ),
+        _row(
+            "TPOT (ms)",
+            metrics["p50_tpot_ms"],
+            metrics["p90_tpot_ms"],
+            metrics["p95_tpot_ms"],
+            metrics["p99_tpot_ms"],
+            metrics["mean_tpot_ms"],
+        ),
+        _row(
+            "ITL (ms)",
+            metrics["p50_itl_ms"],
+            metrics["p90_itl_ms"],
+            metrics["p95_itl_ms"],
+            metrics["p99_itl_ms"],
+            metrics["mean_itl_ms"],
+        ),
+        _row(
+            "E2E (ms)",
+            metrics["p50_e2e_latency_ms"],
+            metrics["p90_e2e_latency_ms"],
+            metrics["p95_e2e_latency_ms"],
+            metrics["p99_e2e_latency_ms"],
+            metrics["mean_e2e_latency_ms"],
+        ),
         "",
         f"- output throughput: {_fmt(metrics['output_throughput'])} tok/s",
         f"- request throughput: {_fmt(metrics['request_throughput'])} req/s",
@@ -618,6 +997,13 @@ def _stream_markdown(metrics: dict[str, Any]) -> list[str]:
         f"peak tok/s: {_fmt(metrics['max_output_tokens_per_s'])}  "
         f"peak concurrent: {metrics['max_concurrent_requests']}",
     ]
+    if metrics.get("token_timing_available") is False:
+        lines.extend(
+            [
+                "",
+                "- TTFT, TPOT, and ITL: unavailable because the response did not stream token events",
+            ]
+        )
     if "images" in metrics:
         img = metrics["images"]["image_latency_ms"]
         lines += [

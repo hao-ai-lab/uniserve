@@ -1,10 +1,10 @@
 """Benchmark operating-point configuration.
 
-One :class:`BenchmarkSpec` describes exactly one operating point (task, dataset,
-arrival rate, concurrency, generation/image knobs). Sweeping across rates or
-concurrency levels is the CLI's job (one run per point), mirroring how
-``refs/sglang`` is invoked.
+One :class:`BenchmarkSpec` describes exactly one operating point: task, dataset,
+request-arrival behavior, concurrency bound, and generation controls. The matrix
+runner creates one spec for each named load case.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -77,6 +77,13 @@ class BenchmarkSpec:
     # Text generation.
     temperature: float = 0.0
     top_p: float = 1.0
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    sampling_seed: int | None = None
+    chat_template_kwargs: dict[str, object] = field(default_factory=dict)
     ignore_eos: bool = True
     max_tokens: int | None = None  # output cap; ShareGPT uses per-row output_len when None.
 
@@ -84,12 +91,15 @@ class BenchmarkSpec:
     width: int | None = None
     height: int | None = None
     steps: int | None = None
+    denoise_updates: int | None = None
     max_images: int | None = None
     guidance_scale: float | None = None
     image_guidance_scale: float | None = None
     cfg_norm: str | None = None
     cfg_interval: tuple[float, float] | None = None
     timestep_shift: float | None = None
+    image_think: bool | None = None
+    image_t_eps: float | None = None
 
     # Request/response shape for this task; see TASK_WIRES. Empty selects the
     # task's first (default) wire.
@@ -109,6 +119,7 @@ class BenchmarkSpec:
 
     # Dataset access: local file/dir override (else HF auto-download).
     dataset_path: str | None = None
+    dataset_revision: str | None = None
 
     # Per-request body extras (rarely needed).
     extra_request_body: dict = field(default_factory=dict)
@@ -148,6 +159,11 @@ class BenchmarkSpec:
             object.__setattr__(self, "name", f"{self.model}_{self.task.value}_{self.dataset}")
         if self.cfg_interval is not None and len(self.cfg_interval) != 2:
             raise ValueError("cfg_interval must contain exactly two values")
+        if self.denoise_updates is not None:
+            if self.denoise_updates < 1:
+                raise ValueError("denoise_updates must be positive")
+            if self.steps is None:
+                raise ValueError("denoise_updates requires a backend steps value")
         if self.measured_runs != 1:
             raise ValueError("one harness invocation is exactly one measured run")
         if self.plan_evidence_policy not in {
@@ -161,7 +177,9 @@ class BenchmarkSpec:
             or self.acceptance_max_failed < 0
             or self.acceptance_min_images_per_success < 0
         ):
-            raise ValueError("acceptance criteria must require success and a non-negative failure bound")
+            raise ValueError(
+                "acceptance criteria must require success and a non-negative failure bound"
+            )
 
     @property
     def is_stream_task(self) -> bool:

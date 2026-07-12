@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest
+from .base import BenchmarkTask, TaskRequest, apply_text_sampling_contract
 
 
 class TextTask(BenchmarkTask):
@@ -26,10 +26,8 @@ class TextTask(BenchmarkTask):
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "temperature": self.spec.temperature,
-            "top_p": self.spec.top_p,
-            "ignore_eos": self.spec.ignore_eos,
         }
+        apply_text_sampling_contract(payload, self.spec)
         if output_len is not None:
             payload["max_completion_tokens"] = int(output_len)
         if self.spec.extra_request_body:

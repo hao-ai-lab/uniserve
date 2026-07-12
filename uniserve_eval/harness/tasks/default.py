@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest
+from .base import BenchmarkTask, TaskRequest, apply_text_sampling_contract
 
 
 class DefaultTask(BenchmarkTask):
@@ -54,4 +54,5 @@ class DefaultTask(BenchmarkTask):
             if isinstance(extra_image, dict):
                 image_config.update(extra_image)
             payload.update(extra)
+        apply_text_sampling_contract(payload, self.spec)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat")

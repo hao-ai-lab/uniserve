@@ -7,6 +7,7 @@ arrival engine, summarizes with the task's metric family, and writes
 One ``run()`` is exactly one operating point (one rate, one concurrency); sweeps
 are the CLI's job.
 """
+
 from __future__ import annotations
 
 import time
@@ -27,6 +28,7 @@ from .report import (
     attach_execution_contract,
     benchmark_contract,
     build_summary,
+    image_sample_collection_contract,
     plan_summary,
     record_collection_contract,
     render_markdown,
@@ -61,6 +63,7 @@ class BenchmarkRunner:
     async def run(self) -> RunResult:
         for commit_marker in ("summary.json", "artifact_manifest.json", "summary.md"):
             (self.writer.output_dir / commit_marker).unlink(missing_ok=True)
+        self.writer.clear_samples()
         rows, tokenizer = load_benchmark_inputs(self.spec)
         contract = benchmark_contract(self.spec, rows)
 
@@ -89,12 +92,9 @@ class BenchmarkRunner:
                 return await self._submit(client, row)
 
             async def warmup_submit(row: dict[str, Any]) -> RequestRecord:
-                warm = {**row, "output_len": 32, "max_tokens": 32}
-                record = await self._submit(client, warm)
+                record = await self._submit(client, row)
                 # A warmup that reached the server and terminated cleanly did
-                # its job even when the capped token budget produced no visible
-                # output — e.g. a reasoning model whose hidden <think> stream
-                # consumes all 32 tokens before any content/image is emitted.
+                # its job even when a reasoning model produced no visible output.
                 if (
                     not record.success
                     and record.status_code == 200
@@ -136,6 +136,9 @@ class BenchmarkRunner:
             summary["gpu_memory"] = sampler.summary()
             gpu_samples = list(sampler.sample_records)
 
+        for record in records:
+            for image in record.decoded_images:
+                self.writer.write_image_sample(image)
         request_records = [record.record_dict() for record in records]
         attach_execution_contract(
             summary,
@@ -146,6 +149,11 @@ class BenchmarkRunner:
             summary,
             "gpu_samples",
             record_collection_contract(gpu_samples),
+        )
+        attach_execution_contract(
+            summary,
+            "image_samples",
+            image_sample_collection_contract(request_records),
         )
         self.writer.write_jsonl("requests.jsonl", request_records)
         self.writer.write_jsonl("gpu_samples.jsonl", gpu_samples)
@@ -161,7 +169,9 @@ class BenchmarkRunner:
                 "completed_at": time.time(),
             },
         )
-        (self.writer.output_dir / "summary.md").write_text(render_markdown(summary), encoding="utf-8")
+        (self.writer.output_dir / "summary.md").write_text(
+            render_markdown(summary), encoding="utf-8"
+        )
         write_summary_artifacts(self.writer.output_dir, summary)
         return RunResult(summary=summary, output_dir=self.writer.output_dir)
 
@@ -184,12 +194,16 @@ class BenchmarkRunner:
         )
 
     async def _fetch_server_info(self, client: httpx.AsyncClient) -> dict[str, Any] | None:
-        try:
-            response = await client.get(self.base_url + "/version", timeout=5.0)
-            if response.status_code == 200:
-                return response.json()
-        except Exception:  # noqa: BLE001 - server_info is best-effort context only.
-            return None
+        for endpoint in ("/server_info", "/get_server_info", "/model_info", "/version"):
+            try:
+                response = await client.get(self.base_url + endpoint, timeout=15.0)
+                if response.status_code != 200:
+                    continue
+                payload = response.json()
+                if isinstance(payload, dict):
+                    return {"source_endpoint": endpoint, "payload": payload}
+            except Exception:  # noqa: BLE001 - try the next standard inspection endpoint.
+                continue
         return None
 
     async def _collect_plan_evidence(
@@ -210,6 +224,7 @@ class BenchmarkRunner:
         if policy == "reference_protocol":
             return {
                 "source": policy,
+                "plan": plan_summary(self.spec),
                 "request": reference_request_summary(request),
             }
         plan_endpoints = {
@@ -238,6 +253,7 @@ class BenchmarkRunner:
                 "source": "runtime_inspection",
                 "endpoint": endpoint,
                 "plan": plan,
+                "request": reference_request_summary(request),
             }
         except Exception as error:  # noqa: BLE001 - the artifact records inspection failure.
             return {
@@ -276,6 +292,13 @@ def reference_request_summary(request: TaskRequest) -> dict[str, Any]:
             "max_tokens": payload.get("max_completion_tokens", payload.get("max_tokens")),
             "temperature": payload.get("temperature"),
             "top_p": payload.get("top_p"),
+            "top_k": payload.get("top_k"),
+            "min_p": payload.get("min_p"),
+            "repetition_penalty": payload.get("repetition_penalty"),
+            "frequency_penalty": payload.get("frequency_penalty"),
+            "presence_penalty": payload.get("presence_penalty"),
+            "seed": payload.get("seed"),
+            "chat_template_kwargs": payload.get("chat_template_kwargs") or {},
             "ignore_eos": payload.get("ignore_eos"),
             "structured_outputs": payload.get("structured_outputs"),
             "response_format": payload.get("response_format"),
@@ -287,17 +310,15 @@ def reference_request_summary(request: TaskRequest) -> dict[str, Any]:
             "steps_consistent": steps_consistent,
             "max_images": image_config.get("num_images", payload.get("n")),
             "seed": image_config.get("seed", payload.get("seed")),
-            "guidance_scale": image_config.get(
-                "guidance_scale", payload.get("guidance_scale")
-            ),
+            "guidance_scale": image_config.get("guidance_scale", payload.get("guidance_scale")),
             "image_guidance_scale": image_config.get(
                 "image_guidance_scale", payload.get("image_guidance_scale")
             ),
             "cfg_norm": image_config.get("cfg_norm", payload.get("cfg_norm")),
             "cfg_interval": image_config.get("cfg_interval", payload.get("cfg_interval")),
-            "timestep_shift": image_config.get(
-                "timestep_shift", payload.get("timestep_shift")
-            ),
+            "timestep_shift": image_config.get("timestep_shift", payload.get("timestep_shift")),
+            "think": image_config.get("think", payload.get("think")),
+            "t_eps": image_config.get("t_eps", payload.get("t_eps")),
         },
         "adapter": "base" if payload.get("lora_request") is None else "lora",
     }

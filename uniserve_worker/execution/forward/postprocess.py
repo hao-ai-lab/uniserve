@@ -260,13 +260,9 @@ class ForwardPostprocessor:
             return
         stats = get_forward_context().stats
         start = component_timer_start(stats)
-        for req_id, pos_range in zip(text.req_ids, text.pos_ranges, strict=True):
-            position = int(pos_range[1])
-            _DECODE_RELAY.publish_position(
-                request_states.get(int(req_id)),
-                position_id=position,
-                position_tensor=torch.tensor([position], dtype=torch.long, device=device),
-            )
+        states = [request_states.get(int(req_id)) for req_id in text.req_ids]
+        positions = [int(pos_range[1]) for pos_range in text.pos_ranges]
+        _DECODE_RELAY.publish_positions(states, position_ids=positions, device=device)
         record_component_elapsed(stats, "text_decode_position_store", start)
 
     @staticmethod

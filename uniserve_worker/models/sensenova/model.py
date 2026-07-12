@@ -24,10 +24,12 @@ from ...contracts.forward_context import get_forward_context
 from ...contracts.forward_mode import ForwardMode
 from ...contracts.resource_plan import (
     CapsDescriptor,
+    EncoderResourcePolicy,
     KvBlockResourcePolicy,
     LatentTokens,
     PerBranch,
     ResourcePlan,
+    active_latent_capacity_tokens,
 )
 from ...execution.denoise_driver import (
     DenoiseDriver,
@@ -123,6 +125,7 @@ from ...runtime.paged_text_cache import (
 )
 from ...runtime.request_state import RequestState as RunnerRequestState
 from ...runtime.residency import (
+    DEFAULT_ENCODER_CACHE_BUDGET,
     GenResidencySpec,
     KvCacheSpec,
     ResidencyManager,
@@ -1197,9 +1200,17 @@ class _SenseNovaAttention(nn.Module):
         if not callable(request_cache) or not callable(finish):
             return None
         n_tokens = int(q.shape[2])
-        if not self.attn.can_run_paged_attention(q, None):
-            metadata = getattr(get_forward_context(), "attention_metadata", None)
-            metadata_cache = getattr(metadata, "cache", None)
+        metadata = getattr(get_forward_context(), "attention_metadata", None)
+        metadata_cache = getattr(metadata, "cache", None)
+        metadata_rows = len(tuple(getattr(metadata_cache, "base_lens", ()) or ()))
+        packed_varlen = (
+            causal
+            and metadata_cache is not None
+            and getattr(past_key_values, "cache", None) is metadata_cache
+            and metadata_rows > 1
+            and int(q.shape[0]) != metadata_rows
+        )
+        if packed_varlen or not self.attn.can_run_paged_attention(q, None):
             if causal and metadata_cache is not None and getattr(past_key_values, "cache", None) is metadata_cache:
                 cache = request_cache(self.layer_idx, n_tokens)
                 try:
@@ -2515,9 +2526,11 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
     adapter_mode = "none"
     resource_plan = ResourcePlan(
         kv_block=KvBlockResourcePolicy.PER_BLOCK,
+        encoder_output=EncoderResourcePolicy.PER_HANDLE,
         image_latent=LatentTokens(downsample=16),
         scratch=PerBranch(),
     )
+    ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
     checkpoint_layout = CheckpointLayout(stacked=_SENSENOVA_STACKED_PARAMS)
     def velocity_parameterization(self) -> str:
         return "velocity"
@@ -2563,6 +2576,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         llm_cfg = self._init_token_geometry(config)
         self.resource_plan = ResourcePlan(
             kv_block=KvBlockResourcePolicy.PER_BLOCK,
+            encoder_output=EncoderResourcePolicy.PER_HANDLE,
             image_latent=LatentTokens(downsample=int(self.latent_downsample)),
             scratch=PerBranch(),
         )
@@ -2658,7 +2672,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         self.scratch_pool: PagedKVPool | None = None
         self.gen_scratch_pool: PagedKVPool | None = None
         self._scratch_blocks = 0
-        self.residency = ResidencyManager()
+        self.residency = ResidencyManager(encoder_cache_budget=self.ENCODER_CACHE_BUDGET)
 
     def _init_loaded_model_residency(
         self,
@@ -2692,6 +2706,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                     if self._tower_coords is not None
                     else None
                 ),
+                encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
             )
         )
         self.kv_pool = self.residency.kv
@@ -2733,12 +2748,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
 
     def _active_latent_capacity_tokens(self, kv_token_capacity: int | None) -> int:
         """Total concurrently resident image-latent tokens this worker advertises."""
-        per_image = int(self.max_latent_size)
-        if per_image <= 0:
-            return 0
-        if kv_token_capacity is None:
-            return per_image
-        return max(per_image, int(kv_token_capacity))
+        return active_latent_capacity_tokens(self.max_latent_size, kv_token_capacity)
 
     @classmethod
     def native_load_spec(cls) -> NativeLoadSpec:
@@ -2864,6 +2874,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             max_batch_ops=MAX_BATCH_OPS,
             attention_backend=self.attention_backend,
             kv_dtype=self._kv_dtype_name_for(torch.bfloat16),
+            encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
         )
 
     def compile_targets(self) -> tuple[CompileTarget, ...]:

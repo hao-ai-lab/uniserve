@@ -11,12 +11,16 @@ LLM-serving summary is numerically identical to ``refs/sglang``'s
 ``calculate_metrics`` (which also uses ``np.percentile`` and ``np.mean`` and
 multiplies seconds by 1000 to report milliseconds).
 """
+
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+
+from ..image_outputs import DecodedImage
 
 
 @dataclass
@@ -43,6 +47,7 @@ class RequestRecord:
     latency: float = 0.0
     ttft: float = 0.0
     itl: list[float] = field(default_factory=list)
+    token_timing_available: bool | None = None
 
     # Server-side scheduling timestamps when a stream exposes them. They are wall-clock seconds from the server process; only the duration between them is mixed with client-side durations.
     server_queued_at: float | None = None
@@ -51,6 +56,11 @@ class RequestRecord:
     # Token accounting (server-reported where available).
     prompt_len: int = 0
     output_len: int = 0
+    requested_output_len: int = 0
+    prompt_len_source: str = "request_fallback"
+    output_len_source: str = "requested_fallback"
+    cached_prompt_tokens: int | None = None
+    cached_prompt_tokens_source: str = "unavailable"
     generated_text: str = ""
     # Visible content chunks (OpenAI streaming), retained only for the optional
     # retokenized-ITL cross-check that mirrors sglang.
@@ -63,6 +73,15 @@ class RequestRecord:
     image_gen_seconds: list[float] = field(default_factory=list)
     image_steps: list[int] = field(default_factory=list)
     image_spans: list[dict[str, Any]] = field(default_factory=list)
+    generated_images_expected: bool = False
+    requested_image_count: int | None = None
+    requested_image_count_is_cap: bool = False
+    requested_image_width: int | None = None
+    requested_image_height: int | None = None
+    # Exact response bytes live only for the duration of the harness process.
+    # ``record_dict`` emits compact metadata and the runner writes the bytes to
+    # content-addressed files under ``samples/``.
+    decoded_images: list[DecodedImage] = field(default_factory=list, repr=False)
 
     status_code: int | None = None
     finish_reason: str | None = None
@@ -70,6 +89,7 @@ class RequestRecord:
 
     def record_dict(self) -> dict[str, Any]:
         """Compact per-request row for ``requests.jsonl`` (no large blobs)."""
+        generated_text_bytes = self.generated_text.encode("utf-8")
         server_queue_wait = (
             self.server_scheduled_at - self.server_queued_at
             if self.server_queued_at is not None and self.server_scheduled_at is not None
@@ -81,9 +101,7 @@ class RequestRecord:
             else None
         )
         dispatch_wait = (
-            self.start_time - self.scheduled_time
-            if self.scheduled_time is not None
-            else None
+            self.start_time - self.scheduled_time if self.scheduled_time is not None else None
         )
         stream_first_text_wait = (
             self.first_text_time - self.http_response_time
@@ -114,13 +132,9 @@ class RequestRecord:
             "client_dispatch_wait_ms": (
                 dispatch_wait * 1000.0 if dispatch_wait is not None else None
             ),
-            "http_response_ms": (
-                http_response * 1000.0 if http_response is not None else None
-            ),
+            "http_response_ms": (http_response * 1000.0 if http_response is not None else None),
             "stream_first_text_wait_ms": (
-                stream_first_text_wait * 1000.0
-                if stream_first_text_wait is not None
-                else None
+                stream_first_text_wait * 1000.0 if stream_first_text_wait is not None else None
             ),
             "server_queue_wait_ms": (
                 server_queue_wait * 1000.0 if server_queue_wait is not None else None
@@ -129,16 +143,36 @@ class RequestRecord:
                 ttft_residual * 1000.0 if ttft_residual is not None else None
             ),
             "e2e_ms": self.latency * 1000.0,
-            "ttft_ms": self.ttft * 1000.0 if self.ttft else None,
+            "token_timing_available": self.token_timing_available is not False,
+            "ttft_ms": (
+                self.ttft * 1000.0
+                if self.token_timing_available is not False and self.ttft
+                else None
+            ),
             "tpot_ms": (
                 (self.latency - self.ttft) / (self.output_len - 1) * 1000.0
-                if self.output_len > 1
+                if self.token_timing_available is not False and self.output_len > 1
                 else None
             ),
             "itl_count": len(self.itl),
             "prompt_len": self.prompt_len,
             "output_len": self.output_len,
+            "requested_output_len": self.requested_output_len,
+            "prompt_len_source": self.prompt_len_source,
+            "output_len_source": self.output_len_source,
+            "cached_prompt_tokens": self.cached_prompt_tokens,
+            "cached_prompt_tokens_source": self.cached_prompt_tokens_source,
+            "generated_text_bytes": len(generated_text_bytes),
+            "generated_text_sha256": (
+                hashlib.sha256(generated_text_bytes).hexdigest() if generated_text_bytes else None
+            ),
             "images": self.images,
+            "generated_images_expected": self.generated_images_expected,
+            "requested_image_count": self.requested_image_count,
+            "requested_image_count_is_cap": self.requested_image_count_is_cap,
+            "requested_image_width": self.requested_image_width,
+            "requested_image_height": self.requested_image_height,
+            "image_outputs": [image.metadata_dict() for image in self.decoded_images],
             "first_image_latency_ms": (
                 self.first_image_latency * 1000.0 if self.first_image_latency is not None else None
             ),

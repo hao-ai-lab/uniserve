@@ -1,4 +1,5 @@
 """BAGEL UniModel entry backed by the shared runner."""
+
 from __future__ import annotations
 
 import json
@@ -26,11 +27,16 @@ from ..contracts.resource_plan import (
     LatentTokens,
     PerBranch,
     ResourcePlan,
+    active_latent_capacity_tokens,
 )
 from ..execution.denoise_driver import TextImageDenoiseStep, text_image_cfg_branch_count
 from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
 from ..execution.model_base import UniModelBase
-from ..execution.paged_denoise import PagedDenoiseBranchSet, can_run_paged_denoise_attention
+from ..execution.paged_denoise import (
+    PagedDenoiseBranchSet,
+    batched_paged_denoise_cache,
+    can_run_paged_denoise_attention,
+)
 from ..execution.text_image_generation_session import TextImageGenerationSession
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import get_worker_config
@@ -65,12 +71,10 @@ from ..runtime.image_params import parse_text_image_generation_params
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.lora import MergeOnLoadLoRA
-from ..runtime.paged_text_cache import (
-    PagedTextCache,
-    copy_paged_text_cache_span,
-)
+from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from ..runtime.request_state import RequestState
 from ..runtime.residency import (
+    DEFAULT_ENCODER_CACHE_BUDGET,
     GenResidencySpec,
     KvCacheSpec,
     ResidencyManager,
@@ -78,12 +82,12 @@ from ..runtime.residency import (
 )
 
 __all__ = [
-    'LLMConfig',
-    'BagelConfig',
-    'GenState',
-    'BagelTextRequestState',
-    'BagelForUnifiedGeneration',
-    'EntryClass',
+    "LLMConfig",
+    "BagelConfig",
+    "GenState",
+    "BagelTextRequestState",
+    "BagelForUnifiedGeneration",
+    "EntryClass",
 ]
 
 logger = logging.getLogger(__name__)
@@ -91,6 +95,7 @@ logger = logging.getLogger(__name__)
 _BAGEL_RMS_NORM_EPS = 1e-6
 _BAGEL_ROPE_THETA = 1_000_000.0
 _BAGEL_VIT_LAYER_NORM_EPS = 1e-6
+_BAGEL_IMAGE_MARKER_TOKENS = 2
 
 
 def _weights_file(model_dir: str) -> str:
@@ -153,6 +158,10 @@ class BagelConfig:
     @property
     def latent_token_capacity(self) -> int:
         return self.max_latent_size * self.max_latent_size
+
+    @property
+    def vit_token_capacity(self) -> int:
+        return (self.vit_image_size // self.vit_patch_size) ** 2
 
     @property
     def latent_channel(self) -> int:
@@ -254,7 +263,9 @@ class _BagelGraph(nn.Module):
             self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden)
             self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim)
             self.time_embedder = TimestepEmbedder(hidden)
-            self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
+            self.latent_pos_embed = PositionEmbedding(
+                cfg.max_latent_size, hidden, init_sincos=False
+            )
             self.vae = AutoEncoder(default_ae_params())
             self.vit_model = SiglipNavitEncoder(
                 SiglipNavitConfig(
@@ -268,7 +279,9 @@ class _BagelGraph(nn.Module):
                 )
             )
             self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
-            self.vit_pos_embed = PositionEmbedding(cfg.vit_max_num_patch_per_side, hidden, init_sincos=False)
+            self.vit_pos_embed = PositionEmbedding(
+                cfg.vit_max_num_patch_per_side, hidden, init_sincos=False
+            )
 
     @property
     def num_layers(self) -> int:
@@ -313,7 +326,7 @@ class _BagelGraph(nn.Module):
             device=self.device,
         )
         marker_emb = self.embed_tokens(marker_ids).to(torch.bfloat16)
-        x_t = x_t.to(self.device)
+        x_t = x_t.to(device=self.device, dtype=torch.bfloat16)
         timesteps = torch.full((int(num_vae),), float(timestep), device=self.device)
         vae_emb = (
             self.vae2llm(x_t)
@@ -332,7 +345,9 @@ class _BagelGraph(nn.Module):
         is_gen[1 : 1 + int(num_vae)] = True
         return is_gen
 
-    def build_gen_segment(self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False) -> Segment:
+    def build_gen_segment(
+        self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False
+    ) -> Segment:
         total = int(num_vae) + 2
         embeds = self.gen_segment_embeds(num_vae, vae_pos_ids, x_t, timestep)
         positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
@@ -620,17 +635,19 @@ class BagelForUnifiedGeneration(UniModelBase):
         scratch=PerBranch(),
         adapter=AdapterResourcePolicy.PER_ADAPTER,
     )
+
     def velocity_parameterization(self) -> str:
         return "velocity"
+
     # Encoder-output cache capacity reported to the host scheduler.
-    ENCODER_CACHE_BUDGET = 256
+    ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
 
     @classmethod
     def recognizes(cls, model_path: str | Path) -> bool:
         root = Path(model_path)
-        return (
-            (root / "ema.safetensors").exists() or (root / "model.safetensors").exists()
-        ) and (root / "ae.safetensors").exists()
+        return ((root / "ema.safetensors").exists() or (root / "model.safetensors").exists()) and (
+            root / "ae.safetensors"
+        ).exists()
 
     def __init__(
         self,
@@ -649,11 +666,15 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.kv_token_capacity = int(kv_token_capacity) if kv_token_capacity is not None else None
         self.attention_backend = attention_backend or "auto"
         self.device = str(device)
-        self.cfg = model.cfg if model is not None else (
-            config if isinstance(config, BagelConfig) else BagelConfig()
+        self.cfg = (
+            model.cfg
+            if model is not None
+            else (config if isinstance(config, BagelConfig) else BagelConfig())
         )
         self.resource_plan = self._build_resource_plan()
-        self.image_processor = image_processor or (BagelImageProcessor() if model is not None else None)
+        self.image_processor = image_processor or (
+            BagelImageProcessor() if model is not None else None
+        )
         self.states: dict[int, RequestState] = {}
         self.generation_session = TextImageGenerationSession(self)
         # Interleaved-text-driver owner surface: per-request driver states plus
@@ -669,7 +690,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.img_end_id = int(self.cfg.end_of_image_id)
         self._shared_text_driver: InterleavedTextCacheDriver | None = None
         self.pool: PagedKVPool | None = None
-        self.residency = ResidencyManager()
+        self.residency = ResidencyManager(encoder_cache_budget=self.ENCODER_CACHE_BUDGET)
         self.lora: MergeOnLoadLoRA | None = None
         # engine_wide LoRA merges/unmerges mutate shared model weights in place;
         # serialize load/unload so a concurrent control op cannot interleave a
@@ -696,9 +717,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
             self.lora = MergeOnLoadLoRA(self.model)
         else:
-            self.num_blocks = derive_num_blocks(
-                self.block_size, self.kv_token_capacity, floor=64
-            )
+            self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
 
     def _build_resource_plan(self) -> ResourcePlan:
         return ResourcePlan(
@@ -731,6 +750,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                 block_size=self.block_size,
                 device=self.device,
                 scratch_num_blocks=self._scratch_blocks,
+                encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
             )
         )
 
@@ -766,22 +786,32 @@ class BagelForUnifiedGeneration(UniModelBase):
         cap = kv_token_capacity if kv_token_capacity is not None else self.kv_token_capacity
         if self.model is not None:
             cap = int(cap or self.kv_token_capacity or self.block_size * self.num_blocks)
-            num_blocks = int(self.num_blocks)
+            physical_blocks = int(self.num_blocks)
         else:
-            num_blocks = derive_num_blocks(block, cap, floor=64)
+            physical_blocks = derive_num_blocks(block, cap, floor=64)
+        # Keep the final worker-local KV block outside the scheduler-visible
+        # range. Decode CUDA graphs use it as a harmless padding row when a
+        # live batch replays in a larger captured bucket.
+        num_blocks = max(1, physical_blocks - 1)
         c = self.cfg.llm
         # Report the actual per-CFG-branch scratch pool capacity in tokens
         # (the built pool's blocks when loaded, the planned sizing otherwise).
-        scratch_blocks = self._scratch_blocks if self.model is not None else self._scratch_num_blocks(block)
+        scratch_blocks = (
+            self._scratch_blocks if self.model is not None else self._scratch_num_blocks(block)
+        )
         return CapsDescriptor(
             block_size=block,
             num_blocks=num_blocks,
             num_layers=c.num_hidden_layers,
             scratch_capacity_tokens=int(scratch_blocks * block),
-            max_latent_size=self.cfg.latent_token_capacity,
+            max_latent_size=active_latent_capacity_tokens(
+                self.cfg.latent_token_capacity,
+                cap,
+            ),
             latent_downsample=self.cfg.latent_downsample,
-            max_vae_grid_tokens=self.cfg.latent_token_capacity,
-            commit_marker_tokens=2,
+            max_vae_grid_tokens=(self.cfg.latent_token_capacity + _BAGEL_IMAGE_MARKER_TOKENS),
+            max_vit_grid_tokens=(self.cfg.vit_token_capacity + _BAGEL_IMAGE_MARKER_TOKENS),
+            commit_marker_tokens=_BAGEL_IMAGE_MARKER_TOKENS,
             gen_rope_advance=2,
             max_cfg_branches=3,
             bytes_per_token=self._kv_bytes_per_token(torch.bfloat16),
@@ -984,6 +1014,14 @@ class BagelForUnifiedGeneration(UniModelBase):
         layer = cast(MoTDecoderLayer, self._ensure_loaded().model.lm.layers[0])
         return int(layer.n_heads), float(layer.scale), torch.bfloat16
 
+    def interleaved_decode_graph_padding_block_id(self, pool: Any) -> int | None:
+        if pool is not self.kv_pool:
+            return None
+        num_blocks = int(getattr(pool, "num_blocks", 0) or 0)
+        if num_blocks <= 1:
+            return None
+        return num_blocks - 1
+
     @staticmethod
     def _encoder_handle(mm_hash: Any) -> int:
         return encoder_handle_from_mm_hash(mm_hash)
@@ -1056,7 +1094,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             n = clean_lat.shape[0]
             seg = m.build_gen_segment(n, vpos, clean_lat, 0.0, rope, view, update=True)
             hidden = m.run([seg])[0]
-            added = n + 2
+            added = n + _BAGEL_IMAGE_MARKER_TOKENS
         elif kind == "vit_encode":
             cached_vemb = cached_payload.get("vemb")
             if not isinstance(cached_vemb, torch.Tensor):
@@ -1064,7 +1102,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             vemb = cached_vemb
             n = vemb.shape[0]
             hidden = m.run([m.build_und_image_segment(vemb, rope, view, update=True)])[0]
-            added = n + 2
+            added = n + _BAGEL_IMAGE_MARKER_TOKENS
         else:
             raise invalid_descriptor(f"unsupported image encode kind: {kind}")
         new_len = base_len + added
@@ -1085,8 +1123,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             rec["context_image_feedback"] = True
             rec["text_branch_kvlen"] = new_len
             rec["text_branch_pos"] = rope + 1
-        return {"req_id": r, "encoder_handle": handle, "num_tokens": added,
-                "image_hw": image_hw}
+        return {"req_id": r, "encoder_handle": handle, "num_tokens": added, "image_hw": image_hw}
 
     def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
         return self.interleaved_image_state(int(req_id)).cond.last_logits
@@ -1145,6 +1182,23 @@ class BagelForUnifiedGeneration(UniModelBase):
     def run_text_logits(self, op):
         return self.run_text_logits_batch([dict(op)])[0]
 
+    def _init_generation_noise(
+        self,
+        shape: tuple[int, ...] | list[int],
+        *,
+        seed: int | None,
+    ) -> torch.Tensor:
+        """Sample BAGEL's request-private CPU-FP32 initial-noise stream."""
+        effective_seed = int(seed if seed is not None else 0)
+        return init_latent(
+            shape,
+            rng=torch.Generator(device="cpu").manual_seed(effective_seed),
+            device=self.device,
+            dtype=torch.float32,
+            source_device="cpu",
+            source_dtype=torch.float32,
+        )
+
     def _init_gen(self, op):
         m = self._ensure_loaded().model
         state = self._state(int(op["req_id"]))
@@ -1167,12 +1221,9 @@ class BagelForUnifiedGeneration(UniModelBase):
         h, w = m.latent_hw(height, width)
         num_vae = h * w
         vae_pos_ids = m.latent_position_ids(height, width).to(self.device)
-        g = state.device_rng(self.device)
-        x_t = init_latent(
+        x_t = self._init_generation_noise(
             (num_vae, m.cfg.patch_latent_dim),
-            rng=g,
-            device=self.device,
-            dtype=torch.bfloat16,
+            seed=params.seed if params.seed is not None else state.seed,
         )
         uses_context_image_feedback = bool(rec.get("context_image_feedback"))
         gs = GenState(
@@ -1265,6 +1316,8 @@ class BagelForUnifiedGeneration(UniModelBase):
                 cond_cache,
                 prototype=self.scratch_pool.k,
                 query_width=self.cfg.llm.head_dim,
+                query_tokens=total_gen,
+                batch_size=1,
                 attention_backend=self.attention_backend,
             ):
                 self.residency.release_scratch_cache(cond_cache)
@@ -1358,26 +1411,103 @@ class BagelForUnifiedGeneration(UniModelBase):
         return self.predict_denoise_velocity(ctx, branch)
 
     def predict_text_image_velocity_batch(self, steps, branches_by_step):
-        """Batched denoise: all CFG branches of a step as rows of ONE gen forward.
+        """Batch compatible request and CFG rows into shared gen forwards.
 
-        The denoise driver prefers this over per-branch ``predict_velocity``
-        calls. Steps whose branches are not fully staged in scratch-paged
-        caches (context-image feedback, or no scratch/backend support) run
-        the per-branch path with its exact existing semantics.
+        Requests may have different prompts, timesteps, latents, positions, and
+        active CFG branch counts. They can still share one weight sweep when
+        their generated-token geometry and scratch KV pool match: embeddings,
+        positions, and prefix-cache rows are concatenated along the batch axis,
+        then results are restored to the original request/branch mapping.
         """
         self._ensure_loaded()
-        results: list[dict[str, torch.Tensor]] = []
-        for step, branches in zip(steps, branches_by_step):
+        results: list[dict[str, torch.Tensor] | None] = [None] * len(steps)
+        groups: dict[
+            tuple[Any, ...],
+            list[tuple[int, TextImageDenoiseStep, GenState, tuple[str, ...]]],
+        ] = {}
+        for index, (step, branches) in enumerate(zip(steps, branches_by_step, strict=True)):
             gs = step.extra["gs"]
             paged_branches = gs.paged_branches
             names = tuple(branches)
             if paged_branches is not None and paged_branches.has_all(names):
-                results.append(self._predict_denoise_velocity_rows(step, gs, names))
-            else:
-                results.append(
-                    {branch: self.predict_denoise_velocity(step, branch) for branch in names}
+                first_cache = paged_branches.caches[names[0]]
+                signature = (
+                    id(first_cache.pool),
+                    int(gs.num_vae),
+                    tuple(step.latent.shape),
+                    str(step.latent.device),
+                    str(step.latent.dtype),
                 )
-        return results
+                groups.setdefault(signature, []).append((index, step, gs, names))
+            else:
+                results[index] = {
+                    branch: self.predict_denoise_velocity(step, branch) for branch in names
+                }
+
+        for items in groups.values():
+            batched = self._predict_denoise_velocity_request_rows(
+                [(step, gs, names) for _index, step, gs, names in items]
+            )
+            for (index, _step, _gs, _names), outputs in zip(items, batched, strict=True):
+                results[index] = outputs
+
+        if any(outputs is None for outputs in results):
+            raise invalid_descriptor("BAGEL denoise batching did not produce every request row")
+        return [outputs for outputs in results if outputs is not None]
+
+    def _predict_denoise_velocity_request_rows(
+        self,
+        items: list[tuple[TextImageDenoiseStep, GenState, tuple[str, ...]]],
+    ) -> list[dict[str, torch.Tensor]]:
+        """Run compatible request/CFG rows through one paged MoT forward."""
+        if not items:
+            return []
+        m = self._ensure_loaded().model
+        num_vae = int(items[0][1].num_vae)
+        total = num_vae + 2
+        input_rows: list[torch.Tensor] = []
+        position_rows: list[torch.Tensor] = []
+        caches: list[PagedTextCache] = []
+        row_ranges: list[tuple[int, int, tuple[str, ...]]] = []
+        offset = 0
+        for step, gs, names in items:
+            paged_branches = gs.paged_branches
+            if paged_branches is None:
+                raise invalid_descriptor("paged denoise branches are not initialized")
+            embeds = m.gen_segment_embeds(
+                num_vae,
+                gs.vae_pos_ids,
+                step.latent,
+                float(step.t.detach().float().item()),
+            )
+            rows = len(names)
+            input_rows.append(embeds.unsqueeze(0).expand(rows, total, embeds.shape[-1]))
+            position_rows.append(
+                paged_branches.positions_tensor(names, device=self.device, width=total)
+            )
+            caches.extend(paged_branches.caches[name] for name in names)
+            row_ranges.append((offset, offset + rows, names))
+            offset += rows
+
+        if len(items) == 1:
+            _step, only_state, only_names = items[0]
+            only_branches = only_state.paged_branches
+            if only_branches is None:
+                raise invalid_descriptor("paged denoise branches are not initialized")
+            batched_cache = only_branches.batched_cache(only_names)
+        else:
+            batched_cache = batched_paged_denoise_cache(caches)
+        hidden = m.lm.forward_paged_gen_batch(
+            torch.cat(input_rows, dim=0),
+            torch.cat(position_rows, dim=0),
+            m.gen_segment_is_gen(num_vae),
+            batched_cache,
+        )
+        velocity = m.llm2vae(hidden[:, 1 : 1 + num_vae].to(torch.bfloat16))
+        return [
+            {name: velocity[row] for row, name in zip(range(start, end), names, strict=True)}
+            for start, end, names in row_ranges
+        ]
 
     def _predict_denoise_velocity_rows(
         self, step: TextImageDenoiseStep, gs: GenState, branches: tuple[str, ...]
@@ -1390,30 +1520,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         changes from the dense per-layer prefix gather to the batched
         transient paged-varlen read, and the branch GEMMs run once as rows.
         """
-        m = self._ensure_loaded().model
-        paged_branches = gs.paged_branches
-        if paged_branches is None:
-            raise invalid_descriptor("paged denoise branches are not initialized")
-        num_vae = int(gs.num_vae)
-        total = num_vae + 2
-        embeds = m.gen_segment_embeds(
-            num_vae, gs.vae_pos_ids, step.latent, float(step.t.detach().float().item())
-        )
-        rows = len(branches)
-        positions = paged_branches.positions_tensor(
-            branches,
-            device=self.device,
-            width=total,
-        )
-        batched = paged_branches.batched_cache(branches)
-        hidden = m.lm.forward_paged_gen_batch(
-            embeds.unsqueeze(0).expand(rows, total, embeds.shape[-1]),
-            positions,
-            m.gen_segment_is_gen(num_vae),
-            batched,
-        )
-        velocity = m.llm2vae(hidden[:, 1 : 1 + num_vae].to(torch.bfloat16))
-        return {branch: velocity[row] for row, branch in enumerate(branches)}
+        return self._predict_denoise_velocity_request_rows([(step, gs, branches)])[0]
 
     def predict_denoise_velocity(self, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:
         loaded = self._ensure_loaded()
@@ -1523,8 +1630,12 @@ class BagelForUnifiedGeneration(UniModelBase):
             added = (nv + 2) + (nt + 2)
             b64 = pil_image_to_png_b64(img)
             self._pop_gen_state(r)
-            return {"req_id": r, "image_png_b64": b64, "image_hw": [gs.H, gs.W],
-                    "num_tokens": added}
+            return {
+                "req_id": r,
+                "image_png_b64": b64,
+                "image_hw": [gs.H, gs.W],
+                "num_tokens": added,
+            }
         rec = self._record(r)
         retain_images = bool((rec.get("image") or {}).get("retain_images", True))
         added = 0
@@ -1569,7 +1680,9 @@ class BagelForUnifiedGeneration(UniModelBase):
         with self._autocast():
             if isinstance(input_ids, UniForwardBatch):
                 batch = input_ids
-                raise capability_mismatch(f"BAGEL direct batch forward is unsupported for {batch.mode}")
+                raise capability_mismatch(
+                    f"BAGEL direct batch forward is unsupported for {batch.mode}"
+                )
             del loaded, positions, kv, mode, input_embeds, request_state
             if op is None:
                 raise invalid_descriptor("BAGEL text forward requires the source op")

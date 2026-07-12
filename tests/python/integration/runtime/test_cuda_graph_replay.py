@@ -281,6 +281,16 @@ def test_prefill_batch_bucket_uses_largest_viable_bucket_for_token_bucket():
     assert runner.bucket_batch_size(3, num_tokens=12) == 8
 
 
+def test_prefill_warmup_uses_declared_batch_capacity():
+    runner = PrefillCudaGraphRunner(
+        name="t",
+        default_warmup_token_buckets=(4, 8),
+        default_warmup_batch_sizes=(1, 2, 4, 8),
+    )
+
+    assert runner.warmup_capture_buckets() == ((8, 8), (4, 8))
+
+
 def test_prefill_kv_bucket_uses_context_capacity_when_available():
     runner = PrefillCudaGraphRunner(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
 
@@ -652,8 +662,8 @@ def test_text_graph_runner_routes_mixed_extend_decode_to_prefill_runner():
     assert "prefill" in calls and "decode" not in calls
 
 
-def test_reorder_mixed_puts_roomy_row_last_for_bucket_padding():
-    """A block-aligned final row swaps with one whose block tail can absorb pad."""
+def test_prefill_graph_padding_preserves_row_order():
+    """Capacity padding leaves real request ordering unchanged."""
 
     from uniserve_worker.contracts.batches import TextBatch
 
@@ -677,14 +687,7 @@ def test_reorder_mixed_puts_roomy_row_last_for_bucket_padding():
         op_modes=(ForwardMode.DECODE, ForwardMode.EXTEND),
         allow_mixed_text=True,
     )
-    out = runner.reorder_mixed_for_padding(text)
-    # pad = 80 - 65 = 15: the aligned extend row (end=64) cannot absorb it, the
-    # decode row (end=11, 53 tokens of tail room) can - it must move last.
-    assert out.req_ids == (2, 1)
-    assert out.pos_ranges[-1] == (10, 11)
-    assert out.token_ids[0] == tuple(range(64))
-    # already-roomy last row stays untouched
-    assert runner.reorder_mixed_for_padding(out) is out
+    assert runner.reorder_mixed_for_padding(text) is text
 
 
 def test_padded_prefill_tokens_accepts_mixed_mode():
@@ -697,6 +700,10 @@ def test_padded_prefill_tokens_accepts_mixed_mode():
         def bucket_num_tokens(self, num_tokens: int) -> int:
             return 8
 
+        def padding_batch_size(self, batch_size: int, *, num_tokens: int) -> int:
+            del batch_size, num_tokens
+            return 4
+
     runner = TextGraphRunner.__new__(TextGraphRunner)
     runner._prefill = PrefillStub()
     runner.block_size = 64
@@ -707,6 +714,33 @@ def test_padded_prefill_tokens_accepts_mixed_mode():
         pos_ranges=[(64, 65), (0, 3)],
     )
     assert runner.padded_num_tokens(text, attention_backend_name=None) == 8
+
+
+def test_prefill_padding_does_not_depend_on_request_kv_tail_capacity():
+    """Graph padding uses sink pages instead of extending request residency."""
+
+    class PrefillStub:
+        def enabled(self) -> bool:
+            return True
+
+        def bucket_num_tokens(self, num_tokens: int) -> int:
+            return 12
+
+        def padding_batch_size(self, batch_size: int, *, num_tokens: int) -> int:
+            del batch_size, num_tokens
+            return 4
+
+    runner = TextGraphRunner.__new__(TextGraphRunner)
+    runner._prefill = PrefillStub()
+    runner.block_size = 4
+    text = SimpleNamespace(
+        mode=ForwardMode.EXTEND,
+        spec_token_ids=[(), ()],
+        token_ids=[(1, 2, 3, 4), (5, 6, 7)],
+        pos_ranges=[(0, 4), (0, 3)],
+    )
+
+    assert runner.padded_num_tokens(text, attention_backend_name=None) == 12
 
 
 @requires_cuda
@@ -736,7 +770,7 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
         num_blocks=16,
         num_tokens=8,
         max_kv_tokens=16,
-        batch_size=2,
+        batch_size=3,
         device=device,
     )
 
@@ -749,16 +783,17 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
         last_token_indices=torch.tensor([1, 4], dtype=torch.long, device=device),
     )
 
-    assert state.cache.base_lens == [5, 7]
-    assert state.metadata.cache_seqlens_cpu == (5, 7)
-    assert state.metadata.query_lens_cpu == (2, 6)
-    assert state.metadata.kv_seqlens_cpu == (7, 13)
+    assert state.cache.base_lens == [5, 7, 0]
+    assert state.cache.block_ids_by_row[2] == []
+    assert state.metadata.cache_seqlens_cpu == (5, 7, 0)
+    assert state.metadata.query_lens_cpu == (2, 6, 0)
+    assert state.metadata.kv_seqlens_cpu == (7, 13, 0)
     assert state.metadata.max_seqlen_k == 16
-    assert state.cache_seqlens.cpu().tolist() == [5, 7]
-    assert state.query_lens.cpu().tolist() == [2, 6]
-    assert state.kv_seqlens.cpu().tolist() == [7, 13]
-    assert state.cu_seqlens_q.cpu().tolist() == [0, 2, 8]
-    assert state.cu_seqlens_k.cpu().tolist() == [0, 7, 20]
+    assert state.cache_seqlens.cpu().tolist() == [5, 7, 0]
+    assert state.query_lens.cpu().tolist() == [2, 6, 0]
+    assert state.kv_seqlens.cpu().tolist() == [7, 13, 0]
+    assert state.cu_seqlens_q.cpu().tolist() == [0, 2, 8, 8]
+    assert state.cu_seqlens_k.cpu().tolist() == [0, 7, 20, 20]
 
 
 @requires_cuda
@@ -794,6 +829,7 @@ def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
     torch.cuda.synchronize()
 
     assert state.metadata.cache_seqlens_cpu == (5, 6, 7, 0)
+    assert state.cache.block_ids_by_row[3] == []
     assert state.metadata.query_lens_cpu == (2, 3, 3, 0)
     assert state.metadata.kv_seqlens_cpu == (7, 9, 10, 0)
     assert state.cache_seqlens.cpu().tolist() == [5, 6, 7, 0]
@@ -802,7 +838,47 @@ def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
     assert state.last_token_indices.cpu().tolist() == [1, 4, 5, 0]
 
 
-def test_padded_prefill_max_kv_tokens_accounts_for_query_padding():
+@requires_cuda
+def test_prefill_graph_token_tail_uses_sink_pages():
+    device = torch.device("cuda")
+    pool = _kv_pool(device, num_blocks=32, block_size=4)
+    metadata = _prefill_metadata(
+        pool,
+        block_ids_by_row=[[5, 6]],
+        cache_seqlens_cpu=(5,),
+        query_lens_cpu=(2,),
+        device=device,
+        max_context_len=16,
+    )
+    state = make_text_initial_prefill_graph_state(
+        kv_pool=pool,
+        num_blocks=32,
+        num_tokens=8,
+        max_kv_tokens=16,
+        batch_size=1,
+        device=device,
+        max_context_len=16,
+    )
+
+    copy_text_initial_prefill_graph_inputs(
+        state,
+        input_ids=torch.arange(2, dtype=torch.long, device=device),
+        positions=torch.arange(5, 7, dtype=torch.long, device=device),
+        attention_metadata=metadata,
+        raw_num_tokens=2,
+        last_token_indices=torch.tensor([1], dtype=torch.long, device=device),
+    )
+    torch.cuda.synchronize()
+
+    assert state.cache.base_lens == [5]
+    assert state.cache.block_ids_by_row == [[5, 6, 0, 0]]
+    assert state.metadata.query_lens_cpu == (8,)
+    assert state.metadata.kv_seqlens_cpu == (13,)
+    assert state.query_lens.cpu().tolist() == [8]
+    assert state.last_token_indices.cpu().tolist() == [1]
+
+
+def test_padded_prefill_max_kv_tokens_isolates_padding_from_cached_prefix():
     metadata = TextAttentionMetadata(
         cache=None,
         block_table=None,
@@ -826,7 +902,7 @@ def test_padded_prefill_max_kv_tokens_accounts_for_query_padding():
             raw_tokens=29,
             batch_size=1,
         )
-        == 1661
+        == 1626
     )
 
 
@@ -997,6 +1073,7 @@ def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
     assert state.input_ids.flatten().tolist() == [11, 22, 0, 0]
     assert state.positions.flatten().tolist() == [3, 5, 0, 0]
     assert state.cache_seqlens.tolist() == [3, 5, 0, 0]
+    assert state.metadata.kv_seqlens.tolist() == [4, 6, 1, 1]
 
 
 @requires_cuda
@@ -1051,6 +1128,7 @@ def test_decode_host_input_copy_populates_static_bucket_inputs():
     assert state.block_table[:2, 2:].sum().item() == 0
     assert state.block_table[2:].sum().item() == 0
     assert state.cache_seqlens.tolist() == [3, 5, 0, 0]
+    assert state.metadata.kv_seqlens.tolist() == [4, 6, 1, 1]
     assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
     assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
     assert state.metadata.cache_seqlens_cpu == (3, 5, 0, 0)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest
+from .base import BenchmarkTask, TaskRequest, input_image_data_url
 
 
 class I2ITask(BenchmarkTask):
@@ -41,9 +41,7 @@ class I2ITask(BenchmarkTask):
                         {"type": "text", "text": item["prompt"]},
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{item.get('input_image_b64')}"
-                            },
+                            "image_url": {"url": input_image_data_url(item)},
                         },
                     ],
                 }

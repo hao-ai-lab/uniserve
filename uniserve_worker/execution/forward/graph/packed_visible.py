@@ -15,7 +15,6 @@ from ....contracts.forward_context import (
     use_forward_context,
 )
 from ....contracts.forward_mode import ForwardMode
-from ....foundation.env import env_flag
 from ....foundation.errors import invalid_descriptor
 from ....runtime.host_staging import fill_cpu_ints, is_pinned
 from ....runtime.paged_text_cache import PagedTextCacheSpanCopy
@@ -30,13 +29,11 @@ from .base import GraphEvent, _GraphRunnerBase, record_graph_stats
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "PACKED_MIXED_GRAPH_ENV",
     "PackedMixedGraphRunner",
     "maybe_run_packed_mixed_graph",
     "packed_mixed_graph_promotions_supported",
 ]
 
-PACKED_MIXED_GRAPH_ENV = "UNISERVE_PACKED_MIXED_GRAPH"
 _RUNNER_ATTR = "_packed_mixed_graph_runner"
 _MAX_FAILURES = 2
 
@@ -81,11 +78,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         logger: Any = logger,
     ) -> None:
         self.name = str(name)
-        self.default_enabled = (
-            env_flag(PACKED_MIXED_GRAPH_ENV, default=True)
-            if default_enabled is None
-            else bool(default_enabled)
-        )
+        self.default_enabled = True if default_enabled is None else bool(default_enabled)
         self.default_warmup = False
         self.metric_prefix = "packed_mixed_"
         self.logger = logger
@@ -113,7 +106,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
     ) -> torch.Tensor | None:
         if not self.enabled() or not torch.cuda.is_available():
             return None
-        if packed_embeds.device.type != "cuda" or not bool(forward_stream.fully_visible):
+        if packed_embeds.device.type != "cuda":
             return None
         ctx = get_forward_context()
         backend = self._resolve_graph_backend(ctx, owner, packed_embeds, forward_stream, kv_view)
@@ -414,15 +407,18 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
                 q=q_probe,
                 k=k_cache,
                 v=v_cache,
-                regime=ops.AttentionRegime.EXTEND,
+                regime=ops.AttentionRegime.VISIBLE_END,
                 causal=False,
                 scale=float(getattr(first_attn, "scaling")),
                 ctx=ctx,
-                block_table=kv_view.block_table(device=packed_embeds.device),
+                visible_end=forward_stream.visible_end,
                 cu_seqlens_q=forward_stream.cu_seqlens_q,
-                cu_seqlens_k=kv_view.cu_seqlens_after(device=packed_embeds.device),
+                page_table=kv_view.block_table(device=packed_embeds.device),
+                seqused_k=kv_view.cache_seqlens_after(device=packed_embeds.device),
                 max_seqlen_q=int(forward_stream.visible_end.shape[1]),
                 max_seqlen_k=_max_context_len(kv_view),
+                use_prefix_bounds=True,
+                fully_visible=bool(forward_stream.fully_visible),
             )
             for provider in ops.attention_dispatcher().ordered(preferred):
                 try:
@@ -642,15 +638,11 @@ def _max_context_len(kv_view: ForwardPagedKVView) -> int:
 
 
 def _backend_can_host_graph(backend: Any) -> bool:
-    bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
-    release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
-    if callable(bind) and callable(release):
-        return True
     try:
         caps = backend.capabilities()
     except Exception:
         return False
-    return bool(getattr(caps, "paged_varlen_cuda_graph", False))
+    return bool(getattr(caps, "visible_end_cuda_graph", False))
 
 
 def _explicit_attention_backend_name(name: str | None) -> str | None:
@@ -683,8 +675,6 @@ def maybe_run_packed_mixed_graph(
 ) -> torch.Tensor | None:
     runner = getattr(owner, _RUNNER_ATTR, None)
     if runner is None:
-        if not env_flag(PACKED_MIXED_GRAPH_ENV, default=True):
-            return None
         runner = packed_mixed_graph_runner(owner)
     return runner.maybe_run(
         owner,

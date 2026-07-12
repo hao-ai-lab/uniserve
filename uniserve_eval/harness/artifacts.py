@@ -3,10 +3,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
+
+from .image_outputs import DecodedImage, inspect_image_bytes
 
 
 class ArtifactWriter:
@@ -14,6 +17,14 @@ class ArtifactWriter:
         self.output_dir = Path(output_dir)
         self.samples_dir = self.output_dir / "samples"
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
+
+    def clear_samples(self) -> None:
+        """Start a run with an empty generated-image sample collection."""
+        if self.samples_dir.is_symlink() or self.samples_dir.is_file():
+            self.samples_dir.unlink()
+        else:
+            shutil.rmtree(self.samples_dir, ignore_errors=True)
         self.samples_dir.mkdir(parents=True, exist_ok=True)
 
     def write_json(self, name: str, payload: Any) -> Path:
@@ -82,6 +93,35 @@ class ArtifactWriter:
 
     def write_png_sample(self, request_id: str, pixels_png_b64: str) -> Path:
         return self.write_sample(request_id, ".png", base64.b64decode(pixels_png_b64))
+
+    def write_image_sample(self, image: DecodedImage) -> Path:
+        """Persist exact response bytes using their validated content address."""
+        inspected = inspect_image_bytes(image.data, declared_mime=image.mime)
+        if inspected.metadata_dict() != image.metadata_dict():
+            raise ValueError("generated image metadata does not match its response bytes")
+        path = self.samples_dir / image.sample_filename
+        if path.exists():
+            if path.read_bytes() != image.data:
+                raise ValueError("content-addressed image sample collision")
+            return path
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+                handle.write(image.data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+        return path
 
 
 def _jsonable(payload: Any) -> Any:

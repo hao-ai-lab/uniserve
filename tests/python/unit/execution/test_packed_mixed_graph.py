@@ -9,7 +9,6 @@ from uniserve_worker.contracts.forward_context import ForwardContext
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.execution.forward.graph import packed_visible as pmg
 from uniserve_worker.execution.forward.graph.packed_visible import (
-    PACKED_MIXED_GRAPH_ENV,
     PackedMixedGraphRunner,
     packed_mixed_graph_promotions_supported,
 )
@@ -28,16 +27,8 @@ from uniserve_worker.runtime.paged_text_cache import (
 pytestmark = pytest.mark.unit
 
 
-def test_packed_mixed_graph_runner_is_enabled_by_default(monkeypatch):
-    monkeypatch.delenv(PACKED_MIXED_GRAPH_ENV, raising=False)
-
+def test_packed_mixed_graph_runner_is_enabled_by_default():
     assert PackedMixedGraphRunner().enabled()
-
-
-def test_packed_mixed_graph_runner_env_can_disable(monkeypatch):
-    monkeypatch.setenv(PACKED_MIXED_GRAPH_ENV, "0")
-
-    assert not PackedMixedGraphRunner().enabled()
 
 
 def _decode_stream(prefix_len: int):
@@ -50,6 +41,22 @@ def _decode_stream(prefix_len: int):
         modality="und",
         segment_class="decode",
         q_len=1,
+        prefix_len=int(prefix_len),
+        visible_policy="causal",
+    )
+    return builder.build(device="cpu")
+
+
+def _prefill_stream(prefix_len: int):
+    builder = ForwardStreamBuilder()
+    builder.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="prefill_und",
+        mode=ForwardMode.EXTEND,
+        modality="und",
+        segment_class="extend",
+        q_len=2,
         prefix_len=int(prefix_len),
         visible_policy="causal",
     )
@@ -91,7 +98,7 @@ class _FakeAttentionBackend:
         self.graph_capable = bool(graph_capable)
 
     def capabilities(self):
-        return SimpleNamespace(paged_varlen_cuda_graph=self.graph_capable)
+        return SimpleNamespace(visible_end_cuda_graph=self.graph_capable)
 
 
 class _FakeAttentionProvider:
@@ -159,6 +166,34 @@ def test_packed_mixed_graph_backend_resolver_respects_explicit_non_graph_provide
     )
 
     assert backend is None
+
+
+def test_packed_mixed_graph_backend_resolver_accepts_causal_visible_end_graph(monkeypatch):
+    graph = _FakeAttentionBackend("fa4_cute", graph_capable=True)
+
+    class Provider(_FakeAttentionProvider):
+        def can_run(self, req) -> bool:
+            assert req.regime is pmg.ops.AttentionRegime.VISIBLE_END
+            assert req.visible_end is not None
+            assert req.fully_visible is False
+            return True
+
+    monkeypatch.setattr(
+        pmg.ops,
+        "attention_dispatcher",
+        lambda: _FakeAttentionDispatcher((Provider(graph),)),
+    )
+    owner, embeds, _indicators, _stream, kv_view = _resolver_inputs()
+
+    backend = PackedMixedGraphRunner()._resolve_graph_backend(
+        ForwardContext(attention_backend_name="auto"),
+        owner,
+        embeds,
+        _prefill_stream(prefix_len=0),
+        kv_view,
+    )
+
+    assert backend is graph
 
 
 def _write_cache_span(cache: PagedTextCache, *, start: int, length: int) -> None:

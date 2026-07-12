@@ -273,7 +273,7 @@ def test_runner_driver_executes_registered_stub_model():
     from uniserve_worker.server.stub import StubUniModel
 
     model = StubUniModel()
-    driver = RunnerDriver(model, block_size=256)
+    driver = RunnerDriver(model, block_size=256, simulation=True)
     result = driver.execute(
         {
             "step_id": 7,
@@ -312,7 +312,12 @@ def test_qwen3_entry_executes_through_text_driver():
     )
     assert isinstance(model.model.embed_tokens, VocabParallelEmbedding)
     assert isinstance(model.lm_head, ParallelLMHead)
-    driver = RunnerDriver(model, block_size=16, kv_token_capacity=64)
+    driver = RunnerDriver(
+        model,
+        block_size=16,
+        kv_token_capacity=64,
+        simulation=True,
+    )
     result = driver.execute(
         {
             "step_id": 8,
@@ -489,7 +494,7 @@ def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():
     from tests.python.fixtures.zero_day import UniServeZeroDayCfgZeroStarModel
 
     cls = UniServeZeroDayCfgZeroStarModel
-    driver = RunnerDriver(cls(), block_size=256)
+    driver = RunnerDriver(cls(), block_size=256, simulation=True)
     result = driver.execute(
         {
             "step_id": 9,

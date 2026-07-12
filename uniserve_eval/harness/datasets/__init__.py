@@ -72,10 +72,16 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
             fixed_output_len=spec.sharegpt_output_len,
             context_len=spec.sharegpt_context_len,
             seed=spec.seed,
+            revision=spec.dataset_revision,
         )
 
     if dataset == "mjhq" or spec.task == TaskName.T2I:
-        return load_mjhq(path, spec.num_prompts, seed=spec.seed)
+        return load_mjhq(
+            path,
+            spec.num_prompts,
+            seed=spec.seed,
+            revision=spec.dataset_revision,
+        )
 
     if dataset in _SYNTHETIC_IMAGE_ALIASES or (
         not dataset and spec.task == TaskName.I2T
@@ -95,6 +101,11 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
         return load_pie_bench(path, spec.num_prompts, seed=spec.seed)
 
     if dataset == "ueval" or spec.task == TaskName.DEFAULT:
-        return load_ueval(path, spec.num_prompts, seed=spec.seed)
+        return load_ueval(
+            path,
+            spec.num_prompts,
+            seed=spec.seed,
+            revision=spec.dataset_revision,
+        )
 
     raise ValueError(f"unknown dataset {spec.dataset!r} for task {spec.task.value!r}")

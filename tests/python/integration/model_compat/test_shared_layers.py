@@ -881,7 +881,115 @@ def test_bagel_model_uses_shared_linear_and_vision_seams():
 
     bcfg.max_latent_size = 8
     wrapper = BagelForUnifiedGeneration(config=bcfg, kv_token_capacity=256)
-    assert wrapper.caps().max_latent_size == 64
+    assert wrapper.caps().max_latent_size == 256
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="BAGEL paged denoise needs CUDA")
+def test_bagel_paged_denoise_matches_dense_branch_forward():
+    from uniserve_worker.models.bagel import LLMConfig
+    from uniserve_worker.nn.decoder import KVCache, MoTModel, Segment
+    from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.paged_text_cache import (
+        BatchedPagedTextCache,
+        PagedTextCache,
+    )
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    cfg = LLMConfig(
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+    )
+    torch.manual_seed(7)
+    model = MoTModel(cfg).to(device=device, dtype=dtype).eval()
+    pool = PagedKVPool(
+        num_layers=cfg.num_hidden_layers,
+        num_blocks=8,
+        block_size=16,
+        num_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    prefix_len = 16
+    token_count = 10
+    block_rows = ([0, 1], [2, 3])
+    dense_caches = [KVCache(cfg.num_hidden_layers) for _ in block_rows]
+    paged_caches = [
+        PagedTextCache(
+            pool,
+            block_ids,
+            num_layers=cfg.num_hidden_layers,
+            length=prefix_len,
+        )
+        for block_ids in block_rows
+    ]
+    generator = torch.Generator(device=device).manual_seed(11)
+    for layer_idx in range(cfg.num_hidden_layers):
+        for dense_cache, paged_cache in zip(dense_caches, paged_caches, strict=True):
+            key = torch.randn(
+                prefix_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            value = torch.randn(
+                prefix_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
+            dense_cache.append(layer_idx, key, value)
+            pool.write(
+                layer_idx,
+                paged_cache.block_ids,
+                start=0,
+                k=key,
+                v=value,
+            )
+
+    inputs = torch.randn(
+        len(block_rows),
+        token_count,
+        cfg.hidden_size,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    positions = torch.tensor([17, 23], device=device).unsqueeze(1).expand(-1, token_count)
+    is_gen = torch.ones(token_count, dtype=torch.bool, device=device)
+    is_gen[[0, -1]] = False
+    segments = [
+        Segment(
+            embeds=inputs[row],
+            positions=positions[row],
+            is_gen=is_gen,
+            cache=dense_caches[row],
+            causal=False,
+            update_cache=False,
+        )
+        for row in range(len(block_rows))
+    ]
+
+    with torch.inference_mode():
+        dense = torch.stack(model.forward_segments(segments))
+        paged = model.forward_paged_gen_batch(
+            inputs,
+            positions,
+            is_gen,
+            BatchedPagedTextCache(paged_caches),
+        )
+
+    torch.testing.assert_close(paged, dense)
 
 
 def test_sensenova_dense_decoder_uses_shared_linear_seams():
