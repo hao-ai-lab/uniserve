@@ -27,8 +27,9 @@ def load_ueval(
     seed: int = 42,
     hf_repo: str = UEVAL_HF_REPO,
     split: str | None = None,
+    revision: str | None = None,
 ) -> list[dict[str, Any]]:
-    raw = _load_local(dataset_path) if dataset_path else _load_hf(hf_repo, split)
+    raw = _load_local(dataset_path) if dataset_path else _load_hf(hf_repo, split, revision)
 
     prompts: list[str] = []
     for entry in raw:
@@ -65,7 +66,9 @@ def _load_local(dataset_path: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _load_hf(hf_repo: str, split: str | None) -> list[dict[str, Any]]:
+def _load_hf(
+    hf_repo: str, split: str | None, revision: str | None
+) -> list[dict[str, Any]]:
     try:
         from datasets import load_dataset
     except ImportError as error:  # pragma: no cover - environment dependent
@@ -74,7 +77,7 @@ def _load_hf(hf_repo: str, split: str | None) -> list[dict[str, Any]]:
             "package; install it or pass --dataset-path to a local prompt file"
         ) from error
 
-    dataset = load_dataset(hf_repo, split=split)
+    dataset = load_dataset(hf_repo, split=split, revision=revision)
     rows: list[dict[str, Any]] = []
     if hasattr(dataset, "keys"):  # DatasetDict: concatenate every split/domain.
         for key in dataset.keys():

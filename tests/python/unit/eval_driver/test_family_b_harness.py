@@ -16,14 +16,21 @@ benchmark harness that Family B (t2i / i2i) relies on:
 The Family A stream summarizer parity is covered by ``test_stream_parity.py`` and
 is not duplicated here.
 """
+
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
+import sys
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from PIL import Image
 
 import uniserve_eval.harness.core.client as client_module
 from uniserve_eval.harness import cli
@@ -35,12 +42,18 @@ from uniserve_eval.harness.datasets import (
     load_ueval,
     trace_items,
 )
+from uniserve_eval.harness.image_outputs import (
+    image_output_mismatch,
+    image_output_requirements,
+    inspect_image_bytes,
+)
 from uniserve_eval.harness.metrics import summarize_image
 from uniserve_eval.harness.metrics.common import RequestRecord
 from uniserve_eval.harness.report import (
     benchmark_contract,
     benchmark_contract_is_valid,
     build_summary,
+    plan_summary,
 )
 from uniserve_eval.harness.response_classifier import (
     classify_json_image_response,
@@ -68,6 +81,62 @@ class _WhitespaceTokenizer:
 
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         return list(range(len(text.split())))
+
+
+def _png_bytes(width: int = 2, height: int = 3) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (width, height), (17, 31, 47)).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _png_data_url(width: int = 2, height: int = 3) -> str:
+    encoded = base64.b64encode(_png_bytes(width, height)).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _successful_image_record(
+    request_id: str = "a", *, width: int = 2, height: int = 3
+) -> RequestRecord:
+    image = inspect_image_bytes(_png_bytes(width, height))
+    return RequestRecord(
+        request_id=request_id,
+        task="t2i",
+        success=True,
+        latency=1.0,
+        images=1,
+        classifier="ok",
+        generated_images_expected=True,
+        requested_image_count=1,
+        requested_image_width=width,
+        requested_image_height=height,
+        decoded_images=[image],
+    )
+
+
+def test_streamed_multimodal_image_count_is_an_upper_bound() -> None:
+    requirements = image_output_requirements(
+        {
+            "modalities": ["text", "image"],
+            "image_config": {"num_images": 4},
+        },
+        request_kind="openai_chat",
+    )
+    images = [inspect_image_bytes(_png_bytes()) for _ in range(2)]
+
+    assert requirements.count_is_cap is True
+    assert image_output_mismatch(images, requirements) is None
+    assert image_output_mismatch(images * 3, requirements) == "protocol_image_count_mismatch"
+
+
+def test_image_generation_count_is_exact() -> None:
+    requirements = image_output_requirements(
+        {"n": 4},
+        request_kind="images_generations",
+    )
+    images = [inspect_image_bytes(_png_bytes()) for _ in range(2)]
+
+    assert requirements.count_is_cap is False
+    assert image_output_mismatch(images, requirements) == "protocol_image_count_mismatch"
 
 
 # --- summarize_image (Family B aggregate fields) ------------------------------
@@ -163,7 +232,20 @@ def test_classify_openai_events_counts_reasoning_content_as_text() -> None:
 
 def test_classify_openai_events_counts_delta_images_as_output() -> None:
     events = [
-        {"choices": [{"delta": {"images": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}}]},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "images": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
         {"type": "sse_done"},
     ]
@@ -193,7 +275,7 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
                         "images": [
                             {
                                 "type": "image_url",
-                                "image_url": {"url": "data:image/png;base64,AAAA"},
+                                "image_url": {"url": _png_data_url()},
                             }
                         ]
                     }
@@ -204,7 +286,13 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
         {"choices": [{"delta": {"content": "b"}}], "_client_t": 14.0},
         {"choices": [{"delta": {"content": "c"}}], "_client_t": 14.25},
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
-        {"usage": {"prompt_tokens": 7, "completion_tokens": 3}},
+        {
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 5},
+            }
+        },
         {"type": "sse_done"},
     ]
 
@@ -219,7 +307,40 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
     assert record.image_latencies == pytest.approx([3.0])
     assert record.prompt_len == 7
     assert record.output_len == 3
+    assert record.prompt_len_source == "server_usage"
+    assert record.output_len_source == "server_usage"
+    assert record.cached_prompt_tokens == 5
+    assert record.cached_prompt_tokens_source == "openai_usage_prompt_tokens_details"
     assert record.finish_reason == "stop"
+    assert record.record_dict()["generated_text_sha256"] == hashlib.sha256(b"abc").hexdigest()
+
+
+def test_openai_parser_captures_sglang_cached_token_breakdown_when_usage_omits_it() -> None:
+    record = RequestRecord(request_id="cache", task="text", start_time=10.0)
+    events = [
+        {"choices": [{"delta": {"content": "a"}}], "_client_t": 11.0},
+        {
+            "choices": [],
+            "sglext": {
+                "cached_tokens_details": {
+                    "device": 4,
+                    "host": 2,
+                    "storage": 1,
+                    "storage_backend": "file",
+                }
+            },
+        },
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        {"usage": {"prompt_tokens": 9, "completion_tokens": 1}},
+        {"type": "sse_done"},
+    ]
+
+    _parse_openai(events, record, output_len_fallback=0, prompt_len=0)
+
+    assert record.success is True
+    assert record.cached_prompt_tokens == 7
+    assert record.cached_prompt_tokens_source == "sglang_sglext_cached_tokens_details"
+    assert record.record_dict()["cached_prompt_tokens"] == 7
 
 
 def test_default_task_omits_image_cap_unless_explicit() -> None:
@@ -276,7 +397,9 @@ def test_default_task_can_emit_openai_chat_wire() -> None:
     assert request.payload["stream"] is True
     assert request.payload["stream_options"] == {"include_usage": True}
     assert request.payload["max_completion_tokens"] == 8192
-    assert request.payload["messages"] == [{"role": "user", "content": "show each step visually and textually"}]
+    assert request.payload["messages"] == [
+        {"role": "user", "content": "show each step visually and textually"}
+    ]
     assert request.payload["image_config"] == {
         "num_images": 4,
         "width": 2048,
@@ -307,6 +430,13 @@ def test_i2t_task_streams_openai_chat_wire() -> None:
     assert request.payload["stream_options"] == {"include_usage": True}
     assert request.payload["modalities"] == ["text"]
     assert request.payload["max_completion_tokens"] == 256
+    assert request.payload["extra_args"] == {
+        "max_tokens": 256,
+        "do_sample": False,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "ignore_eos": True,
+    }
     parts = request.payload["messages"][0]["content"]
     assert parts[1]["image_url"]["url"] == "data:image/png;base64,QUJD"
 
@@ -325,6 +455,22 @@ def test_i2t_task_openai_chat_json_wire_is_not_streamed() -> None:
     assert request.kind == "openai_chat_json"
     assert "stream" not in request.payload
     assert request.payload["max_completion_tokens"] == 256
+    assert request.payload["extra_args"]["max_tokens"] == 256
+
+
+def test_i2t_task_preserves_the_input_image_mime_type() -> None:
+    request = I2TTask(
+        BenchmarkSpec(task=TaskName.I2T, model="M", wire="openai_chat")
+    ).build_request(
+        {
+            "prompt": "Describe this image.",
+            "input_image_b64": "QUJD",
+            "input_image_mime": "image/jpeg",
+        }
+    )
+
+    parts = request.payload["messages"][0]["content"]
+    assert parts[1]["image_url"]["url"] == "data:image/jpeg;base64,QUJD"
 
 
 def test_t2i_task_can_emit_image_only_chat_wire() -> None:
@@ -335,6 +481,14 @@ def test_t2i_task_can_emit_image_only_chat_wire() -> None:
             width=1024,
             height=1024,
             steps=50,
+            max_images=1,
+            guidance_scale=4.0,
+            image_guidance_scale=1.0,
+            cfg_norm="global",
+            cfg_interval=(0.4, 1.0),
+            timestep_shift=3.0,
+            image_think=False,
+            image_t_eps=0.02,
             wire="openai_chat_json",
         )
     ).build_request({"prompt": "a red bicycle"})
@@ -347,7 +501,53 @@ def test_t2i_task_can_emit_image_only_chat_wire() -> None:
         "height": 1024,
         "steps": 50,
         "seed": 42,
+        "num_images": 1,
+        "guidance_scale": 4.0,
+        "image_guidance_scale": 1.0,
+        "cfg_norm": "global",
+        "cfg_interval": [0.4, 1.0],
+        "timestep_shift": 3.0,
     }
+    assert request.payload["size"] == "1024x1024"
+    assert request.payload["num_inference_steps"] == 50
+    assert request.payload["num_outputs_per_prompt"] == 1
+    assert request.payload["cfg_scale"] == 4.0
+    assert request.payload["cfg_text_scale"] == 4.0
+    assert request.payload["img_cfg_scale"] == 1.0
+    assert request.payload["cfg_img_scale"] == 1.0
+    assert request.payload["cfg_renorm_type"] == "global"
+    assert request.payload["cfg_interval"] == [0.4, 1.0]
+    assert request.payload["timestep_shift"] == 3.0
+    assert request.payload["think"] is False
+    assert request.payload["t_eps"] == 0.02
+
+
+def test_nonstreaming_i2t_does_not_fabricate_token_timing() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.I2T,
+        model="M",
+        num_prompts=1,
+        wire="openai_chat_json",
+    )
+    record = RequestRecord(
+        request_id="a",
+        task="i2t",
+        success=True,
+        classifier="ok",
+        latency=2.0,
+        output_len=32,
+        token_timing_available=False,
+    )
+
+    summary = build_summary(spec, "http://server:1", [record], dur_s=2.0)
+
+    assert summary["metrics"]["mean_e2e_latency_ms"] == pytest.approx(2000.0)
+    assert summary["metrics"]["token_timing_available"] is False
+    assert summary["metrics"]["p50_ttft_ms"] is None
+    assert summary["metrics"]["p50_tpot_ms"] is None
+    assert summary["metrics"]["p50_itl_ms"] is None
+    assert record.record_dict()["ttft_ms"] is None
+    assert record.record_dict()["tpot_ms"] is None
 
 
 @pytest.mark.parametrize(
@@ -380,6 +580,13 @@ def test_chat_task_builders_preserve_declared_sampling_contract(
             wire=wire,
             temperature=0.35,
             top_p=0.82,
+            top_k=1 if task is TaskName.TEXT else None,
+            min_p=0.0 if task is TaskName.TEXT else None,
+            repetition_penalty=1.0 if task is TaskName.TEXT else None,
+            frequency_penalty=0.0 if task is TaskName.TEXT else None,
+            presence_penalty=0.0 if task is TaskName.TEXT else None,
+            sampling_seed=42 if task is TaskName.TEXT else None,
+            chat_template_kwargs={"enable_thinking": True} if task is TaskName.TEXT else {},
             ignore_eos=False,
         )
     ).build_request(item)
@@ -387,6 +594,26 @@ def test_chat_task_builders_preserve_declared_sampling_contract(
     assert request.payload["temperature"] == 0.35
     assert request.payload["top_p"] == 0.82
     assert request.payload["ignore_eos"] is False
+    if task is TaskName.TEXT:
+        assert request.payload["top_k"] == 1
+        assert request.payload["min_p"] == 0.0
+        assert request.payload["repetition_penalty"] == 1.0
+        assert request.payload["frequency_penalty"] == 0.0
+        assert request.payload["presence_penalty"] == 0.0
+        assert request.payload["seed"] == 42
+        assert request.payload["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+def test_default_task_emits_declared_sampling_seed() -> None:
+    request = DefaultTask(
+        BenchmarkSpec(
+            task=TaskName.DEFAULT,
+            model="M",
+            sampling_seed=42,
+        )
+    ).build_request({"prompt": "p"})
+
+    assert request.payload["seed"] == 42
 
 
 def test_chat_json_counts_message_images() -> None:
@@ -407,7 +634,7 @@ def test_chat_json_counts_message_images() -> None:
                             "images": [
                                 {
                                     "type": "image_url",
-                                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                                    "image_url": {"url": _png_data_url()},
                                 }
                             ],
                         },
@@ -435,9 +662,9 @@ def test_chat_json_counts_message_images() -> None:
 
 def test_iter_sse_events_frames_multiple_records() -> None:
     lines = [
-        "data: {\"type\": \"text\", \"value\": \"a\"}",
+        'data: {"type": "text", "value": "a"}',
         "",
-        "data: {\"type\": \"finished\"}",
+        'data: {"type": "finished"}',
         "",
     ]
 
@@ -452,8 +679,8 @@ def test_iter_sse_events_joins_event_split_across_two_data_lines() -> None:
     # Multi-line ``data:`` blocks are joined with "\n" and decoded as one event;
     # the blank line flushes them as exactly one record.
     lines = [
-        "data: {\"type\":",
-        "data:  \"finished\"}",
+        'data: {"type":',
+        'data:  "finished"}',
         "",
     ]
 
@@ -463,15 +690,15 @@ def test_iter_sse_events_joins_event_split_across_two_data_lines() -> None:
 
 
 def test_iter_sse_events_strips_optional_leading_space_consistently() -> None:
-    no_space = list(iter_sse_events(["data:{\"a\":1}", ""]))
-    one_space = list(iter_sse_events(["data: {\"a\":1}", ""]))
+    no_space = list(iter_sse_events(['data:{"a":1}', ""]))
+    one_space = list(iter_sse_events(['data: {"a":1}', ""]))
 
     assert no_space == [{"a": 1}]
     assert no_space == one_space
 
 
 def test_iter_sse_events_ignores_comments_and_non_data_lines() -> None:
-    lines = [": keep-alive", "event: message", "data: {\"k\": 1}", ""]
+    lines = [": keep-alive", "event: message", 'data: {"k": 1}', ""]
 
     events = list(iter_sse_events(lines))
 
@@ -479,7 +706,7 @@ def test_iter_sse_events_ignores_comments_and_non_data_lines() -> None:
 
 
 def test_iter_sse_events_flushes_trailing_record_without_blank_line() -> None:
-    events = list(iter_sse_events(["data: {\"k\": 2}"]))
+    events = list(iter_sse_events(['data: {"k": 2}']))
 
     assert events == [{"k": 2}]
 
@@ -492,11 +719,11 @@ def test_iter_sse_events_done_sentinel_becomes_synthetic_event() -> None:
 
 def test_iter_sse_events_stop_on_terminal_halts_after_first_terminal() -> None:
     lines = [
-        "data: {\"type\": \"text\"}",
+        'data: {"type": "text"}',
         "",
-        "data: {\"type\": \"finished\"}",
+        'data: {"type": "finished"}',
         "",
-        "data: {\"type\": \"text\", \"after\": true}",
+        'data: {"type": "text", "after": true}',
         "",
     ]
 
@@ -507,10 +734,10 @@ def test_iter_sse_events_stop_on_terminal_halts_after_first_terminal() -> None:
 
 def test_iter_sse_events_stop_on_terminal_without_trailing_blank_line() -> None:
     lines = [
-        "data: {\"type\": \"text\"}",
+        'data: {"type": "text"}',
         "",
-        "data: {\"type\": \"finished\"}",
-        "data: {\"type\": \"text\", \"after\": true}",
+        'data: {"type": "finished"}',
+        'data: {"type": "text", "after": true}',
         "",
     ]
 
@@ -521,11 +748,11 @@ def test_iter_sse_events_stop_on_terminal_without_trailing_blank_line() -> None:
 
 def test_aiter_sse_events_stop_on_terminal_without_waiting_for_eof() -> None:
     async def lines() -> object:
-        yield "data: {\"type\": \"text\"}"
+        yield 'data: {"type": "text"}'
         yield ""
-        yield "data: {\"type\": \"finished\"}"
+        yield 'data: {"type": "finished"}'
         await asyncio.sleep(60.0)
-        yield "data: {\"type\": \"text\", \"after\": true}"
+        yield 'data: {"type": "text", "after": true}'
 
     async def run_once() -> list[dict[str, object]]:
         return await asyncio.wait_for(
@@ -540,11 +767,11 @@ def test_aiter_sse_events_stop_on_terminal_without_waiting_for_eof() -> None:
 
 def test_aiter_sse_events_from_text_stops_on_terminal_without_newline_or_eof() -> None:
     async def chunks() -> object:
-        yield "data: {\"type\": \"text\"}\n\n"
-        yield "data: {\"type\": \"fin"
-        yield "ished\"}"
+        yield 'data: {"type": "text"}\n\n'
+        yield 'data: {"type": "fin'
+        yield 'ished"}'
         await asyncio.sleep(60.0)
-        yield "\n\ndata: {\"type\": \"text\", \"after\": true}\n\n"
+        yield '\n\ndata: {"type": "text", "after": true}\n\n'
 
     async def run_once() -> list[dict[str, object]]:
         return await asyncio.wait_for(
@@ -593,9 +820,7 @@ def test_trace_items_loads_rows_and_skips_blank_lines(tmp_path: Path) -> None:
 def test_load_dataset_rows_trace_caps_to_num_prompts(tmp_path: Path) -> None:
     path = tmp_path / "trace.jsonl"
     path.write_text(
-        "\n".join(
-            json.dumps({"id": str(i), "task": "text", "prompt": f"p{i}"}) for i in range(5)
-        )
+        "\n".join(json.dumps({"id": str(i), "task": "text", "prompt": f"p{i}"}) for i in range(5))
         + "\n",
         encoding="utf-8",
     )
@@ -708,6 +933,54 @@ def test_load_sharegpt_inline_filters_and_shapes_rows(tmp_path: Path) -> None:
     assert by_prompt["short one"]["output_len"] == 5
 
 
+def test_load_sharegpt_download_pins_declared_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset_path = tmp_path / "sharegpt.json"
+    dataset_path.write_text(
+        json.dumps(
+            [
+                {
+                    "conversations": [
+                        {"value": "hello there friend"},
+                        {"value": "yes indeed ok"},
+                    ]
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_hf_hub_download(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return str(dataset_path)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(hf_hub_download=fake_hf_hub_download),
+    )
+
+    rows = load_sharegpt(
+        "",
+        num_requests=1,
+        tokenizer=_WhitespaceTokenizer(),
+        seed=42,
+        revision="pinned-revision",
+    )
+
+    assert len(rows) == 1
+    assert calls == [
+        {
+            "repo_id": "anon8231489123/ShareGPT_Vicuna_unfiltered",
+            "filename": "ShareGPT_V3_unfiltered_cleaned_split.json",
+            "repo_type": "dataset",
+            "revision": "pinned-revision",
+        }
+    ]
+
+
 def test_load_dataset_rows_sharegpt_requires_tokenizer() -> None:
     spec = BenchmarkSpec(task=TaskName.TEXT, model="M", dataset="sharegpt")
 
@@ -719,9 +992,7 @@ def test_load_dataset_rows_sharegpt_requires_tokenizer() -> None:
 
 
 def test_build_summary_emits_documented_schema_for_image_task() -> None:
-    spec = BenchmarkSpec(
-        task=TaskName.T2I, model="M", num_prompts=2, request_rate=float("inf")
-    )
+    spec = BenchmarkSpec(task=TaskName.T2I, model="M", num_prompts=2, request_rate=float("inf"))
     records = [
         RequestRecord(
             request_id="a", task="t2i", success=True, latency=2.0, images=1, classifier="ok"
@@ -806,16 +1077,7 @@ def test_runtime_plan_evidence_is_required_and_preserved() -> None:
         plan_evidence_policy="runtime_inspection",
         acceptance_min_images_per_success=1.0,
     )
-    records = [
-        RequestRecord(
-            request_id="a",
-            task="t2i",
-            success=True,
-            latency=1.0,
-            images=1,
-            classifier="ok",
-        )
-    ]
+    records = [_successful_image_record()]
 
     missing = build_summary(spec, "http://x", records, dur_s=1.0)
     assert missing["artifact"]["checks"]["plan_evidence"] is False
@@ -844,8 +1106,12 @@ def test_runtime_plan_evidence_is_required_and_preserved() -> None:
             "source": "runtime_inspection",
             "endpoint": "/v1/chat/completions/plan",
             "plan": actual_plan,
+            "request": reference_request_summary(
+                T2ITask(spec).build_request({"prompt": "image prompt"})
+            ),
         },
         contract=benchmark_contract(spec, [{"id": "a"}]),
+        server_info={"source_endpoint": "/server_info", "payload": {"profile": "test"}},
     )
     assert summary["artifact"]["checks"]["plan_evidence"] is True
     assert summary["artifact"]["plan_summary"] == actual_plan
@@ -860,8 +1126,12 @@ def test_runtime_plan_evidence_is_required_and_preserved() -> None:
             "source": "runtime_inspection",
             "endpoint": "/v1/chat/completions/plan",
             "plan": {**actual_plan, "dialect_id": "other"},
+            "request": reference_request_summary(
+                T2ITask(spec).build_request({"prompt": "image prompt"})
+            ),
         },
         contract=benchmark_contract(spec, [{"id": "a"}]),
+        server_info={"source_endpoint": "/server_info", "payload": {"profile": "test"}},
     )
     assert mismatched["artifact"]["checks"]["plan_evidence"] is False
     assert mismatched["artifact"]["valid"] is False
@@ -878,11 +1148,112 @@ def test_runtime_plan_evidence_is_required_and_preserved() -> None:
                 **actual_plan,
                 "generation": {**actual_plan["generation"], "temperature": 0.7},
             },
+            "request": reference_request_summary(
+                T2ITask(spec).build_request({"prompt": "image prompt"})
+            ),
         },
         contract=benchmark_contract(spec, [{"id": "a"}]),
+        server_info={"source_endpoint": "/server_info", "payload": {"profile": "test"}},
     )
     assert wrong_policy["artifact"]["checks"]["plan_evidence"] is False
     assert wrong_policy["artifact"]["valid"] is False
+
+
+def test_text_artifact_requires_server_reported_exact_generation_work() -> None:
+    spec = BenchmarkSpec(task=TaskName.TEXT, model="M", num_prompts=1)
+    contract = benchmark_contract(spec, [{"id": "a"}])
+    exact = RequestRecord(
+        request_id="a",
+        task="text",
+        success=True,
+        classifier="ok",
+        finish_reason="length",
+        prompt_len=7,
+        output_len=11,
+        requested_output_len=11,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="answer",
+    )
+    summary = build_summary(spec, "http://x", [exact], dur_s=1.0, contract=contract)
+
+    assert summary["artifact"]["checks"]["generation_conformance"] is True
+    assert summary["artifact"]["generation_conformance"]["checked_requests"] == 1
+
+    fallback = RequestRecord(**{**exact.__dict__, "output_len_source": "requested_fallback"})
+    invalid = build_summary(spec, "http://x", [fallback], dur_s=1.0, contract=contract)
+    assert invalid["artifact"]["checks"]["generation_conformance"] is False
+    assert invalid["artifact"]["generation_conformance"]["mismatched_request_ids"] == ["a"]
+
+
+def test_fixed_work_i2t_artifact_requires_server_reported_exact_generation_work() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.I2T,
+        model="M",
+        dataset="image-dir",
+        dataset_path="unused",
+        num_prompts=1,
+        max_tokens=256,
+        ignore_eos=True,
+    )
+    contract = benchmark_contract(spec, [{"id": "a"}])
+    exact = RequestRecord(
+        request_id="a",
+        task="i2t",
+        success=True,
+        classifier="ok",
+        finish_reason="length",
+        prompt_len=17,
+        output_len=256,
+        requested_output_len=256,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="answer",
+    )
+
+    summary = build_summary(spec, "http://x", [exact], dur_s=1.0, contract=contract)
+    assert summary["artifact"]["generation_conformance"]["valid"] is True
+
+    early_stop = RequestRecord(**{**exact.__dict__, "finish_reason": "stop", "output_len": 19})
+    invalid = build_summary(spec, "http://x", [early_stop], dur_s=1.0, contract=contract)
+    assert invalid["artifact"]["generation_conformance"]["valid"] is False
+    assert invalid["artifact"]["generation_conformance"]["mismatched_request_ids"] == ["a"]
+
+
+def test_natural_eos_i2t_does_not_require_fixed_output_length() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.I2T,
+        model="M",
+        dataset="image-dir",
+        dataset_path="unused",
+        num_prompts=1,
+        max_tokens=256,
+        ignore_eos=False,
+    )
+    contract = benchmark_contract(spec, [{"id": "a"}])
+    natural_stop = RequestRecord(
+        request_id="a",
+        task="i2t",
+        success=True,
+        classifier="ok",
+        finish_reason="stop",
+        prompt_len=17,
+        output_len=19,
+        requested_output_len=256,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="answer",
+    )
+
+    summary = build_summary(
+        spec,
+        "http://x",
+        [natural_stop],
+        dur_s=1.0,
+        contract=contract,
+    )
+    assert summary["artifact"]["generation_conformance"]["valid"] is True
+    assert summary["artifact"]["generation_conformance"]["policy"] == "successful_response"
 
 
 def test_reference_protocol_evidence_is_derived_from_the_emitted_request() -> None:
@@ -905,17 +1276,12 @@ def test_reference_protocol_evidence_is_derived_from_the_emitted_request() -> No
         acceptance_min_images_per_success=1.0,
     )
     request = T2ITask(spec).build_request({"prompt": "private prompt"})
-    evidence = {"source": "reference_protocol", "request": reference_request_summary(request)}
-    records = [
-        RequestRecord(
-            request_id="a",
-            task="t2i",
-            success=True,
-            latency=1.0,
-            images=1,
-            classifier="ok",
-        )
-    ]
+    evidence = {
+        "source": "reference_protocol",
+        "plan": plan_summary(spec),
+        "request": reference_request_summary(request),
+    }
+    records = [_successful_image_record(width=1024, height=768)]
 
     contract = benchmark_contract(spec, [{"id": "a"}])
     persisted_contract = json.loads(json.dumps(contract))
@@ -928,6 +1294,7 @@ def test_reference_protocol_evidence_is_derived_from_the_emitted_request() -> No
         dur_s=1.0,
         plan_evidence=evidence,
         contract=contract,
+        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
     )
 
     assert summary["artifact"]["checks"]["plan_evidence"] is True
@@ -942,15 +1309,14 @@ def test_reference_protocol_evidence_is_derived_from_the_emitted_request() -> No
         dur_s=1.0,
         plan_evidence=evidence,
         contract=contract,
+        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
     )
     assert mismatched["artifact"]["checks"]["plan_evidence"] is False
     assert mismatched["artifact"]["valid"] is False
 
 
 def test_build_summary_selects_stream_family_for_text_task() -> None:
-    spec = BenchmarkSpec(
-        task=TaskName.TEXT, model="M", num_prompts=1, request_rate=float("inf")
-    )
+    spec = BenchmarkSpec(task=TaskName.TEXT, model="M", num_prompts=1, request_rate=float("inf"))
     records = [
         RequestRecord(
             request_id="a",
@@ -1056,11 +1422,7 @@ def _run_cli_with_stub(monkeypatch, tmp_path, records: list[RequestRecord]) -> i
 
 
 def test_cli_returns_zero_when_all_requests_succeed(monkeypatch, tmp_path: Path) -> None:
-    records = [
-        RequestRecord(
-            request_id="a", task="t2i", success=True, latency=1.0, images=1, classifier="ok"
-        )
-    ]
+    records = [_successful_image_record()]
 
     exit_code = _run_cli_with_stub(monkeypatch, tmp_path, records)
 

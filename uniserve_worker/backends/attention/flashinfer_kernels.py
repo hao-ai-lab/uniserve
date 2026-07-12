@@ -226,6 +226,29 @@ def _write_decode_token(
     paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current, cast=True)
 
 
+def _decode_effective_seqlens(
+    cache_seqlens: torch.Tensor,
+    current_tokens: int,
+    metadata: Any,
+) -> torch.Tensor:
+    """Return once-per-step post-append lengths for paged decode."""
+
+    current_tokens = int(current_tokens)
+    if current_tokens == 0:
+        return cache_seqlens
+    shared = getattr(metadata, "kv_seqlens", None)
+    if (
+        current_tokens == 1
+        and isinstance(shared, torch.Tensor)
+        and shared.shape == cache_seqlens.shape
+        and shared.device == cache_seqlens.device
+        and shared.dtype == cache_seqlens.dtype
+        and shared.is_contiguous()
+    ):
+        return shared
+    return cache_seqlens + current_tokens
+
+
 def _decode_write_locations_from_context(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,

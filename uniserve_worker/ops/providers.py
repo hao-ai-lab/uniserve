@@ -247,8 +247,8 @@ def silu_and_mul_dispatcher():
     return Dispatcher(
         "silu_and_mul",
         [
-            _SiluAndMulKernelProvider("sgl_kernel", _SglSiluAndMulKernel()),
             _SiluAndMulKernelProvider("triton", a._TritonSiluAndMul()),
+            _SiluAndMulKernelProvider("sgl_kernel", _SglSiluAndMulKernel()),
             _SiluAndMulKernelProvider("eager", a._EagerSiluAndMul()),
         ],
         env_override="UNISERVE_SILU_AND_MUL_PROVIDER",
@@ -938,6 +938,7 @@ class _AttentionBackendProvider:
                 "min_head_dim": int(getattr(caps, "min_head_dim", 1) or 1),
                 "paged_decode_only": bool(getattr(caps, "paged_decode_only", False)),
                 "paged_varlen_cuda_graph": bool(getattr(caps, "paged_varlen_cuda_graph", False)),
+                "visible_end_cuda_graph": bool(getattr(caps, "visible_end_cuda_graph", False)),
             },
         )
 
@@ -1042,6 +1043,8 @@ class _AttentionBackendProvider:
                 and req.cache_seqlens is not None
                 and self._paged_storage_supported(caps, req)
             )
+        if bool(getattr(caps, "paged_decode_only", False)):
+            return False
         if req.attn_mask is not None and self.name != "torch_sdpa":
             return False
         return self._dense_layout_supported(self.name, req)

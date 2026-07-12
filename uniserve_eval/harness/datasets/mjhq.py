@@ -24,6 +24,7 @@ def load_mjhq(
     num_requests: int,
     *,
     seed: int = 42,
+    revision: str | None = None,
 ) -> list[dict[str, Any]]:
     path = dataset_path or ""
     if not (path and os.path.isfile(path)):
@@ -33,6 +34,7 @@ def load_mjhq(
             repo_id=MJHQ_REPO_ID,
             filename=MJHQ_META_FILENAME,
             repo_type="dataset",
+            revision=revision,
         )
 
     with open(path, encoding="utf-8") as handle:

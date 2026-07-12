@@ -22,6 +22,7 @@ from .base import (
 )
 
 _DEFAULT_PREFILL_GRAPH_BATCH_SIZES = (1, 2, 4, 8)
+_PREFILL_GRAPH_PADDING_BLOCK_ID = 0
 
 
 def _reset_append_plan(state: "TextInitialPrefillGraphState") -> None:
@@ -125,6 +126,15 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         if candidates:
             return max(candidates) if prefer_reusable else min(candidates)
         return batch_size
+
+    def padding_batch_size(self, batch_size: int, *, num_tokens: int) -> int:
+        """Return a graph row bucket with one isolated token-padding row."""
+
+        batch_size = int(batch_size)
+        configured = self.warmup_batch_sizes()
+        if not configured or batch_size > max(configured):
+            return batch_size
+        return self.bucket_batch_size(batch_size + 1, num_tokens=int(num_tokens))
 
     def resolve_batch_size(self, num_tokens: int, batch_size: int, max_kv_tokens: int) -> int:
         batch_size = int(batch_size)
@@ -306,7 +316,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
     ) -> torch.Tensor | None:
         """Capture-or-replay an initial-prefill bucket; ``None`` on miss/fallback."""
 
-        graph_batch_size = self.resolve_batch_size(num_tokens, batch_size, max_kv_tokens)
+        graph_batch_size = self.resolve_batch_size(num_tokens, int(batch_size), max_kv_tokens)
         graph_key = self.state_key(num_tokens, graph_batch_size, max_kv_tokens)
         if graph_key not in self.states and self.warmup_enabled():
             self.record_stats(
@@ -493,8 +503,15 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         )
 
     def warmup_capture_buckets(self) -> tuple[tuple[int, int], ...]:
+        configured = self.warmup_batch_sizes()
+        if not configured:
+            return ()
+        max_batch_size = max(configured)
         return tuple(
-            (int(num_tokens), self.bucket_batch_size(1, num_tokens=int(num_tokens)))
+            (
+                int(num_tokens),
+                max_batch_size,
+            )
             for num_tokens in self.warmup_capture_token_buckets()
         )
 
@@ -724,18 +741,33 @@ def copy_text_initial_prefill_graph_inputs(
     if len(cache_lens_cpu) != real_rows:
         raise invalid_descriptor("prefill CUDA graph cache length count mismatch")
     graph_cache_lens_cpu = cache_lens_cpu + tuple(0 for _ in range(state.batch_size - real_rows))
-    source_cache = getattr(attention_metadata, "cache", None)
-    block_ids_by_row = getattr(source_cache, "block_ids_by_row", None)
-    if block_ids_by_row is not None:
-        graph_block_ids = [list(row) for row in block_ids_by_row] + [[] for _ in range(state.batch_size - real_rows)]
-        state.cache.reset_rows(graph_block_ids, graph_cache_lens_cpu)
     raw_lens = tuple(int(length) for length in getattr(attention_metadata, "query_lens_cpu", ()) or ())
     if len(raw_lens) != real_rows:
         raise invalid_descriptor("prefill CUDA graph query lengths mismatch")
     if sum(raw_lens) != raw_num_tokens:
         raise invalid_descriptor("prefill CUDA graph raw token count does not match query lengths")
     graph_lens = list(raw_lens) + [0 for _ in range(state.batch_size - real_rows)]
-    graph_lens[real_rows - 1] += int(state.num_tokens) - raw_num_tokens
+    source_cache = getattr(attention_metadata, "cache", None)
+    block_ids_by_row = getattr(source_cache, "block_ids_by_row", None)
+    padding_tokens = int(state.num_tokens) - raw_num_tokens
+    padding_row = real_rows - 1
+    if padding_tokens > 0:
+        graph_lens[padding_row] += padding_tokens
+    if block_ids_by_row is not None:
+        graph_block_ids = [list(row) for row in block_ids_by_row] + [[] for _ in range(state.batch_size - real_rows)]
+        if padding_tokens > 0:
+            required_blocks = ceil_div(
+                int(graph_cache_lens_cpu[padding_row]) + int(graph_lens[padding_row]),
+                int(state.cache.pool.block_size),
+            )
+            missing_blocks = required_blocks - len(graph_block_ids[padding_row])
+            if missing_blocks > 0:
+                graph_block_ids[padding_row].extend(
+                    [_PREFILL_GRAPH_PADDING_BLOCK_ID] * missing_blocks
+                )
+            if len(graph_block_ids[padding_row]) > int(state.block_table.shape[1]):
+                raise invalid_descriptor("prefill CUDA graph sink tail exceeds block-table capacity")
+        state.cache.reset_rows(graph_block_ids, graph_cache_lens_cpu)
     graph_lens_tuple = tuple(int(length) for length in graph_lens)
     kv_lens_tuple = tuple(int(base) + int(query) for base, query in zip(graph_cache_lens_cpu, graph_lens_tuple, strict=True))
     if max(kv_lens_tuple, default=0) > int(state.max_kv_tokens):
@@ -748,8 +780,8 @@ def copy_text_initial_prefill_graph_inputs(
     state.query_lens[:real_rows].copy_(query_lens.to(dtype=torch.int32), non_blocking=True)
     if real_rows < state.batch_size:
         state.query_lens[real_rows:].zero_()
-    if state.num_tokens > raw_num_tokens:
-        state.query_lens[real_rows - 1].add_(int(state.num_tokens) - raw_num_tokens)
+    if padding_tokens > 0:
+        state.query_lens[padding_row] += padding_tokens
     state.kv_seqlens.copy_(state.cache_seqlens, non_blocking=True)
     state.kv_seqlens.add_(state.query_lens)
     state.cu_seqlens_q[:1].zero_()

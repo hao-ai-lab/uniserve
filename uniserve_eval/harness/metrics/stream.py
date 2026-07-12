@@ -33,6 +33,7 @@ def summarize_stream(
     tokenizer: Any | None = None,
 ) -> dict[str, Any]:
     successful = [r for r in records if r.success]
+    timed_successful = [r for r in successful if r.token_timing_available is not False]
     completed = len(successful)
 
     output_lens: list[int] = []
@@ -50,16 +51,18 @@ def summarize_stream(
                 len(tokenizer.encode(r.generated_text, add_special_tokens=False))
             )
         total_input += r.prompt_len
-        if r.output_len > 1:
-            tpots.append((r.latency - r.ttft) / (r.output_len - 1))
-        itls += r.itl
-        ttfts.append(r.ttft)
+        if r.token_timing_available is not False:
+            if r.output_len > 1:
+                tpots.append((r.latency - r.ttft) / (r.output_len - 1))
+            itls += r.itl
+            ttfts.append(r.ttft)
         e2e_latencies.append(r.latency)
 
     total_output = sum(output_lens)
     total_output_retokenized = sum(retokenized_output_lens)
 
-    max_output_tokens_per_s, max_concurrent_requests = _peak_per_second(successful)
+    max_output_tokens_per_s, _ = _peak_per_second(timed_successful)
+    _, max_concurrent_requests = _peak_per_second(successful)
 
     dur_s = dur_s if dur_s > 0 else 1e-9
 
@@ -108,7 +111,38 @@ def summarize_stream(
         "concurrency": float(np.sum(e2e_latencies)) / dur_s,
         "max_output_tokens_per_s": max_output_tokens_per_s,
         "max_concurrent_requests": max_concurrent_requests,
+        "token_timing_available": bool(timed_successful) and len(timed_successful) == completed,
+        "token_timing_request_count": len(timed_successful),
     }
+
+    if not timed_successful:
+        for key in (
+            "mean_ttft_ms",
+            "median_ttft_ms",
+            "std_ttft_ms",
+            "p50_ttft_ms",
+            "p90_ttft_ms",
+            "p95_ttft_ms",
+            "p99_ttft_ms",
+            "mean_tpot_ms",
+            "median_tpot_ms",
+            "std_tpot_ms",
+            "p50_tpot_ms",
+            "p90_tpot_ms",
+            "p95_tpot_ms",
+            "p99_tpot_ms",
+            "mean_itl_ms",
+            "median_itl_ms",
+            "std_itl_ms",
+            "p50_itl_ms",
+            "p90_itl_ms",
+            "p95_itl_ms",
+            "p99_itl_ms",
+            "max_itl_ms",
+            "max_output_tokens_per_s",
+        ):
+            summary[key] = None
+        summary["token_timing_unavailable_reason"] = "non_streaming_response"
 
     if tokenizer is not None:
         summary["total_output_tokens_retokenized"] = total_output_retokenized

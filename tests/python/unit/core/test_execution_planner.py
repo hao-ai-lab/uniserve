@@ -17,7 +17,7 @@ from uniserve_worker.contracts.batches import CfgBatch, UniForwardBatch
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
-from uniserve_worker.execution.runner import ModelRunner
+from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 from uniserve_worker.execution.text_driver import text_input_id_replacements_from_relays
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
@@ -130,7 +130,12 @@ def _cpu_pool_runner(model):
         device="cpu",
         ledger=ledger,
     )
-    return ModelRunner(model, resource_runtime=ledger, residency=residency)
+    return ModelRunner(
+        model,
+        config=RunnerConfig(simulation=True),
+        resource_runtime=ledger,
+        residency=residency,
+    )
 
 
 def ops(*kinds: str) -> list[dict[str, Any]]:
@@ -140,7 +145,7 @@ def ops(*kinds: str) -> list[dict[str, Any]]:
 
 def execute(model: RecordingModel, submitted_ops: list[dict[str, Any]]) -> dict[str, Any]:
     req_ids = sorted({int(op["req_id"]) for op in submitted_ops})
-    return ModelRunner(model).execute(
+    return ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
@@ -162,6 +167,27 @@ def test_strict_policy_preserves_contiguous_order_and_splits_by_max_batch():
         (ForwardMode.DECODE, [4], ["decode_und"]),
         (ForwardMode.EXTEND, [5], ["prefill_und"]),
     ]
+
+
+def test_mixed_admission_splits_when_the_model_adapter_cannot_execute_the_batch():
+    from uniserve_worker.execution.forward.step import ForwardGroupPlanner
+
+    planner = ForwardGroupPlanner(
+        BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),
+        log_text_mixed_split=lambda _ops, _decision: None,
+        can_run_forward=lambda batch: batch.mode is not ForwardMode.MIXED,
+    )
+    submitted = [
+        {"req_id": 1, "kind": "prefill_und", "token_ids": [1]},
+        {"req_id": 2, "kind": "denoise_gen", "latent_shape": [2, 2]},
+        {"req_id": 3, "kind": "prefill_und", "token_ids": [2]},
+        {"req_id": 4, "kind": "denoise_gen", "latent_shape": [2, 2]},
+    ]
+
+    groups = planner.groups(submitted)
+
+    assert [[index for index, _op in group] for group in groups] == [[0, 2], [1, 3]]
+    assert all(UniForwardBatch.from_ops([op for _index, op in group]).mode is not ForwardMode.MIXED for group in groups)
 
 
 def test_runner_executes_whole_batch_forward_under_inference_mode():
@@ -210,7 +236,7 @@ def test_text_extend_decode_route_prefers_whole_batch_forward_over_legacy_hook()
         {"req_id": 2, "kind": "prefill_und", "token_ids": [11, 12], "pos_range": [0, 2]},
     ]
 
-    result = ModelRunner(model).execute(
+    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": 1, "block_ids": []}, {"req_id": 2, "block_ids": []}],
@@ -240,6 +266,7 @@ def test_runner_registers_text_graph_programs_with_forward_executor(monkeypatch)
     runner = ModelRunner(Model())
 
     assert runner.forward_graph_policy.graph_selection_delegated is False
+    assert runner.forward_graph_policy.strict is True
     assert runner.text_graph_runner is graph_runner
     assert runner.text_driver.graph_runner is None
     assert runner.forward_executor.graph_runner is runner.forward_graph_runner
@@ -604,7 +631,7 @@ def test_batch_policy_rejects_invalid_max_batch():
 def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
     model = ForwardHookModel(max_batch_ops=4)
-    runner = ModelRunner(model)
+    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
     result = runner.execute(
         {
             "step_id": 7,
@@ -648,7 +675,7 @@ def test_text_denoise_route_uses_whole_batch_forward_unconditionally(text_kind):
     submitted = ops(text_kind, "denoise_gen")
 
     req_ids = sorted({int(op["req_id"]) for op in submitted})
-    result = ModelRunner(model).execute(
+    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
@@ -677,7 +704,7 @@ def test_mixed_adapter_whole_batch_forward_bypasses_legacy_deferred_hook():
     submitted = ops("decode_und", "denoise_gen")
     req_ids = sorted({int(op["req_id"]) for op in submitted})
 
-    result = ModelRunner(model).execute(
+    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
@@ -700,7 +727,7 @@ def test_text_denoise_forward_route_uses_unified_whole_batch_without_hook(text_k
     submitted = ops(text_kind, "denoise_gen")
 
     req_ids = sorted({int(op["req_id"]) for op in submitted})
-    result = ModelRunner(model).execute(
+    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],

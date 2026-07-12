@@ -9,13 +9,21 @@ Three public wire shapes are supported, selected by ``TaskRequest.kind``:
 Receive timestamps are stamped per SSE event by ``sse.aiter_sse_events`` so
 TTFT/ITL reflect arrival time even though we collect the stream into a list.
 """
+
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, TypeGuard
 
 import httpx
 
+from ..image_outputs import (
+    ImageOutputError,
+    ImageOutputRequirements,
+    decode_openai_image_parts,
+    image_output_mismatch,
+    image_output_requirements,
+)
 from ..metrics.common import RequestRecord
 from ..response_classifier import (
     classify_json_image_response,
@@ -43,6 +51,13 @@ async def send_request(
     payload = {key: value for key, value in request.payload.items() if value is not None}
     url = base_url.rstrip("/") + request.endpoint
     record = RequestRecord(request_id=request_id, task=task)
+    record.requested_output_len = int(output_len_fallback)
+    image_requirements = image_output_requirements(payload, request_kind=request.kind)
+    record.generated_images_expected = image_requirements.expected
+    record.requested_image_count = image_requirements.count
+    record.requested_image_count_is_cap = image_requirements.count_is_cap
+    record.requested_image_width = image_requirements.width
+    record.requested_image_height = image_requirements.height
     record.scheduled_time = scheduled_time
     record.endpoint = request.endpoint
     record.start_time = time.perf_counter()
@@ -53,8 +68,13 @@ async def send_request(
             await _send_chat_json(client, url, payload, record)
         elif request.kind == "openai_chat":
             await _send_sse(
-                client, url, payload, record, protocol="openai",
-                prompt_len=prompt_len, output_len_fallback=output_len_fallback,
+                client,
+                url,
+                payload,
+                record,
+                protocol="openai",
+                prompt_len=prompt_len,
+                output_len_fallback=output_len_fallback,
             )
         else:
             raise ValueError(f"unsupported request kind {request.kind!r}")
@@ -88,12 +108,18 @@ async def _send_images(
     transport_ok = response.status_code < 400
     if not transport_ok and classifier == "ok":
         classifier = f"transport_status_{response.status_code}"
-    record.success = body_ok and transport_ok
-    record.classifier = classifier
     images = data.get("data") if isinstance(data, dict) else None
-    count = len(images) if isinstance(images, list) else 0
+    image_error: str | None = None
+    if body_ok and isinstance(images, list):
+        if not all(isinstance(image, dict) for image in images):
+            image_error = "protocol_invalid_image_part"
+        else:
+            image_error = _decode_record_images(images, record)
+    record.success = body_ok and transport_ok and image_error is None
+    record.classifier = image_error or classifier
+    if image_error is not None:
+        record.error = image_error
     if record.success:
-        record.images = max(1, count)
         # Non-streaming: every returned image shares the request E2E latency.
         record.image_latencies = [record.latency] * record.images
 
@@ -133,24 +159,34 @@ async def _send_chat_json(
         content = openai_message_text(message)
         images = openai_message_images(message)
     record.generated_text = content
-    if images:
-        record.images = len(images)
+    image_error = _decode_record_images(images, record)
+    if images and image_error is None:
         # Non-streaming: every returned image shares the request E2E latency.
-        record.image_latencies = [record.latency] * len(images)
+        record.image_latencies = [record.latency] * record.images
     usage = data.get("usage") if isinstance(data, dict) else None
     if isinstance(usage, dict):
         if isinstance(usage.get("completion_tokens"), int):
             record.output_len = int(usage["completion_tokens"])
+            record.output_len_source = "server_usage"
         if isinstance(usage.get("prompt_tokens"), int):
             record.prompt_len = int(usage["prompt_tokens"])
+            record.prompt_len_source = "server_usage"
+    if isinstance(data, dict):
+        _capture_cached_prompt_tokens(record, data)
     transport_ok = response.status_code < 400
-    record.success = transport_ok and bool(content or images)
-    record.classifier = "ok" if record.success else (
-        f"transport_status_{response.status_code}" if not transport_ok else "empty_completion"
+    record.success = transport_ok and image_error is None and bool(content or record.decoded_images)
+    record.classifier = (
+        "ok"
+        if record.success
+        else (
+            f"transport_status_{response.status_code}"
+            if not transport_ok
+            else image_error or "empty_completion"
+        )
     )
-    # Non-streaming: the full completion shares the request E2E latency.
-    record.ttft = record.latency
-    record.first_text_time = record.final_event_time
+    if image_error is not None:
+        record.error = image_error
+    record.token_timing_available = False
 
 
 async def _send_sse(
@@ -204,6 +240,8 @@ def _parse_openai(
     image_since_last_text = False
     output_len = output_len_fallback
     prompt_tokens: int | None = None
+    completion_tokens_from_usage = False
+    image_parts: list[dict[str, Any]] = []
     for event in events:
         choices = event.get("choices")
         if isinstance(choices, list):
@@ -220,12 +258,15 @@ def _parse_openai(
         if isinstance(usage, dict):
             if isinstance(usage.get("completion_tokens"), int):
                 output_len = int(usage["completion_tokens"])
+                completion_tokens_from_usage = True
             if isinstance(usage.get("prompt_tokens"), int):
                 prompt_tokens = int(usage["prompt_tokens"])
+        _capture_cached_prompt_tokens(record, event)
         content = openai_delta_text(event)
         images = openai_delta_images(event)
         timestamp = event.get("_client_t")
         if content:
+            record.token_timing_available = True
             record.text_chunks.append(content)
             record.generated_text += content
             if timestamp is not None:
@@ -238,7 +279,7 @@ def _parse_openai(
                 last_text_time = timestamp_f
                 image_since_last_text = False
         if images:
-            record.images += len(images)
+            image_parts.extend(images)
             image_since_last_text = True
             if timestamp is not None:
                 timestamp_f = float(timestamp)
@@ -249,8 +290,62 @@ def _parse_openai(
 
     if prompt_tokens is not None:
         record.prompt_len = prompt_tokens
+        record.prompt_len_source = "server_usage"
     record.output_len = output_len
+    if completion_tokens_from_usage:
+        record.output_len_source = "server_usage"
     record.itl = itl
+    image_error = _decode_record_images(image_parts, record)
+    if image_error is not None:
+        record.success = False
+        record.classifier = image_error
+        record.error = image_error
+
+
+def _decode_record_images(parts: list[dict[str, Any]], record: RequestRecord) -> str | None:
+    try:
+        decoded = decode_openai_image_parts(parts)
+    except ImageOutputError as error:
+        return error.classifier
+    record.decoded_images = decoded
+    record.images = len(decoded)
+    requirements = ImageOutputRequirements(
+        expected=record.generated_images_expected,
+        count=record.requested_image_count,
+        count_is_cap=record.requested_image_count_is_cap,
+        width=record.requested_image_width,
+        height=record.requested_image_height,
+    )
+    return image_output_mismatch(decoded, requirements)
+
+
+def _capture_cached_prompt_tokens(record: RequestRecord, payload: dict[str, Any]) -> None:
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = details.get("cached_tokens")
+            if _is_token_count(cached):
+                record.cached_prompt_tokens = int(cached)
+                record.cached_prompt_tokens_source = "openai_usage_prompt_tokens_details"
+                return
+    if record.cached_prompt_tokens_source == "openai_usage_prompt_tokens_details":
+        return
+    sglext = payload.get("sglext")
+    if not isinstance(sglext, dict):
+        return
+    details = sglext.get("cached_tokens_details")
+    if not isinstance(details, dict):
+        return
+    counts = [details.get(name) for name in ("device", "host", "storage")]
+    present = [int(value) for value in counts if _is_token_count(value)]
+    if present:
+        record.cached_prompt_tokens = sum(present)
+        record.cached_prompt_tokens_source = "sglang_sglext_cached_tokens_details"
+
+
+def _is_token_count(value: Any) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _last_event_time(events: list[dict[str, Any]], default_start: float) -> float:

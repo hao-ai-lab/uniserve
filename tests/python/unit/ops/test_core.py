@@ -225,6 +225,31 @@ def test_attention_provider_skips_paged_only_varlen_without_block_table():
     )
 
 
+def test_attention_provider_rejects_paged_decode_only_backend_for_dense_attention():
+    class _PagedDecodeOnlyBackend:
+        name = "paged_decode_only"
+
+        def capabilities(self):
+            return AttentionCapabilities(
+                available=True,
+                paged_kv=True,
+                paged_decode_only=True,
+            )
+
+    provider = _AttentionBackendProvider(_PagedDecodeOnlyBackend())
+    q = torch.empty(3, 2, 64)
+    req = AttentionReq(
+        q=q,
+        k=torch.empty_like(q),
+        v=torch.empty_like(q),
+        regime=AttentionRegime.DENSE,
+        causal=False,
+        scale=1.0,
+    )
+
+    assert not provider.can_run(req)
+
+
 def test_attention_provider_rejects_raw_paged_varlen_page_size_mismatch():
     class _PagedVarlenBackend:
         name = "paged_varlen"

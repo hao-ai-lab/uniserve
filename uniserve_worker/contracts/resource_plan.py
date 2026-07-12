@@ -18,6 +18,7 @@ __all__ = [
     "PerBranch",
     "ResourcePlan",
     "CapsDescriptor",
+    "active_latent_capacity_tokens",
 ]
 
 
@@ -74,6 +75,26 @@ class ResourcePlan:
         if self.adapter:
             out.append("adapter")
         return tuple(out)
+
+
+def active_latent_capacity_tokens(
+    per_image_tokens: int,
+    concurrency_token_budget: int | None,
+) -> int:
+    """Return the scheduler-visible total image-latent residency budget.
+
+    ``max_vae_grid_tokens`` bounds one image. The image-latent resource cap is
+    instead a total across active requests, so a configured runtime token
+    budget expands that cap while retaining one full image as the minimum.
+    """
+
+    per_image = max(0, int(per_image_tokens))
+    if per_image == 0:
+        return 0
+    if concurrency_token_budget is None:
+        return per_image
+    return max(per_image, int(concurrency_token_budget))
+
 
 @dataclass(frozen=True)
 class CapsDescriptor:

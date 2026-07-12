@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+import uniserve_worker.nn.vision.encoder as vision_encoder
 from uniserve_worker.nn.vision import (
     PatchEmbed,
     PositionEmbedding,
@@ -12,6 +13,7 @@ from uniserve_worker.nn.vision import (
     patchify_batch,
     unpatchify_batch,
 )
+from uniserve_worker.nn.vision.encoder import VisionSelfAttention
 
 pytestmark = pytest.mark.unit
 
@@ -47,3 +49,17 @@ def test_position_embedding_supports_bagel_and_sensenova_initialization_modes():
 
     ids = get_flattened_position_ids_extrapolate(4, 6, 2, 8)
     torch.testing.assert_close(ids, torch.tensor([0, 1, 2, 8, 9, 10]))
+
+
+def test_vision_attention_does_not_require_an_optional_named_provider(monkeypatch):
+    def reject_named_override(*_args, **kwargs):
+        assert kwargs["override"] is None
+        return False
+
+    monkeypatch.setattr(vision_encoder.ops, "can_run_attention", reject_named_override)
+    attention = VisionSelfAttention(hidden_size=8, num_heads=2)
+    tokens = torch.randn(3, 8)
+
+    output = attention(tokens, torch.tensor([0, 3], dtype=torch.int32))
+
+    assert output.shape == tokens.shape

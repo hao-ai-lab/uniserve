@@ -6,6 +6,7 @@ import torch
 from uniserve_worker.execution.forward.graph.interleaved_text import (
     InterleavedTextDecodeGraphRunner,
     InterleavedTextPrefillGraphRunner,
+    _InterleavedDecodeGraphPast,
     _Row,
 )
 from uniserve_worker.models.sensenova.model import _SenseNovaDecoderModel
@@ -75,6 +76,16 @@ def test_interleaved_decode_graph_forward_uses_cache_position_without_index_side
     torch.testing.assert_close(logits, torch.tensor([[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]))
 
 
+def test_interleaved_decode_graph_past_accepts_one_token_per_batch_row():
+    cache = SimpleNamespace(pool=object(), block_ids_by_row=[[1], [2]])
+    past = _InterleavedDecodeGraphPast(cache)
+
+    assert past.request_cache_for_update(layer_idx=0, n_tokens=1) is cache
+
+    with pytest.raises(Exception, match="one token per row"):
+        past.request_cache_for_update(layer_idx=0, n_tokens=2)
+
+
 def test_interleaved_prefill_graph_selects_last_real_token_from_all_logits():
     runner = InterleavedTextPrefillGraphRunner()
     input_ids = torch.tensor([5, 6, 0, 0], dtype=torch.long)
@@ -100,6 +111,39 @@ def test_interleaved_prefill_graph_selects_last_real_token_from_all_logits():
 
     assert calls
     torch.testing.assert_close(logits, torch.tensor([[3.0, 4.0, 5.0]]))
+
+
+def test_interleaved_prefill_graph_selects_packed_row_logits():
+    runner = InterleavedTextPrefillGraphRunner()
+    input_ids = torch.tensor([5, 6, 7, 8, 9, 10, 0, 0], dtype=torch.long)
+    positions = torch.arange(8, dtype=torch.long)
+    cache = SimpleNamespace(pool=object(), base_len=0)
+    state = SimpleNamespace(
+        num_tokens=8,
+        batch_size=4,
+        input_ids=input_ids,
+        positions=positions,
+        last_token_indices=torch.tensor([1, 4, 5, 0], dtype=torch.long),
+        cache=cache,
+    )
+
+    class Owner:
+        def interleaved_text_forward(self, **kwargs):
+            return SimpleNamespace(logits=torch.arange(24, dtype=torch.float32).view(1, 8, 3))
+
+    logits = runner._forward(SimpleNamespace(owner=Owner()), state)
+
+    torch.testing.assert_close(
+        logits,
+        torch.tensor(
+            [
+                [3.0, 4.0, 5.0],
+                [12.0, 13.0, 14.0],
+                [15.0, 16.0, 17.0],
+                [0.0, 1.0, 2.0],
+            ]
+        ),
+    )
 
 
 def test_decoder_cache_position_builds_batched_text_indexes():

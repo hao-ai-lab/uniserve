@@ -12,7 +12,7 @@ import torch
 
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.execution.interleaved_text_stepper import resolve_op_token_ids
-from uniserve_worker.execution.runner import ModelRunner
+from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 
 
 class _ScriptedTextModel(ModelHooks):
@@ -52,7 +52,7 @@ def _burst_op(count: int, stop_ids: list[int]) -> dict:
 
 
 def _run_burst(model: _ScriptedTextModel, op: dict) -> dict:
-    runner = ModelRunner(model)
+    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
     result = runner.execute(
         {
             "step_id": 1,
@@ -122,7 +122,7 @@ def test_burst_relay_ops_carry_device_relay_tensor():
 
 def test_multi_row_burst_returns_token_lists_for_each_row():
     model = _ScriptedTextModel([5, 6, 7, 8])
-    runner = ModelRunner(model)
+    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
     result = runner.execute(
         {
             "step_id": 1,

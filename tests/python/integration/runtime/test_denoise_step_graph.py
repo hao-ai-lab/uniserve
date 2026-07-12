@@ -12,7 +12,7 @@ Covers the observable contract of ``uniserve_worker.execution.forward.graph.deno
   (the next replay must not rewrite results a caller retained);
 * release frees the per-image graph states and any backend graph-scoped wrapper
   bindings, and a later step recaptures cleanly;
-* the ``UNISERVE_DENOISE_STEP_GRAPH`` env gate defaults off;
+* graph execution is enabled by the production runtime without a request-time gate;
 * capture failures fall back to eager and hard-disable after two strikes.
 
 The capture/replay tests need a CUDA device plus the FlashInfer paged prefill
@@ -29,7 +29,6 @@ from uniserve_worker.contracts.forward_context import ForwardContext, use_forwar
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.execution import paged_denoise as paged_denoise_mod
 from uniserve_worker.execution.forward.graph.denoise_step import (
-    DENOISE_STEP_GRAPH_ENV,
     DenoiseStepGraphRunner,
     maybe_run_denoise_step_graph,
     release_denoise_step_graphs,
@@ -176,6 +175,45 @@ def test_paged_denoise_uses_transient_varlen_attention_metadata(monkeypatch):
     assert kwargs["cu_seqlens_k"].tolist() == [0, 2]
     assert kwargs["max_seqlen_q"] == 2
     assert kwargs["max_seqlen_k"] == 2
+
+
+@requires_cuda
+def test_paged_denoise_probe_accepts_explicit_query_geometry(monkeypatch):
+    device = torch.device("cuda")
+    pool = PagedKVPool(
+        num_layers=1,
+        num_blocks=4,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=8,
+        device=device,
+        dtype=torch.float16,
+    )
+    cache = PagedTextCache(pool, [1], num_layers=1, length=0)
+    storage_shaped_prototype = pool.k
+    calls = []
+
+    def fake_can_run_attention(q, k, v, **kwargs):
+        del q, k, v
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(paged_denoise_mod.ops, "can_run_attention", fake_can_run_attention)
+
+    assert can_run_paged_denoise_attention(
+        cache,
+        prototype=storage_shaped_prototype,
+        query_width=8,
+        query_tokens=3,
+        batch_size=1,
+    )
+
+    assert len(calls) == 1
+    kwargs = calls[0]
+    assert kwargs["cu_seqlens_q"].tolist() == [0, 3]
+    assert kwargs["cu_seqlens_k"].tolist() == [0, 3]
+    assert kwargs["max_seqlen_q"] == 3
+    assert kwargs["max_seqlen_k"] == 3
 
 
 def _make_caches(
@@ -510,19 +548,13 @@ def test_denoise_step_graph_release_frees_states_and_backend_bindings():
 @requires_cuda
 @requires_flashinfer
 @pytest.mark.gpu
-def test_denoise_step_graph_env_gate_defaults_off(monkeypatch):
+def test_denoise_step_graph_is_enabled_by_default():
     device = torch.device("cuda")
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=9)
     caches = _make_caches(pool, device, seed=10)
     rows = _make_rows(caches, device, seed=100, t_value=0.9)
 
-    monkeypatch.delenv(DENOISE_STEP_GRAPH_ENV, raising=False)
-    with torch.inference_mode(), use_forward_context(ForwardContext(stats=ForwardStats())):
-        assert maybe_run_denoise_step_graph(owner, rows) is None
-    assert getattr(owner, "_denoise_step_graph_runner", None) is None
-
-    monkeypatch.setenv(DENOISE_STEP_GRAPH_ENV, "1")
     with torch.inference_mode():
         eager = _eager_reference(owner, rows)
     with torch.inference_mode(), use_forward_context(ForwardContext(stats=ForwardStats())):

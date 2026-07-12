@@ -27,7 +27,7 @@ from ..contracts.resource_plan import (
     ResourcePlan,
 )
 from ..execution.model_base import UniModelBase
-from ..execution.runner import ModelRunner
+from ..execution.runner import ModelRunner, RunnerConfig
 from ..foundation.env import env_int
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..runtime.image_params import required_image_height, required_image_width
@@ -217,7 +217,7 @@ class StubEngine(BaseWorkerDriver):
     def __init__(self, block_size: int = DEFAULT_BLOCK_SIZE) -> None:
         super().__init__(block_size=block_size)
         self.model = StubUniModel()
-        self.runner = ModelRunner(self.model)
+        self.runner = ModelRunner(self.model, config=RunnerConfig(simulation=True))
         # Aliases onto model state for tests that read emitted/steps/reqs directly.
         self.emitted = self.model.emitted
         self.steps = self.model.steps

@@ -62,8 +62,6 @@ def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any], *, strict_env:
         require_resolved_profile_value(spec, context="server spec")
         require_resolved_profile_value(config.get("python", ""), context="config python")
         require_resolved_profile_value(config.get("server_bin", ""), context="config server_bin")
-    if spec.get("command"):
-        return [str(part) for part in spec["command"]]
     cmd = []
     # Pin the server (and the workers it spawns, which inherit affinity) to one
     # NUMA node's full core set. Servers inherit the parent's CPU mask
@@ -80,6 +78,9 @@ def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any], *, strict_env:
                 f"--membind={int(numa_node)}",
             ]
         )
+    if spec.get("command"):
+        cmd.extend(str(part) for part in spec["command"])
+        return cmd
     cmd.extend(
         [
             _repo_path(config, "server_bin", "target/debug/uniserve"),

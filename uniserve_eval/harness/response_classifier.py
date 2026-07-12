@@ -57,7 +57,7 @@ def openai_message_images(message: dict[str, Any] | None) -> list[dict[str, Any]
         images.extend(
             part
             for part in content
-            if isinstance(part, dict) and (part.get("type") == "image_url" or "image_url" in part)
+            if isinstance(part, dict) and _is_image_part(part)
         )
     return images
 
@@ -115,6 +115,14 @@ def openai_delta_images(event: dict[str, Any]) -> list[dict[str, Any]]:
             images.extend(
                 part
                 for part in content
-                if isinstance(part, dict) and (part.get("type") == "image_url" or "image_url" in part)
+                if isinstance(part, dict) and _is_image_part(part)
             )
     return images
+
+
+def _is_image_part(part: dict[str, Any]) -> bool:
+    return (
+        part.get("type") == "image_url"
+        or "image_url" in part
+        or "b64_json" in part
+    )

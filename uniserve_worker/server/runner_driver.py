@@ -17,7 +17,7 @@ from ..backends.attention import (
 from ..contracts.caps import Caps, validate_caps
 from ..contracts.model_family import ModelFamilyDescriptor
 from ..contracts.model_protocols import UniModel, verify_model_conformance
-from ..execution.runner import ModelRunner
+from ..execution.runner import ModelRunner, RunnerConfig
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
@@ -71,6 +71,7 @@ class RunnerDriver(BaseWorkerDriver):
         transfer_backend: str = "local",
         worker_kind: str | None = None,
         family_descriptor: ModelFamilyDescriptor | None = None,
+        simulation: bool = False,
     ) -> None:
         super().__init__(block_size=block_size)
         self.model = model
@@ -103,6 +104,7 @@ class RunnerDriver(BaseWorkerDriver):
         residency = self._build_residency(ledger)
         self.runner = ModelRunner(
             model,
+            config=RunnerConfig(simulation=bool(simulation)),
             attention_backend=self.attention_backend,
             resource_runtime=ledger,
             multimodal_processor=get_processor_for_descriptor(self.family_descriptor),

@@ -3,20 +3,25 @@ from __future__ import annotations
 import json
 import re
 import tomllib
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from jsonschema import Draft202012Validator
+from PIL import Image
 
+from uniserve_eval.harness.image_outputs import inspect_image_bytes
 from uniserve_eval.harness.metrics.common import RequestRecord
-from uniserve_eval.harness.report import benchmark_contract, build_summary
+from uniserve_eval.harness.report import benchmark_contract, build_summary, plan_summary
 from uniserve_eval.harness.runner import reference_request_summary
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
 from uniserve_eval.harness.tasks.t2i import T2ITask
 
 pytestmark = pytest.mark.architecture
 
-ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "Cargo.toml").exists())
+ROOT = next(
+    parent for parent in Path(__file__).resolve().parents if (parent / "Cargo.toml").exists()
+)
 CRATES = ROOT / "crates"
 
 
@@ -42,7 +47,10 @@ def source_tree(path: Path) -> str:
 
 
 def production_source(path: Path) -> str:
-    return "\n".join(re.split(r"#\[cfg\(test\)\]\s*mod tests", read(file), maxsplit=1)[0] for file in rust_files(path))
+    return "\n".join(
+        re.split(r"#\[cfg\(test\)\]\s*mod tests", read(file), maxsplit=1)[0]
+        for file in rust_files(path)
+    )
 
 
 def struct_body(source: str, name: str) -> str:
@@ -92,7 +100,9 @@ def test_canonical_crates_exist_and_shallow_crates_are_absent() -> None:
 
 def test_production_crate_count_is_within_target_range() -> None:
     manifests = list(CRATES.rglob("Cargo.toml"))
-    production = [path for path in manifests if "support" not in path.parts and "bin" not in path.parts]
+    production = [
+        path for path in manifests if "support" not in path.parts and "bin" not in path.parts
+    ]
     assert 20 <= len(production) <= 25
 
 
@@ -102,10 +112,49 @@ def test_production_package_graph_has_no_upward_edges() -> None:
     serving = normal_deps(CRATES / "frontend" / "serving")
     profile = normal_deps(CRATES / "frontend" / "model-profile")
     adapters = normal_deps(CRATES / "frontend" / "protocol-adapters")
-    assert core.isdisjoint({"axum", "tonic", "prometheus-client", "uniserve-engine-gateway", "uniserve-model-profile", "uniserve-protocol-adapters", "uniserve-serving"})
-    assert scheduler.isdisjoint({"axum", "tonic", "uniserve-grpc-proto", "uniserve-openai-types", "uniserve-protocol-adapters", "uniserve-serving"})
-    assert serving.isdisjoint({"axum", "tonic", "uniserve-engine-wire", "uniserve-grpc-proto", "uniserve-openai-types", "uniserve-protocol-adapters", "uniserve-server"})
-    assert profile.isdisjoint({"axum", "tonic", "uniserve-engine-gateway", "uniserve-grpc-proto", "uniserve-openai-types", "uniserve-protocol-adapters", "uniserve-serving"})
+    assert core.isdisjoint(
+        {
+            "axum",
+            "tonic",
+            "prometheus-client",
+            "uniserve-engine-gateway",
+            "uniserve-model-profile",
+            "uniserve-protocol-adapters",
+            "uniserve-serving",
+        }
+    )
+    assert scheduler.isdisjoint(
+        {
+            "axum",
+            "tonic",
+            "uniserve-grpc-proto",
+            "uniserve-openai-types",
+            "uniserve-protocol-adapters",
+            "uniserve-serving",
+        }
+    )
+    assert serving.isdisjoint(
+        {
+            "axum",
+            "tonic",
+            "uniserve-engine-wire",
+            "uniserve-grpc-proto",
+            "uniserve-openai-types",
+            "uniserve-protocol-adapters",
+            "uniserve-server",
+        }
+    )
+    assert profile.isdisjoint(
+        {
+            "axum",
+            "tonic",
+            "uniserve-engine-gateway",
+            "uniserve-grpc-proto",
+            "uniserve-openai-types",
+            "uniserve-protocol-adapters",
+            "uniserve-serving",
+        }
+    )
     assert adapters.isdisjoint({"uniserve-scheduler", "uniserve-server"})
 
 
@@ -157,15 +206,53 @@ def test_protocol_and_engine_dtos_do_not_cross_canonical_surfaces() -> None:
     adapters = source_tree(CRATES / "frontend" / "protocol-adapters" / "src")
     profile = source_tree(CRATES / "frontend" / "model-profile" / "src")
     scheduler = production_source(CRATES / "engine" / "scheduler" / "src")
-    assert all(token not in serving for token in ["uniserve_engine_wire", "uniserve_grpc_proto", "uniserve_openai_types", "ChatCompletionRequest", "CompletionRequest"])
+    assert all(
+        token not in serving
+        for token in [
+            "uniserve_engine_wire",
+            "uniserve_grpc_proto",
+            "uniserve_openai_types",
+            "ChatCompletionRequest",
+            "CompletionRequest",
+        ]
+    )
     assert all(token not in adapters for token in ["uniserve_scheduler", "uniserve_server"])
-    assert all(token not in profile for token in ["axum::", "tonic::", "ChatCompletionRequest", "CompletionRequest", "NativeGenerateBody"])
-    assert all(token not in scheduler for token in ["uniserve_openai_types", "uniserve_grpc_proto", "ChatCompletionRequest", "CompletionRequest", "NativeGenerateBody"])
+    assert all(
+        token not in profile
+        for token in [
+            "axum::",
+            "tonic::",
+            "ChatCompletionRequest",
+            "CompletionRequest",
+            "NativeGenerateBody",
+        ]
+    )
+    assert all(
+        token not in scheduler
+        for token in [
+            "uniserve_openai_types",
+            "uniserve_grpc_proto",
+            "ChatCompletionRequest",
+            "CompletionRequest",
+            "NativeGenerateBody",
+        ]
+    )
 
 
 def test_scheduler_plans_from_lowered_descriptors_without_public_labels() -> None:
     scheduler = production_source(CRATES / "engine" / "scheduler" / "src")
-    forbidden = ["GenerationConstraint", "UndOnly", "GenOnly", "sensenova", "thinkmorph", "bagel", "image_start_ids", "start_of_image", "render_prompt", "chat_template"]
+    forbidden = [
+        "GenerationConstraint",
+        "UndOnly",
+        "GenOnly",
+        "sensenova",
+        "thinkmorph",
+        "bagel",
+        "image_start_ids",
+        "start_of_image",
+        "render_prompt",
+        "chat_template",
+    ]
     assert [token for token in forbidden if token in scheduler] == []
     assert "transition: PlannedTransition" in scheduler
     assert "transition.validate_result(&sr)" in scheduler
@@ -176,7 +263,10 @@ def test_generation_values_are_pure_and_submission_is_separate() -> None:
     core = read(CRATES / "foundation" / "core" / "src" / "generation.rs")
     engine_api = read(CRATES / "protocol" / "engine-api" / "src" / "lib.rs")
     request = struct_body(core, "GenerationRequest")
-    assert all(token not in request for token in ["Sender", "Receiver", "Stream", "EngineHandle", "WorkerHandle", "Tokenizer"])
+    assert all(
+        token not in request
+        for token in ["Sender", "Receiver", "Stream", "EngineHandle", "WorkerHandle", "Tokenizer"]
+    )
     assert "pub struct GenerationSubmission" in engine_api
     assert "pub request: GenerationRequest" in engine_api
     assert "pub event_tx: EventTx" in engine_api
@@ -186,31 +276,52 @@ def test_generation_transport_uses_only_canonical_request_shapes() -> None:
     translate = production_source(CRATES / "protocol" / "engine-wire" / "src")
     wire = read(CRATES / "protocol" / "engine-wire" / "src" / "lib.rs")
     gateway = production_source(CRATES / "frontend" / "engine-gateway" / "src")
-    gateway_canonical = read(CRATES / "frontend" / "engine-gateway" / "src" / "generation" / "canonical.rs")
+    gateway_canonical = read(
+        CRATES / "frontend" / "engine-gateway" / "src" / "generation" / "canonical.rs"
+    )
     serving = production_source(CRATES / "frontend" / "serving" / "src")
     native_schema = read(CRATES / "frontend" / "protocol-adapters" / "src" / "native" / "schema.rs")
     engine_request = struct_body(wire, "EngineCoreRequest")
     serve_event = enum_body(serving, "ServeEvent")
     assert "pub generation: GenerationRequest" in engine_request
-    assert all(field not in engine_request for field in ["prompt_token_ids", "sampling_params", "prompt_embeds", "extra_args"])
+    assert all(
+        field not in engine_request
+        for field in ["prompt_token_ids", "sampling_params", "prompt_embeds", "extra_args"]
+    )
     assert "req.generation.clone()" in translate
     assert "NativeRequestExt" not in translate
     assert "GenerationConstraint::UndOnly" not in translate
     assert "generation_request_to_wire(submission" in gateway_canonical
     assert "pub request: GenerationRequest" in gateway_canonical
     assert "mm_features" not in gateway_canonical
-    assert all(token not in gateway for token in ["GenerateRequest", "GenerateOutput", "struct Llm"])
-    assert all(token not in serving for token in ["EngineCoreRequest", "EngineCoreSamplingParams", "StructuredOutputsParams", "LoraRequest"])
+    assert all(
+        token not in gateway for token in ["GenerateRequest", "GenerateOutput", "struct Llm"]
+    )
+    assert all(
+        token not in serving
+        for token in [
+            "EngineCoreRequest",
+            "EngineCoreSamplingParams",
+            "StructuredOutputsParams",
+            "LoraRequest",
+        ]
+    )
     assert "TokenLogprobs" not in serve_event
     assert "MmFeatureSpec" not in translate
     assert "mm_features" not in serving
-    assert "input_image_b64" not in production_source(CRATES / "frontend" / "protocol-adapters" / "src" / "native")
+    assert "input_image_b64" not in production_source(
+        CRATES / "frontend" / "protocol-adapters" / "src" / "native"
+    )
     assert "alias =" not in native_schema
 
 
 def test_every_production_crate_has_a_survival_reason() -> None:
     topology = read(ROOT / "specs" / "serving_runtime_crate_audit.md")
-    production_manifests = [path for path in CRATES.rglob("Cargo.toml") if "support" not in path.parts and "bin" not in path.parts]
+    production_manifests = [
+        path
+        for path in CRATES.rglob("Cargo.toml")
+        if "support" not in path.parts and "bin" not in path.parts
+    ]
     names = {manifest(path)["package"]["name"] for path in production_manifests}
     production_topology = topology.split("## Binaries", maxsplit=1)[0]
     documented = set(re.findall(r"^\| `([^`]+)` \|", production_topology, re.M))
@@ -225,7 +336,16 @@ def test_cursor_is_the_single_lifecycle_owner() -> None:
     assert "cursor: GenerationCursor" in state
     for field in ["lifecycle", "ingest", "und", "image_gen", "feedback", "resources", "replay"]:
         assert re.search(rf"\b{field}\s*:", cursor)
-    for field in ["phase", "pos", "kvlen", "prompt_cursor", "image_id", "steps_done", "feedback_locator", "replayability"]:
+    for field in [
+        "phase",
+        "pos",
+        "kvlen",
+        "prompt_cursor",
+        "image_id",
+        "steps_done",
+        "feedback_locator",
+        "replayability",
+    ]:
         assert not re.search(rf"\b{field}\s*:", cursor)
         assert not re.search(rf"\b{field}\s*:", state)
 
@@ -258,15 +378,38 @@ def test_benchmark_support_uses_canonical_runtime_dependencies() -> None:
 
 def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
     profiles = json.loads(read(ROOT / "uniserve_eval" / "profiles.json"))
-    points = profiles["benchmarks"]["main"]["points"].values()
+    benchmark = profiles["benchmarks"]["main"]
+    points = benchmark["points"].values()
     required = {"runtime_profile_id", "output_constraint", "preprocessing", "plan_evidence_policy"}
     assert all(required.issubset(point["harness"]) for point in points)
     assert all(
-        point["harness"]["plan_evidence_policy"]
-        in {"runtime_inspection", "reference_protocol"}
+        point["harness"]["plan_evidence_policy"] in {"runtime_inspection", "reference_protocol"}
         for point in points
     )
     assert '"wire": "native"' not in json.dumps(profiles)
+    assert benchmark["load_cases"] == {
+        "text_arrival": [
+            {"id": "r1", "request_rate": 1},
+            {"id": "r2", "request_rate": 2},
+            {"id": "r4", "request_rate": 4},
+            {"id": "r8", "request_rate": 8},
+            {"id": "r16", "request_rate": 16},
+        ],
+        "image_concurrency": [
+            {"id": "c1", "request_rate": "inf", "max_concurrency": 1},
+            {"id": "c32", "request_rate": "inf", "max_concurrency": 32},
+        ],
+    }
+    matrix_size = sum(
+        len(benchmark["load_cases"][benchmark["points"][point]["load_case_set"]])
+        for group in benchmark["groups"].values()
+        for point in group["points"]
+    )
+    assert matrix_size == 43
+    for point in points:
+        if point["harness"]["task"] == "t2i":
+            assert point["load_case_set"] == "image_concurrency"
+            assert point["name"].endswith("-{load_id}")
 
     spec = BenchmarkSpec(
         task=TaskName.T2I,
@@ -281,8 +424,14 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
         max_images=1,
     )
     request = T2ITask(spec).build_request({"prompt": "not retained"})
-    evidence = {"source": "reference_protocol", "request": reference_request_summary(request)}
+    evidence = {
+        "source": "reference_protocol",
+        "plan": plan_summary(spec),
+        "request": reference_request_summary(request),
+    }
     contract = benchmark_contract(spec, [{"id": "reference-row"}])
+    image_bytes = BytesIO()
+    Image.new("RGB", (64, 64), color=(128, 128, 128)).save(image_bytes, format="PNG")
     records = [
         RequestRecord(
             request_id="reference-row",
@@ -290,6 +439,8 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
             success=True,
             latency=1.0,
             images=1,
+            image_latencies=[1.0],
+            decoded_images=[inspect_image_bytes(image_bytes.getvalue())],
             classifier="ok",
         )
     ]
@@ -300,6 +451,7 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
         dur_s=1.0,
         plan_evidence=evidence,
         contract=contract,
+        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
     )
     schema = json.loads(
         read(ROOT / "uniserve_eval" / "harness" / "schemas" / "summary.schema.json")
@@ -314,5 +466,6 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
         dur_s=1.0,
         plan_evidence=evidence,
         contract=contract,
+        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
     )
     assert mismatched["artifact"]["valid"] is False

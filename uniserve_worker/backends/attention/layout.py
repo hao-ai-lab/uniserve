@@ -75,8 +75,31 @@ def normalize_to(tensor: torch.Tensor, target: QKVLayout) -> tuple[torch.Tensor,
     raise ValueError("paged q/k/v must be [1,H,D] or [B,H,1,D]")
 
 
-def normalize_kv(tensor: torch.Tensor, target: QKVLayout) -> torch.Tensor:
-    """Normalize a current-K/V tensor into ``target``; no restore is needed."""
+def normalize_kv(
+    tensor: torch.Tensor,
+    target: QKVLayout,
+    *,
+    contiguous: bool = True,
+) -> torch.Tensor:
+    """Normalize a current-K/V tensor into ``target``; no restore is needed.
 
-    normalized, _ = normalize_to(tensor, target)
-    return normalized
+    Paged cache writers can set ``contiguous=False`` when they accept packed
+    head/dimension rows with a larger leading stride.
+    """
+
+    if contiguous:
+        normalized, _ = normalize_to(tensor, target)
+        return normalized
+    if target is QKVLayout.BHD:
+        if tensor.ndim == 3:
+            return tensor
+        if tensor.ndim == 4:
+            if int(tensor.shape[2]) != 1:
+                raise ValueError("paged decode only supports one token per row")
+            return tensor.transpose(1, 2).squeeze(1)
+    if target is QKVLayout.BLHD:
+        if tensor.ndim == 3:
+            return tensor.unsqueeze(0)
+        if tensor.ndim == 4:
+            return tensor.transpose(1, 2)
+    raise ValueError("paged q/k/v must use a supported rank")

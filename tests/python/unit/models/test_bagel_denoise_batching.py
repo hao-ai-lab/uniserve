@@ -1,0 +1,99 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
+from uniserve_worker.execution.paged_denoise import PagedDenoiseBranchSet
+from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
+from uniserve_worker.nn.diffusion.cfg import Branch
+
+pytestmark = pytest.mark.unit
+
+
+class _Cache:
+    def __init__(self, pool):
+        self.pool = pool
+        self.layers = [object()]
+
+
+class _LanguageModel:
+    def __init__(self):
+        self.calls = []
+
+    def forward_paged_gen_batch(self, inputs, positions, is_gen, cache):
+        self.calls.append((inputs.clone(), positions.clone(), is_gen.clone(), cache))
+        return inputs
+
+
+class _Graph:
+    def __init__(self):
+        self.lm = _LanguageModel()
+
+    def gen_segment_embeds(self, num_vae, vae_pos_ids, latent, timestep):
+        del vae_pos_ids
+        marker = latent.new_full((1, latent.shape[-1]), float(timestep))
+        return torch.cat((marker, latent + float(timestep), marker), dim=0)
+
+    @staticmethod
+    def gen_segment_is_gen(num_vae):
+        return torch.tensor([False, *([True] * int(num_vae)), False])
+
+    @staticmethod
+    def llm2vae(hidden):
+        return hidden
+
+
+def _step(req_id, timestep, latent, branches):
+    return TextImageDenoiseStep(
+        req_id=req_id,
+        state=None,
+        op={},
+        latent=latent,
+        t=torch.tensor(timestep),
+        t_next=torch.tensor(timestep - 0.1),
+        step_index=0,
+        total_steps=10,
+        cfg_text_scale=4.0,
+        cfg_img_scale=1.0,
+        cfg_interval=(0.4, 1.0),
+        cfg_renorm_type="global",
+        cfg_renorm_min=0.0,
+        extra={"gs": SimpleNamespace(num_vae=2, vae_pos_ids=torch.zeros(2), paged_branches=branches)},
+    )
+
+
+def test_bagel_coalesces_compatible_requests_into_one_denoise_forward(monkeypatch):
+    owner = BagelForUnifiedGeneration(config=BagelConfig(), device="cpu")
+    graph = _Graph()
+    monkeypatch.setattr(owner, "_ensure_loaded", lambda: SimpleNamespace(model=graph))
+    pool = object()
+    branch_names = (Branch.COND, Branch.TEXT_UNCOND)
+
+    def paged(position):
+        return PagedDenoiseBranchSet(
+            caches={name.value: _Cache(pool) for name in branch_names},
+            positions={
+                name.value: position + offset for offset, name in enumerate(branch_names)
+            },
+        )
+
+    first_latent = torch.arange(8, dtype=torch.float32).view(2, 4)
+    second_latent = first_latent + 10
+    steps = [
+        _step(1, 0.8, first_latent, paged(20)),
+        _step(2, 0.6, second_latent, paged(40)),
+    ]
+
+    outputs = owner.predict_text_image_velocity_batch(steps, [branch_names, branch_names])
+
+    assert len(graph.lm.calls) == 1
+    inputs, positions, is_gen, cache = graph.lm.calls[0]
+    assert inputs.shape == (4, 4, 4)
+    assert positions.shape == (4, 4)
+    assert is_gen.tolist() == [False, True, True, False]
+    assert len(cache.caches) == 4
+    assert list(outputs[0]) == list(branch_names)
+    assert list(outputs[1]) == list(branch_names)
+    torch.testing.assert_close(outputs[0]["cond"], (first_latent + 0.8).to(torch.bfloat16))
+    torch.testing.assert_close(outputs[1]["cond"], (second_latent + 0.6).to(torch.bfloat16))

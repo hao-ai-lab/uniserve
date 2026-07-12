@@ -153,6 +153,14 @@ class WorkerForwardAdapter:
             )
         return result
 
+    def can_run_forward(self, fb: UniForwardBatch) -> bool:
+        """Whether this adapter can execute ``fb`` as one unified forward."""
+        if fb.mode is not ForwardMode.MIXED:
+            return True
+        if self._whole_batch_forward or _can_run_private_forward_adapter(self.model, fb):
+            return True
+        return all(mode in _TEXT_DRIVER_MODES for mode in fb.op_modes)
+
     def _run_mixed_mode(
         self,
         fb: UniForwardBatch,

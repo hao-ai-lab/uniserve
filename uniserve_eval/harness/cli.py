@@ -31,6 +31,25 @@ from .runner import BenchmarkRunner
 from .spec import DEFAULT_DATASETS, BenchmarkSpec, TaskName
 
 
+def _json_object(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise argparse.ArgumentTypeError(f"expected a JSON object: {error.msg}") from error
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return parsed
+
+
+def _bool_value(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="uniserve-eval-harness", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -42,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint", help="override the per-task default endpoint")
     parser.add_argument("--dataset", help="dataset name (default per task); 'trace' reads --dataset-path JSONL")
     parser.add_argument("--dataset-path", help="local dataset file/dir override (else HF auto-download)")
+    parser.add_argument("--dataset-revision", help="immutable dataset repository revision")
     parser.add_argument("--tokenizer", help="tokenizer path/name (ShareGPT shaping; defaults to --model)")
 
     parser.add_argument("--num-prompts", type=int, default=1000)
@@ -55,16 +75,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, help="output token cap")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int)
+    parser.add_argument("--min-p", type=float)
+    parser.add_argument("--repetition-penalty", type=float)
+    parser.add_argument("--frequency-penalty", type=float)
+    parser.add_argument("--presence-penalty", type=float)
+    parser.add_argument("--sampling-seed", type=int)
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=_json_object,
+        default={},
+        help="JSON object passed explicitly to the model chat template",
+    )
     parser.add_argument("--disable-ignore-eos", action="store_true", help="respect EOS (default ignores EOS)")
 
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--denoise-updates", type=int, help="semantic denoise update count")
     parser.add_argument("--guidance-scale", type=float)
     parser.add_argument("--image-guidance-scale", type=float)
     parser.add_argument("--cfg-norm")
     parser.add_argument("--cfg-interval", help="comma-separated inclusive CFG interval")
     parser.add_argument("--timestep-shift", type=float)
+    parser.add_argument("--image-think", type=_bool_value)
+    parser.add_argument("--image-t-eps", type=float)
     parser.add_argument(
         "--max-images",
         type=int,
@@ -148,17 +183,27 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         seed=args.seed,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        repetition_penalty=args.repetition_penalty,
+        frequency_penalty=args.frequency_penalty,
+        presence_penalty=args.presence_penalty,
+        sampling_seed=args.sampling_seed,
+        chat_template_kwargs=args.chat_template_kwargs,
         ignore_eos=not args.disable_ignore_eos,
         max_tokens=args.max_tokens,
         width=args.width,
         height=args.height,
         steps=args.steps,
+        denoise_updates=args.denoise_updates,
         max_images=args.max_images,
         guidance_scale=args.guidance_scale,
         image_guidance_scale=args.image_guidance_scale,
         cfg_norm=args.cfg_norm,
         cfg_interval=cfg_interval,
         timestep_shift=args.timestep_shift,
+        image_think=args.image_think,
+        image_t_eps=args.image_t_eps,
         wire=args.wire or "",
         i2t_question=args.i2t_question,
         sample_gpu_memory=not args.no_gpu_memory,
@@ -166,6 +211,7 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         sharegpt_output_len=args.sharegpt_output_len,
         sharegpt_context_len=args.sharegpt_context_len,
         dataset_path=args.dataset_path,
+        dataset_revision=args.dataset_revision,
         runtime_profile_id=args.runtime_profile_id,
         measurement_interface=args.measurement_interface,
         cache_read_policy=args.cache_read_policy,
@@ -230,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
         ok = bool(
             artifact.get("schema_version") == 2
             and artifact.get("valid") is True
-            and artifact.get("valid_marker") == "canonical-valid-v2"
+            and artifact.get("valid_marker") in {"artifact-valid-v2", "canonical-valid-v2"}
             and isinstance(checks, dict)
             and checks
             and all(value is True for value in checks.values())

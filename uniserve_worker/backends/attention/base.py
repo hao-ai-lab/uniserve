@@ -42,6 +42,9 @@ class AttentionCapabilities:
     # graph because it consumes live tensor inputs and does not bake mutable host
     # wrapper plan state that another request can later overwrite.
     paged_varlen_cuda_graph: bool = False
+    # The backend's paged visible-end path consumes only live tensors and is
+    # safe to capture for mixed causal/bidirectional segment compositions.
+    visible_end_cuda_graph: bool = False
     # (q, k, v) head-dim geometries the backend's kernel can run. Empty means the
     # backend imposes no fixed-geometry restriction (the common case); a non-empty
     # set declares the exact tuples a geometry-restricted kernel (e.g. fa4_cute's

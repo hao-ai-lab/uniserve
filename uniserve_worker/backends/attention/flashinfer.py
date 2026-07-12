@@ -14,6 +14,7 @@ from ...contracts.forward_context import get_forward_context
 from ...foundation.runtime_config import get_worker_config
 from .base import AttentionCapabilities
 from .flashinfer_kernels import (
+    _decode_effective_seqlens,
     _fill_paged_decode_plan_tensors,
     _fill_paged_prefill_plan_tensors,
     _paged_decode_indices,
@@ -165,7 +166,11 @@ class FlashInferAttentionBackend(_WrapperPool):
             v,
             metadata,
         )
-        effective_seqlens = inputs.cache_seqlens + current_tokens
+        effective_seqlens = _decode_effective_seqlens(
+            inputs.cache_seqlens,
+            current_tokens,
+            metadata,
+        )
         if int(q_bhd.shape[0]) != int(effective_seqlens.shape[0]):
             raise ValueError("cache lengths must have one entry per decode row")
 
@@ -242,8 +247,8 @@ class FlashInferAttentionBackend(_WrapperPool):
             return 0
         if k is None or v is None:
             raise ValueError("flashinfer paged update requires both k and v")
-        k_bhd = normalize_kv(k, QKVLayout.BHD)
-        v_bhd = normalize_kv(v, QKVLayout.BHD)
+        k_bhd = normalize_kv(k, QKVLayout.BHD, contiguous=False)
+        v_bhd = normalize_kv(v, QKVLayout.BHD, contiguous=False)
         if k_bhd.shape != v_bhd.shape:
             raise ValueError("current paged K/V tensors must have matching shapes")
         if k_bhd.shape[0] != q_bhd.shape[0]:

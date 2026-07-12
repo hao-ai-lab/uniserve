@@ -100,6 +100,7 @@ class Fa4CuteAttentionBackend:
             mixed_mode=True,
             paged_kv=available,
             visible_end=available,
+            visible_end_cuda_graph=available,
             paged_block_size_multiple=1,
             trunk_geometries=_SUPPORTED_TRUNK_GEOMETRIES,
         )

@@ -697,7 +697,7 @@ pub(crate) fn compile_generation_request(
             image.hash = isolated_cache_key(image.hash, cache.isolation_key);
         }
     }
-    let negative_context = (!lowered.neg_prompt_ids.is_empty())
+    let negative_context: Vec<CoreContextSegment> = (!lowered.neg_prompt_ids.is_empty())
         .then(|| CoreContextSegment::UndTokens {
             token_ids: lowered.neg_prompt_ids.clone(),
             visibility: UndVisibility::Internal,
@@ -715,6 +715,7 @@ pub(crate) fn compile_generation_request(
     }
     let mut resources = GenerationResourceBounds::conservative(
         &context,
+        &negative_context,
         &behavior,
         &policy,
         &image,
@@ -733,6 +734,7 @@ pub(crate) fn compile_generation_request(
         })?;
         resources = GenerationResourceBounds::conservative(
             &context,
+            &negative_context,
             &behavior,
             &policy,
             &image,
@@ -1023,6 +1025,7 @@ mod tests {
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             scratch_capacity_tokens: 65_536,
+            scratch_block_size: 64,
             encoder_cache_entries: 256,
             generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities {
                 inline: true,

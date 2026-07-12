@@ -1,11 +1,19 @@
 """Decode-relay ownership for text generation."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from ..foundation.errors import invalid_descriptor
+from ..runtime.host_staging import (
+    canonical_device,
+    copy_cpu_to_device,
+    cpu_int_staging_buffer,
+    fill_cpu_ints,
+    is_pinned,
+)
 from ..runtime.tensor_views import coalesce_one_token_rows
 
 if TYPE_CHECKING:
@@ -48,6 +56,54 @@ class TextDecodeRelay:
         state.decode_relay.position_id = int(position_id)
         state.decode_relay.position_tensor = device_position
         return device_position
+
+    def publish_positions(
+        self,
+        states: Sequence["RequestState"],
+        *,
+        position_ids: Sequence[int],
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        """Publish one contiguous batch of device-resident position relays.
+
+        CUDA scalar construction from Python values performs a blocking host-to-device
+        transfer on the current stream. Decode calls this after graph replay, so doing
+        that once per row serializes the host behind every forward. Stage the complete
+        position vector in pinned memory and enqueue one non-blocking copy instead.
+        """
+
+        if len(states) != len(position_ids):
+            raise invalid_descriptor("decode position relay states and ids must align")
+        resolved_device = canonical_device(device)
+        count = len(position_ids)
+        if resolved_device.type == "cuda":
+            cpu = cpu_int_staging_buffer(
+                count,
+                dtype=torch.long,
+                pin=True,
+                name="decode_position_relay",
+            )
+            fill_cpu_ints(cpu, [int(position_id) for position_id in position_ids])
+            positions = copy_cpu_to_device(
+                cpu,
+                device=resolved_device,
+                non_blocking=is_pinned(cpu),
+                slot=None,
+                name="decode_position_relay",
+            )
+        else:
+            positions = torch.tensor(
+                [int(position_id) for position_id in position_ids],
+                dtype=torch.long,
+                device=resolved_device,
+            )
+        for row, (state, position_id) in enumerate(zip(states, position_ids, strict=True)):
+            self.publish_position(
+                state,
+                position_id=int(position_id),
+                position_tensor=positions[row : row + 1],
+            )
+        return positions
 
     def publish_deferred_sample_id_if_current(
         self,

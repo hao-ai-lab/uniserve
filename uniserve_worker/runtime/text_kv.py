@@ -74,6 +74,7 @@ class TextAttentionPlan:
             kv_seqlens_cpu=kv_lens_values,
         )
         if mode == ForwardMode.DECODE:
+            plan.kv_seqlens = cache_seqlens + 1
             page_ids, page_offsets = decode_write_locations(
                 block_table,
                 cache_seqlens,

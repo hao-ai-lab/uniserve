@@ -22,9 +22,9 @@ from .harness.provenance import (
     input_path_contract,
 )
 from .harness.report import (
+    artifact_bundle_matches,
     attach_execution_contract,
     benchmark_contract,
-    canonical_artifact_bundle_matches,
     canonical_digest,
     write_summary_artifacts,
 )
@@ -161,8 +161,8 @@ def perf(args: argparse.Namespace) -> None:
     print("perf:", " ".join(cmd))
     subprocess.check_call(cmd, cwd=ROOT, env=merged_env(workload))
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
-    if not canonical_artifact_bundle_matches(out_dir, summary, harness_contract):
-        raise SystemExit("benchmark did not produce the current canonical artifact contract")
+    if not artifact_bundle_matches(out_dir, summary, harness_contract):
+        raise SystemExit("benchmark did not produce the current harness artifact contract")
     if summary.get("failed_count"):
         raise SystemExit(f"benchmark had {summary['failed_count']} failed requests")
     metric_failures: list[str] = []

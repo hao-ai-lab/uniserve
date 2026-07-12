@@ -23,13 +23,9 @@ except Exception:  # pragma: no cover
     tl = None
 
 
-# Triton block tile for the fused SiLU-and-mul kernel; fixed by the kernel build.
-# 1024 columns per program x 4 warps gives each thread 8 contiguous elements
-# (16B vectorized bf16 loads); the previous flat 256-element blocks left the
-# loads unvectorizable behind a per-element div/mod and ran ~2.3x slower on the
-# denoise-sized [4608, 12288] call. SiLU-and-mul is purely elementwise (no
-# reduction anywhere), so launch geometry cannot change any output value: every
-# element still computes bf16(x/(1+exp(-x))) * y in fp32 exactly as before.
+# The 1024-column tile gives each thread eight contiguous BF16 elements with
+# four warps per program. SiLU and multiplication are evaluated in FP32 before
+# the output is converted to its storage dtype.
 _TRITON_ACT_BLOCK = 1024
 
 
@@ -45,7 +41,7 @@ if triton is not None:
         base = row * (n_cols * 2)
         x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         y = tl.load(x_ptr + base + n_cols + cols, mask=mask, other=0.0).to(tl.float32)
-        silu = (x / (1.0 + tl.exp(-x))).to(tl.bfloat16).to(tl.float32)
+        silu = x / (1.0 + tl.exp(-x))
         out = silu * y
         tl.store(out_ptr + row * n_cols + cols, out, mask=mask)
 

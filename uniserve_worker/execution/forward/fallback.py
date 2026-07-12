@@ -34,7 +34,7 @@ class EagerFallbackReason(StrEnum):
 @dataclass(frozen=True)
 class ForwardGraphPolicy:
     prefer_graph: bool = True
-    strict: bool = False
+    strict: bool = True
     allow_capture: bool = True
     graph_selection_delegated: bool = False
 

@@ -11,7 +11,6 @@ Graph settings are model-neutral and come from the worker runtime config.
 from __future__ import annotations
 
 import logging
-from dataclasses import replace as _dc_replace
 from typing import TYPE_CHECKING, Any
 
 from ....contracts.forward_batch import ForwardBatch
@@ -233,53 +232,9 @@ class TextGraphRunner:
     # ---- prefill bucket padding + warmup ------------------------------------
 
     def reorder_mixed_for_padding(self, text: Any) -> Any:
-        """Reorder a MIXED group so bucket padding can extend its final row.
+        """Keep row order stable; graph token padding has an isolated row."""
 
-        Token-bucket padding grows the last row's query span, which is only
-        legal while the pad stays inside that row's current KV block. When the
-        natural last row sits at (or too near) a block boundary, swap in any
-        row with enough tail room; row order is otherwise semantically free
-        (results are keyed per op).
-        """
-
-        if getattr(text, "mode", None) != ForwardMode.MIXED or not self._prefill.enabled():
-            return text
-        if any(text.spec_token_ids):
-            return text
-        lengths = [len(tokens) for tokens in text.token_ids]
-        if not lengths or any(length <= 0 for length in lengths):
-            return text
-        raw_tokens = sum(lengths)
-        pad = self._prefill.bucket_num_tokens(raw_tokens) - raw_tokens
-        if pad <= 0:
-            return text
-
-        def room_ok(row: int) -> bool:
-            end = int(text.pos_ranges[row][1])
-            return _blocks_for_tokens(end + pad, self.block_size) <= _blocks_for_tokens(
-                end, self.block_size
-            )
-
-        count = len(lengths)
-        if room_ok(count - 1):
-            return text
-        swap = next((row for row in range(count - 1) if room_ok(row)), None)
-        if swap is None:
-            return text
-        order = list(range(count))
-        order[swap], order[-1] = order[-1], order[swap]
-
-        def pick(seq: Any) -> tuple:
-            return tuple(seq[row] for row in order)
-
-        return _dc_replace(
-            text,
-            req_ids=pick(text.req_ids),
-            token_ids=pick(text.token_ids),
-            spec_token_ids=pick(text.spec_token_ids),
-            pos_ranges=pick(text.pos_ranges),
-            ops=pick(text.ops),
-        )
+        return text
 
     def padded_num_tokens(self, text: Any, *, attention_backend_name: str | None) -> int | None:
         """Pad an extend group up to a captured prefill bucket, else ``None``."""
@@ -298,11 +253,11 @@ class TextGraphRunner:
         bucket = self._prefill.bucket_num_tokens(raw_tokens)
         if bucket <= raw_tokens:
             return None
-        pad = int(bucket) - int(raw_tokens)
-        base, end = text.pos_ranges[-1]
-        raw_last = int(end) - int(base)
-        padded_last = raw_last + pad
-        if _blocks_for_tokens(int(base) + padded_last, self.block_size) > _blocks_for_tokens(int(end), self.block_size):
+        graph_batch_size = self._prefill.padding_batch_size(
+            len(lengths),
+            num_tokens=int(bucket),
+        )
+        if graph_batch_size <= len(lengths):
             return None
         return bucket
 
@@ -350,12 +305,6 @@ class TextGraphRunner:
                 )
 
 
-def _blocks_for_tokens(tokens: int, block_size: int) -> int:
-    tokens = max(0, int(tokens))
-    block_size = max(1, int(block_size))
-    return (tokens + block_size - 1) // block_size
-
-
 def _padded_prefill_max_kv_tokens(
     metadata: Any,
     *,
@@ -364,15 +313,13 @@ def _padded_prefill_max_kv_tokens(
     batch_size: int,
 ) -> int:
     pad = max(0, int(padded_tokens) - int(raw_tokens))
-    fallback = int(getattr(metadata, "max_seqlen_k", 0) or 0) + pad
+    fallback = max(int(getattr(metadata, "max_seqlen_k", 0) or 0), pad)
     cache_lens = tuple(int(length) for length in getattr(metadata, "cache_seqlens_cpu", ()) or ())
     query_lens = tuple(int(length) for length in getattr(metadata, "query_lens_cpu", ()) or ())
     if len(cache_lens) != int(batch_size) or len(query_lens) != int(batch_size) or not query_lens:
         return max(1, fallback)
-    graph_lens = list(query_lens)
-    graph_lens[-1] += pad
     padded_max = max(
-        (int(base) + int(query) for base, query in zip(cache_lens, graph_lens, strict=True)),
+        (int(base) + int(query) for base, query in zip(cache_lens, query_lens, strict=True)),
         default=fallback,
     )
-    return max(1, padded_max)
+    return max(1, padded_max, pad)

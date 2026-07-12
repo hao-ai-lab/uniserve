@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, RequestKind, TaskRequest
+from .base import (
+    BenchmarkTask,
+    RequestKind,
+    TaskRequest,
+    apply_text_sampling_contract,
+    input_image_data_url,
+)
 
 
 class I2TTask(BenchmarkTask):
@@ -10,7 +16,6 @@ class I2TTask(BenchmarkTask):
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
         max_tokens = int(item.get("max_tokens", self.spec.max_tokens or 512))
-        image_b64 = item.get("input_image_b64")
         streamed = self.spec.wire == "openai_chat"
         kind: RequestKind = "openai_chat" if streamed else "openai_chat_json"
         payload: dict[str, Any] = {
@@ -22,17 +27,36 @@ class I2TTask(BenchmarkTask):
                         {"type": "text", "text": item["prompt"]},
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                            "image_url": {"url": input_image_data_url(item)},
                         },
                     ],
                 }
             ],
             "modalities": ["text"],
-            "temperature": self.spec.temperature,
-            "top_p": self.spec.top_p,
-            "ignore_eos": self.spec.ignore_eos,
             "max_completion_tokens": max_tokens,
+            "extra_args": {
+                "max_tokens": max_tokens,
+                "do_sample": self.spec.temperature > 0,
+                "temperature": self.spec.temperature,
+                "top_p": self.spec.top_p,
+                "ignore_eos": self.spec.ignore_eos,
+            },
         }
+        apply_text_sampling_contract(payload, self.spec)
+        payload["extra_args"].update(
+            {
+                key: payload[key]
+                for key in (
+                    "top_k",
+                    "min_p",
+                    "repetition_penalty",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "seed",
+                )
+                if key in payload
+            }
+        )
         if streamed:
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}

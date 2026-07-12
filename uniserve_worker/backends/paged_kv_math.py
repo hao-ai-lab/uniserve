@@ -3,11 +3,59 @@ from __future__ import annotations
 
 import torch
 
+from ..foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
+
 __all__ = [
     'write_locations',
     'decode_write_locations',
     'paged_kv_write',
 ]
+
+try:  # pragma: no cover - availability depends on the serving environment.
+    import triton
+    import triton.language as tl
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+
+
+_TRITON_KV_WRITE_BLOCK = 256
+
+
+if triton is not None:
+
+    @triton.jit
+    def _paged_kv_write_kernel(
+        k_cache_ptr,
+        v_cache_ptr,
+        page_ids_ptr,
+        offsets_ptr,
+        k_src_ptr,
+        v_src_ptr,
+        num_pages: tl.constexpr,
+        page_size: tl.constexpr,
+        row_width: tl.constexpr,
+        k_row_stride: tl.constexpr,
+        v_row_stride: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        columns = tl.program_id(1) * block_size + tl.arange(0, block_size)
+        page_id = tl.load(page_ids_ptr + row)
+        page_offset = tl.load(offsets_ptr + row)
+        valid_address = (page_id >= 0) & (page_id < num_pages)
+        valid_address &= (page_offset >= 0) & (page_offset < page_size)
+        tl.device_assert(valid_address, "paged KV write index out of bounds")
+
+        k_source_offsets = row * k_row_stride + columns
+        v_source_offsets = row * v_row_stride + columns
+        cache_row = page_id * page_size + page_offset
+        cache_offsets = cache_row * row_width + columns
+        mask = valid_address & (columns < row_width)
+        k = tl.load(k_src_ptr + k_source_offsets, mask=mask, other=0.0)
+        v = tl.load(v_src_ptr + v_source_offsets, mask=mask, other=0.0)
+        tl.store(k_cache_ptr + cache_offsets, k, mask=mask)
+        tl.store(v_cache_ptr + cache_offsets, v, mask=mask)
 
 
 def write_locations(
@@ -42,6 +90,86 @@ def decode_write_locations(
     return page_ids.squeeze(1), offsets.squeeze(1)
 
 
+def _triton_paged_kv_write_eligible(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_ids: torch.Tensor,
+    offsets: torch.Tensor,
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+) -> bool:
+    tensors = (k_cache, v_cache, page_ids, offsets, k_src, v_src)
+    if (
+        triton is None
+        or torch.is_grad_enabled()
+        or not triton_fused_layers_enabled()
+        or not all(tensor.is_cuda for tensor in tensors)
+        or len({tensor.device for tensor in tensors}) != 1
+        or not triton_device_supported(k_cache.device)
+    ):
+        return False
+    if page_ids.dtype not in (torch.int32, torch.int64) or offsets.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        return False
+    if (
+        k_cache.shape != v_cache.shape
+        or k_cache.dtype != v_cache.dtype
+        or k_src.dtype != k_cache.dtype
+        or v_src.dtype != v_cache.dtype
+    ):
+        return False
+    if not all(tensor.is_contiguous() for tensor in (k_cache, v_cache, page_ids, offsets)):
+        return False
+    head_dim = int(k_src.shape[2])
+    row_width = int(k_src.shape[1]) * head_dim
+    if not all(
+        int(tensor.stride(2)) == 1
+        and int(tensor.stride(1)) == head_dim
+        and int(tensor.stride(0)) >= row_width
+        for tensor in (k_src, v_src)
+    ):
+        return False
+    num_rows = int(page_ids.numel())
+    return (
+        num_rows > 0
+        and int(offsets.numel()) == num_rows
+        and int(k_src.shape[0]) == num_rows
+        and int(v_src.shape[0]) == num_rows
+        and int(k_src.shape[1] * k_src.shape[2]) > 0
+    )
+
+
+def _triton_paged_kv_write(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_ids: torch.Tensor,
+    offsets: torch.Tensor,
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+) -> None:
+    num_pages, page_size, heads, head_dim = (int(dim) for dim in k_cache.shape)
+    row_width = heads * head_dim
+    grid = (int(page_ids.numel()), triton.cdiv(row_width, _TRITON_KV_WRITE_BLOCK))
+    _paged_kv_write_kernel[grid](
+        k_cache,
+        v_cache,
+        page_ids,
+        offsets,
+        k_src,
+        v_src,
+        num_pages,
+        page_size,
+        row_width,
+        int(k_src.stride(0)),
+        int(v_src.stride(0)),
+        _TRITON_KV_WRITE_BLOCK,
+        num_warps=4,
+        debug=True,
+    )
+
+
 def paged_kv_write(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -66,13 +194,25 @@ def paged_kv_write(
     num_pages = int(k_cache.shape[0])
     heads = int(k_cache.shape[2])
     head_dim = int(k_cache.shape[3])
-    flat_index = (page_ids * page_size + offsets).reshape(-1)
     k_flat = k_cache.view(num_pages * page_size, heads, head_dim)
     v_flat = v_cache.view(num_pages * page_size, heads, head_dim)
     k_src = k_current.reshape(-1, heads, head_dim)
     v_src = v_current.reshape(-1, heads, head_dim)
+    page_ids = page_ids.reshape(-1)
+    offsets = offsets.reshape(-1)
+    if _triton_paged_kv_write_eligible(
+        k_cache,
+        v_cache,
+        page_ids,
+        offsets,
+        k_src,
+        v_src,
+    ):
+        _triton_paged_kv_write(k_cache, v_cache, page_ids, offsets, k_src, v_src)
+        return
     if cast:
         k_src = k_src.to(dtype=k_cache.dtype)
         v_src = v_src.to(dtype=v_cache.dtype)
+    flat_index = page_ids * page_size + offsets
     k_flat.index_copy_(0, flat_index, k_src)
     v_flat.index_copy_(0, flat_index, v_src)

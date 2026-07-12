@@ -1,9 +1,11 @@
 """Sanitized provenance for reproducible benchmark execution contracts."""
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import platform
 import shlex
 import shutil
 import stat
@@ -44,6 +46,127 @@ def environment_contract(environment: Mapping[str, str]) -> dict[str, Any]:
         "schema_version": 1,
         "variable_count": len(variables),
         "variables_sha256": _canonical_digest(variables),
+    }
+    return {**payload, "fingerprint": _canonical_digest(payload)}
+
+
+_PERFORMANCE_ENVIRONMENT_NAMES = frozenset(
+    {
+        "CUDA_DEVICE_MAX_CONNECTIONS",
+        "CUDA_MODULE_LOADING",
+        "CUDA_VISIBLE_DEVICES",
+        "NVIDIA_TF32_OVERRIDE",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "TOKENIZERS_PARALLELISM",
+        "UNISERVE_DECODE_TOKEN_BURST",
+        "NCCL_ALGO",
+        "NCCL_BUFFSIZE",
+        "NCCL_COLLNET_ENABLE",
+        "NCCL_IB_DISABLE",
+        "NCCL_MAX_NCHANNELS",
+        "NCCL_MIN_NCHANNELS",
+        "NCCL_NET",
+        "NCCL_NTHREADS",
+        "NCCL_NVLS_ENABLE",
+        "NCCL_P2P_DISABLE",
+        "NCCL_P2P_LEVEL",
+        "NCCL_PROTO",
+        "NCCL_SHM_DISABLE",
+        "SGLANG_ENABLE_JIT_DEEPGEMM",
+        "SGLANG_ENABLE_TORCH_COMPILE",
+        "VLLM_ATTENTION_BACKEND",
+        "VLLM_ENABLE_V1_MULTIPROCESSING",
+        "VLLM_FLASH_ATTN_VERSION",
+        "VLLM_OMNI_USE_QUACK_FP8",
+        "VLLM_USE_V1",
+        "VLLM_WORKER_MULTIPROC_METHOD",
+    }
+)
+
+
+def performance_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    """Persist only non-secret variables with known serving-performance impact."""
+    return {
+        str(key): str(value)
+        for key, value in sorted(environment.items())
+        if key in _PERFORMANCE_ENVIRONMENT_NAMES
+    }
+
+
+def _command_output(command: Sequence[str]) -> str | None:
+    try:
+        process = subprocess.run(
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = process.stdout.strip()
+    return output if process.returncode == 0 and output else None
+
+
+@lru_cache(maxsize=1)
+def hardware_contract() -> dict[str, Any]:
+    """Capture the accelerator, CPU/NUMA, and kernel identity used by a run."""
+    gpu_query = _command_output(
+        (
+            "nvidia-smi",
+            "--query-gpu=index,uuid,name,driver_version,memory.total,compute_cap,clocks.max.sm,clocks.max.memory,power.limit",
+            "--format=csv,noheader,nounits",
+        )
+    )
+    payload = {
+        "schema_version": 1,
+        "machine": platform.machine(),
+        "kernel": platform.release(),
+        "system": platform.system(),
+        "cpu": _command_output(("lscpu", "--json")),
+        "numa": _command_output(("numactl", "--hardware")),
+        "gpu": gpu_query,
+        "gpu_topology": _command_output(("nvidia-smi", "topo", "-m")),
+    }
+    return {**payload, "fingerprint": _canonical_digest(payload)}
+
+
+def selected_accelerator_contract(visible_devices: str) -> dict[str, Any]:
+    """Capture one explicitly selected physical accelerator."""
+    devices = [value.strip() for value in visible_devices.split(",") if value.strip()]
+    if len(devices) != 1:
+        raise ValueError("formal execution requires exactly one visible accelerator")
+    selector = devices[0]
+    fields = (
+        "index",
+        "uuid",
+        "name",
+        "driver_version",
+        "memory.total",
+        "compute_cap",
+        "clocks.max.sm",
+        "clocks.max.memory",
+        "power.limit",
+    )
+    output = _command_output(
+        (
+            "nvidia-smi",
+            f"--id={selector}",
+            f"--query-gpu={','.join(fields)}",
+            "--format=csv,noheader,nounits",
+        )
+    )
+    if output is None or len(output.splitlines()) != 1:
+        raise RuntimeError(f"cannot resolve selected accelerator {selector!r}")
+    values = [value.strip() for value in output.split(",")]
+    if len(values) != len(fields):
+        raise RuntimeError("selected accelerator query returned an unexpected shape")
+    payload = {
+        "schema_version": 1,
+        "selector": selector,
+        "gpu": dict(zip(fields, values, strict=True)),
     }
     return {**payload, "fingerprint": _canonical_digest(payload)}
 
@@ -127,9 +250,7 @@ def executable_contracts(
     return contracts, source_candidates
 
 
-_OUTPUT_PATH_OPTIONS = frozenset(
-    {"--cache-dir", "--download-dir", "--log-file", "--output-dir"}
-)
+_OUTPUT_PATH_OPTIONS = frozenset({"--cache-dir", "--download-dir", "--log-file", "--output-dir"})
 
 
 def _hash_file_contract(path: Path) -> dict[str, Any]:
@@ -245,9 +366,7 @@ def command_input_contracts(
     return contracts, source_candidates
 
 
-def _python_interpreter(
-    launcher: Path, environment: Mapping[str, str], cwd: Path
-) -> Path | None:
+def _python_interpreter(launcher: Path, environment: Mapping[str, str], cwd: Path) -> Path | None:
     if launcher.name.lower().startswith("python"):
         return launcher.absolute()
     try:
@@ -273,6 +392,33 @@ def _python_interpreter(
     return interpreter.absolute()
 
 
+def _python_invocation(
+    command: Sequence[str], environment: Mapping[str, str], cwd: Path
+) -> tuple[Path, list[str], bool, str] | None:
+    """Find a Python interpreter even when a process wrapper precedes it."""
+    for index, raw_value in enumerate(command):
+        value = str(raw_value)
+        if index > 0:
+            candidate = Path(value)
+            if not (candidate.is_absolute() or candidate.parent != Path(".")):
+                continue
+            lexical = candidate if candidate.is_absolute() else cwd / candidate
+            if not lexical.is_file() or not os.access(lexical, os.X_OK):
+                continue
+        else:
+            lexical = _resolve_command_file(value, environment, cwd)
+        interpreter = _python_interpreter(lexical, environment, cwd)
+        if interpreter is not None:
+            launcher = "" if lexical.name.lower().startswith("python") else lexical.stem
+            return (
+                interpreter,
+                [str(part) for part in command[index + 1 :]],
+                index == 0,
+                launcher,
+            )
+    return None
+
+
 _PYTHON_PROBE = r"""
 import hashlib
 import importlib.metadata
@@ -282,6 +428,7 @@ import pathlib
 import sys
 
 module = sys.argv[1] or None
+launcher = sys.argv[2] or None
 distributions = []
 for distribution in importlib.metadata.distributions():
     name = distribution.metadata.get("Name") or ""
@@ -294,6 +441,13 @@ for distribution in importlib.metadata.distributions():
         "record_sha256": hashlib.sha256(record.encode()).hexdigest(),
         "direct_url_sha256": hashlib.sha256(direct.encode()).hexdigest(),
     })
+    if module is None and launcher:
+        for entry_point in distribution.entry_points:
+            if entry_point.group == "console_scripts" and entry_point.name == launcher:
+                module = entry_point.value.partition(":")[0]
+                break
+if module is None and launcher:
+    module = launcher.replace("-", "_")
 distributions.sort(key=lambda item: (item["name"], item["version"], item["record_sha256"]))
 origin = None
 locations = []
@@ -327,17 +481,19 @@ def python_runtime_contract(
 ) -> tuple[dict[str, Any] | None, list[Path], list[dict[str, Any]]]:
     """Capture the exact Python environment and target package when applicable."""
     cwd_path = Path(cwd).resolve()
-    launcher = _resolve_command_file(str(command[0]), environment, cwd_path)
-    interpreter = _python_interpreter(launcher, environment, cwd_path)
-    if interpreter is None:
+    invocation = _python_invocation(command, environment, cwd_path)
+    if invocation is None:
         return None, [], []
+    interpreter, python_arguments, interpreter_is_launcher, console_launcher = invocation
     module = ""
-    if len(command) >= 3 and command[1] == "-m":
-        module = str(command[2])
-    elif not launcher.resolve(strict=True).name.lower().startswith("python"):
-        module = launcher.stem.replace("-", "_")
+    if len(python_arguments) >= 2 and python_arguments[0] == "-m":
+        module = python_arguments[1]
+    elif interpreter_is_launcher:
+        launcher = _resolve_command_file(str(command[0]), environment, cwd_path)
+        if not launcher.resolve(strict=True).name.lower().startswith("python"):
+            module = launcher.stem.replace("-", "_")
     process = subprocess.run(
-        [str(interpreter), "-c", _PYTHON_PROBE, module],
+        [str(interpreter), "-c", _PYTHON_PROBE, module, console_launcher],
         cwd=cwd_path,
         env=dict(environment),
         stdout=subprocess.PIPE,
@@ -362,10 +518,11 @@ def python_runtime_contract(
         for index, path in enumerate(module_paths)
     ]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         **probe,
         "distribution_count": len(distributions),
         "distributions_sha256": _canonical_digest(distributions),
+        "distributions": distributions,
         "module_source_count": len(module_sources),
     }
     return (
@@ -431,9 +588,7 @@ def repository_state(path: str | Path) -> dict[str, Any]:
         raise RuntimeError(f"source path is not in a Git repository: {path}")
     head = _run_git(root, ["rev-parse", "HEAD"]).decode("ascii").strip()
     tracked_changes = _run_git(root, ["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
-    raw_untracked = _run_git(
-        root, ["ls-files", "--others", "--exclude-standard", "-z", "--"]
-    )
+    raw_untracked = _run_git(root, ["ls-files", "--others", "--exclude-standard", "-z", "--"])
     untracked_paths = sorted(path for path in raw_untracked.split(b"\0") if path)
     payload = {
         "schema_version": 1,
@@ -502,6 +657,7 @@ def execution_provenance(
         "command": [str(part) for part in command],
         "working_directory": str(cwd_path),
         "environment": environment_contract(environment),
+        "performance_environment": performance_environment(environment),
         "executables": executables,
         "command_inputs": command_inputs,
         "python_runtime": python_runtime,

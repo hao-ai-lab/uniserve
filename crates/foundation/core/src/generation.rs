@@ -549,6 +549,8 @@ pub struct GenerationRuntimeCapabilities {
     pub commit_marker_tokens: u32,
     pub max_cfg_branches: u32,
     pub scratch_capacity_tokens: u64,
+    #[serde(default)]
+    pub scratch_block_size: u32,
     pub encoder_cache_entries: u32,
     #[serde(default)]
     pub generated_image_commit: GeneratedImageCommitCapabilities,
@@ -560,9 +562,32 @@ impl GenerationRuntimeCapabilities {
     }
 }
 
+pub fn denoise_scratch_tokens(
+    latent_tokens: u64,
+    marker_tokens: u64,
+    conditioning_tokens: u64,
+    negative_tokens: u64,
+    cfg_branches: u64,
+    block_size: u64,
+) -> u64 {
+    let block_size = block_size.max(1);
+    let branch_tokens = latent_tokens.saturating_add(marker_tokens);
+    let rounded_span = |prefix_tokens: u64| {
+        branch_tokens
+            .saturating_add(prefix_tokens)
+            .div_ceil(block_size)
+            .saturating_mul(block_size)
+    };
+    let branches = cfg_branches.max(1);
+    let conditioning = rounded_span(conditioning_tokens);
+    let auxiliary = rounded_span(conditioning_tokens.max(negative_tokens));
+    conditioning.saturating_add(auxiliary.saturating_mul(branches.saturating_sub(1)))
+}
+
 impl GenerationResourceBounds {
     pub fn conservative(
         context: &[ContextSegment],
+        negative_context: &[ContextSegment],
         behavior: &GenerationBehaviorDescriptor,
         policy: &GenerationPolicyDescriptor,
         image: &ImageParams,
@@ -571,6 +596,13 @@ impl GenerationResourceBounds {
         capabilities: &GenerationRuntimeCapabilities,
     ) -> Result<Self, GenerationResourceError> {
         let context_tokens = context
+            .iter()
+            .map(|segment| match segment {
+                ContextSegment::UndTokens { token_ids, .. } => token_ids.len(),
+                ContextSegment::Image { .. } => 0,
+            })
+            .sum::<usize>();
+        let negative_tokens = negative_context
             .iter()
             .map(|segment| match segment {
                 ContextSegment::UndTokens { token_ids, .. } => token_ids.len(),
@@ -707,11 +739,14 @@ impl GenerationResourceBounds {
             });
         }
         let requested_host_scratch_tokens = if behavior.gen_output {
-            requested_latent_units
-                .checked_mul(requested_scratch_units)
-                .ok_or(GenerationResourceError::ResourceOverflow {
-                    resource: "host scratch tokens",
-                })?
+            denoise_scratch_tokens(
+                requested_latent_units,
+                u64::from(capabilities.commit_marker_tokens),
+                context_tokens as u64,
+                negative_tokens as u64,
+                requested_scratch_units,
+                u64::from(capabilities.scratch_block_size),
+            )
         } else {
             0
         };
@@ -1107,6 +1142,7 @@ impl GenerationRequest {
         }
         let required = GenerationResourceBounds::conservative(
             &self.context,
+            &self.negative_context,
             &self.behavior,
             &self.policy,
             &self.image,
@@ -1235,6 +1271,7 @@ mod tests {
             commit_marker_tokens: 2,
             max_cfg_branches: 3,
             scratch_capacity_tokens: 8_192,
+            scratch_block_size: 64,
             encoder_cache_entries: 4,
             generated_image_commit: GeneratedImageCommitCapabilities {
                 inline: true,
@@ -1318,6 +1355,7 @@ mod tests {
         };
         request.resources = GenerationResourceBounds::conservative(
             &request.context,
+            &request.negative_context,
             &request.behavior,
             &request.policy,
             &request.image,
@@ -1452,6 +1490,7 @@ mod tests {
         request.image.max_images = 2;
         let bounds = GenerationResourceBounds::conservative(
             &request.context,
+            &request.negative_context,
             &request.behavior,
             &request.policy,
             &request.image,
@@ -1465,7 +1504,7 @@ mod tests {
         assert_eq!(bounds.max_kv_tokens, 4 + 16 + 64 + 32 + 2 * (64 + 64));
         assert_eq!(bounds.max_image_latent_units, 1_024);
         assert_eq!(bounds.max_scratch_units, 2);
-        assert_eq!(bounds.max_host_scratch_tokens, 2_048);
+        assert_eq!(bounds.max_host_scratch_tokens, 2_176);
         assert_eq!(bounds.encoder_cache_keys.len(), 2);
         assert!(bounds.generated_feedback_makes_non_replayable);
     }
@@ -1482,6 +1521,7 @@ mod tests {
         assert_eq!(
             GenerationResourceBounds::conservative(
                 &request.context,
+                &request.negative_context,
                 &request.behavior,
                 &request.policy,
                 &request.image,
@@ -1528,6 +1568,7 @@ mod tests {
             GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
         request.resources = GenerationResourceBounds::conservative(
             &request.context,
+            &request.negative_context,
             &request.behavior,
             &request.policy,
             &request.image,

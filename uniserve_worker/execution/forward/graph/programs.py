@@ -238,9 +238,11 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
         *,
         owner: Any | None = None,
         request_states: Any | None = None,
+        image_decode_driver: Any | None = None,
     ) -> None:
         self.owner = owner
         self.request_states = request_states
+        self.image_decode_driver = image_decode_driver
 
     @property
     def _bound_packed_visible(self) -> bool:
@@ -254,7 +256,9 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
 
     def can_run(self, batch: ForwardBatch, plan: ForwardPlan) -> GraphEligibility:
         del batch
-        if plan.shape.text_row_count and plan.shape.denoise_row_count:
+        if plan.shape.text_row_count and (
+            plan.shape.denoise_row_count or plan.shape.commit_row_count
+        ):
             if not self._bound_packed_visible:
                 if self.owner is None and self.request_states is None:
                     return GraphEligibility(True)
@@ -264,8 +268,10 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
                     return GraphEligibility(False, "decode burst rows are not graphable")
                 if int(op.get("denoise_step_count") or 1) > 1:
                     return GraphEligibility(False, "denoise burst rows are not graphable")
+            if plan.shape.commit_row_count and self.image_decode_driver is None:
+                return GraphEligibility(False, "packed visible commit publication is not bound")
             return GraphEligibility(True)
-        return GraphEligibility(False, "not a packed visible mixed shape")
+        return GraphEligibility(False, "not a packed visible generation shape")
 
     def capture(
         self,
@@ -311,7 +317,7 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
             residual_state = getattr(img, "residual_cache", None)
             if residual_state is not None:
                 residual_state.invalidate()
-        return run_packed_visible_forward_result(
+        result = run_packed_visible_forward_result(
             owner,
             dispatch_batch,
             request_states,
@@ -320,6 +326,26 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
             allow_graph=True,
             require_graph=True,
         )
+        if result is None or not plan.shape.commit_row_count:
+            return result
+        image_decode_driver = self.image_decode_driver
+        if image_decode_driver is None:
+            raise invalid_descriptor("packed visible commit publication is not bound")
+        commit_rows = tuple(row for row in plan.rows if row.mode is ForwardMode.COMMIT)
+        commit_result = image_decode_driver.forward_result(
+            tuple(
+                (int(row.req_id), request_states.get(int(row.req_id)), row.op)
+                for row in commit_rows
+            ),
+            owner,
+            row_indices=tuple(int(row.row_index) for row in commit_rows),
+        )
+        if not isinstance(commit_result, ForwardResult) or commit_result.commit_outputs is None:
+            raise invalid_descriptor("packed visible commit publication returned no commit outputs")
+        commit_outputs = dict(result.commit_outputs or {})
+        commit_outputs.update(commit_result.commit_outputs)
+        result.commit_outputs = commit_outputs
+        return result
 
 
 class DenoiseStepGraphProgram(ForwardGraphProgram):

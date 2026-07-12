@@ -1528,6 +1528,17 @@ impl Scheduler {
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
+    fn denoise_host_scratch_tokens(&self, st: &ReqState) -> u64 {
+        uniserve_core::denoise_scratch_tokens(
+            self.num_vae(&st.req.image),
+            u64::from(self.caps.commit_marker_tokens),
+            u64::from(st.image_gen.cond_pos),
+            st.context.negative_prompt_ids.len() as u64,
+            u64::from(cfg_branch_count(&st.req.image)),
+            u64::from(self.caps.block_size),
+        )
+    }
+
     fn cap_max_vae_grid_tokens(&self) -> usize {
         if self.caps.max_vae_grid_tokens > 0 {
             self.caps.max_vae_grid_tokens as usize
@@ -1553,6 +1564,7 @@ impl Scheduler {
             commit_marker_tokens: self.caps.commit_marker_tokens,
             max_cfg_branches: self.caps.max_cfg_branches,
             scratch_capacity_tokens: self.caps.scratch_capacity_tokens,
+            scratch_block_size: self.caps.block_size,
             encoder_cache_entries: self.caps.encoder_cache_budget,
             generated_image_commit: self.executor.generated_image_commit_capabilities(),
         }
@@ -1620,10 +1632,9 @@ impl Scheduler {
                 <= self.caps.max_latent_size as u64;
         let host_scratch_ok = self.running.get(&id).is_some_and(|st| {
             st.resources.host_scratch_tokens > 0
-                || self.bm.can_reserve_scratch(
-                    self.num_vae(&st.req.image)
-                        .saturating_mul(u64::from(st.req.image.cfg_branch_count())),
-                )
+                || self
+                    .bm
+                    .can_reserve_scratch(self.denoise_host_scratch_tokens(st))
         });
         worker_capacity_ok && host_scratch_ok
     }
@@ -3710,7 +3721,7 @@ impl Scheduler {
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
                 let scratch_units = u64::from(cfg.branch_count);
-                let host_scratch_tokens = self.num_vae(&st.req.image).saturating_mul(scratch_units);
+                let host_scratch_tokens = self.denoise_host_scratch_tokens(st);
                 let image_prompt = Self::image_prompt_for(st);
                 let image_id = st.image_gen.image_id;
                 let projection = self.projected_cursor(id)?;
@@ -5227,6 +5238,22 @@ mod tests {
         assert_eq!(cfg_branch_count(&img), 3);
     }
 
+    #[test]
+    fn denoise_scratch_accounts_for_branch_prefixes_markers_and_block_rounding() {
+        assert_eq!(
+            uniserve_core::denoise_scratch_tokens(4096, 2, 45, 0, 1, 64),
+            4160
+        );
+        assert_eq!(
+            uniserve_core::denoise_scratch_tokens(4096, 2, 45, 0, 2, 64),
+            8320
+        );
+        assert_eq!(
+            uniserve_core::denoise_scratch_tokens(4096, 2, 45, 80, 3, 64),
+            12_608
+        );
+    }
+
     /// A no-op executor: every submit succeeds, no result ever returns, and
     /// controls are accepted. Enough to unit-test admission/backpressure/reap.
     #[derive(Default)]
@@ -5324,6 +5351,7 @@ mod tests {
     fn compile_resources(scheduler: &Scheduler, request: &mut GenerationRequest) {
         request.resources = uniserve_core::GenerationResourceBounds::conservative(
             &request.context,
+            &request.negative_context,
             &request.behavior,
             &request.policy,
             &request.image,

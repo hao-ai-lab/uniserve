@@ -60,7 +60,7 @@ class VisionSelfAttention(nn.Module):
         if max_seqlen is None:
             max_seqlen = max_seqlen_from_cu(cu, n_tokens)
         backend = varlen_backend
-        override = "context" if backend is not None else "flash_attn"
+        override = "context" if backend is not None else None
         if ops.can_run_attention(
             q,
             k,

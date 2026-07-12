@@ -59,6 +59,7 @@ def load_pie_bench(
                 "task": "i2i",
                 "prompt": instruction,
                 "input_image_b64": _png_b64(image_file),
+                "input_image_mime": "image/png",
                 "source_prompt": value.get("original_prompt") or value.get("source_prompt"),
                 "target_prompt": value.get("editing_prompt") or value.get("target_prompt"),
                 "editing_type_id": value.get("editing_type_id"),

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from uniserve_worker.execution.paged_denoise import PagedDenoiseBranchSet
+from uniserve_worker.nn.diffusion.cfg import Branch
 from uniserve_worker.runtime.paged_text_cache import PagedTextCache
 from uniserve_worker.runtime.residency import ResidencyManager, ScratchKvPool
 
@@ -47,3 +48,18 @@ def test_paged_denoise_branch_set_reuses_rows_and_releases_scratch_blocks():
     branches.release(ResidencyManager(scratch=pool))
 
     assert pool.allocate_blocks(2) == [0, 1]
+
+
+def test_paged_denoise_branch_set_accepts_cfg_branch_enums():
+    pool = _scratch_pool()
+    cond = PagedTextCache(pool, [], num_layers=1, allocate_blocks=pool.allocate_blocks)
+    text_uncond = PagedTextCache(pool, [], num_layers=1, allocate_blocks=pool.allocate_blocks)
+    branches = PagedDenoiseBranchSet(
+        caches={"cond": cond, "text_uncond": text_uncond},
+        positions={"cond": 5, "text_uncond": 7},
+    )
+    names = (Branch.COND, Branch.TEXT_UNCOND)
+
+    assert branches.has_all(names)
+    assert branches.batched_cache(names).caches == [cond, text_uncond]
+    assert branches.positions_tensor(names, device="cpu", width=2).tolist() == [[5, 5], [7, 7]]
