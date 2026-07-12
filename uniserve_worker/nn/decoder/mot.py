@@ -738,6 +738,8 @@ class MoTModel(nn.Module):
         positions: torch.Tensor,
         is_gen: torch.Tensor,
         past_key_values: Any,
+        *,
+        text_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run all layers over ``B`` CFG-branch rows of one shared gen segment.
 
@@ -749,6 +751,8 @@ class MoTModel(nn.Module):
         ``past_key_values`` implements the batched transient paged protocol
         (``request_cache_for_transient``) over per-row prefix caches sharing
         one pool. Returns modality-routed final-norm hidden ``[B, T, hidden]``.
+        CUDA-graph callers pass the static flattened text-row ``text_idx``;
+        eager callers may omit it and derive the indexes from ``is_gen``.
         """
         batch, n_tokens, hidden_size = inputs_embeds.shape
         hidden_states = inputs_embeds.reshape(batch * n_tokens, hidden_size)
@@ -756,15 +760,14 @@ class MoTModel(nn.Module):
         # Flat indexes of the (few) text-modality rows — one nonzero for the
         # whole step; the per-layer dispatch is index-based (see the layer's
         # ``forward_paged_gen_batch`` docstring).
-        text_base = (~is_gen.reshape(-1)).nonzero(as_tuple=False).reshape(-1)
-        if int(text_base.numel()):
-            row_offsets = (
-                torch.arange(batch, device=text_base.device, dtype=text_base.dtype)
-                * n_tokens
-            )
-            text_idx = (row_offsets.unsqueeze(1) + text_base.unsqueeze(0)).reshape(-1)
-        else:
-            text_idx = None
+        if text_idx is None:
+            text_base = (~is_gen.reshape(-1)).nonzero(as_tuple=False).reshape(-1)
+            if int(text_base.numel()):
+                row_offsets = (
+                    torch.arange(batch, device=text_base.device, dtype=text_base.dtype)
+                    * n_tokens
+                )
+                text_idx = (row_offsets.unsqueeze(1) + text_base.unsqueeze(0)).reshape(-1)
         for layer_idx, layer_module in enumerate(self.layers):
             layer = cast(MoTDecoderLayer, layer_module)
             hidden_states = layer.forward_paged_gen_batch(

@@ -1,0 +1,177 @@
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from uniserve_worker.models import bagel as bagel_model
+from uniserve_worker.models.bagel import BagelForUnifiedGeneration
+
+pytestmark = pytest.mark.unit
+
+
+def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
+    calls = []
+    synced = []
+    past = SimpleNamespace(length=23)
+    state = SimpleNamespace(cond=SimpleNamespace(past=past, t_index=-1))
+    logits = [torch.tensor([[1.0, 2.0]])]
+
+    class GraphDriver:
+        def try_run_text_graph_logits_batch(self, ops):
+            calls.append([dict(op) for op in ops])
+            return logits
+
+    class Owner:
+        _prepare_text_logits_batch = BagelForUnifiedGeneration._prepare_text_logits_batch
+        _sync_text_cache_lengths = BagelForUnifiedGeneration._sync_text_cache_lengths
+
+        def _ensure_loaded(self):
+            return None
+
+        def interleaved_image_state(self, req_id):
+            assert int(req_id) == 7
+            return state
+
+        def _text_driver(self):
+            return GraphDriver()
+
+        def _set_length(self, req_id, length):
+            synced.append((int(req_id), int(length)))
+
+    op = {
+        "req_id": 7,
+        "kind": "prefill_und",
+        "token_ids": [3, 4],
+        "pos_range": [11, 13],
+    }
+    owner = Owner()
+
+    result = BagelForUnifiedGeneration.try_run_text_graph_logits_batch(owner, [op])
+
+    assert result is logits
+    assert calls == [[op]]
+    assert state.cond.t_index == 10
+    assert synced == [(7, 23)]
+
+
+def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
+    cache_a = SimpleNamespace(pool=object())
+    cache_b = SimpleNamespace(pool=cache_a.pool)
+
+    class Branches:
+        caches = {"cond": cache_a, "text_uncond": cache_b}
+
+        def has_all(self, names):
+            return all(name in self.caches for name in names)
+
+        def positions_tensor(self, names, *, device, width):
+            del device
+            return torch.stack(
+                [torch.full((width,), index + 5, dtype=torch.long) for index, _ in enumerate(names)]
+            )
+
+    graph_image = SimpleNamespace(token_h=1, token_w=4, height=32, width=32)
+    gs = SimpleNamespace(
+        paged_branches=Branches(),
+        graph_image=graph_image,
+        num_vae=2,
+        vae_pos_ids=torch.zeros(2, dtype=torch.long),
+    )
+    step = SimpleNamespace(
+        extra={"gs": gs},
+        latent=torch.ones((1, 2, 1)),
+        t=torch.tensor(0.5),
+    )
+
+    class Model:
+        def gen_segment_embeds(self, num_vae, vae_pos_ids, latent, timestep):
+            assert num_vae == 2
+            assert vae_pos_ids is gs.vae_pos_ids
+            assert latent is step.latent
+            assert timestep == pytest.approx(0.5)
+            return torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+        @staticmethod
+        def gen_segment_graph_layout(batch_size, num_vae):
+            assert (batch_size, num_vae) == (2, 2)
+            return torch.tensor([False, True, True, False]), torch.tensor([0, 3, 4, 7])
+
+    class Owner:
+        device = "cpu"
+        _predict_text_image_velocity_graph = (
+            BagelForUnifiedGeneration._predict_text_image_velocity_graph
+        )
+
+        def _ensure_loaded(self):
+            return SimpleNamespace(model=Model())
+
+    captured = []
+
+    def graph_forward(owner, rows):
+        captured.append((owner, rows))
+        return torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
+
+    monkeypatch.setattr(bagel_model, "maybe_run_denoise_step_graph", graph_forward)
+    owner = Owner()
+
+    result = BagelForUnifiedGeneration.predict_text_image_velocity_batch(
+        owner,
+        [step],
+        [("cond", "text_uncond")],
+        graph_mode="require",
+    )
+
+    assert len(captured) == 1
+    rows = captured[0][1]
+    assert [row.branch for row in rows] == ["cond", "text_uncond"]
+    assert [row.cache for row in rows] == [cache_a, cache_b]
+    assert step.extra["img"] is graph_image
+    assert tuple(step.extra["image_embeds"].shape) == (1, 4, 3)
+    torch.testing.assert_close(result[0]["cond"], torch.tensor([[1.0], [2.0]]))
+    torch.testing.assert_close(result[0]["text_uncond"], torch.tensor([[3.0], [4.0]]))
+
+
+def test_bagel_denoise_graph_forward_maps_static_positions_and_latent_rows():
+    calls = []
+
+    class Language:
+        def forward_paged_gen_batch(self, embeds, positions, is_gen, cache, *, text_idx=None):
+            calls.append((embeds, positions, is_gen, cache, text_idx))
+            return torch.arange(24, dtype=torch.float32).reshape(2, 4, 3)
+
+    class Model:
+        lm = Language()
+
+        @staticmethod
+        def gen_segment_graph_layout(batch_size, num_vae):
+            assert (batch_size, num_vae) == (2, 2)
+            return torch.tensor([False, True, True, False]), torch.tensor([0, 3, 4, 7])
+
+        @staticmethod
+        def llm2vae(hidden):
+            return hidden[..., :1]
+
+    class Owner:
+        def _ensure_loaded(self):
+            return SimpleNamespace(model=Model())
+
+    embeds = torch.zeros((2, 4, 3))
+    token_by_row_positions = torch.tensor([[5, 8], [5, 8], [5, 8], [5, 8]])
+    cache = object()
+    velocity = BagelForUnifiedGeneration.interleaved_image_predict_velocity(
+        Owner(),
+        embeds,
+        token_by_row_positions,
+        None,
+        cache,
+        torch.tensor(0.5),
+        torch.zeros((2, 2, 1)),
+        image_token_num=4,
+        image_size=(32, 32),
+    )
+
+    assert calls[0][0] is embeds
+    torch.testing.assert_close(calls[0][1], token_by_row_positions.transpose(0, 1))
+    assert calls[0][3] is cache
+    torch.testing.assert_close(calls[0][4], torch.tensor([0, 3, 4, 7]))
+    assert tuple(velocity.shape) == (2, 2, 1)
