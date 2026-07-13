@@ -94,6 +94,34 @@ def route_by_modality(
     return dst
 
 
+def _route_packed_by_text_indices(
+    src: torch.Tensor,
+    *,
+    text_indices: torch.Tensor | None,
+    text_fn: Callable[[torch.Tensor], torch.Tensor],
+    gen_fn: Callable[[torch.Tensor], torch.Tensor],
+    any_text: bool,
+    any_gen: bool,
+) -> torch.Tensor:
+    """Route a fixed-shape packed stream without data-dependent indexing."""
+
+    if any_text and any_gen:
+        if text_indices is None:
+            raise ValueError("mixed packed MoT routing requires static text indices")
+        out = gen_fn(src)
+        out.index_copy_(
+            0,
+            text_indices,
+            text_fn(src.index_select(0, text_indices)),
+        )
+        return out
+    if any_gen:
+        return gen_fn(src)
+    if any_text:
+        return text_fn(src)
+    raise ValueError("packed MoT routing requires at least one modality")
+
+
 def _tower_target_device(
     transport: Any | None,
     coords: dict[Modality, int] | None,
@@ -573,12 +601,36 @@ class MoTDecoderLayer(nn.Module):
         kv_view: Any,
         any_text: bool,
         any_gen: bool,
+        text_indices: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run one mixed-modality layer over a packed visible-end stream."""
 
-        routes = self._present_routes(text_mask, gen_mask, any_text, any_gen)
-        normed = self._route_input_norm(hidden_states, routes)
-        q, k, v = self._project_qkv_by_modality(normed, routes, cos, sin)
+        del text_mask, gen_mask
+        text = self.experts[Modality.TEXT]
+        gen = self.experts[Modality.GEN]
+        normed = _route_packed_by_text_indices(
+            hidden_states,
+            text_indices=text_indices,
+            text_fn=text.input_norm,
+            gen_fn=gen.input_norm,
+            any_text=any_text,
+            any_gen=any_gen,
+        )
+        if any_text and any_gen:
+            if text_indices is None:
+                raise ValueError("mixed packed MoT projection requires static text indices")
+            q, k, v = gen.project_qkv(normed, cos, sin)
+            tq, tk, tv = text.project_qkv(
+                normed.index_select(0, text_indices),
+                cos.index_select(0, text_indices),
+                sin.index_select(0, text_indices),
+            )
+            q.index_copy_(0, text_indices, tq)
+            k.index_copy_(0, text_indices, tk)
+            v.index_copy_(0, text_indices, tv)
+        else:
+            expert = gen if any_gen else text
+            q, k, v = expert.project_qkv(normed, cos, sin)
         kv_view.append_packed(layer_idx, k, v)
         k_cache, v_cache = kv_view.pool.layer_cache(layer_idx)
         max_seqlen_k_hook = getattr(kv_view, "max_seqlen_k", None)
@@ -606,14 +658,32 @@ class MoTDecoderLayer(nn.Module):
             use_prefix_bounds=True,
             fully_visible=bool(forward_stream.fully_visible),
         )
-        attention_out = self._route_output_projection(
+        attention_out = _route_packed_by_text_indices(
             attended.reshape(hidden_states.shape[0], self.q_size),
-            hidden_states,
-            routes,
+            text_indices=text_indices,
+            text_fn=text.o_proj,
+            gen_fn=gen.o_proj,
+            any_text=any_text,
+            any_gen=any_gen,
         )
         hidden_states = hidden_states + attention_out
-        post_norm = self._route_post_norm(hidden_states, routes)
-        return hidden_states + self._route_mlp(post_norm, hidden_states, routes)
+        post_norm = _route_packed_by_text_indices(
+            hidden_states,
+            text_indices=text_indices,
+            text_fn=text.post_norm,
+            gen_fn=gen.post_norm,
+            any_text=any_text,
+            any_gen=any_gen,
+        )
+        mlp_out = _route_packed_by_text_indices(
+            post_norm,
+            text_indices=text_indices,
+            text_fn=lambda x: text.mlp(x.to(torch.bfloat16)),
+            gen_fn=lambda x: gen.mlp(x.to(torch.bfloat16)),
+            any_text=any_text,
+            any_gen=any_gen,
+        )
+        return hidden_states + mlp_out
 
     def _present_routes(
         self, text_mask, gen_mask, any_text, any_gen,
@@ -929,6 +999,9 @@ class MoTModel(nn.Module):
             segment.modality == "und" and int(segment.q_len) > 0
             for segment in forward_stream.segments
         )
+        text_indices = getattr(forward_stream, "und_indices", None)
+        if any_text and any_gen and not isinstance(text_indices, torch.Tensor):
+            raise ValueError("mixed BAGEL packed model requires static text modality indices")
         cos, sin = self.rotary.cos_sin_1d(indexes[0].reshape(-1))
         hidden_states = inputs_embeds
         for layer_idx, layer_module in enumerate(self.layers):
@@ -943,20 +1016,15 @@ class MoTModel(nn.Module):
                 kv_view=kv_view,
                 any_text=any_text,
                 any_gen=any_gen,
+                text_indices=text_indices,
             )
-        routes: dict[
-            Modality,
-            tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]],
-        ] = {}
-        if any_text:
-            routes[Modality.TEXT] = (text_mask, self.final_norm[Modality.TEXT])
-        if any_gen:
-            routes[Modality.GEN] = (gen_mask, self.final_norm[Modality.GEN])
-        return route_by_modality(
+        return _route_packed_by_text_indices(
             hidden_states,
-            routes,
-            transport=self._tower_transport,
-            coords=self._tower_coords,
+            text_indices=text_indices,
+            text_fn=self.final_norm[Modality.TEXT],
+            gen_fn=self.final_norm[Modality.GEN],
+            any_text=any_text,
+            any_gen=any_gen,
         )
 
     @torch.no_grad()
