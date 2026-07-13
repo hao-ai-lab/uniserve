@@ -3974,6 +3974,44 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
     assert owner.driver.calls[0][0]["pos_range"] == [3, 4]
 
 
+def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
+    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    class Owner:
+        def _run_packed_decode_burst_graph_followup(
+            self, _ops, _request_states, *, defer_cpu_results=False
+        ):
+            del defer_cpu_results
+            return None
+
+    states = RequestStateTable()
+    states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
+    batch = UniForwardBatch.from_ops(
+        [
+            {
+                "req_id": 7,
+                "kind": "decode_und",
+                "token_ids": [13],
+                "pos_range": [2, 3],
+                "decode_token_count": 2,
+            }
+        ]
+    )
+    results = [{"req_id": 7, "sampled_token_id": 2}]
+
+    with pytest.raises(WorkerError, match="requires CUDA graph coverage") as exc_info:
+        sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
+            Owner(),
+            batch,
+            states,
+            results,
+        )
+
+    assert exc_info.value.code == "CapabilityMismatch"
+
+
 def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_finalizing():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.execution.forward.deferred_text import DeferredTextSeqResult

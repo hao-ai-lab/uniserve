@@ -783,9 +783,9 @@ class TextImageDenoiseOps:
         img = first.img
         for row in rows:
             self._wait_gen_cache_ready(row.cache)
-        # Capture-or-replay the whole batched step as one CUDA graph when the
-        # per-image geometry allows it (env-gated, default off); ``None`` means
-        # the eager path below stays authoritative.
+        # Capture or replay the whole compatible batched step as one CUDA graph.
+        # Strict unified-forward callers use ``graph_mode="require"`` and reject
+        # the batch when its geometry is not covered.
         if graph_mode != "eager":
             graphed = maybe_run_denoise_step_graph(self, rows, return_hidden=return_hidden)
             if graphed is not None:
