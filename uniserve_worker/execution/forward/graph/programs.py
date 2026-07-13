@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -263,11 +264,10 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
                 if self.owner is None and self.request_states is None:
                     return GraphEligibility(True)
                 return GraphEligibility(False, "packed visible graph program is not bound")
-            for op in plan.ops:
-                if int(op.get("decode_token_count") or 1) > 1:
-                    return GraphEligibility(False, "decode burst rows are not graphable")
-                if int(op.get("denoise_step_count") or 1) > 1:
-                    return GraphEligibility(False, "denoise burst rows are not graphable")
+            if self._has_burst_rows(plan) and not callable(
+                getattr(self.owner, "_run_forward_adapter", None)
+            ):
+                return GraphEligibility(False, "packed burst graph adapter is not bound")
             if plan.shape.commit_row_count and self.image_decode_driver is None:
                 return GraphEligibility(False, "packed visible commit publication is not bound")
             return GraphEligibility(True)
@@ -305,6 +305,31 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
         dispatch_batch = plan.runtime_handles.get("dispatch_batch")
         if not isinstance(dispatch_batch, UniForwardBatch):
             dispatch_batch = UniForwardBatch.from_ops(plan.ops)
+        if self._has_burst_rows(plan):
+            run = getattr(owner, "_run_forward_adapter", None)
+            if not callable(run):
+                return None
+            outputs = run(
+                dispatch_batch,
+                request_states=request_states,
+                group=list(enumerate(dispatch_batch.ops)),
+                defer_text_cpu_results=bool(
+                    plan.runtime_handles.get("defer_text_cpu_results", False)
+                ),
+            )
+            if isinstance(outputs, ForwardResult):
+                return outputs
+            if not isinstance(outputs, Sequence) or isinstance(
+                outputs, (str, bytes, bytearray)
+            ):
+                raise invalid_descriptor(
+                    "packed burst graph adapter must return one result per forward row"
+                )
+            if len(outputs) != len(plan.rows):
+                raise invalid_descriptor(
+                    "packed burst graph adapter returned the wrong number of results"
+                )
+            return ForwardResult(runtime_outputs=tuple(outputs))
         denoise_steps = []
         for row in plan.rows:
             if row.mode is not ForwardMode.DENOISE:
@@ -346,6 +371,14 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
         commit_outputs.update(commit_result.commit_outputs)
         result.commit_outputs = commit_outputs
         return result
+
+    @staticmethod
+    def _has_burst_rows(plan: ForwardPlan) -> bool:
+        return any(
+            int(op.get("decode_token_count") or 1) > 1
+            or int(op.get("denoise_step_count") or 1) > 1
+            for op in plan.ops
+        )
 
 
 class DenoiseStepGraphProgram(ForwardGraphProgram):

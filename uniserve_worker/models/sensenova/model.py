@@ -3867,6 +3867,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             denoise_steps,
             results,
             defer_text_cpu_results=defer_text_cpu_results,
+            require_graph=True,
         ):
             self._complete_packed_decode_bursts(
                 batch,
@@ -4151,7 +4152,7 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             items.append((req_id, request_states.get(req_id), followup))
         if not items:
             return
-        outputs = DenoiseDriver().step_many(items, self, graph_mode="eager")
+        outputs = DenoiseDriver().step_many(items, self, graph_mode="require")
         for row_index, output in zip(row_indexes, outputs, strict=True):
             results[row_index] = output
 
