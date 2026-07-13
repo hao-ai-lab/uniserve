@@ -53,6 +53,40 @@ def test_interleaved_decode_graph_padding_requires_reserved_block_hook():
         runner._pad_rows(driver, [_row(pool)], 2, pool)
 
 
+def test_interleaved_decode_graph_fences_staging_after_graph_submission():
+    calls = []
+    device = torch.device("cuda:0")
+    pool = SimpleNamespace(
+        num_blocks=64,
+        block_size=16,
+        k=SimpleNamespace(device=device),
+    )
+    row = _row(pool)
+    runner = InterleavedTextDecodeGraphRunner()
+    runner._prepare = lambda driver, ops: ([row], None)
+    runner._decode = SimpleNamespace(
+        resolve_bucket=lambda batch: batch,
+        maybe_run_host_inputs=lambda **kwargs: calls.append("submit"),
+    )
+
+    class _Stager:
+        def acquire_slot(self, *, device):
+            calls.append(("acquire", device))
+            return "slot"
+
+        def mark_slot_submitted(self, slot, *, device):
+            calls.append(("mark", slot, device))
+
+    runner._stager = _Stager()
+
+    assert runner.maybe_run_batch(SimpleNamespace(owner=_Owner()), [{}]) is None
+    assert calls == [
+        ("acquire", device),
+        "submit",
+        ("mark", "slot", device),
+    ]
+
+
 def test_interleaved_decode_graph_forward_uses_cache_position_without_index_sidecar():
     runner = InterleavedTextDecodeGraphRunner()
     input_ids = torch.tensor([[5], [6]], dtype=torch.long)

@@ -41,13 +41,64 @@ class TextTensorStager:
     def __init__(self, *, ring_depth: int = 3) -> None:
         self.ring_depth = max(1, int(ring_depth))
         self._slots: list[dict[str, torch.Tensor]] = [{} for _ in range(self.ring_depth)]
+        self._completion_events: list[dict[str, torch.cuda.Event]] = [
+            {} for _ in range(self.ring_depth)
+        ]
         self._cursor = 0
         self._pin_memory_supported = True
 
     def next_slot(self) -> "TextTensorStagingSlot":
-        slot = self._slots[self._cursor]
+        index = self._cursor
+        slot = self._slots[index]
         self._cursor = (self._cursor + 1) % self.ring_depth
-        return TextTensorStagingSlot(self, slot)
+        return TextTensorStagingSlot(self, slot, index)
+
+    def acquire_slot(
+        self,
+        *,
+        device: torch.device | str,
+    ) -> "TextTensorStagingSlot":
+        """Acquire a slot after its prior CUDA submission has completed.
+
+        Pinned host buffers may be overwritten by the CPU as soon as a caller
+        fills a slot, while their asynchronous H2D copies are still pending.
+        CUDA consumers must pair this method with :meth:`mark_slot_submitted`
+        after every operation using the slot has been enqueued.
+        """
+
+        target = _canonical_device(device)
+        slot = self.next_slot()
+        if target.type != "cuda":
+            return slot
+        event = self._completion_events[slot.index].get(str(target))
+        if event is not None:
+            event.synchronize()
+        return slot
+
+    def mark_slot_submitted(
+        self,
+        slot: "TextTensorStagingSlot",
+        *,
+        device: torch.device | str,
+    ) -> None:
+        """Fence a slot after its last CUDA use has been submitted."""
+
+        target = _canonical_device(device)
+        if target.type != "cuda":
+            return
+        if (
+            slot.stager is not self
+            or slot.index < 0
+            or slot.index >= self.ring_depth
+            or slot.buffers is not self._slots[slot.index]
+        ):
+            raise ValueError("staging slot does not belong to this stager")
+        events = self._completion_events[slot.index]
+        event = events.get(str(target))
+        if event is None:
+            event = torch.cuda.Event()
+            events[str(target)] = event
+        event.record(torch.cuda.current_stream(target))
 
     def stage_text(
         self,
@@ -171,6 +222,7 @@ class TextTensorStager:
 class TextTensorStagingSlot:
     stager: TextTensorStager
     buffers: dict[str, torch.Tensor]
+    index: int
 
     def long_buffer(self, name: str, numel: int, *, pin: bool) -> torch.Tensor:
         return self.stager._long_buffer(self.buffers, name, numel, pin=pin)

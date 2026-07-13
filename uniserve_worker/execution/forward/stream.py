@@ -14,6 +14,7 @@ from ...foundation.errors import invalid_descriptor
 from ...runtime.cache_protocols import KVCacheView
 from ...runtime.host_staging import fill_cpu_ints, is_pinned
 from ...runtime.kv_pool import PagedKVPool
+from ...runtime.tensor_staging import TextTensorStager, TextTensorStagingSlot
 
 __all__ = [
     'SegmentClass',
@@ -501,8 +502,7 @@ class ForwardGraphPagedKVView:
         )
         self._page_ids = self._write_plan_inputs[: self._write_tokens]
         self._offsets = self._write_plan_inputs[self._write_tokens :]
-        self._cpu_staging: dict[tuple[str, torch.dtype], torch.Tensor] = {}
-        self._pin_memory_supported = self._device.type == "cuda"
+        self._stager = TextTensorStager(ring_depth=3)
         token_indices = self._static_token_indices(self.segments)
         self._token_indices = (
             None
@@ -532,9 +532,20 @@ class ForwardGraphPagedKVView:
         for value in cache_after:
             total += int(value)
             cu_after.append(total)
-        self._copy_int32_inputs(normalized, cache_before, cache_after, persistent_after, cu_after)
-        page_ids, offsets = self._write_plan_values(normalized)
-        self._copy_write_plan_inputs(page_ids, offsets)
+        slot = self._stager.acquire_slot(device=self._device)
+        try:
+            self._copy_int32_inputs(
+                normalized,
+                cache_before,
+                cache_after,
+                persistent_after,
+                cu_after,
+                slot=slot,
+            )
+            page_ids, offsets = self._write_plan_values(normalized)
+            self._copy_write_plan_inputs(page_ids, offsets, slot=slot)
+        finally:
+            self._stager.mark_slot_submitted(slot, device=self._device)
         return self
 
     def _copy_int32_inputs(
@@ -544,6 +555,8 @@ class ForwardGraphPagedKVView:
         cache_after: list[int],
         persistent_after: list[int],
         cu_after: list[int],
+        *,
+        slot: TextTensorStagingSlot,
     ) -> None:
         segment_count = len(segments)
         if (
@@ -557,10 +570,10 @@ class ForwardGraphPagedKVView:
         total_numel = block_table_numel + 3 * segment_count + segment_count + 1
         if int(self._int32_inputs.numel()) != total_numel:
             raise invalid_descriptor("forward graph paged KV side-table geometry mismatch")
-        flat = self._cpu_buffer(
+        flat = slot.int_buffer(
             "int32_inputs",
             total_numel,
-            dtype=torch.int32,
+            pin=self._device.type == "cuda",
         )
         flat.zero_()
         for row, seg in enumerate(segments):
@@ -573,37 +586,25 @@ class ForwardGraphPagedKVView:
             offset += len(values)
         self._int32_inputs.copy_(flat, non_blocking=self._non_blocking_cpu_copy(flat))
 
-    def _copy_write_plan_inputs(self, page_ids: list[int], offsets: list[int]) -> None:
+    def _copy_write_plan_inputs(
+        self,
+        page_ids: list[int],
+        offsets: list[int],
+        *,
+        slot: TextTensorStagingSlot,
+    ) -> None:
         if len(page_ids) != self._write_tokens or len(offsets) != self._write_tokens:
             raise invalid_descriptor("forward graph paged KV write-plan length mismatch")
         if self._write_tokens == 0:
             return
-        cpu = self._cpu_buffer(
+        cpu = slot.long_buffer(
             "write_plan_inputs",
             2 * self._write_tokens,
-            dtype=torch.int64,
+            pin=self._device.type == "cuda",
         )
         fill_cpu_ints(cpu[: self._write_tokens], page_ids)
         fill_cpu_ints(cpu[self._write_tokens :], offsets)
         self._write_plan_inputs.copy_(cpu, non_blocking=self._non_blocking_cpu_copy(cpu))
-
-    def _cpu_buffer(self, name: str, numel: int, *, dtype: torch.dtype) -> torch.Tensor:
-        key = (name, dtype)
-        want_pin = self._device.type == "cuda" and self._pin_memory_supported
-        buffer = self._cpu_staging.get(key)
-        if (
-            buffer is None
-            or int(buffer.numel()) < int(numel)
-            or buffer.dtype != dtype
-            or is_pinned(buffer) != want_pin
-        ):
-            try:
-                buffer = torch.empty(int(numel), dtype=dtype, pin_memory=want_pin)
-            except RuntimeError:
-                self._pin_memory_supported = False
-                buffer = torch.empty(int(numel), dtype=dtype)
-            self._cpu_staging[key] = buffer
-        return buffer[: int(numel)]
 
     def _non_blocking_cpu_copy(self, cpu: torch.Tensor) -> bool:
         return self._device.type == "cuda" and is_pinned(cpu)
