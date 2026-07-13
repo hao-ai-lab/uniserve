@@ -626,11 +626,11 @@ class _BagelDenoiseGraphImage:
 # shared text driver takes it as configuration.
 _BAGEL_IMG_START_TOKEN = "<|vision_start|>"
 
-# Scratch (per-CFG-branch) KV pool capacity in tokens. Sized for several
-# concurrent denoises: each t2i image stages cond + text-uncond prefixes plus
-# one transient gen span (``num_vae + 2`` <= 4098 at the 64x64 latent cap) per
-# branch, ~9k tokens for a 1024x1024 image. The caps descriptor advertises
-# exactly this pool's capacity.
+# Scheduler-visible denoise scratch capacity in tokens. Each image stages cond
+# and text-uncond prefixes plus one transient gen span per physical branch. The
+# physical pool also reserves one request-KV-pool-sized region for text rows in
+# shared packed forwards; that staging reserve is not additional denoise
+# admission capacity.
 _BAGEL_SCRATCH_CAPACITY_TOKENS = 65536
 
 
@@ -761,14 +761,21 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
             adapter=AdapterResourcePolicy.PER_ADAPTER,
         )
 
-    def _scratch_num_blocks(self, block_size: int | None = None) -> int:
+    def _denoise_scratch_num_blocks(self, block_size: int | None = None) -> int:
         return ceil_div(_BAGEL_SCRATCH_CAPACITY_TOKENS, int(block_size or self.block_size))
+
+    def _scratch_num_blocks(self, block_size: int | None = None) -> int:
+        # Every live text token can require one same-pool packed-forward mirror.
+        # Host KV admission bounds their aggregate by ``num_blocks``; adding
+        # that exact capacity preserves the independently admitted denoise
+        # reservation without allowing it to consume text-staging headroom.
+        return self._denoise_scratch_num_blocks(block_size) + int(self.num_blocks)
 
     def _build_residency(self, cfg: LLMConfig) -> ResidencyManager:
         # System-owned residency: the worker-owned ResidencyManager constructs
         # and owns the KV pool; the model declares only geometry/sizing here.
-        # The scratch pool holds the denoise CFG-branch prefix KV (staged cond
-        # + neg-prompt branches) and their per-step transient gen rows.
+        # The scratch pool holds denoise CFG branches and same-pool text mirrors
+        # used by shared packed text/denoise forwards.
         self._scratch_blocks = self._scratch_num_blocks()
         return ResidencyManager.build_gen(
             GenResidencySpec(
@@ -827,11 +834,10 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         # live batch replays in a larger captured bucket.
         num_blocks = max(1, physical_blocks - 1)
         c = self.cfg.llm
-        # Report the actual per-CFG-branch scratch pool capacity in tokens
-        # (the built pool's blocks when loaded, the planned sizing otherwise).
-        scratch_blocks = (
-            self._scratch_blocks if self.model is not None else self._scratch_num_blocks(block)
-        )
+        # Report only schedulable denoise capacity. The physical pool's separate
+        # text-staging reserve mirrors already-admitted request KV and must not
+        # increase host denoise admission.
+        scratch_blocks = self._denoise_scratch_num_blocks(block)
         return CapsDescriptor(
             block_size=block,
             num_blocks=num_blocks,
