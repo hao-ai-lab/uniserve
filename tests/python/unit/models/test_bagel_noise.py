@@ -84,53 +84,16 @@ def test_latent_noise_default_samples_directly_in_output_format():
     assert torch.equal(actual, expected)
 
 
-class _InitialNoiseGraph:
-    cfg = SimpleNamespace(patch_latent_dim=64, timestep_shift=3.0)
-
-    @staticmethod
-    def latent_hw(height, width):
-        return height // 16, width // 16
-
-    @staticmethod
-    def latent_position_ids(height, width):
-        return torch.arange((height // 16) * (width // 16))
-
-    @staticmethod
-    def new_cache():
-        return object()
-
-
-def test_bagel_generation_state_keeps_exact_cpu_float32_initial_noise(monkeypatch):
+def test_bagel_initial_noise_keeps_exact_cpu_float32_values():
     owner = BagelForUnifiedGeneration(config=BagelConfig(), device="cpu")
-    graph = _InitialNoiseGraph()
-    monkeypatch.setattr(owner, "_ensure_loaded", lambda: SimpleNamespace(model=graph))
-    request_id = 5
-    owner.states[request_id] = RequestState(seed=999)
-    owner.generation_session.begin_request(
-        request_id,
-        image={
-            "width": 48,
-            "height": 32,
-            "steps": 50,
-            "cfg_text_scale": 1.0,
-            "cfg_img_scale": 1.0,
-            "cfg_interval": [0.4, 1.0],
-            "cfg_renorm_type": "global",
-            "cfg_renorm_min": 0.0,
-            "timestep_shift": 3.0,
-            "seed": 0,
-        },
-    )
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(0)
         expected = torch.randn((6, 64), device="cpu", dtype=torch.float32)
 
-    owner._init_gen({"req_id": request_id, "cond_pos": 0})
+    actual = owner._init_generation_noise((6, 64), seed=0)
 
-    state = owner._gen_state(request_id)
-    assert state is not None
-    assert state.x_t.dtype == torch.float32
-    assert torch.equal(state.x_t, expected)
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.parametrize(

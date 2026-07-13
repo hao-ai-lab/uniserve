@@ -399,17 +399,22 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
             {"id": "c1", "request_rate": "inf", "max_concurrency": 1},
             {"id": "c32", "request_rate": "inf", "max_concurrency": 32},
         ],
+        "mixed_concurrency": [
+            {"id": "c32", "request_rate": "inf", "max_concurrency": 32},
+        ],
     }
     matrix_size = sum(
         len(benchmark["load_cases"][benchmark["points"][point]["load_case_set"]])
         for group in benchmark["groups"].values()
         for point in group["points"]
     )
-    assert matrix_size == 43
+    assert matrix_size == 42
     for point in points:
         if point["harness"]["task"] == "t2i":
             assert point["load_case_set"] == "image_concurrency"
             assert point["name"].endswith("-{load_id}")
+        if point["harness"]["task"] == "mixed":
+            assert point["load_case_set"] == "mixed_concurrency"
 
     spec = BenchmarkSpec(
         task=TaskName.T2I,

@@ -15,7 +15,7 @@ from ...contracts.forward_mode import ForwardMode, mode_for_op
 from ...contracts.forward_stats import ForwardStats
 from ...contracts.outputs import DeferredForwardOutput, ForwardOutput, ForwardOutputBase
 from ...foundation.env import env_flag
-from ...foundation.errors import invalid_descriptor
+from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...foundation.profiling import profile_range
 from .plan import ForwardAdmissionRouter, ForwardRuntimeHandles
 
@@ -54,6 +54,13 @@ class ForwardGroupPlanner:
                 batch = UniForwardBatch.from_ops(ops)
                 if self._can_run_forward is None or self._can_run_forward(batch):
                     return [list(enumerate(ops))]
+                raise capability_mismatch(
+                    "admitted mixed forward has no whole-batch executor",
+                    details={
+                        "modes": [mode.value for mode in decision.modes],
+                        "reason": decision.reason,
+                    },
+                )
             self._log_text_mixed_split(ops, decision)
             return self._mode_ordered_groups(ops)
         return self._contiguous_groups(ops)

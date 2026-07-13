@@ -169,7 +169,7 @@ def test_strict_policy_preserves_contiguous_order_and_splits_by_max_batch():
     ]
 
 
-def test_mixed_admission_splits_when_the_model_adapter_cannot_execute_the_batch():
+def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch():
     from uniserve_worker.execution.forward.step import ForwardGroupPlanner
 
     planner = ForwardGroupPlanner(
@@ -184,10 +184,8 @@ def test_mixed_admission_splits_when_the_model_adapter_cannot_execute_the_batch(
         {"req_id": 4, "kind": "denoise_gen", "latent_shape": [2, 2]},
     ]
 
-    groups = planner.groups(submitted)
-
-    assert [[index for index, _op in group] for group in groups] == [[0, 2], [1, 3]]
-    assert all(UniForwardBatch.from_ops([op for _index, op in group]).mode is not ForwardMode.MIXED for group in groups)
+    with pytest.raises(WorkerError, match="admitted mixed forward has no whole-batch executor"):
+        planner.groups(submitted)
 
 
 def test_runner_executes_whole_batch_forward_under_inference_mode():

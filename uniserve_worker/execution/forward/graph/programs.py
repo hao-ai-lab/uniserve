@@ -253,6 +253,8 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
             and callable(getattr(self.owner, "prepare_denoise", None))
             and callable(getattr(self.owner, "packed_decoder_forward", None))
             and callable(getattr(self.owner, "packed_text_embeddings", None))
+            and callable(getattr(self.owner, "packed_text_logits", None))
+            and callable(getattr(self.owner, "packed_graph_attention", None))
         )
 
     def can_run(self, batch: ForwardBatch, plan: ForwardPlan) -> GraphEligibility:
@@ -264,6 +266,10 @@ class PackedVisibleGraphProgram(ForwardGraphProgram):
                 if self.owner is None and self.request_states is None:
                     return GraphEligibility(True)
                 return GraphEligibility(False, "packed visible graph program is not bound")
+            if plan.shape.denoise_row_count and not callable(
+                getattr(self.owner, "packed_hidden_to_velocity", None)
+            ):
+                return GraphEligibility(False, "packed denoise projection is not bound")
             if self._has_burst_rows(plan) and not callable(
                 getattr(self.owner, "_run_forward_adapter", None)
             ):

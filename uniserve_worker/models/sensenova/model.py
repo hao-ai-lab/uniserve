@@ -32,26 +32,13 @@ from ...contracts.resource_plan import (
     ResourcePlan,
     active_latent_capacity_tokens,
 )
-from ...execution.denoise_driver import (
-    DenoiseDriver,
-    TextImageDenoiseStep,
-    text_image_branches,
-)
+from ...execution.denoise_driver import TextImageDenoiseStep
 from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
-from ...execution.forward.deferred_text import (
-    DeferredDecodeBurstSeqResult,
-    DeferredTerminalDecodeBurstSeqResult,
-    DeferredTextSeqResult,
-)
-from ...execution.forward.programs.packed_visible import (
-    run_packed_mixed_forward,
-    run_packed_visible_forward_result,
-)
+from ...execution.forward.programs.packed_batch import PackedVisibleBatchAdapter
+from ...execution.forward.programs.packed_model import PackedVisibleModelMixin
 from ...execution.forward.stream import (
-    ForwardPagedKVSegment,
     ForwardPagedKVView,
     ForwardStream,
-    ForwardStreamBuilder,
 )
 from ...execution.input_image_ingest import InputImageIngestDriver
 from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
@@ -65,11 +52,8 @@ from ...execution.interleaved_text_stepper import (
     TextCache,
 )
 from ...execution.model_base import UniModelBase
-from ...execution.text_decode_relay import TextDecodeRelay
-from ...execution.text_driver import sample_logits_result
 from ...execution.tower_execution_session import TowerExecutionSession
 from ...foundation.errors import capability_mismatch, invalid_descriptor
-from ...foundation.profiling import profile_range
 from ...foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -108,21 +92,10 @@ from ...nn.quant import (
     kv_cache_bytes_per_token,
     use_quantization_config,
 )
-from ...nn.sampler import (
-    apply_sampling_batched_with_device_tokens,
-    finalize_sampling_result,
-    is_deferred_sampling_result,
-)
 from ...nn.vision import NeoVitConfig, NeoVitEncoder
 from ...processors.registry import get_processor_for_model
 from ...runtime.compile import CompileTarget
-from ...runtime.host_staging import fill_cpu_ints, is_pinned
 from ...runtime.kv_pool import PagedKVPool
-from ...runtime.paged_text_cache import (
-    PagedTextCache,
-    PagedTextCacheSpanCopy,
-    copy_paged_text_cache_span,
-)
 from ...runtime.request_state import RequestState as RunnerRequestState
 from ...runtime.residency import (
     DEFAULT_ENCODER_CACHE_BUDGET,
@@ -131,7 +104,6 @@ from ...runtime.residency import (
     ResidencyManager,
     encoder_handle_from_mm_hash,
 )
-from ...runtime.tensor_staging import TextTensorStager
 from ...runtime.tower_handoff import (
     ConditioningSnapshot,
     DataPlaneTowerHandoff,
@@ -186,200 +158,12 @@ _NOISE_DYNAMIC_SQRT_EXPONENT = 0.5
 _NOISE_RESOLUTION_MODES = frozenset({"resolution", "dynamic", "dynamic_sqrt"})
 
 logger = logging.getLogger(__name__)
-_DECODE_RELAY = TextDecodeRelay()
-_RELAY_PLACEHOLDER_TOKEN_ID = -1
 
 
 def _packed_mixed_has_und_and_gen(op_modes: Sequence[ForwardMode]) -> bool:
     has_und = any(mode in {ForwardMode.EXTEND, ForwardMode.DECODE} for mode in op_modes)
     has_gen = any(mode in {ForwardMode.DENOISE, ForwardMode.COMMIT} for mode in op_modes)
     return has_und and has_gen
-
-
-def _output_value(output: Any, field: str) -> Any:
-    if isinstance(output, Mapping):
-        return output.get(field)
-    if hasattr(output, field):
-        return getattr(output, field)
-    finalize = getattr(output, "finalize", None)
-    if callable(finalize):
-        finalized = finalize()
-        if isinstance(finalized, Mapping):
-            return finalized.get(field)
-    to_seq_result = getattr(output, "to_seq_result", None)
-    if callable(to_seq_result):
-        return dict(to_seq_result()).get(field)
-    raise invalid_descriptor(f"packed mixed output does not expose {field!r}")
-
-
-def _output_int(output: Any, field: str) -> int:
-    value = _output_value(output, field)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise invalid_descriptor(f"packed mixed output field {field!r} must be an integer")
-    return int(value)
-
-
-def _output_bool(output: Any, field: str) -> bool:
-    value = _output_value(output, field)
-    if not isinstance(value, bool):
-        raise invalid_descriptor(f"packed mixed output field {field!r} must be a boolean")
-    return bool(value)
-
-
-def _sampled_token_id(output: Any, *, profile_name: str) -> int:
-    materialize = getattr(output, "materialize_sampled_token_id", None)
-    with profile_range(profile_name):
-        token = (
-            int(materialize()) if callable(materialize) else _output_int(output, "sampled_token_id")
-        )
-    if token < 0:
-        raise invalid_descriptor("sampled_token_id must be non-negative")
-    return token
-
-
-def _decode_burst_result(op: Mapping[str, Any], tokens: Sequence[int]) -> dict[str, Any]:
-    if not tokens:
-        raise invalid_descriptor("decode burst did not produce a sampled token")
-    token_ids = [int(token) for token in tokens]
-    return {
-        "req_id": int(op["req_id"]),
-        "sampled_token_id": token_ids[-1],
-        "sampled_token_ids": token_ids,
-    }
-
-
-def _decode_burst_result_with_pending(
-    op: Mapping[str, Any],
-    tokens: Sequence[int],
-    pending: Any,
-    *,
-    defer_cpu: bool,
-) -> dict[str, Any] | DeferredDecodeBurstSeqResult:
-    materialize = getattr(pending, "materialize_sampled_token_id", None)
-    ready = getattr(pending, "ready", None)
-    if defer_cpu and callable(materialize) and callable(ready):
-        return DeferredDecodeBurstSeqResult(
-            req_id=int(op["req_id"]),
-            prefix_token_ids=tokens,
-            pending=pending,
-        )
-    token = _sampled_token_id(
-        pending,
-        profile_name="uniserve.packed_burst.finalize_pending",
-    )
-    return _decode_burst_result(op, [*tokens, token])
-
-
-def _decode_burst_terminal_result(
-    op: Mapping[str, Any],
-    pending_tokens: Sequence[Any],
-    stop_ids: set[int],
-    *,
-    defer_cpu: bool,
-) -> dict[str, Any] | DeferredTerminalDecodeBurstSeqResult:
-    if not pending_tokens:
-        return _decode_burst_result(op, [])
-    if defer_cpu and all(
-        callable(getattr(pending, "materialize_sampled_token_id", None))
-        for pending in pending_tokens
-    ):
-        return DeferredTerminalDecodeBurstSeqResult(
-            req_id=int(op["req_id"]),
-            pending_tokens=pending_tokens,
-            stop_token_ids=stop_ids,
-        )
-    token_ids: list[int] = []
-    for pending in pending_tokens:
-        token = _sampled_token_id(
-            pending,
-            profile_name="uniserve.packed_burst.finalize_terminal",
-        )
-        token_ids.append(token)
-        if token in stop_ids:
-            break
-    return _decode_burst_result(op, token_ids)
-
-
-def _attach_decode_relay_input(op: dict[str, Any], state: Any) -> bool:
-    relay = getattr(state, "decode_relay", None)
-    token_tensor = getattr(relay, "token_tensor", None)
-    if not isinstance(token_tensor, torch.Tensor) or token_tensor.dtype != torch.long:
-        return False
-    op["token_tensor"] = token_tensor
-    return True
-
-
-def _decode_op_next_pos(op: Mapping[str, Any]) -> int:
-    pos = op.get("pos_range") or [0, 0]
-    if not isinstance(pos, Sequence) or len(pos) != 2:
-        raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
-    return int(pos[1])
-
-
-def _coerce_logits_row(logits: Any) -> torch.Tensor:
-    if not isinstance(logits, torch.Tensor):
-        raise invalid_descriptor("decode graph follow-up must return logits tensors")
-    if logits.ndim == 0:
-        raise invalid_descriptor("decode graph follow-up logits must have a vocabulary dimension")
-    return logits.reshape(-1, logits.shape[-1])[-1]
-
-
-def _store_decode_followup_relay(
-    state: Any,
-    *,
-    token_id: int | None,
-    device: torch.device,
-    position_id: int,
-    token_tensor: torch.Tensor,
-    position_tensor: torch.Tensor | None = None,
-) -> None:
-    relay = getattr(state, "decode_relay", None)
-    if relay is None:
-        return
-    token_tensor = token_tensor.reshape(1).to(device=device, dtype=torch.long)
-    _DECODE_RELAY.publish_sample(
-        state,
-        token_id=None if token_id is None else int(token_id),
-        token_tensor=token_tensor,
-    )
-    if position_tensor is None:
-        position_tensor = torch.tensor([int(position_id)], dtype=torch.long, device=device)
-    else:
-        position_tensor = position_tensor.reshape(1).to(device=device, dtype=torch.long)
-    _DECODE_RELAY.publish_position(
-        state,
-        position_id=int(position_id),
-        position_tensor=position_tensor,
-    )
-
-
-def _decode_followup_position_tensors(
-    owner: Any,
-    ops: Sequence[Mapping[str, Any]],
-    *,
-    device: torch.device,
-) -> tuple[list[int], list[torch.Tensor]]:
-    position_ids = [int((op.get("pos_range") or [0, 0])[1]) for op in ops]
-    if not position_ids:
-        return [], []
-    if device.type != "cuda":
-        positions = torch.tensor(position_ids, dtype=torch.long, device=device)
-    else:
-        stager = getattr(owner, "_decode_followup_position_stager", None)
-        if not isinstance(stager, TextTensorStager):
-            stager = TextTensorStager(ring_depth=3)
-            setattr(owner, "_decode_followup_position_stager", stager)
-        slot = stager.next_slot()
-        cpu = slot.long_buffer("sensenova_decode_followup_positions", len(position_ids), pin=True)
-        fill_cpu_ints(cpu, position_ids)
-        positions = slot.device_buffer(
-            "sensenova_decode_followup_positions",
-            len(position_ids),
-            dtype=torch.long,
-            device=device,
-        )
-        positions.copy_(cpu, non_blocking=is_pinned(cpu))
-    return position_ids, [positions[row : row + 1] for row in range(len(position_ids))]
 
 
 def _cat_token_slices(parts: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -2573,7 +2357,11 @@ def check_checkpoint_compatibility(config_or_dict: Any) -> None:
         raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
 
 
-class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
+class SenseNovaU1ForUnifiedGeneration(
+    UniModelBase,
+    TextImageDenoiseOps,
+    PackedVisibleModelMixin,
+):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
     architectures = ("NEOChatModel", "neo_chat", "neo-unify", "neo_unify")
@@ -3314,6 +3102,13 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             image_size=image_size,
         )
 
+    def packed_graph_attention(self) -> Any:
+        if self.model is None or not self.model.language_model.model.layers:
+            raise capability_mismatch(
+                "SenseNova packed graph requires at least one decoder layer"
+            )
+        return self.model.language_model.model.layers[0].self_attn
+
     def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
         """Query-side geometry for the system decode-graph FlashInfer planner.
 
@@ -3584,234 +3379,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
             self._shared_denoise_residual_adapter = adapter
         return adapter
 
-    @staticmethod
-    def _same_kv_pool(pool: Any, first_pool: Any) -> bool:
-        return first_pool is None or pool is first_pool
-
-    def _stage_text_cache_for_forward(
-        self,
-        source: PagedTextCache,
-        *,
-        target_pool: PagedKVPool,
-        end_len: int,
-        pending_prefix_copies: list[PagedTextCacheSpanCopy] | None = None,
-    ) -> PagedTextCache:
-        if target_pool is not self.gen_scratch_pool and target_pool is not self.scratch_pool:
-            raise RuntimeError("forward text staging target must be a scratch KV pool")
-        allocator = self.residency.require_allocator_for_pool(
-            target_pool,
-            label="forward scratch KV pool",
-        )
-        staged_by_pool = getattr(source, "_uniserve_forward_staging", None)
-        if not isinstance(staged_by_pool, dict):
-            staged_by_pool = {}
-            setattr(source, "_uniserve_forward_staging", staged_by_pool)
-        key = id(target_pool)
-        staged = staged_by_pool.get(key)
-        source_len = int(source.length)
-        source_prefix = self._forward_staging_source_prefix(source, source_len)
-        if (
-            staged is not None
-            and getattr(staged, "pool", None) is target_pool
-            and int(getattr(staged, "length", -1)) <= source_len
-            and getattr(staged, "_uniserve_forward_staging_source_prefix", ())
-            == self._forward_staging_source_prefix(source, int(getattr(staged, "length", 0)))
-        ):
-            staged.ensure_capacity(int(end_len))
-            copied_len = int(staged.length)
-            if copied_len < source_len:
-                if pending_prefix_copies is None:
-                    copy_paged_text_cache_span(
-                        source,
-                        staged,
-                        start=copied_len,
-                        length=source_len - copied_len,
-                        num_layers=self.num_layers,
-                        missing_message="cannot extend mixed forward staging without a paged source cache",
-                    )
-                    setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
-                else:
-                    pending_prefix_copies.append(
-                        PagedTextCacheSpanCopy(
-                            source=source,
-                            target=staged,
-                            start=copied_len,
-                            length=source_len - copied_len,
-                        )
-                    )
-                staged.length = source_len
-            if copied_len >= source_len:
-                setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
-            return staged
-        if staged is not None:
-            self.residency.release_scratch_cache(staged)
-        staged = PagedTextCache(
-            target_pool,
-            [],
-            num_layers=self.num_layers,
-            length=0,
-            allocate_blocks=allocator,
-        )
-        staged.ensure_capacity(int(end_len))
-        if source_len > 0:
-            if pending_prefix_copies is None:
-                copy_paged_text_cache_span(
-                    source,
-                    staged,
-                    start=0,
-                    length=source_len,
-                    num_layers=self.num_layers,
-                    missing_message="cannot stage mixed forward prefix without a paged source cache",
-                )
-                setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
-            else:
-                pending_prefix_copies.append(
-                    PagedTextCacheSpanCopy(
-                        source=source,
-                        target=staged,
-                        start=0,
-                        length=source_len,
-                    )
-                )
-        elif pending_prefix_copies is None:
-            setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
-        staged.length = source_len
-        if source_len <= 0:
-            setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
-        staged_by_pool[key] = staged
-        return staged
-
-    def _mark_forward_staging_advanced(
-        self,
-        staged: PagedTextCache,
-        source: PagedTextCache,
-        new_len: int,
-    ) -> None:
-        staged.length = int(new_len)
-        setattr(
-            staged,
-            "_uniserve_forward_staging_source_prefix",
-            self._forward_staging_source_prefix(source, int(new_len)),
-        )
-
-    def _release_forward_staging_for_cache(self, cache: Any) -> None:
-        staged_by_pool = getattr(cache, "_uniserve_forward_staging", None)
-        if not isinstance(staged_by_pool, dict):
-            return
-        seen: set[int] = set()
-        for staged in staged_by_pool.values():
-            staged_id = id(staged)
-            if staged_id in seen:
-                continue
-            seen.add(staged_id)
-            self.residency.release_scratch_cache(staged)
-        staged_by_pool.clear()
-
-    @staticmethod
-    def _forward_staging_source_prefix(cache: PagedTextCache, length: int) -> tuple[int, ...]:
-        length = int(length)
-        if length <= 0:
-            return ()
-        block_size = int(
-            getattr(cache.pool, "block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE
-        )
-        block_count = ceil_div(length, block_size)
-        return tuple(int(block_id) for block_id in list(cache.block_ids)[:block_count])
-
-    def _forward_target_pool(
-        self, denoise_steps: list[tuple[int, TextImageDenoiseStep]]
-    ) -> PagedKVPool | None:
-        target_pool = None
-        for _row_index, step in denoise_steps:
-            img = step.extra["img"]
-            for branch in text_image_branches(step):
-                _indexes, cache = self._denoise_branch_inputs(img, branch)
-                pool = getattr(cache, "pool", None)
-                if pool is None:
-                    return None
-                if target_pool is None:
-                    target_pool = pool
-                elif pool is not target_pool:
-                    return None
-        return target_pool
-
-    def _add_text_forward_segment(
-        self,
-        *,
-        builder: ForwardStreamBuilder,
-        kv_segments: list[ForwardPagedKVSegment],
-        row_index: int,
-        req_id: int,
-        op: dict[str, Any],
-        mode: ForwardMode,
-        cache: Any,
-        q_len: int,
-        start_pos: int,
-        device: torch.device,
-    ) -> None:
-        builder.add_segment(
-            op_index=row_index,
-            req_id=req_id,
-            kind=str(op["kind"]),
-            mode=mode,
-            modality="und",
-            segment_class="decode" if mode is ForwardMode.DECODE else "extend",
-            q_len=q_len,
-            prefix_len=int(cache.past.length),
-            visible_policy="causal",
-            index_start=int(start_pos),
-        )
-        kv_segments.append(
-            ForwardPagedKVSegment(
-                block_ids=tuple(cache.past.block_ids),
-                base_len=int(cache.past.length),
-                q_len=q_len,
-                write_kv=True,
-            )
-        )
-
-    def _add_denoise_forward_segment(
-        self,
-        *,
-        builder: ForwardStreamBuilder,
-        kv_segments: list[ForwardPagedKVSegment],
-        row_index: int,
-        req_id: int,
-        op: dict[str, Any],
-        cache: Any,
-        indexes: torch.Tensor,
-        q_len: int,
-        branch_index: int,
-        device: torch.device,
-    ) -> None:
-        builder.add_segment(
-            op_index=row_index,
-            req_id=req_id,
-            kind=str(op["kind"]),
-            mode=ForwardMode.DENOISE,
-            modality="gen",
-            segment_class="denoise",
-            q_len=q_len,
-            prefix_len=int(cache.length),
-            branch_id=branch_index,
-            visible_policy="bidirectional",
-            indexes=indexes.to(device=device),
-        )
-        kv_segments.append(
-            ForwardPagedKVSegment(
-                block_ids=tuple(cache.block_ids),
-                base_len=int(cache.length),
-                q_len=q_len,
-                # Denoise K/V is transient, not persistent: write the physical
-                # image-token span so the bidirectional visible_end segment can
-                # attend it, but leave the branch cache length owned by the
-                # denoise state unchanged.
-                write_kv=True,
-                persist_kv=False,
-                branch_id=branch_index,
-            )
-        )
-
     def _run_forward_adapter(
         self,
         batch: UniForwardBatch,
@@ -3820,341 +3387,12 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
         group: Any,
         defer_text_cpu_results: bool = False,
     ) -> Any:
-        results: list[Any] = [None] * len(batch.ops)
-        denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
-        commit_rows: list[tuple[int, int, dict[str, Any]]] = []
-        has_burst_rows = False
-        with profile_range("uniserve.sensenova.mixed_prepare_ops"):
-            for row_index, op in enumerate(batch.ops):
-                mode = batch.op_modes[row_index]
-                req_id = int(op["req_id"])
-                if (
-                    int(op.get("decode_token_count") or 1) > 1
-                    or int(op.get("denoise_step_count") or 1) > 1
-                ):
-                    has_burst_rows = True
-                if mode is ForwardMode.DENOISE:
-                    with profile_range("uniserve.sensenova.mixed_prepare_denoise"):
-                        step = self.prepare_denoise(request_states.get(req_id), dict(op))
-                    denoise_steps.append((row_index, step))
-                elif mode is ForwardMode.COMMIT:
-                    commit_rows.append((row_index, req_id, dict(op)))
-                elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
-                    raise RuntimeError(f"unsupported mixed SenseNova mode {mode.value!r}")
-        # Packed-mixed denoise runs outside the residual-reuse policy's view:
-        # drop any replay state so the next pure-denoise step recomputes
-        # instead of replaying a stale residual.
-        for _row_index, step in denoise_steps:
-            extra = getattr(step, "extra", None)
-            img = extra.get("img") if isinstance(extra, dict) else None
-            residual_state = getattr(img, "residual_cache", None)
-            if residual_state is not None:
-                residual_state.invalidate()
-        if not commit_rows and not has_burst_rows:
-            result = run_packed_visible_forward_result(
-                self,
-                batch,
-                request_states,
-                denoise_steps,
-                defer_text_cpu_results=defer_text_cpu_results,
-            )
-            if result is not None:
-                return result
-        if run_packed_mixed_forward(
-            self,
+        del group
+        return PackedVisibleBatchAdapter(self).execute(
             batch,
-            request_states,
-            denoise_steps,
-            results,
+            request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,
-            require_graph=True,
-        ):
-            self._complete_packed_decode_bursts(
-                batch,
-                request_states,
-                results,
-                defer_final_cpu_results=defer_text_cpu_results,
-            )
-            self._complete_packed_denoise_bursts(batch, request_states, results)
-            for row_index, req_id, op in commit_rows:
-                state = request_states.get(req_id)
-                decoded = self.decode_image(
-                    getattr(state, "latent", None),
-                    req_id=req_id,
-                    state=state,
-                    op=op,
-                )
-                out = dict(decoded)
-                logits = out.pop("logits", None)
-                if logits is not None:
-                    sampled = sample_logits_result(
-                        req_id=req_id,
-                        state=state,
-                        logits=logits,
-                        op=op,
-                    )
-                    sampled.pop("req_id", None)
-                    out.update(sampled)
-                results[row_index] = out
-            return results
-        raise capability_mismatch(
-            "admitted mixed SenseNova batch could not be packed; split-mode fallback is disabled"
         )
-
-    def _complete_packed_decode_bursts(
-        self,
-        batch: UniForwardBatch,
-        request_states: Any,
-        results: list[Any],
-        *,
-        defer_final_cpu_results: bool = False,
-    ) -> None:
-        active: list[dict[str, Any]] = []
-        for row_index, op in enumerate(batch.ops):
-            if batch.op_modes[row_index] is not ForwardMode.DECODE:
-                continue
-            requested = int(op.get("decode_token_count") or 1)
-            if requested <= 1:
-                continue
-            stop_ids = {int(token) for token in (op.get("decode_stop_token_ids") or [])}
-            terminal_stop = not stop_ids or op.get("decode_stop_terminal") is True
-            pos = op.get("pos_range") or [0, 0]
-            if not isinstance(pos, Sequence) or len(pos) != 2:
-                raise invalid_descriptor("decode burst op.pos_range must be [start, end]")
-            active.append(
-                {
-                    "row_index": row_index,
-                    "op": dict(op),
-                    "tokens": [],
-                    "requested": requested,
-                    "launched": 1,
-                    "last_op": dict(op),
-                    "pending": results[row_index],
-                    "pending_tokens": [results[row_index]] if terminal_stop else [],
-                    "stop_ids": stop_ids,
-                    "terminal_stop": terminal_stop,
-                    "done": False,
-                }
-            )
-
-        while any(not bool(item["done"]) for item in active):
-            iter_ops: list[dict[str, Any]] = []
-            iter_items: list[dict[str, Any]] = []
-            for item in active:
-                if bool(item["done"]) or int(item["launched"]) >= int(item["requested"]):
-                    continue
-                op = dict(item["op"])
-                op["new_block_ids"] = []
-                state = request_states.get(int(op["req_id"]))
-                if _attach_decode_relay_input(op, state):
-                    op["token_ids"] = [_RELAY_PLACEHOLDER_TOKEN_ID]
-                    op["token_source"] = "last_sampled"
-                else:
-                    pending = item.get("pending")
-                    if pending is None:
-                        raise invalid_descriptor("decode burst relay input is missing")
-                    token = _sampled_token_id(
-                        pending,
-                        profile_name="uniserve.packed_burst.relay_input_materialize",
-                    )
-                    item["tokens"].append(token)
-                    item["pending"] = None
-                    if token in item["stop_ids"]:
-                        item["done"] = True
-                        continue
-                    op["token_ids"] = [token]
-                    op.pop("token_source", None)
-                    op.pop("token_tensor", None)
-                next_pos = _decode_op_next_pos(item["last_op"])
-                op["pos_range"] = [next_pos, next_pos + 1]
-                op["decode_token_count"] = None
-                op["decode_stop_token_ids"] = []
-                item["last_op"] = op
-                iter_ops.append(op)
-                iter_items.append(item)
-            if not iter_ops:
-                break
-
-            followup_results = self._run_packed_decode_burst_graph_followup(
-                iter_ops,
-                request_states,
-                defer_cpu_results=True,
-            )
-            if followup_results is None:
-                raise capability_mismatch(
-                    "packed decode burst follow-up requires CUDA graph coverage"
-                )
-
-            for item, output in zip(iter_items, followup_results, strict=True):
-                previous = item.get("pending")
-                item["pending"] = output
-                item["launched"] = int(item["launched"]) + 1
-                if bool(item.get("terminal_stop")):
-                    item["pending_tokens"].append(output)
-                    continue
-                if previous is None:
-                    continue
-                token = _sampled_token_id(
-                    previous,
-                    profile_name="uniserve.packed_burst.stop_check",
-                )
-                item["tokens"].append(token)
-                if token in item["stop_ids"]:
-                    item["pending"] = None
-                    item["done"] = True
-        for item in active:
-            if bool(item.get("terminal_stop")):
-                results[int(item["row_index"])] = _decode_burst_terminal_result(
-                    item["op"],
-                    item["pending_tokens"],
-                    item["stop_ids"],
-                    defer_cpu=bool(defer_final_cpu_results),
-                )
-                item["pending"] = None
-                continue
-            pending = item.get("pending")
-            if pending is not None:
-                results[int(item["row_index"])] = _decode_burst_result_with_pending(
-                    item["op"],
-                    item["tokens"],
-                    pending,
-                    defer_cpu=bool(defer_final_cpu_results),
-                )
-                item["pending"] = None
-                continue
-            results[int(item["row_index"])] = _decode_burst_result(
-                item["op"],
-                item["tokens"],
-            )
-
-    def _run_packed_decode_burst_graph_followup(
-        self,
-        ops: Sequence[Mapping[str, Any]],
-        request_states: Any,
-        *,
-        defer_cpu_results: bool = False,
-    ) -> list[Any] | None:
-        driver = self._text_driver()
-        run_graph = getattr(driver, "try_run_decode_graph_logits_batch", None)
-        if not callable(run_graph):
-            return None
-        logits_rows = run_graph(ops)
-        if logits_rows is None:
-            return None
-        if len(logits_rows) != len(ops):
-            raise invalid_descriptor("decode graph follow-up logits row count must match ops")
-        rows = [_coerce_logits_row(logits) for logits in logits_rows]
-        if not rows:
-            return []
-        logits_batch = torch.stack(rows, dim=0)
-        sampling_params: list[dict[str, Any]] = []
-        recent: list[list[int] | tuple[int, ...]] = []
-        allowed: list[list[int] | tuple[int, ...] | None] = []
-        suppress: list[list[int] | tuple[int, ...] | None] = []
-        generators: list[torch.Generator] = []
-        for op in ops:
-            state = request_states.get(int(op["req_id"]))
-            sampling_params.append(dict(state.sampling or {}))
-            recent.append(op.get("recent_tokens") or [])
-            allowed.append(op.get("allowed_tokens"))
-            suppress.append(op.get("suppress_tokens"))
-            generators.append(state.device_rng(logits_batch.device, stream="text_sampling"))
-        sampled = apply_sampling_batched_with_device_tokens(
-            logits_batch,
-            sampling_params,
-            recent,
-            allowed,
-            suppress,
-            generators=generators,
-            defer_cpu=defer_cpu_results,
-        )
-        device = logits_batch.device
-        position_ids, position_tensors = _decode_followup_position_tensors(
-            self,
-            ops,
-            device=device,
-        )
-        if is_deferred_sampling_result(sampled) and defer_cpu_results:
-            deferred_outputs: list[Any] = []
-            for row, op in enumerate(ops):
-                req_id = int(op["req_id"])
-                state = request_states.get(req_id)
-                _store_decode_followup_relay(
-                    state,
-                    token_id=None,
-                    device=device,
-                    position_id=position_ids[row],
-                    token_tensor=sampled.device_tokens[row : row + 1],
-                    position_tensor=position_tensors[row],
-                )
-                relay_token_tensor = sampled.device_tokens[row : row + 1]
-                deferred_outputs.append(
-                    DeferredTextSeqResult(
-                        req_id=req_id,
-                        row=row,
-                        state=state,
-                        sampling_result=sampled,
-                        relay_token_tensor=relay_token_tensor,
-                    )
-                )
-            return deferred_outputs
-        sampled = finalize_sampling_result(sampled)
-        immediate_outputs: list[Any] = []
-        for row, op in enumerate(ops):
-            req_id = int(op["req_id"])
-            sample = sampled.samples[row]
-            token_id = int(sample.token_id)
-            _store_decode_followup_relay(
-                request_states.get(req_id),
-                token_id=token_id,
-                device=device,
-                position_id=position_ids[row],
-                token_tensor=sampled.device_tokens[row : row + 1],
-                position_tensor=position_tensors[row],
-            )
-            top_logprobs = (
-                [(int(item[0]), float(item[1]), int(item[2])) for item in sample.top_logprobs]
-                if sample.top_logprobs is not None
-                else None
-            )
-            immediate_outputs.append(
-                {
-                    "req_id": req_id,
-                    "sampled_token_id": token_id,
-                    "sampled_logprob": sample.logprob,
-                    "top_logprobs": top_logprobs,
-                }
-            )
-        return immediate_outputs
-
-    def _complete_packed_denoise_bursts(
-        self,
-        batch: UniForwardBatch,
-        request_states: Any,
-        results: list[Any],
-    ) -> None:
-        items: list[tuple[int, Any, dict[str, Any]]] = []
-        row_indexes: list[int] = []
-        for row_index, op in enumerate(batch.ops):
-            if batch.op_modes[row_index] is not ForwardMode.DENOISE:
-                continue
-            requested = int(op.get("denoise_step_count") or 1)
-            if requested <= 1 or _output_bool(results[row_index], "denoise_done"):
-                continue
-            remaining = requested - 1
-            if remaining <= 0:
-                continue
-            req_id = int(op["req_id"])
-            followup = dict(op)
-            followup["timestep_idx"] = _output_int(results[row_index], "num_steps_done")
-            followup["denoise_step_count"] = remaining
-            row_indexes.append(row_index)
-            items.append((req_id, request_states.get(req_id), followup))
-        if not items:
-            return
-        outputs = DenoiseDriver().step_many(items, self, graph_mode="require")
-        for row_index, output in zip(row_indexes, outputs, strict=True):
-            results[row_index] = output
 
     def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
         self.apply_denoise_update(ctx, latent)

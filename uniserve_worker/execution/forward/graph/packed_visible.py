@@ -125,7 +125,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
             if self.logger is not None:
                 self.logger.warning(
-                    "%s CUDA graph disabled: no graph-capable paged-varlen attention backend; using eager packed mixed forward",
+                    "%s CUDA graph unavailable: no graph-capable paged-varlen attention backend",
                     self.name,
                 )
             return None
@@ -231,7 +231,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             num_kv_heads=int(getattr(first_attn, "num_kv_heads")),
             head_dim=int(getattr(first_attn, "head_dim")),
             page_size=int(kv_view.pool.block_size),
-            scale=float(getattr(first_attn, "scaling")),
+            scale=_attention_scale(first_attn),
         )
         if text_kv_promotions:
             source_pool, target_pool, source_index, target_index = _promotion_index_tensors(
@@ -435,7 +435,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
                 v=v_cache,
                 regime=ops.AttentionRegime.VISIBLE_END,
                 causal=False,
-                scale=float(getattr(first_attn, "scaling")),
+                scale=_attention_scale(first_attn),
                 ctx=ctx,
                 visible_end=forward_stream.visible_end,
                 cu_seqlens_q=forward_stream.cu_seqlens_q,
@@ -500,10 +500,19 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
 
 
 def _first_attention(owner: Any) -> Any:
-    layers = getattr(owner.model.language_model.model, "layers")
-    if not layers:
-        raise RuntimeError("packed mixed graph requires at least one decoder layer")
-    return layers[0].self_attn
+    packed_attention = getattr(owner, "packed_graph_attention", None)
+    if not callable(packed_attention):
+        raise RuntimeError("packed mixed graph requires an explicit attention binding")
+    return packed_attention()
+
+
+def _attention_scale(attention: Any) -> float:
+    scale = getattr(attention, "scaling", None)
+    if scale is None:
+        scale = getattr(attention, "scale", None)
+    if scale is None:
+        raise RuntimeError("packed mixed graph attention does not expose a scale")
+    return float(scale)
 
 
 def _stream_geometry(forward_stream: ForwardStream) -> tuple[tuple[Any, ...], ...]:
