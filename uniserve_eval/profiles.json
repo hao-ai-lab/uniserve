@@ -654,6 +654,18 @@
             "sensenova_beans_i2t_omni"
           ]
         },
+        "sensenova-mixed-uniserve": {
+          "server": "benchmark/server/sensenova-uniserve",
+          "points": [
+            "sensenova_mixed_uniserve"
+          ]
+        },
+        "sensenova-mixed-omni": {
+          "server": "benchmark/server/sensenova-omni",
+          "points": [
+            "sensenova_mixed_omni"
+          ]
+        },
         "bagel-uniserve": {
           "server": "benchmark/server/bagel-uniserve",
           "points": [
@@ -860,6 +872,102 @@
           "plan_evidence_policy": "reference_protocol",
             "output_constraint": "und_only",
             "preprocessing": "beans_jpeg95_seed42_v1"
+          }
+        },
+        "sensenova_mixed_uniserve": {
+          "load_case_set": "mixed_concurrency",
+          "parity_group": "sensenova_mixed_image_text",
+          "comparison_role": "candidate",
+          "name": "sensenova-uniserve-mixed-{load_id}",
+          "output": "sensenova_mixed_image_text/uniserve_{load_id}",
+          "harness": {
+            "task": "mixed",
+            "model": "SenseNova-U1",
+            "dataset": "mixed-image-text",
+            "dataset_ref": "beans",
+            "t2i_dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
+            "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
+            "num_prompts": 32,
+            "warmup_requests": 4,
+            "workload_mix": {"t2i": 8, "i2t": 24},
+            "warmup_mix": {"t2i": 1, "i2t": 3},
+            "max_tokens": 256,
+            "temperature": 0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "disable_ignore_eos": true,
+            "steps": 50,
+            "denoise_updates": 50,
+            "width": 2048,
+            "height": 1152,
+            "wire": "mixed_chat",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "image_t_eps": 0.02,
+            "runtime_profile_id": "sensenova-u1",
+            "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "mixed_image_text",
+            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
+            "acceptance_min_success": 32,
+            "acceptance_min_images_per_success": 0.25
+          }
+        },
+        "sensenova_mixed_omni": {
+          "load_case_set": "mixed_concurrency",
+          "parity_group": "sensenova_mixed_image_text",
+          "comparison_role": "reference",
+          "name": "sensenova-omni-mixed-{load_id}",
+          "output": "sensenova_mixed_image_text/omni_{load_id}",
+          "harness": {
+            "task": "mixed",
+            "model": "${UNISERVE_SENSENOVA_MODEL}",
+            "dataset": "mixed-image-text",
+            "dataset_ref": "beans",
+            "t2i_dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
+            "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
+            "num_prompts": 32,
+            "warmup_requests": 4,
+            "workload_mix": {"t2i": 8, "i2t": 24},
+            "warmup_mix": {"t2i": 1, "i2t": 3},
+            "max_tokens": 256,
+            "temperature": 0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "disable_ignore_eos": true,
+            "steps": 50,
+            "denoise_updates": 50,
+            "width": 2048,
+            "height": 1152,
+            "wire": "mixed_chat",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "image_t_eps": 0.02,
+            "runtime_profile_id": "sensenova-u1-reference",
+            "plan_evidence_policy": "reference_protocol",
+            "output_constraint": "mixed_image_text",
+            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
+            "acceptance_min_success": 32,
+            "acceptance_min_images_per_success": 0.25
           }
         },
         "bagel_mjhq_t2i_uniserve": {
