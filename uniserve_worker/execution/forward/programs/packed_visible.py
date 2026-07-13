@@ -18,6 +18,7 @@ from ....contracts.outputs import TextTokenOutput
 from ....foundation.env import env_flag
 from ....foundation.errors import capability_mismatch, invalid_descriptor
 from ....foundation.profiling import profile_range
+from ....foundation.runtime_config import DEFAULT_DECODE_GRAPH_BATCH_SIZES
 from ....nn.diffusion import euler_step
 from ....nn.diffusion.cfg import Branch, CfgPlan
 from ....nn.sampler import (
@@ -80,6 +81,61 @@ class _PendingTextBuildRow:
     staged_cache: PagedTextCache
     base_len: int
     last_input_token: int
+
+
+def _append_decode_graph_padding(
+    *,
+    builder: ForwardStreamBuilder,
+    kv_segments: list[ForwardPagedKVSegment],
+    embed_chunks: list[torch.Tensor],
+    indicator_chunks: list[tuple[int, bool] | torch.Tensor],
+    padding_cache: PagedTextCache,
+    padding_start: int,
+    decode_rows: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> int:
+    capacity = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES)
+    decode_rows = int(decode_rows)
+    if decode_rows <= 0 or decode_rows >= capacity:
+        return decode_rows
+    padding_rows = capacity - decode_rows
+    padding_start = int(padding_start)
+    padding_cache.ensure_capacity(padding_start + padding_rows)
+    block_ids = tuple(int(block_id) for block_id in padding_cache.block_ids)
+    for offset in range(padding_rows):
+        base_len = padding_start + offset
+        builder.add_segment(
+            op_index=-1,
+            req_id=-1,
+            kind="decode_und",
+            mode=ForwardMode.DECODE,
+            modality="und",
+            segment_class="decode",
+            q_len=1,
+            prefix_len=base_len,
+            visible_policy="causal",
+            index_start=base_len,
+        )
+        kv_segments.append(
+            ForwardPagedKVSegment(
+                block_ids=block_ids,
+                base_len=base_len,
+                q_len=1,
+                write_kv=True,
+                persist_kv=True,
+            )
+        )
+    embed_chunks.append(
+        torch.zeros(
+            (padding_rows, int(hidden_size)),
+            dtype=dtype,
+            device=device,
+        )
+    )
+    indicator_chunks.append((padding_rows, False))
+    return capacity
 
 
 @dataclass
@@ -281,10 +337,12 @@ def _run_packed_mixed_forward_impl(
         build_start = timing.start()
         text_stage_prefix_copies: list[PagedTextCacheSpanCopy] = []
         pending_text_rows: list[_PendingTextBuildRow] = []
+        text_kv_promotion_capacity: int | None = None
+        decode_boundary_flushed = False
 
-        def flush_text_rows() -> None:
+        def flush_text_rows(*, pad_decode_rows: bool = False) -> int | None:
             if not pending_text_rows:
-                return
+                return None
             total_q = sum(int(row.q_len) for row in pending_text_rows)
             with profile_range("uniserve.packed_mixed.text_embed"):
                 input_ids = torch.cat(
@@ -315,12 +373,31 @@ def _run_packed_mixed_forward_impl(
                     last_input_token=row.last_input_token,
                 )
                 offset += int(row.q_len)
+            capacity = None
+            if pad_decode_rows:
+                first_row = pending_text_rows[0]
+                capacity = _append_decode_graph_padding(
+                    builder=builder,
+                    kv_segments=kv_segments,
+                    embed_chunks=embed_chunks,
+                    indicator_chunks=indicator_chunks,
+                    padding_cache=first_row.staged_cache,
+                    padding_start=first_row.base_len + first_row.q_len,
+                    decode_rows=len(pending_text_rows),
+                    hidden_size=int(text_embeds.shape[1]),
+                    dtype=text_embeds.dtype,
+                    device=device,
+                )
             pending_text_rows.clear()
+            return capacity
 
         with profile_range("uniserve.packed_mixed.build"):
             for row_index in _packed_mixed_row_order(batch):
                 op = batch.ops[row_index]
                 mode = batch.op_modes[row_index]
+                if require_graph and mode is not ForwardMode.DECODE and not decode_boundary_flushed:
+                    text_kv_promotion_capacity = flush_text_rows(pad_decode_rows=True)
+                    decode_boundary_flushed = True
                 req_id = int(op["req_id"])
                 current_context = {
                     "row_index": row_index,
@@ -533,7 +610,10 @@ def _run_packed_mixed_forward_impl(
                         )
                     return False
                 current_context = None
-            flush_text_rows()
+            if require_graph and not decode_boundary_flushed:
+                text_kv_promotion_capacity = flush_text_rows(pad_decode_rows=True)
+            else:
+                flush_text_rows()
         if text_stage_prefix_copies:
             with profile_range("uniserve.packed_mixed.text_prefix_stage"):
                 copy_paged_text_cache_spans(
@@ -630,6 +710,11 @@ def _run_packed_mixed_forward_impl(
             )
         hidden = None
         if allow_graph:
+            graph_kwargs = (
+                {"text_kv_promotion_capacity": text_kv_promotion_capacity}
+                if text_kv_promotion_capacity is not None
+                else {}
+            )
             hidden = maybe_run_packed_mixed_graph(
                 owner,
                 packed_embeds,
@@ -637,6 +722,7 @@ def _run_packed_mixed_forward_impl(
                 forward_stream=forward_stream,
                 kv_view=kv_view,
                 text_kv_promotions=graph_text_kv_promotions,
+                **graph_kwargs,
             )
         graph_promoted_text_kv = hidden is not None and bool(graph_text_kv_promotions)
         if hidden is None:
@@ -1191,20 +1277,23 @@ def _validate_modality_indices(
 def _packed_mixed_row_order(batch: UniForwardBatch) -> list[int]:
     if not _PACKED_MIXED_SORT_BY_MODALITY:
         return list(range(len(batch.ops)))
-    text_rows: list[int] = []
+    decode_rows: list[int] = []
+    extend_rows: list[int] = []
     denoise_rows: list[int] = []
     commit_rows: list[int] = []
     other_rows: list[int] = []
     for row_index, mode in enumerate(batch.op_modes):
-        if mode in {ForwardMode.EXTEND, ForwardMode.DECODE}:
-            text_rows.append(row_index)
+        if mode is ForwardMode.DECODE:
+            decode_rows.append(row_index)
+        elif mode is ForwardMode.EXTEND:
+            extend_rows.append(row_index)
         elif mode is ForwardMode.DENOISE:
             denoise_rows.append(row_index)
         elif mode is ForwardMode.COMMIT:
             commit_rows.append(row_index)
         else:
             other_rows.append(row_index)
-    return text_rows + denoise_rows + commit_rows + other_rows
+    return decode_rows + extend_rows + denoise_rows + commit_rows + other_rows
 
 
 def _store_forward_sampled_token_relay(
