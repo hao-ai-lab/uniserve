@@ -37,6 +37,9 @@ __all__ = [
 _TEXT_MODES = frozenset(
     {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
 )
+_PACKED_FORWARD_MODES = frozenset(
+    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE, ForwardMode.COMMIT}
+)
 
 
 class Route(str, Enum):
@@ -70,6 +73,12 @@ class ForwardAdmissionRouter:
         modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
         if not ops:
             return ForwardAdmissionDecision(Route.PER_MODE, "empty batch", modes)
+        if any(mode not in _PACKED_FORWARD_MODES for mode in modes):
+            return ForwardAdmissionDecision(
+                Route.PER_MODE,
+                "mixed forward supports only text and gen ops",
+                modes,
+            )
         text_modes = {ForwardMode.EXTEND, ForwardMode.DECODE}
         if set(modes).issubset(text_modes) and all(mode in modes for mode in text_modes):
             if any(_has_values(op.get("spec_token_ids")) for op in ops):
@@ -86,14 +95,19 @@ class ForwardAdmissionRouter:
         has_gen = any(mode in gen_modes for mode in modes)
         if has_text and has_gen:
             return ForwardAdmissionDecision(Route.FORWARD, "und/gen mixed forward", modes)
-        supported = {ForwardMode.EXTEND, ForwardMode.DECODE, *gen_modes}
-        if any(mode not in supported for mode in modes):
-            return ForwardAdmissionDecision(
-                Route.PER_MODE,
-                "mixed forward supports only text and gen ops",
-                modes,
-            )
         return ForwardAdmissionDecision(Route.PER_MODE, "requires concurrent und and gen ops", modes)
+
+    def partition_supported(
+        self,
+        ops: Sequence[Mapping[str, object]],
+    ) -> tuple[list[tuple[int, Mapping[str, object]]], list[tuple[int, Mapping[str, object]]]]:
+        supported: list[tuple[int, Mapping[str, object]]] = []
+        delegated: list[tuple[int, Mapping[str, object]]] = []
+        for index, op in enumerate(ops):
+            mode = mode_for_op(str(op.get("kind")))
+            target = supported if mode in _PACKED_FORWARD_MODES else delegated
+            target.append((index, op))
+        return supported, delegated
 
 
 class ForwardModality(StrEnum):

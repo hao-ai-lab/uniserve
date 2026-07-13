@@ -106,6 +106,20 @@ def test_decide_decode_plus_commit_routes_forward():
     assert decision.use_forward is True
 
 
+def test_decide_encode_with_text_and_denoise_does_not_admit_whole_batch():
+    router = ForwardAdmissionRouter()
+    ops = [
+        {"kind": DECODE_UND, "token_ids": [1]},
+        {"kind": "vit_encode"},
+        {"kind": DENOISE_GEN},
+    ]
+
+    decision = router.decide(ops)
+
+    assert decision.route is Route.PER_MODE
+    assert decision.use_forward is False
+
+
 def test_decide_denoise_without_decode_routes_per_mode():
     router = ForwardAdmissionRouter()
     ops = [{"kind": DENOISE_GEN}]
