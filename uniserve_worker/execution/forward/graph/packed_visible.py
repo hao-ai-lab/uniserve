@@ -46,6 +46,7 @@ class _MixedGraphBackendUnplanned(RuntimeError):
 @dataclass
 class PackedMixedGraphState:
     key: tuple[Any, ...]
+    family: str
     graph: torch.cuda.CUDAGraph
     packed_embeds: torch.Tensor
     indicators: torch.Tensor
@@ -107,9 +108,14 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         self,
         key: tuple[Any, ...],
         *,
+        family: str,
         device: torch.device | str,
     ) -> None:
-        inactive = tuple(existing for existing in self.states if existing != key)
+        inactive = tuple(
+            existing
+            for existing, state in self.states.items()
+            if existing != key and str(getattr(state, "family", family)) == str(family)
+        )
         self._retire_graph_states(inactive, device=device, reclaim=True)
 
     def maybe_run(
@@ -164,7 +170,12 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             self.last_miss_reason = "shape_ineligible" if key is None else "shape_disabled"
             self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
             return None
-        self._retire_inactive_geometry(key, device=packed_embeds.device)
+        family = _graph_family(forward_stream)
+        self._retire_inactive_geometry(
+            key,
+            family=family,
+            device=packed_embeds.device,
+        )
         out = self._capture_or_replay(
             key=key,
             ctx=ctx,
@@ -176,6 +187,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
                 kv_view=kv_view,
                 text_kv_promotions=promotions,
                 text_kv_promotion_capacity=text_kv_promotion_capacity,
+                family=family,
                 key=key,
                 ctx=ctx,
                 backend=backend,
@@ -223,6 +235,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         backend: Any,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
         text_kv_promotion_capacity: int | None = None,
+        family: str,
     ) -> PackedMixedGraphState:
         first_attn = _first_attention(owner)
         block_width_capacity = _graph_block_width_capacity(kv_view)
@@ -245,6 +258,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         )
         state = PackedMixedGraphState(
             key=key,
+            family=str(family),
             graph=torch.cuda.CUDAGraph(),
             packed_embeds=packed_embeds.detach().clone(),
             indicators=image_gen_indicators.detach().clone(),
@@ -539,6 +553,12 @@ def _first_attention(owner: Any) -> Any:
     if not callable(packed_attention):
         raise RuntimeError("packed mixed graph requires an explicit attention binding")
     return packed_attention()
+
+
+def _graph_family(forward_stream: ForwardStream) -> str:
+    if any(segment.mode is ForwardMode.DECODE for segment in forward_stream.segments):
+        return "decode"
+    return "context"
 
 
 def _attention_scale(attention: Any) -> float:
