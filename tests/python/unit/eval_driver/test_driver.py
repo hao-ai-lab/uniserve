@@ -414,6 +414,10 @@ def test_main_benchmark_declares_every_runtime_comparison_pair() -> None:
             "candidate": "benchmark/server/sensenova-uniserve",
             "reference": "benchmark/server/sensenova-omni",
         },
+        "sensenova_mixed_image_text": {
+            "candidate": "benchmark/server/sensenova-uniserve",
+            "reference": "benchmark/server/sensenova-omni",
+        },
         "bagel_mjhq_t2i": {
             "candidate": "benchmark/server/bagel-uniserve",
             "reference": "benchmark/server/bagel-omni",

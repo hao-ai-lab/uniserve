@@ -56,6 +56,77 @@ class _JsonClient:
         return _JsonResponse(self.payload)
 
 
+class _StreamingJsonResponse:
+    status_code = 200
+    headers = {"content-type": "application/json; charset=utf-8"}
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    async def __aenter__(self) -> _StreamingJsonResponse:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def aread(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+    def json(self) -> dict:
+        return self.payload
+
+    def aiter_lines(self):
+        raise AssertionError("JSON chat responses must not be parsed as SSE")
+
+
+class _StreamingJsonClient:
+    def __init__(self, payload: dict) -> None:
+        self.response = _StreamingJsonResponse(payload)
+
+    def stream(self, _method: str, _url: str, *, json: dict) -> _StreamingJsonResponse:
+        del json
+        return self.response
+
+
+def test_openai_chat_accepts_non_streaming_json_response() -> None:
+    request = TaskRequest(
+        endpoint="/v1/chat/completions",
+        kind="openai_chat",
+        payload={"messages": [{"role": "user", "content": "describe"}], "stream": True},
+    )
+    response = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "a green bean plant"},
+            }
+        ],
+        "usage": {"prompt_tokens": 16, "completion_tokens": 7, "total_tokens": 23},
+    }
+
+    record = asyncio.run(
+        send_request(
+            _StreamingJsonClient(response),
+            "http://server",
+            request,
+            "i2t-1",
+            task="i2t",
+            prompt_len=99,
+            output_len_fallback=256,
+        )
+    )
+
+    assert record.success is True
+    assert record.classifier == "ok"
+    assert record.generated_text == "a green bean plant"
+    assert record.finish_reason == "stop"
+    assert record.prompt_len == 16
+    assert record.prompt_len_source == "server_usage"
+    assert record.output_len == 7
+    assert record.output_len_source == "server_usage"
+    assert record.token_timing_available is False
+
+
 def test_images_generations_decodes_exact_bytes_and_records_only_metadata() -> None:
     image_bytes = _image_bytes()
     request = TaskRequest(
