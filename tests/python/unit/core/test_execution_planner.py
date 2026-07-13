@@ -188,6 +188,26 @@ def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch()
         planner.groups(submitted)
 
 
+def test_mixed_planner_peels_encode_rows_and_keeps_text_denoise_packed():
+    from uniserve_worker.execution.forward.step import ForwardGroupPlanner
+
+    planner = ForwardGroupPlanner(
+        BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),
+        log_text_mixed_split=lambda _ops, _decision: None,
+        can_run_forward=lambda _batch: True,
+    )
+    submitted = [
+        {"req_id": 1, "kind": "decode_und", "token_ids": [1]},
+        {"req_id": 2, "kind": "vit_encode"},
+        {"req_id": 3, "kind": "denoise_gen", "latent_shape": [2, 2]},
+        {"req_id": 4, "kind": "prefill_und", "token_ids": [2]},
+    ]
+
+    groups = planner.groups(submitted)
+
+    assert [[index for index, _op in group] for group in groups] == [[1], [0, 2, 3]]
+
+
 def test_runner_executes_whole_batch_forward_under_inference_mode():
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
 

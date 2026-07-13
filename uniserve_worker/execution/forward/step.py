@@ -49,11 +49,15 @@ class ForwardGroupPlanner:
 
     def groups(self, ops: list[Mapping[str, Any]]) -> list[list[tuple[int, Mapping[str, Any]]]]:
         if self.batch_policy.supports_mixed_modes:
-            decision = ForwardAdmissionRouter.from_runtime_config().decide(ops)
+            router = ForwardAdmissionRouter.from_runtime_config()
+            forward_rows, delegated_rows = router.partition_supported(ops)
+            forward_ops = [op for _index, op in forward_rows]
+            decision = router.decide(forward_ops)
             if decision.use_forward:
-                batch = UniForwardBatch.from_ops(ops)
+                batch = UniForwardBatch.from_ops(forward_ops)
                 if self._can_run_forward is None or self._can_run_forward(batch):
-                    return [list(enumerate(ops))]
+                    delegated_groups = self._mode_ordered_indexed_groups(delegated_rows)
+                    return self._order_groups([*delegated_groups, forward_rows])
                 raise capability_mismatch(
                     "admitted mixed forward has no whole-batch executor",
                     details={
@@ -61,7 +65,7 @@ class ForwardGroupPlanner:
                         "reason": decision.reason,
                     },
                 )
-            self._log_text_mixed_split(ops, decision)
+            self._log_text_mixed_split(forward_ops, decision)
             return self._mode_ordered_groups(ops)
         return self._contiguous_groups(ops)
 
@@ -84,9 +88,15 @@ class ForwardGroupPlanner:
         self,
         ops: list[Mapping[str, Any]],
     ) -> list[list[tuple[int, Mapping[str, Any]]]]:
+        return self._mode_ordered_indexed_groups(list(enumerate(ops)))
+
+    def _mode_ordered_indexed_groups(
+        self,
+        indexed_ops: list[tuple[int, Mapping[str, Any]]],
+    ) -> list[list[tuple[int, Mapping[str, Any]]]]:
         buckets: dict[ForwardMode, list[tuple[int, Mapping[str, Any]]]] = {}
         first_seen: list[ForwardMode] = []
-        for idx, op in enumerate(ops):
+        for idx, op in indexed_ops:
             mode = self._validated_mode(idx, op)
             if mode not in buckets:
                 buckets[mode] = []
@@ -108,6 +118,22 @@ class ForwardGroupPlanner:
             for start in range(0, len(items), max_batch_ops):
                 groups.append(items[start:start + max_batch_ops])
         return groups
+
+    def _order_groups(
+        self,
+        groups: list[list[tuple[int, Mapping[str, Any]]]],
+    ) -> list[list[tuple[int, Mapping[str, Any]]]]:
+        rank = {mode: index for index, mode in enumerate(self.batch_policy.mode_order)}
+        fallback = len(rank)
+
+        def group_key(group: list[tuple[int, Mapping[str, Any]]]) -> tuple[int, int]:
+            modes = [self._validated_mode(index, op) for index, op in group]
+            return min((rank.get(mode, fallback) for mode in modes), default=fallback), min(
+                (index for index, _op in group),
+                default=0,
+            )
+
+        return sorted(groups, key=group_key)
 
     @staticmethod
     def _validated_mode(idx: int, op: Mapping[str, Any]) -> ForwardMode:
