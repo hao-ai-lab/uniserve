@@ -2,7 +2,7 @@
 
 Three public wire shapes are supported, selected by ``TaskRequest.kind``:
 
-* ``openai_chat`` -- OpenAI ``/v1/chat/completions`` SSE (LLM serving and default mixed-output tasks). TTFT/ITL are measured per text chunk, ``delta.images`` drives image counts and image latency, and ``output_len`` comes from ``usage`` when the server emits it (``stream_options.include_usage``), else the requested length.
+* ``openai_chat`` -- OpenAI ``/v1/chat/completions`` responses. SSE responses provide TTFT/ITL from text chunks and image latency from ``delta.images``; JSON responses provide request E2E latency and server usage without token timing.
 * ``images_generations`` -- OpenAI-style ``/v1/images/generations`` (t2i), a
   single non-streaming JSON ``{"data": [{"b64_json", ...}]}`` response.
 
@@ -65,7 +65,14 @@ async def send_request(
         if request.kind == "images_generations":
             await _send_images(client, url, payload, record)
         elif request.kind == "openai_chat_json":
-            await _send_chat_json(client, url, payload, record)
+            await _send_chat_json(
+                client,
+                url,
+                payload,
+                record,
+                prompt_len=prompt_len,
+                output_len_fallback=output_len_fallback,
+            )
         elif request.kind == "openai_chat":
             await _send_sse(
                 client,
@@ -129,6 +136,9 @@ async def _send_chat_json(
     url: str,
     payload: dict[str, Any],
     record: RequestRecord,
+    *,
+    prompt_len: int = 0,
+    output_len_fallback: int = 0,
 ) -> None:
     """One non-streamed chat completion (diffusion-pipeline backends and
     image-only chat). Success requires text or images."""
@@ -144,6 +154,23 @@ async def _send_chat_json(
         record.classifier = f"transport_status_{response.status_code}"
         record.error = response.text[:500]
         return
+    _parse_chat_json(
+        data,
+        record,
+        status_code=response.status_code,
+        prompt_len=prompt_len,
+        output_len_fallback=output_len_fallback,
+    )
+
+
+def _parse_chat_json(
+    data: Any,
+    record: RequestRecord,
+    *,
+    status_code: int,
+    prompt_len: int,
+    output_len_fallback: int,
+) -> None:
     choices = data.get("choices") if isinstance(data, dict) else None
     content = ""
     images: list[dict[str, Any]] = []
@@ -171,15 +198,19 @@ async def _send_chat_json(
         if isinstance(usage.get("prompt_tokens"), int):
             record.prompt_len = int(usage["prompt_tokens"])
             record.prompt_len_source = "server_usage"
+    if record.output_len_source != "server_usage":
+        record.output_len = output_len_fallback
+    if record.prompt_len_source != "server_usage":
+        record.prompt_len = prompt_len
     if isinstance(data, dict):
         _capture_cached_prompt_tokens(record, data)
-    transport_ok = response.status_code < 400
+    transport_ok = status_code < 400
     record.success = transport_ok and image_error is None and bool(content or record.decoded_images)
     record.classifier = (
         "ok"
         if record.success
         else (
-            f"transport_status_{response.status_code}"
+            f"transport_status_{status_code}"
             if not transport_ok
             else image_error or "empty_completion"
         )
@@ -210,6 +241,25 @@ async def _send_sse(
             record.classifier = f"transport_status_{response.status_code}"
             record.error = body.decode("utf-8", errors="replace")[:500]
             return
+        if _is_json_content_type(response.headers.get("content-type", "")):
+            await response.aread()
+            record.latency = time.perf_counter() - record.start_time
+            record.final_event_time = record.start_time + record.latency
+            try:
+                data = response.json()
+            except Exception:  # noqa: BLE001 - non-JSON body is a protocol failure.
+                record.success = False
+                record.classifier = "protocol_invalid_json_response"
+                record.error = "response declared JSON but could not be decoded"
+                return
+            _parse_chat_json(
+                data,
+                record,
+                status_code=response.status_code,
+                prompt_len=prompt_len,
+                output_len_fallback=output_len_fallback,
+            )
+            return
         if protocol != "openai":
             raise ValueError(f"unsupported SSE protocol {protocol!r}")
         events = await aiter_sse_events(
@@ -221,6 +271,11 @@ async def _send_sse(
     record.final_event_time = last_event_time
     record.latency = last_event_time - record.start_time
     _parse_openai(events, record, output_len_fallback=output_len_fallback, prompt_len=prompt_len)
+
+
+def _is_json_content_type(content_type: str) -> bool:
+    media_type = content_type.partition(";")[0].strip().lower()
+    return media_type == "application/json" or media_type.endswith("+json")
 
 
 def _parse_openai(
