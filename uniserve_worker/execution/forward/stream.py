@@ -411,10 +411,14 @@ class ForwardGraphStreamState:
     def refresh(self, stream: ForwardStream) -> ForwardStream:
         if self._stream_signature(stream) != self._signature:
             raise invalid_descriptor("forward graph stream geometry mismatch")
-        # cu_seqlens_q and modality index lists are fully determined by the captured
-        # segment geometry. Replay-varying base positions live in visible_end/indexes.
+        # cu_seqlens_q is fixed by captured segment geometry. Base positions and
+        # exact expert routes may vary while preserving their captured shapes.
         self.stream.visible_end.copy_(stream.visible_end, non_blocking=True)
         self.stream.indexes.copy_(stream.indexes, non_blocking=True)
+        if self.stream.und_indices is not None and stream.und_indices is not None:
+            self.stream.und_indices.copy_(stream.und_indices, non_blocking=True)
+        if self.stream.gen_indices is not None and stream.gen_indices is not None:
+            self.stream.gen_indices.copy_(stream.gen_indices, non_blocking=True)
         object.__setattr__(self.stream, "segments", tuple(stream.segments))
         return self.stream
 

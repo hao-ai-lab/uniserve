@@ -54,6 +54,7 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
             kv_view,
             any_text,
             any_gen,
+            text_indices,
         ):
             calls.append(
                 {
@@ -66,6 +67,7 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
                     "kv_view": kv_view,
                     "any_text": any_text,
                     "any_gen": any_gen,
+                    "text_indices": text_indices.clone(),
                 }
             )
             return hidden_states + 1
@@ -108,7 +110,9 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
         segments=(
             SimpleNamespace(modality="und", q_len=2),
             SimpleNamespace(modality="gen", q_len=4),
-        )
+        ),
+        und_indices=torch.tensor([0, 1, 2, 5]),
+        gen_indices=torch.tensor([3, 4]),
     )
     kv_view = object()
 
@@ -124,7 +128,24 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
     assert all(call["any_text"] is True and call["any_gen"] is True for call in calls)
     assert all(call["text_mask"].tolist() == [True, True, True, False, False, True] for call in calls)
     assert all(call["gen_mask"].tolist() == is_gen.tolist() for call in calls)
+    assert all(call["text_indices"].tolist() == [0, 1, 2, 5] for call in calls)
     torch.testing.assert_close(output, hidden + 2)
+
+
+def test_bagel_packed_modality_indices_include_text_rows_and_generation_markers():
+    owner = BagelForUnifiedGeneration(device="cpu")
+    stream = SimpleNamespace(
+        segments=(
+            SimpleNamespace(modality="und", q_len=3),
+            SimpleNamespace(modality="gen", q_len=5),
+            SimpleNamespace(modality="gen", q_len=4),
+        )
+    )
+
+    text_indices, gen_indices = owner.packed_modality_indices(stream, device="cpu")
+
+    torch.testing.assert_close(text_indices, torch.tensor([0, 1, 2, 3, 7, 8, 11]))
+    torch.testing.assert_close(gen_indices, torch.tensor([4, 5, 6, 9, 10]))
 
 
 def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():

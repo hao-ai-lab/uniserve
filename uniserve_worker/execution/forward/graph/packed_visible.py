@@ -491,6 +491,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             str(image_gen_indicators.dtype),
             tuple(int(dim) for dim in image_gen_indicators.shape),
             _stream_geometry(forward_stream),
+            _modality_index_geometry(forward_stream),
             _kv_geometry(kv_view),
             int(block_width),
             int(kv_view.pool.block_size),
@@ -539,6 +540,15 @@ def _kv_geometry(kv_view: ForwardPagedKVView) -> tuple[tuple[int, bool, bool, in
         )
         for seg in kv_view.segments
     )
+
+
+def _modality_index_geometry(forward_stream: ForwardStream) -> tuple[Any, ...]:
+    def geometry(indices: torch.Tensor | None) -> tuple[Any, ...] | None:
+        if indices is None:
+            return None
+        return (tuple(int(dim) for dim in indices.shape), str(indices.dtype))
+
+    return (geometry(forward_stream.und_indices), geometry(forward_stream.gen_indices))
 
 
 def packed_mixed_graph_promotions_supported(

@@ -1050,6 +1050,34 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
             raise invalid_descriptor("BAGEL denoise modality mask does not match token geometry")
         return indicators
 
+    def packed_modality_indices(
+        self,
+        forward_stream: Any,
+        *,
+        device: torch.device | str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        text_indices: list[int] = []
+        gen_indices: list[int] = []
+        offset = 0
+        for segment in forward_stream.segments:
+            q_len = int(segment.q_len)
+            if q_len <= 0:
+                raise invalid_descriptor("BAGEL packed segments must contain tokens")
+            if segment.modality == "und":
+                text_indices.extend(range(offset, offset + q_len))
+            elif segment.modality == "gen":
+                if q_len <= _BAGEL_IMAGE_MARKER_TOKENS:
+                    raise invalid_descriptor("BAGEL generation segment is missing latent tokens")
+                text_indices.extend((offset, offset + q_len - 1))
+                gen_indices.extend(range(offset + 1, offset + q_len - 1))
+            else:
+                raise invalid_descriptor("BAGEL packed segment has an unsupported modality")
+            offset += q_len
+        return (
+            torch.tensor(text_indices, dtype=torch.long, device=device),
+            torch.tensor(gen_indices, dtype=torch.long, device=device),
+        )
+
     def interleaved_text_forward(
         self,
         input_ids: torch.Tensor | None = None,

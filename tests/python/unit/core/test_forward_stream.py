@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -237,6 +239,11 @@ def test_forward_graph_stream_state_refreshes_values_without_reallocating_tensor
         indexes=torch.tensor([[4, 4], [1, 1], [0, 1]], dtype=torch.long),
     )
     refreshed = refreshed_builder.build(device="cpu")
+    refreshed = replace(
+        refreshed,
+        und_indices=torch.tensor([2], dtype=torch.long),
+        gen_indices=torch.tensor([0, 1], dtype=torch.long),
+    )
 
     graph_stream = state.refresh(refreshed)
 

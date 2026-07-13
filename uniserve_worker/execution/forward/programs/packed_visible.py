@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
@@ -564,6 +564,34 @@ def _run_packed_mixed_forward_impl(
         stream_start = timing.start()
         with profile_range("uniserve.packed_mixed.stream_build"):
             forward_stream = builder.build(device=device)
+            modality_indices = getattr(owner, "packed_modality_indices", None)
+            if callable(modality_indices):
+                und_indices, gen_indices = modality_indices(
+                    forward_stream,
+                    device=device,
+                )
+                token_count = int(forward_stream.indexes.shape[1])
+                und_indices = _validate_modality_indices(
+                    und_indices,
+                    token_count=token_count,
+                    device=device,
+                    name="text",
+                )
+                gen_indices = _validate_modality_indices(
+                    gen_indices,
+                    token_count=token_count,
+                    device=device,
+                    name="generation",
+                )
+                if int(und_indices.numel()) + int(gen_indices.numel()) != token_count:
+                    raise invalid_descriptor(
+                        "packed modality indices must partition the token stream"
+                    )
+                forward_stream = replace(
+                    forward_stream,
+                    und_indices=und_indices,
+                    gen_indices=gen_indices,
+                )
             kv_view = ForwardPagedKVView(first_pool, kv_segments)
         timing.stop("stream_build_ms", stream_start)
         ctx.record_component_elapsed("packed_mixed_stream_build", stream_stats_start)
@@ -1143,6 +1171,21 @@ def _packed_indicator_tensor(
     )
     indicators.copy_(cpu, non_blocking=is_pinned(cpu))
     return indicators
+
+
+def _validate_modality_indices(
+    indices: torch.Tensor,
+    *,
+    token_count: int,
+    device: torch.device,
+    name: str,
+) -> torch.Tensor:
+    if not isinstance(indices, torch.Tensor):
+        raise invalid_descriptor(f"packed {name} modality indices must be a tensor")
+    resolved = indices.reshape(-1).to(device=device, dtype=torch.long)
+    if int(resolved.numel()) > int(token_count):
+        raise invalid_descriptor(f"packed {name} modality indices exceed the token count")
+    return resolved
 
 
 def _packed_mixed_row_order(batch: UniForwardBatch) -> list[int]:
