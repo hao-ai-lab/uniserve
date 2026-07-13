@@ -683,6 +683,56 @@ def test_benchmark_comparison_requires_distinct_server_profiles() -> None:
         run_benchmarks.comparison_profile_roles(benchmark)
 
 
+def test_benchmark_comparison_profiles_are_validated_before_group_filtering(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_benchmarks = _load_run_benchmarks()
+    benchmark = {
+        "artifact_root": str(tmp_path / "benchmark"),
+        "datasets": {},
+        "groups": {
+            "candidate": {
+                "server": "benchmark/server/candidate",
+                "points": ["candidate_point"],
+            },
+            "reference": {
+                "server": "benchmark/server/reference",
+                "points": ["reference_point"],
+            },
+        },
+        "points": {
+            "candidate_point": {
+                "parity_group": "pair",
+                "comparison_role": "candidate",
+            },
+            "reference_point": {
+                "parity_group": "pair",
+                "comparison_role": "reference",
+            },
+        },
+    }
+    observed_groups: list[list[str]] = []
+
+    monkeypatch.setattr(run_benchmarks, "load_config", lambda _path: {})
+    monkeypatch.setattr(run_benchmarks, "benchmark_spec", lambda _config, _name: benchmark)
+    monkeypatch.setattr(
+        run_benchmarks,
+        "comparison_profile_roles",
+        lambda value: observed_groups.append(list(value["groups"])) or {},
+    )
+    monkeypatch.setattr(run_benchmarks, "active_benchmark_processes", lambda: "(none)")
+    monkeypatch.setattr(run_benchmarks, "build_servers", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        run_benchmarks,
+        "build_benches",
+        lambda _config, value, *_args, **_kwargs: {name: [] for name in value["groups"]},
+    )
+    monkeypatch.setattr(run_benchmarks, "write_runbook", lambda *_args, **_kwargs: None)
+
+    assert run_benchmarks._main(["--dry-run", "--only", "candidate"]) == 0
+    assert observed_groups == [["candidate", "reference"]]
+
+
 def test_benchmark_repeat_wraps_complete_matrix_runs(tmp_path: Path, monkeypatch) -> None:
     run_benchmarks = _load_run_benchmarks()
     output_root = tmp_path / "benchmark"

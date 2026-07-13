@@ -1113,7 +1113,6 @@ def build_benches(
         raise SystemExit(
             f"benchmark parity groups need exactly one candidate and one reference: {invalid_roles}"
         )
-    comparison_profile_roles(benchmark)
     resolved_parity: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
 
     for group_name, group in dict(benchmark["groups"]).items():
@@ -1779,6 +1778,7 @@ def _run_once(args: argparse.Namespace) -> int:
         raise SystemExit("--formal requires the canonical uniserve_eval/profiles.json config")
     config = load_config(args.config)
     full_benchmark = benchmark_spec(config, args.benchmark)
+    comparison_profile_roles(full_benchmark)
     output_root = repo_path(
         args.output_root or str(full_benchmark.get("artifact_root", "artifacts/benchmark"))
     )
