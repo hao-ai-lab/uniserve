@@ -1,32 +1,29 @@
-"""Per-image CUDA-graph capture/replay for the batched text-image denoise step.
+"""Geometry-keyed CUDA-graph replay for batched text-image denoise steps.
 
 The batched denoise velocity prediction (``TextImageDenoiseOps._predict_v_batched``)
 launches the full generation-tower forward — thousands of kernels plus, under
 tensor parallelism, two NCCL all-reduces per layer — for every one of ~50 flow
-steps. Per step only the *inputs* change (image embeds, timestep, latent);
-the paged-KV geometry (scratch blocks, base lengths, rope indexes, shapes) is
-frozen for the lifetime of one image. That makes each step a textbook CUDA-graph
-replay: this runner captures the forward once per image and replays it with a
-handful of device-to-device input copies, eliminating the CPU launch overhead
-that dominates the TP4 denoise wall clock.
+steps. Image embeds, timestep, latent, positions, and paged-KV side tables are
+graph inputs; model weights and tensor geometry are stable. The runner captures
+one graph per bounded geometry and rebinds it to live request caches before each
+replay.
 
 Correctness rests on three pillars:
 
-* **Graph key.** A graph is only replayed while its identity holds: the same
-  KV pool, the same per-branch cache objects, the same base lengths, and the
-  *same block-id contents* (``request_cache_for_transient`` reuses stable
-  scratch blocks per image, so the captured page writes stay valid). Any drift
-  changes the key and the step falls back to eager (or captures anew).
+* **Graph key.** Device, dtype, row count, block-table bucket, token geometry,
+  latent geometry, and output mode define graph identity. Cache IDs, block IDs,
+  and prefix lengths are copied into stable side-table buffers per replay.
+* **Bounded graph microbatches.** Large mixed batches are partitioned into
+  graph-sized row groups and concatenated in input order. This bounds resident
+  activation pools without changing request concurrency or branch semantics.
 * **Graph-capable attention backend.** The dispatcher-winner probe guarantees
   capture never swaps in a backend the eager path would not use. Backends with
   mutable wrapper plans bind a graph-scoped exclusive wrapper (see
   ``bind_paged_prefill_graph_wrapper``); direct paged-varlen kernels declare
   graph safety through their attention capabilities.
-* **Private capture pool.** Per-image graphs are freed independently at image
-  commit; sharing one ``graph_pool_handle`` across graphs aborts with a
-  ``use_count > 0`` internal assert (CUDACachingAllocator.cpp:2291) once the
-  last graph in the shared pool is destroyed. ``capture_pool`` therefore
-  returns ``None`` so each capture owns a private pool.
+* **Private capture pool.** Geometry graphs can replay in any order, so each
+  capture owns an isolated allocation pool rather than aliasing static graph
+  storage across shapes.
 
 The production runner is always enabled. Unsupported shapes or capture failures
 are returned to the strict graph executor as misses and fail closed.
@@ -55,7 +52,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DenoiseStepGraphRunner",
     "maybe_run_denoise_step_graph",
-    "release_denoise_step_graphs",
 ]
 
 # Consecutive capture/replay failures before the runner hard-disables itself.
@@ -63,18 +59,31 @@ _MAX_FAILURES = 2
 
 _RUNNER_ATTR = "_denoise_step_graph_runner"
 
+# Keep graph-resident activation pools bounded while retaining useful GEMM
+# batching: one graph microbatch covers two full three-branch CFG requests.
+_MAX_GRAPH_ROWS = 6
+
 
 class _DenoiseGraphMetadata:
     """Per-graph identity sentinel published as ``ctx.attention_metadata``.
 
-    Deliberately attribute-free: the varlen/paged eligibility probes read
-    ``metadata.cache`` / ``metadata.mode`` via ``getattr`` defaults, so an empty
-    sentinel keeps the captured forward on the exact transient paged-varlen path
-    the eager forward takes, while its *identity* routes FlashInfer's
-    ``forward_varlen`` to the graph-scoped exclusive prefill wrapper.
+    It intentionally omits ``cache`` and ``mode`` so attention stays on the
+    transient paged-varlen path. Stable plan tensors are refreshed before replay,
+    while object identity routes FlashInfer to the graph-scoped wrapper.
     """
 
-    __slots__ = ("__weakref__",)
+    __slots__ = ("block_table", "cu_seqlens_k", "cu_seqlens_q", "__weakref__")
+
+    def __init__(
+        self,
+        *,
+        block_table: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+    ) -> None:
+        self.block_table = block_table
+        self.cu_seqlens_q = cu_seqlens_q
+        self.cu_seqlens_k = cu_seqlens_k
 
 
 class _GraphBackendUnplanned(RuntimeError):
@@ -83,17 +92,23 @@ class _GraphBackendUnplanned(RuntimeError):
 
 @dataclass
 class DenoiseStepGraphState:
-    """Static buffers + captured graph for one image's batched denoise step."""
+    """Static buffers and one captured denoise geometry graph."""
 
     key: tuple[Any, ...]
-    cache_ids: frozenset[int]
     graph: torch.cuda.CUDAGraph
     image_embeds: torch.Tensor          # [rows, tokens, hidden] static input
     t: torch.Tensor                     # timestep static input (shape of step.t)
     z: torch.Tensor                     # [rows, tokens, latent] static input
     indexes: torch.Tensor               # [3, rows, tokens] static input
     cache: BatchedPagedTextCache        # batched view over the rows' caches
+    request_cache: Any                  # stable graph-owned paged side tables
     metadata: _DenoiseGraphMetadata     # wrapper-routing sentinel (kept alive here)
+    backend: Any
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    page_size: int
+    scale: float
     image_token_num: int
     image_size: tuple[int, int]
     release_backend: Any = None         # callable dropping the exclusive wrapper
@@ -101,7 +116,7 @@ class DenoiseStepGraphState:
 
 
 class DenoiseStepGraphRunner(_GraphRunnerBase):
-    """Own per-image denoise-step CUDA graphs and their capture/replay lifecycle."""
+    """Own bounded denoise-step CUDA graphs and refreshable request inputs."""
 
     def __init__(
         self,
@@ -130,10 +145,8 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
 
     def capture_pool(self) -> Any:
-        # CRITICAL: per-image graphs are released independently at image commit.
-        # A shared ``torch.cuda.graph_pool_handle`` aborts with an internal
-        # ``use_count > 0`` assert (CUDACachingAllocator.cpp:2291) once the last
-        # graph sharing the pool is freed — every capture gets a private pool.
+        # Independent geometry graphs can replay in any order. Keep their static
+        # allocations isolated instead of sharing addresses across graph shapes.
         return None
 
     # -- public entry ------------------------------------------------------------
@@ -145,7 +158,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         *,
         return_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-        """Capture-or-replay the denoise step for ``rows``; ``None`` -> eager.
+        """Capture or replay the denoise step for ``rows``; ``None`` is a miss.
 
         Outputs are cloned per replay so nothing the caller retains (velocity
         slices, TeaCache hidden records) aliases the graph's static output
@@ -154,6 +167,21 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
 
         if not self.enabled() or not torch.cuda.is_available():
             return None
+        if len(rows) > _MAX_GRAPH_ROWS:
+            chunks = []
+            for start in range(0, len(rows), _MAX_GRAPH_ROWS):
+                chunk = self.maybe_run_rows(
+                    owner,
+                    rows[start : start + _MAX_GRAPH_ROWS],
+                    return_hidden=return_hidden,
+                )
+                if chunk is None:
+                    return None
+                chunks.append(chunk)
+            if return_hidden:
+                velocities, hidden = zip(*chunks, strict=True)
+                return torch.cat(velocities, dim=0), torch.cat(hidden, dim=0)
+            return torch.cat(chunks, dim=0)
         if not self._ensure_transient_capacity(rows):
             return None
         key = self._rows_key(rows, return_hidden)
@@ -167,7 +195,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             if backend is None:
                 # Dispatcher-winner probe failed: the backend eager would pick
                 # cannot host the captured graph path. Config-wide, so disable
-                # the runner rather than accumulate per-image miss keys.
+                # the runner rather than accumulate geometry-specific miss keys.
                 self._backend_ineligible = True
                 if self.logger is not None:
                     self.logger.info(
@@ -191,6 +219,8 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             capture_metric=f"{self.metric_prefix}step_graph_capture",
             input_copy_metric=f"{self.metric_prefix}step_graph_input_copy",
             replay_metric=f"{self.metric_prefix}step_graph_replay_launch",
+            after_copy=self._prepare_backend,
+            after_copy_metric=f"{self.metric_prefix}step_graph_attention_prepare",
         )
         if out is None:
             return None
@@ -208,41 +238,18 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             return velocity.clone(), hidden.clone()
         return velocity.clone()
 
-    # -- release -----------------------------------------------------------------
+    def clear(self) -> None:
+        """Release every resident graph and graph-scoped backend binding."""
 
-    def release_image(self, image_state: Any) -> int:
-        """Free every graph keyed on ``image_state``'s denoise caches.
-
-        Called from the owner's image-state release at commit/drop. Graphs use
-        private capture pools, so dropping the last reference here frees the
-        graph memory without touching any other image's capture.
-        """
-
-        cache_ids = {
-            id(cache)
-            for cache in (
-                getattr(image_state, "cond_cache", None),
-                getattr(image_state, "tu_cache", None),
-                getattr(image_state, "iu_cache", None),
-            )
-            if cache is not None
-        }
-        released = 0
-        for key, state in list(self.states.items()):
-            if not (state.cache_ids & cache_ids):
-                continue
-            self.states.pop(key, None)
-            self.disabled.discard(key)
+        if self.states and torch.cuda.is_available():
+            device = next(iter(self.states.values())).image_embeds.device
+            torch.cuda.synchronize(device)
+        for state in self.states.values():
             if callable(state.release_backend):
-                try:
-                    state.release_backend()
-                except Exception:  # pragma: no cover - defensive release
-                    if self.logger is not None:
-                        self.logger.warning(
-                            "%s failed to release graph attention wrapper", self.name, exc_info=True
-                        )
-            released += 1
-        return released
+                state.release_backend()
+        self.states.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # -- keying / stats ------------------------------------------------------------
 
@@ -276,9 +283,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         pool = getattr(first.cache, "pool", None)
         if pool is None:
             return None
-        cache_ids: list[int] = []
-        base_lens: list[int] = []
-        block_ids: list[tuple[int, ...]] = []
+        max_blocks = 0
         for row in rows:
             cache = row.cache
             if getattr(cache, "pool", None) is not pool:
@@ -295,14 +300,12 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
                 or row.indexes.dtype != first.indexes.dtype
             ):
                 return None
-            cache_ids.append(id(cache))
-            base_lens.append(int(cache.length))
-            block_ids.append(tuple(int(block) for block in cache.block_ids))
+            max_blocks = max(max_blocks, len(cache.block_ids))
+        block_width = 1 << max(0, int(max_blocks - 1).bit_length())
         return (
             id(pool),
-            tuple(cache_ids),
-            tuple(base_lens),
-            tuple(block_ids),
+            len(rows),
+            block_width,
             str(embeds.device),
             str(embeds.dtype),
             tuple(int(dim) for dim in embeds.shape),
@@ -436,10 +439,38 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         first = rows[0]
         img = first.img
         device = first.step.extra["image_embeds"].device
-        metadata = _DenoiseGraphMetadata()
+        cache = BatchedPagedTextCache(
+            [row.cache for row in rows],
+            block_table_width=int(key[2]),
+        )
+        request_cache = cache.request_cache_for_transient(
+            0, int(img.token_h) * int(img.token_w)
+        )
+        pool = request_cache.pool
+        head_dim = int(pool.head_dim)
+        q_shape_probe = first.step.extra["image_embeds"].new_empty(
+            (len(rows), 1, int(img.token_h) * int(img.token_w), head_dim)
+        )
+        transient = RadixAttention._transient_varlen_metadata(request_cache, q_shape_probe)
+        if transient is None:
+            raise RuntimeError("denoise graph could not build paged side-table inputs")
+        (_query_lens, block_table, _cache_lens, cu_q, cu_k, _max_q, _max_k) = transient
+        metadata = _DenoiseGraphMetadata(
+            block_table=block_table,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+        )
+        geometry = getattr(owner, "text_decode_graph_query_geometry", None)
+        if callable(geometry):
+            num_q_heads, scale, _q_dtype = geometry()
+        else:
+            first_attention = getattr(owner, "attn", None)
+            if first_attention is None:
+                raise RuntimeError("denoise graph owner does not expose query geometry")
+            num_q_heads = int(first_attention.num_heads)
+            scale = float(first_attention.scale)
         state = DenoiseStepGraphState(
             key=key,
-            cache_ids=frozenset(id(row.cache) for row in rows),
             graph=torch.cuda.CUDAGraph(),
             image_embeds=torch.cat(
                 [row.step.extra["image_embeds"] for row in rows], dim=0
@@ -447,8 +478,15 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             t=first.step.t.detach().clone(),
             z=torch.cat([row.step.latent for row in rows], dim=0).contiguous(),
             indexes=torch.stack([row.indexes for row in rows], dim=1).contiguous(),
-            cache=BatchedPagedTextCache([row.cache for row in rows]),
+            cache=cache,
+            request_cache=request_cache,
             metadata=metadata,
+            backend=backend,
+            num_q_heads=int(num_q_heads),
+            num_kv_heads=int(pool.n_kv),
+            head_dim=head_dim,
+            page_size=int(pool.block_size),
+            scale=float(scale),
             image_token_num=int(img.token_h) * int(img.token_w),
             image_size=(int(img.width), int(img.height)),
         )
@@ -511,6 +549,10 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
 
     @staticmethod
     def _copy_inputs(state: DenoiseStepGraphState, rows: "Sequence[DenoiseRow]") -> None:
+        state.cache.refresh_caches(
+            [row.cache for row in rows],
+            state.image_token_num,
+        )
         for row_index, row in enumerate(rows):
             state.image_embeds[row_index].copy_(
                 row.step.extra["image_embeds"][0], non_blocking=True
@@ -518,6 +560,23 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             state.z[row_index].copy_(row.step.latent[0], non_blocking=True)
             state.indexes[:, row_index].copy_(row.indexes, non_blocking=True)
         state.t.copy_(rows[0].step.t, non_blocking=True)
+
+    @staticmethod
+    def _prepare_backend(state: DenoiseStepGraphState) -> None:
+        prepare = getattr(state.backend, "prepare_paged_prefill_cuda_graph", None)
+        if not callable(prepare):
+            return
+        prepare(
+            state.metadata,
+            num_q_heads=state.num_q_heads,
+            num_kv_heads=state.num_kv_heads,
+            head_dim=state.head_dim,
+            page_size=state.page_size,
+            q_dtype=state.image_embeds.dtype,
+            kv_dtype=state.request_cache.pool.k.dtype,
+            causal=False,
+            scale=state.scale,
+        )
 
     @staticmethod
     def _replay(state: DenoiseStepGraphState) -> tuple[torch.Tensor, torch.Tensor]:
@@ -547,14 +606,3 @@ def maybe_run_denoise_step_graph(
     if runner is None:
         runner = denoise_step_graph_runner(owner)
     return runner.maybe_run_rows(owner, rows, return_hidden=return_hidden)
-
-
-def release_denoise_step_graphs(owner: Any, image_state: Any) -> None:
-    """Free the graphs captured for ``image_state`` (image commit/drop hook)."""
-
-    if image_state is None:
-        return
-    runner = getattr(owner, _RUNNER_ATTR, None)
-    if runner is None:
-        return
-    runner.release_image(image_state)

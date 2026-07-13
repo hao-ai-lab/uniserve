@@ -486,6 +486,8 @@ class BatchedPagedRequestCache:
         pool: PagedKVPool,
         block_ids_by_row: Sequence[Sequence[int]],
         base_lens: Sequence[int],
+        *,
+        block_table_width: int | None = None,
     ) -> None:
         if not block_ids_by_row:
             raise invalid_descriptor("batched paged request cache requires at least one row")
@@ -497,6 +499,11 @@ class BatchedPagedRequestCache:
         if any(length < 0 for length in self.base_lens):
             raise invalid_descriptor("batched paged request cache lengths must be non-negative")
         self.base_len = max(self.base_lens, default=0)
+        minimum_width = max(len(ids) for ids in self.block_ids_by_row)
+        self._block_table_width = int(block_table_width or minimum_width)
+        if self._block_table_width < minimum_width:
+            raise invalid_descriptor("batched paged request cache block-table width is too small")
+        self._fixed_block_table_width = block_table_width is not None
         self._append_plan: _VarlenAppendPlan | None = None
         self._block_table_cache: dict[torch.device, torch.Tensor] = {}
         self._cache_seqlens_cache: dict[torch.device, torch.Tensor] = {}
@@ -514,9 +521,97 @@ class BatchedPagedRequestCache:
         self.block_ids_by_row = [self.pool.validate_block_ids(ids) for ids in block_ids_by_row]
         self.base_lens = new_lens
         self.base_len = max(self.base_lens, default=0)
+        minimum_width = max(len(ids) for ids in self.block_ids_by_row)
+        if self._fixed_block_table_width and minimum_width > self._block_table_width:
+            raise invalid_descriptor("batched paged request cache block-table width exceeded")
+        if not self._fixed_block_table_width:
+            self._block_table_width = minimum_width
         self._append_plan = None
         self._block_table_cache.clear()
         self._cache_seqlens_cache.clear()
+
+    def refresh_rows(
+        self,
+        block_ids_by_row: Sequence[Sequence[int]],
+        base_lens: Sequence[int],
+    ) -> None:
+        """Refresh graph inputs without changing their device addresses."""
+
+        if len(block_ids_by_row) != len(self.block_ids_by_row) or len(base_lens) != len(self.base_lens):
+            raise invalid_descriptor("batched paged request cache refresh shape mismatch")
+        rows = [self.pool.validate_block_ids(ids) for ids in block_ids_by_row]
+        lengths = [int(length) for length in base_lens]
+        if any(length < 0 for length in lengths):
+            raise invalid_descriptor("batched paged request cache lengths must be non-negative")
+        if max(len(ids) for ids in rows) > self._block_table_width:
+            raise invalid_descriptor("batched paged request cache block-table width exceeded")
+        self.block_ids_by_row = rows
+        self.base_lens = lengths
+        self.base_len = max(lengths, default=0)
+
+        row_count = len(rows)
+        for target, out in self._block_table_cache.items():
+            cpu = _cpu_int_buffer(
+                row_count * self._block_table_width,
+                pin=target.type == "cuda",
+                name="paged_block_table_refresh",
+            )
+            _fill_block_table(cpu, rows, self._block_table_width)
+            out.copy_(
+                cpu.view(row_count, self._block_table_width),
+                non_blocking=target.type == "cuda" and _is_pinned(cpu),
+            )
+        for target, out in self._cache_seqlens_cache.items():
+            cpu = _cpu_int_buffer(
+                row_count,
+                pin=target.type == "cuda",
+                name="paged_cache_seqlens_refresh",
+            )
+            _fill_cpu_int(cpu, lengths)
+            out.copy_(cpu, non_blocking=target.type == "cuda" and _is_pinned(cpu))
+
+        cached = getattr(self, "_transient_varlen_metadata", None)
+        if cached is not None:
+            _old_key, metadata = cached
+            (
+                query_lens_cpu,
+                block_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_q,
+                _max_k,
+            ) = metadata
+            kv_lens = [
+                int(base_len) + int(query_len)
+                for base_len, query_len in zip(lengths, query_lens_cpu, strict=True)
+            ]
+            cu_k_values = [0]
+            for length in kv_lens:
+                cu_k_values.append(cu_k_values[-1] + length)
+            cu_k_cpu = _cpu_int_buffer(
+                len(cu_k_values),
+                pin=cu_seqlens_k.device.type == "cuda",
+                name="paged_cu_seqlens_k_refresh",
+            )
+            _fill_cpu_int(cu_k_cpu, cu_k_values)
+            cu_seqlens_k.copy_(
+                cu_k_cpu,
+                non_blocking=cu_seqlens_k.device.type == "cuda" and _is_pinned(cu_k_cpu),
+            )
+            key = (str(block_table.device), tuple(lengths), int(query_lens_cpu[0]))
+            self._transient_varlen_metadata = (
+                key,
+                (
+                    query_lens_cpu,
+                    block_table,
+                    cache_seqlens,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_q,
+                    max(kv_lens, default=0),
+                ),
+            )
 
     def invalidate_append_plan(self) -> None:
         self._append_plan = None
@@ -527,7 +622,7 @@ class BatchedPagedRequestCache:
         device: torch.device | str | None = None,
         stager: BufferStager | None = None,
     ) -> torch.Tensor:
-        max_blocks = max(len(ids) for ids in self.block_ids_by_row)
+        max_blocks = self._block_table_width
         row_count = len(self.block_ids_by_row)
         target = torch.device(device if device is not None else self.pool.k.device)
         if stager is None:
@@ -727,7 +822,12 @@ class BatchedPagedTextCache:
 
     supports_batched_paged = True
 
-    def __init__(self, caches: Sequence[PagedTextCache]) -> None:
+    def __init__(
+        self,
+        caches: Sequence[PagedTextCache],
+        *,
+        block_table_width: int | None = None,
+    ) -> None:
         if not caches:
             raise invalid_descriptor("BatchedPagedTextCache requires at least one cache")
         first = caches[0]
@@ -740,7 +840,33 @@ class BatchedPagedTextCache:
                 raise invalid_descriptor("batched paged caches must have the same layer count")
         self.caches = list(caches)
         self.pool = pool
+        self.block_table_width = block_table_width
         self._transient_view_cache: tuple[tuple[Any, ...], BatchedPagedRequestCache] | None = None
+
+    def refresh_caches(self, caches: Sequence[PagedTextCache], n_tokens: int) -> None:
+        """Rebind a graph-owned batched view to same-geometry live caches."""
+
+        if len(caches) != len(self.caches):
+            raise invalid_descriptor("batched paged cache refresh row count mismatch")
+        n_tokens = int(n_tokens)
+        for cache in caches:
+            if cache.pool is not self.pool or len(cache.layers) != len(self.caches[0].layers):
+                raise invalid_descriptor("batched paged cache refresh geometry mismatch")
+            cache.ensure_capacity(int(cache.length) + n_tokens)
+        cached = self._transient_view_cache
+        if cached is None:
+            raise invalid_descriptor("batched paged cache graph view is not initialized")
+        view = cached[1]
+        view.refresh_rows(
+            [cache.block_ids for cache in caches],
+            [int(cache.length) for cache in caches],
+        )
+        self.caches = list(caches)
+        key = tuple(
+            (tuple(int(block_id) for block_id in cache.block_ids), int(cache.length))
+            for cache in caches
+        )
+        self._transient_view_cache = (key, view)
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         del layer_idx
@@ -767,6 +893,7 @@ class BatchedPagedTextCache:
             self.pool,
             [cache.block_ids for cache in self.caches],
             [int(cache.length) for cache in self.caches],
+            block_table_width=self.block_table_width,
         )
         self._transient_view_cache = (key, view)
         return view

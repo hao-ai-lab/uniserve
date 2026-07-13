@@ -10,8 +10,8 @@ Covers the observable contract of ``uniserve_worker.execution.forward.graph.deno
   the exclusive wrapper exists for);
 * returned velocity/hidden tensors never alias the graph's static output buffers
   (the next replay must not rewrite results a caller retained);
-* release frees the per-image graph states and any backend graph-scoped wrapper
-  bindings, and a later step recaptures cleanly;
+* geometry-keyed graphs survive request release and replay across different
+  cache identities while explicit runner teardown frees backend bindings;
 * graph execution is enabled by the production runtime without a request-time gate;
 * capture failures fall back to eager and hard-disable after two strikes.
 
@@ -31,7 +31,6 @@ from uniserve_worker.execution import paged_denoise as paged_denoise_mod
 from uniserve_worker.execution.forward.graph.denoise_step import (
     DenoiseStepGraphRunner,
     maybe_run_denoise_step_graph,
-    release_denoise_step_graphs,
 )
 from uniserve_worker.execution.interleaved_image_denoise import DenoiseRow
 from uniserve_worker.execution.paged_denoise import can_run_paged_denoise_attention
@@ -217,18 +216,23 @@ def test_paged_denoise_probe_accepts_explicit_query_geometry(monkeypatch):
 
 
 def _make_caches(
-    pool: PagedKVPool, device: torch.device, *, seed: int, first_block: int = 0
+    pool: PagedKVPool,
+    device: torch.device,
+    *,
+    seed: int,
+    first_block: int = 0,
+    row_count: int = 2,
 ) -> list[PagedTextCache]:
     """Two CFG-branch caches with random conditioning KV and a block allocator."""
 
     gen = torch.Generator(device=device).manual_seed(seed)
-    free_blocks = list(range(first_block + 2, first_block + 32))
+    free_blocks = list(range(first_block + row_count, first_block + 48))
 
     def allocate(count: int) -> list[int]:
         return [free_blocks.pop(0) for _ in range(count)]
 
     caches = []
-    for row in range(2):
+    for row in range(row_count):
         cache = PagedTextCache(
             pool, [first_block + row], num_layers=1, length=_BASE_LEN, allocate_blocks=allocate
         )
@@ -377,11 +381,13 @@ def test_rows_key_component_stability_and_change_detection():
     assert DenoiseStepGraphRunner._rows_key(rows(), True) != key_a  # return_hidden in key
 
     caches[0].length = 17
-    assert DenoiseStepGraphRunner._rows_key(rows(), False) != key_a  # base len in key
+    assert DenoiseStepGraphRunner._rows_key(rows(), False) == key_a
     caches[0].length = 16
 
     caches[1].block_ids = [3, 5]
-    assert DenoiseStepGraphRunner._rows_key(rows(), False) != key_a  # block ids in key
+    assert DenoiseStepGraphRunner._rows_key(rows(), False) == key_a
+    caches[1].block_ids = [3, 4, 5]
+    assert DenoiseStepGraphRunner._rows_key(rows(), False) != key_a
 
 
 # --------------------------------------------------------------------------- #
@@ -420,6 +426,29 @@ def test_denoise_step_graph_replay_is_bitwise_identical_to_eager():
     assert stats_b.cuda_graph_captures == 0
     assert stats_b.cuda_graph_replays == 1
     assert len(runner.states) == 1
+
+
+@requires_cuda
+@requires_flashinfer
+@pytest.mark.gpu
+def test_denoise_step_graph_microbatches_large_row_groups():
+    device = torch.device("cuda")
+    pool = _make_pool(device)
+    owner = _TinyDenoiseOwner(device, pool, seed=14)
+    caches = _make_caches(pool, device, seed=15, row_count=8)
+    runner = DenoiseStepGraphRunner(default_enabled=True)
+    rows = _make_rows(caches, device, seed=130, t_value=0.7)
+
+    with torch.inference_mode():
+        eager = _eager_reference(owner, rows)
+    out, stats = _run(runner, owner, rows)
+
+    assert out is not None
+    assert torch.equal(out, eager)
+    assert stats.cuda_graph_captures == 2
+    assert stats.cuda_graph_replays == 2
+    assert sorted(int(state.image_embeds.shape[0]) for state in runner.states.values()) == [2, 6]
+    runner.clear()
 
 
 @requires_cuda
@@ -504,7 +533,7 @@ def test_denoise_step_graph_outputs_do_not_alias_static_buffers():
 @requires_cuda
 @requires_flashinfer
 @pytest.mark.gpu
-def test_denoise_step_graph_release_frees_states_and_backend_bindings():
+def test_denoise_step_graph_rebinds_across_images_and_clear_frees_bindings():
     device = torch.device("cuda")
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=7)
@@ -525,22 +554,20 @@ def test_denoise_step_graph_release_frees_states_and_backend_bindings():
     else:
         assert set(_scoped_prefill_keys(backend)) == scoped_before
 
-    image_state = SimpleNamespace(cond_cache=caches[0], tu_cache=caches[1], iu_cache=None)
-    release_denoise_step_graphs(owner, image_state)
+    assert len(runner.states) == 1
 
-    assert runner.states == {}
-    assert set(_scoped_prefill_keys(backend)) == scoped_before
-
-    # A later image over the same caches recaptures cleanly.
-    rows_again = _make_rows(caches, device, seed=90, t_value=0.6)
+    # A later image over different physical blocks reuses the same geometry graph.
+    later_caches = _make_caches(pool, device, seed=9, first_block=32)
+    rows_again = _make_rows(later_caches, device, seed=90, t_value=0.6)
     with torch.inference_mode():
         eager_again = _eager_reference(owner, rows_again)
     out_again, stats_again = _run(runner, owner, rows_again)
     assert out_again is not None
-    assert stats_again.cuda_graph_captures == 1
+    assert stats_again.cuda_graph_captures == 0
+    assert stats_again.cuda_graph_replays == 1
     assert torch.equal(out_again, eager_again)
 
-    release_denoise_step_graphs(owner, image_state)
+    runner.clear()
     assert runner.states == {}
     assert set(_scoped_prefill_keys(backend)) == scoped_before
 
@@ -563,9 +590,7 @@ def test_denoise_step_graph_is_enabled_by_default():
     assert out is not None
     assert torch.equal(out, eager)
     runner = owner._denoise_step_graph_runner
-    release_denoise_step_graphs(
-        owner, SimpleNamespace(cond_cache=caches[0], tu_cache=caches[1], iu_cache=None)
-    )
+    runner.clear()
     assert runner.states == {}
 
 
@@ -591,7 +616,7 @@ def test_denoise_step_graph_capture_failure_falls_back_then_hard_disables():
 
     other_caches = _make_caches(pool, device, seed=13, first_block=32)
     other_rows = _make_rows(other_caches, device, seed=120, t_value=0.8)
-    out_second, stats_second = _run(runner, owner, other_rows)
+    out_second, stats_second = _run(runner, owner, other_rows, return_hidden=True)
     assert out_second is None
     assert stats_second.cuda_graph_fallbacks == 1
     assert not runner.enabled()  # two strikes -> hard disable

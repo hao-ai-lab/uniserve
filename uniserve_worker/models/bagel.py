@@ -32,7 +32,6 @@ from ..contracts.resource_plan import (
 from ..execution.denoise_driver import TextImageDenoiseStep, text_image_cfg_branch_count
 from ..execution.forward.graph.denoise_step import (
     maybe_run_denoise_step_graph,
-    release_denoise_step_graphs,
 )
 from ..execution.interleaved_image_denoise import DenoiseRow
 from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
@@ -945,7 +944,6 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     def _release_paged_denoise_branches(self, gs: GenState) -> None:
         if gs.graph_image is not None:
-            release_denoise_step_graphs(self, gs.graph_image)
             gs.graph_image = None
         self.generation_session.release_paged_branches(gs)
 
