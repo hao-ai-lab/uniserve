@@ -9,9 +9,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from .text_parity import evaluate_text_canary, evaluate_text_work_conformance
+from .text_parity import (
+    evaluate_i2t_work_conformance,
+    evaluate_text_canary,
+    evaluate_text_work_conformance,
+)
 
-_TEXT_TASKS = frozenset({"text", "i2t"})
 _IMAGE_TASKS = frozenset({"default", "i2i", "t2i"})
 
 
@@ -47,6 +50,14 @@ def compare_pair(
         failures.append("comparison_mismatch")
     if load_case is None:
         failures.append("load_case_mismatch")
+    parity_fingerprint = (
+        reference.get("parity_fingerprint")
+        if reference.get("parity_fingerprint") == candidate.get("parity_fingerprint")
+        and _is_fingerprint(reference.get("parity_fingerprint"))
+        else None
+    )
+    if parity_fingerprint is None:
+        failures.append("parity_contract_mismatch")
     if not reference.get("valid"):
         failures.append("reference_artifact_invalid")
     if not candidate.get("valid"):
@@ -55,7 +66,7 @@ def compare_pair(
     work: dict[str, Any]
     canary: dict[str, Any] | None = None
     smoke: dict[str, Any] | None = None
-    if task in _TEXT_TASKS:
+    if task == "text":
         work_evidence = evaluate_text_work_conformance(
             reference_path / "requests.jsonl",
             candidate_path / "requests.jsonl",
@@ -81,6 +92,33 @@ def compare_pair(
                 },
                 "mismatch_request_ids": strict.get("canary", {}).get("mismatch_request_ids", []),
             }
+        metric_name = "output_throughput"
+        metric_path = (metric_name,)
+        objective = "maximize"
+    elif task == "i2t":
+        ignore_eos = (
+            reference.get("ignore_eos")
+            if isinstance(reference.get("ignore_eos"), bool)
+            and reference.get("ignore_eos") == candidate.get("ignore_eos")
+            else None
+        )
+        if ignore_eos is None:
+            failures.append("output_semantics_mismatch")
+            work = {"passed": False, "checks": {}, "mismatch_request_ids": []}
+        else:
+            work_evidence = evaluate_i2t_work_conformance(
+                reference_path / "requests.jsonl",
+                candidate_path / "requests.jsonl",
+                ignore_eos=ignore_eos,
+            )
+            work = {
+                "passed": work_evidence.get("passed") is True,
+                "checks": work_evidence.get("work_checks", {}),
+                "mismatch_request_ids": work_evidence.get("mismatch_request_ids", []),
+                "input_failures": work_evidence.get("input_failures", []),
+            }
+            if not work["passed"]:
+                failures.append("work_mismatch")
         metric_name = "output_throughput"
         metric_path = (metric_name,)
         objective = "maximize"
@@ -310,6 +348,8 @@ def _load_point(directory: Path, *, expected_role: str) -> dict[str, Any]:
             isinstance(artifact.get("generation_conformance"), dict)
             and artifact["generation_conformance"].get("valid") is True
         ),
+        "parity_fingerprint": parity.get("fingerprint"),
+        "ignore_eos": spec.get("ignore_eos"),
     }
 
 
@@ -332,6 +372,14 @@ def _point_result(point: dict[str, Any]) -> dict[str, Any]:
         "failed_count": point.get("failed_count"),
         "elapsed_s": point.get("elapsed_s"),
     }
+
+
+def _is_fingerprint(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _number(value: Any) -> str:

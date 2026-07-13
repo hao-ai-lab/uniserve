@@ -20,7 +20,7 @@ Select complete backend groups with `--only`, inspect generated commands with `-
 
 The runner holds a host-wide lock. Each matrix point starts a fresh server, launches one harness against it, stops the server, validates the resulting artifact, and only then advances to the next point. Backend groups, workload points, load cases, and repeated matrices are never run concurrently.
 
-The runner writes `COMMANDS.md`, point-local artifacts, server logs and snapshots, `results.json`, and `results.md` beneath the selected root. Candidate/reference ratios are reported only when both point artifacts exist and the fixed-work comparison passes.
+The runner writes `COMMANDS.md`, point-local artifacts, server logs and snapshots, `results.json`, and `results.md` beneath the selected root. Candidate/reference ratios are reported only when both point artifacts exist and their parity and task work checks pass.
 
 ## Configuration
 

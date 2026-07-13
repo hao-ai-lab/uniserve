@@ -788,6 +788,8 @@
         },
         "sensenova_beans_i2t_uniserve": {
           "load_case_set": "text_arrival",
+          "parity_group": "sensenova_beans_i2t",
+          "comparison_role": "candidate",
           "name": "sensenova-uniserve-i2t-{load_id}",
           "output": "sensenova_beans_i2t/uniserve_{load_id}",
           "harness": {
@@ -816,6 +818,8 @@
         },
         "sensenova_beans_i2t_omni": {
           "load_case_set": "text_arrival",
+          "parity_group": "sensenova_beans_i2t",
+          "comparison_role": "reference",
           "name": "sensenova-omni-i2t-{load_id}",
           "output": "sensenova_beans_i2t/omni_{load_id}",
           "harness": {

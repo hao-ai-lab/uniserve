@@ -29,6 +29,22 @@ _WORK_CHECK_NAMES = (
     "matching_requested_output_work",
     "matching_output_counts",
 )
+_I2T_BASE_CHECK_NAMES = (
+    "inputs_readable",
+    "nonempty_inputs",
+    "ordered_request_ids",
+    "unique_request_ids",
+    "successful_requests",
+    "server_reported_prompt_counts",
+    "server_reported_output_counts",
+    "requested_output_limits",
+    "matching_requested_output_limits",
+)
+_I2T_FIXED_CHECK_NAMES = _I2T_BASE_CHECK_NAMES + (
+    "exact_requested_output_work",
+    "matching_output_counts",
+)
+_I2T_CAPPED_CHECK_NAMES = _I2T_BASE_CHECK_NAMES + ("output_counts_within_requested_limits",)
 _CANARY_CHECK_NAMES = (
     "matching_finish_reason",
     "matching_generated_text_bytes",
@@ -104,6 +120,68 @@ def evaluate_text_work_conformance(
     return evidence
 
 
+def evaluate_i2t_work_conformance(
+    reference_requests: str | Path,
+    candidate_requests: str | Path,
+    *,
+    ignore_eos: bool,
+) -> dict[str, Any]:
+    """Return I2T request and output-limit conformance.
+
+    Prompt token usage remains server-accounted on both sides, but is not a
+    cross-runtime equality field because multimodal runtimes expose expanded
+    image tokens differently. Ignoring EOS declares fixed output work;
+    otherwise the shared requested length is an upper bound.
+    """
+
+    check_names = _I2T_FIXED_CHECK_NAMES if ignore_eos else _I2T_CAPPED_CHECK_NAMES
+    checks = {name: True for name in check_names}
+    (
+        reference_rows,
+        candidate_rows,
+        input_failures,
+        reference_ids,
+        candidate_ids,
+        common_ids,
+        reference_by_id,
+        candidate_by_id,
+        reasons_by_id,
+    ) = _prepare_request_comparison(reference_requests, candidate_requests, checks=checks)
+    for request_id in common_ids:
+        _compare_i2t_request(
+            request_id,
+            reference_by_id[request_id],
+            candidate_by_id[request_id],
+            checks=checks,
+            reasons_by_id=reasons_by_id,
+            exact_output_work=ignore_eos,
+        )
+
+    mismatch_order = _unique_in_order(reference_ids + candidate_ids)
+    mismatch_request_ids = [
+        request_id for request_id in mismatch_order if reasons_by_id.get(request_id)
+    ]
+    mismatches = [
+        {"request_id": request_id, "reasons": reasons_by_id[request_id]}
+        for request_id in mismatch_request_ids
+    ]
+    passed = not input_failures and all(checks.values())
+    return {
+        "schema_version": 1,
+        "kind": "fixed_work_i2t_conformance" if ignore_eos else "capped_i2t_conformance",
+        "passed": passed,
+        "work_conformance_passed": passed,
+        "reference_request_count": len(reference_rows),
+        "candidate_request_count": len(candidate_rows),
+        "compared_request_count": len(common_ids),
+        "checks": checks,
+        "work_checks": checks,
+        "mismatch_request_ids": mismatch_request_ids,
+        "mismatches": mismatches,
+        "input_failures": input_failures,
+    }
+
+
 def _evaluate_text_parity(
     reference_requests: str | Path,
     candidate_requests: str | Path,
@@ -112,56 +190,17 @@ def _evaluate_text_parity(
 ) -> dict[str, Any]:
     check_names = _CHECK_NAMES if include_canary else _WORK_CHECK_NAMES
     checks = {name: True for name in check_names}
-    reference_rows, reference_failures = _load_jsonl(Path(reference_requests), side="reference")
-    candidate_rows, candidate_failures = _load_jsonl(Path(candidate_requests), side="candidate")
-    input_failures = reference_failures + candidate_failures
-    if input_failures:
-        checks["inputs_readable"] = False
-    if not reference_rows or not candidate_rows:
-        checks["nonempty_inputs"] = False
-
-    reasons_by_id: dict[str, list[dict[str, Any]]] = {}
-    reference_ids = _request_ids(
+    (
         reference_rows,
-        side="reference",
-        checks=checks,
-        input_failures=input_failures,
-    )
-    candidate_ids = _request_ids(
         candidate_rows,
-        side="candidate",
-        checks=checks,
-        input_failures=input_failures,
-    )
-    if input_failures:
-        checks["inputs_readable"] = False
-
-    _record_duplicate_ids(
-        reference_ids,
-        side="reference",
-        checks=checks,
-        reasons_by_id=reasons_by_id,
-    )
-    _record_duplicate_ids(
-        candidate_ids,
-        side="candidate",
-        checks=checks,
-        reasons_by_id=reasons_by_id,
-    )
-    _compare_request_id_sequences(
+        input_failures,
         reference_ids,
         candidate_ids,
-        checks=checks,
-        reasons_by_id=reasons_by_id,
-    )
-
-    reference_by_id = _first_rows_by_id(reference_rows)
-    candidate_by_id = _first_rows_by_id(candidate_rows)
-    common_ids = [
-        request_id
-        for request_id in _unique_in_order(reference_ids)
-        if request_id in candidate_by_id
-    ]
+        common_ids,
+        reference_by_id,
+        candidate_by_id,
+        reasons_by_id,
+    ) = _prepare_request_comparison(reference_requests, candidate_requests, checks=checks)
     for request_id in common_ids:
         _compare_request(
             request_id,
@@ -234,6 +273,85 @@ def _evaluate_text_parity(
         },
         "input_failures": input_failures,
     }
+
+
+def _prepare_request_comparison(
+    reference_requests: str | Path,
+    candidate_requests: str | Path,
+    *,
+    checks: dict[str, bool],
+) -> tuple[
+    list[tuple[int, dict[str, Any]]],
+    list[tuple[int, dict[str, Any]]],
+    list[dict[str, Any]],
+    list[str],
+    list[str],
+    list[str],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+]:
+    reference_rows, reference_failures = _load_jsonl(Path(reference_requests), side="reference")
+    candidate_rows, candidate_failures = _load_jsonl(Path(candidate_requests), side="candidate")
+    input_failures = reference_failures + candidate_failures
+    if input_failures:
+        checks["inputs_readable"] = False
+    if not reference_rows or not candidate_rows:
+        checks["nonempty_inputs"] = False
+
+    reasons_by_id: dict[str, list[dict[str, Any]]] = {}
+    reference_ids = _request_ids(
+        reference_rows,
+        side="reference",
+        checks=checks,
+        input_failures=input_failures,
+    )
+    candidate_ids = _request_ids(
+        candidate_rows,
+        side="candidate",
+        checks=checks,
+        input_failures=input_failures,
+    )
+    if input_failures:
+        checks["inputs_readable"] = False
+
+    _record_duplicate_ids(
+        reference_ids,
+        side="reference",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+    _record_duplicate_ids(
+        candidate_ids,
+        side="candidate",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+    _compare_request_id_sequences(
+        reference_ids,
+        candidate_ids,
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+
+    reference_by_id = _first_rows_by_id(reference_rows)
+    candidate_by_id = _first_rows_by_id(candidate_rows)
+    common_ids = [
+        request_id
+        for request_id in _unique_in_order(reference_ids)
+        if request_id in candidate_by_id
+    ]
+    return (
+        reference_rows,
+        candidate_rows,
+        input_failures,
+        reference_ids,
+        candidate_ids,
+        common_ids,
+        reference_by_id,
+        candidate_by_id,
+        reasons_by_id,
+    )
 
 
 def _load_jsonl(
@@ -360,6 +478,111 @@ def _first_rows_by_id(
         if isinstance(request_id, str) and request_id:
             by_id.setdefault(request_id, record)
     return by_id
+
+
+def _compare_i2t_request(
+    request_id: str,
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    checks: dict[str, bool],
+    reasons_by_id: dict[str, list[dict[str, Any]]],
+    exact_output_work: bool,
+) -> None:
+    for side, record in (("reference", reference), ("candidate", candidate)):
+        if record.get("success") is not True:
+            checks["successful_requests"] = False
+            _add_reason(reasons_by_id, request_id, "request_unsuccessful", side=side)
+
+    for side, record in (("reference", reference), ("candidate", candidate)):
+        _server_count(
+            request_id,
+            record,
+            side=side,
+            field="prompt_len",
+            checks=checks,
+            reasons_by_id=reasons_by_id,
+        )
+    reference_output = _server_count(
+        request_id,
+        reference,
+        side="reference",
+        field="output_len",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+    candidate_output = _server_count(
+        request_id,
+        candidate,
+        side="candidate",
+        field="output_len",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+    reference_limit = _positive_int(
+        request_id,
+        reference,
+        side="reference",
+        field="requested_output_len",
+        check="requested_output_limits",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+    candidate_limit = _positive_int(
+        request_id,
+        candidate,
+        side="candidate",
+        field="requested_output_len",
+        check="requested_output_limits",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+    _compare_values(
+        request_id,
+        reference_limit,
+        candidate_limit,
+        check="matching_requested_output_limits",
+        mismatch_code="requested_output_len_mismatch",
+        checks=checks,
+        reasons_by_id=reasons_by_id,
+    )
+
+    for side, limit, actual in (
+        ("reference", reference_limit, reference_output),
+        ("candidate", candidate_limit, candidate_output),
+    ):
+        if exact_output_work:
+            if limit is None or actual is None:
+                checks["exact_requested_output_work"] = False
+            elif actual != limit:
+                checks["exact_requested_output_work"] = False
+                _add_reason(
+                    reasons_by_id,
+                    request_id,
+                    "requested_output_work_mismatch",
+                    side=side,
+                )
+        elif limit is None or actual is None:
+            checks["output_counts_within_requested_limits"] = False
+        elif actual > limit:
+            checks["output_counts_within_requested_limits"] = False
+            _add_reason(
+                reasons_by_id,
+                request_id,
+                "output_count_exceeds_requested_limit",
+                side=side,
+            )
+
+    if exact_output_work:
+        _compare_values(
+            request_id,
+            reference_output,
+            candidate_output,
+            check="matching_output_counts",
+            mismatch_code="output_len_mismatch",
+            checks=checks,
+            reasons_by_id=reasons_by_id,
+        )
 
 
 def _compare_request(
@@ -599,6 +822,29 @@ def _nonnegative_int(
 ) -> int | None:
     value = record.get(field)
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        checks[check] = False
+        _add_reason(
+            reasons_by_id,
+            request_id,
+            f"invalid_{field}",
+            side=side,
+        )
+        return None
+    return value
+
+
+def _positive_int(
+    request_id: str,
+    record: dict[str, Any],
+    *,
+    side: str,
+    field: str,
+    check: str,
+    checks: dict[str, bool],
+    reasons_by_id: dict[str, list[dict[str, Any]]],
+) -> int | None:
+    value = record.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         checks[check] = False
         _add_reason(
             reasons_by_id,

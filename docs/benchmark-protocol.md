@@ -56,6 +56,8 @@ BAGEL T2I fixes seed 42 in both autoregressive and diffusion stages, non-thinkin
 
 Both sides receive the same selected inputs, seeds, requested image count and dimensions, semantic denoising work, load case, and accelerator allocation. Every generated image must decode successfully and match its declared format, dimensions, and count before a T2I comparison is valid.
 
+Beans I2T fixes the selected JPEG inputs, prompt, preprocessing, sampling controls, and 256-token completion limit. BAGEL ignores EOS, so the limit defines fixed output work. SenseNova respects EOS, so the same value is an upper bound and throughput uses the completion tokens reported by each server. Both runtimes must report prompt and output usage, but prompt token counts are not compared across runtimes because multimodal backends account for expanded image tokens differently; the shared parity contract binds the selected images, request order, prompt, preprocessing, and completion limit.
+
 ## Optional diagnostics
 
 `--text-canary` compares termination metadata and generated-content fingerprints without retaining response text. It is a numerical regression diagnostic because valid kernel and batching choices can change greedy decisions near numerical ties.
@@ -70,7 +72,7 @@ Candidate and reference points use the same selected inputs, semantic request wo
 
 The profile records model and dataset revisions, backend launch commands, numerical and capacity settings, cache policy, source revisions, environment fingerprints, selected accelerator, host topology, and content digests. If a reference runtime cannot expose an equivalent feature or effective runtime field, the mismatch remains explicit in the artifact.
 
-Each point retains `run.json`, `requests.jsonl`, `gpu_samples.jsonl`, `summary.json`, `summary.md`, `artifact_manifest.json`, command and log files, and pre/post snapshots. Generated image bytes are content-addressed and bound into the artifact. A comparison is emitted only for a complete candidate/reference pair whose point artifacts and fixed-work checks are valid.
+Each point retains `run.json`, `requests.jsonl`, `gpu_samples.jsonl`, `summary.json`, `summary.md`, `artifact_manifest.json`, command and log files, and pre/post snapshots. Generated image bytes are content-addressed and bound into the artifact. A comparison is emitted only for a complete candidate/reference pair whose point artifacts, parity contracts, and task work checks are valid.
 
 ## Interpreting results
 
