@@ -1032,12 +1032,22 @@ class BagelForUnifiedGeneration(UniModelBase):
                 raise invalid_descriptor("BAGEL text input ids are missing")
             inputs_embeds = m.embed_tokens(input_ids).to(torch.bfloat16)
         batch, seq_len = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
-        hidden = m.lm.forward_paged_text(
-            inputs_embeds.reshape(batch * seq_len, -1),
-            indexes[0].reshape(-1),
-            past_key_values,
-        )
-        hidden = hidden.view(batch, seq_len, -1)
+        if batch > 1:
+            if seq_len != 1:
+                raise invalid_descriptor(
+                    "BAGEL batched interleaved text forward requires one token per row"
+                )
+            hidden = m.lm.forward_paged_text_batch(
+                inputs_embeds,
+                indexes[0].reshape(-1),
+                past_key_values,
+            )
+        else:
+            hidden = m.lm.forward_paged_text(
+                inputs_embeds.reshape(seq_len, -1),
+                indexes[0].reshape(-1),
+                past_key_values,
+            ).view(batch, seq_len, -1)
         logits = (
             m.logits(hidden.reshape(batch * seq_len, -1)).view(batch, seq_len, -1)
             if return_all_logits
