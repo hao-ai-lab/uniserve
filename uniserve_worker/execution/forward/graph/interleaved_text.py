@@ -452,10 +452,10 @@ class InterleavedTextDecodeGraphRunner:
         # Pinned host + reusable device staging for the tiny per-replay input
         # tensors. Building them with pageable ``torch.tensor(..., device=)``
         # would issue an implicit cudaStreamSynchronize per copy, blocking the
-        # CPU behind the in-flight replay and serializing decode. The ring
-        # keeps a slot's buffers alive across the one-step CPU/GPU overlap the
-        # pipelined burst runs at.
-        self._stager = TextTensorStager(ring_depth=3)
+        # CPU behind the in-flight replay and serializing decode. Completion
+        # events keep each ring slot alive until every copy and replay using it
+        # has completed, including wrap-around inside a decode burst.
+        self._stager = TextTensorStager(ring_depth=8)
 
     # -- public entry ---------------------------------------------------------
 
@@ -480,7 +480,7 @@ class InterleavedTextDecodeGraphRunner:
         device = rows[0].past_cache.pool.k.device
         pool = rows[0].past_cache.pool
         graph_rows = self._pad_rows(driver, rows, graph_batch, pool)
-        slot = self._stager.next_slot()
+        slot = self._stager.acquire_slot(device=device)
         host_inputs = TextDecodeGraphHostInputs(
             input_ids=tuple(r.token_id if r.token_id is not None else 0 for r in graph_rows),
             positions=tuple(r.pos for r in graph_rows),
@@ -495,16 +495,19 @@ class InterleavedTextDecodeGraphRunner:
             max_context_len=_owner_max_context_len(driver.owner, pool),
         )
 
-        logits = self._decode.maybe_run_host_inputs(
-            kv_pool=pool,
-            num_blocks=int(pool.num_blocks),
-            device=device,
-            host_inputs=host_inputs,
-            ctx=get_forward_context(),
-            forward_fn=lambda state: self._forward(driver, state),
-            prepare_backend=prepare_backend,
-            staging_slot=slot,
-        )
+        try:
+            logits = self._decode.maybe_run_host_inputs(
+                kv_pool=pool,
+                num_blocks=int(pool.num_blocks),
+                device=device,
+                host_inputs=host_inputs,
+                ctx=get_forward_context(),
+                forward_fn=lambda state: self._forward(driver, state),
+                prepare_backend=prepare_backend,
+                staging_slot=slot,
+            )
+        finally:
+            self._stager.mark_slot_submitted(slot, device=device)
         if logits is None:
             return None
         self._graphed_steps += 1

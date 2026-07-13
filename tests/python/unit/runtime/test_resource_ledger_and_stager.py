@@ -228,6 +228,32 @@ def test_ring_depth_is_clamped_to_at_least_one():
     assert stager.next_slot().buffers is stager.next_slot().buffers
 
 
+def test_cuda_slot_waits_for_prior_submission_before_ring_reuse(monkeypatch):
+    calls = []
+
+    class _Event:
+        def record(self, stream):
+            calls.append(("record", stream))
+
+        def synchronize(self):
+            calls.append(("synchronize", None))
+
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: ("stream", str(device)))
+    stager = TextTensorStager(ring_depth=1)
+    device = torch.device("cuda:0")
+
+    first = stager.acquire_slot(device=device)
+    stager.mark_slot_submitted(first, device=device)
+    second = stager.acquire_slot(device=device)
+
+    assert second.buffers is first.buffers
+    assert calls == [
+        ("record", ("stream", "cuda:0")),
+        ("synchronize", None),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # TextTensorStager: host buffer reuse / grow (slot API)                       #
 # --------------------------------------------------------------------------- #
@@ -415,6 +441,29 @@ def test_stage_text_rejects_op_with_zero_tokens():
 # --------------------------------------------------------------------------- #
 # TextTensorStager: CUDA buffer reuse (GPU tier)                              #
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
+def test_cuda_slot_reuse_preserves_pending_h2d_source_bytes():
+    device = torch.device("cuda:0")
+    stream = torch.cuda.Stream(device=device)
+    stager = TextTensorStager(ring_depth=1)
+    numel = 1 << 18
+
+    with torch.cuda.stream(stream):
+        first = stager.acquire_slot(device=device)
+        source = first.int_buffer("page_ids", numel, pin=True)
+        source.fill_(7)
+        target = torch.empty(numel, dtype=torch.int32, device=device)
+        torch.cuda._sleep(20_000_000)
+        target.copy_(source, non_blocking=True)
+        stager.mark_slot_submitted(first, device=device)
+
+    second = stager.acquire_slot(device=device)
+    second.int_buffer("page_ids", numel, pin=True).fill_(9)
+
+    assert torch.count_nonzero(target != 7).item() == 0
 
 
 @pytest.mark.gpu

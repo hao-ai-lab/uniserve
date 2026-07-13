@@ -18,6 +18,7 @@ from ....contracts.forward_mode import ForwardMode
 from ....foundation.errors import invalid_descriptor
 from ....runtime.host_staging import fill_cpu_ints, is_pinned
 from ....runtime.paged_text_cache import PagedTextCacheSpanCopy
+from ....runtime.tensor_staging import TextTensorStager, TextTensorStagingSlot
 from ..stream import (
     ForwardGraphPagedKVView,
     ForwardGraphStreamState,
@@ -63,8 +64,9 @@ class PackedMixedGraphState:
     promotion_target_pool: Any = None
     promotion_source_index: torch.Tensor | None = None
     promotion_target_index: torch.Tensor | None = None
-    promotion_cpu_staging: dict[str, torch.Tensor] = field(default_factory=dict)
-    promotion_pin_memory_supported: bool = True
+    promotion_stager: TextTensorStager = field(
+        default_factory=lambda: TextTensorStager(ring_depth=3)
+    )
 
 
 class PackedMixedGraphRunner(_GraphRunnerBase):
@@ -312,8 +314,22 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         target_index = state.promotion_target_index
         if source_index is None or target_index is None:
             return
-        _copy_long_values_to_tensor(state, source_index, "promotion_source_index", source_positions)
-        _copy_long_values_to_tensor(state, target_index, "promotion_target_index", target_positions)
+        slot = state.promotion_stager.acquire_slot(device=source_index.device)
+        try:
+            _copy_long_values_to_tensor(
+                source_index,
+                "promotion_source_index",
+                source_positions,
+                slot=slot,
+            )
+            _copy_long_values_to_tensor(
+                target_index,
+                "promotion_target_index",
+                target_positions,
+                slot=slot,
+            )
+        finally:
+            state.promotion_stager.mark_slot_submitted(slot, device=source_index.device)
 
     @staticmethod
     def _copy_promotions_in_graph(state: PackedMixedGraphState) -> None:
@@ -585,43 +601,17 @@ def _promotion_index_values(
 
 
 def _copy_long_values_to_tensor(
-    state: PackedMixedGraphState,
     target: torch.Tensor,
     name: str,
     values: list[int],
+    *,
+    slot: TextTensorStagingSlot,
 ) -> None:
     if int(target.numel()) != len(values):
         raise invalid_descriptor("packed mixed graph promotion index length changed")
-    cpu = _promotion_cpu_buffer(state, name, len(values))
+    cpu = slot.long_buffer(name, len(values), pin=target.device.type == "cuda")
     fill_cpu_ints(cpu, values)
     target.copy_(cpu, non_blocking=target.device.type == "cuda" and is_pinned(cpu))
-
-
-def _promotion_cpu_buffer(
-    state: PackedMixedGraphState,
-    name: str,
-    numel: int,
-) -> torch.Tensor:
-    want_pin = bool(state.promotion_pin_memory_supported)
-    target = state.promotion_source_index
-    if target is None:
-        target = state.promotion_target_index
-    if isinstance(target, torch.Tensor):
-        want_pin = target.device.type == "cuda" and want_pin
-    buffer = state.promotion_cpu_staging.get(name)
-    if (
-        buffer is None
-        or int(buffer.numel()) < int(numel)
-        or buffer.dtype != torch.long
-        or is_pinned(buffer) != want_pin
-    ):
-        try:
-            buffer = torch.empty(int(numel), dtype=torch.long, pin_memory=want_pin)
-        except RuntimeError:
-            state.promotion_pin_memory_supported = False
-            buffer = torch.empty(int(numel), dtype=torch.long)
-        state.promotion_cpu_staging[name] = buffer
-    return buffer[: int(numel)]
 
 
 def _cache_positions(pool: Any, block_ids: list[int], start: int, length: int) -> list[int]:
