@@ -466,6 +466,41 @@ def test_flashinfer_prefill_graph_prepare_replans_live_side_tables(monkeypatch):
     assert stats.flashinfer_prefill_plan_indices == 7
 
 
+def test_flashinfer_prefill_graph_binding_owns_stable_graph_buffers(monkeypatch):
+    from uniserve_worker.backends.attention import flashinfer as fi
+
+    class RecordingPrefillWrapper:
+        def __init__(self, workspace, layout, **kwargs) -> None:
+            self.workspace = workspace
+            self.layout = layout
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(fi, "_BatchPrefillWithPagedKVCacheWrapper", RecordingPrefillWrapper)
+    backend = fi.FlashInferAttentionBackend()
+    monkeypatch.setattr(
+        backend,
+        "_workspace",
+        lambda device: torch.empty(1, dtype=torch.uint8, device=device),
+    )
+    metadata = SimpleNamespace(
+        block_table=torch.zeros((3, 7), dtype=torch.int32),
+        cu_seqlens_q=torch.tensor([0, 2, 5, 9], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 7, 11, 20], dtype=torch.int32),
+    )
+
+    backend.bind_paged_prefill_graph_wrapper(metadata, device="cpu")
+
+    wrapper_key, wrapper = backend._prefill_graph_wrapper_for_metadata(metadata)
+    workspace = backend._prefill_plan_workspaces[wrapper_key]
+    assert wrapper_key.batch_size == 3
+    assert wrapper_key.max_indices == 21
+    assert wrapper.kwargs["use_cuda_graph"] is True
+    assert wrapper.kwargs["qo_indptr_buf"] is workspace.qo_indptr
+    assert wrapper.kwargs["paged_kv_indptr_buf"] is workspace.kv_indptr
+    assert wrapper.kwargs["paged_kv_indices_buf"] is workspace.indices
+    assert wrapper.kwargs["paged_kv_last_page_len_buf"] is workspace.last_page_len
+
+
 def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
     from uniserve_worker.execution.forward.graph import text_prefill as pcg
 

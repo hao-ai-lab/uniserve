@@ -46,8 +46,8 @@ class WrapperKey(NamedTuple):
     compares by value like the positional tuple it replaced, while the
     discriminating fields (``kind``, ``backend``) are read by name instead of by
     index. ``kind`` is one of ``"decode"``, ``"decode_graph"`` or ``"prefill"``;
-    ``use_tensor_cores`` is ``None`` for prefill keys and ``batch_size`` /
-    ``max_indices`` are set only for cuda-graph decode keys. ``scope`` is a
+    ``use_tensor_cores`` is ``None`` for prefill keys. ``batch_size`` and
+    ``max_indices`` define fixed CUDA-graph buffer capacities. ``scope`` is a
     nonce isolating a graph-scoped *exclusive* prefill wrapper (one per captured
     graph); the shared prefill wrapper keeps ``scope=None``.
     """
@@ -197,28 +197,55 @@ class _WrapperPool(PagedAttentionPlanPool):
         self.plan_prefill(tuple(key), workspace=self._workspace(device), wrapper=wrapper)
         return key, wrapper
 
-    def _prefill_graph_wrapper(self, device: torch.device, *, scope: int) -> tuple[WrapperKey, Any]:
+    def _prefill_graph_wrapper(
+        self,
+        device: torch.device,
+        *,
+        scope: int,
+        batch_size: int,
+        max_indices: int,
+    ) -> tuple[WrapperKey, Any]:
         """Construct (or return) the exclusive prefill wrapper for ``scope``.
 
-        Exclusive wrappers share the device float workspace (transient kernel
-        scratch, serialized on the compute stream) but own their int workspace,
-        so a plan against the shared prefill wrapper can never mutate the plan
-        state a captured graph baked from this one.
+        The wrapper and its paged side tables have stable addresses for the
+        lifetime of one captured graph. Exclusive wrappers share the device
+        float workspace (transient kernel scratch, serialized on the compute
+        stream) while owning their plan and integer workspaces.
         """
         from . import flashinfer as _fi
 
+        batch_size = max(1, int(batch_size))
+        max_indices = max(1, int(max_indices))
         device_key = _device_key(device)
         backend = get_worker_config().flashinfer.prefill_backend
-        key = WrapperKey("prefill", device_key, backend, scope=int(scope))
+        key = WrapperKey(
+            "prefill",
+            device_key,
+            backend,
+            batch_size=batch_size,
+            max_indices=max_indices,
+            scope=int(scope),
+        )
         wrapper = self._prefill_wrappers.get(key)
         if wrapper is None:
             wrapper_cls = _fi._BatchPrefillWithPagedKVCacheWrapper
             if wrapper_cls is None:
                 raise RuntimeError("flashinfer paged prefill wrapper is not available")
             workspace = self._workspace(device)
+            plan_workspace = self._prefill_plan_workspace(
+                key,
+                device,
+                batch_size=batch_size,
+                max_indices=max_indices,
+            )
             wrapper = wrapper_cls(
                 workspace,
                 "NHD",
+                use_cuda_graph=True,
+                qo_indptr_buf=plan_workspace.qo_indptr,
+                paged_kv_indptr_buf=plan_workspace.kv_indptr,
+                paged_kv_indices_buf=plan_workspace.indices,
+                paged_kv_last_page_len_buf=plan_workspace.last_page_len,
                 backend=backend,
             )
             self._prefill_wrappers[key] = wrapper
