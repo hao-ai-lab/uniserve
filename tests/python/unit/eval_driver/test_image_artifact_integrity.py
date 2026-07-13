@@ -10,6 +10,7 @@ from PIL import Image
 
 import uniserve_eval.harness.runner as harness_runner
 from uniserve_eval.harness.core.client import _parse_openai, send_request
+from uniserve_eval.harness.datasets import BenchmarkInputs
 from uniserve_eval.harness.image_outputs import ImageOutputError, inspect_image_bytes
 from uniserve_eval.harness.metrics.common import RequestRecord
 from uniserve_eval.harness.report import (
@@ -26,9 +27,7 @@ from uniserve_eval.harness.tasks.base import TaskRequest
 pytestmark = pytest.mark.unit
 
 
-def _image_bytes(
-    *, width: int = 2, height: int = 3, image_format: str = "PNG"
-) -> bytes:
+def _image_bytes(*, width: int = 2, height: int = 3, image_format: str = "PNG") -> bytes:
     output = BytesIO()
     Image.new("RGB", (width, height), (29, 43, 71)).save(output, format=image_format)
     return output.getvalue()
@@ -103,9 +102,7 @@ def test_chat_json_image_part_must_match_declared_count_and_dimensions() -> None
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{_encoded(image_bytes)}"
-                            },
+                            "image_url": {"url": f"data:image/png;base64,{_encoded(image_bytes)}"},
                         }
                     ]
                 },
@@ -147,9 +144,7 @@ def test_streaming_image_delta_uses_the_same_decoder_and_rejects_mime_mismatch()
                         "images": [
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{_encoded(png)}"
-                                },
+                                "image_url": {"url": f"data:image/jpeg;base64,{_encoded(png)}"},
                             }
                         ]
                     }
@@ -190,9 +185,7 @@ def test_decoder_rejects_malformed_base64_and_non_images() -> None:
         inspect_image_bytes(b"not an image")
 
 
-def test_runner_commits_exact_samples_and_bundle_rejects_file_drift(
-    tmp_path, monkeypatch
-) -> None:
+def test_runner_commits_exact_samples_and_bundle_rejects_file_drift(tmp_path, monkeypatch) -> None:
     stale_path = tmp_path / "samples" / "stale.png"
     stale_path.parent.mkdir(parents=True)
     stale_path.write_bytes(b"stale")
@@ -210,7 +203,11 @@ def test_runner_commits_exact_samples_and_bundle_rejects_file_drift(
         sample_gpu_memory=False,
     )
 
-    monkeypatch.setattr(harness_runner, "load_benchmark_inputs", lambda _spec: (rows, None))
+    monkeypatch.setattr(
+        harness_runner,
+        "load_benchmark_inputs",
+        lambda _spec: BenchmarkInputs(measured=rows, warmup=[], tokenizer=None),
+    )
 
     async def fake_submit(self, _client, row):
         del self, row

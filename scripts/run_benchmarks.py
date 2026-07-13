@@ -93,6 +93,8 @@ HARNESS_FLAGS = {
     "dataset": "--dataset",
     "dataset_path": "--dataset-path",
     "dataset_revision": "--dataset-revision",
+    "t2i_dataset_revision": "--t2i-dataset-revision",
+    "i2t_dataset_revision": "--i2t-dataset-revision",
     "tokenizer": "--tokenizer",
     "endpoint": "--endpoint",
     "max_tokens": "--max-tokens",
@@ -122,6 +124,8 @@ HARNESS_FLAGS = {
     "timestep_shift": "--timestep-shift",
     "image_think": "--image-think",
     "image_t_eps": "--image-t-eps",
+    "workload_mix": "--workload-mix",
+    "warmup_mix": "--warmup-mix",
     "runtime_profile_id": "--runtime-profile-id",
     "measurement_interface": "--measurement-interface",
     "cache_read_policy": "--cache-read-policy",
@@ -717,7 +721,9 @@ def harness_command(
         value = harness.pop(key)
         if key == "cfg_interval" and isinstance(value, list):
             value = ",".join(str(part) for part in value)
-        if key == "chat_template_kwargs" and isinstance(value, dict):
+        if key in {"chat_template_kwargs", "workload_mix", "warmup_mix"} and isinstance(
+            value, dict
+        ):
             value = json.dumps(value, sort_keys=True, separators=(",", ":"))
         cmd.extend([flag, str(value)])
     if harness:
@@ -1175,7 +1181,12 @@ def build_benches(
                             "dataset": spec.dataset,
                             "dataset_path": spec.dataset_path,
                             "dataset_revision": spec.dataset_revision,
+                            "t2i_dataset_revision": spec.t2i_dataset_revision,
+                            "i2t_dataset_revision": spec.i2t_dataset_revision,
                             "num_prompts": spec.num_prompts,
+                            "workload_mix": spec.workload_mix,
+                            "warmup_mix": spec.warmup_mix,
+                            "warmup_requests": spec.warmup_requests,
                             "seed": spec.seed,
                             "tokenizer": spec.tokenizer,
                             "sharegpt_context_len": spec.sharegpt_context_len,
@@ -1185,7 +1196,7 @@ def build_benches(
                         }
                     )
                     if row_key not in selected_rows_cache:
-                        selected_rows_cache[row_key], _ = load_benchmark_inputs(spec)
+                        selected_rows_cache[row_key] = load_benchmark_inputs(spec).measured
                     harness_contract = benchmark_contract(spec, selected_rows_cache[row_key])
                     harness_parity_contract = benchmark_parity_contract(harness_contract)
                     parity_payload = {

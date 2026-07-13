@@ -122,6 +122,17 @@ def compare_pair(
         metric_name = "output_throughput"
         metric_path = (metric_name,)
         objective = "maximize"
+    elif task == "mixed":
+        work = {
+            "passed": bool(
+                reference.get("generation_conformance") and candidate.get("generation_conformance")
+            )
+        }
+        if not work["passed"]:
+            failures.append("work_mismatch")
+        metric_name = "mixed_request_throughput"
+        metric_path = (metric_name,)
+        objective = "maximize"
     elif task in _IMAGE_TASKS:
         work = {
             "passed": bool(
@@ -268,12 +279,16 @@ def render_markdown(report: dict[str, Any]) -> str:
         )
         for point in points:
             metrics = point.get("metrics", {})
-            image_latency = metrics.get("image_latency_ms", {})
+            image_metrics = metrics.get("t2i", metrics)
+            text_metrics = metrics.get("i2t", metrics)
+            image_metrics = image_metrics if isinstance(image_metrics, dict) else {}
+            text_metrics = text_metrics if isinstance(text_metrics, dict) else {}
+            image_latency = image_metrics.get("image_latency_ms", {})
             lines.append(
                 f"| {point.get('benchmark')} | {point.get('group')} | {point.get('task')} | "
                 f"{point.get('load_case')} | {point.get('ok_count', 0)}/{point.get('request_count', 0)} | "
-                f"{_number(point.get('elapsed_s'))} | {_number(metrics.get('output_throughput'))} | "
-                f"{_number(metrics.get('images_per_second'))} | "
+                f"{_number(point.get('elapsed_s'))} | {_number(text_metrics.get('output_throughput'))} | "
+                f"{_number(image_metrics.get('images_per_second'))} | "
                 f"{_number(image_latency.get('mean') if isinstance(image_latency, dict) else None)} |"
             )
         lines.extend(["", "## Paired comparisons", ""])

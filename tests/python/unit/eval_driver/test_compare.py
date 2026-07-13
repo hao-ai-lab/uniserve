@@ -1,4 +1,5 @@
 """Compare-command behaviors over fabricated workload summaries."""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +9,7 @@ import pytest
 
 from uniserve_eval import compare
 from uniserve_eval.harness.artifacts import ArtifactWriter
+from uniserve_eval.harness.datasets import BenchmarkInputs
 from uniserve_eval.harness.report import record_collection_contract, write_summary_artifacts
 
 pytestmark = pytest.mark.unit
@@ -71,7 +73,11 @@ def current_contract(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda _config, name: ([name], {"name": name}, {"name": name}),
     )
     monkeypatch.setattr(compare, "spec_from_harness_command", lambda command: command[0])
-    monkeypatch.setattr(compare, "load_benchmark_inputs", lambda _spec: ([{"id": "row"}], None))
+    monkeypatch.setattr(
+        compare,
+        "load_benchmark_inputs",
+        lambda _spec: BenchmarkInputs(measured=[{"id": "row"}], warmup=[], tokenizer=None),
+    )
     monkeypatch.setattr(
         compare,
         "benchmark_contract",
@@ -136,7 +142,9 @@ def test_compare_image_family_table_and_ratio_math(image_config, capsys) -> None
     assert rows["images_per_minute"]["ratios"]["cand-t2i"] == pytest.approx(0.5)
     # Common rows present when the summaries carry them.
     assert rows["ok_count"]["values"] == {"base-t2i": 4, "cand-t2i": 4}
-    assert rows["gpu_memory.peak_single_gpu_mib"]["ratios"]["cand-t2i"] == pytest.approx(60000 / 36000)
+    assert rows["gpu_memory.peak_single_gpu_mib"]["ratios"]["cand-t2i"] == pytest.approx(
+        60000 / 36000
+    )
 
     table = capsys.readouterr().out
     assert "| metric | base-t2i (baseline) | cand-t2i | cand-t2i (x vs baseline) |" in table
@@ -148,9 +156,7 @@ def test_compare_image_family_table_and_ratio_math(image_config, capsys) -> None
     assert persisted["workloads"] == ["base-t2i", "cand-t2i"]
 
 
-def test_compare_rejects_protocol_or_workload_parity_mismatch(
-    image_config, monkeypatch
-) -> None:
+def test_compare_rejects_protocol_or_workload_parity_mismatch(image_config, monkeypatch) -> None:
     monkeypatch.setattr(
         compare,
         "benchmark_parity_contract",
@@ -163,7 +169,10 @@ def test_compare_rejects_protocol_or_workload_parity_mismatch(
 
 def test_compare_stream_family_metric_set(tmp_path: Path) -> None:
     config = {"artifact_root": str(tmp_path)}
-    for name, throughput, ttft, itl, e2e in [("base-i2t", 160.0, 200.0, 5.0, 1500.0), ("cand-i2t", 10.0, 400.0, 100.0, 34000.0)]:
+    for name, throughput, ttft, itl, e2e in [
+        ("base-i2t", 160.0, 200.0, 5.0, 1500.0),
+        ("cand-i2t", 10.0, 400.0, 100.0, 34000.0),
+    ]:
         _write_summary(
             tmp_path,
             name,

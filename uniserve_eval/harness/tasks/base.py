@@ -14,6 +14,7 @@ class TaskRequest:
     payload: dict[str, Any]
     # Wire shape, dispatched by ``core.client.send_request``.
     kind: RequestKind
+    semantic_task: str | None = None
 
 
 class BenchmarkTask:
@@ -24,9 +25,7 @@ class BenchmarkTask:
         raise NotImplementedError
 
 
-def apply_text_sampling_contract(
-    payload: dict[str, Any], spec: BenchmarkSpec
-) -> None:
+def apply_text_sampling_contract(payload: dict[str, Any], spec: BenchmarkSpec) -> None:
     payload["temperature"] = spec.temperature
     payload["top_p"] = spec.top_p
     payload["ignore_eos"] = spec.ignore_eos

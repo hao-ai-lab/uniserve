@@ -17,6 +17,7 @@ Examples:
       --base-url http://127.0.0.1:18080 --task t2i --model SenseNova-U1 \
       --num-prompts 200 --max-concurrencies 1,2,4 --output-dir results/t2i
 """
+
 from __future__ import annotations
 
 import argparse
@@ -52,25 +53,37 @@ def _bool_value(value: str) -> bool:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="uniserve-eval-harness", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="uniserve-eval-harness",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--task", required=True, choices=[task.value for task in TaskName])
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--endpoint", help="override the per-task default endpoint")
-    parser.add_argument("--dataset", help="dataset name (default per task); 'trace' reads --dataset-path JSONL")
-    parser.add_argument("--dataset-path", help="local dataset file/dir override (else HF auto-download)")
+    parser.add_argument(
+        "--dataset", help="dataset name (default per task); 'trace' reads --dataset-path JSONL"
+    )
+    parser.add_argument(
+        "--dataset-path", help="local dataset file/dir override (else HF auto-download)"
+    )
     parser.add_argument("--dataset-revision", help="immutable dataset repository revision")
-    parser.add_argument("--tokenizer", help="tokenizer path/name (ShareGPT shaping; defaults to --model)")
+    parser.add_argument(
+        "--tokenizer", help="tokenizer path/name (ShareGPT shaping; defaults to --model)"
+    )
 
     parser.add_argument("--num-prompts", type=int, default=1000)
     parser.add_argument("--request-rate", default="inf", help="req/s or 'inf' (single point)")
-    parser.add_argument("--request-rates", help="comma-separated req/s sweep (overrides --request-rate)")
+    parser.add_argument(
+        "--request-rates", help="comma-separated req/s sweep (overrides --request-rate)"
+    )
     parser.add_argument("--max-concurrency", type=int, help="in-flight cap (single point)")
     parser.add_argument("--max-concurrencies", help="comma-separated concurrency sweep")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--workload-mix", type=_json_object, default={})
+    parser.add_argument("--warmup-mix", type=_json_object, default={})
 
     parser.add_argument("--max-tokens", type=int, help="output token cap")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -87,7 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
         default={},
         help="JSON object passed explicitly to the model chat template",
     )
-    parser.add_argument("--disable-ignore-eos", action="store_true", help="respect EOS (default ignores EOS)")
+    parser.add_argument(
+        "--disable-ignore-eos", action="store_true", help="respect EOS (default ignores EOS)"
+    )
 
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
@@ -123,6 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--sharegpt-output-len", type=int)
     parser.add_argument("--sharegpt-context-len", type=int)
+    parser.add_argument("--t2i-dataset-revision")
+    parser.add_argument("--i2t-dataset-revision")
 
     parser.add_argument("--runtime-profile-id", default="unspecified")
     parser.add_argument("--measurement-interface", default="public_protocol_adapter")
@@ -181,6 +198,8 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         max_concurrency=concurrency,
         warmup_requests=0 if args.smoke else args.warmup_requests,
         seed=args.seed,
+        workload_mix=args.workload_mix,
+        warmup_mix=args.warmup_mix,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -212,6 +231,8 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         sharegpt_context_len=args.sharegpt_context_len,
         dataset_path=args.dataset_path,
         dataset_revision=args.dataset_revision,
+        t2i_dataset_revision=args.t2i_dataset_revision,
+        i2t_dataset_revision=args.i2t_dataset_revision,
         runtime_profile_id=args.runtime_profile_id,
         measurement_interface=args.measurement_interface,
         cache_read_policy=args.cache_read_policy,
@@ -266,7 +287,9 @@ def main(argv: list[str] | None = None) -> int:
     for rate, concurrency in points:
         spec = _make_spec(args, rate, concurrency)
         if is_sweep:
-            slug = f"{spec.task.value}_r{_rate_slug(rate)}_c{concurrency if concurrency else 'none'}"
+            slug = (
+                f"{spec.task.value}_r{_rate_slug(rate)}_c{concurrency if concurrency else 'none'}"
+            )
             out_dir = output_root / slug
         else:
             out_dir = output_root
@@ -292,7 +315,10 @@ def main(argv: list[str] | None = None) -> int:
                 "metrics": result.summary["metrics"],
             }
         )
-        print(result.summary["metric_family"], json.dumps(result.summary["metrics"], indent=2, sort_keys=True))
+        print(
+            result.summary["metric_family"],
+            json.dumps(result.summary["metrics"], indent=2, sort_keys=True),
+        )
 
     if is_sweep:
         output_root.mkdir(parents=True, exist_ok=True)
