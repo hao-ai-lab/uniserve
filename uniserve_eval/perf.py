@@ -149,8 +149,8 @@ def perf(args: argparse.Namespace) -> None:
     out_dir = workload_dir(config, args.workload)
     out_dir.mkdir(parents=True, exist_ok=True)
     spec = spec_from_harness_command(cmd)
-    rows, _ = load_benchmark_inputs(spec)
-    harness_contract = benchmark_contract(spec, rows)
+    inputs = load_benchmark_inputs(spec)
+    harness_contract = benchmark_contract(spec, inputs.measured)
     profile_contract = perf_profile_contract(
         cmd,
         workload,

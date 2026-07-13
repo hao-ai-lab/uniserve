@@ -19,6 +19,7 @@ import uniserve_eval.harness.runner as harness_runner
 import uniserve_eval.verify
 from uniserve_eval import cli
 from uniserve_eval.harness.artifacts import ArtifactWriter
+from uniserve_eval.harness.datasets import BenchmarkInputs
 from uniserve_eval.harness.metrics.common import RequestRecord
 from uniserve_eval.harness.provenance import (
     execution_provenance,
@@ -317,7 +318,9 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
 
     omni = server_spec(config, "benchmark/server/bagel-omni")
     mot_dir = ROOT / omni["env"]["VLLM_TUNED_CONFIG_FOLDER"]
-    mot_config = json.loads((mot_dir / "device_name=GB200,dtype=w16a16.json").read_text(encoding="utf-8"))
+    mot_config = json.loads(
+        (mot_dir / "device_name=GB200,dtype=w16a16.json").read_text(encoding="utf-8")
+    )
     assert set(mot_config) == {"3584_3584", "3584_4608", "3584_37888", "18944_3584"}
     assert all({"4098", "12294"} <= set(shape_config) for shape_config in mot_config.values())
 
@@ -345,6 +348,10 @@ def test_main_benchmark_declares_every_runtime_comparison_pair() -> None:
             "reference": "benchmark/server/bagel-omni",
         },
         "bagel_beans_i2t": {
+            "candidate": "benchmark/server/bagel-uniserve",
+            "reference": "benchmark/server/bagel-omni",
+        },
+        "bagel_mixed_image_text": {
             "candidate": "benchmark/server/bagel-uniserve",
             "reference": "benchmark/server/bagel-omni",
         },
@@ -1880,7 +1887,11 @@ def test_benchmark_runner_warmup_uses_the_measured_request_shape(tmp_path, monke
     }
     submitted: list[dict] = []
 
-    monkeypatch.setattr(harness_runner, "load_benchmark_inputs", lambda _spec: ([row], None))
+    monkeypatch.setattr(
+        harness_runner,
+        "load_benchmark_inputs",
+        lambda _spec: BenchmarkInputs(measured=[row], warmup=[], tokenizer=None),
+    )
 
     async def fake_submit(self, _client, submitted_row):
         del self

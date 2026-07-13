@@ -610,6 +610,9 @@
         "image_concurrency": [
           {"id": "c1", "request_rate": "inf", "max_concurrency": 1},
           {"id": "c32", "request_rate": "inf", "max_concurrency": 32}
+        ],
+        "mixed_concurrency": [
+          {"id": "c32", "request_rate": "inf", "max_concurrency": 32}
         ]
       },
       "datasets": {
@@ -663,6 +666,18 @@
           "points": [
             "bagel_mjhq_t2i_omni",
             "bagel_beans_i2t_omni"
+          ]
+        },
+        "bagel-mixed-uniserve": {
+          "server": "benchmark/server/bagel-uniserve",
+          "points": [
+            "bagel_mixed_uniserve"
+          ]
+        },
+        "bagel-mixed-omni": {
+          "server": "benchmark/server/bagel-omni",
+          "points": [
+            "bagel_mixed_omni"
           ]
         }
       },
@@ -965,6 +980,98 @@
           "plan_evidence_policy": "reference_protocol",
             "output_constraint": "und_only",
             "preprocessing": "beans_jpeg95_seed42_v1"
+          }
+        },
+        "bagel_mixed_uniserve": {
+          "load_case_set": "mixed_concurrency",
+          "parity_group": "bagel_mixed_image_text",
+          "comparison_role": "candidate",
+          "name": "bagel-uniserve-mixed-{load_id}",
+          "output": "bagel_mixed_image_text/uniserve_{load_id}",
+          "harness": {
+            "task": "mixed",
+            "model": "BAGEL",
+            "dataset": "mixed-image-text",
+            "dataset_ref": "beans",
+            "t2i_dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
+            "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
+            "num_prompts": 32,
+            "warmup_requests": 4,
+            "workload_mix": {"t2i": 8, "i2t": 24},
+            "warmup_mix": {"t2i": 1, "i2t": 3},
+            "max_tokens": 256,
+            "temperature": 0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "steps": 50,
+            "denoise_updates": 50,
+            "width": 1024,
+            "height": 1024,
+            "wire": "mixed_chat",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.5,
+            "cfg_norm": "global",
+            "cfg_interval": [0.4, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "runtime_profile_id": "bagel",
+            "plan_evidence_policy": "declared_contract",
+            "output_constraint": "mixed_image_text",
+            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
+            "acceptance_min_success": 32,
+            "acceptance_min_images_per_success": 0.25
+          }
+        },
+        "bagel_mixed_omni": {
+          "load_case_set": "mixed_concurrency",
+          "parity_group": "bagel_mixed_image_text",
+          "comparison_role": "reference",
+          "name": "bagel-omni-mixed-{load_id}",
+          "output": "bagel_mixed_image_text/omni_{load_id}",
+          "harness": {
+            "task": "mixed",
+            "model": "${UNISERVE_BAGEL_MODEL}",
+            "dataset": "mixed-image-text",
+            "dataset_ref": "beans",
+            "t2i_dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
+            "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
+            "num_prompts": 32,
+            "warmup_requests": 4,
+            "workload_mix": {"t2i": 8, "i2t": 24},
+            "warmup_mix": {"t2i": 1, "i2t": 3},
+            "max_tokens": 256,
+            "temperature": 0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "steps": 51,
+            "denoise_updates": 50,
+            "width": 1024,
+            "height": 1024,
+            "wire": "mixed_chat",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.5,
+            "cfg_norm": "global",
+            "cfg_interval": [0.4, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "runtime_profile_id": "bagel-reference",
+            "plan_evidence_policy": "declared_contract",
+            "output_constraint": "mixed_image_text",
+            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
+            "acceptance_min_success": 32,
+            "acceptance_min_images_per_success": 0.25
           }
         }
       },

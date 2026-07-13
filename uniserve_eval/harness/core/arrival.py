@@ -15,6 +15,7 @@ The timed region matches SGLang's ``benchmark()``:
 Determinism: arrival intervals use ``np.random.exponential`` which the caller
 seeds with ``np.random.seed(seed)`` (default 42), exactly like SGLang.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,14 +49,20 @@ async def run_load(
     submit: Callable[[Row], Coroutine[Any, Any, Any]],
     warmup_submit: Callable[[Row], Coroutine[Any, Any, Any]] | None = None,
     warmup_requests: int = 1,
+    warmup_rows: list[Row] | None = None,
 ) -> tuple[list[Any], float]:
     """Run the warmup + timed region; return ``(outputs, dur_s)``."""
     if not rows:
         return [], 0.0
 
     if warmup_requests > 0 and warmup_submit is not None:
+        selected_warmups = warmup_rows or [rows[0] for _ in range(warmup_requests)]
+        if len(selected_warmups) != warmup_requests:
+            raise ValueError(
+                f"warmup workload has {len(selected_warmups)} rows; expected {warmup_requests}"
+            )
         warmup_tasks: list[asyncio.Task[Any]] = [
-            asyncio.create_task(warmup_submit(rows[0])) for _ in range(warmup_requests)
+            asyncio.create_task(warmup_submit(row)) for row in selected_warmups
         ]
         warmup_outputs = await asyncio.gather(*warmup_tasks)
         if not any(getattr(output, "success", False) for output in warmup_outputs):

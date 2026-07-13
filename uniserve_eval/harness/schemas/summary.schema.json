@@ -16,7 +16,7 @@
   ],
   "properties": {
     "harness_status": {"type": "string"},
-    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "i2t", "default"]},
+    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "i2t", "mixed", "default"]},
     "dataset": {"type": "string"},
     "endpoint": {"type": "string"},
     "model": {"type": "string"},
@@ -27,7 +27,7 @@
       "type": "object",
       "required": ["mode", "request_rate", "num_prompts"],
       "properties": {
-        "mode": {"type": "string", "enum": ["open_loop_poisson", "closed_loop", "saturation"]},
+        "mode": {"type": "string", "enum": ["open_loop_poisson", "single_stream", "saturated_concurrency", "saturation"]},
         "request_rate": {"type": ["number", "string"]},
         "max_concurrency": {"type": ["integer", "null"]},
         "warmup_requests": {"type": "integer"},
@@ -40,7 +40,7 @@
     "ok_count": {"type": "integer", "minimum": 0},
     "failed_count": {"type": "integer", "minimum": 0},
     "classifiers": {"type": "object"},
-    "metric_family": {"type": "string", "enum": ["stream", "image"]},
+    "metric_family": {"type": "string", "enum": ["stream", "image", "mixed"]},
     "metrics": {"type": "object"},
     "artifact": {
       "type": "object",

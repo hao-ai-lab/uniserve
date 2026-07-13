@@ -16,8 +16,8 @@ from .image_outputs import (
     image_output_mismatch,
     inspect_image_bytes,
 )
-from .metrics import RequestRecord, summarize_image, summarize_stream
-from .spec import BenchmarkSpec
+from .metrics import RequestRecord, summarize_image, summarize_mixed, summarize_stream
+from .spec import BenchmarkSpec, TaskName
 
 
 def spec_to_dict(spec: BenchmarkSpec) -> dict[str, Any]:
@@ -430,8 +430,10 @@ def write_summary_artifacts(output_dir: str | Path, summary: dict[str, Any]) -> 
 def load_mode(spec: BenchmarkSpec) -> str:
     if spec.request_rate != float("inf"):
         return "open_loop_poisson"
+    if spec.max_concurrency == 1:
+        return "single_stream"
     if spec.max_concurrency:
-        return "closed_loop"
+        return "saturated_concurrency"
     return "saturation"
 
 
@@ -445,6 +447,10 @@ def plan_summary(spec: BenchmarkSpec) -> dict[str, Any]:
             "dataset": spec.dataset,
             "preprocessing": spec.preprocessing,
             "prompt_source": spec.dataset_path or spec.dataset,
+            "workload_mix": spec.workload_mix,
+            "warmup_mix": spec.warmup_mix,
+            "t2i_dataset_revision": spec.t2i_dataset_revision,
+            "i2t_dataset_revision": spec.i2t_dataset_revision,
         },
         "generation": {
             "output_constraint": spec.output_constraint,
@@ -772,7 +778,10 @@ def build_summary(
     for record in records:
         classifiers[record.classifier] = classifiers.get(record.classifier, 0) + 1
 
-    if spec.is_stream_task:
+    if spec.task == TaskName.MIXED:
+        family = "mixed"
+        metrics = summarize_mixed(records, dur_s)
+    elif spec.is_stream_task:
         family = "stream"
         metrics = summarize_stream(records, dur_s, tokenizer=tokenizer)
     else:
@@ -811,11 +820,7 @@ def build_summary(
         request_count=summary["request_count"],
         ok_count=summary["ok_count"],
         failed_count=summary["failed_count"],
-        total_images=(
-            int(metrics.get("completed_images", 0))
-            if family == "image"
-            else int(metrics.get("images", {}).get("total_images", 0))
-        ),
+        total_images=_completed_images(family, metrics),
         plan_evidence=plan_evidence,
         contract=contract,
         generation_conformance=_generation_conformance(spec, records),
@@ -841,30 +846,76 @@ def build_summary(
     return summary
 
 
+def _completed_images(family: str, metrics: dict[str, Any]) -> int:
+    if family == "image":
+        return int(metrics.get("completed_images", 0))
+    if family == "mixed":
+        image = metrics.get("t2i")
+        return int(image.get("completed_images", 0)) if isinstance(image, dict) else 0
+    images = metrics.get("images")
+    return int(images.get("total_images", 0)) if isinstance(images, dict) else 0
+
+
 def _generation_conformance(
     spec: BenchmarkSpec,
     records: list[RequestRecord],
 ) -> dict[str, Any]:
-    successful = [record for record in records if record.success]
-    image_output_required = spec.task.value in {"t2i", "i2i", "default"}
-    if image_output_required:
-        mismatches = [
-            record.request_id for record in records if not _image_record_conforms(record, spec)
-        ]
+    if spec.task == TaskName.MIXED:
+        image_records = [record for record in records if record.task == TaskName.T2I.value]
+        text_records = [record for record in records if record.task == TaskName.I2T.value]
+        image = _image_generation_conformance(spec, image_records)
+        text = _text_generation_conformance(spec, text_records)
+        counts_match = (
+            len(image_records) == spec.workload_mix[TaskName.T2I.value]
+            and len(text_records) == spec.workload_mix[TaskName.I2T.value]
+        )
         return {
             "schema_version": 1,
-            "policy": (
-                "decoded_image_within_declared_cap"
-                if spec.task.value == "default"
-                else "decoded_image_exact_declared_work"
-            ),
-            "successful_requests": len(successful),
+            "policy": "per_task_declared_work",
+            "successful_requests": sum(record.success for record in records),
             "checked_requests": len(records),
-            "mismatch_count": len(mismatches),
-            "mismatched_request_ids": mismatches,
-            "valid": bool(records) and not mismatches,
+            "mismatch_count": image["mismatch_count"] + text["mismatch_count"],
+            "mismatched_request_ids": image["mismatched_request_ids"]
+            + text["mismatched_request_ids"],
+            "components": {"t2i": image, "i2t": text},
+            "task_counts_match": counts_match,
+            "valid": image["valid"] is True and text["valid"] is True and counts_match,
         }
+    image_output_required = spec.task.value in {"t2i", "i2i", "default"}
+    if image_output_required:
+        return _image_generation_conformance(spec, records)
+    return _text_generation_conformance(spec, records)
+
+
+def _image_generation_conformance(
+    spec: BenchmarkSpec, records: list[RequestRecord]
+) -> dict[str, Any]:
+    successful = [record for record in records if record.success]
+    mismatches = [
+        record.request_id for record in records if not _image_record_conforms(record, spec)
+    ]
+    return {
+        "schema_version": 1,
+        "policy": (
+            "decoded_image_within_declared_cap"
+            if spec.task.value == "default"
+            else "decoded_image_exact_declared_work"
+        ),
+        "successful_requests": len(successful),
+        "checked_requests": len(records),
+        "mismatch_count": len(mismatches),
+        "mismatched_request_ids": mismatches,
+        "valid": bool(records) and not mismatches,
+    }
+
+
+def _text_generation_conformance(
+    spec: BenchmarkSpec, records: list[RequestRecord]
+) -> dict[str, Any]:
+    successful = [record for record in records if record.success]
     exact_length_required = spec.task.value in {"text", "i2t"} and spec.ignore_eos
+    if spec.task == TaskName.MIXED:
+        exact_length_required = spec.ignore_eos
     checked = [record for record in successful if record.requested_output_len > 0]
     mismatches = [
         record.request_id
@@ -937,6 +988,8 @@ def render_markdown(summary: dict[str, Any]) -> str:
     metrics = summary["metrics"]
     if summary["metric_family"] == "stream":
         lines += _stream_markdown(metrics)
+    elif summary["metric_family"] == "mixed":
+        lines += _mixed_markdown(metrics)
     else:
         lines += _image_markdown(metrics)
     return "\n".join(lines) + "\n"
@@ -1034,3 +1087,16 @@ def _image_markdown(metrics: dict[str, Any]) -> list[str]:
         sps = metrics["steps_per_second"]
         lines.append(f"- steps/s p50 = {_fmt(sps['p50'])}")
     return lines
+
+
+def _mixed_markdown(metrics: dict[str, Any]) -> list[str]:
+    image = metrics["t2i"]
+    text = metrics["i2t"]
+    overlap = metrics["client_cross_task_overlap"]
+    return [
+        f"- mixed request throughput: {_fmt(metrics['mixed_request_throughput'])} req/s",
+        f"- T2I: {image['completed_images']} images, {_fmt(image['images_per_minute'])} images/min",
+        f"- I2T: {text['total_output_tokens']} output tokens, {_fmt(text['output_throughput'])} tok/s",
+        f"- client cross-task overlap: {_fmt(overlap['duration_s'])}s "
+        f"({_fmt(100.0 * overlap['timed_region_fraction'])}% of timed region)",
+    ]

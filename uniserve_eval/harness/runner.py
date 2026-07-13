@@ -64,7 +64,9 @@ class BenchmarkRunner:
         for commit_marker in ("summary.json", "artifact_manifest.json", "summary.md"):
             (self.writer.output_dir / commit_marker).unlink(missing_ok=True)
         self.writer.clear_samples()
-        rows, tokenizer = load_benchmark_inputs(self.spec)
+        inputs = load_benchmark_inputs(self.spec)
+        rows = inputs.measured
+        tokenizer = inputs.tokenizer
         contract = benchmark_contract(self.spec, rows)
 
         started_at = time.time()
@@ -115,6 +117,7 @@ class BenchmarkRunner:
                     submit=submit,
                     warmup_submit=warmup_submit,
                     warmup_requests=self.spec.warmup_requests,
+                    warmup_rows=inputs.warmup,
                 )
             finally:
                 if sampler is not None:
@@ -183,7 +186,7 @@ class BenchmarkRunner:
             self.base_url,
             request,
             request_id=str(row.get("id") or f"request-{time.time_ns()}"),
-            task=self.spec.task.value,
+            task=request.semantic_task or self.spec.task.value,
             prompt_len=int(row.get("prompt_len") or 0),
             output_len_fallback=output_len_fallback,
             scheduled_time=(

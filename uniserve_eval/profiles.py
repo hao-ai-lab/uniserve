@@ -781,9 +781,11 @@ def benchmark_matrix_definition_matches(
     if dataset_ref is not None:
         datasets = benchmark.get("datasets")
         dataset = datasets.get(dataset_ref) if isinstance(datasets, dict) else None
+        revision_field = (
+            "i2t_dataset_revision" if actual_spec.get("task") == "mixed" else "dataset_revision"
+        )
         if not (
-            isinstance(dataset, dict)
-            and dataset.get("revision") == actual_spec.get("dataset_revision")
+            isinstance(dataset, dict) and dataset.get("revision") == actual_spec.get(revision_field)
         ):
             return False
     return True

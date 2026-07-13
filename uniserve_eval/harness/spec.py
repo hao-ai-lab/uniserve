@@ -16,6 +16,7 @@ class TaskName(StrEnum):
     T2I = "t2i"
     I2I = "i2i"
     I2T = "i2t"
+    MIXED = "mixed"
     DEFAULT = "default"
 
 
@@ -38,6 +39,7 @@ TASK_WIRES = {
     TaskName.T2I: ("images_generations", "openai_chat_json"),
     TaskName.I2I: ("openai_chat_json",),
     TaskName.I2T: ("openai_chat", "openai_chat_json"),
+    TaskName.MIXED: ("mixed_chat",),
     TaskName.DEFAULT: ("openai_chat",),
 }
 
@@ -45,6 +47,7 @@ WIRE_ENDPOINTS = {
     "openai_chat": "/v1/chat/completions",
     "openai_chat_json": "/v1/chat/completions",
     "images_generations": "/v1/images/generations",
+    "mixed_chat": "/v1/chat/completions",
 }
 
 # Default real dataset backing each task. i2t defaults to deterministic
@@ -55,6 +58,7 @@ DEFAULT_DATASETS = {
     TaskName.T2I: "mjhq",
     TaskName.I2I: "pie-bench",
     TaskName.I2T: "synthetic-images",
+    TaskName.MIXED: "mixed-image-text",
     TaskName.DEFAULT: "ueval",
 }
 
@@ -73,6 +77,8 @@ class BenchmarkSpec:
     max_concurrency: int | None = None
     warmup_requests: int = 1
     seed: int = 42
+    workload_mix: dict[str, int] = field(default_factory=dict)
+    warmup_mix: dict[str, int] = field(default_factory=dict)
 
     # Text generation.
     temperature: float = 0.0
@@ -120,6 +126,8 @@ class BenchmarkSpec:
     # Dataset access: local file/dir override (else HF auto-download).
     dataset_path: str | None = None
     dataset_revision: str | None = None
+    t2i_dataset_revision: str | None = None
+    i2t_dataset_revision: str | None = None
 
     # Per-request body extras (rarely needed).
     extra_request_body: dict = field(default_factory=dict)
@@ -144,6 +152,7 @@ class BenchmarkSpec:
         object.__setattr__(self, "task", TaskName(self.task))
         if self.num_prompts < 1:
             raise ValueError("num_prompts must be positive")
+        self._validate_workload_mix()
         if not self.wire:
             object.__setattr__(self, "wire", TASK_WIRES[self.task][0])
         if self.wire not in TASK_WIRES[self.task]:
@@ -180,6 +189,30 @@ class BenchmarkSpec:
             raise ValueError(
                 "acceptance criteria must require success and a non-negative failure bound"
             )
+
+    def _validate_workload_mix(self) -> None:
+        if self.task != TaskName.MIXED:
+            if self.workload_mix or self.warmup_mix:
+                raise ValueError("workload_mix and warmup_mix require task 'mixed'")
+            return
+        supported = {TaskName.T2I.value, TaskName.I2T.value}
+        for field_name, values, expected_total in (
+            ("workload_mix", self.workload_mix, self.num_prompts),
+            ("warmup_mix", self.warmup_mix, self.warmup_requests),
+        ):
+            if set(values) != supported:
+                raise ValueError(f"{field_name} must declare exactly t2i and i2t")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in values.values()
+            ):
+                raise ValueError(f"{field_name} counts must be non-negative integers")
+            if sum(values.values()) != expected_total:
+                raise ValueError(f"{field_name} counts must sum to {expected_total}")
+        if not all(self.workload_mix.values()):
+            raise ValueError("mixed workloads require at least one measured request per task")
+        if self.dataset_path is None:
+            raise ValueError("mixed-image-text requires an image dataset directory")
 
     @property
     def is_stream_task(self) -> bool:

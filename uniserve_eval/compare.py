@@ -42,6 +42,13 @@ _FAMILY_METRICS: dict[str, list[tuple[str, str, bool]]] = {
         ("mean_itl_ms", "metrics.mean_itl_ms", False),
         ("mean_e2e_latency_ms", "metrics.mean_e2e_latency_ms", False),
     ],
+    "mixed": [
+        ("mixed_request_throughput", "metrics.mixed_request_throughput", True),
+        ("t2i_images_per_minute", "metrics.t2i.images_per_minute", True),
+        ("i2t_output_throughput", "metrics.i2t.output_throughput", True),
+        ("t2i_image_latency_ms.mean", "metrics.t2i.image_latency_ms.mean", False),
+        ("i2t_mean_e2e_latency_ms", "metrics.i2t.mean_e2e_latency_ms", False),
+    ],
 }
 
 _COMMON_METRICS: list[tuple[str, str, bool]] = [
@@ -72,8 +79,8 @@ def _load_summaries(config: dict[str, Any], names: list[str]) -> dict[str, dict[
         summary = json.loads(path.read_text(encoding="utf-8"))
         command, workload, server = resolved_perf_command(config, name)
         spec = spec_from_harness_command(command)
-        rows, _ = load_benchmark_inputs(spec)
-        expected_contract = benchmark_contract(spec, rows)
+        inputs = load_benchmark_inputs(spec)
+        expected_contract = benchmark_contract(spec, inputs.measured)
         profile_fingerprint = perf_profile_contract_fingerprint(
             command,
             workload,
@@ -119,9 +126,7 @@ def compare_workloads(
         harness_parity = benchmark_parity_contract(artifact["contract"])
         profile_contract = artifact.get("profile_contract")
         model_contract = (
-            profile_contract.get("model_contract")
-            if isinstance(profile_contract, dict)
-            else None
+            profile_contract.get("model_contract") if isinstance(profile_contract, dict) else None
         )
         if not isinstance(model_contract, dict):
             raise SystemExit(f"benchmark {name!r} has no model-content provenance")
@@ -131,9 +136,7 @@ def compare_workloads(
             "model": model_contract,
         }
         parity[name] = {**payload, "fingerprint": canonical_digest(payload)}
-    parity_fingerprints = {
-        name: contract["fingerprint"] for name, contract in parity.items()
-    }
+    parity_fingerprints = {name: contract["fingerprint"] for name, contract in parity.items()}
     if len(set(parity_fingerprints.values())) != 1:
         raise SystemExit(
             "refusing to compare workloads with different protocol or workload contracts: "
@@ -183,7 +186,9 @@ def compare_workloads(
     for row in rows:
         cells = [str(row["metric"]), _fmt_value(row["values"][baseline])]
         for candidate in candidates:
-            cells.extend([_fmt_value(row["values"][candidate]), _fmt_ratio(row["ratios"][candidate])])
+            cells.extend(
+                [_fmt_value(row["values"][candidate]), _fmt_ratio(row["ratios"][candidate])]
+            )
         lines.append("| " + " | ".join(cells) + " |")
     table = "\n".join(lines)
 
