@@ -384,7 +384,7 @@ def test_forward_graph_paged_kv_view_refreshes_tables_without_reallocating_tenso
     assert view.persistent_cache_seqlens_after().tolist() == [6, 1]
     assert refreshed_page_ids.tolist() == [4, 4, 1, 1, 1]
     assert refreshed_offsets.tolist() == [0, 1, 1, 2, 3]
-    assert view.max_seqlen_k() == 6
+    assert view.max_seqlen_k() == 8
 
     k = torch.arange(10, dtype=torch.float32).view(5, 1, 2)
     v = -k
@@ -406,6 +406,29 @@ def test_forward_graph_paged_kv_view_rejects_geometry_changes():
 
     with pytest.raises(Exception, match="geometry"):
         view.refresh([ForwardPagedKVSegment(block_ids=(0,), base_len=0, q_len=2)])
+
+
+def test_forward_graph_paged_kv_view_refreshes_within_block_capacity():
+    pool = PagedKVPool(1, 6, 4, 1, 2, device="cpu", dtype=torch.float32)
+    view = ForwardGraphPagedKVView(
+        pool,
+        [ForwardPagedKVSegment(block_ids=(0, 1), base_len=3, q_len=1)],
+        block_width_capacity=4,
+    )
+    table_ptr = view.block_table().data_ptr()
+
+    view.refresh(
+        [ForwardPagedKVSegment(block_ids=(1, 2, 3), base_len=8, q_len=1)]
+    )
+
+    assert view.block_table().data_ptr() == table_ptr
+    assert view.block_table().tolist() == [[1, 2, 3, 0]]
+    assert view.cache_seqlens_after().tolist() == [9]
+    assert view.max_seqlen_k() == 16
+    with pytest.raises(Exception, match="block-table width"):
+        view.refresh(
+            [ForwardPagedKVSegment(block_ids=(0, 1, 2, 3, 4), base_len=8, q_len=1)]
+        )
 
 
 def test_forward_paged_kv_view_requires_one_pool():

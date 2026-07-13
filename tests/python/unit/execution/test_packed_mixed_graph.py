@@ -226,8 +226,8 @@ def _write_cache_span(cache: PagedTextCache, *, start: int, length: int) -> None
         cache.pool.write(layer_idx, cache.block_ids, start=int(start), k=k, v=v)
 
 
-def test_packed_mixed_graph_key_reuses_block_capacity_across_base_lengths():
-    pool = PagedKVPool(1, 4, 4, 1, 2, device="cpu", dtype=torch.float32)
+def test_packed_mixed_graph_key_reuses_paged_kv_capacity_bucket():
+    pool = PagedKVPool(1, 6, 4, 1, 2, device="cpu", dtype=torch.float32)
     owner = SimpleNamespace()
     backend = SimpleNamespace(name="graph_backend")
     embeds = torch.zeros((1, 4), dtype=torch.float32)
@@ -240,7 +240,7 @@ def test_packed_mixed_graph_key_reuses_block_capacity_across_base_lengths():
         _decode_stream(prefix_len=1),
         ForwardPagedKVView(
             pool,
-            [ForwardPagedKVSegment(block_ids=(0, 1), base_len=1, q_len=1)],
+            [ForwardPagedKVSegment(block_ids=(0, 1, 2), base_len=1, q_len=1)],
         ),
         backend,
     )
@@ -251,7 +251,7 @@ def test_packed_mixed_graph_key_reuses_block_capacity_across_base_lengths():
         _decode_stream(prefix_len=2),
         ForwardPagedKVView(
             pool,
-            [ForwardPagedKVSegment(block_ids=(0, 1), base_len=2, q_len=1)],
+            [ForwardPagedKVSegment(block_ids=(0, 1, 2, 3), base_len=2, q_len=1)],
         ),
         backend,
     )
@@ -262,7 +262,7 @@ def test_packed_mixed_graph_key_reuses_block_capacity_across_base_lengths():
         _decode_stream(prefix_len=2),
         ForwardPagedKVView(
             pool,
-            [ForwardPagedKVSegment(block_ids=(0, 1, 2), base_len=2, q_len=1)],
+            [ForwardPagedKVSegment(block_ids=(0, 1, 2, 3, 4), base_len=2, q_len=1)],
         ),
         backend,
     )
