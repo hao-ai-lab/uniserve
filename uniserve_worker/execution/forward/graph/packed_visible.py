@@ -221,8 +221,13 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
     ) -> PackedMixedGraphState:
         first_attn = _first_attention(owner)
-        graph_kv_view = ForwardGraphPagedKVView(kv_view.pool, kv_view.segments)
-        max_context_len = _max_context_len(kv_view)
+        block_width_capacity = _graph_block_width_capacity(kv_view)
+        graph_kv_view = ForwardGraphPagedKVView(
+            kv_view.pool,
+            kv_view.segments,
+            block_width_capacity=block_width_capacity,
+        )
+        max_context_len = graph_kv_view.max_seqlen_k()
         metadata = TextAttentionMetadata(
             cache=graph_kv_view,
             block_table=graph_kv_view.block_table(device=packed_embeds.device),
@@ -322,7 +327,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         state.metadata.cache_seqlens = state.kv_view.cache_seqlens_after(device=packed_embeds.device)
         state.metadata.cu_seqlens_q = state.stream_state.stream.cu_seqlens_q
         state.metadata.cu_seqlens_k = state.kv_view.cu_seqlens_after(device=packed_embeds.device)
-        state.metadata.max_context_len = max(state.metadata.max_context_len, _max_context_len(kv_view))
+        state.metadata.max_context_len = state.kv_view.max_seqlen_k()
         if state.promotion_source_index is not None and text_kv_promotions:
             PackedMixedGraphRunner._copy_promotion_indices(state, text_kv_promotions)
 
@@ -494,8 +499,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
     ) -> tuple[Any, ...] | None:
         if tuple(image_gen_indicators.shape) != (int(packed_embeds.shape[0]),):
             return None
-        block_width = max((len(seg.block_ids) for seg in kv_view.segments), default=0)
-        if block_width <= 0:
+        block_width_capacity = _graph_block_width_capacity(kv_view)
+        if block_width_capacity <= 0:
             return None
         return (
             id(owner),
@@ -509,9 +514,9 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             _stream_geometry(forward_stream),
             _modality_index_geometry(forward_stream),
             _kv_geometry(kv_view),
-            int(block_width),
+            int(block_width_capacity),
             int(kv_view.pool.block_size),
-            int(_max_context_len(kv_view)),
+            int(block_width_capacity * int(kv_view.pool.block_size)),
             _promotion_geometry(text_kv_promotions),
         )
 
@@ -670,6 +675,14 @@ def _cache_positions(pool: Any, block_ids: list[int], start: int, length: int) -
 
 def _max_context_len(kv_view: ForwardPagedKVView) -> int:
     return max((len(seg.block_ids) * int(kv_view.pool.block_size) for seg in kv_view.segments), default=0)
+
+
+def _graph_block_width_capacity(kv_view: ForwardPagedKVView) -> int:
+    required = max((len(seg.block_ids) for seg in kv_view.segments), default=0)
+    if required <= 0:
+        return 0
+    bucket = 1 << (required - 1).bit_length()
+    return min(bucket, int(kv_view.pool.num_blocks))
 
 
 def _backend_can_host_graph(backend: Any) -> bool:

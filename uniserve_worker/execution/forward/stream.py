@@ -467,6 +467,7 @@ class ForwardGraphPagedKVView:
         segments: list[ForwardPagedKVSegment] | tuple[ForwardPagedKVSegment, ...],
         *,
         device: torch.device | str | None = None,
+        block_width_capacity: int | None = None,
     ) -> None:
         self.pool = pool
         self.segments = _normalize_forward_paged_segments(pool, segments)
@@ -474,7 +475,14 @@ class ForwardGraphPagedKVView:
         self._device = torch.device(device if device is not None else pool.k.device)
         if self._device != pool.k.device:
             raise invalid_descriptor("forward graph paged KV view device must match the pool")
-        self._block_width = max(len(seg.block_ids) for seg in self.segments)
+        required_block_width = max(len(seg.block_ids) for seg in self.segments)
+        self._block_width = (
+            required_block_width
+            if block_width_capacity is None
+            else int(block_width_capacity)
+        )
+        if self._block_width < required_block_width or self._block_width > int(pool.num_blocks):
+            raise invalid_descriptor("forward graph paged KV block-table capacity is invalid")
         self._total_tokens = sum(int(seg.q_len) for seg in self.segments)
         self._write_tokens = sum(int(seg.q_len) for seg in self.segments if seg.write_kv)
         segment_count = len(self.segments)
@@ -672,7 +680,7 @@ class ForwardGraphPagedKVView:
         return self._persistent_cache_seqlens_after
 
     def max_seqlen_k(self) -> int:
-        return max((int(seg.base_len) + int(seg.q_len) for seg in self.segments), default=0)
+        return int(self._block_width) * int(self.pool.block_size)
 
     def append_packed(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         if k.shape != v.shape:
