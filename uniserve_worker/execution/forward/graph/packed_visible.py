@@ -92,6 +92,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         self._hard_disabled = False
         self._backend_ineligible = False
         self._replays = 0
+        self.last_miss_reason: str | None = None
 
     def enabled(self) -> bool:
         return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
@@ -106,13 +107,20 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         kv_view: ForwardPagedKVView,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
     ) -> torch.Tensor | None:
-        if not self.enabled() or not torch.cuda.is_available():
+        self.last_miss_reason = None
+        if not self.enabled():
+            self.last_miss_reason = "runner_disabled"
+            return None
+        if not torch.cuda.is_available():
+            self.last_miss_reason = "cuda_unavailable"
             return None
         if packed_embeds.device.type != "cuda":
+            self.last_miss_reason = "inputs_not_cuda"
             return None
         ctx = get_forward_context()
         backend = self._resolve_graph_backend(ctx, owner, packed_embeds, forward_stream, kv_view)
         if backend is None:
+            self.last_miss_reason = "backend_ineligible"
             self._backend_ineligible = True
             self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
             if self.logger is not None:
@@ -136,6 +144,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             promotions,
         )
         if key is None or key in self.disabled:
+            self.last_miss_reason = "shape_ineligible" if key is None else "shape_disabled"
             self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
             return None
         out = self._capture_or_replay(
@@ -170,6 +179,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             after_copy_metric=f"{self.metric_prefix}graph_attention_prepare",
         )
         if out is None:
+            self.last_miss_reason = "capture_or_replay_failed"
             return None
         self._replays += 1
         if self._replays == 1 and self.logger is not None:
