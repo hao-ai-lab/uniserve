@@ -1,6 +1,7 @@
 """Activation helpers shared by model definitions."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Callable
 
 import torch
@@ -27,6 +28,19 @@ except Exception:  # pragma: no cover
 # four warps per program. SiLU and multiplication are evaluated in FP32 before
 # the output is converted to its storage dtype.
 _TRITON_ACT_BLOCK = 1024
+_TRITON_MAX_SIGNED_INDEX = (1 << 31) - 1
+
+
+def _triton_act_row_chunks(rows: int, n_cols: int) -> Iterator[tuple[int, int]]:
+    """Partition rows so every kernel launch uses int32-safe element offsets."""
+
+    rows = int(rows)
+    n_cols = int(n_cols)
+    if rows < 0 or n_cols <= 0:
+        raise ValueError("activation row geometry must be non-negative with positive columns")
+    rows_per_launch = max(1, _TRITON_MAX_SIGNED_INDEX // (2 * n_cols))
+    for start in range(0, rows, rows_per_launch):
+        yield start, min(rows, start + rows_per_launch)
 
 
 if triton is not None:
@@ -76,10 +90,19 @@ class _TritonSiluAndMul:
         out = torch.empty((*x.shape[:-1], n_cols), dtype=x.dtype, device=x.device)
         rows = out.numel() // n_cols
         block = _TRITON_ACT_BLOCK
-        # Rows on axis 0 (the 2^31-limited axis); column blocks on axis 1,
-        # which stays tiny (n_cols/block) for every model width in tree.
-        grid = (rows, triton.cdiv(n_cols, block))
-        _silu_and_mul_kernel[grid](x, out, n_cols, block, num_warps=4)
+        x_rows = x.view(rows, 2 * n_cols)
+        out_rows = out.view(rows, n_cols)
+        for start, end in _triton_act_row_chunks(rows, n_cols):
+            # Rows on axis 0 and column blocks on axis 1. Each launch rebases
+            # its pointers so the kernel's fast int32 offsets cannot overflow.
+            grid = (end - start, triton.cdiv(n_cols, block))
+            _silu_and_mul_kernel[grid](
+                x_rows[start:end],
+                out_rows[start:end],
+                n_cols,
+                block,
+                num_warps=4,
+            )
         return out
 
 
