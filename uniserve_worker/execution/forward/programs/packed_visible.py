@@ -261,6 +261,8 @@ def _run_packed_mixed_forward_impl(
     require_graph: bool = False,
 ) -> bool | ForwardResult:
     if owner.model is None:
+        if require_graph:
+            raise capability_mismatch("packed mixed graph requires a loaded model")
         return False
     batch = plan.batch
     builder = ForwardStreamBuilder()
@@ -333,6 +335,11 @@ def _run_packed_mixed_forward_impl(
                     owner._extend_cache_blocks(cache, dict(op))
                     owner._ensure_host_cache(cache)
                     if cache.past is None:
+                        if require_graph:
+                            raise capability_mismatch(
+                                "packed mixed graph requires a paged text cache",
+                                details=current_context,
+                            )
                         return False
                     current_context.update(
                         {
@@ -387,6 +394,15 @@ def _run_packed_mixed_forward_impl(
                             )
                     pool = staged_cache.pool
                     if not owner._same_kv_pool(pool, first_pool):
+                        if require_graph:
+                            raise capability_mismatch(
+                                "packed mixed graph requires one KV pool",
+                                details={
+                                    **current_context,
+                                    "target_pool": type(first_pool).__name__,
+                                    "row_pool": type(pool).__name__,
+                                },
+                            )
                         return False
                     first_pool = pool if first_pool is None else first_pool
                     ids = _forward_text_input_ids(
@@ -436,10 +452,25 @@ def _run_packed_mixed_forward_impl(
                         with profile_range("uniserve.packed_mixed.denoise_branch_inputs"):
                             indexes, cache = owner._denoise_branch_inputs(img, branch)
                         if cache is None or getattr(cache, "pool", None) is None:
+                            if require_graph:
+                                raise capability_mismatch(
+                                    "packed mixed graph requires a paged denoise cache",
+                                    details={**current_context, "branch": str(branch)},
+                                )
                             return False
                         owner._wait_gen_cache_ready(cache)
                         pool = cache.pool
                         if not owner._same_kv_pool(pool, first_pool):
+                            if require_graph:
+                                raise capability_mismatch(
+                                    "packed mixed graph requires one KV pool",
+                                    details={
+                                        **current_context,
+                                        "branch": str(branch),
+                                        "target_pool": type(first_pool).__name__,
+                                        "row_pool": type(pool).__name__,
+                                    },
+                                )
                             return False
                         first_pool = pool if first_pool is None else first_pool
                         q_len = int(step.extra["image_embeds"].shape[1])
@@ -447,6 +478,18 @@ def _run_packed_mixed_forward_impl(
                         if callable(ensure_capacity):
                             ensure_capacity(int(cache.length) + q_len)
                         if indexes is None or tuple(indexes.shape) != (3, q_len):
+                            if require_graph:
+                                raise capability_mismatch(
+                                    "packed mixed graph denoise indexes do not match the token geometry",
+                                    details={
+                                        **current_context,
+                                        "branch": str(branch),
+                                        "expected_shape": [3, q_len],
+                                        "actual_shape": None
+                                        if indexes is None
+                                        else list(indexes.shape),
+                                    },
+                                )
                             return False
                         segment_start = _append_packed_chunk(
                             embed_chunks,
@@ -481,6 +524,11 @@ def _run_packed_mixed_forward_impl(
                     # after this packed text/denoise forward has updated latent state.
                     pass
                 else:
+                    if require_graph:
+                        raise capability_mismatch(
+                            "packed mixed graph received an unsupported mode",
+                            details=current_context,
+                        )
                     return False
                 current_context = None
             flush_text_rows()
@@ -500,6 +548,15 @@ def _run_packed_mixed_forward_impl(
         timing.stop("build_ms", build_start)
         ctx.record_component_elapsed("packed_mixed_build", build_stats_start)
         if first_pool is None or not embed_chunks:
+            if require_graph:
+                raise capability_mismatch(
+                    "packed mixed graph has no decoder segments",
+                    details={
+                        "pool_available": first_pool is not None,
+                        "embed_chunk_count": len(embed_chunks),
+                        "op_modes": [mode.value for mode in batch.op_modes],
+                    },
+                )
             return False
         stream_stats_start = ctx.component_timer_start()
         stream_start = timing.start()
@@ -554,7 +611,20 @@ def _run_packed_mixed_forward_impl(
         graph_promoted_text_kv = hidden is not None and bool(graph_text_kv_promotions)
         if hidden is None:
             if require_graph:
-                return False
+                graph_runner = getattr(owner, "_packed_mixed_graph_runner", None)
+                raise capability_mismatch(
+                    "packed mixed CUDA graph did not produce hidden states",
+                    details={
+                        "graph_miss_reason": getattr(graph_runner, "last_miss_reason", None),
+                        "packed_tokens": int(packed_embeds.shape[0]),
+                        "segments": len(forward_stream.segments),
+                        "block_width": max(
+                            (len(segment.block_ids) for segment in kv_view.segments),
+                            default=0,
+                        ),
+                        "promotion_count": len(graph_text_kv_promotions),
+                    },
+                )
             hidden = owner.packed_decoder_forward(
                 packed_embeds,
                 image_gen_indicators=packed_indicators,
@@ -833,6 +903,11 @@ def _run_packed_mixed_forward_impl(
             for result_index, step in plan.denoise_steps:
                 velocities = branch_velocities.get(result_index)
                 if not velocities:
+                    if require_graph:
+                        raise capability_mismatch(
+                            "packed mixed graph produced no denoise velocities",
+                            details={"row_index": int(result_index)},
+                        )
                     return False
                 velocity = plan.denoise_cfg_plan_for_row(result_index).combine(velocities)
                 updated = euler_step(step.latent, velocity, step.t, step.t_next)
