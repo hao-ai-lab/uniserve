@@ -653,8 +653,8 @@ struct InflightOp {
     op_id: Option<u64>,
     /// Speculative draft token ids attached to this op (empty when none).
     spec_tokens: Vec<u32>,
-    /// Sequential text decode tokens requested by this op. Values above one
-    /// make dependent decode lookahead unsafe until the op resolves.
+    /// Sequential text decode tokens requested by this op. Projected cursors
+    /// account for the full count while the device relay chains the next op.
     decode_token_count: u16,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
@@ -1938,10 +1938,17 @@ impl Scheduler {
             .is_some_and(|items| items.iter().any(|op| !op.spec_tokens.is_empty()))
     }
 
-    fn inflight_has_multi_decode(&self, id: RequestId) -> bool {
-        self.inflight_ops
-            .get(&id)
-            .is_some_and(|items| items.iter().any(|op| op.decode_token_count > 1))
+    fn inflight_generated_token_count(&self, id: RequestId) -> usize {
+        self.inflight_ops.get(&id).map_or(0, |items| {
+            items
+                .iter()
+                .map(|op| match op.transition.kind {
+                    OpKind::DecodeUnd => usize::from(op.decode_token_count.max(1)),
+                    OpKind::PrefillUnd => 1,
+                    _ => 0,
+                })
+                .sum()
+        })
     }
 
     fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
@@ -2902,11 +2909,7 @@ impl Scheduler {
             return false;
         }
         let depth = self.inflight_decode_count(id);
-        if depth == 0
-            || self.inflight_has_non_decode(id)
-            || self.inflight_has_spec_tokens(id)
-            || self.inflight_has_multi_decode(id)
-        {
+        if depth == 0 || self.inflight_has_non_decode(id) || self.inflight_has_spec_tokens(id) {
             return false;
         }
         let sp = &st.req.sampling;
@@ -2918,7 +2921,11 @@ impl Scheduler {
             && sp.ignore_eos
             && st.req.stop_token_ids.is_empty()
             && st.und.tokens_emitted >= sp.min_tokens
-            && st.und.tokens_emitted.saturating_add(depth) < st.req.max_und_tokens
+            && st
+                .und
+                .tokens_emitted
+                .saturating_add(self.inflight_generated_token_count(id))
+                < st.req.max_und_tokens
             && !sp.generated_logprobs_requested()
             && sp.bad_words_ids.is_empty()
             && !penalties
@@ -2973,8 +2980,11 @@ impl Scheduler {
             && sp.ignore_eos
             && st.req.stop_token_ids.is_empty()
             && st.und.tokens_emitted >= sp.min_tokens
-            // prefill samples one token, the lookahead decode a second.
-            && st.und.tokens_emitted.saturating_add(2) <= st.req.max_und_tokens
+            && st
+                .und
+                .tokens_emitted
+                .saturating_add(self.inflight_generated_token_count(id))
+                < st.req.max_und_tokens
             && !sp.generated_logprobs_requested()
             && sp.bad_words_ids.is_empty()
             && !penalties
@@ -2987,7 +2997,6 @@ impl Scheduler {
     fn decode_burst_plan(
         &self,
         id: RequestId,
-        use_last_sampled: bool,
         pos: usize,
         budget: usize,
         allowed: Option<&[u32]>,
@@ -2995,12 +3004,7 @@ impl Scheduler {
         let Some(st) = self.running.get(&id) else {
             return (1, None, false);
         };
-        if self.decode_token_burst <= 1
-            || use_last_sampled
-            || budget <= 1
-            || st.lifecycle.phase != Phase::DecodeUnd
-            || st.grammar.is_some()
-            || allowed.is_some()
+        if self.decode_token_burst <= 1 || budget <= 1 || st.grammar.is_some() || allowed.is_some()
         {
             return (1, None, false);
         }
@@ -3017,7 +3021,11 @@ impl Scheduler {
             return (1, None, false);
         }
 
-        let remaining = st.req.max_und_tokens.saturating_sub(st.und.tokens_emitted);
+        let remaining = st
+            .req
+            .max_und_tokens
+            .saturating_sub(st.und.tokens_emitted)
+            .saturating_sub(self.inflight_generated_token_count(id));
         let count = self
             .decode_token_burst
             .min(remaining.min(u16::MAX as usize).max(1) as u16)
@@ -3648,14 +3656,8 @@ impl Scheduler {
                 };
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) = self
-                    .decode_burst_plan(
-                        id,
-                        use_last_sampled,
-                        pos as usize,
-                        budget,
-                        allowed.as_deref(),
-                    );
+                let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) =
+                    self.decode_burst_plan(id, pos as usize, budget, allowed.as_deref());
                 let spec_token_ids =
                     if !use_last_sampled && budget > 1 && self.supports_spec_decode() {
                         self.running.get(&id).and_then(|st| {
@@ -3807,7 +3809,7 @@ impl Scheduler {
                 let image_b64 = st.feedback.image_b64.clone();
                 let staged_image = st.feedback.staged_image;
                 let logical_positions = ingest.logical_positions;
-                let physical_kv_tokens = ingest.physical_kv_tokens;
+                let physical_kv_tokens = ingest.kv_effect(step_index)?;
                 let Some(image_b64) = image_b64 else {
                     self.finish(id, FinishReason::Error);
                     return None;
@@ -3884,7 +3886,7 @@ impl Scheduler {
                     is_final_step,
                     position: projection.logical_pos,
                     logical_positions: image.ingest.logical_positions,
-                    physical_kv_tokens: image.ingest.physical_kv_tokens,
+                    physical_kv_tokens: image.ingest.kv_effect(step_index)?,
                     worker_hash,
                     encoder_cache_key: persistent_cache_key,
                     cache_hit,
@@ -5636,6 +5638,7 @@ mod tests {
             uniserve_core::ImageIngestRecipe::vae_then_vit(
                 1,
                 uniserve_core::ImageKvEffect::WorkerDefined,
+                uniserve_core::ImageKvEffect::WorkerDefined,
             )
         } else {
             uniserve_core::ImageIngestRecipe::vit_only(
@@ -6175,6 +6178,60 @@ mod tests {
         sched.register_inflight(ops2[0].clone(), Instant::now());
         let (_new_reqs, ops3) = sched.assemble();
         assert!(ops3.is_empty(), "unexpected extra ops: {ops3:?}");
+    }
+
+    #[test]
+    fn assemble_preserves_decode_bursts_across_the_device_relay() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                mixed_prefill_tokens: 0,
+                ..Default::default()
+            },
+        );
+        sched.decode_lookahead = true;
+        sched.decode_token_burst = 8;
+        let mut req = test_request(1, 4);
+        req.max_und_tokens = 32;
+        req.sampling.ignore_eos = true;
+        compile_resources(&sched, &mut req);
+        let _rx = sched.submit_for_test(req);
+        sched.admit();
+        let id = RequestId(1);
+        if let Some(st) = sched.running.get_mut(&id) {
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.ingest.prompt_cursor = 4;
+            st.und.logical_pos = 4;
+            st.und.physical_kv_len = 4;
+            st.und.tokens_emitted = 1;
+            st.und.next_token = 11;
+        }
+
+        let (_new_reqs, first) = sched.assemble();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].token_source, TokenSource::Wire);
+        assert_eq!(first[0].decode_token_count, Some(8));
+        sched.register_inflight(first[0].clone(), Instant::now());
+
+        let (_new_reqs, relayed) = sched.assemble();
+        assert_eq!(
+            relayed.len(),
+            1,
+            "an in-flight burst must keep the relay pipeline full"
+        );
+        assert_eq!(relayed[0].token_source, TokenSource::LastSampled);
+        assert_eq!(relayed[0].decode_token_count, Some(8));
+        assert_eq!(relayed[0].pos_range, (12, 13));
     }
 
     #[test]

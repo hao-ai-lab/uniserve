@@ -120,6 +120,34 @@ def test_burst_relay_ops_carry_device_relay_tensor():
         assert int(tensor.numel()) == 1
 
 
+def test_relay_started_burst_continues_from_the_previous_burst_tail():
+    model = _ScriptedTextModel([5, 6, 8, 9, 10])
+    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    first = runner.execute(
+        {
+            "step_id": 1,
+            "new_reqs": [{"req_id": 4, "sampling": {"temperature": 0.0}}],
+            "ops": [_burst_op(3, stop_ids=[])],
+        }
+    )["per_seq"][0]
+    second_op = _burst_op(2, stop_ids=[])
+    second_op["token_source"] = "last_sampled"
+    second_op["token_ids"] = [-1]
+    second_op["pos_range"] = [10, 11]
+    second = runner.execute(
+        {
+            "step_id": 2,
+            "new_reqs": [],
+            "ops": [second_op],
+        }
+    )["per_seq"][0]
+
+    assert first["sampled_token_ids"] == [5, 6, 8]
+    assert second["sampled_token_ids"] == [9, 10]
+    assert model.seen_tokens == [[11], [5], [6], [8], [9]]
+    assert model.seen_sources == ["wire", "last_sampled", "last_sampled", "last_sampled", "last_sampled"]
+
+
 def test_multi_row_burst_returns_token_lists_for_each_row():
     model = _ScriptedTextModel([5, 6, 7, 8])
     runner = ModelRunner(model, config=RunnerConfig(simulation=True))
