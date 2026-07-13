@@ -3936,7 +3936,6 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                 }
             )
 
-        warned_graph_fallback = False
         while any(not bool(item["done"]) for item in active):
             iter_ops: list[dict[str, Any]] = []
             iter_items: list[dict[str, Any]] = []
@@ -3981,22 +3980,9 @@ class SenseNovaU1ForUnifiedGeneration(UniModelBase, TextImageDenoiseOps):
                 defer_cpu_results=True,
             )
             if followup_results is None:
-                if not warned_graph_fallback:
-                    logger.warning(
-                        "packed decode burst follow-up CUDA graph unavailable; using eager packed follow-up"
-                    )
-                    warned_graph_fallback = True
-                followup_batch = UniForwardBatch.from_ops(iter_ops)
-                followup_results = [None] * len(iter_ops)
-                if not run_packed_mixed_forward(
-                    self,
-                    followup_batch,
-                    request_states,
-                    [],
-                    followup_results,
-                    defer_text_cpu_results=True,
-                ):
-                    raise capability_mismatch("packed decode burst follow-up could not run")
+                raise capability_mismatch(
+                    "packed decode burst follow-up requires CUDA graph coverage"
+                )
 
             for item, output in zip(iter_items, followup_results, strict=True):
                 previous = item.get("pending")
