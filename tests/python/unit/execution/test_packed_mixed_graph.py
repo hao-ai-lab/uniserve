@@ -31,6 +31,12 @@ def test_packed_mixed_graph_runner_is_enabled_by_default():
     assert PackedMixedGraphRunner().enabled()
 
 
+def test_packed_mixed_graph_geometries_use_private_capture_pools():
+    runner = PackedMixedGraphRunner()
+
+    assert runner.capture_pool() is None
+
+
 def _decode_stream(prefix_len: int):
     builder = ForwardStreamBuilder()
     builder.add_segment(
