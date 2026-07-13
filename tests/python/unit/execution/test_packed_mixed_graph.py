@@ -45,19 +45,31 @@ def test_packed_mixed_graph_retires_inactive_geometry_before_capture(monkeypatch
         def reset(self) -> None:
             events.append("reset")
 
-    state = SimpleNamespace(
+    decode_state = SimpleNamespace(
         graph=Graph(),
         release_backend=lambda: events.append("release_backend"),
+        family="decode",
+    )
+    context_state = SimpleNamespace(
+        graph=Graph(),
+        release_backend=lambda: events.append("release_context_backend"),
+        family="context",
     )
     runner = PackedMixedGraphRunner()
-    runner.states["old"] = state
+    runner.states["old_decode"] = decode_state
+    runner.states["active_context"] = context_state
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: events.append("synchronize"))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
 
-    runner._retire_inactive_geometry("new", device=torch.device("cuda:0"))
+    runner._retire_inactive_geometry(
+        "new_decode",
+        family="decode",
+        device=torch.device("cuda:0"),
+    )
 
-    assert runner.states == {}
-    assert state.release_backend is None
+    assert runner.states == {"active_context": context_state}
+    assert decode_state.release_backend is None
+    assert context_state.release_backend is not None
     assert events == ["synchronize", "reset", "release_backend", "empty_cache"]
 
 
