@@ -681,10 +681,22 @@ class FlashInferAttentionBackend(_WrapperPool):
             raise RuntimeError("flashinfer paged prefill wrapper is not available")
         if metadata is None:
             raise ValueError("graph prefill wrapper binding requires a metadata identity")
+        block_table = getattr(metadata, "block_table", None)
+        cu_seqlens_q = getattr(metadata, "cu_seqlens_q", None)
+        if not isinstance(block_table, torch.Tensor) or not isinstance(cu_seqlens_q, torch.Tensor):
+            raise ValueError("graph prefill wrapper binding requires paged side-table tensors")
+        batch_size = int(cu_seqlens_q.numel()) - 1
+        if batch_size <= 0 or int(block_table.shape[0]) != batch_size:
+            raise ValueError("graph prefill wrapper binding side-table geometry mismatch")
         from .flashinfer_pool import _PREFILL_GRAPH_SCOPES
 
         scope = next(_PREFILL_GRAPH_SCOPES)
-        key, _wrapper = self._prefill_graph_wrapper(torch.device(device), scope=scope)
+        key, _wrapper = self._prefill_graph_wrapper(
+            torch.device(device),
+            scope=scope,
+            batch_size=batch_size,
+            max_indices=max(1, int(block_table.numel())),
+        )
         self._metadata_prefill_graph_wrappers[id(metadata)] = (key, _weakref_or_none(metadata))
         self.bind_graph((id(metadata), "prefill"), key)
 
