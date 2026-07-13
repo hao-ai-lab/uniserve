@@ -198,6 +198,22 @@ def test_bagel_latent_capacity_scales_for_concurrent_generation():
     assert caps.max_vae_grid_tokens == model.cfg.latent_token_capacity + caps.commit_marker_tokens
 
 
+def test_bagel_scratch_pool_reserves_request_kv_capacity_for_packed_staging():
+    from uniserve_worker.models.bagel import BagelForUnifiedGeneration
+
+    model = BagelForUnifiedGeneration(
+        config=None,
+        device="cpu",
+        block_size=64,
+        kv_token_capacity=65_536,
+    )
+    caps = model.caps(block_size=64, kv_token_capacity=65_536)
+
+    denoise_blocks = caps.scratch_capacity_tokens // 64
+    assert denoise_blocks == 1_024
+    assert model._scratch_num_blocks(64) == denoise_blocks + model.num_blocks
+
+
 def test_bagel_caps_bound_maximum_image_ingest_kv_writes():
     from uniserve_worker.models.bagel import BagelForUnifiedGeneration
 
