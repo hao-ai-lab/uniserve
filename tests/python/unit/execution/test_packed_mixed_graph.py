@@ -65,23 +65,14 @@ def _prefill_stream(prefix_len: int):
 
 def _resolver_inputs():
     pool = PagedKVPool(1, 4, 4, 1, 2, device="cpu", dtype=torch.float32)
+    attention = SimpleNamespace(
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        scale=0.5,
+    )
     owner = SimpleNamespace(
-        model=SimpleNamespace(
-            language_model=SimpleNamespace(
-                model=SimpleNamespace(
-                    layers=[
-                        SimpleNamespace(
-                            self_attn=SimpleNamespace(
-                                num_heads=1,
-                                num_kv_heads=1,
-                                head_dim=2,
-                                scaling=0.5,
-                            )
-                        )
-                    ]
-                )
-            )
-        )
+        packed_graph_attention=lambda: attention,
     )
     embeds = torch.zeros((1, 4), dtype=torch.float32)
     indicators = torch.zeros((1,), dtype=torch.bool)

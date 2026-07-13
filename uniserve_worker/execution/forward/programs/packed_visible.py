@@ -268,7 +268,7 @@ def _run_packed_mixed_forward_impl(
     builder = ForwardStreamBuilder()
     kv_segments: list[ForwardPagedKVSegment] = []
     embed_chunks: list[torch.Tensor] = []
-    indicator_spans: list[tuple[int, bool]] = []
+    indicator_chunks: list[tuple[int, bool] | torch.Tensor] = []
     first_pool = owner._forward_target_pool(plan.denoise_steps)
     device = torch.device(str(owner.device))
     current_context: dict[str, Any] | None = None
@@ -297,9 +297,10 @@ def _run_packed_mixed_forward_impl(
                 text_embeds = owner.packed_text_embeddings(input_ids).reshape(total_q, -1)
             segment_base = _append_packed_chunk(
                 embed_chunks,
-                indicator_spans,
+                indicator_chunks,
                 text_embeds,
                 image_tokens=False,
+                indicators=None,
                 device=device,
             )
             offset = 0
@@ -493,9 +494,10 @@ def _run_packed_mixed_forward_impl(
                             return False
                         segment_start = _append_packed_chunk(
                             embed_chunks,
-                            indicator_spans,
+                            indicator_chunks,
                             step.extra["image_embeds"].reshape(q_len, -1),
                             image_tokens=True,
+                            indicators=_packed_denoise_indicators(owner, step, q_len),
                             device=device,
                         )
                         with profile_range("uniserve.packed_mixed.denoise_segment"):
@@ -595,7 +597,7 @@ def _run_packed_mixed_forward_impl(
             packed_embeds = torch.cat(embed_chunks, dim=0)
             packed_indicators = _packed_indicator_tensor(
                 owner,
-                indicator_spans,
+                indicator_chunks,
                 device=device,
             )
         hidden = None
@@ -1050,38 +1052,73 @@ def _sync_host_cache_blocks(
 
 def _append_packed_chunk(
     embed_chunks: list[torch.Tensor],
-    indicator_spans: list[tuple[int, bool]],
+    indicator_chunks: list[tuple[int, bool] | torch.Tensor],
     embeds: torch.Tensor,
     *,
     image_tokens: bool,
+    indicators: torch.Tensor | None,
     device: torch.device,
 ) -> int:
     del device
     start = sum(chunk.shape[0] for chunk in embed_chunks)
     q_len = int(embeds.shape[0])
     embed_chunks.append(embeds)
-    indicator_spans.append((q_len, bool(image_tokens)))
+    if indicators is None:
+        indicator_chunks.append((q_len, bool(image_tokens)))
+    else:
+        flat = indicators.reshape(-1)
+        if int(flat.numel()) != q_len:
+            raise invalid_descriptor("packed mixed modality mask does not match chunk length")
+        indicator_chunks.append(flat)
     return start
+
+
+def _packed_denoise_indicators(
+    owner: Any,
+    step: TextImageDenoiseStep,
+    q_len: int,
+) -> torch.Tensor | None:
+    build = getattr(owner, "packed_denoise_indicators", None)
+    if not callable(build):
+        return None
+    indicators = build(step, int(q_len))
+    if indicators is not None and not isinstance(indicators, torch.Tensor):
+        raise invalid_descriptor("packed denoise modality indicators must be a tensor")
+    return indicators
 
 
 def _packed_indicator_tensor(
     owner: Any,
-    spans: Sequence[tuple[int, bool]],
+    chunks: Sequence[tuple[int, bool] | torch.Tensor],
     *,
     device: torch.device,
 ) -> torch.Tensor:
-    total = sum(int(length) for length, _value in spans)
+    total = sum(
+        int(chunk.numel()) if isinstance(chunk, torch.Tensor) else int(chunk[0])
+        for chunk in chunks
+    )
     if total <= 0:
         raise invalid_descriptor("packed mixed indicators must not be empty")
-    if device.type != "cuda":
-        chunks = [
-            torch.full((int(length),), bool(value), dtype=torch.bool, device=device)
-            for length, value in spans
-            if int(length) > 0
-        ]
-        if len(chunks) == 1:
-            return chunks[0]
-        return torch.cat(chunks, dim=0)
+    if device.type != "cuda" or any(isinstance(chunk, torch.Tensor) for chunk in chunks):
+        tensors: list[torch.Tensor] = []
+        for chunk in chunks:
+            if isinstance(chunk, torch.Tensor):
+                if int(chunk.numel()) > 0:
+                    tensors.append(chunk.reshape(-1).to(device=device, dtype=torch.bool))
+                continue
+            length, value = chunk
+            if int(length) > 0:
+                tensors.append(
+                    torch.full(
+                        (int(length),),
+                        bool(value),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                )
+        if len(tensors) == 1:
+            return tensors[0]
+        return torch.cat(tensors, dim=0)
     stager = getattr(owner, "_packed_mixed_indicator_stager", None)
     if not isinstance(stager, TextTensorStager):
         stager = TextTensorStager(ring_depth=3)
@@ -1089,7 +1126,10 @@ def _packed_indicator_tensor(
     slot = stager.next_slot()
     cpu = slot.bool_buffer("packed_mixed_indicators", total, pin=True)
     offset = 0
-    for length, value in spans:
+    for chunk in chunks:
+        if isinstance(chunk, torch.Tensor):
+            raise invalid_descriptor("CUDA tensor modality chunks must use tensor packing")
+        length, value = chunk
         length = int(length)
         if length <= 0:
             continue

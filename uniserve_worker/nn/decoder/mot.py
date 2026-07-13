@@ -431,10 +431,9 @@ class MoTDecoderLayer(nn.Module):
         ``hidden_states`` ``[tokens, hidden]`` attend causally against the
         request's paged KV through the duck-typed layer-update protocol
         (``request_cache_for_update`` / ``finish_layer_update`` /
-        ``cancel_layer_update``). The protocol hands RadixAttention the same
-        per-request page view the eager ``Segment(causal=True)`` path passes
-        (PAGED_EXTEND for a multi-token span, PAGED_DECODE for one token), so
-        the numerics match :meth:`forward`'s text lane exactly.
+        ``cancel_layer_update``). The protocol hands RadixAttention a
+        per-request page view (PAGED_EXTEND for a multi-token span,
+        PAGED_DECODE for one token).
         """
         expert = self.experts[Modality.TEXT]
         n_tokens = int(hidden_states.shape[0])
@@ -500,16 +499,11 @@ class MoTDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """One layer step over ``batch`` transient CFG-branch rows of one gen segment.
 
-        The batched-rows twin of the eager ``Segment(causal=False,
-        update_cache=False)`` gen lane in :meth:`forward`: per-token math is
-        identical, and attention runs the GEN expert for every row (marker
-        tokens included, exactly like the eager path's per-segment expert
-        selection) over ``[row prefix + row tokens]`` through the batched
-        transient paged protocol (``request_cache_for_transient``): row K/V
-        land in scratch pages past each row's fixed base length — overwritten
-        next step, never persisted — and the paged varlen kernel reads the
-        prefix in place of the eager path's per-layer ``cache.get`` gather +
-        concat.
+        Attention runs the GEN expert for every row and the TEXT expert for the
+        marker-token indexes over ``[row prefix + row tokens]`` through the
+        batched transient paged protocol (``request_cache_for_transient``).
+        Row K/V land in scratch pages past each row's fixed base length and are
+        overwritten on the next step rather than persisted.
 
         Modality dispatch is *indexed*, not boolean-masked: a gen segment is
         almost entirely gen-modality (only the two image markers per row are
@@ -565,6 +559,61 @@ class MoTDecoderLayer(nn.Module):
                 raise RuntimeError("text expert rows are missing post-attention inputs")
             mlp_out.index_copy_(0, text_idx, text.mlp(normed_text.to(torch.bfloat16)))
         return hidden_states + mlp_out
+
+    def forward_packed_visible(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        *,
+        text_mask: torch.Tensor,
+        gen_mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        forward_stream: Any,
+        kv_view: Any,
+        any_text: bool,
+        any_gen: bool,
+    ) -> torch.Tensor:
+        """Run one mixed-modality layer over a packed visible-end stream."""
+
+        routes = self._present_routes(text_mask, gen_mask, any_text, any_gen)
+        normed = self._route_input_norm(hidden_states, routes)
+        q, k, v = self._project_qkv_by_modality(normed, routes, cos, sin)
+        kv_view.append_packed(layer_idx, k, v)
+        k_cache, v_cache = kv_view.pool.layer_cache(layer_idx)
+        max_seqlen_k_hook = getattr(kv_view, "max_seqlen_k", None)
+        max_seqlen_k = (
+            int(max_seqlen_k_hook())
+            if callable(max_seqlen_k_hook)
+            else max(
+                (int(segment.base_len) + int(segment.q_len) for segment in kv_view.segments),
+                default=0,
+            )
+        )
+        attention = self.experts[Modality.TEXT].attn
+        attention.layer_id = int(layer_idx)
+        attended = attention.forward_visible_end(
+            q,
+            k_cache,
+            v_cache,
+            visible_end=forward_stream.visible_end,
+            cu_seqlens_q=forward_stream.cu_seqlens_q,
+            page_table=kv_view.block_table(device=q.device),
+            seqused_k=kv_view.cache_seqlens_after(device=q.device),
+            max_seqlen_q=int(forward_stream.visible_end.shape[1]),
+            max_seqlen_k=max_seqlen_k,
+            scale=self.scale,
+            use_prefix_bounds=True,
+            fully_visible=bool(forward_stream.fully_visible),
+        )
+        attention_out = self._route_output_projection(
+            attended.reshape(hidden_states.shape[0], self.q_size),
+            hidden_states,
+            routes,
+        )
+        hidden_states = hidden_states + attention_out
+        post_norm = self._route_post_norm(hidden_states, routes)
+        return hidden_states + self._route_mlp(post_norm, hidden_states, routes)
 
     def _present_routes(
         self, text_mask, gen_mask, any_text, any_gen,
@@ -750,9 +799,8 @@ class MoTModel(nn.Module):
 
         Token-major ``inputs_embeds`` ``[tokens, hidden]`` with 1-D rope
         ``positions`` ``[tokens]``; ``past_key_values`` implements the paged
-        layer-update protocol (``PagedTextCache`` eagerly, the system decode
-        graph's past adapter under capture/replay). Returns final-norm hidden
-        states ``[tokens, hidden]``.
+        layer-update protocol implemented by ``PagedTextCache`` and graph past
+        adapters. Returns final-norm hidden states ``[tokens, hidden]``.
         """
         cos, sin = self.rotary.cos_sin_1d(positions)
         hidden_states = inputs_embeds
@@ -812,7 +860,7 @@ class MoTModel(nn.Module):
         (``request_cache_for_transient``) over per-row prefix caches sharing
         one pool. Returns modality-routed final-norm hidden ``[B, T, hidden]``.
         CUDA-graph callers pass the static flattened text-row ``text_idx``;
-        eager callers may omit it and derive the indexes from ``is_gen``.
+        callers without a precomputed layout may derive it from ``is_gen``.
         """
         batch, n_tokens, hidden_size = inputs_embeds.shape
         hidden_states = inputs_embeds.reshape(batch * n_tokens, hidden_size)
@@ -848,6 +896,68 @@ class MoTModel(nn.Module):
                 self.final_norm[Modality.TEXT](hidden_states.index_select(0, text_idx)),
             )
         return out.view(batch, n_tokens, hidden_size)
+
+    @torch.no_grad()
+    def forward_packed_visible(
+        self,
+        inputs_embeds: torch.Tensor,
+        *,
+        image_gen_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_stream: Any,
+        kv_view: Any,
+    ) -> torch.Tensor:
+        """Run text and image-generation tokens in one packed decoder sweep."""
+
+        if inputs_embeds.ndim != 2:
+            raise ValueError("BAGEL packed model expects inputs_embeds [N, C]")
+        token_count = int(inputs_embeds.shape[0])
+        if tuple(image_gen_indicators.shape) != (token_count,):
+            raise ValueError("BAGEL packed model expects image_gen_indicators [N]")
+        if indexes.ndim != 2 or int(indexes.shape[1]) != token_count:
+            raise ValueError("BAGEL packed model expects one position per token")
+        gen_mask = image_gen_indicators.to(dtype=torch.bool)
+        text_mask = ~gen_mask
+        has_gen_segment = any(
+            segment.modality == "gen" and int(segment.q_len) > 0
+            for segment in forward_stream.segments
+        )
+        any_gen = has_gen_segment
+        # Every BAGEL image-generation segment contains text-expert marker
+        # tokens at its boundaries.
+        any_text = has_gen_segment or any(
+            segment.modality == "und" and int(segment.q_len) > 0
+            for segment in forward_stream.segments
+        )
+        cos, sin = self.rotary.cos_sin_1d(indexes[0].reshape(-1))
+        hidden_states = inputs_embeds
+        for layer_idx, layer_module in enumerate(self.layers):
+            hidden_states = layer_module.forward_packed_visible(
+                layer_idx,
+                hidden_states,
+                text_mask=text_mask,
+                gen_mask=gen_mask,
+                cos=cos,
+                sin=sin,
+                forward_stream=forward_stream,
+                kv_view=kv_view,
+                any_text=any_text,
+                any_gen=any_gen,
+            )
+        routes: dict[
+            Modality,
+            tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]],
+        ] = {}
+        if any_text:
+            routes[Modality.TEXT] = (text_mask, self.final_norm[Modality.TEXT])
+        if any_gen:
+            routes[Modality.GEN] = (gen_mask, self.final_norm[Modality.GEN])
+        return route_by_modality(
+            hidden_states,
+            routes,
+            transport=self._tower_transport,
+            coords=self._tower_coords,
+        )
 
     @torch.no_grad()
     def forward_segments(self, segs: list[Segment]) -> list[torch.Tensor]:

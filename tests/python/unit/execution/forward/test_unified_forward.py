@@ -319,6 +319,15 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
         def packed_text_embeddings(self):
             raise AssertionError("fake packed runner owns the graph-only result")
 
+        def packed_text_logits(self):
+            raise AssertionError("fake packed runner owns the graph-only result")
+
+        def packed_hidden_to_velocity(self):
+            raise AssertionError("fake packed runner owns the graph-only result")
+
+        def packed_graph_attention(self):
+            raise AssertionError("fake packed runner owns the graph-only result")
+
     owner = Owner()
     states = RequestStates()
 
@@ -377,6 +386,15 @@ def test_packed_visible_graph_program_runs_decode_burst_as_graph_only_runtime_re
 
         def packed_text_embeddings(self):
             raise AssertionError("outer graph execution must not invoke eager text embedding")
+
+        def packed_text_logits(self):
+            raise AssertionError("outer graph execution must not invoke text projection")
+
+        def packed_hidden_to_velocity(self):
+            raise AssertionError("outer graph execution must not invoke velocity projection")
+
+        def packed_graph_attention(self):
+            raise AssertionError("outer graph execution must not inspect attention")
 
         def _run_forward_adapter(self, batch, **kwargs):
             self.calls.append({"batch": batch, **kwargs})
@@ -452,6 +470,12 @@ def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(mon
             raise AssertionError("fake packed runner owns the graph result")
 
         def packed_text_embeddings(self):
+            raise AssertionError("fake packed runner owns the graph result")
+
+        def packed_text_logits(self):
+            raise AssertionError("fake packed runner owns the graph result")
+
+        def packed_graph_attention(self):
             raise AssertionError("fake packed runner owns the graph result")
 
     class ImageDecodeDriver:

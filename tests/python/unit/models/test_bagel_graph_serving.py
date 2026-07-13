@@ -2,11 +2,129 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
+from uniserve_worker.execution.forward.graph.programs import PackedVisibleGraphProgram
+from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models import bagel as bagel_model
-from uniserve_worker.models.bagel import BagelForUnifiedGeneration
+from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig
+from uniserve_worker.nn.decoder import Modality, MoTModel
 
 pytestmark = pytest.mark.unit
+
+
+def test_bagel_binds_packed_visible_mixed_graph_program():
+    owner = BagelForUnifiedGeneration(device="cpu")
+    program = PackedVisibleGraphProgram(owner=owner, request_states=object())
+    plan = SimpleNamespace(
+        shape=SimpleNamespace(text_row_count=1, denoise_row_count=1, commit_row_count=0),
+        ops=[
+            {"req_id": 1, "kind": "decode_und"},
+            {"req_id": 2, "kind": "denoise_gen"},
+        ],
+    )
+
+    eligibility = program.can_run(SimpleNamespace(), plan)
+
+    assert eligibility.eligible is True
+
+
+def test_bagel_denoise_rejects_eager_execution(monkeypatch):
+    owner = BagelForUnifiedGeneration(device="cpu")
+    monkeypatch.setattr(owner, "_ensure_loaded", lambda: object())
+
+    with pytest.raises(WorkerError, match="requires CUDA graphs"):
+        owner.predict_text_image_velocity_batch([], [], graph_mode="eager")
+
+
+def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
+    calls = []
+
+    class PackedLayer(nn.Module):
+        def forward_packed_visible(
+            self,
+            layer_idx,
+            hidden_states,
+            *,
+            text_mask,
+            gen_mask,
+            cos,
+            sin,
+            forward_stream,
+            kv_view,
+            any_text,
+            any_gen,
+        ):
+            calls.append(
+                {
+                    "layer_idx": layer_idx,
+                    "text_mask": text_mask.clone(),
+                    "gen_mask": gen_mask.clone(),
+                    "cos": cos,
+                    "sin": sin,
+                    "forward_stream": forward_stream,
+                    "kv_view": kv_view,
+                    "any_text": any_text,
+                    "any_gen": any_gen,
+                }
+            )
+            return hidden_states + 1
+
+    class Rotary(nn.Module):
+        @staticmethod
+        def cos_sin_1d(positions):
+            return positions.float().unsqueeze(-1), positions.float().unsqueeze(-1) + 10
+
+    model = MoTModel(
+        LLMConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            vocab_size=16,
+        )
+    )
+    model.layers = nn.ModuleList([PackedLayer(), PackedLayer()])
+    model.rotary = Rotary()
+    model.norm = nn.Identity()
+    model.norm_moe_gen = nn.Identity()
+    model.final_norm = {
+        Modality.TEXT: model.norm,
+        Modality.GEN: model.norm_moe_gen,
+    }
+    hidden = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    # Two ordinary text tokens followed by one BAGEL denoise segment:
+    # marker, two latent tokens, marker.
+    is_gen = torch.tensor([False, False, False, True, True, False])
+    indexes = torch.tensor(
+        [
+            [0, 1, 7, 7, 7, 7],
+            [0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0],
+        ]
+    )
+    stream = SimpleNamespace(
+        segments=(
+            SimpleNamespace(modality="und", q_len=2),
+            SimpleNamespace(modality="gen", q_len=4),
+        )
+    )
+    kv_view = object()
+
+    output = model.forward_packed_visible(
+        hidden,
+        image_gen_indicators=is_gen,
+        indexes=indexes,
+        forward_stream=stream,
+        kv_view=kv_view,
+    )
+
+    assert len(calls) == 2
+    assert all(call["any_text"] is True and call["any_gen"] is True for call in calls)
+    assert all(call["text_mask"].tolist() == [True, True, True, False, False, True] for call in calls)
+    assert all(call["gen_mask"].tolist() == is_gen.tolist() for call in calls)
+    torch.testing.assert_close(output, hidden + 2)
 
 
 def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():

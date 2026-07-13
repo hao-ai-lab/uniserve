@@ -16,6 +16,9 @@ from uniserve_worker.backends.attention import (
     has_attention_backend,
 )
 from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.execution.forward.programs import packed_batch
+from uniserve_worker.execution.forward.programs.packed_batch import PackedVisibleBatchAdapter
+from uniserve_worker.execution.forward.programs.packed_model import PackedVisibleModelMixin
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.runtime_config import TorchCompileRuntimeConfig
 from uniserve_worker.foundation.triton_compat import triton_device_supported
@@ -2127,7 +2130,7 @@ def test_sensenova_packed_visible_fully_visible_uses_visible_end_backend():
     torch.testing.assert_close(pool.k[0, 1, :3], k[1:])
 
 
-def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
+def test_sensenova_admitted_forward_requires_whole_batch_graph(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
@@ -2146,13 +2149,14 @@ def test_sensenova_admitted_forward_does_not_split_fallback(monkeypatch):
             return {"req_id": req_id}
 
     monkeypatch.setattr(wrapper, "prepare_denoise", lambda _state, _op: object())
-    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(packed_batch, "run_packed_visible_forward_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(packed_batch, "run_packed_mixed_forward", lambda *_args, **_kwargs: False)
 
-    def split_fallback_called(_op):
-        raise AssertionError("admitted mixed batch must not use text split fallback")
+    def scalar_text_called(_op):
+        raise AssertionError("admitted mixed batch must stay whole")
 
-    monkeypatch.setattr(wrapper, "run_text_logits", split_fallback_called)
-    with pytest.raises(WorkerError, match="split-mode fallback is disabled"):
+    monkeypatch.setattr(wrapper, "run_text_logits", scalar_text_called)
+    with pytest.raises(WorkerError, match="did not execute as one packed graph"):
         wrapper._run_forward_adapter(
             batch,
             request_states=RequestStates(),
@@ -2316,7 +2320,6 @@ def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
 
 def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class GraphDriver:
@@ -2339,19 +2342,6 @@ def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
         def _text_driver(self):
             return self.driver
 
-        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
-            return sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_packed_decode_burst_graph_followup(
-                self,
-                ops,
-                request_states,
-                defer_cpu_results=defer_cpu_results,
-            )
-
-    def eager_followup_called(*_args):
-        raise AssertionError("graph-eligible burst follow-up should not use packed eager fallback")
-
-    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", eager_followup_called)
-
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
     state = states.get(7)
@@ -2373,8 +2363,7 @@ def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
     results = [{"req_id": 7, "sampled_token_id": 2}]
     owner = Owner()
 
-    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
-        owner,
+    PackedVisibleBatchAdapter(owner)._complete_decode_bursts(
         batch,
         states,
         results,
@@ -3137,7 +3126,6 @@ def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
         ForwardPagedKVSegment,
         ForwardStreamBuilder,
     )
-    from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -3257,14 +3245,14 @@ def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
             return first is None or candidate is first
 
         def _stage_text_cache_for_forward(self, *args, **kwargs):
-            return SenseNovaU1ForUnifiedGeneration._stage_text_cache_for_forward(
+            return PackedVisibleModelMixin._stage_text_cache_for_forward(
                 self,
                 *args,
                 **kwargs,
             )
 
         def _mark_forward_staging_advanced(self, *args, **kwargs):
-            return SenseNovaU1ForUnifiedGeneration._mark_forward_staging_advanced(
+            return PackedVisibleModelMixin._mark_forward_staging_advanced(
                 self,
                 *args,
                 **kwargs,
@@ -3272,7 +3260,7 @@ def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
 
         @staticmethod
         def _forward_staging_source_prefix(cache, length):
-            return SenseNovaU1ForUnifiedGeneration._forward_staging_source_prefix(cache, length)
+            return PackedVisibleModelMixin._forward_staging_source_prefix(cache, length)
 
         def packed_text_embeddings(self, ids):
             return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
@@ -3897,7 +3885,6 @@ def test_sensenova_packed_mixed_defers_text_cpu_result_when_not_burst(monkeypatc
 def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followup():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.execution.forward.deferred_text import DeferredTextSeqResult
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
 
@@ -3917,14 +3904,6 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
 
         def _text_driver(self):
             return self.driver
-
-        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
-            return sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_packed_decode_burst_graph_followup(
-                self,
-                ops,
-                request_states,
-                defer_cpu_results=defer_cpu_results,
-            )
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
@@ -3960,8 +3939,7 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
     )
     owner = Owner()
 
-    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
-        owner,
+    PackedVisibleBatchAdapter(owner)._complete_decode_bursts(
         batch,
         states,
         results,
@@ -3976,15 +3954,16 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
 
 def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class Owner:
-        def _run_packed_decode_burst_graph_followup(
-            self, _ops, _request_states, *, defer_cpu_results=False
-        ):
-            del defer_cpu_results
-            return None
+        class Driver:
+            @staticmethod
+            def try_run_decode_graph_logits_batch(_ops):
+                return None
+
+        def _text_driver(self):
+            return self.Driver()
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
@@ -4002,8 +3981,7 @@ def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
     results = [{"req_id": 7, "sampled_token_id": 2}]
 
     with pytest.raises(WorkerError, match="requires CUDA graph coverage") as exc_info:
-        sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
-            Owner(),
+        PackedVisibleBatchAdapter(Owner())._complete_decode_bursts(
             batch,
             states,
             results,
@@ -4015,7 +3993,6 @@ def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
 def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_finalizing():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.execution.forward.deferred_text import DeferredTextSeqResult
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
 
@@ -4040,7 +4017,7 @@ def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_fina
             self.calls: list[list[dict]] = []
             self.followup_sampling: GuardedSampling | None = None
 
-        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+        def run_followup(self, ops, request_states, *, defer_cpu_results=False):
             self.calls.append([dict(op) for op in ops])
             token = torch.tensor([5], dtype=torch.long)
             state = request_states.get(int(ops[0]["req_id"]))
@@ -4091,9 +4068,10 @@ def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_fina
         ]
     )
     owner = Owner()
+    adapter = PackedVisibleBatchAdapter(owner)
+    adapter._run_decode_burst_graph_followup = owner.run_followup
 
-    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
-        owner,
+    adapter._complete_decode_bursts(
         batch,
         states,
         results,
@@ -4112,7 +4090,6 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
         DeferredDecodeBurstSeqResult,
         DeferredTextSeqResult,
     )
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
 
@@ -4137,7 +4114,7 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
             self.calls: list[list[dict]] = []
             self.followup_samplings: list[GuardedSampling] = []
 
-        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+        def run_followup(self, ops, request_states, *, defer_cpu_results=False):
             del defer_cpu_results
             self.calls.append([dict(op) for op in ops])
             token = torch.tensor([3 + len(self.followup_samplings)], dtype=torch.long)
@@ -4184,9 +4161,10 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
         ]
     )
     owner = Owner()
+    adapter = PackedVisibleBatchAdapter(owner)
+    adapter._run_decode_burst_graph_followup = owner.run_followup
 
-    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
-        owner,
+    adapter._complete_decode_bursts(
         batch,
         states,
         results,
@@ -4208,7 +4186,6 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
         DeferredTerminalDecodeBurstSeqResult,
         DeferredTextSeqResult,
     )
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
 
@@ -4230,7 +4207,7 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
             self.calls: list[list[dict]] = []
             self.followup_samplings: list[GuardedSampling] = []
 
-        def _run_packed_decode_burst_graph_followup(self, ops, request_states, *, defer_cpu_results=False):
+        def run_followup(self, ops, request_states, *, defer_cpu_results=False):
             del defer_cpu_results
             self.calls.append([dict(op) for op in ops])
             token_values = [5, 7, 9]
@@ -4279,9 +4256,10 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
         ]
     )
     owner = Owner()
+    adapter = PackedVisibleBatchAdapter(owner)
+    adapter._run_decode_burst_graph_followup = owner.run_followup
 
-    sensenova_u1.SenseNovaU1ForUnifiedGeneration._complete_packed_decode_bursts(
-        owner,
+    adapter._complete_decode_bursts(
         batch,
         states,
         results,
@@ -4298,7 +4276,6 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
 
 
 def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(monkeypatch):
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
 
@@ -4325,17 +4302,12 @@ def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(mon
             copy_event=None,
         )
 
-    monkeypatch.setattr(
-        sensenova_u1,
-        "apply_sampling_batched_with_device_tokens",
-        fake_sampling,
-    )
+    monkeypatch.setattr(packed_batch, "apply_sampling_batched_with_device_tokens", fake_sampling)
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
     state = states.get(7)
-    outputs = sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_packed_decode_burst_graph_followup(
-        Owner(),
+    outputs = PackedVisibleBatchAdapter(Owner())._run_decode_burst_graph_followup(
         [
             {
                 "req_id": 7,
@@ -4363,20 +4335,9 @@ def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(mon
 
 def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
-    from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class Owner:
-        def __init__(self) -> None:
-            self.completed_decode = False
-            self.completed_denoise = False
-
-        def _complete_packed_decode_bursts(self, _batch, _request_states, _results, **_kwargs):
-            self.completed_decode = True
-
-        def _complete_packed_denoise_bursts(self, _batch, _request_states, _results):
-            self.completed_denoise = True
-
         def decode_image(self, _latent, *, req_id, state, op):
             assert req_id == 7
             assert op["kind"] == "commit_gen"
@@ -4395,7 +4356,7 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
         assert _kwargs["require_graph"] is True
         return True
 
-    monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", packed_forward)
+    monkeypatch.setattr(packed_batch, "run_packed_mixed_forward", packed_forward)
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
@@ -4407,15 +4368,11 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
     )
     owner = Owner()
 
-    results = sensenova_u1.SenseNovaU1ForUnifiedGeneration._run_forward_adapter(
-        owner,
+    results = PackedVisibleBatchAdapter(owner).execute(
         batch,
         request_states=states,
-        group=None,
     )
 
-    assert owner.completed_decode
-    assert owner.completed_denoise
     assert results[1]["image_png_b64"] == "png"
     assert results[1]["image_hw"] == [16, 16]
     assert results[1]["sampled_token_id"] == 5
