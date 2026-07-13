@@ -121,6 +121,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
+        text_kv_promotion_capacity: int | None = None,
     ) -> torch.Tensor | None:
         self.last_miss_reason = None
         if not self.enabled():
@@ -157,6 +158,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             kv_view,
             backend,
             promotions,
+            text_kv_promotion_capacity,
         )
         if key is None or key in self.disabled:
             self.last_miss_reason = "shape_ineligible" if key is None else "shape_disabled"
@@ -173,6 +175,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
                 forward_stream=forward_stream,
                 kv_view=kv_view,
                 text_kv_promotions=promotions,
+                text_kv_promotion_capacity=text_kv_promotion_capacity,
                 key=key,
                 ctx=ctx,
                 backend=backend,
@@ -219,6 +222,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         ctx: Any,
         backend: Any,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
+        text_kv_promotion_capacity: int | None = None,
     ) -> PackedMixedGraphState:
         first_attn = _first_attention(owner)
         block_width_capacity = _graph_block_width_capacity(kv_view)
@@ -256,7 +260,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         )
         if text_kv_promotions:
             source_pool, target_pool, source_index, target_index = _promotion_index_tensors(
-                text_kv_promotions
+                text_kv_promotions,
+                capacity=text_kv_promotion_capacity,
             )
             state.promotion_source_pool = source_pool
             state.promotion_target_pool = target_pool
@@ -336,15 +341,19 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         state: PackedMixedGraphState,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...],
     ) -> None:
-        source_pool, target_pool, source_positions, target_positions = _promotion_index_values(
-            text_kv_promotions
-        )
-        if source_pool is not state.promotion_source_pool or target_pool is not state.promotion_target_pool:
-            raise invalid_descriptor("packed mixed graph promotion pool changed")
         source_index = state.promotion_source_index
         target_index = state.promotion_target_index
         if source_index is None or target_index is None:
             return
+        source_pool, target_pool, source_positions, target_positions = _promotion_index_values(
+            text_kv_promotions,
+            capacity=int(source_index.numel()),
+        )
+        if (
+            source_pool is not state.promotion_source_pool
+            or target_pool is not state.promotion_target_pool
+        ):
+            raise invalid_descriptor("packed mixed graph promotion pool changed")
         slot = state.promotion_stager.acquire_slot(device=source_index.device)
         try:
             _copy_long_values_to_tensor(
@@ -496,6 +505,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         kv_view: ForwardPagedKVView,
         backend: Any,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
+        text_kv_promotion_capacity: int | None = None,
     ) -> tuple[Any, ...] | None:
         if tuple(image_gen_indicators.shape) != (int(packed_embeds.shape[0]),):
             return None
@@ -517,7 +527,10 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             int(block_width_capacity),
             int(kv_view.pool.block_size),
             int(block_width_capacity * int(kv_view.pool.block_size)),
-            _promotion_geometry(text_kv_promotions),
+            _promotion_geometry(
+                text_kv_promotions,
+                capacity=text_kv_promotion_capacity,
+            ),
         )
 
 
@@ -605,7 +618,11 @@ def packed_mixed_graph_promotions_supported(
     return total > 0
 
 
-def _promotion_geometry(promotions: tuple[PagedTextCacheSpanCopy, ...]) -> tuple[Any, ...]:
+def _promotion_geometry(
+    promotions: tuple[PagedTextCacheSpanCopy, ...],
+    *,
+    capacity: int | None = None,
+) -> tuple[Any, ...]:
     if not promotions:
         return ()
     source_pool = promotions[0].source.pool
@@ -616,14 +633,22 @@ def _promotion_geometry(promotions: tuple[PagedTextCacheSpanCopy, ...]) -> tuple
         str(source_pool.k.device),
         str(source_pool.k.dtype),
         str(target_pool.k.dtype),
-        sum(max(0, int(promotion.length)) for promotion in promotions),
+        max(
+            sum(max(0, int(promotion.length)) for promotion in promotions),
+            0 if capacity is None else int(capacity),
+        ),
     )
 
 
 def _promotion_index_tensors(
     promotions: tuple[PagedTextCacheSpanCopy, ...],
+    *,
+    capacity: int | None = None,
 ) -> tuple[Any, Any, torch.Tensor, torch.Tensor]:
-    source_pool, target_pool, source_positions, target_positions = _promotion_index_values(promotions)
+    source_pool, target_pool, source_positions, target_positions = _promotion_index_values(
+        promotions,
+        capacity=capacity,
+    )
     device = source_pool.k.device
     return (
         source_pool,
@@ -635,6 +660,8 @@ def _promotion_index_tensors(
 
 def _promotion_index_values(
     promotions: tuple[PagedTextCacheSpanCopy, ...],
+    *,
+    capacity: int | None = None,
 ) -> tuple[Any, Any, list[int], list[int]]:
     source_pool = promotions[0].source.pool
     target_pool = promotions[0].target.pool
@@ -642,11 +669,34 @@ def _promotion_index_values(
     target_positions: list[int] = []
     for promotion in promotions:
         source_positions.extend(
-            _cache_positions(promotion.source.pool, promotion.source.block_ids, promotion.start, promotion.length)
+            _cache_positions(
+                promotion.source.pool,
+                promotion.source.block_ids,
+                promotion.start,
+                promotion.length,
+            )
         )
         target_positions.extend(
-            _cache_positions(promotion.target.pool, promotion.target.block_ids, promotion.start, promotion.length)
+            _cache_positions(
+                promotion.target.pool,
+                promotion.target.block_ids,
+                promotion.start,
+                promotion.length,
+            )
         )
+    resolved_capacity = (
+        len(source_positions)
+        if capacity is None
+        else max(
+            len(source_positions),
+            int(capacity),
+        )
+    )
+    if resolved_capacity > len(source_positions):
+        if not source_positions:
+            raise invalid_descriptor("packed mixed graph promotion capacity requires an index")
+        source_positions.extend([source_positions[0]] * (resolved_capacity - len(source_positions)))
+        target_positions.extend([target_positions[0]] * (resolved_capacity - len(target_positions)))
     return source_pool, target_pool, source_positions, target_positions
 
 
@@ -720,6 +770,7 @@ def maybe_run_packed_mixed_graph(
     forward_stream: ForwardStream,
     kv_view: ForwardPagedKVView,
     text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
+    text_kv_promotion_capacity: int | None = None,
 ) -> torch.Tensor | None:
     runner = getattr(owner, _RUNNER_ATTR, None)
     if runner is None:
@@ -731,4 +782,5 @@ def maybe_run_packed_mixed_graph(
         forward_stream=forward_stream,
         kv_view=kv_view,
         text_kv_promotions=text_kv_promotions,
+        text_kv_promotion_capacity=text_kv_promotion_capacity,
     )

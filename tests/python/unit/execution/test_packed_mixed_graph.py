@@ -12,6 +12,7 @@ from uniserve_worker.execution.forward.graph.packed_visible import (
     PackedMixedGraphRunner,
     packed_mixed_graph_promotions_supported,
 )
+from uniserve_worker.execution.forward.programs import packed_visible as packed_program
 from uniserve_worker.execution.forward.stream import (
     ForwardPagedKVSegment,
     ForwardPagedKVView,
@@ -315,3 +316,83 @@ def test_packed_mixed_graph_promotion_copy_matches_span_copy_across_layers():
 
     assert torch.equal(graph_target.pool.k, expected_target.pool.k)
     assert torch.equal(graph_target.pool.v, expected_target.pool.v)
+
+
+def test_packed_mixed_graph_promotion_indices_fill_static_capacity():
+    source_pool = PagedKVPool(1, 2, 4, 1, 2, device="cpu", dtype=torch.float32)
+    target_pool = PagedKVPool(1, 2, 4, 1, 2, device="cpu", dtype=torch.float32)
+    source = PagedTextCache(source_pool, [0], num_layers=1)
+    target = PagedTextCache(target_pool, [1], num_layers=1)
+    promotion = PagedTextCacheSpanCopy(source, target, start=0, length=1)
+    next_promotion = PagedTextCacheSpanCopy(source, target, start=1, length=1)
+
+    _, _, source_positions, target_positions = pmg._promotion_index_values(
+        (promotion,),
+        capacity=4,
+    )
+
+    assert source_positions == [0, 0, 0, 0]
+    assert target_positions == [4, 4, 4, 4]
+    assert pmg._promotion_geometry((promotion,), capacity=4) == pmg._promotion_geometry(
+        (promotion, next_promotion),
+        capacity=4,
+    )
+
+
+def test_packed_decode_graph_padding_uses_writable_scratch_positions():
+    pool = PagedKVPool(1, 4, 64, 1, 2, device="cpu", dtype=torch.float32)
+    allocated: list[int] = []
+
+    def allocate(count: int) -> list[int]:
+        start = 1 + len(allocated)
+        blocks = list(range(start, start + int(count)))
+        allocated.extend(blocks)
+        return blocks
+
+    cache = PagedTextCache(
+        pool,
+        [0],
+        num_layers=1,
+        length=4,
+        allocate_blocks=allocate,
+    )
+    builder = ForwardStreamBuilder()
+    builder.add_segment(
+        op_index=0,
+        req_id=1,
+        kind="decode_und",
+        mode=ForwardMode.DECODE,
+        modality="und",
+        segment_class="decode",
+        q_len=1,
+        prefix_len=4,
+        visible_policy="causal",
+    )
+    kv_segments = [ForwardPagedKVSegment(block_ids=(0,), base_len=4, q_len=1)]
+    embed_chunks = [torch.ones((1, 4), dtype=torch.float32)]
+    indicator_chunks: list[tuple[int, bool] | torch.Tensor] = [(1, False)]
+
+    capacity = packed_program._append_decode_graph_padding(
+        builder=builder,
+        kv_segments=kv_segments,
+        embed_chunks=embed_chunks,
+        indicator_chunks=indicator_chunks,
+        padding_cache=cache,
+        padding_start=5,
+        decode_rows=1,
+        hidden_size=4,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    stream = builder.build(device="cpu")
+    kv_view = ForwardPagedKVView(pool, kv_segments)
+
+    assert capacity == 128
+    assert len(stream.segments) == 128
+    assert sum(int(segment.q_len) for segment in stream.segments) == 128
+    assert all(segment.mode is ForwardMode.DECODE for segment in stream.segments)
+    assert all(segment.write_kv and segment.persist_kv for segment in kv_view.segments)
+    assert [segment.base_len for segment in kv_view.segments[1:]] == list(range(5, 132))
+    assert allocated == [1, 2]
+    assert torch.cat(embed_chunks, dim=0).shape == (128, 4)
+    assert sum(int(chunk[0]) for chunk in indicator_chunks) == 128
