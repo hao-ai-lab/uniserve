@@ -149,7 +149,10 @@ class TextDecodeRelay:
         if not isinstance(relay_token_tensor, torch.Tensor):
             _bump_stat(stats, "text_decode_token_relay_misses")
             return self._missing_token(require=require)
-        if relay_token_tensor.dtype != torch.long or relay_token_tensor.device != device:
+        if relay_token_tensor.dtype != torch.long or not _same_device(
+            relay_token_tensor.device,
+            device,
+        ):
             _bump_stat(stats, "text_decode_token_relay_misses")
             if from_last_sampled or require:
                 raise invalid_descriptor(
@@ -173,7 +176,7 @@ class TextDecodeRelay:
             or int(relay_position_id) != int(expected_position_id)
             or not isinstance(relay_position_tensor, torch.Tensor)
             or relay_position_tensor.dtype != torch.long
-            or relay_position_tensor.device != device
+            or not _same_device(relay_position_tensor.device, device)
         ):
             return None
         return relay_position_tensor.reshape(1)
@@ -287,6 +290,10 @@ def _same_tensor(lhs: Any, rhs: torch.Tensor) -> bool:
     if lhs.device != rhs.device or lhs.dtype != rhs.dtype or lhs.shape != rhs.shape:
         return False
     return int(lhs.data_ptr()) == int(rhs.data_ptr())
+
+
+def _same_device(lhs: torch.device | str, rhs: torch.device | str) -> bool:
+    return canonical_device(lhs) == canonical_device(rhs)
 
 
 def _bump_stat(stats: "ForwardStats | None", attr: str, delta: int = 1) -> None:

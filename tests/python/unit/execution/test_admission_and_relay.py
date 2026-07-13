@@ -20,6 +20,7 @@ from uniserve_worker.execution.forward.deferred_text import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
 )
+from uniserve_worker.execution.text_decode_relay import TextDecodeRelay
 from uniserve_worker.execution.text_driver import DeferredTextSeqResult
 from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
 from uniserve_worker.runtime.request_state import RequestState, RequestStateTable
@@ -194,6 +195,32 @@ def _store_relay(state: RequestState, token_id: int | None, tensor: torch.Tensor
     """Mirror the driver's relay store at the public state boundary."""
     state.decode_relay.token_id = token_id
     state.decode_relay.token_tensor = tensor.detach().reshape(1)
+
+
+def test_decode_relay_accepts_canonical_device_alias(monkeypatch):
+    from uniserve_worker.execution import text_decode_relay
+
+    state = RequestState()
+    relay_tensor = torch.tensor([7], dtype=torch.long)
+    TextDecodeRelay().publish_sample(state, token_id=7, token_tensor=relay_tensor)
+    monkeypatch.setattr(
+        text_decode_relay,
+        "canonical_device",
+        lambda device: torch.device("cpu")
+        if torch.device(device).type in {"cpu", "cuda"}
+        else torch.device(device),
+    )
+
+    consumed = TextDecodeRelay().consume_token(
+        state,
+        expected_token_id=None,
+        device=torch.device("cuda"),
+        token_source="last_sampled",
+        require=True,
+    )
+
+    assert consumed is not None
+    assert consumed.data_ptr() == relay_tensor.data_ptr()
 
 
 def test_finalize_returns_its_own_sampled_token():
