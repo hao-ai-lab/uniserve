@@ -640,8 +640,7 @@
           "server": "benchmark/server/sensenova-uniserve",
           "points": [
             "sensenova_mjhq_t2i_uniserve",
-            "sensenova_beans_i2t_uniserve",
-            "sensenova_ueval_default_uniserve"
+            "sensenova_beans_i2t_uniserve"
           ]
         },
         "sensenova-omni": {
@@ -843,36 +842,6 @@
             "preprocessing": "beans_jpeg95_seed42_v1"
           }
         },
-        "sensenova_ueval_default_uniserve": {
-          "load_case_set": "text_arrival",
-          "name": "sensenova-uniserve-ueval-{load_id}",
-          "output": "sensenova_ueval_default/uniserve_{load_id}",
-          "harness": {
-            "task": "default",
-            "model": "SenseNova-U1",
-            "dataset": "ueval",
-            "dataset_revision": "fdeac6654b113d20e7e89d496167a4a5bb55bc66",
-            "num_prompts": 32,
-            "max_tokens": 8192,
-            "steps": 50,
-            "denoise_updates": 50,
-            "width": 2048,
-            "height": 1152,
-            "wire": "openai_chat",
-            "temperature": 0.7,
-            "max_images": 4,
-            "guidance_scale": 4.0,
-            "image_guidance_scale": 1.0,
-            "cfg_norm": "none",
-            "cfg_interval": [0.0, 1.0],
-            "timestep_shift": 3.0,
-          "runtime_profile_id": "sensenova-u1",
-          "plan_evidence_policy": "runtime_inspection",
-            "output_constraint": "default",
-            "preprocessing": "ueval_prompt_text_v1",
-            "acceptance_min_images_per_success": 1.0
-          }
-        },
         "bagel_mjhq_t2i_uniserve": {
           "load_case_set": "image_concurrency",
           "parity_group": "bagel_mjhq_t2i",
@@ -995,18 +964,6 @@
         }
       },
       "investigations": {
-        "sensenova_ueval_ttft_jump": {
-          "status": "required",
-          "reason": "SenseNova UEval p90 TTFT at load points 4 and 8 requires request-level attribution.",
-          "minimum_artifacts": [
-            "scheduler admission trace",
-            "per-request TTFT decomposition",
-            "queue depth timeline",
-            "image-count distribution",
-            "GPU utilization timeline",
-            "server and worker logs"
-          ]
-        },
         "uniserve_radix_cache": {
           "status": "required",
           "reason": "Qwen3 ShareGPT comparison requires cache-mode evidence for the declared SGLang and UniServe server profiles."
