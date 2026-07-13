@@ -124,6 +124,7 @@ pub struct GenerationDialectProfile {
     pub output_filter: OutputFilterPolicy,
     pub image_ingest: ImageIngestRecipe,
     pub generation_policy: GenerationPolicyDescriptor,
+    image_ingest_estimators: Vec<ImageKvEstimator>,
     supported_constraints: Vec<GenerationConstraint>,
     prompts: PromptRecipes,
     context_system_prompt: String,
@@ -137,6 +138,43 @@ impl GenerationDialectProfile {
 
     pub fn context_system_prompt(&self) -> &str {
         &self.context_system_prompt
+    }
+
+    pub fn image_ingest_requires_dimensions(&self) -> bool {
+        self.image_ingest
+            .step_kv_tokens
+            .contains(&ImageKvEffect::WorkerDefined)
+    }
+
+    pub fn image_ingest_for_dimensions(
+        &self,
+        width: u32,
+        height: u32,
+        image_count: usize,
+    ) -> assets::Result<ImageIngestRecipe> {
+        let mut recipe = self.image_ingest.clone();
+        if !self.image_ingest_requires_dimensions() {
+            return Ok(recipe);
+        }
+        if width == 0 || height == 0 {
+            return Err(AssetError::message(
+                "input image dimensions must be positive",
+            ));
+        }
+        if self.image_ingest_estimators.len() != recipe.steps.len() {
+            return Err(AssetError::message(format!(
+                "generation profile {:?} has no exact image-KV estimator for every ingest step",
+                self.id
+            )));
+        }
+        for (index, effect) in recipe.step_kv_tokens.iter_mut().enumerate() {
+            if *effect == ImageKvEffect::WorkerDefined {
+                let tokens =
+                    self.image_ingest_estimators[index].tokens(width, height, image_count)?;
+                *effect = ImageKvEffect::Exact { tokens };
+            }
+        }
+        Ok(recipe)
     }
 
     /// Whether input images ride as markers inside the prompt token stream.
@@ -307,10 +345,35 @@ fn profile_from_manifest(
             "generation profile id must not be empty",
         ));
     }
-    let image_ingest: ImageIngestRecipe = manifest.image_ingest.into();
+    let ImageIngestManifest {
+        steps,
+        logical_positions,
+        step_kv_tokens,
+        step_estimators,
+    } = manifest.image_ingest;
+    let image_ingest = ImageIngestRecipe {
+        steps,
+        logical_positions,
+        step_kv_tokens,
+        modality: uniserve_core::Modality::Und,
+    };
     if image_ingest.steps.is_empty() {
         return Err(AssetError::message(format!(
             "generation profile {id:?} declares an empty image ingest recipe"
+        )));
+    }
+    if image_ingest.steps.len() != image_ingest.step_kv_tokens.len() {
+        return Err(AssetError::message(format!(
+            "generation profile {id:?} must declare one KV effect per image ingest step"
+        )));
+    }
+    if image_ingest
+        .step_kv_tokens
+        .contains(&ImageKvEffect::WorkerDefined)
+        && step_estimators.len() != image_ingest.steps.len()
+    {
+        return Err(AssetError::message(format!(
+            "generation profile {id:?} must declare one exact KV estimator per image ingest step"
         )));
     }
     let GenerationPolicyManifest {
@@ -392,6 +455,7 @@ fn profile_from_manifest(
         output_filter,
         image_ingest,
         generation_policy,
+        image_ingest_estimators: step_estimators,
         supported_constraints,
         prompts: manifest.prompts.try_into()?,
         context_system_prompt: manifest.context_system_prompt,
@@ -619,18 +683,159 @@ struct ProfileManifest {
 struct ImageIngestManifest {
     steps: Vec<ImageIngestStep>,
     logical_positions: u32,
-    physical_kv_tokens: ImageKvEffect,
+    step_kv_tokens: Vec<ImageKvEffect>,
+    #[serde(default)]
+    step_estimators: Vec<ImageKvEstimator>,
 }
 
-impl From<ImageIngestManifest> for ImageIngestRecipe {
-    fn from(value: ImageIngestManifest) -> Self {
-        Self {
-            steps: value.steps,
-            logical_positions: value.logical_positions,
-            physical_kv_tokens: value.physical_kv_tokens,
-            modality: uniserve_core::Modality::Und,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum ImageKvEstimator {
+    ResizeChain {
+        transforms: Vec<StrideResize>,
+        token_stride: u32,
+        marker_tokens: u32,
+    },
+    PixelBounds {
+        factor: u32,
+        min_pixels: u64,
+        max_pixels: u64,
+        #[serde(default)]
+        shared_pixel_budget: Option<u64>,
+        token_stride: u32,
+        marker_tokens: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrideResize {
+    max_side: u32,
+    min_side: u32,
+    stride: u32,
+    max_pixels: u64,
+}
+
+impl ImageKvEstimator {
+    fn tokens(&self, width: u32, height: u32, image_count: usize) -> assets::Result<u32> {
+        let (width, height, token_stride, marker_tokens) = match self {
+            Self::ResizeChain {
+                transforms,
+                token_stride,
+                marker_tokens,
+            } => {
+                let mut dimensions = (width, height);
+                for transform in transforms {
+                    dimensions = transform.resize(dimensions.0, dimensions.1)?;
+                }
+                (dimensions.0, dimensions.1, *token_stride, *marker_tokens)
+            }
+            Self::PixelBounds {
+                factor,
+                min_pixels,
+                max_pixels,
+                shared_pixel_budget,
+                token_stride,
+                marker_tokens,
+            } => {
+                let max_pixels = shared_pixel_budget.map_or(*max_pixels, |budget| {
+                    (*max_pixels).min(budget / image_count.max(1) as u64)
+                });
+                let dimensions =
+                    pixel_bound_resize(width, height, *factor, *min_pixels, max_pixels)?;
+                (dimensions.0, dimensions.1, *token_stride, *marker_tokens)
+            }
+        };
+        if token_stride == 0
+            || !width.is_multiple_of(token_stride)
+            || !height.is_multiple_of(token_stride)
+        {
+            return Err(AssetError::message(
+                "image-KV estimator produced dimensions outside its token stride",
+            ));
         }
+        let tokens = u64::from(width / token_stride)
+            .saturating_mul(u64::from(height / token_stride))
+            .saturating_add(u64::from(marker_tokens));
+        u32::try_from(tokens)
+            .map_err(|_| AssetError::message("image-KV token count exceeds the engine range"))
     }
+}
+
+impl StrideResize {
+    fn resize(self, width: u32, height: u32) -> assets::Result<(u32, u32)> {
+        if self.max_side == 0 || self.min_side == 0 || self.stride == 0 || self.max_pixels == 0 {
+            return Err(AssetError::message(
+                "stride-resize geometry must be positive",
+            ));
+        }
+        let mut scale = (f64::from(self.max_side) / f64::from(width.max(height))).min(1.0);
+        scale = scale.max(f64::from(self.min_side) / f64::from(width.min(height)));
+        let mut resized = scale_to_stride(width, height, scale, self.stride);
+        if u64::from(resized.0).saturating_mul(u64::from(resized.1)) > self.max_pixels {
+            scale = self.max_pixels as f64 / (f64::from(resized.0) * f64::from(resized.1));
+            resized = scale_to_stride(resized.0, resized.1, scale, self.stride);
+        }
+        if resized.0.max(resized.1) > self.max_side {
+            scale = f64::from(self.max_side) / f64::from(resized.0.max(resized.1));
+            resized = scale_to_stride(resized.0, resized.1, scale, self.stride);
+        }
+        Ok(resized)
+    }
+}
+
+fn scale_to_stride(width: u32, height: u32, scale: f64, stride: u32) -> (u32, u32) {
+    let scale_one = |value: u32| {
+        let scaled = (f64::from(value) * scale).round_ties_even();
+        let aligned = (scaled / f64::from(stride)).round_ties_even() * f64::from(stride);
+        stride.max(aligned.max(f64::from(stride)) as u32)
+    };
+    (scale_one(width), scale_one(height))
+}
+
+fn pixel_bound_resize(
+    width: u32,
+    height: u32,
+    factor: u32,
+    min_pixels: u64,
+    max_pixels: u64,
+) -> assets::Result<(u32, u32)> {
+    if factor == 0 || min_pixels == 0 || max_pixels < min_pixels {
+        return Err(AssetError::message(
+            "pixel-bound resize geometry is invalid",
+        ));
+    }
+    let aspect = f64::from(width.max(height)) / f64::from(width.min(height));
+    if aspect > 200.0 {
+        return Err(AssetError::message(
+            "input image aspect ratio must not exceed 200",
+        ));
+    }
+    let round_factor = |value: u32| {
+        factor.max(
+            ((f64::from(value) / f64::from(factor)).round_ties_even() as u32)
+                .saturating_mul(factor),
+        )
+    };
+    let mut resized_h = round_factor(height);
+    let mut resized_w = round_factor(width);
+    let pixels = u64::from(resized_h).saturating_mul(u64::from(resized_w));
+    if pixels > max_pixels {
+        let beta = (f64::from(height) * f64::from(width) / max_pixels as f64).sqrt();
+        resized_h = factor.max(
+            ((f64::from(height) / beta / f64::from(factor)).floor() as u32).saturating_mul(factor),
+        );
+        resized_w = factor.max(
+            ((f64::from(width) / beta / f64::from(factor)).floor() as u32).saturating_mul(factor),
+        );
+    } else if pixels < min_pixels {
+        let beta = (min_pixels as f64 / (f64::from(height) * f64::from(width))).sqrt();
+        resized_h =
+            ((f64::from(height) * beta / f64::from(factor)).ceil() as u32).saturating_mul(factor);
+        resized_w =
+            ((f64::from(width) * beta / f64::from(factor)).ceil() as u32).saturating_mul(factor);
+    }
+    Ok((resized_w, resized_h))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1182,6 +1387,42 @@ mod tests {
                 .as_ref()
                 .map(|feedback| feedback.commit),
             Some(uniserve_core::CommitRecipe::CommitGen)
+        );
+    }
+
+    #[test]
+    fn profiles_resolve_exact_input_image_kv_from_dimensions() {
+        let tok = ByteTokenizer;
+        let bagel = profile_from_key("bagel", &tok).expect("BAGEL profile");
+        for (width, height, vae_tokens, vit_tokens) in [
+            (512, 512, 1_026, 1_371),
+            (640, 480, 1_378, 1_815),
+            (1_920, 1_080, 2_306, 2_732),
+            (300, 1_200, 1_026, 1_262),
+            (2_048, 2_048, 4_098, 4_902),
+            (224, 224, 1_026, 1_371),
+            (321, 517, 1_666, 2_185),
+        ] {
+            let bagel_ingest = bagel
+                .image_ingest_for_dimensions(width, height, 1)
+                .expect("BAGEL image KV");
+            assert_eq!(
+                bagel_ingest.step_kv_tokens,
+                vec![
+                    ImageKvEffect::Exact { tokens: vae_tokens },
+                    ImageKvEffect::Exact { tokens: vit_tokens },
+                ],
+                "BAGEL image geometry {width}x{height}"
+            );
+        }
+
+        let sensenova = profile_from_key("sensenova-u1", &tok).expect("SenseNova profile");
+        let sensenova_ingest = sensenova
+            .image_ingest_for_dimensions(512, 512, 1)
+            .expect("SenseNova image KV");
+        assert_eq!(
+            sensenova_ingest.step_kv_tokens,
+            vec![ImageKvEffect::Exact { tokens: 256 }]
         );
     }
 }

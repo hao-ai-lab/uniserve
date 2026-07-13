@@ -144,27 +144,35 @@ pub enum SegmentPlacement {
 pub struct ImageIngestRecipe {
     pub steps: Vec<ImageIngestStep>,
     pub logical_positions: u32,
-    pub physical_kv_tokens: ImageKvEffect,
+    pub step_kv_tokens: Vec<ImageKvEffect>,
     pub modality: Modality,
 }
 
 impl ImageIngestRecipe {
-    pub fn vit_only(logical_positions: u32, physical_kv_tokens: ImageKvEffect) -> Self {
+    pub fn vit_only(logical_positions: u32, kv_tokens: ImageKvEffect) -> Self {
         Self {
             steps: vec![ImageIngestStep::VitEncode],
             logical_positions,
-            physical_kv_tokens,
+            step_kv_tokens: vec![kv_tokens],
             modality: Modality::Und,
         }
     }
 
-    pub fn vae_then_vit(logical_positions: u32, physical_kv_tokens: ImageKvEffect) -> Self {
+    pub fn vae_then_vit(
+        logical_positions: u32,
+        vae_kv_tokens: ImageKvEffect,
+        vit_kv_tokens: ImageKvEffect,
+    ) -> Self {
         Self {
             steps: vec![ImageIngestStep::VaeEncode, ImageIngestStep::VitEncode],
             logical_positions,
-            physical_kv_tokens,
+            step_kv_tokens: vec![vae_kv_tokens, vit_kv_tokens],
             modality: Modality::Und,
         }
+    }
+
+    pub fn kv_effect(&self, step_index: usize) -> Option<ImageKvEffect> {
+        self.step_kv_tokens.get(step_index).copied()
     }
 
     /// Stable per-step keys for reusable worker-side encoder outputs.
@@ -825,25 +833,23 @@ fn ingest_kv_bound(
     ingest: &ImageIngestRecipe,
     capabilities: &GenerationRuntimeCapabilities,
 ) -> Result<usize, GenerationResourceError> {
+    if ingest.steps.len() != ingest.step_kv_tokens.len() {
+        return Err(GenerationResourceError::ImageIngestKvArity {
+            steps: ingest.steps.len(),
+            effects: ingest.step_kv_tokens.len(),
+        });
+    }
     ingest
         .steps
         .iter()
         .copied()
-        .enumerate()
-        .try_fold(0usize, |total, (index, step)| {
+        .zip(ingest.step_kv_tokens.iter().copied())
+        .try_fold(0usize, |total, (step, effect)| {
             let fallback = match step {
                 ImageIngestStep::VaeEncode => capabilities.max_vae_grid_tokens,
                 ImageIngestStep::VitEncode => capabilities.max_vit_grid_tokens,
             };
-            let step_bound = if index + 1 == ingest.steps.len() {
-                kv_effect_bound(ingest.physical_kv_tokens, fallback, step.as_str())?
-            } else if fallback == 0 {
-                return Err(GenerationResourceError::UnboundedImageKv {
-                    operation: step.as_str(),
-                });
-            } else {
-                fallback as usize
-            };
+            let step_bound = kv_effect_bound(effect, fallback, step.as_str())?;
             Ok(total.saturating_add(step_bound))
         })
 }
@@ -874,6 +880,8 @@ impl ImageIngestStep {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenerationResourceError {
+    #[error("image ingest declares {steps} steps but {effects} KV effects")]
+    ImageIngestKvArity { steps: usize, effects: usize },
     #[error("{operation} has a worker-defined KV effect but the runtime declares no bound")]
     UnboundedImageKv { operation: &'static str },
     #[error("generated image continuation requires a feedback resource recipe")]
@@ -1158,10 +1166,20 @@ fn validate_ingest_recipe(recipe: &ImageIngestRecipe) -> Result<(), GenerationRe
     if recipe.steps.is_empty() {
         return Err(GenerationRequestError::EmptyImageIngestRecipe);
     }
+    if recipe.steps.len() != recipe.step_kv_tokens.len() {
+        return Err(GenerationRequestError::ImageIngestKvArity {
+            steps: recipe.steps.len(),
+            effects: recipe.step_kv_tokens.len(),
+        });
+    }
     if recipe.logical_positions == 0 {
         return Err(GenerationRequestError::ZeroImageLogicalPositions);
     }
-    validate_kv_effect(recipe.physical_kv_tokens)
+    recipe
+        .step_kv_tokens
+        .iter()
+        .copied()
+        .try_for_each(validate_kv_effect)
 }
 
 fn validate_kv_effect(effect: ImageKvEffect) -> Result<(), GenerationRequestError> {
@@ -1178,6 +1196,8 @@ fn validate_kv_effect(effect: ImageKvEffect) -> Result<(), GenerationRequestErro
 pub enum GenerationRequestError {
     #[error("generation context must contain at least one segment")]
     EmptyContext,
+    #[error("image ingest declares {steps} steps but {effects} KV effects")]
+    ImageIngestKvArity { steps: usize, effects: usize },
     #[error("max_und_tokens must be positive")]
     ZeroMaxUndTokens,
     #[error("resolved generation behavior does not match constraint and policy")]
@@ -1298,6 +1318,7 @@ mod tests {
                     ingest: Box::new(ImageIngestRecipe::vae_then_vit(
                         1,
                         ImageKvEffect::Bounded { max_tokens: 64 },
+                        ImageKvEffect::Bounded { max_tokens: 64 },
                     )),
                 },
                 next_und_token: FeedbackNextToken::Token { token_id: 12 },
@@ -1320,7 +1341,11 @@ mod tests {
                         b64: "aW1hZ2U=".into(),
                         placement: SegmentPlacement::AtToken { position: 2 },
                     },
-                    ingest: ImageIngestRecipe::vae_then_vit(1, ImageKvEffect::Exact { tokens: 32 }),
+                    ingest: ImageIngestRecipe::vae_then_vit(
+                        1,
+                        ImageKvEffect::Bounded { max_tokens: 64 },
+                        ImageKvEffect::Exact { tokens: 32 },
+                    ),
                 },
                 ContextSegment::UndTokens {
                     token_ids: vec![3, 4],
@@ -1382,7 +1407,11 @@ mod tests {
 
     #[test]
     fn encoder_cache_keys_are_stable_and_step_scoped() {
-        let recipe = ImageIngestRecipe::vae_then_vit(1, ImageKvEffect::WorkerDefined);
+        let recipe = ImageIngestRecipe::vae_then_vit(
+            1,
+            ImageKvEffect::WorkerDefined,
+            ImageKvEffect::WorkerDefined,
+        );
         let keys = recipe.encoder_cache_keys(17);
         assert_eq!(keys.len(), 2);
         assert_ne!(keys[0], keys[1]);
@@ -1510,12 +1539,54 @@ mod tests {
     }
 
     #[test]
+    fn conservative_resources_use_each_exact_image_ingest_step() {
+        let mut request = complete_request();
+        request.context = vec![
+            ContextSegment::UndTokens {
+                token_ids: vec![1; 35],
+                visibility: UndVisibility::Internal,
+            },
+            ContextSegment::Image {
+                image: ImageSegment {
+                    hash: 17,
+                    b64: "aW1hZ2U=".into(),
+                    placement: SegmentPlacement::AtToken { position: 35 },
+                },
+                ingest: ImageIngestRecipe::vae_then_vit(
+                    1,
+                    ImageKvEffect::Exact { tokens: 1_026 },
+                    ImageKvEffect::Exact { tokens: 1_371 },
+                ),
+            },
+        ];
+        request.behavior.gen_output = false;
+        request.behavior.generated_image_feedback = false;
+        request.policy.feedback = None;
+        request.max_und_tokens = 256;
+
+        let bounds = GenerationResourceBounds::conservative(
+            &request.context,
+            &request.negative_context,
+            &request.behavior,
+            &request.policy,
+            &request.image,
+            request.max_und_tokens,
+            &request.cache,
+            &runtime_capabilities(),
+        )
+        .expect("exact per-step image resources");
+
+        assert_eq!(bounds.max_kv_tokens, 35 + 256 + 1_026 + 1_371);
+        assert_eq!(bounds.max_kv_tokens.div_ceil(64), 42);
+    }
+
+    #[test]
     fn resource_compilation_rejects_unbounded_worker_kv_and_capacity_overflow() {
         let mut request = complete_request();
         let ContextSegment::Image { ingest, .. } = &mut request.context[1] else {
             panic!("image fixture");
         };
-        ingest.physical_kv_tokens = ImageKvEffect::WorkerDefined;
+        ingest.step_kv_tokens[1] = ImageKvEffect::WorkerDefined;
         let mut capabilities = runtime_capabilities();
         capabilities.max_vit_grid_tokens = 0;
         assert_eq!(
@@ -1531,6 +1602,28 @@ mod tests {
             ),
             Err(GenerationResourceError::UnboundedImageKv {
                 operation: "vit_encode",
+            })
+        );
+
+        let mut invalid_request = complete_request();
+        let ContextSegment::Image { ingest, .. } = &mut invalid_request.context[1] else {
+            panic!("image fixture");
+        };
+        ingest.step_kv_tokens.pop();
+        assert_eq!(
+            GenerationResourceBounds::conservative(
+                &invalid_request.context,
+                &invalid_request.negative_context,
+                &invalid_request.behavior,
+                &invalid_request.policy,
+                &invalid_request.image,
+                invalid_request.max_und_tokens,
+                &invalid_request.cache,
+                &runtime_capabilities(),
+            ),
+            Err(GenerationResourceError::ImageIngestKvArity {
+                steps: 2,
+                effects: 1,
             })
         );
 

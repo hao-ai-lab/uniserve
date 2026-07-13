@@ -809,7 +809,10 @@ async fn multimodal_plan_inspection_records_rendered_scaffold_and_image_placemen
     )
     .unwrap()
     .unwrap();
-    dialect.image_ingest.physical_kv_tokens = uniserve_core::ImageKvEffect::Exact { tokens: 8 };
+    dialect.image_ingest.step_kv_tokens = vec![
+        uniserve_core::ImageKvEffect::Exact { tokens: 8 },
+        uniserve_core::ImageKvEffect::Exact { tokens: 8 },
+    ];
     dialect
         .generation_policy
         .feedback

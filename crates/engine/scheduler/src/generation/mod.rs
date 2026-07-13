@@ -530,16 +530,16 @@ impl CursorProjection {
                 is_final_step,
                 ..
             } => {
+                let physical = match physical_kv_tokens {
+                    ImageKvEffect::Exact { tokens } => tokens,
+                    ImageKvEffect::Bounded { max_tokens } => max_tokens,
+                    ImageKvEffect::WorkerDefined => 0,
+                };
+                self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
                 if is_final_step {
                     self.logical_pos = self
                         .logical_pos
                         .max(position.saturating_add(logical_positions));
-                    let physical = match physical_kv_tokens {
-                        ImageKvEffect::Exact { tokens } => tokens,
-                        ImageKvEffect::Bounded { max_tokens } => max_tokens,
-                        ImageKvEffect::WorkerDefined => 0,
-                    };
-                    self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
                 }
             }
             TransitionDelta::DecodeUnd {
@@ -591,16 +591,16 @@ impl CursorProjection {
                 is_final_step,
                 ..
             } => {
+                let physical = match physical_kv_tokens {
+                    ImageKvEffect::Exact { tokens } => tokens,
+                    ImageKvEffect::Bounded { max_tokens } => max_tokens,
+                    ImageKvEffect::WorkerDefined => 0,
+                };
+                self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
                 if is_final_step {
                     self.logical_pos = self
                         .logical_pos
                         .max(position.saturating_add(logical_positions));
-                    let physical = match physical_kv_tokens {
-                        ImageKvEffect::Exact { tokens } => tokens,
-                        ImageKvEffect::Bounded { max_tokens } => max_tokens,
-                        ImageKvEffect::WorkerDefined => 0,
-                    };
-                    self.physical_kv_len = self.physical_kv_len.saturating_add(physical);
                 }
             }
         }
@@ -1144,29 +1144,15 @@ impl GenerationPlanner {
                 }),
             expected_image_kv: match delta {
                 TransitionDelta::IngestImageStep {
-                    is_final_step,
-                    physical_kv_tokens,
-                    ..
+                    physical_kv_tokens, ..
                 }
                 | TransitionDelta::FeedbackIngestStep {
-                    is_final_step,
+                    physical_kv_tokens, ..
+                } => Some(bounded_worker_kv(
                     physical_kv_tokens,
-                    ..
-                } => Some(if is_final_step {
-                    bounded_worker_kv(
-                        physical_kv_tokens,
-                        request.resources.max_kv_tokens,
-                        cursor.physical_kv_len,
-                    )
-                } else {
-                    ImageKvEffect::Bounded {
-                        max_tokens: request
-                            .resources
-                            .max_kv_tokens
-                            .saturating_sub(cursor.physical_kv_len as usize)
-                            .min(u32::MAX as usize) as u32,
-                    }
-                }),
+                    request.resources.max_kv_tokens,
+                    cursor.physical_kv_len,
+                )),
                 TransitionDelta::CommitGen {
                     physical_kv_tokens, ..
                 }
@@ -1254,7 +1240,6 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ..
         } => physical_start.saturating_add(end.saturating_sub(*start)),
         TransitionDelta::IngestImageStep {
-            is_final_step: true,
             physical_start,
             physical_kv_tokens,
             ..
@@ -1264,7 +1249,6 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ImageKvEffect::WorkerDefined => return None,
         }),
         TransitionDelta::FeedbackIngestStep {
-            is_final_step: true,
             physical_start,
             physical_kv_tokens,
             ..
@@ -1292,9 +1276,7 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ImageKvEffect::Bounded { max_tokens } => *max_tokens,
             ImageKvEffect::WorkerDefined => return None,
         }),
-        TransitionDelta::IngestImageStep { .. }
-        | TransitionDelta::FeedbackIngestStep { .. }
-        | TransitionDelta::DenoiseGen { .. }
+        TransitionDelta::DenoiseGen { .. }
         | TransitionDelta::CommitGen { .. }
         | TransitionDelta::Feedback { .. } => return None,
     };

@@ -26,7 +26,17 @@
   "image_ingest": {
     "steps": ["vit_encode"],
     "logical_positions": 1,
-    "physical_kv_tokens": {"kind": "worker_defined"}
+    "step_kv_tokens": [{"kind": "worker_defined"}],
+    "step_estimators": [
+      {
+        "kind": "pixel_bounds",
+        "factor": 32,
+        "min_pixels": 262144,
+        "max_pixels": 4194304,
+        "token_stride": 32,
+        "marker_tokens": 0
+      }
+    ]
   },
   "generation_policy": {
     "gen_only_start": "immediate",

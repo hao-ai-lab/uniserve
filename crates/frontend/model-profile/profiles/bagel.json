@@ -28,7 +28,24 @@
   "image_ingest": {
     "steps": ["vae_encode", "vit_encode"],
     "logical_positions": 1,
-    "physical_kv_tokens": {"kind": "worker_defined"}
+    "step_kv_tokens": [{"kind": "worker_defined"}, {"kind": "worker_defined"}],
+    "step_estimators": [
+      {
+        "kind": "resize_chain",
+        "transforms": [{"max_side": 1024, "min_side": 512, "stride": 16, "max_pixels": 1806336}],
+        "token_stride": 16,
+        "marker_tokens": 2
+      },
+      {
+        "kind": "resize_chain",
+        "transforms": [
+          {"max_side": 1024, "min_side": 512, "stride": 16, "max_pixels": 1806336},
+          {"max_side": 980, "min_side": 224, "stride": 14, "max_pixels": 1806336}
+        ],
+        "token_stride": 14,
+        "marker_tokens": 2
+      }
+    ]
   },
   "generation_policy": {
     "gen_only_start": "immediate",

@@ -1,7 +1,9 @@
+use base64::Engine as _;
+use std::io::Cursor;
 use uniserve_core::{
     ContextSegment as CoreContextSegment, GenerationBehaviorDescriptor,
     GenerationCachePolicyDescriptor, GenerationConstraint, GenerationRequest,
-    GenerationResourceBounds, GenerationRuntimeCapabilities, ImageIngestRecipe, ImageParams,
+    GenerationResourceBounds, GenerationRuntimeCapabilities, ImageParams,
     ImageSegment as CoreImageSegment, RequestId, SamplingParams as EngineSamplingParams,
     SegmentPlacement, UndVisibility,
 };
@@ -691,7 +693,7 @@ pub(crate) fn compile_generation_request(
     };
     let cache =
         generation_cache_policy(&request.cache, lowered.sampling.prompt_logprobs_requested());
-    let mut context = build_context_segments(&lowered, &profile.image_ingest);
+    let mut context = build_context_segments(&lowered, profile)?;
     for segment in &mut context {
         if let CoreContextSegment::Image { image, .. } = segment {
             image.hash = isolated_cache_key(image.hash, cache.isolation_key);
@@ -797,10 +799,11 @@ fn isolated_cache_key(content_key: u64, isolation_key: Option<u64>) -> u64 {
 
 fn build_context_segments(
     lowered: &LoweredGenerationInput,
-    profile_ingest: &ImageIngestRecipe,
-) -> Vec<CoreContextSegment> {
+    profile: &GenerationDialectProfile,
+) -> Result<Vec<CoreContextSegment>, BuildError> {
     let mut images = lowered.mm_items.clone();
     images.sort_by_key(|image| image.position);
+    let image_count = images.len();
     let mut segments = Vec::with_capacity(images.len().saturating_mul(2).saturating_add(1));
     let mut token_cursor = 0usize;
     for image in images {
@@ -811,6 +814,21 @@ fn build_context_segments(
                 visibility: UndVisibility::Internal,
             });
         }
+        let ingest = if profile.image_ingest_requires_dimensions() {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&image.b64)
+                .map_err(|error| BuildError::new(format!("invalid input image base64: {error}")))?;
+            let dimensions = image::ImageReader::new(Cursor::new(bytes))
+                .with_guessed_format()
+                .map_err(|error| BuildError::new(format!("invalid input image data: {error}")))?
+                .into_dimensions()
+                .map_err(|error| BuildError::new(format!("invalid input image data: {error}")))?;
+            profile
+                .image_ingest_for_dimensions(dimensions.0, dimensions.1, image_count)
+                .map_err(|error| BuildError::new(error.to_string()))?
+        } else {
+            profile.image_ingest.clone()
+        };
         segments.push(CoreContextSegment::Image {
             image: CoreImageSegment {
                 hash: image.hash,
@@ -819,7 +837,7 @@ fn build_context_segments(
                     position: image.position,
                 },
             },
-            ingest: profile_ingest.clone(),
+            ingest,
         });
         token_cursor = position;
     }
@@ -835,7 +853,7 @@ fn build_context_segments(
             visibility: UndVisibility::Internal,
         });
     }
-    segments
+    Ok(segments)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,10 +967,25 @@ mod tests {
 
     use crate::ModalityPolicy;
     use crate::text::tokenizer::{DynTokenizer, Tokenizer};
+    use base64::Engine as _;
     use uniserve_core::OpKind;
     use uniserve_model_profile::dialect::resolve_generation_dialect_for_model;
 
     use super::*;
+
+    fn test_png_b64(width: u32, height: u32) -> String {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer
+                .write_image_data(&vec![0; (width * height) as usize])
+                .expect("PNG pixels");
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
 
     #[derive(Debug)]
     struct SenseNovaTokenizer;
@@ -1196,7 +1229,7 @@ mod tests {
                             text: "Render this request".into(),
                         },
                         ContextSegment::Image(ImageInput {
-                            b64: "aW1hZ2U=".into(),
+                            b64: test_png_b64(512, 512),
                             placement: None,
                         }),
                     ]);
@@ -1520,7 +1553,7 @@ mod tests {
                 text: "paint".into(),
             },
             ContextSegment::Image(ImageInput {
-                b64: "aGVsbG8=".into(),
+                b64: test_png_b64(512, 512),
                 placement: None,
             }),
         ]);
@@ -1543,7 +1576,7 @@ mod tests {
             .resources
             .context_tokens
             .saturating_add(lowered.max_und_tokens)
-            .saturating_add(capabilities.max_vit_grid_tokens as usize)
+            .saturating_add(256)
             .saturating_add(
                 capabilities
                     .max_vae_grid_tokens
@@ -1554,5 +1587,54 @@ mod tests {
         assert!(lowered.behavior.generated_image_feedback);
         assert_eq!(lowered.resources.max_kv_tokens, expected);
         assert_eq!(lowered.resources.encoder_cache_keys.len(), 1);
+    }
+
+    #[test]
+    fn bagel_i2t_reserves_the_exact_image_kv_envelope() {
+        let tok: DynTokenizer = Arc::new(SenseNovaTokenizer);
+        let profile = resolve_generation_dialect_for_model("bagel", &*tok)
+            .expect("profile resolution")
+            .expect("BAGEL profile");
+        let mut request = ServeRequest::text("bagel-i2t-resources", "describe this image");
+        request.model_context = ModelContext::Segments(vec![
+            ContextSegment::Text {
+                role: ContextRole::User,
+                text: "describe this image".into(),
+            },
+            ContextSegment::Image(ImageInput {
+                b64: test_png_b64(512, 512),
+                placement: None,
+            }),
+        ]);
+        request.generation.constraint = GenerationConstraint::UndOnly;
+        request.generation.max_tokens = Some(256);
+        request.modalities.input_image = true;
+
+        let lowered =
+            compile_generation_request(&request, tok, &profile, &test_capabilities(), None, 32_768)
+                .expect("lower BAGEL I2T request");
+        let expected_tokens = lowered.resources.context_tokens + 256 + 1_026 + 1_371;
+        let global_cap_tokens = lowered.resources.context_tokens
+            + 256
+            + test_capabilities().max_vae_grid_tokens as usize
+            + test_capabilities().max_vit_grid_tokens as usize;
+
+        assert_eq!(lowered.resources.max_kv_tokens, expected_tokens);
+        assert!(lowered.resources.max_kv_tokens.div_ceil(64) < global_cap_tokens.div_ceil(64));
+        let image_ingest = lowered
+            .context
+            .iter()
+            .find_map(|segment| match segment {
+                CoreContextSegment::Image { ingest, .. } => Some(ingest),
+                CoreContextSegment::UndTokens { .. } => None,
+            })
+            .expect("input image segment");
+        assert_eq!(
+            image_ingest.step_kv_tokens,
+            vec![
+                uniserve_core::ImageKvEffect::Exact { tokens: 1_026 },
+                uniserve_core::ImageKvEffect::Exact { tokens: 1_371 },
+            ]
+        );
     }
 }
