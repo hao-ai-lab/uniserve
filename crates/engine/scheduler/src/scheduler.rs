@@ -2754,9 +2754,9 @@ impl Scheduler {
                             encodes_left -= 1;
                         }
                         if mixed_prefill {
-                            mixed_left = mixed_left.saturating_sub(op_token_cost(&op));
+                            mixed_left = mixed_left.saturating_sub(planned_op_token_cost(&op));
                         }
-                        budget = budget.saturating_sub(op_token_cost(&op));
+                        budget = budget.saturating_sub(planned_op_token_cost(&op));
                         // Stateful-diff contract: a request's static state and
                         // initial block allocation cross once, ahead of its
                         // first op; the op then carries only deltas.
@@ -3362,7 +3362,7 @@ impl Scheduler {
                     "token_source": format!("{:?}", op.token_source),
                     "spec_token_ids_len": op.spec_token_ids.as_ref().map(|ids| ids.len()).unwrap_or(0),
                     "new_block_ids_len": op.new_block_ids.len(),
-                    "token_cost": op_token_cost(op),
+                    "token_cost": planned_op_token_cost(op),
                     "timestep_idx": op.timestep_idx,
                     "denoise_step_count": op.denoise_step_count,
                     "decode_token_count": op.decode_token_count,
@@ -4976,6 +4976,27 @@ fn op_token_cost(op: &ForwardOp) -> usize {
     }
 }
 
+/// Physical transformer-token work a planned op contributes to one scheduler
+/// step. Denoise executes every latent token once per CFG branch at every
+/// timestep, so its cost must use the compiled latent geometry rather than the
+/// scalar wire-op count.
+fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
+    if transition.kind != OpKind::DenoiseGen {
+        return op_token_cost(&transition.op);
+    }
+    let latent_tokens = usize::try_from(transition.resources.latent_units)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let cfg_branches = transition
+        .cfg
+        .as_ref()
+        .map_or(1, |cfg| usize::from(cfg.branch_count.max(1)));
+    let timesteps = usize::from(transition.denoise_step_count.unwrap_or(1).max(1));
+    latent_tokens
+        .saturating_mul(cfg_branches)
+        .saturating_mul(timesteps)
+}
+
 fn decode_lookahead_from_env() -> bool {
     env::var(DECODE_LOOKAHEAD_ENV)
         .map(|raw| {
@@ -5190,6 +5211,46 @@ mod tests {
         assert_eq!(op_token_cost(&prefill), 5);
         assert_eq!(op_token_cost(&burst_decode), 16);
         assert_eq!(op_token_cost(&denoise), 8);
+    }
+
+    #[test]
+    fn denoise_step_budget_counts_cfg_latent_transformer_tokens() {
+        let mut sched = test_scheduler();
+        let request_id = RequestId(1);
+        let mut request = test_request(request_id.0, 4);
+        request_with_generation_behavior(
+            &mut request,
+            uniserve_core::GenerationConstraint::Default,
+        );
+        request.image = uniserve_core::ImageParams {
+            height: 1_024,
+            width: 1_024,
+            steps: 50,
+            cfg_img_scale: 1.5,
+            max_images: 1,
+            retain_images: false,
+            ..Default::default()
+        };
+        compile_resources(&sched, &mut request);
+        let _events = sched.submit_for_test(request);
+        sched.admit();
+        {
+            let state = sched
+                .running
+                .get_mut(&request_id)
+                .expect("generation request admitted");
+            state.ingest.prompt_cursor = 4;
+            state.und.logical_pos = 4;
+            state.und.physical_kv_len = 4;
+        }
+        sched.begin_image(request_id);
+
+        let transition = sched
+            .next_transition(request_id, 8_192)
+            .expect("denoise transition");
+
+        assert_eq!(transition.kind, OpKind::DenoiseGen);
+        assert_eq!(planned_op_token_cost(&transition), 12_288);
     }
 
     #[test]
