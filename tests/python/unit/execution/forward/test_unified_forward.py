@@ -361,6 +361,79 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
     assert owner.residual.invalidated is True
 
 
+def test_packed_visible_graph_program_runs_decode_burst_as_graph_only_runtime_result():
+    class RequestStates:
+        pass
+
+    class Owner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def prepare_denoise(self, state, op):
+            raise AssertionError("burst execution must stay inside the composite graph adapter")
+
+        def packed_decoder_forward(self):
+            raise AssertionError("outer graph execution must not invoke eager decoder forward")
+
+        def packed_text_embeddings(self):
+            raise AssertionError("outer graph execution must not invoke eager text embedding")
+
+        def _run_forward_adapter(self, batch, **kwargs):
+            self.calls.append({"batch": batch, **kwargs})
+            return [
+                {"req_id": 1, "sampled_token_id": 17, "sampled_token_ids": [10, 17]},
+                {"req_id": 2, "denoise_done": False, "num_steps_done": 1},
+            ]
+
+    owner = Owner()
+    states = RequestStates()
+    ops = [
+        {
+            "req_id": 1,
+            "kind": "decode_und",
+            "token_ids": [9],
+            "pos_range": [4, 5],
+            "decode_token_count": 2,
+        },
+        {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
+    ]
+    dispatch_batch = UniForwardBatch.from_ops(ops)
+    handles = ForwardRuntimeHandles(
+        values={
+            "dispatch_batch": dispatch_batch,
+            "defer_text_cpu_results": True,
+        }
+    )
+    plan = ForwardPlanBuilder().build(
+        ops,
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+        runtime_handles=handles,
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    executor = ForwardExecutor(
+        graph_runner=CudaGraphForwardRunner(
+            programs=(PackedVisibleGraphProgram(owner=owner, request_states=states),)
+        ),
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+
+    result = executor.execute(batch, plan)
+
+    assert result.graph is not None and result.graph.captured
+    assert result.runtime_outputs == (
+        {"req_id": 1, "sampled_token_id": 17, "sampled_token_ids": [10, 17]},
+        {"req_id": 2, "denoise_done": False, "num_steps_done": 1},
+    )
+    assert owner.calls == [
+        {
+            "batch": dispatch_batch,
+            "request_states": states,
+            "group": list(enumerate(ops)),
+            "defer_text_cpu_results": True,
+        }
+    ]
+
+
 def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(monkeypatch):
     import uniserve_worker.execution.forward.programs.packed_visible as packed_visible_programs
 

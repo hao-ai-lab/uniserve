@@ -4392,6 +4392,7 @@ def test_sensenova_packed_mixed_commit_samples_followup_token(monkeypatch):
     def packed_forward(_owner, _batch, _request_states, denoise_steps, results, **_kwargs):
         assert denoise_steps == []
         assert results == [None, None]
+        assert _kwargs["require_graph"] is True
         return True
 
     monkeypatch.setattr(sensenova_u1, "run_packed_mixed_forward", packed_forward)
