@@ -455,6 +455,38 @@ class MoTDecoderLayer(nn.Module):
         normed = expert.post_norm(hidden_states)
         return hidden_states + expert.mlp(normed.to(torch.bfloat16))
 
+    def forward_paged_text_batch(
+        self,
+        layer_idx: int,
+        hidden_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past_key_values: Any,
+    ) -> torch.Tensor:
+        """Run one text decode token for each row of a batched paged cache."""
+
+        expert = self.experts[Modality.TEXT]
+        batch = int(hidden_states.shape[0])
+        normed = expert.input_norm(hidden_states)
+        q, k, v = expert.project_qkv(normed, cos, sin)
+        q = q.view(batch, 1, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, 1, self.n_kv, self.head_dim).transpose(1, 2)
+        v = v.view(batch, 1, self.n_kv, self.head_dim).transpose(1, 2)
+        cache = past_key_values.request_cache_for_update(layer_idx, 1)
+        try:
+            attn_values = expert.attend(layer_idx, q, k, v, cache, True, True)
+        except BaseException:
+            cancel = getattr(past_key_values, "cancel_layer_update", None)
+            if callable(cancel):
+                cancel(layer_idx)
+            raise
+        past_key_values.finish_layer_update(layer_idx, 1)
+        hidden_states = hidden_states + expert.o_proj(
+            attn_values.transpose(1, 2).reshape(batch, self.q_size)
+        )
+        normed = expert.post_norm(hidden_states)
+        return hidden_states + expert.mlp(normed.to(torch.bfloat16))
+
     def forward_paged_gen_batch(
         self,
         layer_idx: int,
@@ -730,6 +762,34 @@ class MoTModel(nn.Module):
                 layer_idx, hidden_states, cos, sin, past_key_values
             )
         return self.norm(hidden_states)
+
+    @torch.no_grad()
+    def forward_paged_text_batch(
+        self,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: Any,
+    ) -> torch.Tensor:
+        """Run a batched one-token text decode over independent paged rows."""
+
+        if inputs_embeds.ndim != 3 or int(inputs_embeds.shape[1]) != 1:
+            raise ValueError("paged text batch expects [batch, 1, hidden] inputs")
+        batch = int(inputs_embeds.shape[0])
+        positions = positions.reshape(-1)
+        if int(positions.numel()) != batch:
+            raise ValueError("paged text batch positions must align with rows")
+        cos, sin = self.rotary.cos_sin_1d(positions)
+        hidden_states = inputs_embeds[:, 0, :]
+        for layer_idx, layer_module in enumerate(self.layers):
+            layer = cast(MoTDecoderLayer, layer_module)
+            hidden_states = layer.forward_paged_text_batch(
+                layer_idx,
+                hidden_states,
+                cos,
+                sin,
+                past_key_values,
+            )
+        return self.norm(hidden_states).unsqueeze(1)
 
     @torch.no_grad()
     def forward_paged_gen_batch(

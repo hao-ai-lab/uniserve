@@ -175,3 +175,43 @@ def test_bagel_denoise_graph_forward_maps_static_positions_and_latent_rows():
     assert calls[0][3] is cache
     torch.testing.assert_close(calls[0][4], torch.tensor([0, 3, 4, 7]))
     assert tuple(velocity.shape) == (2, 2, 1)
+
+
+def test_bagel_interleaved_text_decode_uses_row_batched_paged_forward():
+    calls = []
+
+    class Language:
+        def forward_paged_text_batch(self, embeds, positions, past):
+            calls.append((embeds, positions, past))
+            return embeds
+
+    class Model:
+        lm = Language()
+
+        @staticmethod
+        def embed_tokens(input_ids):
+            return input_ids.to(torch.bfloat16).unsqueeze(-1).expand(*input_ids.shape, 3)
+
+        @staticmethod
+        def logits(hidden):
+            return hidden[:, :1].expand(int(hidden.shape[0]), 5)
+
+    class Owner:
+        interleaved_text_forward = BagelForUnifiedGeneration.interleaved_text_forward
+
+        def _ensure_loaded(self):
+            return SimpleNamespace(model=Model())
+
+    past = object()
+    output = Owner().interleaved_text_forward(
+        input_ids=torch.tensor([[11], [12]]),
+        indexes=torch.tensor([[5, 7]]),
+        past_key_values=past,
+    )
+
+    assert len(calls) == 1
+    embeds, positions, seen_past = calls[0]
+    assert tuple(embeds.shape) == (2, 1, 3)
+    torch.testing.assert_close(positions, torch.tensor([5, 7]))
+    assert seen_past is past
+    assert tuple(output.logits.shape) == (2, 1, 5)
