@@ -97,6 +97,12 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
     def enabled(self) -> bool:
         return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
 
+    def capture_pool(self) -> Any:
+        # Mixed geometries are captured lazily and can replay in any scheduler
+        # order. Each graph therefore owns its activation pool; sharing one pool
+        # would alias static allocations between independently replayed graphs.
+        return None
+
     def maybe_run(
         self,
         owner: Any,
