@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from uniserve_eval.harness.text_parity import (
+    evaluate_i2t_work_conformance,
     evaluate_text_canary,
     evaluate_text_work_conformance,
 )
@@ -22,6 +23,8 @@ def _record(
     text: str = "answer",
     prompt_len: int = 17,
     output_len: int = 5,
+    requested_output_len: int | None = None,
+    finish_reason: str = "length",
 ) -> dict:
     payload = text.encode("utf-8")
     return {
@@ -30,9 +33,11 @@ def _record(
         "prompt_len": prompt_len,
         "prompt_len_source": "server_usage",
         "output_len": output_len,
-        "requested_output_len": output_len,
+        "requested_output_len": (
+            output_len if requested_output_len is None else requested_output_len
+        ),
         "output_len_source": "server_usage",
-        "finish_reason": "length",
+        "finish_reason": finish_reason,
         "generated_text_bytes": len(payload),
         "generated_text_sha256": hashlib.sha256(payload).hexdigest(),
     }
@@ -125,6 +130,85 @@ def test_fixed_work_conformance_does_not_run_the_text_canary(
         "mismatch_request_ids": [],
         "mismatches": [],
     }
+
+
+def test_capped_i2t_conformance_accepts_backend_usage_accounting_and_natural_eos(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    _write_jsonl(
+        reference,
+        [
+            _record(
+                "request-0",
+                prompt_len=5,
+                output_len=160,
+                requested_output_len=256,
+                finish_reason="stop",
+            )
+        ],
+    )
+    _write_jsonl(
+        candidate,
+        [
+            _record(
+                "request-0",
+                prompt_len=16,
+                output_len=256,
+                requested_output_len=256,
+            )
+        ],
+    )
+
+    evidence = evaluate_i2t_work_conformance(reference, candidate, ignore_eos=False)
+
+    assert evidence["passed"] is True
+    assert evidence["work_checks"]["server_reported_prompt_counts"] is True
+    assert evidence["work_checks"]["matching_requested_output_limits"] is True
+    assert evidence["work_checks"]["output_counts_within_requested_limits"] is True
+    assert "matching_prompt_counts" not in evidence["work_checks"]
+    assert "matching_output_counts" not in evidence["work_checks"]
+
+
+def test_i2t_conformance_enforces_cap_or_fixed_work_from_eos_semantics(
+    tmp_path: Path,
+) -> None:
+    reference = tmp_path / "reference.jsonl"
+    candidate = tmp_path / "candidate.jsonl"
+    _write_jsonl(
+        reference,
+        [_record("request-0", prompt_len=4936, output_len=256, requested_output_len=256)],
+    )
+    _write_jsonl(
+        candidate,
+        [_record("request-0", prompt_len=35, output_len=255, requested_output_len=256)],
+    )
+
+    capped = evaluate_i2t_work_conformance(reference, candidate, ignore_eos=False)
+    fixed = evaluate_i2t_work_conformance(reference, candidate, ignore_eos=True)
+
+    assert capped["passed"] is True
+    assert fixed["passed"] is False
+    assert fixed["mismatch_request_ids"] == ["request-0"]
+    assert {reason["code"] for reason in fixed["mismatches"][0]["reasons"]} == {
+        "requested_output_work_mismatch",
+        "output_len_mismatch",
+    }
+
+    over_cap = _record(
+        "request-0",
+        prompt_len=35,
+        output_len=257,
+        requested_output_len=256,
+    )
+    _write_jsonl(candidate, [over_cap])
+    invalid = evaluate_i2t_work_conformance(reference, candidate, ignore_eos=False)
+    assert invalid["passed"] is False
+    assert invalid["work_checks"]["output_counts_within_requested_limits"] is False
+    assert invalid["mismatches"][0]["reasons"] == [
+        {"code": "output_count_exceeds_requested_limit", "side": "candidate"}
+    ]
 
 
 def test_text_canary_requires_identical_order_and_unique_request_ids(

@@ -12,6 +12,8 @@ from uniserve_eval.harness.comparison import compare_pair, summarize_runs
 
 pytestmark = pytest.mark.unit
 
+_PARITY_FINGERPRINT = "a" * 64
+
 
 def _request(request_id: str, text: str) -> dict:
     payload = text.encode("utf-8")
@@ -46,6 +48,7 @@ def _point(directory: Path, *, role: str, throughput: float, text: str) -> None:
                 "parity_group": "qwen3_sharegpt",
                 "benchmark_definition": {"load_case_id": "r16"},
                 "parity_contract": {
+                    "fingerprint": _PARITY_FINGERPRINT,
                     "harness": {"spec": {"request_rate": 16.0}},
                 },
             },
@@ -85,6 +88,104 @@ def test_text_canary_is_added_only_when_enabled(tmp_path: Path) -> None:
     assert result["work"]["passed"] is True
     assert result["text_canary"]["passed"] is False
     assert result["text_canary"]["mismatch_request_ids"] == ["request-1"]
+
+
+def _i2t_point(
+    directory: Path,
+    *,
+    role: str,
+    prompt_len: int,
+    output_len: int,
+    ignore_eos: bool,
+    parity_fingerprint: str = _PARITY_FINGERPRINT,
+) -> None:
+    directory.mkdir()
+    summary = {
+        "task": "i2t",
+        "request_count": 1,
+        "ok_count": 1,
+        "failed_count": 0,
+        "elapsed_s": 1.0,
+        "metrics": {"output_throughput": float(output_len)},
+        "artifact": {
+            "valid": True,
+            "valid_marker": "canonical-valid-v2",
+            "matrix_contract": {
+                "comparison_role": role,
+                "parity_group": "image_to_text",
+                "benchmark_definition": {"load_case_id": "r1"},
+                "parity_contract": {
+                    "fingerprint": parity_fingerprint,
+                    "harness": {"spec": {"ignore_eos": ignore_eos}},
+                },
+            },
+        },
+    }
+    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    record = _request("request-1", "answer")
+    record.update(
+        {
+            "prompt_len": prompt_len,
+            "output_len": output_len,
+            "requested_output_len": 256,
+            "finish_reason": "length" if output_len == 256 else "stop",
+        }
+    )
+    (directory / "requests.jsonl").write_text(
+        json.dumps(record) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_i2t_comparison_uses_declared_natural_eos_work_contract(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    _i2t_point(
+        reference,
+        role="reference",
+        prompt_len=5,
+        output_len=160,
+        ignore_eos=False,
+    )
+    _i2t_point(
+        candidate,
+        role="candidate",
+        prompt_len=16,
+        output_len=256,
+        ignore_eos=False,
+    )
+
+    result = compare_pair(reference, candidate)
+
+    assert result["valid"] is True
+    assert result["work"]["passed"] is True
+    assert result["work"]["checks"]["output_counts_within_requested_limits"] is True
+    assert result["metric"]["candidate_over_reference"] == pytest.approx(1.6)
+
+
+def test_comparison_rejects_different_parity_contracts(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    _i2t_point(
+        reference,
+        role="reference",
+        prompt_len=5,
+        output_len=160,
+        ignore_eos=False,
+    )
+    _i2t_point(
+        candidate,
+        role="candidate",
+        prompt_len=16,
+        output_len=256,
+        ignore_eos=False,
+        parity_fingerprint="b" * 64,
+    )
+
+    result = compare_pair(reference, candidate)
+
+    assert result["valid"] is False
+    assert result["failures"] == ["parity_contract_mismatch"]
 
 
 def test_run_summary_keeps_each_ratio_and_reports_geometric_mean() -> None:
@@ -148,6 +249,7 @@ def _image_point(
                 "comparison_role": role,
                 "parity_group": "t2i_pair",
                 "benchmark_definition": {"load_case_id": load_case},
+                "parity_contract": {"fingerprint": _PARITY_FINGERPRINT},
             },
         },
     }

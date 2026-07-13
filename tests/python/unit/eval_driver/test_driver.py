@@ -316,6 +316,35 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
     assert "seed: 52" not in deploy
 
 
+def test_main_benchmark_declares_every_runtime_comparison_pair() -> None:
+    config = load_config(DEFAULT_CONFIG)
+    benchmark = config["benchmarks"]["main"]
+    run_benchmarks = _load_run_benchmarks()
+
+    assert run_benchmarks.comparison_profile_roles(benchmark) == {
+        "qwen3_sharegpt": {
+            "candidate": "benchmark/server/qwen-uniserve",
+            "reference": "benchmark/server/qwen-sglang",
+        },
+        "sensenova_mjhq_t2i": {
+            "candidate": "benchmark/server/sensenova-uniserve",
+            "reference": "benchmark/server/sensenova-omni",
+        },
+        "sensenova_beans_i2t": {
+            "candidate": "benchmark/server/sensenova-uniserve",
+            "reference": "benchmark/server/sensenova-omni",
+        },
+        "bagel_mjhq_t2i": {
+            "candidate": "benchmark/server/bagel-uniserve",
+            "reference": "benchmark/server/bagel-omni",
+        },
+        "bagel_beans_i2t": {
+            "candidate": "benchmark/server/bagel-uniserve",
+            "reference": "benchmark/server/bagel-omni",
+        },
+    }
+
+
 def test_explicit_reference_servers_receive_the_same_numa_binding() -> None:
     config = load_config(DEFAULT_CONFIG)
     for server_name in (
