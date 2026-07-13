@@ -224,7 +224,8 @@
       "required_source_role": "pythonpath:0",
       "env": {
         "PYTHONPATH": "refs/vllm-omni",
-        "VLLM_OMNI_USE_QUACK_FP8": "0"
+        "VLLM_OMNI_USE_QUACK_FP8": "0",
+        "VLLM_TUNED_CONFIG_FOLDER": "uniserve_eval/configs/vllm_omni/mot"
       },
       "command": [
         "${UNISERVE_OMNI_VLLM}",
