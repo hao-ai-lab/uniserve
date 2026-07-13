@@ -6,6 +6,14 @@ import torch.nn.functional as F
 
 from uniserve_worker import ops
 from uniserve_worker.foundation.triton_compat import triton_device_supported
+from uniserve_worker.nn.activation import _triton_act_row_chunks
+
+
+def test_triton_silu_and_mul_chunks_bagel_rows_before_int32_offset_overflow():
+    assert list(_triton_act_row_chunks(61_470, 18_944)) == [
+        (0, 56_679),
+        (56_679, 61_470),
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
