@@ -39,6 +39,7 @@ from uniserve_eval.harness.report import (
 )
 from uniserve_eval.harness.runner import BenchmarkRunner
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
+from uniserve_eval.harness.tasks.base import TaskRequest
 from uniserve_eval.profiles import (
     DEFAULT_CONFIG,
     benchmark_matrix_definition_contract,
@@ -55,6 +56,76 @@ from uniserve_eval.profiles import (
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[4]
+
+
+def test_mixed_runtime_plan_evidence_inspects_each_semantic_workload(tmp_path):
+    spec = BenchmarkSpec(
+        task=TaskName.MIXED,
+        model="M",
+        num_prompts=2,
+        warmup_requests=0,
+        workload_mix={"t2i": 1, "i2t": 1},
+        warmup_mix={"t2i": 0, "i2t": 0},
+        dataset_path=str(tmp_path),
+        runtime_profile_id="dialect",
+        plan_evidence_policy="runtime_inspection",
+        output_constraint="mixed_image_text",
+    )
+    runner = BenchmarkRunner("http://127.0.0.1:8000", spec, tmp_path / "out")
+
+    class _Task:
+        def build_request(self, row):
+            task = row["task"]
+            return TaskRequest(
+                endpoint="/v1/chat/completions",
+                kind="openai_chat_json" if task == "t2i" else "openai_chat",
+                semantic_task=task,
+                payload={
+                    "model": "M",
+                    "modalities": ["image" if task == "t2i" else "text"],
+                    "messages": [],
+                },
+            )
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, task):
+            self.task = task
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"profile_id": f"profile-{self.task}"}
+
+    class _Client:
+        def __init__(self):
+            self.tasks = []
+
+        async def post(self, _url, *, json, headers, timeout):
+            del headers, timeout
+            task = "t2i" if json["modalities"] == ["image"] else "i2t"
+            self.tasks.append(task)
+            return _Response(task)
+
+    runner.task = _Task()
+    client = _Client()
+    evidence = asyncio.run(
+        runner._collect_plan_evidence(
+            client,
+            [{"task": "t2i"}, {"task": "i2t"}],
+        )
+    )
+
+    assert client.tasks == ["i2t", "t2i"]
+    assert set(evidence["workloads"]) == {"t2i", "i2t"}
+    assert evidence["plan"] == {
+        "workloads": {
+            "i2t": {"profile_id": "profile-i2t"},
+            "t2i": {"profile_id": "profile-t2i"},
+        }
+    }
 
 
 def test_benchmark_parity_excludes_backend_identity_but_pins_protocol_and_rows():
