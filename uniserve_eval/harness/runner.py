@@ -35,9 +35,10 @@ from .report import (
     spec_to_dict,
     write_summary_artifacts,
 )
-from .spec import BenchmarkSpec
+from .spec import BenchmarkSpec, TaskName
 from .tasks import TASKS
 from .tasks.base import TaskRequest
+from .tasks.mixed import mixed_subtask_specs
 
 
 @dataclass
@@ -223,6 +224,38 @@ class BenchmarkRunner:
                 "plan": None,
                 "error": "the dataset produced no request for plan inspection",
             }
+        if self.spec.task == TaskName.MIXED:
+            workloads: dict[str, dict[str, Any]] = {}
+            subtask_specs = mixed_subtask_specs(self.spec)
+            for task_name in sorted(self.spec.workload_mix):
+                row = next(
+                    (candidate for candidate in rows if candidate.get("task") == task_name),
+                    None,
+                )
+                if row is None:
+                    workloads[task_name] = {
+                        "plan": None,
+                        "error": "the dataset produced no representative request",
+                    }
+                    continue
+                request = self.task.build_request(row)
+                if policy == "reference_protocol":
+                    workloads[task_name] = {
+                        "plan": plan_summary(subtask_specs[task_name]),
+                        "request": reference_request_summary(request),
+                    }
+                else:
+                    workloads[task_name] = await self._inspect_runtime_plan(client, request)
+            return {
+                "source": policy,
+                "plan": {
+                    "workloads": {
+                        task_name: evidence.get("plan")
+                        for task_name, evidence in workloads.items()
+                    }
+                },
+                "workloads": workloads,
+            }
         request = self.task.build_request(rows[0])
         if policy == "reference_protocol":
             return {
@@ -230,6 +263,14 @@ class BenchmarkRunner:
                 "plan": plan_summary(self.spec),
                 "request": reference_request_summary(request),
             }
+        evidence = await self._inspect_runtime_plan(client, request)
+        return {"source": "runtime_inspection", **evidence}
+
+    async def _inspect_runtime_plan(
+        self,
+        client: httpx.AsyncClient,
+        request: TaskRequest,
+    ) -> dict[str, Any]:
         plan_endpoints = {
             "/v1/chat/completions": "/v1/chat/completions/plan",
             "/v1/images/generations": "/v1/images/generations/plan",
@@ -237,7 +278,6 @@ class BenchmarkRunner:
         endpoint = plan_endpoints.get(request.endpoint)
         if endpoint is None:
             return {
-                "source": "runtime_inspection",
                 "plan": None,
                 "error": f"no runtime plan endpoint is defined for {request.endpoint}",
             }
@@ -253,14 +293,12 @@ class BenchmarkRunner:
             if not isinstance(plan, dict) or not isinstance(plan.get("profile_id"), str):
                 raise ValueError("runtime plan response is not a PlanInspection object")
             return {
-                "source": "runtime_inspection",
                 "endpoint": endpoint,
                 "plan": plan,
                 "request": reference_request_summary(request),
             }
         except Exception as error:  # noqa: BLE001 - the artifact records inspection failure.
             return {
-                "source": "runtime_inspection",
                 "endpoint": endpoint,
                 "plan": None,
                 "error": str(error),

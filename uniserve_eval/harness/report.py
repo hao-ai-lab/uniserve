@@ -512,20 +512,34 @@ def artifact_contract(
     if plan_evidence_valid and expected_plan_source == "declared_contract":
         plan_evidence_valid = isinstance(plan, dict)
     elif plan_evidence_valid and expected_plan_source == "runtime_inspection":
-        request = plan_evidence.get("request")
-        plan_evidence_valid = (
-            isinstance(plan, dict)
-            and isinstance(request, dict)
-            and _reference_request_matches_contract(request, spec)
-            and _runtime_plan_matches_declared_contract(plan, spec, request=request)
-        )
+        if spec.task == TaskName.MIXED:
+            plan_evidence_valid = _mixed_plan_evidence_matches_contract(
+                plan_evidence,
+                spec,
+                source="runtime_inspection",
+            )
+        else:
+            request = plan_evidence.get("request")
+            plan_evidence_valid = (
+                isinstance(plan, dict)
+                and isinstance(request, dict)
+                and _reference_request_matches_contract(request, spec)
+                and _runtime_plan_matches_declared_contract(plan, spec, request=request)
+            )
     elif plan_evidence_valid and expected_plan_source == "reference_protocol":
-        request = plan_evidence.get("request")
-        plan_evidence_valid = (
-            isinstance(request, dict)
-            and plan == plan_summary(spec)
-            and _reference_request_matches_contract(request, spec)
-        )
+        if spec.task == TaskName.MIXED:
+            plan_evidence_valid = _mixed_plan_evidence_matches_contract(
+                plan_evidence,
+                spec,
+                source="reference_protocol",
+            )
+        else:
+            request = plan_evidence.get("request")
+            plan_evidence_valid = (
+                isinstance(request, dict)
+                and plan == plan_summary(spec)
+                and _reference_request_matches_contract(request, spec)
+            )
     checks = {
         "declared_request_count": request_count == spec.num_prompts,
         "minimum_successful_requests": ok_count >= spec.acceptance_min_success,
@@ -556,6 +570,47 @@ def artifact_contract(
         "contract": contract,
         "generation_conformance": generation_conformance,
     }
+
+
+def _mixed_plan_evidence_matches_contract(
+    evidence: dict[str, Any],
+    spec: BenchmarkSpec,
+    *,
+    source: str,
+) -> bool:
+    from .tasks.mixed import mixed_subtask_specs
+
+    workloads = evidence.get("workloads")
+    aggregate = evidence.get("plan")
+    subtask_specs = mixed_subtask_specs(spec)
+    expected_tasks = set(subtask_specs)
+    if not isinstance(workloads, dict) or set(workloads) != expected_tasks:
+        return False
+    expected_aggregate: dict[str, Any] = {"workloads": {}}
+    for task_name, subtask_spec in subtask_specs.items():
+        entry = workloads.get(task_name)
+        if not isinstance(entry, dict):
+            return False
+        plan = entry.get("plan")
+        request = entry.get("request")
+        if not isinstance(plan, dict) or not isinstance(request, dict):
+            return False
+        if not _reference_request_matches_contract(request, subtask_spec):
+            return False
+        if source == "runtime_inspection":
+            if not _runtime_plan_matches_declared_contract(
+                plan,
+                subtask_spec,
+                request=request,
+            ):
+                return False
+        elif source == "reference_protocol":
+            if plan != plan_summary(subtask_spec):
+                return False
+        else:
+            return False
+        expected_aggregate["workloads"][task_name] = plan
+    return aggregate == expected_aggregate
 
 
 def _runtime_plan_matches_declared_contract(
