@@ -301,6 +301,26 @@ def test_batched_request_cache_reuses_metadata_tensors_per_device():
     assert request.cache_seqlens(device="cpu") is request.cache_seqlens(device="cpu")
 
 
+def test_batched_graph_cache_refreshes_rows_in_place():
+    pool = _make_pool(block_size=4, num_blocks=32)
+    first0 = PagedTextCache(pool, [0, 1], num_layers=1, length=3)
+    first1 = PagedTextCache(pool, [2, 3], num_layers=1, length=5)
+    batched = BatchedPagedTextCache([first0, first1], block_table_width=4)
+    request = batched.request_cache_for_transient(0, 1)
+    table = request.block_table(device="cpu")
+    seqlens = request.cache_seqlens(device="cpu")
+
+    later0 = PagedTextCache(pool, [8, 9, 10], num_layers=1, length=7)
+    later1 = PagedTextCache(pool, [11, 12], num_layers=1, length=6)
+    batched.refresh_caches([later0, later1], 1)
+
+    assert batched.request_cache_for_transient(0, 1) is request
+    assert request.block_table(device="cpu") is table
+    assert request.cache_seqlens(device="cpu") is seqlens
+    assert table.tolist() == [[8, 9, 10, 0], [11, 12, 0, 0]]
+    assert seqlens.tolist() == [7, 6]
+
+
 def test_batched_transient_view_reuses_request_cache_until_a_row_grows():
     pool = _make_pool(block_size=4, num_blocks=16)
     requested: list[int] = []
