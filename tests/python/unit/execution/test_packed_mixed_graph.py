@@ -37,6 +37,29 @@ def test_packed_mixed_graph_geometries_use_private_capture_pools():
     assert runner.capture_pool() is None
 
 
+def test_packed_mixed_graph_retires_inactive_geometry_before_capture(monkeypatch):
+    events: list[str] = []
+
+    class Graph:
+        def reset(self) -> None:
+            events.append("reset")
+
+    state = SimpleNamespace(
+        graph=Graph(),
+        release_backend=lambda: events.append("release_backend"),
+    )
+    runner = PackedMixedGraphRunner()
+    runner.states["old"] = state
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: events.append("synchronize"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+
+    runner._retire_inactive_geometry("new", device=torch.device("cuda:0"))
+
+    assert runner.states == {}
+    assert state.release_backend is None
+    assert events == ["synchronize", "reset", "release_backend", "empty_cache"]
+
+
 def _decode_stream(prefix_len: int):
     builder = ForwardStreamBuilder()
     builder.add_segment(

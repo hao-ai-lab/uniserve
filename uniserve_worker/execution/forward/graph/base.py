@@ -1,6 +1,7 @@
-"""Shared CUDA graph plumbing for text decode and initial prefill."""
+"""Shared CUDA graph capture, replay, buffer, metric, and lifecycle plumbing."""
 from __future__ import annotations
 
+import gc
 import threading
 from contextlib import nullcontext
 from enum import Enum
@@ -210,6 +211,44 @@ class _GraphRunnerBase:
         """
 
         return _share_input_buffer(self._graph_input_buffer_pool, name, tensor, strict=True)
+
+    @staticmethod
+    def _destroy_graph_state(state: Any) -> None:
+        """Destroy one graph executable and its graph-scoped backend binding."""
+
+        graph = getattr(state, "graph", None)
+        release_backend = getattr(state, "release_backend", None)
+        if hasattr(state, "release_backend"):
+            state.release_backend = None
+        try:
+            reset = getattr(graph, "reset", None)
+            if callable(reset):
+                reset()
+        finally:
+            if callable(release_backend):
+                release_backend()
+
+    def _retire_graph_states(
+        self,
+        keys: tuple[Any, ...],
+        *,
+        device: torch.device | str,
+        reclaim: bool,
+    ) -> None:
+        """Synchronously retire graph states before another private-pool capture."""
+
+        states = [self.states.pop(key) for key in keys if key in self.states]
+        if not states:
+            return
+        torch.cuda.synchronize(device)
+        try:
+            for state in states:
+                self._destroy_graph_state(state)
+        finally:
+            states.clear()
+            if reclaim:
+                gc.collect()
+                torch.cuda.empty_cache()
 
     def _capture_or_replay(
         self,

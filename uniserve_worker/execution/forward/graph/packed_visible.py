@@ -70,7 +70,7 @@ class PackedMixedGraphState:
 
 
 class PackedMixedGraphRunner(_GraphRunnerBase):
-    """Own bucketed CUDA graphs for packed mixed decoder forwards."""
+    """Own the active-topology CUDA graph for packed mixed decoder forwards."""
 
     def __init__(
         self,
@@ -98,10 +98,19 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
 
     def capture_pool(self) -> Any:
-        # Mixed geometries are captured lazily and can replay in any scheduler
-        # order. Each graph therefore owns its activation pool; sharing one pool
-        # would alias static allocations between independently replayed graphs.
+        # Exact mixed geometries are captured lazily. The resident topology owns
+        # its activation pool so its static allocations cannot alias another
+        # graph executable.
         return None
+
+    def _retire_inactive_geometry(
+        self,
+        key: tuple[Any, ...],
+        *,
+        device: torch.device | str,
+    ) -> None:
+        inactive = tuple(existing for existing in self.states if existing != key)
+        self._retire_graph_states(inactive, device=device, reclaim=True)
 
     def maybe_run(
         self,
@@ -153,6 +162,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             self.last_miss_reason = "shape_ineligible" if key is None else "shape_disabled"
             self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
             return None
+        self._retire_inactive_geometry(key, device=packed_embeds.device)
         out = self._capture_or_replay(
             key=key,
             ctx=ctx,
