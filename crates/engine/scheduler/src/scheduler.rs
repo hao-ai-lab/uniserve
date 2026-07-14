@@ -414,6 +414,11 @@ pub struct Scheduler {
     /// FIFO submission order; the FIFO
     /// front is only a fallback when the worker did not echo an op_id.
     inflight_ops: HashMap<RequestId, VecDeque<InflightOp>>,
+    /// Finite resident-request cohort whose prompt and image-ingest work is
+    /// drained before its first decode service. Membership is frozen when a
+    /// ready decode would otherwise overlap another resident prompt, so later
+    /// arrivals cannot extend the cohort indefinitely.
+    prompt_cohort: Option<HashSet<RequestId>>,
     /// Decode lookahead toggle. The fast path is additionally gated per request
     /// to plain text generation whose next logits processors do not depend on
     /// an unknown sampled token.
@@ -802,6 +807,7 @@ impl Scheduler {
             reserved_blocks: 0,
             step_id: 0,
             inflight_ops: HashMap::new(),
+            prompt_cohort: None,
             decode_lookahead,
             denoise_step_burst,
             decode_token_burst,
@@ -2662,6 +2668,15 @@ impl Scheduler {
     /// pair first-dispatch requests with their `NewRequestData` record.
     fn assemble(&mut self) -> (Vec<NewRequestData>, Vec<PlannedTransition>) {
         let ids = self.assembly_order();
+        self.refresh_prompt_cohort(&ids);
+        if let Some(cohort) = self.prompt_cohort.as_ref() {
+            let cohort_ids = ids
+                .iter()
+                .copied()
+                .filter(|id| cohort.contains(id))
+                .collect::<Vec<_>>();
+            return self.assemble_pass(&cohort_ids, Some(AssemblyLane::Prefill));
+        }
         let lane = self.select_assembly_lane(&ids);
         let (new_reqs, ops) = self.assemble_pass(&ids, lane);
         if ops.is_empty() && lane == Some(AssemblyLane::Prefill) {
@@ -2673,6 +2688,67 @@ impl Scheduler {
             return self.assemble_pass(&ids, Some(AssemblyLane::Decode));
         }
         (new_reqs, ops)
+    }
+
+    fn request_has_prompt_work(&self, id: RequestId) -> bool {
+        if self.running.get(&id).is_none_or(|st| st.cancelled) {
+            return false;
+        }
+        let prompt_inflight = self.inflight_ops.get(&id).is_some_and(|items| {
+            items
+                .iter()
+                .any(|op| assembly_lane_for_kind(op.transition.kind) == AssemblyLane::Prefill)
+        });
+        prompt_inflight
+            || self
+                .peek_next_kind(id)
+                .is_some_and(|kind| assembly_lane_for_kind(kind) == AssemblyLane::Prefill)
+    }
+
+    fn request_has_ready_decode(&self, id: RequestId) -> bool {
+        if self.running.get(&id).is_none_or(|st| st.cancelled)
+            || self
+                .peek_next_kind(id)
+                .is_none_or(|kind| assembly_lane_for_kind(kind) != AssemblyLane::Decode)
+        {
+            return false;
+        }
+        !self.has_inflight(id)
+            || self.can_decode_lookahead(id)
+            || self.can_prefill_decode_lookahead(id)
+    }
+
+    fn refresh_prompt_cohort(&mut self, ids: &[RequestId]) {
+        let active = self.prompt_cohort.as_ref().is_some_and(|cohort| {
+            cohort
+                .iter()
+                .copied()
+                .any(|id| self.request_has_prompt_work(id))
+        });
+        if active {
+            return;
+        }
+        if self.prompt_cohort.take().is_some() {
+            // The first scheduling turn after a cohort drains remains available
+            // to ready decodes before another finite cohort may open.
+            return;
+        }
+
+        let prompt_ids = ids
+            .iter()
+            .copied()
+            .filter(|id| self.request_has_prompt_work(*id))
+            .collect::<HashSet<_>>();
+        if prompt_ids.len() < 2 {
+            return;
+        }
+        let has_cross_request_conflict = ids.iter().copied().any(|decode_id| {
+            self.request_has_ready_decode(decode_id)
+                && prompt_ids.iter().any(|prompt_id| *prompt_id != decode_id)
+        });
+        if has_cross_request_conflict {
+            self.prompt_cohort = Some(prompt_ids);
+        }
     }
 
     fn assemble_pass(
@@ -6152,7 +6228,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_coalesces_prompts_while_prefill_inflight() {
+    fn assemble_drains_a_resident_prompt_cohort_before_decode() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -6178,9 +6254,8 @@ mod tests {
         assert_eq!(ops[0].kind, OpKind::PrefillUnd);
         sched.register_inflight(ops[0].clone(), Instant::now());
 
-        // A second prompt arrives while request 1's prefill is in flight:
-        // decode work (request 1's lookahead decode) fills the slot and the
-        // prompt coalesces into the next prefill batch.
+        // A second resident prompt joins the same admission cohort while the
+        // first prompt's final prefill is in flight.
         let mut req = test_request(2, 4);
         req.sampling.ignore_eos = true;
         let _rx2 = sched.submit_for_test(req);
@@ -6190,18 +6265,51 @@ mod tests {
             ops2.iter()
                 .map(|op| (op.kind, op.req_id))
                 .collect::<Vec<_>>(),
-            vec![(OpKind::DecodeUnd, RequestId(1))]
+            vec![(OpKind::PrefillUnd, RequestId(2))]
         );
         sched.register_inflight(ops2[0].clone(), Instant::now());
 
-        // With no decode left to run, the waiting prompt proceeds even though
-        // a prefill batch is still in flight (never idle the pipeline).
+        // A later arrival cannot extend the frozen cohort. While both cohort
+        // prefills are in flight, no first token is emitted and request 3 waits.
+        let mut req = test_request(3, 4);
+        req.sampling.ignore_eos = true;
+        let _rx3 = sched.submit_for_test(req);
+        sched.admit();
         let (_new_reqs, ops3) = sched.assemble();
+        assert!(
+            ops3.is_empty(),
+            "unexpected ops while cohort drains: {ops3:?}"
+        );
+
+        for (id, op) in [
+            (RequestId(1), ops[0].clone()),
+            (RequestId(2), ops2[0].clone()),
+        ] {
+            sched.inflight_ops.remove(&id);
+            apply_and_resolve(
+                &mut sched,
+                id,
+                op,
+                uniserve_worker_wire::SeqResult {
+                    req_id: id,
+                    sampled_token_id: Some(10 + id.0 as u32),
+                    ..Default::default()
+                },
+                Vec::new(),
+            );
+        }
+
+        // Completing the cohort guarantees a decode turn; the later prompt did
+        // not extend the cohort that was already in flight.
+        let (_new_reqs, ops4) = sched.assemble();
         assert_eq!(
-            ops3.iter()
+            ops4.iter()
                 .map(|op| (op.kind, op.req_id))
                 .collect::<Vec<_>>(),
-            vec![(OpKind::PrefillUnd, RequestId(2))]
+            vec![
+                (OpKind::DecodeUnd, RequestId(1)),
+                (OpKind::DecodeUnd, RequestId(2)),
+            ]
         );
     }
 
