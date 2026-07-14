@@ -199,8 +199,6 @@ enum AssemblyLane {
     Other,
 }
 
-/// default per-step multimodal encode budget when the worker caps do not pin it.
-const DEFAULT_MM_ENCODE_BUDGET: usize = 4;
 /// default bound on the recent-output window carried for penalties.
 const DEFAULT_PENALTY_WINDOW: usize = 256;
 const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
@@ -395,8 +393,6 @@ pub struct Scheduler {
     enc_cache: EncoderCacheManager,
     /// Encoder-cache entries reserved by admitted image requests.
     reserved_encoder_entries: usize,
-    /// Max image-encode ops admitted per step.
-    mm_encode_budget: usize,
     running: HashMap<RequestId, ReqState>,
     order: Vec<RequestId>, // stable iteration order
     pending: Box<dyn RequestQueue>,
@@ -799,7 +795,6 @@ impl Scheduler {
             penalty_window: DEFAULT_PENALTY_WINDOW,
             enc_cache: EncoderCacheManager::new(caps_encoder_budget),
             reserved_encoder_entries: 0,
-            mm_encode_budget: DEFAULT_MM_ENCODE_BUDGET,
             running: HashMap::new(),
             order: Vec::new(),
             skipped_waiting: HashMap::new(),
@@ -846,10 +841,7 @@ impl Scheduler {
     pub fn set_penalty_window(&mut self, n: usize) {
         self.penalty_window = n.max(1);
     }
-    /// Configure the per-step multimodal encode budget. `0` disables encoding.
-    pub fn set_mm_encode_budget(&mut self, n: usize) {
-        self.mm_encode_budget = n;
-    }
+    /// Configure the per-step token budget.
     pub fn set_token_budget(&mut self, tokens: usize) {
         self.config.max_num_batched_tokens = tokens.max(1);
     }
@@ -1807,7 +1799,13 @@ impl Scheduler {
             return progressed;
         }
 
-        // 3. submit as many batches as pipeline capacity allows.
+        // 3. Admission owns request/resource residency and progresses even
+        // while every execution slot is occupied. This lets the next batch see
+        // the complete resident cohort instead of admitting only when a slot
+        // happens to open.
+        self.admit();
+
+        // 4. submit as many batches as pipeline capacity allows.
         while self.executor.can_submit() {
             self.admit();
             let (new_reqs, ops) = self.assemble();
@@ -2762,8 +2760,6 @@ impl Scheduler {
         // vLLM's per-step token budget with the clip rule: the budget, not the
         // chunk threshold, is the binding constraint.
         let mut budget: usize = self.config.max_num_batched_tokens;
-        // per-step multimodal encode budget.
-        let mut encodes_left = self.mm_encode_budget;
         // Text prefill tokens may ride along inside a decode batch (mixed
         // extend+decode forward): the prompt work then shares the decode
         // step's weight sweep instead of paying a full sweep of its own.
@@ -2834,13 +2830,6 @@ impl Scheduler {
                 };
                 match self.next_transition(id, op_budget) {
                     Some(mut op) => {
-                        // bound encode work per step; defer if over budget.
-                        if op.kind == OpKind::VitEncode || op.kind == OpKind::VaeEncode {
-                            if encodes_left == 0 {
-                                break;
-                            }
-                            encodes_left -= 1;
-                        }
                         if mixed_prefill {
                             mixed_left = mixed_left.saturating_sub(planned_op_token_cost(&op));
                         }
@@ -6152,6 +6141,77 @@ mod tests {
             0,
             "no staged request should be requeued by preemption"
         );
+    }
+
+    #[test]
+    fn admission_progresses_while_the_execution_pipeline_is_full() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 64,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 1 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 4,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 4,
+                long_prefill_threshold: 16,
+                ..Default::default()
+            },
+        );
+        let _rx1 = sched.submit_for_test(test_request(1, 4));
+        let _rx2 = sched.submit_for_test(test_request(2, 4));
+
+        sched.step_nonblocking();
+
+        assert_eq!(sched.running.len(), 2);
+        assert_eq!(sched.pending.len(), 0);
+        assert_eq!(sched.executor.in_flight(), 1);
+    }
+
+    #[test]
+    fn image_encode_batch_uses_the_declared_batch_capacity() {
+        let caps = EngineCaps {
+            block_size: 4,
+            num_blocks: 65_536,
+            supported_ops: vec![
+                OpKind::PrefillUnd,
+                OpKind::DecodeUnd,
+                OpKind::VaeEncode,
+                OpKind::VitEncode,
+            ],
+            max_vae_grid_tokens: 4_098,
+            max_vit_grid_tokens: 4_902,
+            encoder_cache_budget: 32,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_config(
+            Box::new(NullExecutor { caps, in_flight: 0 }),
+            ControlTokens::default(),
+            SchedulerConfig {
+                max_batch: 8,
+                max_num_batched_tokens: 64,
+                max_num_seqs: 8,
+                long_prefill_threshold: 16,
+                ..Default::default()
+            },
+        );
+        let mut receivers = Vec::new();
+        for id in 1..=8 {
+            let mut request = test_request(id, 4);
+            add_context_image(&mut request, 0, true);
+            compile_resources(&sched, &mut request);
+            receivers.push(sched.submit_for_test(request));
+        }
+        sched.admit();
+        assert_eq!(sched.running.len(), 8);
+
+        let (_new_requests, ops) = sched.assemble();
+
+        assert_eq!(ops.len(), 8);
+        assert!(ops.iter().all(|op| op.kind == OpKind::VaeEncode));
     }
 
     #[test]
