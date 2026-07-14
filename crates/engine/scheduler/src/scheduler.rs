@@ -1914,6 +1914,14 @@ impl Scheduler {
         })
     }
 
+    fn any_denoise_inflight(&self) -> bool {
+        self.inflight_ops.values().any(|items| {
+            items
+                .iter()
+                .any(|op| op.transition.kind == OpKind::DenoiseGen)
+        })
+    }
+
     fn has_inflight(&self, id: RequestId) -> bool {
         self.inflight_ops
             .get(&id)
@@ -2692,6 +2700,8 @@ impl Scheduler {
             0
         };
         let mut mixed_ops: Vec<PlannedTransition> = Vec::new();
+        let denoise_occupies_decode_pipeline =
+            lane == Some(AssemblyLane::Decode) && self.any_denoise_inflight();
         for id in ids.iter().copied() {
             if ops.len() + mixed_ops.len() >= self.config.max_batch {
                 break;
@@ -2732,8 +2742,10 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_kind == Some(OpKind::DenoiseGen) && !self.can_schedule_denoise(id) {
-                continue;
+            if next_kind == Some(OpKind::DenoiseGen) {
+                if denoise_occupies_decode_pipeline || !self.can_schedule_denoise(id) {
+                    continue;
+                }
             }
             // Build an op; on a block-budget miss, preempt a budgeted victim
             // and retry — else skip this request for the step.
@@ -6733,15 +6745,13 @@ mod tests {
     }
 
     #[test]
-    fn assemble_co_batches_und_decode_with_denoise() {
-        // und/gen mixed-batch single-forward is a core project invariant: a
-        // text-decode op and an image-denoise op resident at the same step
-        // MUST land in one batch (one packed forward), never be serialized
-        // into separate forwards. Drive one request into DenoiseGen and one
-        // into DecodeUnd, then assert one assemble() pass emits both.
+    fn assemble_interleaves_packed_mixed_and_decode_service() {
+        // A ready text-decode op and image-denoise op share one packed forward.
+        // While that denoise op is in flight, the next pipeline slot services
+        // decode lookahead without admitting another denoise request.
         let caps = EngineCaps {
             block_size: 4,
-            num_blocks: 64,
+            num_blocks: 256,
             latent_downsample: 16,
             ..Default::default()
         };
@@ -6750,7 +6760,7 @@ mod tests {
             ControlTokens::default(),
             SchedulerConfig {
                 max_batch: 8,
-                max_num_batched_tokens: 64,
+                max_num_batched_tokens: 24,
                 max_num_seqs: 8,
                 long_prefill_threshold: 16,
                 ..Default::default()
@@ -6776,9 +6786,29 @@ mod tests {
         // Request 2: a plain text-decode request -> DecodeUnd.
         let mut und_req = test_request(2, 4);
         und_req.max_und_tokens = 64;
+        und_req.sampling.ignore_eos = true;
         compile_resources(&sched, &mut und_req);
         let _rx2 = sched.submit_for_test(und_req);
+        // Request 3: another image-denoise request. The token budget admits
+        // one denoise operation per batch, matching large-latent workloads.
+        let mut second_gen_req = test_request(3, 4);
+        request_with_generation_behavior(
+            &mut second_gen_req,
+            uniserve_core::GenerationConstraint::Default,
+        );
+        second_gen_req.max_und_tokens = 64;
+        second_gen_req.image = uniserve_core::ImageParams {
+            height: 64,
+            width: 64,
+            max_images: 2,
+            retain_images: true,
+            ..Default::default()
+        };
+        compile_resources(&sched, &mut second_gen_req);
+        let _rx3 = sched.submit_for_test(second_gen_req);
         sched.admit();
+        sched.decode_lookahead = true;
+        sched.decode_token_burst = 8;
 
         if let Some(st) = sched.running.get_mut(&RequestId(1)) {
             st.lifecycle.phase = Phase::DecodeUnd;
@@ -6788,10 +6818,23 @@ mod tests {
             st.replay.generated_ids.clear();
         }
         sched.begin_image(RequestId(1));
+        if let Some(st) = sched.running.get_mut(&RequestId(3)) {
+            st.lifecycle.phase = Phase::DecodeUnd;
+            st.und.logical_pos = 4;
+            st.ingest.prompt_cursor = 4;
+            st.und.tokens_emitted = 1;
+            st.replay.generated_ids.clear();
+        }
+        sched.begin_image(RequestId(3));
         assert_eq!(
             sched.running.get(&RequestId(1)).map(|s| s.lifecycle.phase),
             Some(Phase::DenoiseGen),
             "request 1 must be denoising"
+        );
+        assert_eq!(
+            sched.running.get(&RequestId(3)).map(|s| s.lifecycle.phase),
+            Some(Phase::DenoiseGen),
+            "request 3 must be denoising"
         );
         if let Some(st) = sched.running.get_mut(&RequestId(2)) {
             st.lifecycle.phase = Phase::DecodeUnd;
@@ -6807,6 +6850,27 @@ mod tests {
             has_gen && has_und_decode,
             "assemble must co-batch text-decode with image-denoise in one forward: {:?}",
             ops.iter().map(|o| o.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.kind == OpKind::DenoiseGen)
+                .count(),
+            1,
+            "the token budget should admit one denoise operation"
+        );
+        for op in ops {
+            sched.register_inflight(op, Instant::now());
+        }
+
+        let (_new, lookahead) = sched.assemble();
+        assert!(
+            lookahead.iter().any(|op| op.kind == OpKind::DecodeUnd),
+            "decode lookahead must keep the pipeline full"
+        );
+        assert!(
+            lookahead.iter().all(|op| op.kind != OpKind::DenoiseGen),
+            "a second denoise operation must not occupy the decode service slot: {:?}",
+            lookahead.iter().map(|op| op.kind).collect::<Vec<_>>()
         );
     }
 
