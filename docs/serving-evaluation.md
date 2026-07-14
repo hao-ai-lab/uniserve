@@ -4,7 +4,7 @@
 
 ## Benchmark entry
 
-Run the configured 38-point matrix through one command:
+Run the configured 42-point matrix through one command:
 
 ```bash
 .venv/bin/python scripts/run_benchmarks.py \

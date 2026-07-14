@@ -29,8 +29,10 @@ A failed point stops the run and preserves its partial artifacts and logs. The f
 | BAGEL MJHQ T2I | UniServe, vLLM-Omni | 32 | `c1`, `c32` | `c1`: mean image latency, minimize; `c32`: images/s, maximize |
 | SenseNova-U1 Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s |
 | BAGEL Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize |
+| SenseNova-U1 mixed MJHQ T2I and Beans I2T | UniServe, vLLM-Omni | 32: 8 T2I, 24 I2T | `c32` | Fixed-mix requests/s, maximize |
+| BAGEL mixed MJHQ T2I and Beans I2T | UniServe, vLLM-Omni | 32: 8 T2I, 24 I2T | `c32` | Fixed-mix requests/s, maximize |
 
-The matrix contains 38 serial points. `rN` is an open-loop seed-42 Poisson trace with an offered rate of N requests/s and no client concurrency semaphore. `c1` submits the fixed prompt set immediately with client concurrency one. `c32` submits the same set immediately with client concurrency 32.
+The matrix contains 42 serial points. `rN` is an open-loop seed-42 Poisson trace with an offered rate of N requests/s and no client concurrency semaphore. `c1` submits the fixed prompt set immediately with client concurrency one. `c32` submits the fixed workload immediately with client concurrency 32.
 
 Timing covers the complete measured arrival and completion region. TTFT begins at client send and ends at the first non-empty content or reasoning delta; TPOT uses server completion-token accounting; output throughput is server-reported completion tokens divided by the complete timed region. Image latency is measured from request send through decoded output receipt, and image throughput is the number of successfully decoded images divided by the complete timed region.
 
@@ -57,6 +59,10 @@ BAGEL T2I fixes seed 42 in both autoregressive and diffusion stages, non-thinkin
 Both sides receive the same selected inputs, seeds, requested image count and dimensions, semantic denoising work, load case, and accelerator allocation. Every generated image must decode successfully and match its declared format, dimensions, and count before a T2I comparison is valid.
 
 Beans I2T fixes the selected JPEG inputs, prompt, preprocessing, sampling controls, and 256-token completion limit. BAGEL ignores EOS, so the limit defines fixed output work. SenseNova respects EOS, so the same value is an upper bound and throughput uses the completion tokens reported by each server. Both runtimes must report prompt and output usage, but prompt token counts are not compared across runtimes because multimodal backends account for expanded image tokens differently; the shared parity contract binds the selected images, request order, prompt, preprocessing, and completion limit.
+
+Each mixed point submits 32 measured requests at `c32`: 8 MJHQ T2I requests and 24 Beans I2T requests. Four excluded warm-up requests use the same 1:3 task ratio. Request construction, ordering, T2I generation controls, I2T sampling controls, output limits, model inputs, and preprocessing are inherited unchanged from the corresponding homogeneous workloads.
+
+The mixed primary metric is the 32-request completion rate over the complete timed region. Every result also reports the per-task completion counts, I2T output tokens/s, TTFT, TPOT, end-to-end latency, T2I images/s, image latency, and the interval in which both task classes are active. The comparison is valid only when both systems complete the declared 8:24 task mix with no failed requests and all T2I outputs pass the image work checks. SenseNova retains natural-EOS I2T semantics, so its artifacts must report realized output-token counts and its mixed request-rate ratio is not interpreted as a fixed-token throughput ratio when those counts differ.
 
 ## Optional diagnostics
 
