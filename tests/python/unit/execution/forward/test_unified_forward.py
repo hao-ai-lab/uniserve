@@ -11,6 +11,7 @@ from uniserve_worker.contracts.forward_context import ForwardContext, use_forwar
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.contracts.model_protocols import ModelHooks
+from uniserve_worker.execution.encode_driver import EncodeDriver
 from uniserve_worker.execution.forward import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
@@ -1281,6 +1282,44 @@ def test_worker_adapter_encode_result_is_published_by_postprocess():
     assert outputs[0].encoder_handle == 44
     assert outputs[0].num_tokens == 3
     assert outputs[0].image_hw == (8, 9)
+
+
+def test_encode_driver_uses_model_batch_hook_for_aligned_outputs():
+    ops = [
+        {"req_id": 2, "kind": "vit_encode", "mm_hash": 9},
+        {"req_id": 3, "kind": "vae_encode", "mm_hash": 10},
+    ]
+
+    class Model:
+        def __init__(self):
+            self.calls = 0
+
+        def encode_many(self, submitted_ops):
+            self.calls += 1
+            assert tuple(submitted_ops) == tuple(ops)
+            return [
+                {"req_id": 2, "encoder_handle": 44, "num_tokens": 3},
+                {"req_id": 3, "encoder_handle": 45, "num_tokens": 4},
+            ]
+
+        def encode_image(self, *args, **kwargs):
+            raise AssertionError("batched encode must not fall back to per-op execution")
+
+        def encode_latents(self, *args, **kwargs):
+            raise AssertionError("batched encode must not fall back to per-op execution")
+
+    model = Model()
+    result = EncodeDriver().forward_result(
+        UniForwardBatch.from_ops(ops),
+        model,
+        row_indices=(4, 9),
+    )
+
+    assert model.calls == 1
+    assert result.encode_outputs is not None
+    assert sorted(result.encode_outputs) == [4, 9]
+    assert result.encode_outputs[4].encoder_handle == 44
+    assert result.encode_outputs[9].encoder_handle == 45
 
 
 def test_worker_adapter_commit_result_is_sampled_by_postprocess():

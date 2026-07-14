@@ -7,7 +7,7 @@ import logging
 import math
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,7 +69,7 @@ from ..nn.vision import (
     SiglipNavitConfig,
     SiglipNavitEncoder,
     get_flattened_position_ids_extrapolate,
-    patchify,
+    patchify_batch,
 )
 from ..processors.bagel import BagelImageProcessor
 from ..runtime.image_params import parse_text_image_generation_params
@@ -417,8 +417,14 @@ class _BagelGraph(nn.Module):
 
     @torch.no_grad()
     def vit_encode(self, image_tensor: torch.Tensor) -> torch.Tensor:
-        image_tensor = image_tensor.to(self.device)
-        height, width = image_tensor.shape[1], image_tensor.shape[2]
+        return self.vit_encode_batch(image_tensor.unsqueeze(0))[0]
+
+    @torch.no_grad()
+    def vit_encode_batch(self, image_tensors: torch.Tensor) -> torch.Tensor:
+        if image_tensors.ndim != 4:
+            raise invalid_descriptor("BAGEL batched ViT encode expects NCHW pixels")
+        image_tensors = image_tensors.to(self.device)
+        batch, _channels, height, width = image_tensors.shape
         patch = self.cfg.vit_patch_size
         pos_ids = get_flattened_position_ids_extrapolate(
             height,
@@ -426,34 +432,70 @@ class _BagelGraph(nn.Module):
             patch,
             self.cfg.vit_max_num_patch_per_side,
         ).to(self.device)
-        patches = patchify(image_tensor, patch).to(self.device, torch.bfloat16)
-        cu_seqlens = torch.tensor([0, patches.shape[0]], dtype=torch.int32, device=self.device)
+        patches = (
+            patchify_batch(image_tensors, patch)
+            .reshape(
+                -1,
+                patch * patch * int(image_tensors.shape[1]),
+            )
+            .to(self.device, torch.bfloat16)
+        )
+        tokens_per_image = (height // patch) * (width // patch)
+        cu_seqlens = torch.arange(
+            0,
+            (batch + 1) * tokens_per_image,
+            tokens_per_image,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        packed_pos_ids = pos_ids.repeat(batch)
         vit_out = self.vit_model(
             patches,
-            {"position_ids": pos_ids, "cu_seqlens": cu_seqlens},
+            {"position_ids": packed_pos_ids, "cu_seqlens": cu_seqlens},
         )
-        emb = self.connector(vit_out) + self.vit_pos_embed(pos_ids)
-        return emb.to(torch.bfloat16)
+        emb = self.connector(vit_out) + self.vit_pos_embed(packed_pos_ids)
+        return emb.reshape(batch, tokens_per_image, -1).to(torch.bfloat16)
 
     @torch.no_grad()
     def vae_encode_clean(self, image_tensor: torch.Tensor):
-        image_tensor = image_tensor.to(self.device)
-        height, width = image_tensor.shape[1], image_tensor.shape[2]
+        latents, pos_ids, hw = self.vae_encode_clean_batch(image_tensor.unsqueeze(0))
+        return latents[0], pos_ids, hw
+
+    @torch.no_grad()
+    def vae_encode_clean_batch(
+        self,
+        image_tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        if image_tensors.ndim != 4:
+            raise invalid_descriptor("BAGEL batched VAE encode expects NCHW pixels")
+        image_tensors = image_tensors.to(self.device)
+        _batch, _channels, height, width = image_tensors.shape
         vae_dtype = next(self.vae.parameters()).dtype
-        latent_image = self.vae.encode(image_tensor.unsqueeze(0).to(vae_dtype))[0]
+        latent_images = self.vae.encode(image_tensors.to(vae_dtype))
         patch = self.cfg.latent_patch_size
         channels = self.cfg.latent_channel
         h = height // self.cfg.latent_downsample
         w = width // self.cfg.latent_downsample
-        latent = latent_image[:, : h * patch, : w * patch].reshape(channels, h, patch, w, patch)
-        latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, patch * patch * channels)
+        latents = latent_images[:, :, : h * patch, : w * patch].reshape(
+            int(latent_images.shape[0]),
+            channels,
+            h,
+            patch,
+            w,
+            patch,
+        )
+        latents = torch.einsum("nchpwq->nhwpqc", latents).reshape(
+            int(latent_images.shape[0]),
+            -1,
+            patch * patch * channels,
+        )
         pos_ids = get_flattened_position_ids_extrapolate(
             height,
             width,
             self.cfg.latent_downsample,
             self.cfg.max_latent_size,
         ).to(self.device)
-        return latent.to(torch.bfloat16), pos_ids, (h, w)
+        return latents.to(torch.bfloat16), pos_ids, (h, w)
 
     def build_und_image_segment(self, vit_embeds, position_id, cache, update=True) -> Segment:
         n_tokens = vit_embeds.shape[0]
@@ -1174,104 +1216,171 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
     def _encoder_handle(mm_hash: Any) -> int:
         return encoder_handle_from_mm_hash(mm_hash)
 
-    def run_encode(self, op):
+    def encode_many(self, ops: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        if not ops:
+            return []
         loaded = self._ensure_loaded()
         m = loaded.model
         pool = loaded.pool
         image_processor = loaded.image_processor
-        r = int(op["req_id"])
-        # Encode writes image KV into the same paged text cache the shared
-        # driver serves text from: extend blocks / base length through the
-        # driver's TextCache so both paths agree on one residency state.
         driver = self._text_driver()
-        st = self.interleaved_image_state(r)
-        driver.extend_cache_blocks(st.cond, op)
-        driver.ensure_host_cache(st.cond)
-        base_len = int(st.cond.past.length)
-        view = pool.view(st.cond.block_ids, base_len)
-        rope = int(op["cond_pos"])
-        kind = str(op["kind"])
-        image_b64 = op.get("image_b64")
-        if image_b64:
-            pre = image_processor.prepare_from_b64(image_b64)
-            image_hw = [pre.size[1], pre.size[0]]
-            handle = self._encoder_handle(op.get("mm_hash"))
-            if kind == "vae_encode":
-                clean_lat, vpos, _ = m.vae_encode_clean(image_processor.vae_tensor(pre))
-                cached_payload = {
-                    "kind": kind,
-                    "clean_lat": clean_lat.detach(),
-                    "vpos": vpos.detach(),
-                    "image_hw": image_hw,
-                }
-            elif kind == "vit_encode":
-                vemb = m.vit_encode(image_processor.vit_tensor(pre)).detach()
-                cached_payload = {
-                    "kind": kind,
-                    "vemb": vemb,
-                    "image_hw": image_hw,
-                }
-            else:
+        items: list[dict[str, Any]] = []
+        feature_groups: dict[tuple[str, tuple[int, ...]], list[dict[str, Any]]] = {}
+        for raw_op in ops:
+            op = dict(raw_op)
+            req_id = int(op["req_id"])
+            kind = str(op["kind"])
+            if kind not in {"vae_encode", "vit_encode"}:
                 raise invalid_descriptor(f"unsupported image encode kind: {kind}")
-            self.residency.encoder.put(handle, cached_payload)
-        else:
-            cached_handle = op.get("image_in")
-            if not isinstance(cached_handle, int) or isinstance(cached_handle, bool):
-                raise invalid_descriptor("cached image encode requires an encoder handle")
-            cached_payload = self.residency.encoder.get(cached_handle)
-            if not isinstance(cached_payload, Mapping) or cached_payload.get("kind") != kind:
-                raise invalid_descriptor("cached image encode handle is not resident")
-            cached_image_hw = cached_payload.get("image_hw")
-            if (
-                not isinstance(cached_image_hw, list)
-                or len(cached_image_hw) != 2
-                or any(
-                    not isinstance(value, int) or isinstance(value, bool)
-                    for value in cached_image_hw
+            state = self.interleaved_image_state(req_id)
+            driver.extend_cache_blocks(state.cond, op)
+            driver.ensure_host_cache(state.cond)
+            base_len = int(state.cond.past.length)
+            item: dict[str, Any] = {
+                "req_id": req_id,
+                "kind": kind,
+                "state": state,
+                "base_len": base_len,
+                "view": pool.view(state.cond.block_ids, base_len),
+                "rope": int(op["cond_pos"]),
+            }
+            image_b64 = op.get("image_b64")
+            if image_b64:
+                preprocessed = image_processor.prepare_from_b64(image_b64)
+                image_hw = [preprocessed.size[1], preprocessed.size[0]]
+                handle = self._encoder_handle(op.get("mm_hash"))
+                tensor = (
+                    image_processor.vae_tensor(preprocessed)
+                    if kind == "vae_encode"
+                    else image_processor.vit_tensor(preprocessed)
                 )
-            ):
-                raise invalid_descriptor("cached image encode dimensions are invalid")
-            image_hw = [int(value) for value in cached_image_hw]
-            handle = cached_handle
+                item.update({"image_hw": image_hw, "handle": handle, "tensor": tensor})
+                feature_groups.setdefault((kind, tuple(int(v) for v in tensor.shape)), []).append(
+                    item
+                )
+            else:
+                handle = op.get("image_in")
+                if not isinstance(handle, int) or isinstance(handle, bool):
+                    raise invalid_descriptor("cached image encode requires an encoder handle")
+                payload = self.residency.encoder.get(handle)
+                if not isinstance(payload, Mapping) or payload.get("kind") != kind:
+                    raise invalid_descriptor("cached image encode handle is not resident")
+                cached_image_hw = payload.get("image_hw")
+                if (
+                    not isinstance(cached_image_hw, list)
+                    or len(cached_image_hw) != 2
+                    or any(
+                        not isinstance(value, int) or isinstance(value, bool)
+                        for value in cached_image_hw
+                    )
+                ):
+                    raise invalid_descriptor("cached image encode dimensions are invalid")
+                item.update(
+                    {
+                        "image_hw": [int(value) for value in cached_image_hw],
+                        "handle": handle,
+                        "payload": payload,
+                    }
+                )
+            items.append(item)
 
-        if kind == "vae_encode":
-            clean_lat = cached_payload.get("clean_lat")
-            vpos = cached_payload.get("vpos")
-            if not isinstance(clean_lat, torch.Tensor) or not isinstance(vpos, torch.Tensor):
-                raise invalid_descriptor("cached VAE output is incomplete")
-            n = clean_lat.shape[0]
-            seg = m.build_gen_segment(n, vpos, clean_lat, 0.0, rope, view, update=True)
-            hidden = m.run([seg])[0]
-            added = n + _BAGEL_IMAGE_MARKER_TOKENS
-        elif kind == "vit_encode":
-            cached_vemb = cached_payload.get("vemb")
-            if not isinstance(cached_vemb, torch.Tensor):
-                raise invalid_descriptor("cached ViT output is incomplete")
-            vemb = cached_vemb
-            n = vemb.shape[0]
-            hidden = m.run([m.build_und_image_segment(vemb, rope, view, update=True)])[0]
-            added = n + _BAGEL_IMAGE_MARKER_TOKENS
-        else:
-            raise invalid_descriptor(f"unsupported image encode kind: {kind}")
-        new_len = base_len + added
-        # The image span consumed `added` KV slots but a single rope position;
-        # advance the driver's text cache for both so following text ops
-        # continue from the right KV length and position.
-        self._sync_text_cache_after_image(r, length=new_len, last_position=rope)
-        sampling = self._state(r).sampling
-        if (
-            sampling.get("return_prompt_logprobs")
-            or int(sampling.get("n_prompt_logprobs", 0) or 0) > 0
-        ):
-            st.cond.last_logits = m.logits(hidden[-1:]).unsqueeze(0)
-        self._set_length(r, new_len)
-        rec = self._record(r)
-        rec["dims"] = image_hw
-        if kind == "vit_encode":
-            rec["context_image_feedback"] = True
-            rec["text_branch_kvlen"] = new_len
-            rec["text_branch_pos"] = rope + 1
-        return {"req_id": r, "encoder_handle": handle, "num_tokens": added, "image_hw": image_hw}
+        for (kind, _shape), group in feature_groups.items():
+            tensors = torch.stack([item["tensor"] for item in group], dim=0)
+            if kind == "vae_encode":
+                clean_latents, position_ids, _ = m.vae_encode_clean_batch(tensors)
+                for index, item in enumerate(group):
+                    payload = {
+                        "kind": kind,
+                        "clean_lat": clean_latents[index].detach(),
+                        "vpos": position_ids.detach(),
+                        "image_hw": item["image_hw"],
+                    }
+                    item["payload"] = payload
+                    self.residency.encoder.put(item["handle"], payload)
+            else:
+                embeddings = m.vit_encode_batch(tensors)
+                for index, item in enumerate(group):
+                    payload = {
+                        "kind": kind,
+                        "vemb": embeddings[index].detach(),
+                        "image_hw": item["image_hw"],
+                    }
+                    item["payload"] = payload
+                    self.residency.encoder.put(item["handle"], payload)
+
+        segments: list[Segment] = []
+        for item in items:
+            kind = item["kind"]
+            payload = item["payload"]
+            if kind == "vae_encode":
+                clean_lat = payload.get("clean_lat")
+                position_ids = payload.get("vpos")
+                if not isinstance(clean_lat, torch.Tensor) or not isinstance(
+                    position_ids, torch.Tensor
+                ):
+                    raise invalid_descriptor("cached VAE output is incomplete")
+                token_count = int(clean_lat.shape[0])
+                segment = m.build_gen_segment(
+                    token_count,
+                    position_ids,
+                    clean_lat,
+                    0.0,
+                    item["rope"],
+                    item["view"],
+                    update=True,
+                )
+            else:
+                embeddings = payload.get("vemb")
+                if not isinstance(embeddings, torch.Tensor):
+                    raise invalid_descriptor("cached ViT output is incomplete")
+                token_count = int(embeddings.shape[0])
+                segment = m.build_und_image_segment(
+                    embeddings,
+                    item["rope"],
+                    item["view"],
+                    update=True,
+                )
+            item["added"] = token_count + _BAGEL_IMAGE_MARKER_TOKENS
+            segments.append(segment)
+
+        hidden_rows = m.run(segments)
+        if len(hidden_rows) != len(items):
+            raise invalid_descriptor("BAGEL batched image encode returned the wrong row count")
+        outputs: list[dict[str, Any]] = []
+        for item, hidden in zip(items, hidden_rows, strict=True):
+            req_id = int(item["req_id"])
+            added = int(item["added"])
+            new_len = int(item["base_len"]) + added
+            self._sync_text_cache_after_image(
+                req_id,
+                length=new_len,
+                last_position=int(item["rope"]),
+            )
+            sampling = self._state(req_id).sampling
+            if (
+                sampling.get("return_prompt_logprobs")
+                or int(sampling.get("n_prompt_logprobs", 0) or 0) > 0
+            ):
+                item["state"].cond.last_logits = m.logits(hidden[-1:]).unsqueeze(0)
+            self._set_length(req_id, new_len)
+            record = self._record(req_id)
+            record["dims"] = item["image_hw"]
+            if item["kind"] == "vit_encode":
+                record["context_image_feedback"] = True
+                record["text_branch_kvlen"] = new_len
+                record["text_branch_pos"] = int(item["rope"]) + 1
+            outputs.append(
+                {
+                    "req_id": req_id,
+                    "encoder_handle": int(item["handle"]),
+                    "num_tokens": added,
+                    "image_hw": item["image_hw"],
+                }
+            )
+        return outputs
+
+    def run_encode(self, op: Mapping[str, Any]) -> dict[str, Any]:
+        return self.encode_many((op,))[0]
 
     def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
         return self.interleaved_image_state(int(req_id)).cond.last_logits

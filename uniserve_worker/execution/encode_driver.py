@@ -26,10 +26,7 @@ class EncodeDriver:
         # op mapping retained so the model encode hooks still receive their
         # unparsed pixel/grid payloads.
         ops = fb.as_encode().ops
-        outputs = [self._run_one(model, op) for op in ops]
-        if len(outputs) != len(ops):
-            raise invalid_descriptor(f"model returned {len(outputs)} encode outputs for {len(ops)} ops")
-        return [_coerce_encode_output(output) for output in outputs]
+        return self._run_many(model, ops)
 
     @torch.inference_mode()
     def forward_result(
@@ -43,8 +40,20 @@ class EncodeDriver:
         rows = tuple(range(len(ops))) if row_indices is None else tuple(int(row) for row in row_indices)
         if len(rows) != len(ops):
             raise invalid_descriptor("encode row_indices must align with encode ops")
-        outputs = {row: self._run_one(model, op) for row, op in zip(rows, ops, strict=True)}
+        outputs = dict(zip(rows, self._run_many(model, ops), strict=True))
         return ForwardResult(encode_outputs=outputs)
+
+    def _run_many(self, model: Any, ops: tuple[Mapping[str, Any], ...]) -> list[EncodeOutput]:
+        encode_many = getattr(model, "encode_many", None)
+        if callable(encode_many):
+            outputs = list(encode_many(ops))
+        else:
+            outputs = [self._run_one(model, op) for op in ops]
+        if len(outputs) != len(ops):
+            raise invalid_descriptor(
+                f"model returned {len(outputs)} encode outputs for {len(ops)} ops"
+            )
+        return [_coerce_encode_output(output) for output in outputs]
 
     def _run_one(self, model: Any, op: Mapping[str, Any]) -> Any:
         kind = str(op.get("kind"))
