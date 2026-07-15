@@ -186,6 +186,10 @@ def _parse_chat_json(
         content = openai_message_text(message)
         images = openai_message_images(message)
     record.generated_text = content
+    if content:
+        record.output_modalities.append("text")
+    if images:
+        record.output_modalities.append("image")
     image_error = _decode_record_images(images, record)
     if images and image_error is None:
         # Non-streaming: every returned image shares the request E2E latency.
@@ -321,6 +325,8 @@ def _parse_openai(
         images = openai_delta_images(event)
         timestamp = event.get("_client_t")
         if content:
+            if not record.output_modalities or record.output_modalities[-1] != "text":
+                record.output_modalities.append("text")
             record.token_timing_available = True
             record.text_chunks.append(content)
             record.generated_text += content
@@ -334,6 +340,8 @@ def _parse_openai(
                 last_text_time = timestamp_f
                 image_since_last_text = False
         if images:
+            if not record.output_modalities or record.output_modalities[-1] != "image":
+                record.output_modalities.append("image")
             image_parts.extend(images)
             image_since_last_text = True
             if timestamp is not None:

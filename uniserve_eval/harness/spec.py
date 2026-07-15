@@ -17,11 +17,12 @@ class TaskName(StrEnum):
     I2I = "i2i"
     I2T = "i2t"
     MIXED = "mixed"
+    INTERLEAVE = "interleave"
     DEFAULT = "default"
 
 
 # Streaming token metrics (Family A) vs image-speed metrics (Family B).
-STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.DEFAULT, TaskName.I2T})
+STREAM_TASKS = frozenset({TaskName.TEXT, TaskName.DEFAULT, TaskName.I2T, TaskName.INTERLEAVE})
 IMAGE_TASKS = frozenset({TaskName.T2I, TaskName.I2I})
 
 # Wire = request/response shape used to exercise one task over one endpoint.
@@ -40,6 +41,7 @@ TASK_WIRES = {
     TaskName.I2I: ("openai_chat_json",),
     TaskName.I2T: ("openai_chat", "openai_chat_json"),
     TaskName.MIXED: ("mixed_chat",),
+    TaskName.INTERLEAVE: ("openai_chat",),
     TaskName.DEFAULT: ("openai_chat",),
 }
 
@@ -59,6 +61,7 @@ DEFAULT_DATASETS = {
     TaskName.I2I: "pie-bench",
     TaskName.I2T: "synthetic-images",
     TaskName.MIXED: "mixed-image-text",
+    TaskName.INTERLEAVE: "mjhq",
     TaskName.DEFAULT: "ueval",
 }
 

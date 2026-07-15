@@ -22,19 +22,20 @@ A failed point stops the run and preserves its partial artifacts and logs. The f
 
 ## Workload matrix
 
-| Workload | Systems | Requests per point | Load cases | Primary metric |
+| Workload | Systems | Requests per point | Load cases | Comparison metrics |
 | --- | --- | ---: | --- | --- |
-| Qwen3-32B ShareGPT | UniServe, SGLang | 200 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize |
+| Qwen3-32B ShareGPT | UniServe, SGLang | 200 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize; mean TTFT and mean TPOT, minimize |
 | SenseNova-U1 MJHQ T2I | UniServe, vLLM-Omni | 32 | `c1`, `c32` | `c1`: mean image latency, minimize; `c32`: images/s, maximize |
 | BAGEL MJHQ T2I | UniServe, vLLM-Omni | 32 | `c1`, `c32` | `c1`: mean image latency, minimize; `c32`: images/s, maximize |
 | SenseNova-U1 Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s |
 | BAGEL Beans I2T | UniServe, vLLM-Omni | 32 | `r1`, `r2`, `r4`, `r8`, `r16` | Output tokens/s, maximize |
-| SenseNova-U1 mixed MJHQ T2I and Beans I2T | UniServe, vLLM-Omni | 32: 8 T2I, 24 I2T | `c32` | Fixed-mix requests/s, maximize |
-| BAGEL mixed MJHQ T2I and Beans I2T | UniServe, vLLM-Omni | 32: 8 T2I, 24 I2T | `c32` | Fixed-mix requests/s, maximize |
+| SenseNova-U1 mixed MJHQ T2I and Beans I2T | UniServe, vLLM-Omni | 32 per ratio | `image_light` 8:24, `balanced` 16:16, `image_heavy` 24:8; concurrency 32 | Fixed-mix requests/s, maximize; per-task throughput and latency |
+| BAGEL mixed MJHQ T2I and Beans I2T | UniServe, vLLM-Omni | 32 per ratio | `image_light` 8:24, `balanced` 16:16, `image_heavy` 24:8; concurrency 32 | Fixed-mix requests/s, maximize; per-task throughput and latency |
+| SenseNova-U1 MJHQ interleaved generation | UniServe | 32 | `c1`, `c32` | Text throughput, TTFT, TPOT, image latency, images/s, modality transitions |
 
-The matrix contains 42 serial points. `rN` is an open-loop seed-42 Poisson trace with an offered rate of N requests/s and no client concurrency semaphore. `c1` submits the fixed prompt set immediately with client concurrency one. `c32` submits the fixed workload immediately with client concurrency 32.
+The matrix contains 52 serial points. `rN` is an open-loop seed-42 Poisson trace with an offered rate of N requests/s and no client concurrency semaphore. `c1` submits the fixed prompt set immediately with client concurrency one. `c32` submits the fixed workload immediately with client concurrency 32. Every mixed ratio uses `c32`; its rows repeat the smallest integral T2I:I2T block, giving `T2I,I2T,I2T,I2T` for image-light, `T2I,I2T` for balanced, and `T2I,T2I,T2I,I2T` for image-heavy.
 
-Timing covers the complete measured arrival and completion region. TTFT begins at client send and ends at the first non-empty content or reasoning delta; TPOT uses server completion-token accounting; output throughput is server-reported completion tokens divided by the complete timed region. Image latency is measured from request send through decoded output receipt, and image throughput is the number of successfully decoded images divided by the complete timed region.
+Timing covers the complete measured arrival and completion region. TTFT begins at client send and ends at the first non-empty content or reasoning delta. TPOT is calculated per request as `(E2E - TTFT) / (server-reported completion tokens - 1)` and then averaged, matching the SGLang serving definition. Output throughput is server-reported completion tokens divided by the complete timed region. Image latency is measured from request send through decoded output receipt, and image throughput is the number of successfully decoded images divided by the complete timed region. ShareGPT reports output throughput, mean TTFT, and mean TPOT as separate comparison metrics; the protocol defines no composite score.
 
 ## ShareGPT semantics
 
@@ -60,9 +61,11 @@ Both sides receive the same selected inputs, seeds, requested image count and di
 
 Beans I2T fixes the selected JPEG inputs, prompt, preprocessing, sampling controls, and 256-token completion limit. BAGEL ignores EOS, so the limit defines fixed output work. SenseNova respects EOS, so the same value is an upper bound and throughput uses the completion tokens reported by each server. Both runtimes must report prompt and output usage, but prompt token counts are not compared across runtimes because multimodal backends account for expanded image tokens differently; the shared parity contract binds the selected images, request order, prompt, preprocessing, and completion limit.
 
-Each mixed point submits 32 measured requests at `c32`: 8 MJHQ T2I requests and 24 Beans I2T requests. Four excluded warm-up requests use the same 1:3 task ratio. Request construction, ordering, T2I generation controls, I2T sampling controls, output limits, model inputs, and preprocessing are inherited unchanged from the corresponding homogeneous workloads.
+Each mixed point submits 32 measured requests at `c32`. Image-light contains 8 MJHQ T2I and 24 Beans I2T requests with a 1:3 warm-up; balanced contains 16 and 16 with a 2:2 warm-up; image-heavy contains 24 and 8 with a 3:1 warm-up. Four excluded warm-up requests are used in every case. Measured and warm-up rows are proportionally interleaved in their smallest integral repeating block. Request construction, T2I generation controls, I2T sampling controls, output limits, model inputs, and preprocessing are inherited unchanged from the corresponding homogeneous workloads.
 
-The mixed primary metric is the 32-request completion rate over the complete timed region. Every result also reports the per-task completion counts, I2T output tokens/s, TTFT, TPOT, end-to-end latency, T2I images/s, image latency, and the interval in which both task classes are active. The comparison is valid only when both systems complete the declared 8:24 task mix with no failed requests and all T2I outputs pass the image work checks. SenseNova retains natural-EOS I2T semantics, so its artifacts must report realized output-token counts and its mixed request-rate ratio is not interpreted as a fixed-token throughput ratio when those counts differ.
+The mixed primary metric is the 32-request completion rate over the complete timed region. Paired results also compare I2T output tokens/s, mean TTFT, mean TPOT, T2I images/s, and mean image latency, while point artifacts retain the complete latency distributions, per-task completion counts, and client-visible cross-task active interval. The comparison is valid only when both systems complete the declared ratio with no failed requests and all T2I outputs pass the image work checks. SenseNova retains natural-EOS I2T semantics, so its artifacts must report realized output-token counts and its mixed request-rate ratio is not interpreted as a fixed-token throughput ratio when those counts differ.
+
+SenseNova interleaved generation uses the same seed-42 MJHQ selection as T2I and a deterministic prompt transform that requests one introductory sentence, one generated image, and one closing sentence. Each request uses natural EOS, a 256-token limit, one-image cap, 2048×1152 output, and the SenseNova 50-update image controls. A request is conformant only when it emits visible text and a decoded image with at least one transition between the two output modalities; image spans are excluded from text ITL. The main matrix records UniServe characterization points because the pinned vLLM-Omni SenseNova endpoint does not expose equivalent single-request alternating text/image generation semantics, so no cross-runtime ratio is emitted for this workload.
 
 ## Optional diagnostics
 

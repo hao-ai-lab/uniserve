@@ -936,6 +936,8 @@ def _generation_conformance(
             "task_counts_match": counts_match,
             "valid": image["valid"] is True and text["valid"] is True and counts_match,
         }
+    if spec.task == TaskName.INTERLEAVE:
+        return _interleave_generation_conformance(spec, records)
     image_output_required = spec.task.value in {"t2i", "i2i", "default"}
     if image_output_required:
         return _image_generation_conformance(spec, records)
@@ -953,13 +955,47 @@ def _image_generation_conformance(
         "schema_version": 1,
         "policy": (
             "decoded_image_within_declared_cap"
-            if spec.task.value == "default"
+            if spec.task.value in {"default", "interleave"}
             else "decoded_image_exact_declared_work"
         ),
         "successful_requests": len(successful),
         "checked_requests": len(records),
         "mismatch_count": len(mismatches),
         "mismatched_request_ids": mismatches,
+        "valid": bool(records) and not mismatches,
+    }
+
+
+def _interleave_generation_conformance(
+    spec: BenchmarkSpec, records: list[RequestRecord]
+) -> dict[str, Any]:
+    image = _image_generation_conformance(spec, records)
+    modality_mismatches = [
+        record.request_id
+        for record in records
+        if not (
+            record.success
+            and record.generated_text
+            and "text" in record.output_modalities
+            and "image" in record.output_modalities
+            and len(record.output_modalities) >= 2
+        )
+    ]
+    mismatches = list(dict.fromkeys(image["mismatched_request_ids"] + modality_mismatches))
+    return {
+        "schema_version": 1,
+        "policy": "decoded_image_and_visible_modality_transition",
+        "successful_requests": sum(record.success for record in records),
+        "checked_requests": len(records),
+        "mismatch_count": len(mismatches),
+        "mismatched_request_ids": mismatches,
+        "components": {
+            "image": image,
+            "modality_transition": {
+                "mismatch_count": len(modality_mismatches),
+                "mismatched_request_ids": modality_mismatches,
+            },
+        },
         "valid": bool(records) and not mismatches,
     }
 
@@ -1005,7 +1041,7 @@ def _image_record_conforms(record: RequestRecord, spec: BenchmarkSpec) -> bool:
         count_is_cap=(
             record.requested_image_count_is_cap
             if record.requested_image_count is not None
-            else spec.task.value == "default"
+            else spec.task.value in {"default", "interleave"}
         ),
         width=(
             record.requested_image_width if record.requested_image_width is not None else spec.width

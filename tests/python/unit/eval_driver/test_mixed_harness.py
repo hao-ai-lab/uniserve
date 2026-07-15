@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,65 @@ def test_mixed_dataset_interleaves_disjoint_measured_and_warmup_rows(
     assert [row["task"] for row in rows.warmup] == ["t2i", "i2t", "i2t", "i2t"]
     assert {row["id"] for row in rows.measured}.isdisjoint(row["id"] for row in rows.warmup)
     assert all(row["max_tokens"] == 256 for row in rows.measured if row["task"] == "i2t")
+
+
+@pytest.mark.parametrize(
+    ("workload_mix", "warmup_mix", "measured_block", "warmup_block"),
+    [
+        (
+            {"t2i": 8, "i2t": 24},
+            {"t2i": 1, "i2t": 3},
+            ["t2i", "i2t", "i2t", "i2t"],
+            ["t2i", "i2t", "i2t", "i2t"],
+        ),
+        (
+            {"t2i": 16, "i2t": 16},
+            {"t2i": 2, "i2t": 2},
+            ["t2i", "i2t"],
+            ["t2i", "i2t"],
+        ),
+        (
+            {"t2i": 24, "i2t": 8},
+            {"t2i": 3, "i2t": 1},
+            ["t2i", "t2i", "t2i", "i2t"],
+            ["t2i", "t2i", "t2i", "i2t"],
+        ),
+    ],
+)
+def test_mixed_matrix_ratios_use_the_declared_proportional_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workload_mix: dict[str, int],
+    warmup_mix: dict[str, int],
+    measured_block: list[str],
+    warmup_block: list[str],
+) -> None:
+    monkeypatch.setattr(
+        mixed_dataset,
+        "load_mjhq",
+        lambda _path, count, **_kwargs: [
+            {"id": f"t{index}", "task": "t2i", "prompt": "draw"} for index in range(count)
+        ],
+    )
+    monkeypatch.setattr(
+        mixed_dataset,
+        "load_image_dir",
+        lambda _path, count, **_kwargs: [
+            {"id": f"i{index}", "prompt": "describe", "input_image_b64": "QUJD"}
+            for index in range(count)
+        ],
+    )
+    spec = dataclasses.replace(
+        _spec(tmp_path),
+        num_prompts=32,
+        workload_mix=workload_mix,
+        warmup_mix=warmup_mix,
+    )
+
+    rows = mixed_dataset.load_mixed_image_text(spec)
+
+    assert [row["task"] for row in rows.measured] == measured_block * (32 // len(measured_block))
+    assert [row["task"] for row in rows.warmup] == warmup_block * (4 // len(warmup_block))
 
 
 def test_mixed_task_routes_each_row_through_its_semantic_adapter(tmp_path: Path) -> None:

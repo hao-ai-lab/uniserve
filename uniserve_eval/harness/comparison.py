@@ -17,6 +17,8 @@ from .text_parity import (
 
 _IMAGE_TASKS = frozenset({"default", "i2i", "t2i"})
 
+_MetricSpec = tuple[str, tuple[str, ...], str]
+
 
 def compare_pair(
     reference_directory: str | Path,
@@ -92,9 +94,6 @@ def compare_pair(
                 },
                 "mismatch_request_ids": strict.get("canary", {}).get("mismatch_request_ids", []),
             }
-        metric_name = "output_throughput"
-        metric_path = (metric_name,)
-        objective = "maximize"
     elif task == "i2t":
         ignore_eos = (
             reference.get("ignore_eos")
@@ -119,9 +118,6 @@ def compare_pair(
             }
             if not work["passed"]:
                 failures.append("work_mismatch")
-        metric_name = "output_throughput"
-        metric_path = (metric_name,)
-        objective = "maximize"
     elif task == "mixed":
         work = {
             "passed": bool(
@@ -130,9 +126,6 @@ def compare_pair(
         }
         if not work["passed"]:
             failures.append("work_mismatch")
-        metric_name = "mixed_request_throughput"
-        metric_path = (metric_name,)
-        objective = "maximize"
     elif task in _IMAGE_TASKS:
         work = {
             "passed": bool(
@@ -152,48 +145,39 @@ def compare_pair(
                 "aggregate": smoke_report.get("aggregate"),
                 "failures": smoke_report.get("failures", []),
             }
-        if load_case == "c1":
-            metric_name = "image_latency_ms.mean"
-            metric_path = ("image_latency_ms", "mean")
-            objective = "minimize"
-        elif load_case == "c32":
-            metric_name = "images_per_second"
-            metric_path = (metric_name,)
-            objective = "maximize"
-        else:
-            metric_name = "images_per_second"
-            metric_path = (metric_name,)
-            objective = "maximize"
+        if load_case not in {"c1", "c32"}:
             failures.append("unsupported_image_load_case")
     else:
         work = {"passed": False}
-        metric_name = "output_throughput"
-        metric_path = (metric_name,)
-        objective = "maximize"
         failures.append("unsupported_task")
 
-    reference_metric = _metric(reference, metric_path)
-    candidate_metric = _metric(candidate, metric_path)
-    ratio = None
-    if reference_metric is None or candidate_metric is None or reference_metric <= 0.0:
-        failures.append("metric_unavailable")
-    else:
-        ratio = candidate_metric / reference_metric
+    metrics: list[dict[str, Any]] = []
+    for metric_name, metric_path, objective in _comparison_metric_specs(task, load_case):
+        reference_metric = _metric(reference, metric_path)
+        candidate_metric = _metric(candidate, metric_path)
+        ratio = None
+        if reference_metric is None or candidate_metric is None or reference_metric <= 0.0:
+            failures.append(f"metric_unavailable:{metric_name}")
+        else:
+            ratio = candidate_metric / reference_metric
+        metrics.append(
+            {
+                "name": metric_name,
+                "objective": objective,
+                "reference": reference_metric,
+                "candidate": candidate_metric,
+                "candidate_over_reference": ratio,
+            }
+        )
 
     result: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "comparison": parity_group,
         "task": task,
         "load_case": load_case,
         "valid": not failures,
         "work": work,
-        "metric": {
-            "name": metric_name,
-            "objective": objective,
-            "reference": reference_metric,
-            "candidate": candidate_metric,
-            "candidate_over_reference": ratio,
-        },
+        "metrics": metrics,
         "reference": _point_result(reference),
         "candidate": _point_result(candidate),
         "failures": failures,
@@ -208,29 +192,37 @@ def compare_pair(
 def summarize_runs(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
     """Combine independently executed run summaries without imposing a repeat policy."""
 
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
     for run in runs:
         for comparison in run.get("comparisons", []):
             name = comparison.get("comparison")
             load_case = comparison.get("load_case")
-            if isinstance(name, str) and isinstance(load_case, str):
-                grouped.setdefault((name, load_case), []).append(comparison)
+            metrics = comparison.get("metrics")
+            if not (
+                isinstance(name, str) and isinstance(load_case, str) and isinstance(metrics, list)
+            ):
+                continue
+            for metric in metrics:
+                metric_name = metric.get("name") if isinstance(metric, dict) else None
+                if isinstance(metric_name, str):
+                    grouped.setdefault((name, load_case, metric_name), []).append(
+                        (comparison, metric)
+                    )
 
     comparisons: list[dict[str, Any]] = []
-    for (name, load_case), values in sorted(grouped.items()):
+    for (name, load_case, metric_name), values in sorted(grouped.items()):
         ratios = [
-            float(value["metric"]["candidate_over_reference"])
-            for value in values
-            if value.get("valid") is True
-            and isinstance(value.get("metric"), dict)
-            and isinstance(value["metric"].get("candidate_over_reference"), (int, float))
+            float(metric["candidate_over_reference"])
+            for comparison, metric in values
+            if comparison.get("valid") is True
+            and isinstance(metric.get("candidate_over_reference"), (int, float))
         ]
         comparisons.append(
             {
                 "comparison": name,
                 "load_case": load_case,
-                "metric": values[0].get("metric", {}).get("name") if values else None,
-                "objective": values[0].get("metric", {}).get("objective") if values else None,
+                "metric": metric_name,
+                "objective": values[0][1].get("objective") if values else None,
                 "run_count": len(values),
                 "valid_run_count": len(ratios),
                 "candidate_over_reference": ratios,
@@ -242,7 +234,7 @@ def summarize_runs(runs: Sequence[dict[str, Any]]) -> dict[str, Any]:
             }
         )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_count": len(runs),
         "comparisons": comparisons,
     }
@@ -273,8 +265,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     if points:
         lines.extend(
             [
-                "| Point | Group | Task | Load case | Success | Elapsed (s) | Output tok/s | Images/s | Mean image latency (ms) |",
-                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+                "| Point | Group | Task | Load case | Success | Elapsed (s) | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Images/s | Mean image latency (ms) |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for point in points:
@@ -283,11 +275,15 @@ def render_markdown(report: dict[str, Any]) -> str:
             text_metrics = metrics.get("i2t", metrics)
             image_metrics = image_metrics if isinstance(image_metrics, dict) else {}
             text_metrics = text_metrics if isinstance(text_metrics, dict) else {}
+            if isinstance(metrics.get("images"), dict):
+                image_metrics = metrics["images"]
             image_latency = image_metrics.get("image_latency_ms", {})
             lines.append(
                 f"| {point.get('benchmark')} | {point.get('group')} | {point.get('task')} | "
                 f"{point.get('load_case')} | {point.get('ok_count', 0)}/{point.get('request_count', 0)} | "
                 f"{_number(point.get('elapsed_s'))} | {_number(text_metrics.get('output_throughput'))} | "
+                f"{_number(text_metrics.get('mean_ttft_ms'))} | "
+                f"{_number(text_metrics.get('mean_tpot_ms'))} | "
                 f"{_number(image_metrics.get('images_per_second'))} | "
                 f"{_number(image_latency.get('mean') if isinstance(image_latency, dict) else None)} |"
             )
@@ -299,14 +295,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         ]
     )
     for comparison in report.get("comparisons", []):
-        metric = comparison.get("metric", {})
-        lines.append(
-            f"| {comparison.get('comparison')} | {comparison.get('load_case')} | "
-            f"{metric.get('name')} | {metric.get('objective')} | "
-            f"{_number(metric.get('reference'))} | {_number(metric.get('candidate'))} | "
-            f"{_number(metric.get('candidate_over_reference'))} | "
-            f"{'pass' if comparison.get('work', {}).get('passed') else 'fail'} |"
-        )
+        for metric in comparison.get("metrics", []):
+            lines.append(
+                f"| {comparison.get('comparison')} | {comparison.get('load_case')} | "
+                f"{metric.get('name')} | {metric.get('objective')} | "
+                f"{_number(metric.get('reference'))} | {_number(metric.get('candidate'))} | "
+                f"{_number(metric.get('candidate_over_reference'))} | "
+                f"{'pass' if comparison.get('work', {}).get('passed') else 'fail'} |"
+            )
         if "text_canary" in comparison:
             canary = comparison["text_canary"]
             lines.append(
@@ -378,6 +374,35 @@ def _metric(point: dict[str, Any], path: tuple[str, ...]) -> float | None:
         return None
     numeric = float(value)
     return numeric if math.isfinite(numeric) else None
+
+
+def _comparison_metric_specs(task: Any, load_case: Any) -> tuple[_MetricSpec, ...]:
+    if task == "text":
+        return (
+            ("output_throughput", ("output_throughput",), "maximize"),
+            ("mean_ttft_ms", ("mean_ttft_ms",), "minimize"),
+            ("mean_tpot_ms", ("mean_tpot_ms",), "minimize"),
+        )
+    if task == "i2t":
+        return (("output_throughput", ("output_throughput",), "maximize"),)
+    if task == "mixed":
+        return (
+            ("mixed_request_throughput", ("mixed_request_throughput",), "maximize"),
+            ("i2t.output_throughput", ("i2t", "output_throughput"), "maximize"),
+            ("i2t.mean_ttft_ms", ("i2t", "mean_ttft_ms"), "minimize"),
+            ("i2t.mean_tpot_ms", ("i2t", "mean_tpot_ms"), "minimize"),
+            ("t2i.images_per_second", ("t2i", "images_per_second"), "maximize"),
+            (
+                "t2i.image_latency_ms.mean",
+                ("t2i", "image_latency_ms", "mean"),
+                "minimize",
+            ),
+        )
+    if task in _IMAGE_TASKS and load_case == "c1":
+        return (("image_latency_ms.mean", ("image_latency_ms", "mean"), "minimize"),)
+    if task in _IMAGE_TASKS:
+        return (("images_per_second", ("images_per_second",), "maximize"),)
+    return ()
 
 
 def _point_result(point: dict[str, Any]) -> dict[str, Any]:

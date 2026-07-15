@@ -17,6 +17,7 @@ LLM-serving numbers are directly comparable to SGLang's. The key contracts:
 The parity test in ``tests/python/unit/eval_driver/test_stream_parity.py`` pins
 this against the exact SGLang formulas.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -154,6 +155,9 @@ def summarize_stream(
     image_block = _default_image_block(successful, dur_s)
     if image_block is not None:
         summary["images"] = image_block
+    interleave_block = _interleave_block(successful)
+    if interleave_block is not None:
+        summary["modality_interleave"] = interleave_block
     timing_block = _timing_attribution_block(successful)
     if timing_block is not None:
         summary["timing_attribution"] = timing_block
@@ -212,6 +216,25 @@ def _default_image_block(successful: list[RequestRecord], dur_s: float) -> dict[
     if steps:
         block["image_steps"] = distribution(steps)
     return block
+
+
+def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
+    multimodal = [record for record in successful if record.images > 0]
+    if not multimodal:
+        return None
+    transitions = [max(0, len(record.output_modalities) - 1) for record in multimodal]
+    patterns: dict[str, int] = {}
+    for record in multimodal:
+        pattern = "->".join(record.output_modalities)
+        patterns[pattern] = patterns.get(pattern, 0) + 1
+    return {
+        "requests_with_text_and_image": sum(
+            "text" in record.output_modalities and "image" in record.output_modalities
+            for record in multimodal
+        ),
+        "modality_transitions": distribution(transitions),
+        "patterns": patterns,
+    }
 
 
 def _timing_attribution_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
