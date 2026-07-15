@@ -75,6 +75,7 @@ from uniserve_eval.profiles import (  # noqa: E402
     benchmark_matrix_definition_matches,
     command_template_matches,
     expand_profile_value,
+    load_case_harness_overrides,
     load_config,
     require_resolved_profile_value,
     server_command_template,
@@ -669,19 +670,10 @@ def harness_command(
     datasets: dict[str, Path],
 ) -> list[str]:
     harness = expand_profile_value(harness)
-    load_harness = load_case.get("harness", {})
-    if not isinstance(load_harness, dict):
-        raise SystemExit("load case harness overrides must be an object")
-    unsupported_load_fields = set(load_harness) - {
-        "workload_mix",
-        "warmup_mix",
-        "acceptance_min_images_per_success",
-    }
-    if unsupported_load_fields:
-        raise SystemExit(
-            "load case contains unsupported harness override(s): "
-            + ", ".join(sorted(unsupported_load_fields))
-        )
+    try:
+        load_harness = load_case_harness_overrides(load_case)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     dataset_ref = harness.pop("dataset_ref", None)
     if dataset_ref:
         if str(dataset_ref) not in datasets:

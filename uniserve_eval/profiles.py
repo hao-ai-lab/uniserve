@@ -29,6 +29,13 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.json"
 ENV_REF_RE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
+_LOAD_CASE_HARNESS_FIELDS = frozenset(
+    {
+        "workload_mix",
+        "warmup_mix",
+        "acceptance_min_images_per_success",
+    }
+)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -73,6 +80,19 @@ def require_resolved_profile_value(value: Any, *, context: str) -> None:
     if refs:
         names = ", ".join(refs)
         raise SystemExit(f"{context} has unresolved environment variable(s): {names}")
+
+
+def load_case_harness_overrides(load_case: dict[str, Any]) -> dict[str, Any]:
+    """Return the benchmark-spec fields controlled by one load case."""
+    overrides = load_case.get("harness", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("load case harness overrides must be an object")
+    unsupported = set(overrides) - _LOAD_CASE_HARNESS_FIELDS
+    if unsupported:
+        raise ValueError(
+            "load case contains unsupported harness override(s): " + ", ".join(sorted(unsupported))
+        )
+    return dict(overrides)
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -524,8 +544,9 @@ def _active_benchmark_parts(
     ):
         raise ValueError("benchmark point is not declared by the active group and load-case set")
     case = matching_cases[0]
-    if set(case) - {"id", "request_rate", "max_concurrency"}:
+    if set(case) - {"id", "request_rate", "max_concurrency", "harness"}:
         raise ValueError("load case has unknown fields")
+    load_case_harness_overrides(case)
     request_rate = case.get("request_rate")
     try:
         numeric_rate = float(request_rate)
@@ -559,9 +580,11 @@ def _declared_benchmark_semantics(
 
     defaults = dict(benchmark.get("defaults") or {})
     harness = dict(point.get("harness") or {})
-    controlled_fields = {"request_rate", "max_concurrency"}
+    load_harness = load_case_harness_overrides(load_case)
+    controlled_fields = {"request_rate", "max_concurrency", *load_harness}
     if controlled_fields & (set(defaults) | set(harness)):
         raise ValueError("load-controlled fields must be declared by the load case")
+    harness.update(load_harness)
     dataset_ref = harness.pop("dataset_ref", None)
     disable_ignore_eos = bool(harness.pop("disable_ignore_eos", False))
     fields = BenchmarkSpec.__dataclass_fields__
