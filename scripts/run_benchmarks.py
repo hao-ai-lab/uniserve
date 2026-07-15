@@ -988,14 +988,14 @@ def build_manifest_contract(
         return process.stdout.strip()
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "command": ["cargo", "build", "--release", "--bin", "uniserve"],
         "cargo_version": version(["cargo", "--version"]),
         "rustc_version": version(["rustc", "--version", "--verbose"]),
         "source_state": repository_state(ROOT),
         "cargo_lock": _file_content_contract(cargo_lock),
         "binary": _file_content_contract(binary),
-        "build_log": _file_content_contract(build_log),
+        "build_log_present": True,
     }
     return {**payload, "fingerprint": canonical_digest(payload)}
 
@@ -1435,6 +1435,28 @@ def parse_name_filter(value: str | None, all_names: set[str], *, flag: str) -> s
     return selected
 
 
+def resolve_benchmark_selection(
+    groups: dict[str, list[BenchRunSpec]],
+    selected_groups: list[str],
+    *,
+    only_benches: set[str],
+    skipped_benches: set[str],
+) -> tuple[dict[str, list[BenchRunSpec]], list[BenchRunSpec]]:
+    execution: dict[str, list[BenchRunSpec]] = {}
+    report: list[BenchRunSpec] = []
+    for group_name in selected_groups:
+        selected = [
+            bench
+            for bench in groups[group_name]
+            if not only_benches or bench.name in only_benches
+        ]
+        report.extend(selected)
+        execution[group_name] = [
+            bench for bench in selected if bench.name not in skipped_benches
+        ]
+    return execution, report
+
+
 def filter_benchmark_groups(benchmark: dict[str, Any], selected: list[str]) -> dict[str, Any]:
     filtered = dict(benchmark)
     declared = dict(benchmark["groups"])
@@ -1865,21 +1887,21 @@ def _run_once(args: argparse.Namespace) -> int:
     all_bench_names = {bench.name for benches in groups.values() for bench in benches}
     only_benches = parse_name_filter(args.only_bench, all_bench_names, flag="--only-bench")
     skipped_benches = parse_name_filter(args.skip_bench, all_bench_names, flag="--skip-bench")
+    execution_groups, report_benches = resolve_benchmark_selection(
+        groups,
+        selected,
+        only_benches=only_benches,
+        skipped_benches=skipped_benches,
+    )
 
     if args.dry_run:
         print(output_root / "COMMANDS.md")
         return 0
 
-    completed_benches: list[BenchRunSpec] = []
     for group_name in groups:
         if group_name not in selected:
             continue
-        benches = [
-            bench
-            for bench in groups[group_name]
-            if (not only_benches or bench.name in only_benches)
-            and bench.name not in skipped_benches
-        ]
+        benches = execution_groups[group_name]
         if not benches:
             print(f"[{now()}] skip {group_name}: no benchmarks selected", flush=True)
             continue
@@ -1893,11 +1915,10 @@ def _run_once(args: argparse.Namespace) -> int:
             require_clean_gpu=args.require_clean_gpu,
             enforce_execution_identity=args.formal,
         )
-        completed_benches.extend(benches)
 
     write_comparisons(
         output_root,
-        completed_benches,
+        report_benches,
         benchmark=args.benchmark,
         text_canary=args.text_canary,
         image_smoke=args.image_smoke,

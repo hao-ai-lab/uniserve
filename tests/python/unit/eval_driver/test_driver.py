@@ -11,6 +11,7 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -935,6 +936,50 @@ def test_benchmark_repeat_wraps_complete_matrix_runs(tmp_path: Path, monkeypatch
     ]
     combined = json.loads((output_root / "results.json").read_text(encoding="utf-8"))
     assert combined == {"schema_version": 2, "run_count": 3, "comparisons": []}
+
+
+def test_skipped_benchmarks_remain_in_the_aggregate_selection(tmp_path: Path) -> None:
+    run_benchmarks = _load_run_benchmarks()
+
+    def bench(name: str, group: str) -> Any:
+        return run_benchmarks.BenchRunSpec(
+            name=name,
+            group=group,
+            command=("harness",),
+            output_dir=tmp_path / name,
+            server_output_dir=tmp_path / "servers" / name,
+            process_environment={},
+            harness_contract={},
+            parity_group=None,
+            parity_contract=None,
+            matrix_contract={},
+        )
+
+    first = bench("first", "group")
+    second = bench("second", "group")
+    execution, report = run_benchmarks.resolve_benchmark_selection(
+        {"group": [first, second]},
+        ["group"],
+        only_benches=set(),
+        skipped_benches={"first"},
+    )
+
+    assert [item.name for item in execution["group"]] == ["second"]
+    assert [item.name for item in report] == ["first", "second"]
+
+
+def test_build_manifest_identity_ignores_timestamped_log_content(tmp_path: Path) -> None:
+    run_benchmarks = _load_run_benchmarks()
+    build_log = tmp_path / "build.log"
+    build_log.write_text("started at 2026-01-01T00:00:00Z\n", encoding="utf-8")
+    config = {"server_bin": str(run_benchmarks.ROOT / "target/release/uniserve")}
+
+    first = run_benchmarks.build_manifest_contract(config, build_log)
+    build_log.write_text("started at 2027-01-01T00:00:00Z\n", encoding="utf-8")
+    second = run_benchmarks.build_manifest_contract(config, build_log)
+
+    assert first == second
+    assert first["build_log_present"] is True
 
 
 def test_clean_gpu_check_queries_only_the_selected_physical_gpu(monkeypatch) -> None:
