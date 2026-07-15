@@ -854,7 +854,7 @@
             "dataset": "mjhq",
             "dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
             "num_prompts": 32,
-            "max_tokens": 2048,
+            "max_tokens": 4096,
             "temperature": 0,
             "top_p": 1.0,
             "top_k": 1,
