@@ -382,7 +382,7 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
     assert interleave["image_think"] is False
     assert interleave["image_t_eps"] == 0.02
     assert interleave["max_images"] == 1
-    assert interleave["max_tokens"] == 2048
+    assert interleave["max_tokens"] == 4096
     assert interleave["disable_ignore_eos"] is True
     for name in ("bagel_mjhq_t2i_uniserve", "bagel_mjhq_t2i_omni"):
         harness = points[name]["harness"]
