@@ -15,6 +15,7 @@ from .env import DEFAULT_ATTENTION_BACKEND, DEFAULT_COMPILE_BACKEND
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
+    "decode_graph_padding_block_count",
     "FlashInferTuningConfig",
     "TorchCompileRuntimeConfig",
     "WorkerRuntimeConfig",
@@ -115,6 +116,12 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     15872,
     16384,
 )
+
+
+def decode_graph_padding_block_count(block_size: int) -> int:
+    block_size = max(1, int(block_size))
+    max_padding_rows = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
+    return (max_padding_rows + block_size - 1) // block_size
 
 
 @dataclass(frozen=True)

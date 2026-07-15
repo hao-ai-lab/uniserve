@@ -20,7 +20,12 @@ from uniserve_worker.runtime.paged_text_cache import (
     copy_paged_text_cache_span,
     copy_paged_text_cache_spans,
 )
-from uniserve_worker.runtime.residency import ScratchKvPool
+from uniserve_worker.runtime.residency import (
+    GenResidencySpec,
+    KvCacheSpec,
+    ResidencyManager,
+    ScratchKvPool,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -92,6 +97,61 @@ def test_scratch_pool_owns_transient_block_leases():
     pool.release_cache(cache)
 
     assert pool.allocate_blocks(3) == [0, 1, 2]
+
+
+def test_scratch_pool_excludes_reserved_tail_blocks_from_transient_leases():
+    pool = ScratchKvPool(
+        num_layers=1,
+        num_blocks=5,
+        block_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        device="cpu",
+        dtype=torch.float32,
+        label="reserved scratch KV pool",
+        reserved_tail_blocks=2,
+    )
+
+    assert pool.schedulable_num_blocks == 3
+    assert pool.reserved_block_ids == (3, 4)
+    assert pool.allocate_blocks(3) == [0, 1, 2]
+    with pytest.raises(RuntimeError, match="reserved scratch KV pool exhausted"):
+        pool.allocate_blocks(1)
+    with pytest.raises(RuntimeError, match="cannot release a reserved"):
+        pool.release_blocks([3])
+
+
+def test_generation_residency_reserves_tail_blocks_in_every_kv_pool():
+    residency = ResidencyManager.build_gen(
+        GenResidencySpec(
+            kv=KvCacheSpec(
+                num_layers=1,
+                num_kv_heads=1,
+                head_dim=2,
+                dtype=torch.float32,
+            ),
+            num_blocks=4,
+            block_size=4,
+            device="cpu",
+            scratch_num_blocks=3,
+            reserved_tail_blocks=2,
+            gen_scratch_num_blocks=2,
+            gen_device="cpu",
+        )
+    )
+
+    assert residency.kv is not None
+    assert residency.kv.schedulable_num_blocks == 2
+    assert residency.kv.reserved_block_ids == (2, 3)
+    assert residency.scratch is not None
+    assert residency.scratch.num_blocks == 5
+    assert residency.scratch.schedulable_num_blocks == 3
+    assert residency.scratch.reserved_block_ids == (3, 4)
+    assert residency.scratch.allocate_blocks(3) == [0, 1, 2]
+    assert residency.gen_scratch is not None
+    assert residency.gen_scratch.num_blocks == 4
+    assert residency.gen_scratch.schedulable_num_blocks == 2
+    assert residency.gen_scratch.reserved_block_ids == (2, 3)
 
 
 def test_batched_span_copy_matches_per_span_copy_across_rows_and_blocks():

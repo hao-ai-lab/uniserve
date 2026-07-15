@@ -42,6 +42,7 @@ from ..graph.packed_visible import (
     maybe_run_packed_mixed_graph,
     packed_mixed_graph_promotions_supported,
 )
+from ..graph.padding import decode_graph_padding_block_ids
 from ..result import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
@@ -89,8 +90,7 @@ def _append_decode_graph_padding(
     kv_segments: list[ForwardPagedKVSegment],
     embed_chunks: list[torch.Tensor],
     indicator_chunks: list[tuple[int, bool] | torch.Tensor],
-    padding_cache: PagedTextCache,
-    padding_start: int,
+    padding_pool: Any,
     decode_rows: int,
     hidden_size: int,
     dtype: torch.dtype,
@@ -101,11 +101,14 @@ def _append_decode_graph_padding(
     if decode_rows <= 0 or decode_rows >= capacity:
         return decode_rows
     padding_rows = capacity - decode_rows
-    padding_start = int(padding_start)
-    padding_cache.ensure_capacity(padding_start + padding_rows)
-    block_ids = tuple(int(block_id) for block_id in padding_cache.block_ids)
+    block_ids = decode_graph_padding_block_ids(padding_pool)
+    block_size = int(getattr(padding_pool, "block_size", 0) or 0)
+    if not block_ids:
+        raise invalid_descriptor("packed decode graph padding requires reserved KV blocks")
+    if block_size <= 0 or padding_rows > len(block_ids) * block_size:
+        raise invalid_descriptor("packed decode graph padding exceeds the reserved KV blocks")
     for offset in range(padding_rows):
-        base_len = padding_start + offset
+        base_len = offset
         builder.add_segment(
             op_index=-1,
             req_id=-1,
@@ -381,8 +384,7 @@ def _run_packed_mixed_forward_impl(
                     kv_segments=kv_segments,
                     embed_chunks=embed_chunks,
                     indicator_chunks=indicator_chunks,
-                    padding_cache=first_row.staged_cache,
-                    padding_start=first_row.base_len + first_row.q_len,
+                    padding_pool=first_row.staged_cache.pool,
                     decode_rows=len(pending_text_rows),
                     hidden_size=int(text_embeds.shape[1]),
                     dtype=text_embeds.dtype,

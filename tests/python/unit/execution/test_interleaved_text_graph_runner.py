@@ -13,8 +13,7 @@ from uniserve_worker.models.sensenova.model import _SenseNovaDecoderModel
 
 
 class _Owner:
-    def interleaved_decode_graph_padding_block_id(self, pool):
-        return int(pool.num_blocks) - 1
+    pass
 
 
 def _row(pool, *, block_ids=None, base_len=3):
@@ -30,7 +29,7 @@ def _row(pool, *, block_ids=None, base_len=3):
 
 
 def test_interleaved_decode_graph_padding_uses_reserved_block_offsets():
-    pool = SimpleNamespace(num_blocks=64, block_size=16)
+    pool = SimpleNamespace(num_blocks=64, block_size=16, reserved_block_ids=(62, 63))
     runner = InterleavedTextDecodeGraphRunner()
     driver = SimpleNamespace(owner=_Owner())
     rows = [_row(pool, block_ids=[3], base_len=11)]
@@ -38,18 +37,18 @@ def test_interleaved_decode_graph_padding_uses_reserved_block_offsets():
     padded = runner._pad_rows(driver, rows, 4, pool)
 
     assert padded[:1] == rows
-    assert [row.block_ids for row in padded[1:]] == [[63], [63], [63]]
+    assert [row.block_ids for row in padded[1:]] == [[62, 63], [62, 63], [62, 63]]
     assert [row.base_len for row in padded[1:]] == [0, 1, 2]
     assert [row.pos for row in padded[1:]] == [0, 1, 2]
     assert [row.token_id for row in padded[1:]] == [0, 0, 0]
 
 
-def test_interleaved_decode_graph_padding_requires_reserved_block_hook():
+def test_interleaved_decode_graph_padding_requires_reserved_blocks():
     pool = SimpleNamespace(num_blocks=64, block_size=16)
     runner = InterleavedTextDecodeGraphRunner()
     driver = SimpleNamespace(owner=object())
 
-    with pytest.raises(Exception, match="reserved KV padding block"):
+    with pytest.raises(Exception, match="reserved KV padding blocks"):
         runner._pad_rows(driver, [_row(pool)], 2, pool)
 
 

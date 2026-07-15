@@ -54,6 +54,7 @@ from ...execution.interleaved_text_stepper import (
 from ...execution.model_base import UniModelBase
 from ...execution.tower_execution_session import TowerExecutionSession
 from ...foundation.errors import capability_mismatch, invalid_descriptor
+from ...foundation.runtime_config import decode_graph_padding_block_count
 from ...foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -2552,6 +2553,7 @@ class SenseNovaU1ForUnifiedGeneration(
                 block_size=self.block_size,
                 device=self.device,
                 scratch_num_blocks=scratch_blocks,
+                reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
                 gen_scratch_num_blocks=gen_blocks,
                 gen_device=self.gen_device if gen_blocks is not None else None,
                 gen_tower_coord=(
@@ -2712,10 +2714,8 @@ class SenseNovaU1ForUnifiedGeneration(
         physical_blocks = (
             max(1, int(token_capacity) // block) if token_capacity else int(self.num_blocks)
         )
-        # Keep one worker-local KV block out of the scheduler's advertised pool.
-        # The interleaved decode CUDA-graph adapter uses it as a harmless padding
-        # target when replaying a larger graph bucket for a smaller live batch.
-        num_blocks = max(1, physical_blocks - 1)
+        padding_blocks = decode_graph_padding_block_count(block)
+        num_blocks = max(1, physical_blocks - padding_blocks)
         # Report scratch pool capacity in tokens; use a large sentinel when no pool exists.
         scratch_capacity_tokens = (
             int(self._scratch_blocks) * block if self._scratch_blocks > 0 else 1 << 24
@@ -3120,14 +3120,6 @@ class SenseNovaU1ForUnifiedGeneration(
         return self._text_decode_graph_query_geometry_from(
             self.model.language_model.model.layers[0].self_attn
         )
-
-    def interleaved_decode_graph_padding_block_id(self, pool: Any) -> int | None:
-        if pool is not self.kv_pool:
-            return None
-        num_blocks = int(getattr(pool, "num_blocks", 0) or 0)
-        if num_blocks <= 1:
-            return None
-        return num_blocks - 1
 
     def _text_indexes(
         self, start: int, seq_len: int, *, device: torch.device | str | None = None
