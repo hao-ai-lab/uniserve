@@ -54,13 +54,16 @@ class ScratchKvPool(PagedKVPool):
     def __init__(self, *args: Any, label: str = "scratch KV pool", **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.label = str(label)
-        self._allocator = BlockFreeList(self.num_blocks)
+        self._allocator = BlockFreeList(self.schedulable_num_blocks)
 
     def allocate_blocks(self, count: int) -> list[int]:
         return self._allocator.allocate(int(count), label=self.label)
 
     def release_blocks(self, block_ids: Iterable[int]) -> None:
-        self._allocator.release(int(block_id) for block_id in block_ids)
+        ids = tuple(int(block_id) for block_id in block_ids)
+        if any(block_id < 0 or block_id >= self.schedulable_num_blocks for block_id in ids):
+            raise RuntimeError(f"{self.label} cannot release a reserved or out-of-range block")
+        self._allocator.release(ids)
 
     def release_cache(self, cache: Any) -> None:
         if cache is None or getattr(cache, "pool", None) is not self:
@@ -165,6 +168,7 @@ class GenResidencySpec:
     block_size: int
     device: str
     scratch_num_blocks: int
+    reserved_tail_blocks: int = 0
     gen_scratch_num_blocks: int | None = None
     gen_device: str | None = None
     # Tower coordinate the gen-scratch pool is Pinned to (the gen tower); recorded
@@ -254,12 +258,13 @@ class ResidencyManager:
             device=spec.device,
             dtype=spec.kv.dtype,
             store_dtype=spec.kv.store_dtype,
+            reserved_tail_blocks=int(spec.reserved_tail_blocks),
         )
         scratch = None
         if int(spec.scratch_num_blocks) > 0:
             scratch = ScratchKvPool(
                 num_layers=int(spec.kv.num_layers),
-                num_blocks=int(spec.scratch_num_blocks),
+                num_blocks=int(spec.scratch_num_blocks) + int(spec.reserved_tail_blocks),
                 block_size=int(spec.block_size),
                 num_kv_heads=int(spec.kv.num_kv_heads),
                 head_dim=int(spec.kv.head_dim),
@@ -267,12 +272,13 @@ class ResidencyManager:
                 dtype=spec.kv.dtype,
                 store_dtype=spec.kv.store_dtype,
                 label="scratch KV pool",
+                reserved_tail_blocks=int(spec.reserved_tail_blocks),
             )
         gen_scratch = None
         if spec.gen_scratch_num_blocks is not None and spec.gen_device is not None:
             gen_scratch = ScratchKvPool(
                 num_layers=int(spec.kv.num_layers),
-                num_blocks=int(spec.gen_scratch_num_blocks),
+                num_blocks=int(spec.gen_scratch_num_blocks) + int(spec.reserved_tail_blocks),
                 block_size=int(spec.block_size),
                 num_kv_heads=int(spec.kv.num_kv_heads),
                 head_dim=int(spec.kv.head_dim),
@@ -281,6 +287,7 @@ class ResidencyManager:
                 store_dtype=spec.kv.store_dtype,
                 tower_coord=spec.gen_tower_coord,
                 label="gen scratch KV pool",
+                reserved_tail_blocks=int(spec.reserved_tail_blocks),
             )
         return cls(
             kv=kv,

@@ -48,6 +48,7 @@ class PagedKVPool:
         dtype: torch.dtype = torch.bfloat16,
         store_dtype: torch.dtype | str | None = None,
         tower_coord: int | None = None,
+        reserved_tail_blocks: int = 0,
     ) -> None:
         self.num_layers = int(num_layers)
         self.num_blocks = int(num_blocks)
@@ -56,6 +57,7 @@ class PagedKVPool:
         self.head_dim = int(head_dim)
         self.dtype = dtype
         self.store_dtype = resolve_kv_store_dtype(dtype, store_dtype)
+        self.reserved_tail_blocks = int(reserved_tail_blocks)
         # The tower coordinate this pool's storage is Pinned to (``None`` == the
         # primary/shared coordinate). The KV cache as a placed tensor: a gen-tower
         # scratch pool records ``tower_coord=gen`` so the snapshot reshard knows
@@ -72,6 +74,10 @@ class PagedKVPool:
         self.supports_paged_attention_storage = not self.is_quantized
         if self.num_layers <= 0 or self.num_blocks <= 0 or self.block_size <= 0:
             raise invalid_descriptor("PagedKVPool dimensions must be positive")
+        if self.reserved_tail_blocks < 0 or self.reserved_tail_blocks >= self.num_blocks:
+            raise invalid_descriptor(
+                "PagedKVPool reserved tail blocks must leave at least one schedulable block"
+            )
         # Layer-major storage makes a single layer's page table contiguous for
         # flash-attn's paged-kv kernel: [num_blocks, page, kv_heads, head_dim].
         shape = (self.num_layers, self.num_blocks, self.block_size, self.n_kv, self.head_dim)
@@ -100,6 +106,14 @@ class PagedKVPool:
             if self.is_quantized
             else None
         )
+
+    @property
+    def schedulable_num_blocks(self) -> int:
+        return self.num_blocks - self.reserved_tail_blocks
+
+    @property
+    def reserved_block_ids(self) -> tuple[int, ...]:
+        return tuple(range(self.schedulable_num_blocks, self.num_blocks))
 
     def view(self, block_ids: Iterable[int], base_len: int) -> "PagedRequestCache":
         ids = self.validate_block_ids(block_ids)

@@ -1,8 +1,6 @@
 """KV block sizing snapshots for shared and model-specific semantics."""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from uniserve_worker.foundation.sizing import (
@@ -117,10 +115,7 @@ def test_derive_runtime_kv_capacity_falls_back_to_default_blocks(monkeypatch):
     assert capacity.cuda is None
 
 
-def test_sensenova_caps_reserve_decode_graph_padding_block():
-    # SenseNova still derives the physical no-capacity fallback through the
-    # shared formula, then withholds one worker-local block from scheduler caps
-    # for decode-graph padding.
+def test_sensenova_caps_reserve_decode_graph_padding_blocks():
     from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
 
     model = SenseNovaU1ForUnifiedGeneration(
@@ -130,6 +125,7 @@ def test_sensenova_caps_reserve_decode_graph_padding_block():
     assert model.num_blocks == 4096
     assert model.caps(block_size=256, kv_token_capacity=None).num_blocks == 4095
     assert model.caps(block_size=256, kv_token_capacity=512).num_blocks == 1
+    assert model.caps(block_size=64, kv_token_capacity=4096).num_blocks == 62
 
 
 def test_sensenova_latent_and_scratch_capacity_scale_for_concurrent_interleave():
@@ -168,18 +164,15 @@ def test_sensenova_caps_declare_worker_owned_encoder_residency():
     assert model.residency.encoder.budget == caps.encoder_cache_budget
 
 
-def test_bagel_caps_reserve_decode_graph_padding_block():
+def test_bagel_caps_reserve_decode_graph_padding_blocks():
     from uniserve_worker.models.bagel import BagelForUnifiedGeneration
 
     model = BagelForUnifiedGeneration(config=None, device="cpu", block_size=256)
-    pool = SimpleNamespace(num_blocks=model.num_blocks)
-    model.pool = pool
 
     assert model.num_blocks == 4096
     assert model.caps(block_size=256, kv_token_capacity=None).num_blocks == 4095
     assert model.caps(block_size=256, kv_token_capacity=512).num_blocks == 63
-    assert model.interleaved_decode_graph_padding_block_id(pool) == 4095
-    assert model.interleaved_decode_graph_padding_block_id(object()) is None
+    assert model.caps(block_size=64, kv_token_capacity=4096).num_blocks == 62
 
 
 def test_bagel_latent_capacity_scales_for_concurrent_generation():

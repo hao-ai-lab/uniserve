@@ -351,22 +351,16 @@ def test_packed_mixed_graph_promotion_indices_fill_static_capacity():
     )
 
 
-def test_packed_decode_graph_padding_uses_writable_scratch_positions():
-    pool = PagedKVPool(1, 4, 64, 1, 2, device="cpu", dtype=torch.float32)
-    allocated: list[int] = []
-
-    def allocate(count: int) -> list[int]:
-        start = 1 + len(allocated)
-        blocks = list(range(start, start + int(count)))
-        allocated.extend(blocks)
-        return blocks
-
-    cache = PagedTextCache(
-        pool,
-        [0],
-        num_layers=1,
-        length=4,
-        allocate_blocks=allocate,
+def test_packed_decode_graph_padding_uses_reserved_kv_blocks():
+    pool = PagedKVPool(
+        1,
+        4,
+        64,
+        1,
+        2,
+        device="cpu",
+        dtype=torch.float32,
+        reserved_tail_blocks=2,
     )
     builder = ForwardStreamBuilder()
     builder.add_segment(
@@ -389,8 +383,7 @@ def test_packed_decode_graph_padding_uses_writable_scratch_positions():
         kv_segments=kv_segments,
         embed_chunks=embed_chunks,
         indicator_chunks=indicator_chunks,
-        padding_cache=cache,
-        padding_start=5,
+        padding_pool=pool,
         decode_rows=1,
         hidden_size=4,
         dtype=torch.float32,
@@ -404,7 +397,7 @@ def test_packed_decode_graph_padding_uses_writable_scratch_positions():
     assert sum(int(segment.q_len) for segment in stream.segments) == 128
     assert all(segment.mode is ForwardMode.DECODE for segment in stream.segments)
     assert all(segment.write_kv and segment.persist_kv for segment in kv_view.segments)
-    assert [segment.base_len for segment in kv_view.segments[1:]] == list(range(5, 132))
-    assert allocated == [1, 2]
+    assert [segment.base_len for segment in kv_view.segments[1:]] == list(range(127))
+    assert all(segment.block_ids == (2, 3) for segment in kv_view.segments[1:])
     assert torch.cat(embed_chunks, dim=0).shape == (128, 4)
     assert sum(int(chunk[0]) for chunk in indicator_chunks) == 128

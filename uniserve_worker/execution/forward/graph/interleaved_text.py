@@ -45,6 +45,7 @@ from ....foundation.runtime_config import get_worker_config
 from ....runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
 from ....runtime.tensor_staging import TextTensorStager
 from ...interleaved_text_stepper import hydrate_cached_prefix_from_op, resolve_op_token_ids
+from .padding import decode_graph_padding_block_ids
 from .text_decode import (
     DecodeCudaGraphRunner,
     TextDecodeGraphHostInputs,
@@ -63,20 +64,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["InterleavedTextDecodeGraphRunner", "InterleavedTextPrefillGraphRunner"]
-
-
-def _padding_block_id(owner: Any, pool: Any) -> int | None:
-    hook = getattr(owner, "interleaved_decode_graph_padding_block_id", None)
-    if not callable(hook):
-        return None
-    raw = hook(pool)
-    if raw is None:
-        return None
-    block_id = int(raw)
-    num_blocks = int(getattr(pool, "num_blocks", 0) or 0)
-    if block_id < 0 or block_id >= num_blocks:
-        raise invalid_descriptor("reserved interleaved decode graph padding block is out of range")
-    return block_id
 
 
 def _owner_max_context_len(owner: Any, pool: Any) -> int:
@@ -528,16 +515,16 @@ class InterleavedTextDecodeGraphRunner:
         graph_batch = int(graph_batch)
         if graph_batch <= len(rows):
             return rows
-        padding_block_id = _padding_block_id(driver.owner, pool)
-        if padding_block_id is None:
+        padding_block_ids = decode_graph_padding_block_ids(pool)
+        if not padding_block_ids:
             raise invalid_descriptor(
-                "interleaved decode graph padded replay requires a reserved KV padding block"
+                "interleaved decode graph padded replay requires reserved KV padding blocks"
             )
         block_size = int(getattr(pool, "block_size", 0) or 0)
         needed = graph_batch - len(rows)
-        if block_size <= 0 or needed > block_size:
+        if block_size <= 0 or needed > len(padding_block_ids) * block_size:
             raise invalid_descriptor(
-                "interleaved decode graph padding exceeds the reserved KV padding block"
+                "interleaved decode graph padding exceeds the reserved KV padding blocks"
             )
         base = rows[0]
         padded = list(rows)
@@ -549,7 +536,7 @@ class InterleavedTextDecodeGraphRunner:
                     token_id=0,
                     pos=offset,
                     base_len=offset,
-                    block_ids=[padding_block_id],
+                    block_ids=list(padding_block_ids),
                     token_tensor=None,
                 )
             )
@@ -596,7 +583,7 @@ class InterleavedTextDecodeGraphRunner:
         # Validation phase: prove every row is a one-token host-KV decode before
         # mutating any cache block ids or lengths.
         validated: list[tuple[Mapping[str, Any], "TextCache", int | None, torch.Tensor | None]] = []
-        padding_block_id = _padding_block_id(owner, pool)
+        padding_block_ids = set(decode_graph_padding_block_ids(pool))
         for op in ops:
             tokens = list(op.get("token_ids") or [])
             if len(tokens) != 1:
@@ -642,9 +629,9 @@ class InterleavedTextDecodeGraphRunner:
             base_len = int(cache.past.length)
             cache.past.ensure_capacity(base_len + 1)
             block_ids = list(cache.past.block_ids)
-            if padding_block_id is not None and padding_block_id in block_ids:
+            if padding_block_ids.intersection(block_ids):
                 raise invalid_descriptor(
-                    "scheduler assigned the reserved interleaved decode graph padding block"
+                    "scheduler assigned a reserved interleaved decode graph padding block"
                 )
             rows.append(
                 _Row(

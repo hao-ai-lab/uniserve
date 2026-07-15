@@ -44,7 +44,7 @@ from ..execution.paged_denoise import (
 )
 from ..execution.text_image_generation_session import TextImageGenerationSession
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import decode_graph_padding_block_count, get_worker_config
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -832,6 +832,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
                 block_size=self.block_size,
                 device=self.device,
                 scratch_num_blocks=self._scratch_blocks,
+                reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
                 encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
             )
         )
@@ -871,10 +872,8 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
             physical_blocks = int(self.num_blocks)
         else:
             physical_blocks = derive_num_blocks(block, cap, floor=64)
-        # Keep the final worker-local KV block outside the scheduler-visible
-        # range. Decode CUDA graphs use it as a harmless padding row when a
-        # live batch replays in a larger captured bucket.
-        num_blocks = max(1, physical_blocks - 1)
+        padding_blocks = decode_graph_padding_block_count(block)
+        num_blocks = max(1, physical_blocks - padding_blocks)
         c = self.cfg.llm
         # Report only schedulable denoise capacity. The physical pool's separate
         # text-staging reserve mirrors already-admitted request KV and must not
@@ -1203,14 +1202,6 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         """
         layer = cast(MoTDecoderLayer, self._ensure_loaded().model.lm.layers[0])
         return int(layer.n_heads), float(layer.scale), torch.bfloat16
-
-    def interleaved_decode_graph_padding_block_id(self, pool: Any) -> int | None:
-        if pool is not self.kv_pool:
-            return None
-        num_blocks = int(getattr(pool, "num_blocks", 0) or 0)
-        if num_blocks <= 1:
-            return None
-        return num_blocks - 1
 
     @staticmethod
     def _encoder_handle(mm_hash: Any) -> int:
