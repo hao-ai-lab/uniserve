@@ -100,13 +100,16 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
             revision=spec.dataset_revision,
         )
 
-    if dataset == "mjhq" or spec.task == TaskName.T2I:
-        return load_mjhq(
+    if dataset == "mjhq" or spec.task in {TaskName.T2I, TaskName.INTERLEAVE}:
+        rows = load_mjhq(
             path,
             spec.num_prompts,
             seed=spec.seed,
             revision=spec.dataset_revision,
         )
+        if spec.task == TaskName.INTERLEAVE:
+            return [_interleave_prompt(row) for row in rows]
+        return rows
 
     if dataset in _SYNTHETIC_IMAGE_ALIASES or (not dataset and spec.task == TaskName.I2T):
         return load_synthetic_images(spec.num_prompts, seed=spec.seed, question=spec.i2t_question)
@@ -128,3 +131,17 @@ def load_dataset_rows(spec: BenchmarkSpec, *, tokenizer: Any | None = None) -> l
         )
 
     raise ValueError(f"unknown dataset {spec.dataset!r} for task {spec.task.value!r}")
+
+
+def _interleave_prompt(row: dict[str, Any]) -> dict[str, Any]:
+    prompt = row.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("MJHQ interleave row has no prompt")
+    return {
+        **row,
+        "prompt": (
+            "Create a short illustrated response about the following scene. "
+            "Write one introductory sentence, generate one image, then write one closing "
+            f"sentence. Scene: {prompt}"
+        ),
+    }

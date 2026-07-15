@@ -34,6 +34,7 @@ import pytest
 from PIL import Image
 
 import uniserve_eval.harness.core.client as client_module
+import uniserve_eval.harness.datasets as datasets_module
 from uniserve_eval.harness import cli
 from uniserve_eval.harness.core.client import _parse_openai
 from uniserve_eval.harness.datasets import (
@@ -67,7 +68,7 @@ from uniserve_eval.harness.sse import (
     aiter_sse_events_from_text,
     iter_sse_events,
 )
-from uniserve_eval.harness.tasks.default import DefaultTask
+from uniserve_eval.harness.tasks.default import DefaultTask, InterleaveTask
 from uniserve_eval.harness.tasks.i2i import I2ITask
 from uniserve_eval.harness.tasks.i2t import I2TTask
 from uniserve_eval.harness.tasks.mixed import MixedTask, mixed_subtask_specs
@@ -313,8 +314,134 @@ def test_openai_parser_counts_delta_images_without_charging_text_itl() -> None:
     assert record.output_len_source == "server_usage"
     assert record.cached_prompt_tokens == 5
     assert record.cached_prompt_tokens_source == "openai_usage_prompt_tokens_details"
+    assert record.output_modalities == ["text", "image", "text"]
     assert record.finish_reason == "stop"
     assert record.record_dict()["generated_text_sha256"] == hashlib.sha256(b"abc").hexdigest()
+
+
+def test_interleave_summary_requires_visible_text_image_transition() -> None:
+    spec = BenchmarkSpec(
+        task=TaskName.INTERLEAVE,
+        model="SenseNova-U1",
+        num_prompts=1,
+        max_tokens=256,
+        max_images=1,
+        width=2,
+        height=3,
+        steps=50,
+        denoise_updates=50,
+        ignore_eos=False,
+        acceptance_min_images_per_success=1.0,
+    )
+    record = RequestRecord(
+        request_id="interleave-1",
+        task="interleave",
+        success=True,
+        classifier="ok",
+        latency=4.0,
+        ttft=0.5,
+        itl=[0.1],
+        token_timing_available=True,
+        prompt_len=16,
+        output_len=3,
+        prompt_len_source="server_usage",
+        output_len_source="server_usage",
+        generated_text="intro caption",
+        images=1,
+        image_latencies=[3.0],
+        output_modalities=["text", "image", "text"],
+        decoded_images=[inspect_image_bytes(_png_bytes())],
+    )
+    contract = benchmark_contract(spec, [{"id": "interleave-1"}])
+
+    summary = build_summary(spec, "http://x", [record], dur_s=4.0, contract=contract)
+
+    assert summary["artifact"]["generation_conformance"]["valid"] is True
+    assert summary["metrics"]["modality_interleave"] == {
+        "requests_with_text_and_image": 1,
+        "modality_transitions": {
+            "count": 1,
+            "mean": 2.0,
+            "std": 0.0,
+            "min": 2.0,
+            "p50": 2.0,
+            "p90": 2.0,
+            "p95": 2.0,
+            "p99": 2.0,
+            "max": 2.0,
+        },
+        "patterns": {"text->image->text": 1},
+    }
+
+    missing_text = dataclasses.replace(
+        record,
+        generated_text="",
+        output_modalities=["image"],
+    )
+    invalid_summary = build_summary(
+        spec,
+        "http://x",
+        [missing_text],
+        dur_s=4.0,
+        contract=contract,
+    )
+    conformance = invalid_summary["artifact"]["generation_conformance"]
+    assert conformance["valid"] is False
+    assert conformance["mismatched_request_ids"] == ["interleave-1"]
+
+
+def test_interleave_dataset_uses_deterministic_mjhq_prompt_transform(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        datasets_module,
+        "load_mjhq",
+        lambda *_args, **_kwargs: [{"id": "mjhq-1", "prompt": "a glass greenhouse"}],
+    )
+    spec = BenchmarkSpec(
+        task=TaskName.INTERLEAVE,
+        model="SenseNova-U1",
+        dataset="mjhq",
+        num_prompts=1,
+    )
+
+    assert load_dataset_rows(spec) == [
+        {
+            "id": "mjhq-1",
+            "prompt": (
+                "Create a short illustrated response about the following scene. "
+                "Write one introductory sentence, generate one image, then write one closing "
+                "sentence. Scene: a glass greenhouse"
+            ),
+        }
+    ]
+
+
+def test_interleave_task_carries_fixed_image_generation_controls() -> None:
+    request = InterleaveTask(
+        BenchmarkSpec(
+            task=TaskName.INTERLEAVE,
+            model="SenseNova-U1",
+            max_tokens=256,
+            max_images=1,
+            width=2048,
+            height=1152,
+            steps=50,
+            image_think=False,
+            image_t_eps=0.02,
+        )
+    ).build_request({"prompt": "write, illustrate, and conclude"})
+
+    assert request.payload["modalities"] == ["text", "image"]
+    assert request.payload["image_config"] == {
+        "num_images": 1,
+        "width": 2048,
+        "height": 1152,
+        "steps": 50,
+        "seed": 42,
+        "think": False,
+        "t_eps": 0.02,
+    }
 
 
 def test_openai_parser_captures_sglang_cached_token_breakdown_when_usage_omits_it() -> None:
@@ -556,6 +683,7 @@ def test_nonstreaming_i2t_does_not_fabricate_token_timing() -> None:
     ("task_class", "task", "wire", "item"),
     [
         (DefaultTask, TaskName.DEFAULT, "openai_chat", {"prompt": "p"}),
+        (InterleaveTask, TaskName.INTERLEAVE, "openai_chat", {"prompt": "p"}),
         (
             I2ITask,
             TaskName.I2I,

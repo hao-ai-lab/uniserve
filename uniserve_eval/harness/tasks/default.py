@@ -31,6 +31,10 @@ class DefaultTask(BenchmarkTask):
             image["cfg_interval"] = list(self.spec.cfg_interval)
         if self.spec.timestep_shift is not None:
             image["timestep_shift"] = self.spec.timestep_shift
+        if self.spec.image_think is not None:
+            image["think"] = self.spec.image_think
+        if self.spec.image_t_eps is not None:
+            image["t_eps"] = self.spec.image_t_eps
         max_tokens = item.get("max_tokens", self.spec.max_tokens or 512)
 
         image_config = dict(image)
@@ -56,3 +60,7 @@ class DefaultTask(BenchmarkTask):
             payload.update(extra)
         apply_text_sampling_contract(payload, self.spec)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat")
+
+
+class InterleaveTask(DefaultTask):
+    """Stream one response whose visible output alternates between text and images."""

@@ -612,7 +612,36 @@
           {"id": "c32", "request_rate": "inf", "max_concurrency": 32}
         ],
         "mixed_concurrency": [
-          {"id": "c32", "request_rate": "inf", "max_concurrency": 32}
+          {
+            "id": "image_light",
+            "request_rate": "inf",
+            "max_concurrency": 32,
+            "harness": {
+              "workload_mix": {"t2i": 8, "i2t": 24},
+              "warmup_mix": {"t2i": 1, "i2t": 3},
+              "acceptance_min_images_per_success": 0.25
+            }
+          },
+          {
+            "id": "balanced",
+            "request_rate": "inf",
+            "max_concurrency": 32,
+            "harness": {
+              "workload_mix": {"t2i": 16, "i2t": 16},
+              "warmup_mix": {"t2i": 2, "i2t": 2},
+              "acceptance_min_images_per_success": 0.5
+            }
+          },
+          {
+            "id": "image_heavy",
+            "request_rate": "inf",
+            "max_concurrency": 32,
+            "harness": {
+              "workload_mix": {"t2i": 24, "i2t": 8},
+              "warmup_mix": {"t2i": 3, "i2t": 1},
+              "acceptance_min_images_per_success": 0.75
+            }
+          }
         ]
       },
       "datasets": {
@@ -644,7 +673,8 @@
           "server": "benchmark/server/sensenova-uniserve",
           "points": [
             "sensenova_mjhq_t2i_uniserve",
-            "sensenova_beans_i2t_uniserve"
+            "sensenova_beans_i2t_uniserve",
+            "sensenova_mjhq_interleave_uniserve"
           ]
         },
         "sensenova-omni": {
@@ -814,6 +844,47 @@
             "acceptance_min_images_per_success": 1.0
           }
         },
+        "sensenova_mjhq_interleave_uniserve": {
+          "load_case_set": "image_concurrency",
+          "name": "sensenova-uniserve-interleave-{load_id}",
+          "output": "sensenova_mjhq_interleave/uniserve_{load_id}",
+          "harness": {
+            "task": "interleave",
+            "model": "SenseNova-U1",
+            "dataset": "mjhq",
+            "dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
+            "num_prompts": 32,
+            "max_tokens": 256,
+            "temperature": 0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "disable_ignore_eos": true,
+            "steps": 50,
+            "denoise_updates": 50,
+            "width": 2048,
+            "height": 1152,
+            "wire": "openai_chat",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "image_t_eps": 0.02,
+            "runtime_profile_id": "sensenova-u1",
+            "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "default",
+            "preprocessing": "mjhq_interleaved_response_v1",
+            "acceptance_min_success": 32,
+            "acceptance_min_images_per_success": 1.0
+          }
+        },
         "sensenova_beans_i2t_uniserve": {
           "load_case_set": "text_arrival",
           "parity_group": "sensenova_beans_i2t",
@@ -889,8 +960,6 @@
             "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
             "num_prompts": 32,
             "warmup_requests": 4,
-            "workload_mix": {"t2i": 8, "i2t": 24},
-            "warmup_mix": {"t2i": 1, "i2t": 3},
             "max_tokens": 256,
             "temperature": 0,
             "top_p": 1.0,
@@ -917,9 +986,8 @@
             "runtime_profile_id": "sensenova-u1",
             "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "mixed_image_text",
-            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
-            "acceptance_min_success": 32,
-            "acceptance_min_images_per_success": 0.25
+            "preprocessing": "mjhq_beans_proportional_interleave_v1",
+            "acceptance_min_success": 32
           }
         },
         "sensenova_mixed_omni": {
@@ -937,8 +1005,6 @@
             "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
             "num_prompts": 32,
             "warmup_requests": 4,
-            "workload_mix": {"t2i": 8, "i2t": 24},
-            "warmup_mix": {"t2i": 1, "i2t": 3},
             "max_tokens": 256,
             "temperature": 0,
             "top_p": 1.0,
@@ -965,9 +1031,8 @@
             "runtime_profile_id": "sensenova-u1-reference",
             "plan_evidence_policy": "reference_protocol",
             "output_constraint": "mixed_image_text",
-            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
-            "acceptance_min_success": 32,
-            "acceptance_min_images_per_success": 0.25
+            "preprocessing": "mjhq_beans_proportional_interleave_v1",
+            "acceptance_min_success": 32
           }
         },
         "bagel_mjhq_t2i_uniserve": {
@@ -1105,8 +1170,6 @@
             "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
             "num_prompts": 32,
             "warmup_requests": 4,
-            "workload_mix": {"t2i": 8, "i2t": 24},
-            "warmup_mix": {"t2i": 1, "i2t": 3},
             "max_tokens": 256,
             "temperature": 0,
             "top_p": 1.0,
@@ -1131,9 +1194,8 @@
             "runtime_profile_id": "bagel",
             "plan_evidence_policy": "runtime_inspection",
             "output_constraint": "mixed_image_text",
-            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
-            "acceptance_min_success": 32,
-            "acceptance_min_images_per_success": 0.25
+            "preprocessing": "mjhq_beans_proportional_interleave_v1",
+            "acceptance_min_success": 32
           }
         },
         "bagel_mixed_omni": {
@@ -1151,8 +1213,6 @@
             "i2t_dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
             "num_prompts": 32,
             "warmup_requests": 4,
-            "workload_mix": {"t2i": 8, "i2t": 24},
-            "warmup_mix": {"t2i": 1, "i2t": 3},
             "max_tokens": 256,
             "temperature": 0,
             "top_p": 1.0,
@@ -1177,9 +1237,8 @@
             "runtime_profile_id": "bagel-reference",
             "plan_evidence_policy": "reference_protocol",
             "output_constraint": "mixed_image_text",
-            "preprocessing": "mjhq_text_beans_jpeg95_seed42_v1",
-            "acceptance_min_success": 32,
-            "acceptance_min_images_per_success": 0.25
+            "preprocessing": "mjhq_beans_proportional_interleave_v1",
+            "acceptance_min_success": 32
           }
         }
       },

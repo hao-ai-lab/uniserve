@@ -65,6 +65,7 @@ class RequestRecord:
     # Visible content chunks (OpenAI streaming), retained only for the optional
     # retokenized-ITL cross-check that mirrors sglang.
     text_chunks: list[str] = field(default_factory=list)
+    output_modalities: list[str] = field(default_factory=list)
 
     # Image accounting. ``image_latencies`` is per-image E2E from request start to image availability; ``first_image_latency`` is time to the first image signal; ``image_gen_seconds`` is populated only when a backend exposes a per-image generation span; ``image_steps`` is populated only when a backend reports per-image diffusion steps.
     images: int = 0
@@ -166,6 +167,7 @@ class RequestRecord:
             "generated_text_sha256": (
                 hashlib.sha256(generated_text_bytes).hexdigest() if generated_text_bytes else None
             ),
+            "output_modalities": list(self.output_modalities),
             "images": self.images,
             "generated_images_expected": self.generated_images_expected,
             "requested_image_count": self.requested_image_count,

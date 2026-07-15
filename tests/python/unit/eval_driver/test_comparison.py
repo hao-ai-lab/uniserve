@@ -39,7 +39,11 @@ def _point(directory: Path, *, role: str, throughput: float, text: str) -> None:
         "ok_count": 1,
         "failed_count": 0,
         "elapsed_s": 1.0,
-        "metrics": {"output_throughput": throughput},
+        "metrics": {
+            "output_throughput": throughput,
+            "mean_ttft_ms": 40.0 if role == "reference" else 30.0,
+            "mean_tpot_ms": 12.0 if role == "reference" else 10.0,
+        },
         "artifact": {
             "valid": True,
             "valid_marker": "canonical-valid-v2",
@@ -71,7 +75,10 @@ def test_text_comparison_runs_only_fixed_work_by_default(tmp_path: Path) -> None
 
     assert result["valid"] is True
     assert result["work"]["passed"] is True
-    assert result["metric"]["candidate_over_reference"] == 1.25
+    metrics = {metric["name"]: metric for metric in result["metrics"]}
+    assert metrics["output_throughput"]["candidate_over_reference"] == 1.25
+    assert metrics["mean_ttft_ms"]["candidate_over_reference"] == 0.75
+    assert metrics["mean_tpot_ms"]["candidate_over_reference"] == pytest.approx(10.0 / 12.0)
     assert "text_canary" not in result
     assert "image_smoke" not in result
 
@@ -160,7 +167,7 @@ def test_i2t_comparison_uses_declared_natural_eos_work_contract(tmp_path: Path) 
     assert result["valid"] is True
     assert result["work"]["passed"] is True
     assert result["work"]["checks"]["output_counts_within_requested_limits"] is True
-    assert result["metric"]["candidate_over_reference"] == pytest.approx(1.6)
+    assert result["metrics"][0]["candidate_over_reference"] == pytest.approx(1.6)
 
 
 def test_comparison_rejects_different_parity_contracts(tmp_path: Path) -> None:
@@ -196,11 +203,13 @@ def test_run_summary_keeps_each_ratio_and_reports_geometric_mean() -> None:
                     "comparison": "qwen3_sharegpt",
                     "load_case": "r16",
                     "valid": True,
-                    "metric": {
-                        "name": "output_throughput",
-                        "objective": "maximize",
-                        "candidate_over_reference": ratio,
-                    },
+                    "metrics": [
+                        {
+                            "name": "output_throughput",
+                            "objective": "maximize",
+                            "candidate_over_reference": ratio,
+                        }
+                    ],
                 }
             ]
         }
@@ -220,6 +229,64 @@ def test_run_summary_keeps_each_ratio_and_reports_geometric_mean() -> None:
             "geometric_mean": pytest.approx(1.1),
         }
     ]
+
+
+def _mixed_point(directory: Path, *, role: str, scale: float) -> None:
+    directory.mkdir()
+    summary = {
+        "task": "mixed",
+        "request_count": 32,
+        "ok_count": 32,
+        "failed_count": 0,
+        "elapsed_s": 64.0 / scale,
+        "metrics": {
+            "mixed_request_throughput": 0.5 * scale,
+            "i2t": {
+                "output_throughput": 100.0 * scale,
+                "mean_ttft_ms": 400.0 / scale,
+                "mean_tpot_ms": 20.0 / scale,
+            },
+            "t2i": {
+                "images_per_second": 0.125 * scale,
+                "image_latency_ms": {"mean": 8000.0 / scale},
+            },
+        },
+        "artifact": {
+            "valid": True,
+            "valid_marker": "canonical-valid-v2",
+            "generation_conformance": {"valid": True},
+            "matrix_contract": {
+                "comparison_role": role,
+                "parity_group": "mixed_pair",
+                "benchmark_definition": {"load_case_id": "balanced"},
+                "parity_contract": {"fingerprint": _PARITY_FINGERPRINT},
+            },
+        },
+    }
+    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+
+def test_mixed_comparison_reports_aggregate_and_per_task_tradeoffs(tmp_path: Path) -> None:
+    reference = tmp_path / "reference"
+    candidate = tmp_path / "candidate"
+    _mixed_point(reference, role="reference", scale=1.0)
+    _mixed_point(candidate, role="candidate", scale=2.0)
+
+    result = compare_pair(reference, candidate)
+
+    assert result["valid"] is True
+    metrics = {metric["name"]: metric for metric in result["metrics"]}
+    assert set(metrics) == {
+        "mixed_request_throughput",
+        "i2t.output_throughput",
+        "i2t.mean_ttft_ms",
+        "i2t.mean_tpot_ms",
+        "t2i.images_per_second",
+        "t2i.image_latency_ms.mean",
+    }
+    assert metrics["mixed_request_throughput"]["candidate_over_reference"] == 2.0
+    assert metrics["i2t.mean_ttft_ms"]["candidate_over_reference"] == 0.5
+    assert metrics["t2i.image_latency_ms.mean"]["candidate_over_reference"] == 0.5
 
 
 def _image_point(
@@ -280,6 +347,6 @@ def test_image_comparison_uses_concurrency_case_metric(
     result = compare_pair(reference, candidate)
 
     assert result["valid"] is True
-    assert result["metric"]["name"] == expected_name
-    assert result["metric"]["objective"] == expected_objective
-    assert result["metric"]["candidate_over_reference"] == pytest.approx(expected_ratio)
+    assert result["metrics"][0]["name"] == expected_name
+    assert result["metrics"][0]["objective"] == expected_objective
+    assert result["metrics"][0]["candidate_over_reference"] == pytest.approx(expected_ratio)

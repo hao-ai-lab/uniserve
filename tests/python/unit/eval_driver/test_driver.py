@@ -378,6 +378,11 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
         harness = points[name]["harness"]
         assert harness["image_think"] is False
         assert harness["image_t_eps"] == 0.02
+    interleave = points["sensenova_mjhq_interleave_uniserve"]["harness"]
+    assert interleave["image_think"] is False
+    assert interleave["image_t_eps"] == 0.02
+    assert interleave["max_images"] == 1
+    assert interleave["disable_ignore_eos"] is True
     for name in ("bagel_mjhq_t2i_uniserve", "bagel_mjhq_t2i_omni"):
         harness = points[name]["harness"]
         assert harness["image_think"] is False
@@ -516,6 +521,40 @@ def test_benchmark_runner_applies_concurrency_load_case(tmp_path):
     spec = run_benchmarks.spec_from_harness_command(cmd)
     assert spec.request_rate == float("inf")
     assert spec.max_concurrency == 32
+
+
+def test_benchmark_runner_binds_mixed_ratio_to_the_load_case(tmp_path):
+    run_benchmarks = _load_run_benchmarks()
+    cmd = run_benchmarks.harness_command(
+        python="python",
+        base_url="http://127.0.0.1:1",
+        output_dir=tmp_path,
+        defaults={},
+        harness={
+            "task": "mixed",
+            "model": "multimodal-model",
+            "dataset_path": str(tmp_path),
+            "num_prompts": 32,
+            "warmup_requests": 4,
+        },
+        load_case={
+            "id": "balanced",
+            "request_rate": "inf",
+            "max_concurrency": 32,
+            "harness": {
+                "workload_mix": {"t2i": 16, "i2t": 16},
+                "warmup_mix": {"t2i": 2, "i2t": 2},
+                "acceptance_min_images_per_success": 0.5,
+            },
+        },
+        datasets={},
+    )
+
+    spec = run_benchmarks.spec_from_harness_command(cmd)
+    assert spec.workload_mix == {"t2i": 16, "i2t": 16}
+    assert spec.warmup_mix == {"t2i": 2, "i2t": 2}
+    assert spec.max_concurrency == 32
+    assert spec.acceptance_min_images_per_success == 0.5
 
 
 def test_formal_command_log_contains_only_the_current_invocation(tmp_path):
@@ -894,7 +933,7 @@ def test_benchmark_repeat_wraps_complete_matrix_runs(tmp_path: Path, monkeypatch
         ("run-003", 1, True, True),
     ]
     combined = json.loads((output_root / "results.json").read_text(encoding="utf-8"))
-    assert combined == {"schema_version": 1, "run_count": 3, "comparisons": []}
+    assert combined == {"schema_version": 2, "run_count": 3, "comparisons": []}
 
 
 def test_clean_gpu_check_queries_only_the_selected_physical_gpu(monkeypatch) -> None:

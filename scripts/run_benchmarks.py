@@ -669,6 +669,19 @@ def harness_command(
     datasets: dict[str, Path],
 ) -> list[str]:
     harness = expand_profile_value(harness)
+    load_harness = load_case.get("harness", {})
+    if not isinstance(load_harness, dict):
+        raise SystemExit("load case harness overrides must be an object")
+    unsupported_load_fields = set(load_harness) - {
+        "workload_mix",
+        "warmup_mix",
+        "acceptance_min_images_per_success",
+    }
+    if unsupported_load_fields:
+        raise SystemExit(
+            "load case contains unsupported harness override(s): "
+            + ", ".join(sorted(unsupported_load_fields))
+        )
     dataset_ref = harness.pop("dataset_ref", None)
     if dataset_ref:
         if str(dataset_ref) not in datasets:
@@ -680,7 +693,7 @@ def harness_command(
     num_prompts = int(harness.pop("num_prompts"))
     warmup = int(harness.pop("warmup_requests", defaults.get("warmup_requests", 1)))
     seed = int(harness.pop("seed", defaults.get("seed", 42)))
-    controlled_fields = {"request_rate", "max_concurrency"}
+    controlled_fields = {"request_rate", "max_concurrency", *load_harness}
     if controlled_fields & (set(defaults) | set(harness)):
         raise SystemExit("load-controlled fields must be declared by the load case")
     request_rate = load_case.get("request_rate")
@@ -688,6 +701,7 @@ def harness_command(
     for key in HARNESS_FLAGS:
         if key not in harness and key in defaults:
             harness[key] = defaults[key]
+    harness.update(load_harness)
 
     cmd = [
         python,
@@ -1767,7 +1781,7 @@ def write_comparisons(
             )
         )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark": benchmark,
         "points": point_results,
         "comparisons": comparisons,

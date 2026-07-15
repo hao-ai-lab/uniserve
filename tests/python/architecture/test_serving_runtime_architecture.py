@@ -400,7 +400,36 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
             {"id": "c32", "request_rate": "inf", "max_concurrency": 32},
         ],
         "mixed_concurrency": [
-            {"id": "c32", "request_rate": "inf", "max_concurrency": 32},
+            {
+                "id": "image_light",
+                "request_rate": "inf",
+                "max_concurrency": 32,
+                "harness": {
+                    "workload_mix": {"t2i": 8, "i2t": 24},
+                    "warmup_mix": {"t2i": 1, "i2t": 3},
+                    "acceptance_min_images_per_success": 0.25,
+                },
+            },
+            {
+                "id": "balanced",
+                "request_rate": "inf",
+                "max_concurrency": 32,
+                "harness": {
+                    "workload_mix": {"t2i": 16, "i2t": 16},
+                    "warmup_mix": {"t2i": 2, "i2t": 2},
+                    "acceptance_min_images_per_success": 0.5,
+                },
+            },
+            {
+                "id": "image_heavy",
+                "request_rate": "inf",
+                "max_concurrency": 32,
+                "harness": {
+                    "workload_mix": {"t2i": 24, "i2t": 8},
+                    "warmup_mix": {"t2i": 3, "i2t": 1},
+                    "acceptance_min_images_per_success": 0.75,
+                },
+            },
         ],
     }
     matrix_size = sum(
@@ -408,13 +437,19 @@ def test_benchmark_profiles_produce_schema_valid_canonical_artifacts() -> None:
         for group in benchmark["groups"].values()
         for point in group["points"]
     )
-    assert matrix_size == 42
+    assert matrix_size == 52
     for point in points:
         if point["harness"]["task"] == "t2i":
             assert point["load_case_set"] == "image_concurrency"
             assert point["name"].endswith("-{load_id}")
         if point["harness"]["task"] == "mixed":
             assert point["load_case_set"] == "mixed_concurrency"
+            assert "workload_mix" not in point["harness"]
+            assert point["harness"]["preprocessing"] == ("mjhq_beans_proportional_interleave_v1")
+        if point["harness"]["task"] == "interleave":
+            assert point["load_case_set"] == "image_concurrency"
+            assert point.get("parity_group") is None
+            assert point["harness"]["output_constraint"] == "default"
 
     spec = BenchmarkSpec(
         task=TaskName.T2I,
