@@ -1238,6 +1238,24 @@ def test_matrix_definition_binds_active_point_semantics_load_case_dataset_and_ha
     assert not benchmark_matrix_definition_matches(matrix, changed_config)
 
 
+def test_matrix_definition_binds_load_case_harness_overrides() -> None:
+    config = load_config(DEFAULT_CONFIG)
+
+    contracts = [
+        benchmark_matrix_definition_contract(
+            config,
+            "main",
+            group_name="sensenova-mixed-uniserve",
+            point_name="sensenova_mixed_uniserve",
+            load_case_set="mixed_concurrency",
+            load_case_id=load_case,
+        )
+        for load_case in ("image_light", "balanced", "image_heavy")
+    ]
+
+    assert len({contract["declared_semantics_sha256"] for contract in contracts}) == 3
+
+
 def test_formal_execution_rejects_noncanonical_profile_config(tmp_path: Path) -> None:
     run_benchmarks = _load_run_benchmarks()
 
