@@ -593,6 +593,7 @@ pub fn denoise_scratch_tokens(
 }
 
 impl GenerationResourceBounds {
+    #[allow(clippy::too_many_arguments)]
     pub fn conservative(
         context: &[ContextSegment],
         negative_context: &[ContextSegment],
