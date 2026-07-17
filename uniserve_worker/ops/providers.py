@@ -7,6 +7,7 @@ from importlib import import_module
 
 import torch
 
+from ..contracts.attention_plan import PagedDecodePlan
 from ..foundation.env import env_flag
 from .core import Capabilities, CommDispatcher, Dispatcher, Handoff, Provider
 from .requests import (
@@ -983,9 +984,9 @@ class _AttentionBackendProvider:
     @staticmethod
     def _is_one_token_decode(req: AttentionReq) -> bool:
         if req.q.ndim == 3:
-            metadata = getattr(req.ctx, "attention_metadata", None) if req.ctx is not None else None
-            query_lens = getattr(metadata, "query_lens_cpu", ()) or ()
-            if getattr(metadata, "mode", None) == "decode" and len(query_lens) == int(req.q.shape[0]):
+            plan = getattr(req.ctx, "attention_plan", None) if req.ctx is not None else None
+            query_lens = getattr(plan, "query_lens_cpu", ()) or ()
+            if isinstance(plan, PagedDecodePlan) and len(query_lens) == int(req.q.shape[0]):
                 return all(int(length) == 1 for length in query_lens)
             return int(req.q.shape[0]) == 1
         if req.q.ndim == 4:

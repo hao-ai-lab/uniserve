@@ -1,16 +1,14 @@
-"""The unified GPU-snapshot ``ForwardBatch`` for every forward mode.
+"""Unified device snapshot for one scheduler forward.
 
-This is the UniServe analog of SGLang's ``ForwardBatch.init_new``: the single
-device snapshot the *system* builds for text (extend/decode/verify), denoise,
-encode, and commit. It carries **indices and small typed sub-blocks, never the
-pools themselves** — the KV/latent/scratch/encoder residency is addressed by the
-host-leased handle (``block_table``/``latent_handle``/``out_handle``), resolved
-to physical buffers by the worker-owned ``ResidencyManager`` behind the published
-``ForwardContext``. Forward batches therefore carry descriptor indices only; pool
-storage stays in the residency layer.
+:class:`ForwardBatch` is the single GPU-facing batch type for every
+:class:`~.forward_mode.ForwardMode`. The runtime builder
+(``runtime.forward_batch_builder``) stages text, denoise, encode, and commit
+groups into this type.
 
-One builder (``runtime.forward_batch_builder``) stages every mode's tensors
-into this type.
+The batch carries indices, geometry tensors, and small typed mode sub-blocks —
+never the residency pools themselves. Physical KV, latent, scratch, and encoder
+buffers are resolved through the published
+:class:`~.forward_context.ForwardContext`.
 """
 from __future__ import annotations
 
@@ -21,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 if TYPE_CHECKING:
     import torch
 
+    from .attention_plan import AttentionPlanBase
     from .forward_mode import ForwardMode
 
 __all__ = [
@@ -181,22 +180,35 @@ class CommitInputs:
 
 @dataclass
 class ForwardBatch:
-    """The system-built GPU snapshot of one scheduler op group.
+    """System-built device snapshot of one scheduler op group.
 
-    Holds indices and small typed sub-blocks for every mode; never holds pools
-    or KV/latent/logit bytes. Mutable (not frozen) so the metadata builder and
-    the CUDA-graph runner can attach/refresh per-forward plan state in place, the
-    way the captured graph rewrites its dynamic summary fields each replay.
+    The explicit argument into model and graph-runner entry points. Carries:
+
+    - identity and shape (``forward_mode``, ``req_ids``, per-op modes for
+      ``MIXED``)
+    - text-core tensors when the group is text-shaped (``input_ids``,
+      ``positions``, extend/decode geometry); ``None`` for pure-gen groups
+    - residency *indices* only (``block_table``, ``out_cache_loc``, and the
+      handles inside :class:`DenoiseInputs` / :class:`EncodeInputs` /
+      :class:`CommitInputs`) — never the pools or KV/latent bytes
+    - modality and attention-regime metadata (``is_gen``, ``segments``)
+    - the per-forward :class:`~.attention_plan.AttentionPlanBase` attached by the
+      system plan builder (``None`` for dense vision attention)
+
+    Pool storage stays in the residency layer; shared layers resolve physical
+    buffers from :class:`~.forward_context.ForwardContext`. Mutable so the
+    metadata builder and CUDA-graph runner can attach or refresh plan state in
+    place, including rewriting dynamic summary fields on each graph replay.
     """
 
-    # --- identity / shape ---
+    # identity / shape
     forward_mode: "ForwardMode"
     req_ids: tuple[int, ...]
     op_modes: tuple["ForwardMode", ...] = ()  # per-op mode (MIXED carries het. modes)
     ops: tuple[Mapping[str, Any], ...] = ()
     device: "torch.device | None" = None  # resolves gen_device / tower placement
 
-    # --- text core (SGLang-parity; None for pure-gen groups) ---
+    # text core (None for pure-gen groups)
     input_ids: "torch.Tensor | None" = None
     positions: "torch.Tensor | None" = None
     seq_lens: "torch.Tensor | None" = None
@@ -208,33 +220,30 @@ class ForwardBatch:
     padded_num_tokens: int = 0
     spec_token_ids: tuple[tuple[int, ...], ...] = ()
 
-    # --- KV residency, by index (the system fills these from block_ids) ---
+    # KV residency, by index (filled from host-leased block_ids)
     block_table: "torch.Tensor | None" = None  # [batch, max_blocks] logical->physical
     out_cache_loc: "torch.Tensor | None" = None  # per-token destination slot (write side)
     cache_seqlens: "torch.Tensor | None" = None
 
-    # --- modality / attention regime (per token / per segment) ---
+    # modality / attention regime
     is_gen: "torch.Tensor | None" = None  # per-token modality mask (MoT routing)
     segments: tuple[SegmentSpec, ...] = ()  # causal vs bidirectional spans, branch ids
 
-    # --- generation sub-blocks (None unless the mode needs them) ---
+    # mode sub-blocks (None unless the mode needs them)
     denoise: DenoiseInputs | None = None
     encode: EncodeInputs | None = None
     commit: CommitInputs | None = None
 
-    # --- sampling / spec (deferred-handle-friendly) ---
+    # sampling / spec
     sampling: Any = None
     return_all_logits: bool = False
 
-    # --- per-forward attention plan (attached by AttentionBackend) ---
-    # The system metadata builder stashes the per-forward kernel plan here (the
-    # paged request-cache view + cu_seqlens / decode write-locations); the model
-    # never builds or threads it. ``None`` for dense (vision) attention.
-    attn_metadata: Any = None
+    # per-forward attention plan (system-attached; None for dense vision)
+    attn_plan: "AttentionPlanBase | None" = None
 
     @property
     def mode(self) -> "ForwardMode":
-        """Back-compat alias: the single forward mode of this snapshot."""
+        """Alias for :attr:`forward_mode`."""
         return self.forward_mode
 
     @property

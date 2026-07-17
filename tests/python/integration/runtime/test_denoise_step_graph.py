@@ -140,7 +140,7 @@ def _make_pool(device: torch.device) -> PagedKVPool:
 
 
 @requires_cuda
-def test_paged_denoise_uses_transient_varlen_attention_metadata(monkeypatch):
+def test_paged_denoise_uses_transient_varlen_attention_plan(monkeypatch):
     device = torch.device("cuda")
     pool = PagedKVPool(
         num_layers=1,

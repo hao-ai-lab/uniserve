@@ -1,4 +1,5 @@
 """CUDA graph plumbing for text decode (re-exports the shared and prefill surface)."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
@@ -8,7 +9,12 @@ from typing import Any
 import torch
 
 from ....backends.paged_kv_math import decode_write_locations
-from ....contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
+from ....contracts.forward_context import (
+    ForwardContext,
+    GraphBinding,
+    PagedDecodePlan,
+    use_forward_context,
+)
 from ....contracts.forward_mode import ForwardMode
 from ....foundation.errors import invalid_descriptor
 from ....foundation.sizing import ceil_div
@@ -27,22 +33,23 @@ from .base import (
 )
 
 __all__ = [
-    'GraphEvent',
-    'record_graph_stats',
-    'TextDecodeGraphHostInputs',
-    'TextDecodeGraphState',
-    'TextInitialPrefillGraphState',
-    'DecodeCudaGraphRunner',
-    'PrefillCudaGraphRunner',
-    'make_text_decode_graph_state',
-    'make_text_initial_prefill_graph_state',
-    'copy_text_decode_graph_inputs',
-    'copy_text_decode_graph_host_inputs',
-    'copy_text_initial_prefill_graph_inputs',
-    'maybe_weak_ref_cuda_graph_tensor',
-    'resolve_paged_decode_graph_backend',
-    'prepare_paged_decode_graph_backend',
+    "GraphEvent",
+    "record_graph_stats",
+    "TextDecodeGraphHostInputs",
+    "TextDecodeGraphState",
+    "TextInitialPrefillGraphState",
+    "DecodeCudaGraphRunner",
+    "PrefillCudaGraphRunner",
+    "make_text_decode_graph_state",
+    "make_text_initial_prefill_graph_state",
+    "copy_text_decode_graph_inputs",
+    "copy_text_decode_graph_host_inputs",
+    "copy_text_initial_prefill_graph_inputs",
+    "maybe_weak_ref_cuda_graph_tensor",
+    "resolve_paged_decode_graph_backend",
+    "prepare_paged_decode_graph_backend",
 ]
+
 
 @dataclass
 class TextDecodeGraphState:
@@ -56,7 +63,8 @@ class TextDecodeGraphState:
     cache_seqlens: torch.Tensor
     graph: torch.cuda.CUDAGraph
     cache: BatchedPagedRequestCache
-    metadata: TextAttentionMetadata
+    plan: PagedDecodePlan
+    graph_binding: GraphBinding
     logits: torch.Tensor | None = None
     long_inputs: torch.Tensor | None = None
     block_table_rows: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
@@ -195,7 +203,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         batch_size: int,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attention_metadata: TextAttentionMetadata,
+        attention_plan: PagedDecodePlan,
         ctx: Any,
         forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
         prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
@@ -208,18 +216,26 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             num_blocks=num_blocks,
             batch_size=batch_size,
             device=device,
-            max_context_len=int(getattr(attention_metadata, "max_context_len", 0) or 0),
+            max_context_len=int(getattr(attention_plan, "max_context_len", 0) or 0),
         )
         copy_text_decode_graph_inputs(
             state,
             input_ids=input_ids,
             positions=positions,
-            attention_metadata=attention_metadata,
+            attention_plan=attention_plan,
         )
-        graph_ctx = replace(ctx, attention_metadata=state.metadata, stats=None)
+        graph_ctx = replace(
+            ctx,
+            attention_plan=state.plan,
+            graph_binding=state.graph_binding,
+            stats=None,
+        )
 
         def run() -> torch.Tensor:
-            with use_forward_context(graph_ctx):
+            # copy_inputs rebuilds state.plan before each warmup and capture run;
+            # publish that snapshot so capture records the same plan the backend
+            # prepare step plans from.
+            with use_forward_context(replace(graph_ctx, attention_plan=state.plan)):
                 return forward_fn(state)
 
         def copy_inputs(capture_state: TextDecodeGraphState) -> None:
@@ -227,7 +243,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
                 capture_state,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_plan=attention_plan,
             )
 
         def prepare(capture_state: TextDecodeGraphState) -> None:
@@ -265,14 +281,24 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             max_context_len=int(host_inputs.max_context_len),
         )
         copy_text_decode_graph_host_inputs(state, host_inputs, staging_slot=staging_slot)
-        graph_ctx = replace(ctx, attention_metadata=state.metadata, stats=None)
+        graph_ctx = replace(
+            ctx,
+            attention_plan=state.plan,
+            graph_binding=state.graph_binding,
+            stats=None,
+        )
 
         def run() -> torch.Tensor:
-            with use_forward_context(graph_ctx):
+            # copy_inputs rebuilds state.plan before each warmup and capture run;
+            # publish that snapshot so capture records the same plan the backend
+            # prepare step plans from.
+            with use_forward_context(replace(graph_ctx, attention_plan=state.plan)):
                 return forward_fn(state)
 
         def copy_inputs(capture_state: TextDecodeGraphState) -> None:
-            copy_text_decode_graph_host_inputs(capture_state, host_inputs, staging_slot=staging_slot)
+            copy_text_decode_graph_host_inputs(
+                capture_state, host_inputs, staging_slot=staging_slot
+            )
 
         def prepare(capture_state: TextDecodeGraphState) -> None:
             if prepare_backend is not None:
@@ -308,7 +334,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         graph_batch_size: int,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attention_metadata: TextAttentionMetadata,
+        attention_plan: PagedDecodePlan,
         ctx: Any,
         forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
         prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None,
@@ -319,7 +345,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
             batch_size=graph_batch_size,
             input_ids=input_ids,
             positions=positions,
-            attention_metadata=attention_metadata,
+            attention_plan=attention_plan,
             ctx=ctx,
             forward_fn=forward_fn,
             prepare_backend=prepare_backend,
@@ -357,7 +383,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         batch_size: int,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attention_metadata: TextAttentionMetadata,
+        attention_plan: PagedDecodePlan,
         ctx: Any,
         forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
         prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
@@ -382,7 +408,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
                 graph_batch_size=graph_batch_size,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_plan=attention_plan,
                 ctx=ctx,
                 forward_fn=forward_fn,
                 prepare_backend=prepare_backend,
@@ -391,7 +417,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
                 state,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_plan=attention_plan,
             ),
             replay=lambda state: _replay_decode_graph(state, batch_size),
             record=lambda event: self._record_decode_graph_event(
@@ -473,20 +499,21 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         num_blocks: int,
         device: torch.device,
         max_context_len: int = 0,
-        attention_backend_name: str | None = "auto",
+        attention_preference: str | None = "auto",
         forward_fn: Callable[[TextDecodeGraphState], torch.Tensor],
         prepare_backend: Callable[[TextDecodeGraphState, Any], None] | None = None,
     ) -> None:
         """Pre-capture decode graph buckets ahead of serving."""
 
-        ctx = ForwardContext(attention_backend_name=attention_backend_name or "auto")
+        ctx = ForwardContext(attention_preference=attention_preference or "auto")
+
         def should_skip(batch_size: int) -> bool:
             return int(batch_size) <= 0 or int(batch_size) > int(num_blocks)
 
         def capture_bucket(batch_size: int, capture_ctx: ForwardContext) -> TextDecodeGraphState:
             batch_size = int(batch_size)
             input_ids, positions = _synthetic_decode_inputs(batch_size, device)
-            metadata = _synthetic_decode_metadata(
+            plan = _synthetic_decode_plan(
                 _synthetic_decode_cache(kv_pool, batch_size),
                 batch_size,
                 device,
@@ -498,7 +525,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
                 batch_size=batch_size,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=metadata,
+                attention_plan=plan,
                 ctx=capture_ctx,
                 forward_fn=forward_fn,
                 prepare_backend=prepare_backend,
@@ -507,7 +534,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         def copy_inputs(batch_size: int, state: TextDecodeGraphState) -> None:
             batch_size = int(batch_size)
             input_ids, positions = _synthetic_decode_inputs(batch_size, device)
-            metadata = _synthetic_decode_metadata(
+            plan = _synthetic_decode_plan(
                 state.cache,
                 batch_size,
                 device,
@@ -517,7 +544,7 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
                 state,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=metadata,
+                attention_plan=plan,
             )
 
         self._warmup_capture_buckets(
@@ -535,7 +562,9 @@ class DecodeCudaGraphRunner(_GraphRunnerBase):
         )
 
 
-def _synthetic_decode_inputs(batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _synthetic_decode_inputs(
+    batch_size: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
     shape = (int(batch_size), 1)
     return (
         torch.zeros(shape, dtype=torch.long, device=device),
@@ -559,26 +588,33 @@ def _replay_decode_graph(state: TextDecodeGraphState, batch_size: int) -> torch.
     return state.logits[:batch_size]
 
 
-def _synthetic_decode_metadata(
+def _synthetic_decode_plan(
     cache: BatchedPagedRequestCache,
     batch_size: int,
     device: torch.device,
     *,
     max_context_len: int = 0,
-) -> TextAttentionMetadata:
+) -> PagedDecodePlan:
     batch_size = int(batch_size)
+    block_table = cache.block_table(device=device)
     cache_seqlens = cache.cache_seqlens(device=device)
-    return TextAttentionMetadata(
-        cache=cache,
-        block_table=cache.block_table(device=device),
+    decode_page_ids, decode_page_offsets = decode_write_locations(
+        block_table,
+        cache_seqlens,
+        cache.pool.block_size,
+    )
+    return PagedDecodePlan(
+        residency_cache=cache,
+        block_table=block_table,
         cache_seqlens=cache_seqlens,
         cache_seqlens_cpu=tuple(0 for _ in range(batch_size)),
         kv_seqlens=cache_seqlens + 1,
         query_lens=torch.ones(batch_size, dtype=torch.int32, device=device),
         query_lens_cpu=tuple(1 for _ in range(batch_size)),
         kv_seqlens_cpu=tuple(1 for _ in range(batch_size)),
+        decode_page_ids=decode_page_ids,
+        decode_page_offsets=decode_page_offsets,
         max_context_len=int(max_context_len),
-        mode=ForwardMode.DECODE,
     )
 
 
@@ -598,7 +634,9 @@ def make_text_decode_graph_state(
     max_blocks_per_seq = max(1, int(num_blocks))
     context_len = max(0, int(max_context_len))
     if context_len > 0:
-        max_blocks_per_seq = max(1, min(max_blocks_per_seq, ceil_div(context_len, kv_pool.block_size)))
+        max_blocks_per_seq = max(
+            1, min(max_blocks_per_seq, ceil_div(context_len, kv_pool.block_size))
+        )
     if buffer_pool is not None:
         share = buffer_pool.share_graph_input_buffer
     else:
@@ -631,8 +669,8 @@ def make_text_decode_graph_state(
         cache_seqlens=cache_seqlens,
         graph=torch.cuda.CUDAGraph(),
         cache=graph_cache,
-        metadata=TextAttentionMetadata.for_decode_graph(
-            cache=graph_cache,
+        plan=PagedDecodePlan.for_decode_graph(
+            residency_cache=graph_cache,
             batch_size=batch_size,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
@@ -645,6 +683,7 @@ def make_text_decode_graph_state(
             decode_page_offsets=long_inputs[3 * batch_size : 4 * batch_size],
             max_context_len=max_context_len,
         ),
+        graph_binding=GraphBinding(),
         long_inputs=long_inputs,
     )
     return state
@@ -655,7 +694,7 @@ def copy_text_decode_graph_inputs(
     *,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
-    attention_metadata: TextAttentionMetadata,
+    attention_plan: PagedDecodePlan,
 ) -> None:
     """Refresh dynamic tensors feeding a captured paged one-token decode graph."""
 
@@ -667,9 +706,14 @@ def copy_text_decode_graph_inputs(
     if actual_batch < state.batch_size:
         state.input_ids[actual_batch:].zero_()
         state.positions[actual_batch:].zero_()
-    source_cache = getattr(attention_metadata, "cache", None)
-    if isinstance(state.cache, BatchedPagedRequestCache) and isinstance(source_cache, BatchedPagedRequestCache):
-        if len(source_cache.block_ids_by_row) != actual_batch or len(source_cache.base_lens) != actual_batch:
+    source_cache = attention_plan.residency_cache
+    if isinstance(state.cache, BatchedPagedRequestCache) and isinstance(
+        source_cache, BatchedPagedRequestCache
+    ):
+        if (
+            len(source_cache.block_ids_by_row) != actual_batch
+            or len(source_cache.base_lens) != actual_batch
+        ):
             raise invalid_descriptor("decode CUDA graph cache row batch mismatch")
         graph_block_rows = [list(row) for row in source_cache.block_ids_by_row]
         graph_base_lens = [int(length) for length in source_cache.base_lens]
@@ -677,7 +721,7 @@ def copy_text_decode_graph_inputs(
             graph_block_rows.extend([] for _ in range(state.batch_size - actual_batch))
             graph_base_lens.extend(0 for _ in range(state.batch_size - actual_batch))
         state.cache.reset_rows(graph_block_rows, graph_base_lens)
-    block_table = attention_metadata.block_table
+    block_table = attention_plan.block_table
     if block_table is None:
         raise invalid_descriptor("decode CUDA graph block table is missing")
     if block_table.shape[0] != actual_batch:
@@ -693,18 +737,18 @@ def copy_text_decode_graph_inputs(
             non_blocking=True,
         )
         if block_table.shape[1] < state.block_table.shape[1]:
-            state.block_table[:actual_batch, block_table.shape[1]:].zero_()
+            state.block_table[:actual_batch, block_table.shape[1] :].zero_()
         if actual_batch < state.batch_size:
             state.block_table[actual_batch:].zero_()
         state.block_table_rows = block_rows_key or ()
-    cache_seqlens = attention_metadata.cache_seqlens
+    cache_seqlens = attention_plan.cache_seqlens
     if cache_seqlens is None:
         raise invalid_descriptor("decode CUDA graph cache lengths are missing")
     if int(cache_seqlens.shape[0]) != actual_batch:
         raise invalid_descriptor("decode CUDA graph cache length batch mismatch")
     state.cache_seqlens[:actual_batch].copy_(cache_seqlens.to(dtype=torch.int32), non_blocking=True)
-    graph_kv_seqlens = state.metadata.kv_seqlens
-    source_kv_seqlens = attention_metadata.kv_seqlens
+    graph_kv_seqlens = state.plan.kv_seqlens
+    source_kv_seqlens = attention_plan.kv_seqlens
     if not isinstance(graph_kv_seqlens, torch.Tensor):
         raise invalid_descriptor("decode CUDA graph KV lengths are missing")
     if isinstance(source_kv_seqlens, torch.Tensor):
@@ -720,8 +764,8 @@ def copy_text_decode_graph_inputs(
     if actual_batch < state.batch_size:
         state.cache_seqlens[actual_batch:].zero_()
         graph_kv_seqlens[actual_batch:].fill_(1)
-    decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
-    decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
+    decode_page_ids = state.plan.decode_page_ids
+    decode_page_offsets = state.plan.decode_page_offsets
     if (
         isinstance(decode_page_ids, torch.Tensor)
         and isinstance(decode_page_offsets, torch.Tensor)
@@ -737,8 +781,8 @@ def copy_text_decode_graph_inputs(
         if actual_batch < state.batch_size:
             decode_page_ids[actual_batch:].zero_()
             decode_page_offsets[actual_batch:].zero_()
-    cache_cpu = tuple(int(x) for x in getattr(attention_metadata, "cache_seqlens_cpu", ())[:actual_batch])
-    kv_cpu = tuple(int(x) for x in getattr(attention_metadata, "kv_seqlens_cpu", ())[:actual_batch])
+    cache_cpu = tuple(int(x) for x in attention_plan.cache_seqlens_cpu[:actual_batch])
+    kv_cpu = tuple(int(x) for x in attention_plan.kv_seqlens_cpu[:actual_batch])
     if len(cache_cpu) != actual_batch:
         cache_cpu = ()
     if len(kv_cpu) != actual_batch:
@@ -747,13 +791,14 @@ def copy_text_decode_graph_inputs(
         cache_cpu = cache_cpu + tuple(0 for _ in range(state.batch_size - actual_batch))
     if kv_cpu and actual_batch < state.batch_size:
         kv_cpu = kv_cpu + tuple(1 for _ in range(state.batch_size - actual_batch))
-    # Captured graph closures keep a reference to this metadata object.  Keep
-    # its identity stable so backend graph-wrapper lookup and replay planning
-    # stay attached to the same object while the dynamic CPU summaries change.
-    state.metadata.cache_seqlens_cpu = cache_cpu
-    state.metadata.kv_seqlens_cpu = kv_cpu
-    state.metadata.max_context_len = int(
-        getattr(attention_metadata, "max_context_len", 0) or state.metadata.max_context_len
+    # Publish a fresh frozen plan reusing the state's static device tensors with
+    # the current per-replay CPU summaries. The graph reads the buffers (stable
+    # addresses); graph-wrapper identity stays on the separate graph binding.
+    state.plan = replace(
+        state.plan,
+        cache_seqlens_cpu=cache_cpu,
+        kv_seqlens_cpu=kv_cpu,
+        max_context_len=int(attention_plan.max_context_len or state.plan.max_context_len),
     )
 
 
@@ -774,8 +819,8 @@ def copy_text_decode_graph_host_inputs(
 
     cache_lens = rows["cache_seqlens_cpu"]
     kv_lens = rows["kv_seqlens_cpu"]
-    decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
-    decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
+    decode_page_ids = state.plan.decode_page_ids
+    decode_page_offsets = state.plan.decode_page_offsets
     page_ids: list[int] = []
     offsets: list[int] = []
     if isinstance(decode_page_ids, torch.Tensor) and isinstance(decode_page_offsets, torch.Tensor):
@@ -817,7 +862,9 @@ def copy_text_decode_graph_host_inputs(
             name="text_decode.positions",
             view_shape=(actual_batch, 1),
         )
-        if isinstance(decode_page_ids, torch.Tensor) and isinstance(decode_page_offsets, torch.Tensor):
+        if isinstance(decode_page_ids, torch.Tensor) and isinstance(
+            decode_page_offsets, torch.Tensor
+        ):
             _copy_host_ints_to_device(
                 page_ids,
                 decode_page_ids[:actual_batch],
@@ -835,7 +882,9 @@ def copy_text_decode_graph_host_inputs(
         if actual_batch < state.batch_size:
             state.input_ids[actual_batch:].zero_()
             state.positions[actual_batch:].zero_()
-            if isinstance(decode_page_ids, torch.Tensor) and isinstance(decode_page_offsets, torch.Tensor):
+            if isinstance(decode_page_ids, torch.Tensor) and isinstance(
+                decode_page_offsets, torch.Tensor
+            ):
                 decode_page_ids[actual_batch:].zero_()
                 decode_page_offsets[actual_batch:].zero_()
     if dense_replacements is None:
@@ -892,9 +941,12 @@ def copy_text_decode_graph_host_inputs(
     if actual_batch < state.batch_size:
         cache_cpu = cache_cpu + tuple(0 for _ in range(state.batch_size - actual_batch))
         kv_cpu = kv_cpu + tuple(1 for _ in range(state.batch_size - actual_batch))
-    state.metadata.cache_seqlens_cpu = cache_cpu
-    state.metadata.kv_seqlens_cpu = kv_cpu
-    state.metadata.max_context_len = int(host_inputs.max_context_len or state.metadata.max_context_len)
+    state.plan = replace(
+        state.plan,
+        cache_seqlens_cpu=cache_cpu,
+        kv_seqlens_cpu=kv_cpu,
+        max_context_len=int(host_inputs.max_context_len or state.plan.max_context_len),
+    )
 
 
 def _normalize_text_decode_graph_host_inputs(
@@ -1013,9 +1065,11 @@ def _long_inputs_match_state(state: TextDecodeGraphState) -> bool:
     batch = int(state.batch_size)
     if int(long_inputs.numel()) < 4 * batch or long_inputs.dtype != torch.long:
         return False
-    decode_page_ids = getattr(state.metadata, "decode_page_ids", None)
-    decode_page_offsets = getattr(state.metadata, "decode_page_offsets", None)
-    if not isinstance(decode_page_ids, torch.Tensor) or not isinstance(decode_page_offsets, torch.Tensor):
+    decode_page_ids = state.plan.decode_page_ids
+    decode_page_offsets = state.plan.decode_page_offsets
+    if not isinstance(decode_page_ids, torch.Tensor) or not isinstance(
+        decode_page_offsets, torch.Tensor
+    ):
         return False
     return (
         state.input_ids.data_ptr() == long_inputs[:batch].data_ptr()
@@ -1112,7 +1166,7 @@ def _host_decode_write_locations(
     return page_ids, offsets
 
 
-def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> Any | None:
+def resolve_paged_decode_graph_backend(attention_preference: str | None) -> Any | None:
     """Return the attention backend that can host a *captured* paged-decode graph.
 
     A paged-decode graph is only correct when its backend refills the page-index /
@@ -1129,7 +1183,7 @@ def resolve_paged_decode_graph_backend(attention_backend_name: str | None) -> An
         normalize_attention_backend_name,
     )
 
-    normalized = normalize_attention_backend_name(attention_backend_name)
+    normalized = normalize_attention_backend_name(attention_preference)
     if normalized == "auto" and has_attention_backend("trtllm_mha"):
         backend = get_attention_backend("trtllm_mha")
         if bool(getattr(backend.capabilities(), "available", True)):
@@ -1171,7 +1225,7 @@ def resolve_paged_decode_graph_prepare(
     owner: Any,
     kv_pool: PagedKVPool,
     num_blocks: int,
-    attention_backend_name: str | None,
+    attention_preference: str | None,
     before: Callable[[TextDecodeGraphState, Any], None] | None = None,
 ) -> Callable[[TextDecodeGraphState, Any], None] | None:
     """Build the per-replay decode-graph prepare hook, or ``None`` to stay eager.
@@ -1189,7 +1243,7 @@ def resolve_paged_decode_graph_prepare(
     geometry_hook = getattr(owner, "text_decode_graph_query_geometry", None)
     if not callable(geometry_hook):
         return None
-    backend = resolve_paged_decode_graph_backend(attention_backend_name)
+    backend = resolve_paged_decode_graph_backend(attention_preference)
     if backend is None:
         return None
     caps = backend.capabilities()
@@ -1236,14 +1290,15 @@ def prepare_paged_decode_graph_backend(
 
     Called from the runner's ``prepare_backend`` hook (outside the captured
     region) after ``copy_text_decode_graph_inputs`` has refreshed ``state``'s
-    static block table + cache lengths. It re-plans the graph decode wrapper bound
-    to ``state.metadata`` from those tensors so the captured ``wrapper.run`` reads
+    static block table + cache lengths. It re-plans the graph decode wrapper from
+    ``state.plan`` so the captured ``wrapper.run`` reads
     the current pages/lengths — the mechanism that makes one capture correct across
     growth and across requests.
     """
 
     backend.prepare_paged_decode_cuda_graph(
-        state.metadata,
+        state.graph_binding,
+        state.plan,
         batch_size=int(state.batch_size),
         max_indices=int(max_indices),
         num_q_heads=int(num_q_heads),

@@ -38,7 +38,8 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
-from ....contracts.forward_context import TextAttentionMetadata, get_forward_context
+from ....contracts.attention_plan import PagedVarlenPlan
+from ....contracts.forward_context import get_forward_context
 from ....contracts.forward_mode import ForwardMode, mode_for_op
 from ....foundation.errors import invalid_descriptor
 from ....foundation.runtime_config import get_worker_config
@@ -89,12 +90,12 @@ class _InterleavedDecodeGraphPast:
 
     Presents the paged-update protocol the native decoder attention expects, but
     every layer's ``request_cache_for_update`` returns the *same*
-    ``BatchedPagedRequestCache`` the captured graph's ``TextAttentionMetadata``
-    already points at. RadixAttention's identity check
-    (``ctx.attention_metadata.cache is kv_cache``) then routes attention through
-    the static graph tensors. The finish/cancel hooks are no-ops: the graph cache
-    is a transient write target, and persistent request lengths are advanced by
-    the adapter only after a successful replay.
+    ``BatchedPagedRequestCache`` the captured graph's paged decode plan names as
+    its residency cache. RadixAttention's identity check
+    (``ctx.attention_plan.residency_cache is kv_cache``) then routes attention
+    through the static graph tensors. The finish/cancel hooks are no-ops: the
+    graph cache is a transient write target, and persistent request lengths are
+    advanced by the adapter only after a successful replay.
     """
 
     supports_batched_paged = True
@@ -223,7 +224,7 @@ class InterleavedTextPrefillGraphRunner:
             batch_size=len(rows),
             input_ids=inputs["input_ids"],
             positions=inputs["positions"],
-            attention_metadata=inputs["metadata"],
+            attention_plan=inputs["attention_plan"],
             last_token_indices=inputs["last_token_indices"],
             raw_num_tokens=sum(row.raw_len for row in rows),
             ctx=get_forward_context(),
@@ -264,7 +265,7 @@ class InterleavedTextPrefillGraphRunner:
         prepare_backend = resolve_paged_prefill_graph_prepare(
             owner=owner,
             kv_pool=pool,
-            attention_backend_name=getattr(get_forward_context(), "attention_backend_name", None),
+            attention_preference=getattr(get_forward_context(), "attention_preference", None),
         )
         if prepare_backend is None:
             return None
@@ -357,8 +358,8 @@ class InterleavedTextPrefillGraphRunner:
             "input_ids": input_ids,
             "positions": positions,
             "last_token_indices": torch.tensor(offsets, dtype=torch.long, device=device),
-            "metadata": TextAttentionMetadata(
-                cache=graph_cache,
+            "attention_plan": PagedVarlenPlan(
+                residency_cache=graph_cache,
                 block_table=graph_cache.block_table(device=device),
                 cache_seqlens=cache_seqlens,
                 cache_seqlens_cpu=cache_seqlens_cpu,
@@ -570,8 +571,8 @@ class InterleavedTextDecodeGraphRunner:
             owner=owner,
             kv_pool=pool,
             num_blocks=int(pool.num_blocks),
-            attention_backend_name=getattr(
-                get_forward_context(), "attention_backend_name", None
+            attention_preference=getattr(
+                get_forward_context(), "attention_preference", None
             ),
         )
         if prepare_backend is None:

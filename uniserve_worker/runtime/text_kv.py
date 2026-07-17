@@ -8,7 +8,8 @@ from typing import Any, cast
 import torch
 
 from ..backends.paged_kv_math import decode_write_locations
-from ..contracts.forward_context import AttentionCache, TextAttentionMetadata
+from ..contracts.attention_plan import AttentionPlanBase, PagedDecodePlan, PagedVarlenPlan
+from ..contracts.forward_context import AttentionCache
 from ..contracts.forward_mode import ForwardMode
 from .kv_pool import PagedKVPool
 from .paged_text_cache import BatchedPagedRequestCache
@@ -92,9 +93,41 @@ class TextAttentionPlan:
         plan.cu_seqlens_k = torch.cat([zero, torch.cumsum(kv_seqlens, dim=0).to(torch.int32)])
         return plan
 
-    def to_metadata(self) -> TextAttentionMetadata:
-        return TextAttentionMetadata(
-            cache=cast(AttentionCache, self.cache),
+    def to_plan(self) -> AttentionPlanBase:
+        residency = cast(AttentionCache, self.cache)
+        if self.mode == ForwardMode.DECODE:
+            if (
+                self.block_table is None
+                or self.cache_seqlens is None
+                or self.kv_seqlens is None
+                or self.decode_page_ids is None
+                or self.decode_page_offsets is None
+            ):
+                raise ValueError("decode plan is missing required residency tensors")
+            query_lens = self.query_lens
+            if query_lens is None:
+                query_lens = torch.ones(
+                    len(self.query_lens_cpu),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            return PagedDecodePlan(
+                residency_cache=residency,
+                block_table=self.block_table,
+                cache_seqlens=self.cache_seqlens,
+                cache_seqlens_cpu=self.cache_seqlens_cpu,
+                kv_seqlens=self.kv_seqlens,
+                query_lens=query_lens,
+                query_lens_cpu=self.query_lens_cpu or tuple(1 for _ in self.cache_seqlens_cpu),
+                kv_seqlens_cpu=self.kv_seqlens_cpu,
+                decode_page_ids=self.decode_page_ids,
+                decode_page_offsets=self.decode_page_offsets,
+                max_context_len=int(self.max_context_len),
+            )
+        if self.block_table is None or self.cu_seqlens_q is None or self.cu_seqlens_k is None:
+            raise ValueError("varlen plan is missing required residency tensors")
+        return PagedVarlenPlan(
+            residency_cache=residency,
             block_table=self.block_table,
             cache_seqlens=self.cache_seqlens,
             cache_seqlens_cpu=self.cache_seqlens_cpu,
@@ -104,20 +137,18 @@ class TextAttentionPlan:
             kv_seqlens_cpu=self.kv_seqlens_cpu,
             cu_seqlens_q=self.cu_seqlens_q,
             cu_seqlens_k=self.cu_seqlens_k,
-            decode_page_ids=self.decode_page_ids,
-            decode_page_offsets=self.decode_page_offsets,
             max_seqlen_q=max(self.query_lens_cpu, default=0),
             max_seqlen_k=max(self.kv_seqlens_cpu, default=0),
             max_context_len=int(self.max_context_len),
             mode=self.mode,
         )
 
-    def attach_to(self, batch: Any) -> TextAttentionMetadata:
-        metadata = self.to_metadata()
-        batch.attn_metadata = metadata
-        batch.block_table = metadata.block_table
-        batch.cache_seqlens = metadata.cache_seqlens
-        return metadata
+    def attach_to(self, batch: Any) -> AttentionPlanBase:
+        plan = self.to_plan()
+        batch.attn_plan = plan
+        batch.block_table = plan.block_table
+        batch.cache_seqlens = plan.cache_seqlens
+        return plan
 
 
 class TextKvResidency:

@@ -102,11 +102,11 @@ class TRTLLMMHAAttentionBackend:
             k,
             v,
         )
-        metadata = getattr(get_forward_context(), "attention_metadata", None)
+        plan = get_forward_context().attention_plan
         effective_seqlens = _decode_effective_seqlens(
             inputs.cache_seqlens,
             current_tokens,
-            metadata,
+            plan,
         )
         page_size = int(k_cache.shape[1])
         max_seq_len = _metadata_context_len(max(1, int(inputs.block_table.shape[1]) * page_size))
@@ -228,8 +228,8 @@ class TRTLLMMHAAttentionBackend:
             raise ValueError("current K/V batch size must match q batch size")
         if k_bhd.shape[1:] != k_cache.shape[2:]:
             raise ValueError("current K/V head geometry does not match paged cache")
-        metadata = getattr(get_forward_context(), "attention_metadata", None)
-        _write_decode_token(k_cache, v_cache, block_table, cache_seqlens, k_bhd, v_bhd, metadata)
+        plan = get_forward_context().attention_plan
+        _write_decode_token(k_cache, v_cache, block_table, cache_seqlens, k_bhd, v_bhd, plan)
         return 1
 
     def _workspace(self, device: torch.device | str) -> torch.Tensor:
@@ -267,8 +267,8 @@ def _hnd_kv_cache(k_cache: torch.Tensor, v_cache: torch.Tensor) -> tuple[torch.T
 
 
 def _metadata_context_len(default: int) -> int:
-    metadata = getattr(get_forward_context(), "attention_metadata", None)
-    value = getattr(metadata, "max_context_len", 0)
+    plan = get_forward_context().attention_plan
+    value = getattr(plan, "max_context_len", 0)
     try:
         parsed = int(value)
     except (TypeError, ValueError):

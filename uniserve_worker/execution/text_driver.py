@@ -551,7 +551,7 @@ class TextDriver:
         ctx = get_forward_context()
         device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
         batched = self.gate is not None and self.gate.batched_capable(
-            text, attention_backend_name=ctx.attention_backend_name
+            text, attention_preference=ctx.attention_preference
         )
         if batched:
             return self._forward_batched(
@@ -753,7 +753,7 @@ class TextDriver:
         start = component_timer_start(stats)
         with profile_range("uniserve.text.model_forward"):
             with use_forward_context(
-                replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=kv_pool)
+                replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)
             ):
                 logits = self._run_model_forward(
                     model,
@@ -803,7 +803,7 @@ class TextDriver:
                 input_ids_override=relay,
             )
             with use_forward_context(
-                replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=kv_pool)
+                replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)
             ):
                 logits = model.forward(fb.input_ids, fb.positions, fb)
             rows.append(logits.reshape(-1, logits.shape[-1])[-1])
@@ -875,7 +875,7 @@ class TextDriver:
         if active_graph_runner is None:
             return None
         return active_graph_runner.padded_num_tokens(
-            text, attention_backend_name=ctx.attention_backend_name
+            text, attention_preference=ctx.attention_preference
         )
 
     def _advance_kv_lengths(self, text: "TextBatch", request_states: RequestStateTable) -> None:
@@ -1032,7 +1032,7 @@ class TextDriver:
             )
             batch.return_all_logits = bool(op.get("return_all_logits"))
             with use_forward_context(
-                replace(ctx, attention_metadata=batch.attn_metadata, kv_pool=self.kv_pool)
+                replace(ctx, attention_plan=batch.attn_plan, kv_pool=self.kv_pool)
             ):
                 logits = model.forward(batch.input_ids, batch.positions, batch)
         if not isinstance(logits, torch.Tensor) or logits.ndim == 0:

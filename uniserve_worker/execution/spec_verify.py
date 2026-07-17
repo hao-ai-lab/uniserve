@@ -90,7 +90,7 @@ def verify_speculative_tokens(
         input_ids = fb.input_ids.reshape(len(rows), length)
         positions = fb.positions.reshape(len(rows), length)
         with use_forward_context(
-            replace(ctx, attention_metadata=fb.attn_metadata, kv_pool=kv_pool)
+            replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)
         ):
             logits = model.forward(input_ids, positions, fb)
         for row, (original_idx, op, spec) in enumerate(rows):

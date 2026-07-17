@@ -166,7 +166,7 @@ def test_packed_mixed_graph_backend_resolver_skips_non_graph_auto_provider(monke
     owner, embeds, _indicators, stream, kv_view = _resolver_inputs()
 
     backend = PackedMixedGraphRunner()._resolve_graph_backend(
-        ForwardContext(attention_backend_name="auto"),
+        ForwardContext(attention_preference="auto"),
         owner,
         embeds,
         stream,
@@ -191,7 +191,7 @@ def test_packed_mixed_graph_backend_resolver_respects_explicit_non_graph_provide
     owner, embeds, _indicators, stream, kv_view = _resolver_inputs()
 
     backend = PackedMixedGraphRunner()._resolve_graph_backend(
-        ForwardContext(attention_backend_name="fa4_cute"),
+        ForwardContext(attention_preference="fa4_cute"),
         owner,
         embeds,
         stream,
@@ -219,7 +219,7 @@ def test_packed_mixed_graph_backend_resolver_accepts_causal_visible_end_graph(mo
     owner, embeds, _indicators, _stream, kv_view = _resolver_inputs()
 
     backend = PackedMixedGraphRunner()._resolve_graph_backend(
-        ForwardContext(attention_backend_name="auto"),
+        ForwardContext(attention_preference="auto"),
         owner,
         embeds,
         _prefill_stream(prefix_len=0),

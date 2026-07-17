@@ -38,6 +38,7 @@ import torch
 
 import uniserve_worker.ops as ops
 
+from ....contracts.attention_plan import GraphBinding, PagedVarlenPlan
 from ....contracts.forward_context import get_forward_context, use_forward_context
 from ....contracts.forward_mode import ForwardMode
 from ....nn.attention import RadixAttention
@@ -64,28 +65,6 @@ _RUNNER_ATTR = "_denoise_step_graph_runner"
 _MAX_GRAPH_ROWS = 6
 
 
-class _DenoiseGraphMetadata:
-    """Per-graph identity sentinel published as ``ctx.attention_metadata``.
-
-    It intentionally omits ``cache`` and ``mode`` so attention stays on the
-    transient paged-varlen path. Stable plan tensors are refreshed before replay,
-    while object identity routes FlashInfer to the graph-scoped wrapper.
-    """
-
-    __slots__ = ("block_table", "cu_seqlens_k", "cu_seqlens_q", "__weakref__")
-
-    def __init__(
-        self,
-        *,
-        block_table: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-    ) -> None:
-        self.block_table = block_table
-        self.cu_seqlens_q = cu_seqlens_q
-        self.cu_seqlens_k = cu_seqlens_k
-
-
 class _GraphBackendUnplanned(RuntimeError):
     """Capture completed but the exclusive wrapper was never planned."""
 
@@ -102,7 +81,8 @@ class DenoiseStepGraphState:
     indexes: torch.Tensor               # [3, rows, tokens] static input
     cache: BatchedPagedTextCache        # batched view over the rows' caches
     request_cache: Any                  # stable graph-owned paged side tables
-    metadata: _DenoiseGraphMetadata     # wrapper-routing sentinel (kept alive here)
+    plan: PagedVarlenPlan               # stable transient paged-varlen plan
+    graph_binding: GraphBinding         # wrapper-routing identity (kept alive here)
     backend: Any
     num_q_heads: int
     num_kv_heads: int
@@ -379,7 +359,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             (_query_lens, block_table, _seqlens, cu_q, cu_k, max_q, max_k) = transient
             k_cache, v_cache = pool.layer_cache(0)
             q_probe = embeds.new_empty((1, 1, head_dim))
-            preferred = getattr(ctx, "attention_backend_name", None) or "torch_sdpa"
+            preferred = getattr(ctx, "attention_preference", None) or "torch_sdpa"
             override = RadixAttention._attention_override(ctx, preferred)
             req = ops.AttentionReq(
                 q=q_probe,
@@ -454,12 +434,18 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         transient = RadixAttention._transient_varlen_metadata(request_cache, q_shape_probe)
         if transient is None:
             raise RuntimeError("denoise graph could not build paged side-table inputs")
-        (_query_lens, block_table, _cache_lens, cu_q, cu_k, _max_q, _max_k) = transient
-        metadata = _DenoiseGraphMetadata(
+        (_query_lens, block_table, _cache_lens, cu_q, cu_k, max_q, max_k) = transient
+        # The directly-passed denoise cache remains authoritative. An unset
+        # residency cache keeps RadixAttention on its transient paged-varlen path.
+        plan = PagedVarlenPlan(
             block_table=block_table,
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
+            max_seqlen_q=int(max_q),
+            max_seqlen_k=int(max_k),
+            residency_cache=None,
         )
+        graph_binding = GraphBinding()
         geometry = getattr(owner, "text_decode_graph_query_geometry", None)
         if callable(geometry):
             num_q_heads, scale, _q_dtype = geometry()
@@ -480,7 +466,8 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             indexes=torch.stack([row.indexes for row in rows], dim=1).contiguous(),
             cache=cache,
             request_cache=request_cache,
-            metadata=metadata,
+            plan=plan,
+            graph_binding=graph_binding,
             backend=backend,
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(pool.n_kv),
@@ -493,13 +480,17 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
         release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
         if callable(bind) and callable(release):
-            bind(metadata, device=device)
-            state.release_backend = lambda: release(metadata)
+            bind(graph_binding, plan, device=device)
+            state.release_backend = lambda: release(graph_binding)
 
-        # Capture under a context whose ``attention_metadata`` is this graph's
-        # sentinel (routes FlashInfer to the exclusive wrapper) and with stats
-        # detached, mirroring the shared decode/prefill graph capture discipline.
-        graph_ctx = replace(ctx, attention_metadata=metadata, stats=None)
+        # Capture with this graph's stable plan and wrapper-routing binding while
+        # stats are detached, mirroring the shared decode/prefill graph discipline.
+        graph_ctx = replace(
+            ctx,
+            attention_plan=plan,
+            graph_binding=graph_binding,
+            stats=None,
+        )
 
         def run() -> tuple[torch.Tensor, torch.Tensor | None]:
             # Capture with the *requested* ``return_hidden`` (it is part of the
@@ -534,7 +525,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
                 copy_inputs=lambda capture_state: self._copy_inputs(capture_state, rows),
             )
             planned = getattr(backend, "paged_prefill_graph_wrapper_planned", None)
-            if callable(planned) and not planned(metadata):
+            if callable(planned) and not planned(graph_binding):
                 raise _GraphBackendUnplanned(
                     "captured denoise forward did not plan the graph-scoped prefill "
                     "wrapper; the dispatcher routed attention elsewhere"
@@ -567,7 +558,8 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         if not callable(prepare):
             return
         prepare(
-            state.metadata,
+            state.graph_binding,
+            state.plan,
             num_q_heads=state.num_q_heads,
             num_kv_heads=state.num_kv_heads,
             head_dim=state.head_dim,

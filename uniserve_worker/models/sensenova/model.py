@@ -1000,21 +1000,21 @@ class _SenseNovaAttention(nn.Module):
         if not callable(request_cache) or not callable(finish):
             return None
         n_tokens = int(q.shape[2])
-        metadata = getattr(get_forward_context(), "attention_metadata", None)
-        metadata_cache = getattr(metadata, "cache", None)
-        metadata_rows = len(tuple(getattr(metadata_cache, "base_lens", ()) or ()))
+        plan = get_forward_context().attention_plan
+        residency_cache = getattr(plan, "residency_cache", None)
+        plan_rows = len(tuple(getattr(residency_cache, "base_lens", ()) or ()))
         packed_varlen = (
             causal
-            and metadata_cache is not None
-            and getattr(past_key_values, "cache", None) is metadata_cache
-            and metadata_rows > 1
-            and int(q.shape[0]) != metadata_rows
+            and residency_cache is not None
+            and getattr(past_key_values, "cache", None) is residency_cache
+            and plan_rows > 1
+            and int(q.shape[0]) != plan_rows
         )
         if packed_varlen or not self.attn.can_run_paged_attention(q, None):
             if (
                 causal
-                and metadata_cache is not None
-                and getattr(past_key_values, "cache", None) is metadata_cache
+                and residency_cache is not None
+                and getattr(past_key_values, "cache", None) is residency_cache
             ):
                 cache = request_cache(self.layer_idx, n_tokens)
                 try:

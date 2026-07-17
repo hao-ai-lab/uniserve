@@ -179,7 +179,7 @@ class ModelRunner:
         self.tensor_store = deps.tensor_store
         self.simulation = bool(deps.simulation)
         self.batch_policy = deps.batch_policy or self._model_batch_policy()
-        self.attention_backend, self.attention_backend_name = self._resolve_attention_backend(
+        self.attention_backend, self.attention_preference = self._resolve_attention_backend(
             deps.attention_backend
         )
         self.denoise_driver = deps.denoise_driver or DenoiseDriver()
@@ -379,10 +379,10 @@ class ModelRunner:
     @staticmethod
     def _resolve_attention_backend(attention_backend: Any | None) -> tuple[Any | None, str | None]:
         if isinstance(attention_backend, str) or attention_backend is None:
-            attention_backend_name = normalize_attention_backend_name(attention_backend or "auto")
-            if attention_backend_name != "auto":
-                get_attention_backend(attention_backend_name)
-            return None, attention_backend_name
+            attention_preference = normalize_attention_backend_name(attention_backend or "auto")
+            if attention_preference != "auto":
+                get_attention_backend(attention_preference)
+            return None, attention_preference
         return attention_backend, getattr(attention_backend, "name", None)
 
     @property
@@ -432,7 +432,7 @@ class ModelRunner:
                 num_blocks=int(residency.kv.num_blocks),
                 block_size=int(residency.kv.block_size),
                 device=device,
-                attention_backend_name=self.attention_backend_name,
+                attention_preference=self.attention_preference,
                 max_context_len=max_context_len,
             )
             try:

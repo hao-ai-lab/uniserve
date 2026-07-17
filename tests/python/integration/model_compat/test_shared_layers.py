@@ -336,28 +336,32 @@ def test_quantization_config_rejects_unsupported_checkpoint_method():
 
 def test_flashinfer_decode_write_uses_precomputed_locations():
     from uniserve_worker.backends.attention.flashinfer import _write_decode_token
+    from uniserve_worker.contracts.attention_plan import PagedDecodePlan
     from uniserve_worker.contracts.forward_context import (
         ForwardContext,
-        TextAttentionMetadata,
         use_forward_context,
     )
 
     k_cache = torch.zeros((4, 4, 1, 1), dtype=torch.float32)
     v_cache = torch.zeros_like(k_cache)
-    metadata = TextAttentionMetadata(
-        cache=None,
-        block_table=None,
-        cache_seqlens=None,
+    block_table = torch.zeros((2, 1), dtype=torch.int32)
+    cache_seqlens = torch.zeros(2, dtype=torch.int32)
+    plan = PagedDecodePlan(
+        residency_cache=object(),
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        kv_seqlens=torch.ones(2, dtype=torch.int32),
+        query_lens=torch.ones(2, dtype=torch.int32),
         decode_page_ids=torch.tensor([2, 3], dtype=torch.long),
         decode_page_offsets=torch.tensor([1, 2], dtype=torch.long),
     )
 
-    with use_forward_context(ForwardContext(attention_metadata=metadata)):
+    with use_forward_context(ForwardContext(attention_plan=plan)):
         _write_decode_token(
             k_cache,
             v_cache,
-            block_table=torch.zeros((2, 1), dtype=torch.int32),
-            cache_seqlens=torch.zeros(2, dtype=torch.int32),
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
             k_current=torch.tensor([[[11.0]], [[12.0]]]),
             v_current=torch.tensor([[[21.0]], [[22.0]]]),
         )
@@ -1327,7 +1331,7 @@ def test_uni_attention_records_forward_context_stats():
     attn = RadixAttention(num_heads=2, num_kv_heads=2, head_dim=4)
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend_name="torch_sdpa", stats=stats)):
+    with use_forward_context(ForwardContext(attention_preference="torch_sdpa", stats=stats)):
         out = attn(q, k, v, causal=False)
 
     assert out.shape == q.shape
@@ -1356,10 +1360,10 @@ def test_ops_dispatcher_records_generic_operator_stats():
     assert wire["operator_counts"] == {"rms_norm:eager": 1}
 
 
-def test_uni_attention_reuses_context_attention_metadata_for_paged_update(monkeypatch):
+def test_uni_attention_reuses_context_attention_plan_for_paged_update(monkeypatch):
+    from uniserve_worker.contracts.attention_plan import PagedDecodePlan
     from uniserve_worker.contracts.forward_context import (
         ForwardContext,
-        TextAttentionMetadata,
         use_forward_context,
     )
 
@@ -1393,11 +1397,11 @@ def test_uni_attention_reuses_context_attention_metadata_for_paged_update(monkey
 
         def block_table(self, *, device=None):  # pragma: no cover - must not be called
             del device
-            raise AssertionError("block_table should be reused from ForwardContext metadata")
+            raise AssertionError("block_table should be reused from ForwardContext plan")
 
         def cache_seqlens(self, *, device=None):  # pragma: no cover - must not be called
             del device
-            raise AssertionError("cache_seqlens should be reused from ForwardContext metadata")
+            raise AssertionError("cache_seqlens should be reused from ForwardContext plan")
 
     attn = RadixAttention(2, 2, 4, layer_id=0)
     backend = FakePagedBackend()
@@ -1407,14 +1411,19 @@ def test_uni_attention_reuses_context_attention_metadata_for_paged_update(monkey
     cache = FakeCache()
     block_table = torch.tensor([[0]], dtype=torch.int32)
     cache_seqlens = torch.tensor([0], dtype=torch.int32)
-    metadata = TextAttentionMetadata(
-        cache=cache,
+    plan = PagedDecodePlan(
+        residency_cache=cache,
         block_table=block_table,
         cache_seqlens=cache_seqlens,
+        kv_seqlens=torch.tensor([1], dtype=torch.int32),
+        query_lens=torch.tensor([1], dtype=torch.int32),
+        query_lens_cpu=(1,),
+        decode_page_ids=torch.tensor([0], dtype=torch.long),
+        decode_page_offsets=torch.tensor([0], dtype=torch.long),
     )
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend=backend, attention_metadata=metadata, stats=stats)):
+    with use_forward_context(ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)):
         out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=True)
 
     assert out.shape == q.shape
@@ -1426,9 +1435,9 @@ def test_uni_attention_reuses_context_attention_metadata_for_paged_update(monkey
 
 
 def test_uni_attention_empty_batched_paged_prefill_appends_current_kv(monkeypatch):
+    from uniserve_worker.contracts.attention_plan import PagedVarlenPlan
     from uniserve_worker.contracts.forward_context import (
         ForwardContext,
-        TextAttentionMetadata,
         use_forward_context,
     )
 
@@ -1468,15 +1477,20 @@ def test_uni_attention_empty_batched_paged_prefill_appends_current_kv(monkeypatc
     k = torch.randn(2, 2, 3, 4)
     v = torch.randn(2, 2, 3, 4)
     cache = FakeCache()
-    metadata = TextAttentionMetadata(
-        cache=cache,
+    plan = PagedVarlenPlan(
+        residency_cache=cache,
         block_table=torch.tensor([[0], [1]], dtype=torch.int32),
         cache_seqlens=torch.tensor([0, 0], dtype=torch.int32),
-        mode="extend",
+        query_lens=torch.tensor([3, 3], dtype=torch.int32),
+        query_lens_cpu=(3, 3),
+        cu_seqlens_q=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 3, 6], dtype=torch.int32),
+        max_seqlen_q=3,
+        max_seqlen_k=3,
     )
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend=backend, attention_metadata=metadata, stats=stats)):
+    with use_forward_context(ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)):
         out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=True)
 
     assert out.shape == q.shape
@@ -1490,10 +1504,10 @@ def test_uni_attention_empty_batched_paged_prefill_appends_current_kv(monkeypatc
     assert stats.attention_backend_counts == {"fake_plain": 1}
 
 
-def test_uni_attention_runs_paged_varlen_prefill_with_context_metadata(monkeypatch):
+def test_uni_attention_runs_paged_varlen_prefill_with_context_plan(monkeypatch):
+    from uniserve_worker.contracts.attention_plan import PagedVarlenPlan
     from uniserve_worker.contracts.forward_context import (
         ForwardContext,
-        TextAttentionMetadata,
         use_forward_context,
     )
 
@@ -1543,8 +1557,8 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_metadata(monkeypat
     v = torch.randn(3, 2, 4)
     cache = FakeCache()
     block_table = torch.tensor([[0, 1], [2, 0]], dtype=torch.int32)
-    metadata = TextAttentionMetadata(
-        cache=cache,
+    plan = PagedVarlenPlan(
+        residency_cache=cache,
         block_table=block_table,
         cache_seqlens=torch.tensor([2, 1], dtype=torch.int32),
         query_lens=torch.tensor([2, 1], dtype=torch.int32),
@@ -1554,11 +1568,10 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_metadata(monkeypat
         cu_seqlens_k=torch.tensor([0, 4, 6], dtype=torch.int32),
         max_seqlen_q=2,
         max_seqlen_k=4,
-        mode="extend",
     )
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend=backend, attention_metadata=metadata, stats=stats)):
+    with use_forward_context(ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)):
         out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=True)
 
     assert out.shape == q.shape
@@ -1566,8 +1579,8 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_metadata(monkeypat
     assert backend.calls == 1
     assert backend.args == (q, cache.pool.k_cache, cache.pool.v_cache)
     assert backend.kwargs["block_table"] is block_table
-    assert backend.kwargs["cu_seqlens_q"] is metadata.cu_seqlens_q
-    assert backend.kwargs["cu_seqlens_k"] is metadata.cu_seqlens_k
+    assert backend.kwargs["cu_seqlens_q"] is plan.cu_seqlens_q
+    assert backend.kwargs["cu_seqlens_k"] is plan.cu_seqlens_k
     assert backend.kwargs["max_seqlen_q"] == 2
     assert backend.kwargs["max_seqlen_k"] == 4
     assert stats.attention_backend_counts == {"fake_varlen_paged_varlen": 1}

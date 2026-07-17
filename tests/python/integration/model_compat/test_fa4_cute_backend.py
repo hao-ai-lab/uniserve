@@ -49,7 +49,7 @@ def test_fa4_cute_prefix_bounds_use_packed_gqa_tile_space() -> None:
     torch.testing.assert_close(bounds, expected)
 
 
-def test_fa4_cute_forward_paged_uses_metadata_context_len_without_scalar_sync(monkeypatch) -> None:
+def test_fa4_cute_forward_paged_uses_plan_context_len_without_scalar_sync(monkeypatch) -> None:
     from uniserve_worker.backends.attention import fa4_cute
 
     backend = fa4_cute.Fa4CuteAttentionBackend()
@@ -74,9 +74,9 @@ def test_fa4_cute_forward_paged_uses_metadata_context_len_without_scalar_sync(mo
     v_cache = torch.zeros_like(k_cache)
     block_table = torch.tensor([[0, 1]], dtype=torch.int32)
     cache_seqlens = torch.tensor([3], dtype=torch.int32)
-    metadata = SimpleNamespace(max_context_len=128)
+    plan = SimpleNamespace(max_context_len=128)
 
-    with use_forward_context(ForwardContext(attention_metadata=metadata)):
+    with use_forward_context(ForwardContext(attention_plan=plan)):
         out = backend.forward_paged(
             q,
             k_cache,

@@ -203,7 +203,7 @@ def _triton_decode_indices_enabled(device: torch.device | str) -> bool:
     return triton_fused_layers_enabled() and triton_device_supported(device)
 
 
-_USE_FORWARD_CONTEXT_METADATA = object()
+_USE_FORWARD_CONTEXT_PLAN = object()
 
 
 def _write_decode_token(
@@ -213,7 +213,7 @@ def _write_decode_token(
     cache_seqlens: torch.Tensor,
     k_current: torch.Tensor,
     v_current: torch.Tensor,
-    metadata: Any = _USE_FORWARD_CONTEXT_METADATA,
+    plan: Any = _USE_FORWARD_CONTEXT_PLAN,
 ) -> None:
     page_ids, offsets = _decode_write_locations_from_context(
         block_table,
@@ -221,7 +221,7 @@ def _write_decode_token(
         int(k_cache.shape[1]),
         batch_size=int(k_current.shape[0]),
         device=k_cache.device,
-        metadata=metadata,
+        plan=plan,
     )
     paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current, cast=True)
 
@@ -229,14 +229,14 @@ def _write_decode_token(
 def _decode_effective_seqlens(
     cache_seqlens: torch.Tensor,
     current_tokens: int,
-    metadata: Any,
+    plan: Any,
 ) -> torch.Tensor:
     """Return once-per-step post-append lengths for paged decode."""
 
     current_tokens = int(current_tokens)
     if current_tokens == 0:
         return cache_seqlens
-    shared = getattr(metadata, "kv_seqlens", None)
+    shared = getattr(plan, "kv_seqlens", None)
     if (
         current_tokens == 1
         and isinstance(shared, torch.Tensor)
@@ -256,15 +256,15 @@ def _decode_write_locations_from_context(
     *,
     batch_size: int,
     device: torch.device,
-    metadata: Any = _USE_FORWARD_CONTEXT_METADATA,
+    plan: Any = _USE_FORWARD_CONTEXT_PLAN,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Callers on the forward path pass ``metadata`` explicitly; the sentinel
+    # Callers on the forward path pass ``plan`` explicitly; the sentinel
     # default falls back to the active forward context so direct callers keep
     # the original global-reach behavior.
-    if metadata is _USE_FORWARD_CONTEXT_METADATA:
-        metadata = getattr(get_forward_context(), "attention_metadata", None)
-    page_ids = getattr(metadata, "decode_page_ids", None)
-    offsets = getattr(metadata, "decode_page_offsets", None)
+    if plan is _USE_FORWARD_CONTEXT_PLAN:
+        plan = getattr(get_forward_context(), "attention_plan", None)
+    page_ids = getattr(plan, "decode_page_ids", None)
+    offsets = getattr(plan, "decode_page_offsets", None)
     if (
         isinstance(page_ids, torch.Tensor)
         and isinstance(offsets, torch.Tensor)

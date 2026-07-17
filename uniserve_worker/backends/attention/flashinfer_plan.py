@@ -74,7 +74,7 @@ class _FastDecodePlanHostTensors:
 class _PlanCache:
     """Per-domain wrapper plan-key cache (decode or prefill).
 
-    Owns the ``wrapper_key -> (plan_key, metadata_ref)`` map, the currency
+    Owns the ``wrapper_key -> (plan_key, binding_ref)`` map, the currency
     check, the post-plan commit, and the plan/reuse stats recording. The domain
     differences (decode vs prefill stat counters) are confined to the injected
     ``record`` callback.
@@ -94,23 +94,23 @@ class _PlanCache:
         self,
         wrapper_key: "WrapperKey",
         plan_key: tuple[Any, ...],
-        metadata: Any,
+        binding: Any,
     ) -> bool:
         cached = self._plan_keys.get(wrapper_key)
         if cached is None:
             return False
-        cached_key, metadata_ref = cached
+        cached_key, binding_ref = cached
         if cached_key != plan_key:
             return False
-        return metadata_ref is None or metadata_ref() is metadata
+        return binding_ref is None or binding_ref() is binding
 
     def remember(
         self,
         wrapper_key: "WrapperKey",
         plan_key: tuple[Any, ...],
-        metadata: Any,
+        binding: Any,
     ) -> None:
-        self._plan_keys[wrapper_key] = (plan_key, _weakref_or_none(metadata))
+        self._plan_keys[wrapper_key] = (plan_key, _weakref_or_none(binding))
 
     def forget(self, wrapper_key: "WrapperKey") -> None:
         """Drop the cached plan for ``wrapper_key`` (graph-scoped wrapper release)."""
@@ -122,7 +122,7 @@ class _PlanCache:
         *,
         wrapper_key: "WrapperKey",
         plan_key: tuple[Any, ...],
-        metadata: Any,
+        binding: Any,
         stats: "ForwardStats | None",
         rows: int,
         build: Callable[[], int],
@@ -135,16 +135,16 @@ class _PlanCache:
         """
 
         graph = wrapper_key.is_graph
-        if self.is_current(wrapper_key, plan_key, metadata):
+        if self.is_current(wrapper_key, plan_key, binding):
             self._record(stats, planned=False, graph=graph, rows=rows, indices=0)
             return
         indices = build()
         self._record(stats, planned=True, graph=graph, rows=rows, indices=indices)
-        self.remember(wrapper_key, plan_key, metadata)
+        self.remember(wrapper_key, plan_key, binding)
 
 
 def _decode_plan_key(
-    metadata: Any,
+    binding: Any,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     q: torch.Tensor,
@@ -154,7 +154,7 @@ def _decode_plan_key(
     wrapper_key: "WrapperKey",
 ) -> tuple[Any, ...]:
     return _decode_plan_key_from_shape(
-        metadata,
+        binding,
         block_table,
         cache_seqlens,
         batch_size=int(q.shape[0]),
@@ -171,7 +171,7 @@ def _decode_plan_key(
 
 
 def _decode_plan_key_from_shape(
-    metadata: Any,
+    binding: Any,
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     *,
@@ -188,7 +188,7 @@ def _decode_plan_key_from_shape(
 ) -> tuple[Any, ...]:
     return (
         wrapper_key,
-        id(metadata) if metadata is not None else None,
+        id(binding) if binding is not None else None,
         int(block_table.data_ptr()),
         int(cache_seqlens.data_ptr()),
         tuple(int(dim) for dim in block_table.shape),
@@ -206,7 +206,7 @@ def _decode_plan_key_from_shape(
 
 
 def _prefill_plan_key(
-    metadata: Any,
+    binding: Any,
     block_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
@@ -218,7 +218,7 @@ def _prefill_plan_key(
 ) -> tuple[Any, ...]:
     return (
         wrapper_key,
-        id(metadata) if metadata is not None else None,
+        id(binding) if binding is not None else None,
         int(block_table.data_ptr()),
         int(cu_seqlens_q.data_ptr()),
         int(cu_seqlens_k.data_ptr()),
@@ -644,10 +644,10 @@ def _wrapper_device_context(wrapper: Any):
     return torch.cuda.device(device)
 
 
-def _cpu_paged_indptr(metadata: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
-    if metadata is None:
+def _cpu_paged_indptr(plan: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
+    if plan is None:
         return None
-    kv_seqlens_cpu = tuple(int(x) for x in getattr(metadata, "kv_seqlens_cpu", ()) or ())
+    kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_seqlens_cpu", ()) or ())
     if len(kv_seqlens_cpu) != int(batch_size):
         return None
     page_size = max(1, int(page_size))
@@ -660,10 +660,10 @@ def _cpu_paged_indptr(metadata: Any, batch_size: int, page_size: int) -> torch.T
     return indptr
 
 
-def _cpu_last_page_len(metadata: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
-    if metadata is None:
+def _cpu_last_page_len(plan: Any, batch_size: int, page_size: int) -> torch.Tensor | None:
+    if plan is None:
         return None
-    kv_seqlens_cpu = tuple(int(x) for x in getattr(metadata, "kv_seqlens_cpu", ()) or ())
+    kv_seqlens_cpu = tuple(int(x) for x in getattr(plan, "kv_seqlens_cpu", ()) or ())
     if len(kv_seqlens_cpu) != int(batch_size):
         return None
     page_size = max(1, int(page_size))

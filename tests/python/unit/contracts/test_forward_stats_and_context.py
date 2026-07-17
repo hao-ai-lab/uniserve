@@ -241,13 +241,14 @@ def test_get_forward_context_returns_default_empty_context_when_unset():
 
     assert isinstance(ctx, ForwardContext)
     assert ctx.attention_backend is None
-    assert ctx.attention_metadata is None
+    assert ctx.attention_plan is None
+    assert ctx.graph_binding is None
     assert ctx.kv_pool is None
     assert ctx.stats is None
 
 
 def test_use_forward_context_publishes_context_inside_body():
-    inner = ForwardContext(attention_backend_name="flashinfer")
+    inner = ForwardContext(attention_preference="flashinfer")
 
     with use_forward_context(inner) as published:
         assert published is inner
@@ -257,12 +258,12 @@ def test_use_forward_context_publishes_context_inside_body():
 def test_use_forward_context_restores_prior_token_on_normal_exit():
     # Default (unset) before; must be restored to the default after.
     before = get_forward_context()
-    assert before.attention_backend_name is None
+    assert before.attention_preference is None
 
-    with use_forward_context(ForwardContext(attention_backend_name="inner")):
-        assert get_forward_context().attention_backend_name == "inner"
+    with use_forward_context(ForwardContext(attention_preference="inner")):
+        assert get_forward_context().attention_preference == "inner"
 
-    assert get_forward_context().attention_backend_name is None
+    assert get_forward_context().attention_preference is None
 
 
 def test_use_forward_context_restores_prior_token_when_body_raises():
@@ -270,17 +271,17 @@ def test_use_forward_context_restores_prior_token_when_body_raises():
         pass
 
     with pytest.raises(_Boom):
-        with use_forward_context(ForwardContext(attention_backend_name="inner")):
-            assert get_forward_context().attention_backend_name == "inner"
+        with use_forward_context(ForwardContext(attention_preference="inner")):
+            assert get_forward_context().attention_preference == "inner"
             raise _Boom()
 
     # try/finally semantics: the context must be restored despite the exception.
-    assert get_forward_context().attention_backend_name is None
+    assert get_forward_context().attention_preference is None
 
 
 def test_use_forward_context_restores_outer_context_when_nested():
-    outer = ForwardContext(attention_backend_name="outer")
-    inner = ForwardContext(attention_backend_name="inner")
+    outer = ForwardContext(attention_preference="outer")
+    inner = ForwardContext(attention_preference="inner")
 
     with use_forward_context(outer):
         assert get_forward_context() is outer
@@ -289,4 +290,4 @@ def test_use_forward_context_restores_outer_context_when_nested():
         # Exiting the inner scope restores the outer context, not the default.
         assert get_forward_context() is outer
 
-    assert get_forward_context().attention_backend_name is None
+    assert get_forward_context().attention_preference is None

@@ -9,11 +9,8 @@ import torch
 
 import uniserve_worker.ops as ops
 
-from ....contracts.forward_context import (
-    TextAttentionMetadata,
-    get_forward_context,
-    use_forward_context,
-)
+from ....contracts.attention_plan import GraphBinding, PagedVarlenPlan
+from ....contracts.forward_context import get_forward_context, use_forward_context
 from ....contracts.forward_mode import ForwardMode
 from ....foundation.errors import invalid_descriptor
 from ....runtime.host_staging import fill_cpu_ints, is_pinned
@@ -52,7 +49,8 @@ class PackedMixedGraphState:
     indicators: torch.Tensor
     stream_state: ForwardGraphStreamState
     kv_view: ForwardGraphPagedKVView
-    metadata: TextAttentionMetadata
+    plan: PagedVarlenPlan
+    graph_binding: GraphBinding
     backend: Any
     num_q_heads: int
     num_kv_heads: int
@@ -245,8 +243,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             block_width_capacity=block_width_capacity,
         )
         max_context_len = graph_kv_view.max_seqlen_k()
-        metadata = TextAttentionMetadata(
-            cache=graph_kv_view,
+        plan = PagedVarlenPlan(
+            residency_cache=graph_kv_view,
             block_table=graph_kv_view.block_table(device=packed_embeds.device),
             cache_seqlens=graph_kv_view.cache_seqlens_after(device=packed_embeds.device),
             cu_seqlens_q=forward_stream.cu_seqlens_q.detach().clone(),
@@ -256,6 +254,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             max_context_len=max_context_len,
             mode=ForwardMode.MIXED,
         )
+        graph_binding = GraphBinding()
         state = PackedMixedGraphState(
             key=key,
             family=str(family),
@@ -264,7 +263,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             indicators=image_gen_indicators.detach().clone(),
             stream_state=ForwardGraphStreamState.from_stream(forward_stream),
             kv_view=graph_kv_view,
-            metadata=metadata,
+            plan=plan,
+            graph_binding=graph_binding,
             backend=backend,
             num_q_heads=int(getattr(first_attn, "num_heads")),
             num_kv_heads=int(getattr(first_attn, "num_kv_heads")),
@@ -284,12 +284,21 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
         release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
         if callable(bind) and callable(release):
-            bind(metadata, device=packed_embeds.device)
-            state.release_backend = lambda: release(metadata)
-        graph_ctx = replace(ctx, attention_backend=backend, attention_metadata=metadata, stats=None)
+            bind(graph_binding, plan, device=packed_embeds.device)
+            state.release_backend = lambda: release(graph_binding)
+        graph_ctx = replace(
+            ctx,
+            attention_backend=backend,
+            attention_plan=plan,
+            graph_binding=graph_binding,
+            stats=None,
+        )
 
         def run() -> torch.Tensor:
-            with use_forward_context(graph_ctx):
+            # _copy_inputs rebuilds state.plan before each warmup and capture run;
+            # publish that snapshot so capture records the same plan
+            # _prepare_backend plans from.
+            with use_forward_context(replace(graph_ctx, attention_plan=state.plan)):
                 hidden = owner.packed_decoder_forward(
                     state.packed_embeds,
                     image_gen_indicators=state.indicators,
@@ -316,7 +325,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
                 before_run=self._prepare_backend,
             )
             planned = getattr(backend, "paged_prefill_graph_wrapper_planned", None)
-            if callable(planned) and not planned(metadata):
+            if callable(planned) and not planned(graph_binding):
                 raise _MixedGraphBackendUnplanned(
                     "captured packed mixed forward did not plan the graph-scoped prefill wrapper"
                 )
@@ -342,11 +351,17 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         state.indicators.copy_(image_gen_indicators, non_blocking=True)
         state.stream_state.refresh(forward_stream)
         state.kv_view.refresh(kv_view.segments)
-        state.metadata.block_table = state.kv_view.block_table(device=packed_embeds.device)
-        state.metadata.cache_seqlens = state.kv_view.cache_seqlens_after(device=packed_embeds.device)
-        state.metadata.cu_seqlens_q = state.stream_state.stream.cu_seqlens_q
-        state.metadata.cu_seqlens_k = state.kv_view.cu_seqlens_after(device=packed_embeds.device)
-        state.metadata.max_context_len = state.kv_view.max_seqlen_k()
+        # Publish a fresh frozen plan reusing the kv-view's stable device tensors
+        # with the refreshed geometry. The graph reads those buffers (stable
+        # addresses); wrapper identity stays on the separate graph binding.
+        state.plan = replace(
+            state.plan,
+            block_table=state.kv_view.block_table(device=packed_embeds.device),
+            cache_seqlens=state.kv_view.cache_seqlens_after(device=packed_embeds.device),
+            cu_seqlens_q=state.stream_state.stream.cu_seqlens_q,
+            cu_seqlens_k=state.kv_view.cu_seqlens_after(device=packed_embeds.device),
+            max_context_len=state.kv_view.max_seqlen_k(),
+        )
         if state.promotion_source_index is not None and text_kv_promotions:
             PackedMixedGraphRunner._copy_promotion_indices(state, text_kv_promotions)
 
@@ -407,7 +422,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         if not callable(prepare):
             return
         prepare(
-            state.metadata,
+            state.graph_binding,
+            state.plan,
             num_q_heads=state.num_q_heads,
             num_kv_heads=state.num_kv_heads,
             head_dim=state.head_dim,
@@ -463,7 +479,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
     ) -> Any | None:
         try:
             first_attn = _first_attention(owner)
-            preferred = getattr(ctx, "attention_backend_name", None)
+            preferred = getattr(ctx, "attention_preference", None)
             explicit_backend = _explicit_attention_backend_name(preferred)
             q_probe = packed_embeds.new_empty(
                 (
