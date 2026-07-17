@@ -42,7 +42,7 @@ mode = "decode"
 [[op]]
 wire = "target_verify_und"
 rust = "TargetVerifyUnd"
-mode = "target_verify"
+mode = "verify_draft"
 
 [[op]]
 wire = "denoise_gen"
@@ -72,9 +72,9 @@ mode = "encode"
 [[op]]
 wire = "sample"
 rust = "Sample"
-mode = "sample"
+mode = "emit_token"
 
 [[op]]
 wire = "encode_frame"
 rust = "EncodeFrame"
-mode = "encode_frame"
+mode = "emit_frame"

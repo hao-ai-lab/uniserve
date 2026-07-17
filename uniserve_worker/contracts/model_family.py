@@ -31,7 +31,7 @@ class ModelOperationSet:
             mode = mode_for_op(str(op_kind))
         except WorkerError as exc:
             raise capability_mismatch(f"model declares unknown op {op_kind!r}") from exc
-        if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}:
+        if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}:
             return ("forward",)
         if mode == ForwardMode.DENOISE:
             return ("predict_velocity",)

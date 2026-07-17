@@ -32,7 +32,7 @@ from .result import DenoiseBranchKey, ForwardResult, TextPostprocessEntry
 __all__ = ["ForwardPostprocessor"]
 
 _DECODE_RELAY = TextDecodeRelay()
-_TEXT_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY})
+_TEXT_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
 
 
 class ForwardPostprocessor:

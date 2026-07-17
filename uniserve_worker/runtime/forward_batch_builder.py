@@ -35,7 +35,7 @@ __all__ = [
 ]
 
 _TEXT_MODES = frozenset(
-    {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY}
+    {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.VERIFY_DRAFT}
 )
 
 

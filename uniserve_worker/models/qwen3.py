@@ -499,7 +499,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
 
         from ..contracts.forward_mode import ForwardMode
 
-        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY or forward_batch.return_all_logits:
+        if forward_batch.forward_mode == ForwardMode.VERIFY_DRAFT or forward_batch.return_all_logits:
             return self.logits(hidden, self.lm_head, valid_vocab_size=self.output_vocab_size)
         if hidden.ndim == 3:
             last_hidden = hidden[:, -1, :]

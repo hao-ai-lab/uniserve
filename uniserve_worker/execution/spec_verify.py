@@ -3,7 +3,7 @@
 Relocated from the model: building the verify forward, running it, and applying
 the accept rule (greedy device fast-path / sglang target-only / sequential
 target-sample) are system policy over the thin ``model.forward``. The model only
-returns per-position verify logits for the ``TARGET_VERIFY`` forward; the system
+returns per-position verify logits for the ``VERIFY_DRAFT`` forward; the system
 groups the draft rows, runs one rectangular forward per draft length, and decides
 acceptance + the next KV length here.
 """

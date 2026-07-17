@@ -161,7 +161,7 @@ def _missing_capability(model_cls: Type[UniModel], op: str) -> str | None:
             f"{model_cls.__name__} declares unknown op {op!r}"
         ) from exc
     required: tuple[str, ...]
-    if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}:
+    if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}:
         required = ("forward",)
     elif mode == ForwardMode.DENOISE:
         required = ("predict_velocity",)

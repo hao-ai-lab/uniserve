@@ -106,7 +106,7 @@ class ThinCPUTextModel(ModelHooks):
         flat = input_ids.reshape(-1)
         self.input_values.append([int(token) for token in flat.tolist()])
         self.input_ptrs.append(int(flat.data_ptr()))
-        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+        if forward_batch.forward_mode == ForwardMode.VERIFY_DRAFT:
             # Per-position logits [batch, length, vocab] with a fixed argmax (7).
             batch, length = int(input_ids.shape[0]), int(input_ids.shape[1])
             logits = torch.full((batch, length, 16), -1000.0)
@@ -623,8 +623,8 @@ def test_target_verify_is_a_text_forward_mode():
     )
 
     text = batch.as_text()
-    assert batch.mode is ForwardMode.TARGET_VERIFY
-    assert text.mode is ForwardMode.TARGET_VERIFY
+    assert batch.mode is ForwardMode.VERIFY_DRAFT
+    assert text.mode is ForwardMode.VERIFY_DRAFT
     built = stage_text_forward_batch(text, torch.device("cpu"))
     torch.testing.assert_close(built.input_ids, torch.tensor([10, 11, 12], dtype=torch.long))
     torch.testing.assert_close(built.positions, torch.tensor([4, 5, 6], dtype=torch.long))

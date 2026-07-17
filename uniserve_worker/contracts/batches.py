@@ -84,7 +84,7 @@ class CfgBatch:
 
 
 _TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
+    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
 )
 
 
@@ -315,7 +315,7 @@ def parse_batch(
     their own drivers) and the ``case _`` guard raise ``invalid_descriptor``.
     """
     match mode:
-        case ForwardMode.EXTEND | ForwardMode.DECODE | ForwardMode.TARGET_VERIFY:
+        case ForwardMode.EXTEND | ForwardMode.DECODE | ForwardMode.VERIFY_DRAFT:
             return TextBatch.from_ops(mode, ops, op_modes=op_modes, allow_mixed_text=allow_mixed_text)
         case ForwardMode.DENOISE:
             return DenoiseBatch.from_ops(ops)
@@ -327,7 +327,7 @@ def parse_batch(
             if allow_mixed_text and all(m in _TEXT_MODES for m in op_modes):
                 return TextBatch.from_ops(mode, ops, op_modes=op_modes, allow_mixed_text=True)
             return MixedBatch.from_ops(ops, op_modes=op_modes)
-        case ForwardMode.SAMPLE | ForwardMode.ENCODE_FRAME:
+        case ForwardMode.EMIT_TOKEN | ForwardMode.EMIT_FRAME:
             raise invalid_descriptor(f"mode {mode.value} has no parsed batch view")
         case _:
             raise invalid_descriptor(f"unhandled forward mode {mode!r}")

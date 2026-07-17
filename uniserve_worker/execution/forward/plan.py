@@ -35,7 +35,7 @@ __all__ = [
 ]
 
 _TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
+    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
 )
 _PACKED_FORWARD_MODES = frozenset(
     {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE, ForwardMode.COMMIT}
@@ -427,7 +427,7 @@ class ForwardPlanBuilder:
             position_start=start,
             position_end=end,
             token_source=str(op.get("token_source") or "wire"),
-            last_token_only=mode in {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY},
+            last_token_only=mode in {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.VERIFY_DRAFT},
         )
 
     @staticmethod

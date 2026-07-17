@@ -23,7 +23,7 @@ from .plan import ForwardModality, ForwardPlan
 __all__ = ["ForwardBatchBuilder"]
 
 _TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
+    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
 )
 
 

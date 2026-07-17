@@ -273,14 +273,14 @@ OP_KIND_TABLE: dict[str, OpKindSpec] = {
     for spec in (
         OpKindSpec(PREFILL_UND, "extend", _schema_validator(_TEXT_RESULT_SCHEMA)),
         OpKindSpec(DECODE_UND, "decode", _schema_validator(_TEXT_RESULT_SCHEMA)),
-        OpKindSpec(TARGET_VERIFY_UND, "target_verify", _schema_validator(_TEXT_RESULT_SCHEMA)),
+        OpKindSpec(TARGET_VERIFY_UND, "verify_draft", _schema_validator(_TEXT_RESULT_SCHEMA)),
         OpKindSpec(DENOISE_GEN, "denoise", _schema_validator(_DENOISE_RESULT_SCHEMA)),
         OpKindSpec(COMMIT_GEN, "commit", _schema_validator(_COMMIT_RESULT_SCHEMA)),
         OpKindSpec(COMMIT_WRITEBACK, "commit", _schema_validator(_COMMIT_RESULT_SCHEMA)),
         OpKindSpec(VAE_ENCODE, "encode", _schema_validator(_ENCODE_RESULT_SCHEMA)),
         OpKindSpec(VIT_ENCODE, "encode", _schema_validator(_ENCODE_RESULT_SCHEMA)),
-        OpKindSpec("sample", "sample", _schema_validator(_SAMPLE_RESULT_SCHEMA)),
-        OpKindSpec("encode_frame", "encode_frame", _schema_validator(_FRAME_RESULT_SCHEMA)),
+        OpKindSpec("sample", "emit_token", _schema_validator(_SAMPLE_RESULT_SCHEMA)),
+        OpKindSpec("encode_frame", "emit_frame", _schema_validator(_FRAME_RESULT_SCHEMA)),
     )
 }
 

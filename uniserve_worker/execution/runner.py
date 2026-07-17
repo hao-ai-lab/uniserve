@@ -59,7 +59,7 @@ __all__ = [
 
 # Modes routed to the typed text driver.
 _TEXT_DRIVER_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
+    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
 )
 
 logger = logging.getLogger(__name__)
@@ -484,7 +484,7 @@ class ModelRunner:
         if self.stream_manager is None:
             return nullcontext()
         mode = fb.mode
-        if mode == ForwardMode.EXTEND or mode == ForwardMode.TARGET_VERIFY:
+        if mode == ForwardMode.EXTEND or mode == ForwardMode.VERIFY_DRAFT:
             stream = self.stream_manager.select_streams(0)[0]
         elif mode == ForwardMode.DECODE:
             stream = self.stream_manager.select_streams(len(fb.ops))[1]
