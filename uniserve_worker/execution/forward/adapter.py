@@ -22,7 +22,7 @@ __all__ = [
 ]
 
 _TEXT_DRIVER_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY}
+    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
 )
 
 

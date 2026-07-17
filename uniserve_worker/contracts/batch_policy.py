@@ -19,7 +19,7 @@ class BatchPolicy:
         ForwardMode.ENCODE,
         ForwardMode.EXTEND,
         ForwardMode.DECODE,
-        ForwardMode.TARGET_VERIFY,
+        ForwardMode.VERIFY_DRAFT,
         ForwardMode.DENOISE,
         ForwardMode.COMMIT,
     )

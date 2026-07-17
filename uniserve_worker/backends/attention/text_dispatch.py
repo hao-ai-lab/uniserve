@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 __all__ = ["TextBackendGate"]
 
-_TEXT_MODES = frozenset({ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.TARGET_VERIFY})
+_TEXT_MODES = frozenset({ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.VERIFY_DRAFT})
 
 
 class TextBackendGate:

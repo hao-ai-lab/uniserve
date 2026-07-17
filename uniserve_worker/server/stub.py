@@ -200,11 +200,11 @@ class StubUniModel(UniModelBase):
             out.append(EncodeOutput(req_id=req_id, encoder_handle=handle))
         return out
 
-    # Forward-mode dispatch table. EXTEND/DECODE/TARGET_VERIFY share ``_text``.
+    # Forward-mode dispatch table. EXTEND/DECODE/VERIFY_DRAFT share ``_text``.
     _FORWARD_BY_MODE = {
         ForwardMode.EXTEND: _text,
         ForwardMode.DECODE: _text,
-        ForwardMode.TARGET_VERIFY: _text,
+        ForwardMode.VERIFY_DRAFT: _text,
         ForwardMode.DENOISE: _denoise,
         ForwardMode.COMMIT: _commit,
         ForwardMode.ENCODE: _encode,
