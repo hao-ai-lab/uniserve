@@ -27,6 +27,20 @@ __all__ = [
 
 _GRAPH_SELECTION_DELEGATED_MODES = frozenset({ForwardMode.COMMIT, ForwardMode.ENCODE})
 
+_STREAM_OVERLAP_MODES = frozenset(
+    {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.VERIFY_DRAFT}
+)
+
+
+def _overlap_eligible(group: list[tuple[int, Mapping[str, Any]]]) -> bool:
+    """Plan/forward stream overlap covers text-only groups.
+
+    Denoise, encode, and commit groups run packed graph programs with their own
+    buffer ownership; their prepare phases stay on the forward stream.
+    """
+
+    return all(mode_for_op(op["kind"]) in _STREAM_OVERLAP_MODES for _, op in group)
+
 
 @dataclass(frozen=True)
 class ForwardStepOptions:
@@ -249,21 +263,36 @@ class ForwardStepExecutor:
                 "postprocess_side_effects": postprocess_side_effects,
             },
         )
-        plan = self.runner.forward_plan_builder.build(
-            group,
-            request_states=self.runner.request_states,
-            graph_policy=_graph_policy_for_group(self.runner.forward_graph_policy, fb),
-            runtime_handles=runtime_handles,
-        )
         device = torch.device(str(getattr(self.runner.model, "device", "cpu") or "cpu"))
-        batch = self.runner.unified_forward_batch_builder.build(plan, device=device)
+
+        def prepare() -> tuple[Any, Any]:
+            plan = self.runner.forward_plan_builder.build(
+                group,
+                request_states=self.runner.request_states,
+                graph_policy=_graph_policy_for_group(self.runner.forward_graph_policy, fb),
+                runtime_handles=runtime_handles,
+            )
+            return plan, self.runner.unified_forward_batch_builder.build(plan, device=device)
+
+        overlap = getattr(self.runner, "plan_stream_overlap", None)
+        if overlap is None or device.type != "cuda" or not _overlap_eligible(group):
+            overlap = None
+        prepared = overlap.prepare(prepare) if overlap is not None else None
+        plan, batch = prepared.value if prepared is not None else prepare()
 
         with self.runner.forward_adapter.bind(
             dispatch_batch=fb,
             group=group,
             defer_text_cpu_results=defer_text_cpu_results,
         ):
-            result = self.runner.forward_executor.execute(batch, plan)
+            if overlap is not None and prepared is not None:
+                result = overlap.launch(
+                    prepared,
+                    lambda: self.runner.forward_executor.execute(batch, plan),
+                    retain=batch,
+                )
+            else:
+                result = self.runner.forward_executor.execute(batch, plan)
         if forward_stats is not None and result.graph is not None:
             forward_stats.cuda_graph_runtime_mode_counts[result.graph.program] = (
                 forward_stats.cuda_graph_runtime_mode_counts.get(result.graph.program, 0) + 1
