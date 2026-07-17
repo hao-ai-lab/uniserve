@@ -242,6 +242,29 @@ class ModelRunner:
             fallback_recorder=self.forward_fallback_recorder,
         )
         self.forward_postprocessor = ForwardPostprocessor()
+        self.plan_stream_overlap = self._maybe_build_plan_stream_overlap(device)
+
+    def _maybe_build_plan_stream_overlap(self, device: torch.device):
+        """Build the plan/forward stream-overlap coordinator when enabled.
+
+        Gated behind ``UNISERVE_STREAM_OVERLAP=1`` per
+        ``specs/intra-worker-stream-overlap.md``; requires a CUDA device. The
+        in-flight bound is the staging-ring reuse period so the coordinator's
+        WAR fences cover pinned and device staging-buffer recycling.
+        """
+        if not env_flag("UNISERVE_STREAM_OVERLAP"):
+            return None
+        if device.type != "cuda":
+            return None
+        from .forward.stream_overlap import PlanStreamOverlap
+
+        ring_depth = getattr(self.forward_batch_builder, "staging_ring_depth", 3)
+        overlap = PlanStreamOverlap(device, max_inflight=int(ring_depth))
+        logger.info(
+            "intra-worker stream overlap enabled (plan stream, max_inflight=%d)",
+            overlap.max_inflight,
+        )
+        return overlap
 
     def _build_forward_graph_runner(self, model: UniModel) -> Any | None:
         from .forward.graph import (

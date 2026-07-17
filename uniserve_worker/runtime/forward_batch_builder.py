@@ -100,6 +100,12 @@ class ForwardBatchBuilder:
         )
         self._stager = self._assembler.stager
 
+    @property
+    def staging_ring_depth(self) -> int:
+        """Reuse period of the pinned/device staging buffers (WAR fence bound)."""
+
+        return int(self._stager.ring_depth)
+
     def build_text(
         self,
         text: "TextBatch",
