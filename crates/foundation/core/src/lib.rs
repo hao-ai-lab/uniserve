@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod generation;
 pub mod program;
 pub mod sampling;
+pub mod semantic;
 pub use generation::{
     CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
     GenOnlyStartPolicyDescriptor, GeneratedImageCommitCapabilities, GeneratedImageFeedbackRecipe,
