@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod generation;
 pub mod program;
+pub mod program_cursor;
 pub mod sampling;
 pub mod semantic;
 pub use generation::{
