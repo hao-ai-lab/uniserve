@@ -2814,10 +2814,10 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_kind == Some(OpKind::DenoiseGen) {
-                if denoise_occupies_decode_pipeline || !self.can_schedule_denoise(id) {
-                    continue;
-                }
+            if next_kind == Some(OpKind::DenoiseGen)
+                && (denoise_occupies_decode_pipeline || !self.can_schedule_denoise(id))
+            {
+                continue;
             }
             // Build an op; on a block-budget miss, preempt a budgeted victim
             // and retry — else skip this request for the step.
