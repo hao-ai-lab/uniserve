@@ -317,6 +317,10 @@ def test_models_tree_matches_target_file_set():
         "transformers_fallback.py",
         "qwen3.py",
         "bagel.py",
+        # Dormant family cache registrations for the target unified KV runtime
+        # (specs/unified_kv_attention_runtime.md); family-naming data stays in
+        # the models layer, never in model-neutral contracts.
+        "cache_registrations.py",
     }
     # SenseNova-U1 is its own package; the interleaved image denoise/commit
     # orchestration is system-owned under execution/, not model-local.
