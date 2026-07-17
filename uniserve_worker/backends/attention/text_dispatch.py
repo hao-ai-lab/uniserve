@@ -11,12 +11,13 @@ declares its ``head_dim``; the system owns the rest.
 Both the batched and the per-op path call the same thin ``model.forward``; this
 gate only picks which one the driver builds.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
 from ...contracts.forward_mode import ForwardMode
-from ...foundation.runtime_config import get_worker_config
+from ...foundation.runtime_config import get_execution_config
 
 if TYPE_CHECKING:
     from ...contracts.batches import TextBatch
@@ -94,8 +95,10 @@ class TextBackendGate:
             if not isinstance(kind, str):
                 return False
             mode = (
-                ForwardMode.EXTEND if kind == "prefill_und"
-                else ForwardMode.DECODE if kind == "decode_und"
+                ForwardMode.EXTEND
+                if kind == "prefill_und"
+                else ForwardMode.DECODE
+                if kind == "decode_und"
                 else None
             )
             if mode is None:
@@ -103,7 +106,11 @@ class TextBackendGate:
             if _has_values(op.get("spec_token_ids")):
                 return False
             tokens = op.get("token_ids") or []
-            if not isinstance(tokens, _Seq) or isinstance(tokens, (str, bytes, bytearray)) or len(tokens) <= 0:
+            if (
+                not isinstance(tokens, _Seq)
+                or isinstance(tokens, (str, bytes, bytearray))
+                or len(tokens) <= 0
+            ):
                 return False
             total_tokens += len(tokens)
             if mode is ForwardMode.DECODE and len(tokens) != 1:
@@ -111,7 +118,7 @@ class TextBackendGate:
             modes.append(mode)
         if not modes or ForwardMode.EXTEND not in modes or ForwardMode.DECODE not in modes:
             return False
-        max_tokens = max(0, get_worker_config().mixed_text_max_tokens)
+        max_tokens = max(0, get_execution_config().mixed_text_max_tokens)
         if max_tokens <= 0 or total_tokens > max_tokens:
             return False
         return self._varlen_available(attention_preference, needs_paged_kv=True)
@@ -149,7 +156,7 @@ class TextBackendGate:
         return False
 
     def _varlen_available(self, preferred: str | None, *, needs_paged_kv: bool = False) -> bool:
-        if not get_worker_config().varlen_prefill:
+        if not get_execution_config().varlen_prefill:
             return False
         if needs_paged_kv and not self.paged_storage_ok:
             return False

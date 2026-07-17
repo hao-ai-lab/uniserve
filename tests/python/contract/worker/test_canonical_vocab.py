@@ -10,6 +10,7 @@ The tests skip (rather than fail) when the schema files are absent — e.g. a
 Python-only checkout/wheel — so they are meaningful in the full repo and inert
 elsewhere.
 """
+
 from __future__ import annotations
 
 import tomllib
@@ -19,11 +20,7 @@ import pytest
 
 from uniserve_worker.contracts.op_kinds import OP_KIND_TABLE, OP_KINDS
 from uniserve_worker.foundation.errors import _POLICY, ErrorCode
-from uniserve_worker.server.worker_kind import (
-    RUNNER_BACKED_KINDS,
-    SUPPORTED_OPS,
-    WORKER_KINDS,
-)
+from uniserve_worker.server.worker_kind import WorkerKind
 
 pytestmark = pytest.mark.contract
 
@@ -61,27 +58,19 @@ def test_op_kinds_match_canonical_schema():
 
 
 def test_worker_kinds_match_canonical_schema():
-    """Item 21: Python WORKER_KINDS/SUPPORTED_OPS/RUNNER_BACKED_KINDS == worker_kinds.toml."""
+    """Python WorkerKind tokens and operation envelopes match the schema."""
     schema = _load("worker_kinds.toml")
     entries = schema["kind"]
 
     schema_tokens = {k["token"] for k in entries}
-    assert schema_tokens == set(WORKER_KINDS), (
-        f"worker-kind set drift: schema={sorted(schema_tokens)} "
-        f"python={sorted(WORKER_KINDS)}"
+    python_tokens = set(WorkerKind.wire_values())
+    assert schema_tokens == python_tokens, (
+        f"worker-kind set drift: schema={sorted(schema_tokens)} python={sorted(python_tokens)}"
     )
 
     schema_ops = {k["token"]: set(k["supported_ops"]) for k in entries}
-    python_ops = {token: set(ops) for token, ops in SUPPORTED_OPS.items()}
-    assert schema_ops == python_ops, (
-        f"supported_ops drift: schema={schema_ops} python={python_ops}"
-    )
-
-    schema_runner_backed = {k["token"] for k in entries if k["runner_backed"]}
-    assert schema_runner_backed == set(RUNNER_BACKED_KINDS), (
-        f"runner-backed drift: schema={sorted(schema_runner_backed)} "
-        f"python={sorted(RUNNER_BACKED_KINDS)}"
-    )
+    python_ops = {worker_kind.value: set(worker_kind.supported_ops) for worker_kind in WorkerKind}
+    assert schema_ops == python_ops, f"supported_ops drift: schema={schema_ops} python={python_ops}"
 
 
 def test_error_taxonomy_matches_canonical_schema():
@@ -93,8 +82,7 @@ def test_error_taxonomy_matches_canonical_schema():
     schema_codes = {e["code"] for e in entries}
     python_codes = {str(c) for c in ErrorCode}
     assert schema_codes == python_codes, (
-        f"error-code set drift: schema={sorted(schema_codes)} "
-        f"python={sorted(python_codes)}"
+        f"error-code set drift: schema={sorted(schema_codes)} python={sorted(python_codes)}"
     )
 
     # Each schema member's `python` column names the ErrorCode whose value is its
@@ -106,12 +94,9 @@ def test_error_taxonomy_matches_canonical_schema():
         )
 
     # Policy bits (retryable, fatal, capture_trace) per code.
-    schema_policy = {
-        e["code"]: (e["retryable"], e["fatal"], e["capture_trace"]) for e in entries
-    }
+    schema_policy = {e["code"]: (e["retryable"], e["fatal"], e["capture_trace"]) for e in entries}
     python_policy = {
-        str(code): (pol.retryable, pol.fatal, pol.capture_trace)
-        for code, pol in _POLICY.items()
+        str(code): (pol.retryable, pol.fatal, pol.capture_trace) for code, pol in _POLICY.items()
     }
     assert schema_policy == python_policy, (
         f"error-policy drift: schema={schema_policy} python={python_policy}"

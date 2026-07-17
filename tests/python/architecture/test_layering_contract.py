@@ -6,6 +6,7 @@ strictly-lower (or equal, if acyclic) layer. ``if TYPE_CHECKING:`` imports are
 ignored throughout — they are never executed and so cannot create a runtime
 import cycle or layer violation.
 """
+
 from __future__ import annotations
 
 import ast
@@ -18,9 +19,7 @@ import pytest
 pytestmark = pytest.mark.architecture
 
 ROOT = next(
-    parent
-    for parent in Path(__file__).resolve().parents
-    if (parent / "uniserve_worker").is_dir()
+    parent for parent in Path(__file__).resolve().parents if (parent / "uniserve_worker").is_dir()
 )
 WORKER = ROOT / "uniserve_worker"
 PKG = "uniserve_worker"
@@ -43,15 +42,29 @@ LAYER = {
     "loader": 5,
     "processors": 5,
     "models": 6,
-    "server": 7,
-    "main": 8,
+    "worker": 7,
+    "server": 8,
+    "bootstrap": 9,
+    "main": 10,
     "<root>": 0,  # empty package __init__ + native _uniserve_ipc ext (leaves)
 }
 
 # Lower layers that must stay model-neutral (no concrete-model imports / names).
-MODEL_NEUTRAL = ("foundation", "contracts", "backends", "nn", "runtime", "execution")
+MODEL_NEUTRAL = (
+    "foundation",
+    "contracts",
+    "backends",
+    "nn",
+    "runtime",
+    "execution",
+    "worker",
+)
 FORBIDDEN_MODEL_NAMES = re.compile(r"\b(?:SenseNova|BAGEL|Bagel|sensenova|bagel)\b")
 FORBIDDEN_MODEL_CLASS_NAMES = re.compile(r".*Adapter$")
+LEGACY_WORKER_TYPES = re.compile(
+    r"\b(?:WorkerRuntime|WorkerDriver|BaseWorkerDriver|RunnerDriver|"
+    r"EncodeOnlyDriver|SamplerDriver|PostProcessDriver|StubEngine)\b"
+)
 
 
 def _py_files(*roots: Path) -> list[Path]:
@@ -129,7 +142,9 @@ def _runtime_import_edges() -> set[tuple[str, str]]:
                 continue
             targets: list[str] = []
             if isinstance(node, ast.Import):
-                targets = [a.name for a in node.names if a.name == PKG or a.name.startswith(PKG + ".")]
+                targets = [
+                    a.name for a in node.names if a.name == PKG or a.name.startswith(PKG + ".")
+                ]
             elif isinstance(node, ast.ImportFrom):
                 if node.level and node.level > 0:
                     base = pkg_parts[: len(pkg_parts) - (node.level - 1)]
@@ -196,6 +211,31 @@ def test_package_import_graph_is_a_dag():
     """The whole-codebase headline contract: no package-level import cycles."""
     multi = [c for c in _sccs(_package_edges()) if len(c) > 1]
     assert multi == [], f"package import cycles (SCCs): {[sorted(c) for c in multi]}"
+
+
+def test_worker_assembly_legacy_driver_surface_is_absent():
+    legacy_modules = (
+        "server/base_driver.py",
+        "server/driver_factory.py",
+        "server/encode_only_driver.py",
+        "server/postprocess_driver.py",
+        "server/runner_driver.py",
+        "server/sampler_driver.py",
+    )
+    assert [path for path in legacy_modules if (WORKER / path).exists()] == []
+
+    offenders = [
+        _rel(path)
+        for path in _py_files(WORKER)
+        if LEGACY_WORKER_TYPES.search(path.read_text(encoding="utf-8"))
+    ]
+    assert offenders == []
+
+
+def test_worker_server_does_not_reinterpret_deployment_roles():
+    source = (WORKER / "server" / "app.py").read_text(encoding="utf-8")
+    assert "WorkerKind" not in source
+    assert "worker_kind" not in source
 
 
 def test_no_upward_layer_edges():
@@ -317,14 +357,18 @@ def test_interleaved_text_stepper_is_system_owned():
     """
 
     stepper = WORKER / "execution" / "interleaved_text_stepper.py"
-    assert stepper.is_file(), "execution/interleaved_text_stepper.py must exist (system InterleavedStepper)"
+    assert stepper.is_file(), (
+        "execution/interleaved_text_stepper.py must exist (system InterleavedStepper)"
+    )
     owned = {"InterleavedTextCacheDriver", "TextCache", "InterleavedModelOwner"}
     defined_in_stepper = {
         node.name
         for node in ast.walk(ast.parse(stepper.read_text(encoding="utf-8")))
         if isinstance(node, ast.ClassDef)
     }
-    assert owned <= defined_in_stepper, f"system stepper must define {owned}, has {defined_in_stepper}"
+    assert owned <= defined_in_stepper, (
+        f"system stepper must define {owned}, has {defined_in_stepper}"
+    )
 
     offenders: list[str] = []
     for path in _py_files(WORKER / "models"):
@@ -337,7 +381,10 @@ def test_interleaved_text_stepper_is_system_owned():
 
 def test_interleaved_text_execution_uses_owner_adapter_not_model_backbone():
     offenders: list[str] = []
-    for rel in ("execution/interleaved_text_stepper.py", "execution/forward/graph/interleaved_text.py"):
+    for rel in (
+        "execution/interleaved_text_stepper.py",
+        "execution/forward/graph/interleaved_text.py",
+    ):
         source = (WORKER / rel).read_text(encoding="utf-8")
         for needle in ("owner.model.language_model", "owner.model._build_t2i"):
             if needle in source:
@@ -387,17 +434,13 @@ def test_interleaved_image_engine_is_system_owned():
 
 
 def test_generated_image_commit_driver_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "execution" / "interleaved_image_commit.py").read_text(
-        encoding="utf-8"
-    )
+    source = (WORKER / "execution" / "interleaved_image_commit.py").read_text(encoding="utf-8")
     commit_driver_source = source[source.index("class GeneratedImageCommitDriver") :]
     assert "self.owner.model." not in commit_driver_source
 
 
 def test_interleaved_image_mixin_uses_owner_adapter_for_t2i_model_primitives():
-    source = (WORKER / "execution" / "interleaved_image_denoise.py").read_text(
-        encoding="utf-8"
-    )
+    source = (WORKER / "execution" / "interleaved_image_denoise.py").read_text(encoding="utf-8")
     forbidden = ("self.model.",)
     offenders = [needle for needle in forbidden if needle in source]
     assert offenders == []
@@ -409,7 +452,9 @@ def test_sensenova_does_not_define_a_second_native_qwen3_backbone_namespace():
 
 
 def test_packed_mixed_forward_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "execution" / "forward" / "programs" / "packed_visible.py").read_text(encoding="utf-8")
+    source = (WORKER / "execution" / "forward" / "programs" / "packed_visible.py").read_text(
+        encoding="utf-8"
+    )
     assert "owner.model." not in source
 
 
@@ -457,8 +502,10 @@ def test_models_tree_owns_no_pools_or_graphs():
                 continue
             func = node.func
             name = (
-                func.id if isinstance(func, ast.Name)
-                else func.attr if isinstance(func, ast.Attribute)
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr
+                if isinstance(func, ast.Attribute)
                 else None
             )
             if name in FORBIDDEN_MODEL_CONSTRUCTIONS:
@@ -577,7 +624,9 @@ def test_backend_provider_pack_imports_do_not_mutate_sys_path_or_use_env_paths()
         for path in _py_files(root):
             text = path.read_text(encoding="utf-8")
             if "sys.path" in text:
-                offenders.append(f"{path.relative_to(ROOT).as_posix()}: sys.path mutation/reference")
+                offenders.append(
+                    f"{path.relative_to(ROOT).as_posix()}: sys.path mutation/reference"
+                )
             if re.search(r"os\.environ(?:\.get)?\([^)]*FA4[^)]*PATH", text):
                 offenders.append(f"{path.relative_to(ROOT).as_posix()}: legacy FA4 env path")
     assert offenders == []
@@ -701,7 +750,11 @@ def test_shared_layers_do_not_import_sgl_kernel_pack_directly():
         if path in allowed:
             continue
         text = path.read_text(encoding="utf-8")
-        if "from sgl_kernel" in text or "import sgl_kernel" in text or "torch.ops.sgl_kernel" in text:
+        if (
+            "from sgl_kernel" in text
+            or "import sgl_kernel" in text
+            or "torch.ops.sgl_kernel" in text
+        ):
             offenders.append(_rel(path))
     assert offenders == []
 
@@ -724,7 +777,13 @@ def test_mixed_forward_side_tables_use_forward_names():
     offenders: list[str] = []
     for path in _py_files(WORKER / "execution") + _py_files(WORKER / "models"):
         text = path.read_text(encoding="utf-8")
-        for needle in ("execution.fused_stream", ".fused_stream", "FusedStream", "FusedPagedKV", "fused_stream"):
+        for needle in (
+            "execution.fused_stream",
+            ".fused_stream",
+            "FusedStream",
+            "FusedPagedKV",
+            "fused_stream",
+        ):
             if needle in text:
                 offenders.append(f"{_rel(path)} contains {needle}")
     assert offenders == []
@@ -830,7 +889,12 @@ def test_host_staging_helpers_have_a_single_owner():
 
     offenders: list[str] = []
     owner = WORKER / "runtime" / "host_staging.py"
-    forbidden = ("def _canonical_device", "def canonical_device", "def _fill_cpu_long", "def _fill_cpu_int")
+    forbidden = (
+        "def _canonical_device",
+        "def canonical_device",
+        "def _fill_cpu_long",
+        "def _fill_cpu_int",
+    )
     for path in _py_files(WORKER):
         if path == owner:
             continue

@@ -17,9 +17,9 @@ pub trait ModelEngine: Send {
 ///
 /// A pool is fully determined by three things: the `OpKind` subset it declares
 /// (via `caps().supported_ops`, given here by [`WorkerKind::supported_ops`]),
-/// the driver that handles that subset, and its device profile. The control
-/// plane ([`StageRouter`](../../worker_ipc/struct.StageRouter.html)) routes ops
-/// by `OpKind`→pool; `WorkerKind` is the pool's declared role.
+/// the worker implementation that handles that subset, and its device profile.
+/// The control plane ([`StageRouter`](../../worker_ipc/struct.StageRouter.html))
+/// routes ops by `OpKind`→pool; `WorkerKind` is the pool's declared role.
 ///
 /// `Full` is the non-disaggregated default: it holds the whole model and runs
 /// every model op in one mixed-batch forward. The other kinds are stages peeled

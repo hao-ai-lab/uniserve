@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from ....contracts.forward_batch import ForwardBatch
 from ....contracts.forward_mode import ForwardMode
-from ....foundation.runtime_config import get_worker_config
+from ....foundation.runtime_config import get_execution_config
 from ....runtime.paged_text_cache import BatchedPagedRequestCache
 from .text_decode import (
     DecodeCudaGraphRunner,
@@ -60,7 +60,7 @@ class TextGraphRunner:
         # Startup (warmup) has no forward context to read the backend name from;
         # per-forward calls prefer the context's resolved name.
         self.attention_preference = attention_preference
-        runtime = get_worker_config()
+        runtime = get_execution_config()
         self._decode = DecodeCudaGraphRunner(
             name="text",
             default_enabled=runtime.cuda_graph,

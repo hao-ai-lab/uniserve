@@ -1,45 +1,46 @@
-"""Control-dispatch + typed-error conformance (plan §10.5, DoD 4, 5).
+"""Control dispatch and typed-error conformance.
 
-Runs against the GPU-free StubEngine through the real `main.dispatch` so the
+Runs against the GPU-free StubWorker through the real dispatch path so the
 worker's reject-before-execute behavior and the typed error taxonomy are
 exercised exactly as in production.
 """
+
 from __future__ import annotations
 
 import pytest
 
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError, classify
-from uniserve_worker.server.app import CONTROL_KINDS, WorkerRuntime, dispatch
+from uniserve_worker.server.app import CONTROL_KINDS, WorkerServer, dispatch
 from uniserve_worker.server.metrics import MetricsService
-from uniserve_worker.server.stub import StubEngine
+from uniserve_worker.server.stub import StubWorker
 
 pytestmark = pytest.mark.unit
 
 
-def _engine():
-    return StubEngine(block_size=256)
+def _worker():
+    return StubWorker(block_size=256)
 
 
-def _supported(engine):
-    return set(engine.caps().supported_controls)
+def _supported(worker):
+    return set(worker.caps().supported_controls)
 
 
 def test_declared_controls_return_ok():
-    engine = _engine()
-    supported = _supported(engine)
+    worker = _worker()
+    supported = _supported(worker)
     assert supported, "stub should declare some controls"
     for ctrl in supported:
         req = {"kind": ctrl, "copies": [], "free_handles": [1], "lora_id": 1, "lora_path": "/x"}
-        assert dispatch(engine, supported, req) == {"kind": "ok"}, ctrl
+        assert dispatch(worker, supported, req) == {"kind": "ok"}, ctrl
 
 
-class _RecordingControlDriver:
-    """Driver that records the positional args each control hot path receives.
+class _RecordingControlWorker:
+    """Worker that records the arguments each control hot path receives.
 
     `test_declared_controls_return_ok` only proves dispatch acknowledges a
     control against the no-op stub; it does not prove the untrusted wire fields
     are parsed and forwarded to the right method with the right arity. This spy
-    captures the actual driver call so the wire->`_control_args` plumbing for
+    captures the actual worker call so the wire-field plumbing for
     copy_blocks/load_lora/free_encoder is exercised end to end.
     """
 
@@ -65,23 +66,23 @@ class _RecordingControlDriver:
 
 
 def test_control_hot_paths_forward_parsed_wire_fields():
-    driver = _RecordingControlDriver()
-    supported = set(driver.SUPPORTED_CONTROLS)
+    worker = _RecordingControlWorker()
+    supported = set(worker.SUPPORTED_CONTROLS)
 
     copies = [{"src": 1, "dst": 2}]
-    assert dispatch(driver, supported, {"kind": "copy_blocks", "copies": copies}) == {"kind": "ok"}
+    assert dispatch(worker, supported, {"kind": "copy_blocks", "copies": copies}) == {"kind": "ok"}
     assert dispatch(
-        driver, supported, {"kind": "load_lora", "lora_id": 7, "lora_path": "/adapters/a"}
+        worker, supported, {"kind": "load_lora", "lora_id": 7, "lora_path": "/adapters/a"}
     ) == {"kind": "ok"}
-    assert dispatch(driver, supported, {"kind": "unload_lora", "lora_id": 7}) == {"kind": "ok"}
-    assert dispatch(
-        driver, supported, {"kind": "free_encoder", "free_handles": [11, 22]}
-    ) == {"kind": "ok"}
+    assert dispatch(worker, supported, {"kind": "unload_lora", "lora_id": 7}) == {"kind": "ok"}
+    assert dispatch(worker, supported, {"kind": "free_encoder", "free_handles": [11, 22]}) == {
+        "kind": "ok"
+    }
 
-    # The driver methods were actually invoked with the wire fields parsed into
+    # The worker methods were actually invoked with the wire fields parsed into
     # the documented positional shape (copies/handles as lists, scalars passed
     # through), not merely acknowledged.
-    assert driver.calls == [
+    assert worker.calls == [
         ("copy_blocks", copies),
         ("load_lora", 7, "/adapters/a"),
         ("unload_lora", 7),
@@ -90,11 +91,11 @@ def test_control_hot_paths_forward_parsed_wire_fields():
 
 
 def test_control_hot_paths_reject_missing_required_fields():
-    driver = _RecordingControlDriver()
-    supported = set(driver.SUPPORTED_CONTROLS)
+    worker = _RecordingControlWorker()
+    supported = set(worker.SUPPORTED_CONTROLS)
 
     # load_lora's scalar wire fields are required: a missing field must fail
-    # before the driver is invoked with a typed InvalidDescriptor, not silently
+    # before the worker is invoked with a typed InvalidDescriptor, not silently
     # pass None into the control method.
     for req in (
         {"kind": "load_lora", "lora_path": "/adapters/a"},  # missing lora_id
@@ -102,27 +103,27 @@ def test_control_hot_paths_reject_missing_required_fields():
         {"kind": "unload_lora"},  # missing lora_id
     ):
         with pytest.raises(WorkerError) as excinfo:
-            dispatch(driver, supported, req)
+            dispatch(worker, supported, req)
         assert excinfo.value.code == ErrorCode.INVALID_DESCRIPTOR
-    assert driver.calls == []
+    assert worker.calls == []
 
     # List-valued control fields default to an empty list when absent rather
     # than erroring, and reject a non-list payload with InvalidDescriptor.
-    assert dispatch(driver, supported, {"kind": "copy_blocks"}) == {"kind": "ok"}
-    assert driver.calls[-1] == ("copy_blocks", [])
+    assert dispatch(worker, supported, {"kind": "copy_blocks"}) == {"kind": "ok"}
+    assert worker.calls[-1] == ("copy_blocks", [])
     with pytest.raises(WorkerError) as excinfo:
-        dispatch(driver, supported, {"kind": "free_encoder", "free_handles": 5})
+        dispatch(worker, supported, {"kind": "free_encoder", "free_handles": 5})
     assert excinfo.value.code == ErrorCode.INVALID_DESCRIPTOR
 
 
 def test_undeclared_controls_rejected_typed():
-    engine = _engine()
-    supported = _supported(engine)
+    worker = _worker()
+    supported = _supported(worker)
     undeclared = [c for c in CONTROL_KINDS if c not in supported]
     assert "sleep" in undeclared and "wake_up" in undeclared
     for ctrl in undeclared:
         with pytest.raises(WorkerError) as excinfo:
-            dispatch(engine, supported, {"kind": ctrl})
+            dispatch(worker, supported, {"kind": ctrl})
         err = excinfo.value
         assert err.code == ErrorCode.UNSUPPORTED_CONTROL
         assert err.fatal is False and err.retryable is False
@@ -132,26 +133,33 @@ def test_undeclared_controls_rejected_typed():
 
 
 def test_unknown_kind_is_scheduler_bug():
-    engine = _engine()
+    worker = _worker()
     with pytest.raises(WorkerError) as excinfo:
-        dispatch(engine, _supported(engine), {"kind": "frobnicate"})
+        dispatch(worker, _supported(worker), {"kind": "frobnicate"})
     assert excinfo.value.code == ErrorCode.SCHEDULER_BUG
 
 
 def test_core_kinds_roundtrip():
-    engine = _engine()
-    supported = _supported(engine)
-    assert dispatch(engine, supported, {"kind": "get_caps"})["kind"] == "caps"
-    assert dispatch(engine, supported, {"kind": "drop_request", "req_id": 1}) == {"kind": "ok"}
+    worker = _worker()
+    supported = _supported(worker)
+    assert dispatch(worker, supported, {"kind": "get_caps"})["kind"] == "caps"
+    assert dispatch(worker, supported, {"kind": "drop_request", "req_id": 1}) == {"kind": "ok"}
     batch = {
         "step_id": 1,
         "new_reqs": [{"req_id": 1}],
-        "ops": [{"req_id": 1, "kind": "prefill_und", "modality": "und",
-                 "pos_range": [0, 3], "token_ids": [1, 2, 3]}],
+        "ops": [
+            {
+                "req_id": 1,
+                "kind": "prefill_und",
+                "modality": "und",
+                "pos_range": [0, 3],
+                "token_ids": [1, 2, 3],
+            }
+        ],
     }
     # execute is owned by handle() (the single instrumented path the host uses);
     # dispatch() no longer carries a weaker shadow execute.
-    runtime = WorkerRuntime(engine, server=None)
+    runtime = WorkerServer(worker, ipc_endpoint=None)
     resp = runtime.handle({"kind": "execute", "batch": batch})
     assert resp["kind"] == "result"
     assert resp["result"]["per_seq"][0]["req_id"] == 1
@@ -159,7 +167,7 @@ def test_core_kinds_roundtrip():
 
 
 def test_observability_kinds_are_read_only_and_scalar():
-    engine = _engine()
+    worker = _worker()
     metrics = MetricsService()
     metrics.record_execute(12_000, ["prefill_und", "decode_und"])
     metrics.record_forward_stats(
@@ -190,7 +198,7 @@ def test_observability_kinds_are_read_only_and_scalar():
         }
     )
 
-    metric_resp = dispatch(engine, _supported(engine), {"kind": "get_metrics"}, metrics)
+    metric_resp = dispatch(worker, _supported(worker), {"kind": "get_metrics"}, metrics)
     assert metric_resp["kind"] == "metrics"
     assert metric_resp["metrics"]["executes"] == 1
     assert metric_resp["metrics"]["op_kind_counts"]["prefill_und"] == 1
@@ -210,7 +218,7 @@ def test_observability_kinds_are_read_only_and_scalar():
     assert metric_resp["metrics"]["forward"]["spec_verify_committed_tokens"] == 6
     assert metric_resp["metrics"]["forward"]["spec_verify_path_counts"]["greedy_device"] == 1
 
-    pressure_resp = dispatch(engine, _supported(engine), {"kind": "get_pressure"}, metrics)
+    pressure_resp = dispatch(worker, _supported(worker), {"kind": "get_pressure"}, metrics)
     assert pressure_resp["kind"] == "pressure"
     assert isinstance(pressure_resp["pressure"], list)
 
@@ -219,13 +227,13 @@ def test_observability_kinds_are_read_only_and_scalar():
     # byte-identical to one taken before, so no counter advanced as a side
     # effect of being read.
     before = metrics.snapshot()
-    dispatch(engine, _supported(engine), {"kind": "get_metrics"}, metrics)
-    dispatch(engine, _supported(engine), {"kind": "get_pressure"}, metrics)
+    dispatch(worker, _supported(worker), {"kind": "get_metrics"}, metrics)
+    dispatch(worker, _supported(worker), {"kind": "get_pressure"}, metrics)
     assert metrics.snapshot() == before
 
     # The response must hand back a defensive copy, not the live counters:
     # mutating the returned payload cannot leak back into the service.
-    leaked = dispatch(engine, _supported(engine), {"kind": "get_metrics"}, metrics)["metrics"]
+    leaked = dispatch(worker, _supported(worker), {"kind": "get_metrics"}, metrics)["metrics"]
     leaked["executes"] = 999_999
     leaked["op_kind_counts"]["prefill_und"] = 999_999
     leaked["forward"]["mode_tokens"]["extend"] = 999_999
@@ -246,14 +254,22 @@ def test_classify_passes_through_and_enriches():
     err = WorkerError(code=ErrorCode.USER_INPUT_ERROR, message="m")
     assert classify(err) is err
     # enrich missing context ids without overwriting
-    enriched = classify(WorkerError(code=ErrorCode.MODEL_EXECUTION_ERROR, message="m"),
-                        req_id=7, op_kind="decode_und")
+    enriched = classify(
+        WorkerError(code=ErrorCode.MODEL_EXECUTION_ERROR, message="m"),
+        req_id=7,
+        op_kind="decode_und",
+    )
     assert enriched.req_id == 7 and enriched.op_kind == "decode_und"
 
 
 def test_worker_error_wire_shape():
-    err = WorkerError(code=ErrorCode.MODEL_EXECUTION_ERROR, message="boom",
-                      fatal=False, req_id=3, op_kind="decode_und")
+    err = WorkerError(
+        code=ErrorCode.MODEL_EXECUTION_ERROR,
+        message="boom",
+        fatal=False,
+        req_id=3,
+        op_kind="decode_und",
+    )
     wire = err.to_wire()
     assert wire["kind"] == "error"
     assert wire["code"] == "ModelExecutionError"
@@ -287,7 +303,9 @@ class _FifoServer:
         self.responses.append(response)
 
 
-def _execute_req(call_id, step_id, req_id, *, kind="decode_und", token_ids=(5,), pos_range=(0, 1), **op):
+def _execute_req(
+    call_id, step_id, req_id, *, kind="decode_und", token_ids=(5,), pos_range=(0, 1), **op
+):
     return {
         "kind": "execute",
         "call_id": call_id,
@@ -308,7 +326,7 @@ def _execute_req(call_id, step_id, req_id, *, kind="decode_und", token_ids=(5,),
     }
 
 
-def test_worker_runtime_responds_in_receive_order():
+def test_worker_server_responds_in_receive_order():
     # Mixed controls respond strictly in call_id order; already-queued requests
     # are taken via the non-blocking try_recv, so the blocking recv is reserved
     # for the idle path (plan Phase 2 recv-ahead).
@@ -320,7 +338,7 @@ def test_worker_runtime_responds_in_receive_order():
         ]
     )
 
-    WorkerRuntime(_engine(), server).serve()
+    WorkerServer(_worker(), server).serve()
 
     assert [resp["call_id"] for resp in server.responses] == [1, 2, 3]
     assert [resp["kind"] for resp in server.responses] == ["caps", "metrics", "ok"]
@@ -346,15 +364,19 @@ class _DeferredSeq:
         return {"req_id": self.req_id, "sampled_token_id": self.token}
 
 
-class _DeferredOverlapEngine(StubEngine):
+class _DeferredOverlapWorker(StubWorker):
     def __init__(
         self,
         events: list[str],
         *,
         defer_steps: set[int] | None = None,
         ready_after: dict[int, int] | None = None,
+        pipeline_depth: int = 1,
     ) -> None:
-        super().__init__(block_size=256)
+        super().__init__(
+            block_size=256,
+            pipeline_depth=pipeline_depth,
+        )
         self.events = events
         self.defer_steps = defer_steps or {1}
         self.ready_after = ready_after or {}
@@ -379,7 +401,7 @@ class _DeferredOverlapEngine(StubEngine):
         return super().execute(batch)
 
 
-def test_worker_runtime_depth1_finalizes_each_before_next_dispatch():
+def test_worker_server_depth1_finalizes_each_before_next_dispatch():
     # At depth 1 the oldest forward's deferred D2H is finalized before the next
     # forward is launched (no overlap window).
     events: list[str] = []
@@ -391,7 +413,14 @@ def test_worker_runtime_depth1_finalizes_each_before_next_dispatch():
         ]
     )
 
-    WorkerRuntime(_DeferredOverlapEngine(events, defer_steps={1}), server, pipeline_depth=1).serve()
+    WorkerServer(
+        _DeferredOverlapWorker(
+            events,
+            defer_steps={1},
+            pipeline_depth=1,
+        ),
+        server,
+    ).serve()
 
     assert events.index("finalize:1") < events.index("execute_step:2:defer=True")
     assert [resp["call_id"] for resp in server.responses] == [1, 2, 3]
@@ -401,7 +430,7 @@ def test_worker_runtime_depth1_finalizes_each_before_next_dispatch():
     assert "worker_result_finalize" in component_us
 
 
-def test_worker_runtime_depth3_overlaps_multiple_deferred_finalizes():
+def test_worker_server_depth3_overlaps_multiple_deferred_finalizes():
     # At depth 3 the third forward launches before either earlier deferred D2H
     # finalizes; immediately-ready deferred results still leave in dispatch order.
     events: list[str] = []
@@ -414,8 +443,13 @@ def test_worker_runtime_depth3_overlaps_multiple_deferred_finalizes():
         ]
     )
 
-    WorkerRuntime(
-        _DeferredOverlapEngine(events, defer_steps={1, 2, 3}), server, pipeline_depth=3
+    WorkerServer(
+        _DeferredOverlapWorker(
+            events,
+            defer_steps={1, 2, 3},
+            pipeline_depth=3,
+        ),
+        server,
     ).serve()
 
     assert events.index("execute_step:3:defer=True") < events.index("finalize:1")
@@ -423,7 +457,7 @@ def test_worker_runtime_depth3_overlaps_multiple_deferred_finalizes():
     assert [resp["call_id"] for resp in server.responses] == [1, 2, 3, 4]
 
 
-def test_worker_runtime_sends_ready_work_before_blocked_deferred_execute():
+def test_worker_server_sends_ready_work_before_blocked_deferred_execute():
     events: list[str] = []
     server = _FifoServer(
         [
@@ -434,10 +468,14 @@ def test_worker_runtime_sends_ready_work_before_blocked_deferred_execute():
         ]
     )
 
-    WorkerRuntime(
-        _DeferredOverlapEngine(events, defer_steps={1}, ready_after={1: 3}),
+    WorkerServer(
+        _DeferredOverlapWorker(
+            events,
+            defer_steps={1},
+            ready_after={1: 3},
+            pipeline_depth=4,
+        ),
         server,
-        pipeline_depth=4,
     ).serve()
 
     assert [resp["call_id"] for resp in server.responses] == [2, 3, 1, 4]

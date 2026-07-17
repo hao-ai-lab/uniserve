@@ -1,32 +1,40 @@
-"""Worker process and transport scheduling."""
+"""Pipelined request serving for one already-running worker process."""
+
 from __future__ import annotations
 
 import time
 from collections import deque
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from .execution_pipeline import PendingResult
 
+if TYPE_CHECKING:
+    from .app import WorkerServer
+
 __all__ = [
-    "WorkerProcess",
-    "WorkerTransport",
+    "WorkerIpcTransport",
+    "WorkerServeLoop",
 ]
 
 
-class WorkerTransport(Protocol):
+class WorkerIpcTransport(Protocol):
     def recv(self) -> dict[str, Any]: ...
     def try_recv(self) -> dict[str, Any] | None: ...
-    def respond(self, resp: dict[str, Any]) -> None: ...
+    def respond(self, response: dict[str, Any]) -> None: ...
 
 
-class WorkerProcess:
+class WorkerServeLoop:
     """Owns pipelined receive/dispatch/finalize scheduling."""
 
-    def __init__(self, runtime: Any, transport: WorkerTransport) -> None:
-        self.runtime = runtime
-        self.transport = transport
-        self.inflight: deque[tuple[int | None, PendingResult]] = deque()
-        self.shutdown_resp: dict[str, Any] | None = None
+    def __init__(
+        self,
+        worker_server: WorkerServer,
+        ipc_endpoint: WorkerIpcTransport,
+    ) -> None:
+        self.worker_server = worker_server
+        self.ipc_endpoint = ipc_endpoint
+        self.pending_results: deque[tuple[int | None, PendingResult]] = deque()
+        self.shutdown_response: dict[str, Any] | None = None
         self.draining = False
 
     def run(self) -> None:
@@ -42,32 +50,32 @@ class WorkerProcess:
                 if self._receive_idle_request():
                     break
         finally:
-            self.runtime.profiler.close()
+            self.worker_server.profiler.close()
 
     def _refill_nonblocking(self) -> None:
-        while not self.draining and len(self.inflight) < self.runtime.pipeline_depth:
-            req = self._recv_nonblocking()
-            if req is None:
+        while not self.draining and len(self.pending_results) < self.worker_server.pipeline_depth:
+            request = self._recv_nonblocking()
+            if request is None:
                 return
-            if self._capture_shutdown(req):
+            if self._capture_shutdown(request):
                 return
-            self.inflight.append(self._dispatch(req))
+            self.pending_results.append(self._dispatch(request))
 
     def _finalize_ready(self) -> bool:
-        if not self.inflight:
+        if not self.pending_results:
             return False
-        for idx, item in enumerate(self.inflight):
-            if self.runtime.result_ready(item[1]):
-                ready = self.inflight[idx]
-                del self.inflight[idx]
-                self.runtime.respond_pending(ready[1])
+        for index, item in enumerate(self.pending_results):
+            if self.worker_server.result_ready(item[1]):
+                ready = self.pending_results[index]
+                del self.pending_results[index]
+                self.worker_server.respond_pending(ready[1])
                 return True
         return False
 
     def _wait_for_ready_inflight(self) -> bool:
-        if not self.inflight:
+        if not self.pending_results:
             return False
-        while self.inflight:
+        while self.pending_results:
             self._refill_nonblocking()
             if self._finalize_ready():
                 return True
@@ -75,54 +83,71 @@ class WorkerProcess:
         return True
 
     def _finish_shutdown_if_drained(self) -> bool:
-        if not self.draining or self.inflight:
+        if not self.draining or self.pending_results:
             return False
-        self.runtime.respond_pending(self.shutdown_resp or {"kind": "ok"})
+        self.worker_server.respond_pending(self.shutdown_response or {"kind": "ok"})
         return True
 
     def _receive_idle_request(self) -> bool:
-        req = self._recv_blocking()
-        if self._capture_shutdown(req):
-            self.runtime.respond_pending(self.shutdown_resp or {"kind": "ok"})
+        request = self._recv_blocking()
+        if self._capture_shutdown(request):
+            self.worker_server.respond_pending(self.shutdown_response or {"kind": "ok"})
             return True
-        self.inflight.append(self._dispatch(req))
+        self.pending_results.append(self._dispatch(request))
         return False
 
-    def _capture_shutdown(self, req: dict[str, Any]) -> bool:
-        if req.get("kind") != "shutdown":
+    def _capture_shutdown(self, request: dict[str, Any]) -> bool:
+        if request.get("kind") != "shutdown":
             return False
-        self.shutdown_resp = self._shutdown_response(req)
+        self.shutdown_response = self._shutdown_response(request)
         self.draining = True
         return True
 
     def _recv_nonblocking(self) -> dict[str, Any] | None:
-        try_recv = getattr(self.transport, "try_recv", None)
+        try_recv = getattr(self.ipc_endpoint, "try_recv", None)
         if not callable(try_recv):
             return None
-        t0 = self.runtime.metrics.now_ns()
-        req = try_recv()
-        self.runtime.metrics.record_pipeline("recv", self.runtime.metrics.now_ns() - t0)
-        return cast(dict[str, Any] | None, req)
+        started_ns = self.worker_server.metrics.now_ns()
+        request = try_recv()
+        self.worker_server.metrics.record_pipeline(
+            "recv",
+            self.worker_server.metrics.now_ns() - started_ns,
+        )
+        return cast(dict[str, Any] | None, request)
 
     def _recv_blocking(self) -> dict[str, Any]:
-        t0 = self.runtime.metrics.now_ns()
-        req = self.transport.recv()
-        self.runtime.metrics.record_pipeline("idle", self.runtime.metrics.now_ns() - t0)
-        return req
+        started_ns = self.worker_server.metrics.now_ns()
+        request = self.ipc_endpoint.recv()
+        self.worker_server.metrics.record_pipeline(
+            "idle",
+            self.worker_server.metrics.now_ns() - started_ns,
+        )
+        return request
 
-    def _dispatch(self, req: dict[str, Any]) -> tuple[int | None, PendingResult]:
-        call_id = req.get("call_id")
-        t0 = self.runtime.metrics.now_ns()
-        pending = self.runtime.pending(req, allow_deferred=self.runtime._defer_text_results)
-        self.runtime.metrics.record_pipeline("dispatch", self.runtime.metrics.now_ns() - t0)
+    def _dispatch(
+        self,
+        request: dict[str, Any],
+    ) -> tuple[int | None, PendingResult]:
+        call_id = request.get("call_id")
+        started_ns = self.worker_server.metrics.now_ns()
+        pending = self.worker_server.pending(
+            request,
+            allow_deferred=self.worker_server.allow_deferred_results,
+        )
+        self.worker_server.metrics.record_pipeline(
+            "dispatch",
+            self.worker_server.metrics.now_ns() - started_ns,
+        )
         if call_id is not None:
             pending.response["call_id"] = call_id
         return call_id, pending
 
     @staticmethod
-    def _shutdown_response(req: dict[str, Any]) -> dict[str, Any]:
-        resp: dict[str, Any] = {"kind": "ok"}
-        call_id = req.get("call_id")
+    def _shutdown_response(
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        response: dict[str, Any] = {"kind": "ok"}
+        call_id = request.get("call_id")
         if call_id is not None:
-            resp["call_id"] = call_id
-        return resp
+            response["call_id"] = call_id
+        return response

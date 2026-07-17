@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from uniserve_worker.server.app import WorkerRuntime
+from uniserve_worker.server.app import WorkerServer
 from uniserve_worker.server.profiler import WorkerProfiler
-from uniserve_worker.server.stub import StubEngine
+from uniserve_worker.server.stub import StubWorker
 
 pytestmark = pytest.mark.unit
 
@@ -58,7 +58,7 @@ def test_worker_profiler_is_disabled_without_output_dir(monkeypatch):
         pass
 
 
-def test_worker_runtime_cpu_profiler_exports_execute_trace(monkeypatch, tmp_path):
+def test_worker_server_cpu_profiler_exports_execute_trace(monkeypatch, tmp_path):
     pytest.importorskip("torch")
     _clear_profiler_env(monkeypatch)
     monkeypatch.setenv("UNISERVE_PROFILE_DIR", str(tmp_path))
@@ -66,9 +66,12 @@ def test_worker_runtime_cpu_profiler_exports_execute_trace(monkeypatch, tmp_path
     monkeypatch.setenv("UNISERVE_PROFILE_STEPS", "1")
     monkeypatch.setenv("UNISERVE_PROFILE_PREFIX", "unit-worker")
 
-    resp = WorkerRuntime(StubEngine(block_size=256), server=None).handle(_execute_req())
+    response = WorkerServer(
+        StubWorker(block_size=256),
+        ipc_endpoint=None,
+    ).handle(_execute_req())
 
-    assert resp["kind"] == "result"
+    assert response["kind"] == "result"
     traces = list(tmp_path.glob("unit-worker-*.trace.json.gz"))
     summaries = list(tmp_path.glob("unit-worker-*.summary.txt"))
     assert traces

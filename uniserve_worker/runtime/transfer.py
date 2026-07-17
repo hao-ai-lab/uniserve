@@ -17,6 +17,7 @@ Backends (one chosen per worker via :func:`make_transport`):
   fallback). One engine per worker; ``register_memory`` is cached per pointer so
   each buffer is registered exactly once.
 """
+
 from __future__ import annotations
 
 import base64
@@ -31,7 +32,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 
 if TYPE_CHECKING:
     import torch
@@ -47,6 +48,7 @@ __all__ = [
     "TransportKind",
     "TRANSPORTS",
 ]
+
 
 class TransportKind(StrEnum):
     LOCAL = "local"
@@ -447,7 +449,9 @@ class MooncakeTransport(Transport):
     def fetch(self, locator: Locator) -> "torch.Tensor":
         import torch
 
-        dst = torch.empty(locator.shape, dtype=_dtype_from_str(locator.dtype), device=locator.device)
+        dst = torch.empty(
+            locator.shape, dtype=_dtype_from_str(locator.dtype), device=locator.device
+        )
         dptr = int(dst.data_ptr())
         self._register_once(dptr, locator.nbytes)
         rc = self.engine.transfer_sync_read(locator.session, dptr, locator.addr, locator.nbytes)
@@ -523,7 +527,9 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     try:
         kind = TransportKind(raw_name)
     except ValueError as exc:
-        raise invalid_descriptor(f"unknown transport {raw_name!r}; expected one of {TRANSPORTS}") from exc
+        raise invalid_descriptor(
+            f"unknown transport {raw_name!r}; expected one of {TRANSPORTS}"
+        ) from exc
     if kind is TransportKind.LOCAL:
         return LocalTransport()
     if kind is TransportKind.SHM:
@@ -531,7 +537,7 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     if kind is TransportKind.CUDA_IPC:
         return CudaIpcTransport()
     if kind is TransportKind.MOONCAKE:
-        runtime = get_worker_config()
+        runtime = get_execution_config()
         return MooncakeTransport(
             device_name=cfg.get("device_name", runtime.mooncake_device),
             protocol=cfg.get("protocol", runtime.mooncake_protocol),

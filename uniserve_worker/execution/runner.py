@@ -3,6 +3,7 @@
 Owns request-state creation, wire-op parsing into ``UniForwardBatch``, model
 ``forward`` dispatch, and per-op result reassembly.
 """
+
 from __future__ import annotations
 
 import logging
@@ -24,7 +25,7 @@ from ..contracts.model_protocols import ModelHooks, UniModel
 from ..contracts.resource_plan import LatentTokens, ResourcePlan
 from ..foundation.env import env_flag
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 from ..runtime.forward_batch_builder import ForwardBatchBuilder
 from ..runtime.request_session import RequestSessionTable
 from ..runtime.residency_manager import ResidencyLeaseManager
@@ -52,15 +53,13 @@ if TYPE_CHECKING:
     from ..runtime.residency import ResidencyManager
 
 __all__ = [
-    'ModelRunner',
-    'RunnerConfig',
-    'RunnerDrivers',
+    "ModelRunner",
+    "RunnerConfig",
+    "RunnerComponents",
 ]
 
 # Modes routed to the typed text driver.
-_TEXT_DRIVER_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
-)
+_TEXT_DRIVER_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
 
 logger = logging.getLogger(__name__)
 _MIXED_PROOF_LOG = logging.getLogger("uniserve.mixed_proof")
@@ -81,8 +80,8 @@ def _model_max_context_len(model: Any) -> int:
 
 
 @dataclass
-class RunnerDrivers:
-    """Optional per-modality driver overrides for ``ModelRunner``.
+class RunnerComponents:
+    """Optional per-modality execution overrides for ``ModelRunner``.
 
     Each is constructed with a default when left ``None``; the text driver is
     additionally wired to the system text-execution stack built in ``__init__``.
@@ -111,7 +110,7 @@ class RunnerConfig:
 
 
 @dataclass
-class _ResolvedRunnerDeps:
+class _ResolvedRunnerDependencies:
     batch_policy: BatchPolicy | None
     attention_backend: Any | None
     denoise_driver: DenoiseDriver | None
@@ -139,7 +138,7 @@ class ModelRunner:
         model: UniModel,
         request_states: RequestSessionTable | None = None,
         *,
-        drivers: RunnerDrivers | None = None,
+        components: RunnerComponents | None = None,
         config: RunnerConfig | None = None,
         resource_runtime: ResourceRuntime | None = None,
         residency: "ResidencyManager | None" = None,
@@ -155,8 +154,8 @@ class ModelRunner:
     ):
         if not isinstance(model, ModelHooks):
             raise capability_mismatch("runner model must inherit ModelHooks")
-        deps = self._resolve_deps(
-            drivers=drivers,
+        dependencies = self._resolve_dependencies(
+            components=components,
             config=config,
             batch_policy=batch_policy,
             attention_backend=attention_backend,
@@ -175,19 +174,25 @@ class ModelRunner:
         # Deferred sampling: text decode/extend ops publish logits to
         # ``tensor_store`` and return handles — a separate Sampler worker samples.
         # Off = sample inline (default).
-        self.defer_sampling = bool(deps.defer_sampling) and deps.tensor_store is not None
-        self.tensor_store = deps.tensor_store
-        self.simulation = bool(deps.simulation)
-        self.batch_policy = deps.batch_policy or self._model_batch_policy()
-        self.attention_backend, self.attention_preference = self._resolve_attention_backend(
-            deps.attention_backend
+        self.defer_sampling = (
+            bool(dependencies.defer_sampling) and dependencies.tensor_store is not None
         )
-        self.denoise_driver = deps.denoise_driver or DenoiseDriver()
-        self.encode_driver = deps.encode_driver or EncodeDriver()
-        self.image_decode_driver = deps.image_decode_driver or ImageDecodeDriver()
-        self._init_text_execution(model, residency, deps.text_driver)
+        self.tensor_store = dependencies.tensor_store
+        self.simulation = bool(dependencies.simulation)
+        self.batch_policy = dependencies.batch_policy or self._model_batch_policy()
+        self.attention_backend, self.attention_preference = self._resolve_attention_backend(
+            dependencies.attention_backend
+        )
+        self.denoise_driver = dependencies.denoise_driver or DenoiseDriver()
+        self.encode_driver = dependencies.encode_driver or EncodeDriver()
+        self.image_decode_driver = dependencies.image_decode_driver or ImageDecodeDriver()
+        self._init_text_execution(
+            model,
+            residency,
+            dependencies.text_driver,
+        )
         self._init_unified_forward_execution(model, residency)
-        self.multimodal_processor = deps.multimodal_processor
+        self.multimodal_processor = dependencies.multimodal_processor
         self._init_resource_accounting(resource_runtime, residency)
         # CUDA Green Context SM partitioning. ``None`` unless runtime config
         # enables it and the model runs on a CUDA device.
@@ -214,7 +219,7 @@ class ModelRunner:
             default_device=device,
         )
         self.forward_graph_policy = ForwardGraphPolicy(
-            prefer_graph=bool(get_worker_config().cuda_graph),
+            prefer_graph=bool(get_execution_config().cuda_graph),
             strict=not self.simulation,
         )
         self.forward_graph_runner = self._build_forward_graph_runner(model)
@@ -245,6 +250,7 @@ class ModelRunner:
             ForwardGraphProgram,
             PackedVisibleGraphProgram,
         )
+
         programs: list[ForwardGraphProgram] = []
 
         if self.text_graph_runner is not None:
@@ -337,9 +343,9 @@ class ModelRunner:
         )
 
     @staticmethod
-    def _resolve_deps(
+    def _resolve_dependencies(
         *,
-        drivers: RunnerDrivers | None,
+        components: RunnerComponents | None,
         config: RunnerConfig | None,
         batch_policy: BatchPolicy | None,
         attention_backend: Any | None,
@@ -350,22 +356,26 @@ class ModelRunner:
         multimodal_processor: Any | None,
         defer_sampling: bool,
         tensor_store: Any | None,
-    ) -> _ResolvedRunnerDeps:
-        drivers = drivers or RunnerDrivers()
+    ) -> _ResolvedRunnerDependencies:
+        components = components or RunnerComponents()
         config = config or RunnerConfig()
-        return _ResolvedRunnerDeps(
+        return _ResolvedRunnerDependencies(
             batch_policy=batch_policy if batch_policy is not None else config.batch_policy,
             attention_backend=(
                 attention_backend if attention_backend is not None else config.attention_backend
             ),
-            denoise_driver=denoise_driver if denoise_driver is not None else drivers.denoise_driver,
-            encode_driver=encode_driver if encode_driver is not None else drivers.encode_driver,
+            denoise_driver=(
+                denoise_driver if denoise_driver is not None else components.denoise_driver
+            ),
+            encode_driver=(
+                encode_driver if encode_driver is not None else components.encode_driver
+            ),
             image_decode_driver=(
                 image_decode_driver
                 if image_decode_driver is not None
-                else drivers.image_decode_driver
+                else components.image_decode_driver
             ),
-            text_driver=text_driver if text_driver is not None else drivers.text_driver,
+            text_driver=(text_driver if text_driver is not None else components.text_driver),
             multimodal_processor=(
                 multimodal_processor
                 if multimodal_processor is not None
@@ -438,7 +448,9 @@ class ModelRunner:
             try:
                 graph_runner.warmup(model)
             except Exception:  # noqa: BLE001 - a warmup failure must never block serving.
-                logger.warning("text CUDA-graph warmup failed; falling back to eager", exc_info=True)
+                logger.warning(
+                    "text CUDA-graph warmup failed; falling back to eager", exc_info=True
+                )
         return _TextExecutionStack(
             ForwardBatchBuilder(max_context_len=max_context_len),
             gate,
@@ -450,7 +462,7 @@ class ModelRunner:
         return model.kv_cache_spec()
 
     def _maybe_build_stream_manager(self):
-        if not get_worker_config().green_contexts:
+        if not get_execution_config().green_contexts:
             return None
         import torch
 
@@ -464,7 +476,9 @@ class ModelRunner:
             manager = StreamManager(int(gpu_id))
             logger.info(
                 "green contexts enabled: %d SMs, %d stream groups (partitioned=%s)",
-                manager.total_sms, len(manager.stream_groups), manager.using_green_contexts,
+                manager.total_sms,
+                len(manager.stream_groups),
+                manager.using_green_contexts,
             )
             return manager
         except Exception:  # noqa: BLE001 - never let a stream-setup failure block serving.
@@ -567,7 +581,11 @@ class ModelRunner:
         n_tok = sum(len(op.get("token_ids") or []) for _, op in group)
         _MIXED_PROOF_LOG.info(
             "MIXED FORWARD executed: %d ops (%d extend + %d decode + %d denoise), %d tokens",
-            len(fb.ops), n_ext, n_dec, n_den, n_tok,
+            len(fb.ops),
+            n_ext,
+            n_dec,
+            n_den,
+            n_tok,
         )
 
     def _log_text_mixed_split(self, ops: list[Mapping[str, Any]], decision: Any) -> None:
@@ -577,7 +595,8 @@ class ModelRunner:
             _MIXED_PROOF_LOG.warning(
                 "MIXED TEXT SPLIT: scheduler co-batched %d ops with both prefill+decode "
                 "and runner is splitting per-mode (use_forward=%s)",
-                len(ops), decision.use_forward,
+                len(ops),
+                decision.use_forward,
             )
 
     def _model_batch_policy(self) -> BatchPolicy:
@@ -600,7 +619,9 @@ class ModelRunner:
             totals["image_latent"] = int(caps.max_latent_size if caps is not None else 0)
         if "encoder_output" in totals:
             totals["encoder_output"] = int(
-                caps.encoder_cache_budget if caps is not None and caps.encoder_cache_budget is not None else 0
+                caps.encoder_cache_budget
+                if caps is not None and caps.encoder_cache_budget is not None
+                else 0
             )
         if "adapter" in totals:
             totals["adapter"] = 0
@@ -650,7 +671,9 @@ class ModelRunner:
                 try:
                     return max(1, int(op.get("decode_token_count") or 1))
                 except (TypeError, ValueError):
-                    raise invalid_descriptor("decode_token_count must be a positive integer") from None
+                    raise invalid_descriptor(
+                        "decode_token_count must be a positive integer"
+                    ) from None
             tokens = op.get("token_ids") or []
             return len(tokens) if isinstance(tokens, (list, tuple)) else 0
         if mode == ForwardMode.DENOISE:

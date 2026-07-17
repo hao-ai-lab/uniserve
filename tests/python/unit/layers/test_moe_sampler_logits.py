@@ -31,8 +31,8 @@ pytestmark = pytest.mark.unit
 def _set_worker_runtime(monkeypatch, **kwargs):
     monkeypatch.setattr(
         runtime_config,
-        "_CURRENT_CONFIG",
-        replace(runtime_config.get_worker_config(), **kwargs),
+        "_CURRENT_EXECUTION_CONFIG",
+        replace(runtime_config.get_execution_config(), **kwargs),
     )
 
 

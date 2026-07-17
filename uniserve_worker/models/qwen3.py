@@ -10,6 +10,7 @@ advances KV length — the worker runtime (``ResidencyManager`` /
 the sampler) owns all of that. The model only *declares* its KV geometry via
 :meth:`kv_cache_spec` so the system can own the pool.
 """
+
 from __future__ import annotations
 
 import logging
@@ -21,13 +22,13 @@ import torch
 import uniserve_worker.ops as ops
 
 __all__ = [
-    'Qwen3Attention',
-    'Qwen3MLP',
-    'Qwen3MoE',
-    'Qwen3DecoderLayer',
-    'Qwen3Model',
-    'Qwen3ForCausalLM',
-    'EntryClass',
+    "Qwen3Attention",
+    "Qwen3MLP",
+    "Qwen3MoE",
+    "Qwen3DecoderLayer",
+    "Qwen3Model",
+    "Qwen3ForCausalLM",
+    "EntryClass",
 ]
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ import torch.nn as nn
 
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
 from ..execution.model_base import UniModelBase
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -68,6 +69,7 @@ from ..runtime.compile import CompileTarget
 from ..runtime.residency import KvCacheSpec
 
 logger = logging.getLogger(__name__)
+
 
 def _cfg(config: Any | None) -> SimpleNamespace:
     if isinstance(config, SimpleNamespace):
@@ -101,7 +103,9 @@ def _cfg(config: Any | None) -> SimpleNamespace:
 def _expert_cfg(cfg: SimpleNamespace, intermediate_size: int | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=cfg.hidden_size,
-        intermediate_size=int(intermediate_size or getattr(cfg, "moe_intermediate_size", cfg.intermediate_size)),
+        intermediate_size=int(
+            intermediate_size or getattr(cfg, "moe_intermediate_size", cfg.intermediate_size)
+        ),
     )
 
 
@@ -133,7 +137,9 @@ class Qwen3Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.rope_theta = float(getattr(cfg, "rope_theta", 1000000.0))
-        self.attn = RadixAttention(self.num_heads, self.num_kv_heads, self.head_dim, layer_id=layer_id)
+        self.attn = RadixAttention(
+            self.num_heads, self.num_kv_heads, self.head_dim, layer_id=layer_id
+        )
 
     def forward(
         self,
@@ -148,15 +154,23 @@ class Qwen3Attention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         batched = len(state_shape) == 2
         batched_decode = batched and int(state_shape[1]) == 1
-        fused_prefill = self._try_fused_prefill(qkv, state_shape, forward_batch, batched, cos, sin, positions)
+        fused_prefill = self._try_fused_prefill(
+            qkv, state_shape, forward_batch, batched, cos, sin, positions
+        )
         if fused_prefill is not None:
             return fused_prefill
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._prepare_qk(q, k, v, batched_decode, cos, sin)
-        q_attn, k_attn, v_attn = self._attention_inputs(q, k, v, state_shape, batched_decode, batched)
-        out = self.attn(q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale)
-        return self.o_proj(self._restore_attention_output(out, state_shape, batched_decode, batched))
+        q_attn, k_attn, v_attn = self._attention_inputs(
+            q, k, v, state_shape, batched_decode, batched
+        )
+        out = self.attn(
+            q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale
+        )
+        return self.o_proj(
+            self._restore_attention_output(out, state_shape, batched_decode, batched)
+        )
 
     def _try_fused_prefill(
         self,
@@ -186,7 +200,9 @@ class Qwen3Attention(nn.Module):
         v_attn = v.reshape(-1, self.num_kv_heads, self.head_dim)
         q_attn = q_attn.to(dtype=v_attn.dtype)
         k_attn = k_attn.to(dtype=v_attn.dtype)
-        out = self.attn(q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale)
+        out = self.attn(
+            q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale
+        )
         return self.o_proj(out.reshape(*state_shape, self.q_size))
 
     def _prepare_qk(
@@ -233,8 +249,12 @@ class Qwen3Attention(nn.Module):
             batch, seq = int(state_shape[0]), int(state_shape[1])
             return (
                 q.reshape(batch, seq, self.num_heads, self.head_dim).transpose(1, 2).contiguous(),
-                k.reshape(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous(),
-                v.reshape(batch, seq, self.num_kv_heads, self.head_dim).transpose(1, 2).contiguous(),
+                k.reshape(batch, seq, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+                .contiguous(),
+                v.reshape(batch, seq, self.num_kv_heads, self.head_dim)
+                .transpose(1, 2)
+                .contiguous(),
             )
         return q, k, v
 
@@ -251,6 +271,7 @@ class Qwen3Attention(nn.Module):
             return out.transpose(1, 2).reshape(*state_shape, self.q_size)
         return out.reshape(*state_shape, self.q_size)
 
+
 class Qwen3MoE(nn.Module):
     """Mixture-of-experts feed-forward routed by a learned gate."""
 
@@ -259,7 +280,9 @@ class Qwen3MoE(nn.Module):
         num_experts = int(getattr(cfg, "num_experts", 0) or 0)
         top_k = int(getattr(cfg, "num_experts_per_tok", 1) or 1)
         self.gate = LinearBase(cfg.hidden_size, num_experts, bias=False)
-        expert_intermediate = int(getattr(cfg, "moe_intermediate_size", cfg.intermediate_size) or cfg.intermediate_size)
+        expert_intermediate = int(
+            getattr(cfg, "moe_intermediate_size", cfg.intermediate_size) or cfg.intermediate_size
+        )
         self.experts = FusedMoE(
             [Qwen3MLP(_expert_cfg(cfg, expert_intermediate)) for _ in range(num_experts)],
             top_k=top_k,
@@ -314,7 +337,9 @@ class Qwen3Model(nn.Module):
     def __init__(self, cfg: SimpleNamespace) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
-        self.layers = nn.ModuleList(Qwen3DecoderLayer(cfg, idx) for idx in range(cfg.num_hidden_layers))
+        self.layers = nn.ModuleList(
+            Qwen3DecoderLayer(cfg, idx) for idx in range(cfg.num_hidden_layers)
+        )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.rotary = get_rope(
             cfg.head_dim,
@@ -369,7 +394,9 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         self._quant_config = QuantizationConfig.from_model_config(config)
         with use_quantization_config(self._quant_config):
             self.model = Qwen3Model(self.config)
-            self.lm_head = ParallelLMHead(self.config.hidden_size, self.config.vocab_size, bias=False)
+            self.lm_head = ParallelLMHead(
+                self.config.hidden_size, self.config.vocab_size, bias=False
+            )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits = LogitsProcessor()
@@ -499,7 +526,10 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
 
         from ..contracts.forward_mode import ForwardMode
 
-        if forward_batch.forward_mode == ForwardMode.VERIFY_DRAFT or forward_batch.return_all_logits:
+        if (
+            forward_batch.forward_mode == ForwardMode.VERIFY_DRAFT
+            or forward_batch.return_all_logits
+        ):
             return self.logits(hidden, self.lm_head, valid_vocab_size=self.output_vocab_size)
         if hidden.ndim == 3:
             last_hidden = hidden[:, -1, :]
@@ -530,9 +560,8 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
 
     def _cast_non_quantized_float32_parameters(self, dtype: torch.dtype) -> None:
         for param in self.parameters():
-            if (
-                param.dtype == torch.float32
-                and not bool(getattr(param, "_uniserve_skip_serving_cast", False))
+            if param.dtype == torch.float32 and not bool(
+                getattr(param, "_uniserve_skip_serving_cast", False)
             ):
                 param.data = param.data.to(dtype=dtype)
 
@@ -565,7 +594,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
             kv_token_capacity=kv_token_capacity,
             bytes_per_token=self._kv_bytes_per_token(compute_dtype),
             device=device,
-            memory_fraction=get_worker_config().kv_memory_fraction,
+            memory_fraction=get_execution_config().kv_memory_fraction,
         )
         if capacity.cuda is not None:
             logger.info(

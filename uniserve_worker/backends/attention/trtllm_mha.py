@@ -1,4 +1,5 @@
 """FlashInfer TRT-LLM MHA attention backend."""
+
 from __future__ import annotations
 
 from typing import Any, NamedTuple
@@ -6,7 +7,7 @@ from typing import Any, NamedTuple
 import torch
 
 from ...contracts.forward_context import get_forward_context
-from ...foundation.runtime_config import get_worker_config
+from ...foundation.runtime_config import get_execution_config
 from .base import AttentionCapabilities
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
@@ -23,8 +24,12 @@ else:  # pragma: no cover
 _trtllm_decode = None
 _trtllm_context = None
 if _flashinfer is not None:  # pragma: no cover - availability-specific.
-    _trtllm_decode = getattr(getattr(_flashinfer, "decode", None), "trtllm_batch_decode_with_kv_cache", None)
-    _trtllm_context = getattr(getattr(_flashinfer, "prefill", None), "trtllm_batch_context_with_kv_cache", None)
+    _trtllm_decode = getattr(
+        getattr(_flashinfer, "decode", None), "trtllm_batch_decode_with_kv_cache", None
+    )
+    _trtllm_context = getattr(
+        getattr(_flashinfer, "prefill", None), "trtllm_batch_context_with_kv_cache", None
+    )
 
 
 class _PagedDecodeInputs(NamedTuple):
@@ -204,7 +209,9 @@ class TRTLLMMHAAttentionBackend:
             raise ValueError("trtllm_mha varlen requires a non-empty batch")
         if int(block_table.shape[0]) != batch_size:
             raise ValueError("block table rows must match cu_seqlens batch size")
-        return _VarlenPrefillInputs(q.contiguous(), block_table, cu_seqlens_q, cu_seqlens_k, batch_size)
+        return _VarlenPrefillInputs(
+            q.contiguous(), block_table, cu_seqlens_q, cu_seqlens_k, batch_size
+        )
 
     def _maybe_write_decode_token(
         self,
@@ -237,7 +244,7 @@ class TRTLLMMHAAttentionBackend:
         workspace = self._workspaces.get(resolved)
         if workspace is None:
             workspace = torch.zeros(
-                get_worker_config().flashinfer.workspace_size,
+                get_execution_config().flashinfer.workspace_size,
                 dtype=torch.uint8,
                 device=resolved,
             )
@@ -254,7 +261,9 @@ def _validate_paged_cache(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch
         raise ValueError("query head dim does not match paged KV cache")
 
 
-def _hnd_kv_cache(k_cache: torch.Tensor, v_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _hnd_kv_cache(
+    k_cache: torch.Tensor, v_cache: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     if k_cache.ndim != 4 or v_cache.ndim != 4 or k_cache.shape != v_cache.shape:
         raise ValueError("trtllm_mha paged cache expects matching 4D k/v tensors")
     k_hnd = k_cache.permute(0, 2, 1, 3)
@@ -279,7 +288,9 @@ def _metadata_context_len(default: int) -> int:
 def _canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
     sizes = tensor.size()
     strides = tensor.stride()
-    if not any(sizes[idx] == 1 and strides[idx] == strides[idx + 1] for idx in range(tensor.dim() - 1)):
+    if not any(
+        sizes[idx] == 1 and strides[idx] == strides[idx + 1] for idx in range(tensor.dim() - 1)
+    ):
         return tensor
     new_strides = [0] * tensor.dim()
     new_strides[-1] = 1

@@ -1,4 +1,5 @@
 """Default-off torch.compile helpers for model-owned piecewise compilation."""
+
 from __future__ import annotations
 
 import logging
@@ -12,18 +13,18 @@ import torch.nn as nn
 
 from ..foundation.env import DEFAULT_COMPILE_BACKEND
 from ..foundation.errors import capability_mismatch
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 from ..foundation.triton_compat import ensure_blackwell_ptxas
 
 __all__ = [
-    'is_compiled',
-    'TorchCompileConfig',
-    'CompileTarget',
-    'CompileReport',
-    'maybe_compile_module',
-    'compile_targets',
-    'compile_model_pieces',
-    'named_child_compile_targets',
+    "is_compiled",
+    "TorchCompileConfig",
+    "CompileTarget",
+    "CompileReport",
+    "maybe_compile_module",
+    "compile_targets",
+    "compile_model_pieces",
+    "named_child_compile_targets",
 ]
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ class TorchCompileConfig:
 
     @classmethod
     def from_runtime_config(cls) -> "TorchCompileConfig":
-        cfg = get_worker_config().torch_compile
+        cfg = get_execution_config().torch_compile
         return cls(
             enabled=cfg.enabled,
             backend=cfg.backend,

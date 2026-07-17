@@ -11,6 +11,7 @@ Covers three public surfaces:
   ``None`` / ``"gen"`` / ``"und"`` / unknown-role behavior and the disjoint,
   jointly-complete gen/und predicates.
 """
+
 from __future__ import annotations
 
 import base64
@@ -115,21 +116,21 @@ def _two_arch_registry():
 def _restore_worker_config():
     """Save/restore the process-global worker config around a test.
 
-    ``resolve()`` reads ``get_worker_config().disabled_model_archs``; tests that
+    ``resolve()`` reads ``get_execution_config().disabled_model_archs``; tests that
     flip it must leave the global config exactly as they found it so order does
     not matter.
     """
-    original = runtime_config_module.get_worker_config()
+    original = runtime_config_module.get_execution_config()
     try:
         yield original
     finally:
-        runtime_config_module.set_worker_config(original)
+        runtime_config_module.set_execution_config(original)
 
 
 def test_resolve_skips_disabled_arch_and_returns_next_enabled(
     _two_arch_registry, _restore_worker_config
 ):
-    runtime_config_module.set_worker_config(
+    runtime_config_module.set_execution_config(
         replace(_restore_worker_config, disabled_model_archs=("Arch1",))
     )
 
@@ -139,10 +140,8 @@ def test_resolve_skips_disabled_arch_and_returns_next_enabled(
     assert resolved is _ModelArch2
 
 
-def test_resolve_returns_arch_when_not_disabled(
-    _two_arch_registry, _restore_worker_config
-):
-    runtime_config_module.set_worker_config(
+def test_resolve_returns_arch_when_not_disabled(_two_arch_registry, _restore_worker_config):
+    runtime_config_module.set_execution_config(
         replace(_restore_worker_config, disabled_model_archs=("Arch2",))
     )
 
@@ -155,7 +154,7 @@ def test_resolve_returns_arch_when_not_disabled(
 def test_resolve_raises_capability_mismatch_when_all_requested_disabled(
     _two_arch_registry, _restore_worker_config
 ):
-    runtime_config_module.set_worker_config(
+    runtime_config_module.set_execution_config(
         replace(_restore_worker_config, disabled_model_archs=("Arch1", "Arch2"))
     )
 
@@ -175,7 +174,7 @@ def test_resolve_raises_capability_mismatch_for_unknown_arch(_two_arch_registry)
 def test_resolve_rejects_unknown_arch_with_fallback_disabled(_restore_worker_config):
     registry = ModelRegistry()
     registry.register(_FallbackA, names=_FallbackA.architectures)
-    runtime_config_module.set_worker_config(
+    runtime_config_module.set_execution_config(
         replace(_restore_worker_config, allow_transformers_fallback=False)
     )
 
@@ -189,7 +188,7 @@ def test_resolve_rejects_unknown_arch_with_fallback_disabled(_restore_worker_con
 def test_resolve_returns_fallback_only_when_explicitly_enabled(_restore_worker_config):
     registry = ModelRegistry()
     registry.register(_FallbackA, names=_FallbackA.architectures)
-    runtime_config_module.set_worker_config(
+    runtime_config_module.set_execution_config(
         replace(_restore_worker_config, allow_transformers_fallback=True)
     )
 

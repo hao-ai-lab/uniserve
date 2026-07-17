@@ -30,6 +30,7 @@ Model-neutral: the concrete model is only touched through the duck-typed
 ``InterleavedTextCacheDriver`` / ``InterleavedModelOwner`` surface plus an
 optional ``text_decode_graph_query_geometry`` owner hook.
 """
+
 from __future__ import annotations
 
 import logging
@@ -42,7 +43,7 @@ from ....contracts.attention_plan import PagedVarlenPlan
 from ....contracts.forward_context import get_forward_context
 from ....contracts.forward_mode import ForwardMode, mode_for_op
 from ....foundation.errors import invalid_descriptor
-from ....foundation.runtime_config import get_worker_config
+from ....foundation.runtime_config import get_execution_config
 from ....runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
 from ....runtime.tensor_staging import TextTensorStager
 from ...interleaved_text_stepper import hydrate_cached_prefix_from_op, resolve_op_token_ids
@@ -83,7 +84,10 @@ def _owner_max_context_len(owner: Any, pool: Any) -> int:
             continue
         if parsed > 0:
             return parsed
-    return max(0, int(getattr(pool, "num_blocks", 0) or 0) * int(getattr(pool, "block_size", 0) or 0))
+    return max(
+        0, int(getattr(pool, "num_blocks", 0) or 0) * int(getattr(pool, "block_size", 0) or 0)
+    )
+
 
 class _InterleavedDecodeGraphPast:
     """Native-language-model ``past_key_values`` bound to a shared graph cache.
@@ -109,9 +113,7 @@ class _InterleavedDecodeGraphPast:
 
     def request_cache_for_update(self, layer_idx: int, n_tokens: int) -> BatchedPagedRequestCache:
         if int(n_tokens) != 1:
-            raise invalid_descriptor(
-                "interleaved decode graph requires exactly one token per row"
-            )
+            raise invalid_descriptor("interleaved decode graph requires exactly one token per row")
         return self.cache
 
     def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
@@ -192,7 +194,7 @@ class InterleavedTextPrefillGraphRunner:
     """Route interleaved text prefill through the shared prefill graph."""
 
     def __init__(self) -> None:
-        runtime = get_worker_config()
+        runtime = get_execution_config()
         self._prefill = PrefillCudaGraphRunner(
             name="interleaved_text",
             default_enabled=runtime.prefill_cuda_graph,
@@ -337,9 +339,7 @@ class InterleavedTextPrefillGraphRunner:
         )
         query_lens_cpu = tuple(row.raw_len for row in rows)
         cache_seqlens_cpu = tuple(row.base_len for row in rows)
-        kv_seqlens_cpu = tuple(
-            row.base_len + row.raw_len for row in rows
-        )
+        kv_seqlens_cpu = tuple(row.base_len + row.raw_len for row in rows)
         query_lens = torch.tensor(query_lens_cpu, dtype=torch.int32, device=device)
         cache_seqlens = graph_cache.cache_seqlens(device=device)
         kv_seqlens = torch.tensor(kv_seqlens_cpu, dtype=torch.int32, device=device)
@@ -423,7 +423,7 @@ class InterleavedTextDecodeGraphRunner:
     """Route interleaved one-token text decode through the shared decode graph."""
 
     def __init__(self) -> None:
-        runtime = get_worker_config()
+        runtime = get_execution_config()
         self._decode = DecodeCudaGraphRunner(
             name="interleaved_text",
             default_enabled=runtime.cuda_graph,
@@ -571,9 +571,7 @@ class InterleavedTextDecodeGraphRunner:
             owner=owner,
             kv_pool=pool,
             num_blocks=int(pool.num_blocks),
-            attention_preference=getattr(
-                get_forward_context(), "attention_preference", None
-            ),
+            attention_preference=getattr(get_forward_context(), "attention_preference", None),
         )
         if prepare_backend is None:
             # No re-plannable paged-decode backend or no query-geometry hook: a
@@ -656,7 +654,9 @@ class InterleavedTextDecodeGraphRunner:
             self._sidecars[id(state)] = sidecar
         return sidecar
 
-    def _forward(self, driver: "InterleavedTextCacheDriver", state: TextDecodeGraphState) -> torch.Tensor:
+    def _forward(
+        self, driver: "InterleavedTextCacheDriver", state: TextDecodeGraphState
+    ) -> torch.Tensor:
         sidecar = self._sidecar_for(state)
         outputs = driver.owner.interleaved_text_forward(
             input_ids=state.input_ids,

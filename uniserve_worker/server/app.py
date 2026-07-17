@@ -1,17 +1,16 @@
-"""WorkerRuntime: the reusable worker shell.
+"""WorkerServer: IPC dispatch and lifecycle around one execution worker.
 
 Owns the host↔worker IPC endpoint, request dispatch, capability gating,
-typed-error classification, and metrics. Model-specific work lives behind a
-caps/execute/drop_request adapter; for runner-backed models that adapter is the
-generic runner driver, so models never touch IPC or control dispatch.
+typed-error classification, metrics, and deferred result delivery. Model
+materialization and execution choices are resolved before this module starts.
 """
+
 from __future__ import annotations
 
-import inspect
 import logging
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping
 
-from ..contracts.caps import CONTROL_KINDS, Caps, validate_caps, validate_forward_result
+from ..contracts.caps import CONTROL_KINDS, validate_caps, validate_forward_result
 from ..contracts.outputs import FinalizableSeqResult
 from ..foundation.errors import (
     WorkerError,
@@ -19,20 +18,21 @@ from ..foundation.errors import (
     scheduler_bug,
     should_capture_trace,
 )
+from ..worker.protocol import ResultPolicy, Worker
 from .control_plane import ControlPlane
 from .execution_pipeline import ExecutionPipeline, PendingResult
 from .metrics import MetricsService
 from .profiler import WorkerProfiler
-from .worker_kind import FULL as WORKER_KIND_FULL
-from .worker_kind import UND as WORKER_KIND_UND
-from .worker_kind import restrict_supported_ops
 
-__all__ = ["WorkerRuntime", "WorkerDriver", "dispatch"]
+if TYPE_CHECKING:
+    from .process import WorkerIpcTransport
+
+__all__ = ["WorkerServer", "dispatch"]
 
 logger = logging.getLogger(__name__)
 
 # Control op kinds (vs get_caps/execute/drop_request/shutdown). Controls absent
-# from the driver's declared ``supported_controls`` raise UnsupportedControl.
+# from the worker's declared ``supported_controls`` raise UnsupportedControl.
 # Vocabulary is owned by ``CONTROL_KINDS`` so dispatch and caps validation stay aligned.
 RESPONSE_OPTIONAL_FIELDS = (
     "call_id",
@@ -76,41 +76,41 @@ METRIC_MAP_FIELDS = (
 )
 
 
-def _driver_caps(driver: "WorkerDriver") -> dict:
-    return driver.caps().to_wire()
+def _worker_caps(worker: Worker) -> dict:
+    return worker.caps().to_wire()
 
 
-def _complete_seq_result(raw: dict) -> dict:
-    raw = _finalize_seq_result(raw)
-    out = {"req_id": raw.get("req_id")}
+def _complete_seq_result(payload: dict) -> dict:
+    payload = _finalize_seq_result(payload)
+    response = {"req_id": payload.get("req_id")}
     for key in SEQ_RESULT_FIELDS:
-        out[key] = raw.get(key)
-    out["denoise_done"] = bool(out["denoise_done"])
-    return out
+        response[key] = payload.get(key)
+    response["denoise_done"] = bool(response["denoise_done"])
+    return response
 
 
-def _complete_result(raw: dict) -> dict:
-    _finalize_result_inplace(raw)
+def _complete_result(payload: dict) -> dict:
+    _finalize_result_inplace(payload)
     return {
-        "step_id": raw.get("step_id"),
-        "per_seq": [_complete_seq_result(dict(item)) for item in raw.get("per_seq") or []],
-        "worker_exec_us": raw.get("worker_exec_us"),
-        "forward_stats": raw.get("forward_stats"),
+        "step_id": payload.get("step_id"),
+        "per_seq": [_complete_seq_result(dict(item)) for item in payload.get("per_seq") or []],
+        "worker_exec_us": payload.get("worker_exec_us"),
+        "forward_stats": payload.get("forward_stats"),
     }
 
 
-def _complete_metrics(raw: dict) -> dict:
-    out: dict[str, Any] = {
-        "executes": int(raw.get("executes") or 0),
-        "ops_total": int(raw.get("ops_total") or 0),
-        "exec_us_total": int(raw.get("exec_us_total") or 0),
-        "last_exec_us": int(raw.get("last_exec_us") or 0),
+def _complete_metrics(payload: dict) -> dict:
+    response: dict[str, Any] = {
+        "executes": int(payload.get("executes") or 0),
+        "ops_total": int(payload.get("ops_total") or 0),
+        "exec_us_total": int(payload.get("exec_us_total") or 0),
+        "last_exec_us": int(payload.get("last_exec_us") or 0),
     }
     for key in METRIC_MAP_FIELDS:
-        out[key] = dict(raw.get(key) or {})
-    if isinstance(raw.get("forward"), dict):
-        forward = dict(raw["forward"])
-        out["forward"] = forward
+        response[key] = dict(payload.get(key) or {})
+    if isinstance(payload.get("forward"), dict):
+        forward = dict(payload["forward"])
+        response["forward"] = forward
         for key in (
             "cuda_graph_captures",
             "cuda_graph_replays",
@@ -119,8 +119,8 @@ def _complete_metrics(raw: dict) -> dict:
             "cuda_graph_unpadded_tokens",
             "cuda_graph_padded_tokens",
         ):
-            out[key] = int(forward.get(key) or 0)
-        out["cuda_graph_runtime_mode_counts"] = dict(
+            response[key] = int(forward.get(key) or 0)
+        response["cuda_graph_runtime_mode_counts"] = dict(
             forward.get("cuda_graph_runtime_mode_counts") or {}
         )
     else:
@@ -132,76 +132,76 @@ def _complete_metrics(raw: dict) -> dict:
             "cuda_graph_unpadded_tokens",
             "cuda_graph_padded_tokens",
         ):
-            out[key] = int(raw.get(key) or 0)
-        out["cuda_graph_runtime_mode_counts"] = dict(
-            raw.get("cuda_graph_runtime_mode_counts") or {}
+            response[key] = int(payload.get(key) or 0)
+        response["cuda_graph_runtime_mode_counts"] = dict(
+            payload.get("cuda_graph_runtime_mode_counts") or {}
         )
-    return out
+    return response
 
 
-def _complete_response(raw: dict) -> dict:
-    out = {"kind": raw["kind"]}
+def _complete_response(payload: dict) -> dict:
+    response = {"kind": payload["kind"]}
     for key in RESPONSE_OPTIONAL_FIELDS:
-        out[key] = raw.get(key)
-    if isinstance(out["result"], dict):
-        out["result"] = _complete_result(out["result"])
-    if isinstance(out["metrics"], dict):
-        out["metrics"] = _complete_metrics(out["metrics"])
-    return out
+        response[key] = payload.get(key)
+    if isinstance(response["result"], dict):
+        response["result"] = _complete_result(response["result"])
+    if isinstance(response["metrics"], dict):
+        response["metrics"] = _complete_metrics(response["metrics"])
+    return response
 
 
 def _handle_get_caps(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
     metrics: "MetricsService | None",
 ) -> dict:
-    return {"kind": "caps", "caps": _driver_caps(driver)}
+    return {"kind": "caps", "caps": _worker_caps(worker)}
 
 
 def _handle_get_metrics(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
     metrics: "MetricsService | None",
 ) -> dict:
     return {"kind": "metrics", "metrics": (metrics.snapshot() if metrics is not None else {})}
 
 
 def _handle_get_pressure(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
     metrics: "MetricsService | None",
 ) -> dict:
-    return {"kind": "pressure", "pressure": driver.resource_pressure()}
+    return {"kind": "pressure", "pressure": worker.resource_pressure()}
 
 
 def _handle_execute(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
     metrics: "MetricsService | None",
 ) -> dict:
-    # execute is owned exclusively by WorkerRuntime.handle(), which performs the
+    # execute is owned exclusively by WorkerServer.handle(), which performs the
     # metrics / forward-result validation / op_id stamping / deferred-CPU
     # handling. dispatch() must never run a second, weaker execute path, so
     # reaching here is a routing bug.
-    raise scheduler_bug("execute must be dispatched through WorkerRuntime.handle()")
+    raise scheduler_bug("execute must be dispatched through WorkerServer.handle()")
 
 
 def _handle_drop_request(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
     metrics: "MetricsService | None",
 ) -> dict:
-    driver.drop_request(req["req_id"])
+    worker.drop_request(request["req_id"])
     return {"kind": "ok"}
 
 
 # Request-kind -> handler. Control kinds are not listed here; they fall through
-# to the control path below, gated on the driver's declared supported_controls.
+# to the control path below, gated on the worker's declared supported_controls.
 HANDLERS = {
     "get_caps": _handle_get_caps,
     "get_metrics": _handle_get_metrics,
@@ -212,61 +212,45 @@ HANDLERS = {
 
 
 def _dispatch_control(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
     kind: str,
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
 ) -> dict:
-    return ControlPlane(driver, supported_controls).handle(kind, req)
+    return ControlPlane(worker, supported_controls).handle(kind, request)
 
 
 def dispatch(
-    driver: "WorkerDriver",
+    worker: Worker,
     supported_controls: set[str],
-    req: Mapping[str, Any],
+    request: Mapping[str, Any],
     metrics: MetricsService | None = None,
 ) -> dict:
     """Pure request -> response dispatch (no ring I/O, no shutdown).
 
     Raises a typed ``WorkerError`` for unsupported controls / unknown kinds and
-    lets driver exceptions propagate to the caller's classifier.
+    lets worker exceptions propagate to the caller's classifier.
     """
-    kind = req.get("kind")
+    kind = request.get("kind")
     handler = HANDLERS.get(kind) if isinstance(kind, str) else None
     if handler is not None:
-        return handler(driver, supported_controls, req, metrics)
+        return handler(worker, supported_controls, request, metrics)
     if isinstance(kind, str) and kind in CONTROL_KINDS:
-        return _dispatch_control(driver, supported_controls, kind, req)
+        return _dispatch_control(
+            worker,
+            supported_controls,
+            kind,
+            request,
+        )
     raise scheduler_bug(f"unknown request kind: {kind!r}")
 
 
-def _driver_accepts_deferred_text_cpu_results(driver: "WorkerDriver") -> bool:
-    execute = driver.execute
-    try:
-        signature = inspect.signature(execute)
-    except (TypeError, ValueError):
-        return False
-    return "defer_text_cpu_results" in signature.parameters
-
-
-def _driver_execute(
-    driver,
-    batch: dict,
-    *,
-    defer_text_cpu_results: bool,
-    accepts_deferred_text_cpu_results: bool,
-) -> dict:
-    if accepts_deferred_text_cpu_results:
-        return driver.execute(batch, defer_text_cpu_results=defer_text_cpu_results)
-    return driver.execute(batch)
-
-
-def _finalize_seq_result(raw):
-    if isinstance(raw, FinalizableSeqResult):
-        raw = raw.finalize()
-    if not isinstance(raw, dict):
-        raw = dict(raw)
-    return raw
+def _finalize_seq_result(payload):
+    if isinstance(payload, FinalizableSeqResult):
+        payload = payload.finalize()
+    if not isinstance(payload, dict):
+        payload = dict(payload)
+    return payload
 
 
 def _finalize_result_inplace(result: dict) -> None:
@@ -281,16 +265,22 @@ def _result_has_deferred(result: dict | None) -> bool:
     if not isinstance(result, dict):
         return False
     per_seq = result.get("per_seq")
-    return isinstance(per_seq, list) and any(isinstance(item, FinalizableSeqResult) for item in per_seq)
+    return isinstance(per_seq, list) and any(
+        isinstance(item, FinalizableSeqResult) for item in per_seq
+    )
 
 
-def _result_ready(resp: dict | PendingResult) -> bool:
-    pending = resp if isinstance(resp, PendingResult) else PendingResult(response=resp)
+def _result_ready(response: dict | PendingResult) -> bool:
+    pending = response if isinstance(response, PendingResult) else PendingResult(response=response)
     return pending.ready()
 
 
-def _add_forward_component_us(resp: dict, component: str, dur_ns: int) -> None:
-    result = resp.get("result")
+def _add_forward_component_us(
+    response: dict,
+    component: str,
+    duration_ns: int,
+) -> None:
+    result = response.get("result")
     if not isinstance(result, dict):
         return
     stats = result.get("forward_stats")
@@ -300,11 +290,11 @@ def _add_forward_component_us(resp: dict, component: str, dur_ns: int) -> None:
     if not isinstance(component_us, dict):
         return
     key = str(component)
-    component_us[key] = int(component_us.get(key) or 0) + int(dur_ns) // 1000
+    component_us[key] = int(component_us.get(key) or 0) + int(duration_ns) // 1000
 
 
-def _add_deferred_cuda_ready_component(resp: dict) -> None:
-    result = resp.get("result")
+def _add_deferred_cuda_ready_component(response: dict) -> None:
+    result = response.get("result")
     if not isinstance(result, dict):
         return
     per_seq = result.get("per_seq")
@@ -325,243 +315,276 @@ def _add_deferred_cuda_ready_component(resp: dict) -> None:
         if isinstance(value, int) and value > 0:
             total_us += int(value)
     if total_us > 0:
-        _add_forward_component_us(resp, "worker_cuda_ready_elapsed", total_us * 1000)
+        _add_forward_component_us(
+            response,
+            "worker_cuda_ready_elapsed",
+            total_us * 1000,
+        )
 
 
-@runtime_checkable
-class WorkerDriver(Protocol):
-    """The adapter contract the runtime shell drives.
-
-    ``caps``/``execute``/``drop_request`` are always required. Control methods
-    have no-op defaults on ``BaseWorkerDriver`` and are invoked directly after
-    caps validation proves the worker advertises the control.
-    """
-
-    def caps(self) -> Caps: ...
-
-    def execute(self, batch: dict) -> dict: ...
-
-    def drop_request(self, req_id: int) -> None: ...
-
-    def resource_pressure(self) -> list[dict[str, Any]]: ...
-
-    def copy_blocks(self, copies: Any) -> None: ...
-
-    def load_lora(self, lora_id: int, lora_path: str) -> None: ...
-
-    def unload_lora(self, lora_id: int) -> None: ...
-
-    def free_encoder(self, handles: Any) -> None: ...
-
-    def reset_prefix_cache(self) -> None: ...
-
-    def sleep(self) -> None: ...
-
-    def wake_up(self) -> None: ...
-
-
-class WorkerRuntime:
-    """Transport + dispatch + services shell around one worker adapter."""
+class WorkerServer:
+    """Transport, dispatch, and metrics shell around one assembled worker."""
 
     def __init__(
         self,
-        driver: WorkerDriver,
-        server,
+        worker: Worker,
+        ipc_endpoint: WorkerIpcTransport,
         metrics: MetricsService | None = None,
-        *,
-        worker_kind: str = WORKER_KIND_FULL,
-        pipeline_depth: int = 1,
     ):
-        self.driver = driver
-        self.server = server
+        self.worker = worker
+        self.ipc_endpoint = ipc_endpoint
         self.metrics = metrics or MetricsService()
-        self.worker_kind = worker_kind
-        # Number of forwards the serve loop launches before finalizing the oldest.
-        # Bounded by the host's in-flight cap; when the host stops submitting,
-        # ``try_recv`` returns None and the pipeline drains.
-        self.pipeline_depth = max(1, int(pipeline_depth))
-        self.caps = validate_caps(_driver_caps(driver), owner=driver.__class__.__name__).to_wire()
-        # A peeled stage advertises only its OpKind subset so the host's
-        # StageRouter routes the right ops to it; the gate in ``_execute_pipeline``
-        # then rejects anything outside it. ``full`` uses the model's full op set
-        # and the gate is inert.
-        declared_ops = list(self.caps.get("supported_ops") or [])
-        if worker_kind != WORKER_KIND_FULL:
-            restricted = restrict_supported_ops(worker_kind, declared_ops)
-            self.caps["supported_ops"] = restricted
-            self.allowed_ops: frozenset[str] = frozenset(restricted)
-        else:
-            self.allowed_ops = frozenset(declared_ops)
+        contract = worker.contract
+        self.caps = validate_caps(
+            contract.capabilities,
+            owner=type(worker).__name__,
+        ).to_wire()
+        self.pipeline_depth = max(1, int(self.caps["pipeline_depth"]))
+        self.allowed_ops = frozenset(self.caps["supported_ops"])
         self.supported_controls = set(self.caps.get("supported_controls") or [])
-        self.control_plane = ControlPlane(self.driver, self.supported_controls)
-        self._driver_accepts_deferred_text_cpu_results = _driver_accepts_deferred_text_cpu_results(
-            driver
+        self.control_plane = ControlPlane(
+            self.worker,
+            self.supported_controls,
         )
-        # The Mode-A und worker must read each decode's sampled token synchronously
-        # to detect the image-start trigger and publish the conditioning KV; the
-        # deferred-CPU-results pipeline hides the token until a later finalize, so
-        # the und worker runs text results synchronously.
-        self._defer_text_results = worker_kind != WORKER_KIND_UND
+        self.allow_deferred_results = contract.result_policy is ResultPolicy.DEFER_WHEN_AVAILABLE
         self.profiler = WorkerProfiler.from_env()
         self.execution_pipeline = ExecutionPipeline()
 
-    def handle(self, req, *, allow_deferred: bool = False) -> dict:
+    def handle(self, request, *, allow_deferred: bool = False) -> dict:
         """Dispatch one decoded request, classifying failures and recording
         metrics. Returns the response dict (the ring write stays in `serve`)."""
 
-        return self.pending(req, allow_deferred=allow_deferred).response
+        return self.pending(request, allow_deferred=allow_deferred).response
 
-    def pending(self, req, *, allow_deferred: bool = False) -> PendingResult:
+    def pending(self, request, *, allow_deferred: bool = False) -> PendingResult:
         """Dispatch one decoded request and retain pending-finalization state."""
 
-        kind = req.get("kind")
+        request_kind = request.get("kind")
         try:
-            if kind == "execute":
-                return self._execute_pipeline(req, allow_deferred=allow_deferred)
-            if kind == "get_caps":
-                resp = {"kind": "caps", "caps": dict(self.caps)}
-            elif kind in CONTROL_KINDS:
-                resp = self.control_plane.handle(kind, req)
+            if request_kind == "execute":
+                return self._execute_pipeline(
+                    request,
+                    allow_deferred=allow_deferred,
+                )
+            if request_kind == "get_caps":
+                response = {"kind": "caps", "caps": dict(self.caps)}
+            elif request_kind in CONTROL_KINDS:
+                response = self.control_plane.handle(request_kind, request)
             else:
-                resp = dispatch(self.driver, self.supported_controls, req, self.metrics)
-            if kind in CONTROL_KINDS:
-                self.metrics.record_control(kind, True)
-            return self.execution_pipeline.immediate(resp)
-        except WorkerError as err:
-            if kind in CONTROL_KINDS:
-                self.metrics.record_control(kind, False)
-            self.metrics.record_error(err.code)
+                response = dispatch(
+                    self.worker,
+                    self.supported_controls,
+                    request,
+                    self.metrics,
+                )
+            if request_kind in CONTROL_KINDS:
+                self.metrics.record_control(request_kind, True)
+            return self.execution_pipeline.immediate(response)
+        except WorkerError as error:
+            if request_kind in CONTROL_KINDS:
+                self.metrics.record_control(request_kind, False)
+            self.metrics.record_error(error.code)
             # Log per-request context locally; wire responses omit diagnostic ids.
-            log = logger.exception if should_capture_trace(err.code) else logger.warning
+            log = logger.exception if should_capture_trace(error.code) else logger.warning
             log(
                 "worker request %r failed: %s [code=%s req_id=%s op_id=%s op_kind=%s details=%s]",
-                kind, err.message, err.code, err.req_id, err.op_id, err.op_kind, err.details,
+                request_kind,
+                error.message,
+                error.code,
+                error.req_id,
+                error.op_id,
+                error.op_kind,
+                error.details,
             )
-            return self.execution_pipeline.immediate(err.to_wire())
-        except Exception as exc:  # noqa: BLE001 — classify everything else
-            logger.exception("worker request %r raised an unclassified error", kind)
-            werr = classify(exc, context=kind)
-            self.metrics.record_error(werr.code)
-            return self.execution_pipeline.immediate(werr.to_wire())
+            return self.execution_pipeline.immediate(error.to_wire())
+        except Exception as error:  # noqa: BLE001 — classify everything else
+            logger.exception(
+                "worker request %r raised an unclassified error",
+                request_kind,
+            )
+            worker_error = classify(error, context=request_kind)
+            self.metrics.record_error(worker_error.code)
+            return self.execution_pipeline.immediate(worker_error.to_wire())
 
-    def _execute_pipeline(self, req: dict, *, allow_deferred: bool) -> PendingResult:
+    def _execute_pipeline(
+        self,
+        request: dict,
+        *,
+        allow_deferred: bool,
+    ) -> PendingResult:
         """Run one execute batch: time -> execute -> validate -> annotate -> record.
 
         Returns a pending response. A deferred result skips eager validation here;
         the pending object retains the source batch so send-time finalization can
-        validate after the late CPU copy completes. Driver exceptions propagate to
+        validate after the late CPU copy completes. Worker exceptions propagate to
         ``pending``'s classifier unchanged.
         """
-        batch = req.get("batch") or {}
-        ops = batch.get("ops") or []
-        op_kinds = [op.get("kind", "?") for op in ops]
-        # Routing guard: a peeled stage must only receive ops in its declared
-        # OpKind subset. ``full`` skips this (subset is the model's full op set).
-        if self.worker_kind != WORKER_KIND_FULL:
-            for kind in op_kinds:
-                if kind not in self.allowed_ops:
-                    raise scheduler_bug(
-                        f"worker_kind={self.worker_kind!r} received op kind {kind!r} "
-                        f"outside its OpKind subset {sorted(self.allowed_ops)}"
-                    )
-        t0 = self.metrics.now_ns()
-        result = self._run_execute(req, allow_deferred=allow_deferred)
-        wait_start = self.metrics.now_ns()
+        batch = request.get("batch") or {}
+        operations = batch.get("ops") or []
+        operation_kinds = [operation.get("kind", "?") for operation in operations]
+        for operation_kind in operation_kinds:
+            if operation_kind not in self.allowed_ops:
+                raise scheduler_bug(
+                    f"worker received operation {operation_kind!r} outside its "
+                    f"capability set {sorted(self.allowed_ops)}"
+                )
+        started_ns = self.metrics.now_ns()
+        result = self._run_execute(
+            request,
+            allow_deferred=allow_deferred,
+        )
+        wait_started_ns = self.metrics.now_ns()
         pending = self.execution_pipeline.pending(
             result=result,
             batch=batch,
-            wait_start_ns=wait_start,
+            wait_start_ns=wait_started_ns,
         )
         has_deferred = _result_has_deferred(result)
         if isinstance(result, dict) and not has_deferred:
-            validate_forward_result(result, batch, owner=self.driver.__class__.__name__)
-        dur = self.metrics.now_ns() - t0
-        self._record_execute_metrics(dur, op_kinds, result)
+            validate_forward_result(
+                result,
+                batch,
+                owner=type(self.worker).__name__,
+            )
+        duration_ns = self.metrics.now_ns() - started_ns
+        self._record_execute_metrics(
+            duration_ns,
+            operation_kinds,
+            result,
+        )
         if isinstance(result, dict):
-            self._annotate_execute_result(result, dur, ops)
+            self._annotate_execute_result(
+                result,
+                duration_ns,
+                operations,
+            )
         return pending
 
-    def _run_execute(self, req: dict, *, allow_deferred: bool) -> dict:
+    def _run_execute(
+        self,
+        request: dict,
+        *,
+        allow_deferred: bool,
+    ) -> dict:
         with self.profiler.step("uniserve.worker.execute"):
-            return _driver_execute(
-                self.driver,
-                req["batch"],
+            return self.worker.execute(
+                request["batch"],
                 defer_text_cpu_results=allow_deferred,
-                accepts_deferred_text_cpu_results=(
-                    self._driver_accepts_deferred_text_cpu_results
-                ),
             )
 
-    def _record_execute_metrics(self, dur: int, op_kinds: list, result) -> None:
-        self.metrics.record_execute(dur, op_kinds)
+    def _record_execute_metrics(
+        self,
+        duration_ns: int,
+        operation_kinds: list,
+        result,
+    ) -> None:
+        self.metrics.record_execute(duration_ns, operation_kinds)
         if isinstance(result, dict):
             self.metrics.record_forward_stats(result.get("forward_stats"))
 
-    def _annotate_execute_result(self, result: dict, dur: int, ops: list) -> None:
+    def _annotate_execute_result(
+        self,
+        result: dict,
+        duration_ns: int,
+        operations: list,
+    ) -> None:
         # Stamp worker compute time and echo the submitted operation identity.
-        result["worker_exec_us"] = dur // 1000
-        for op, sr in zip(ops, result.get("per_seq") or []):
-            if isinstance(sr, dict):
-                sr["op_kind"] = op.get("kind")
-                oid = op.get("op_id")
-                if oid is not None:
-                    sr["op_id"] = oid
+        result["worker_exec_us"] = duration_ns // 1000
+        for operation, sequence_result in zip(
+            operations,
+            result.get("per_seq") or [],
+        ):
+            if isinstance(sequence_result, dict):
+                sequence_result["op_kind"] = operation.get("kind")
+                operation_id = operation.get("op_id")
+                if operation_id is not None:
+                    sequence_result["op_id"] = operation_id
 
     def _prepare_response_for_send(self, pending: PendingResult) -> dict:
-        resp = pending.response
-        result = resp.get("result")
+        response = pending.response
+        result = response.get("result")
         if isinstance(result, dict):
             _finalize_result_inplace(result)
             if isinstance(pending.batch, dict):
                 validate_forward_result(
                     result,
                     pending.batch,
-                    owner=self.driver.__class__.__name__,
+                    owner=type(self.worker).__name__,
                 )
-                for op, sr in zip(pending.batch.get("ops") or [], result.get("per_seq") or []):
-                    if isinstance(sr, dict):
-                        sr["op_kind"] = op.get("kind")
-                        oid = op.get("op_id")
-                        if oid is not None:
-                            sr["op_id"] = oid
-        return resp
+                for operation, sequence_result in zip(
+                    pending.batch.get("ops") or [],
+                    result.get("per_seq") or [],
+                ):
+                    if isinstance(sequence_result, dict):
+                        sequence_result["op_kind"] = operation.get("kind")
+                        operation_id = operation.get("op_id")
+                        if operation_id is not None:
+                            sequence_result["op_id"] = operation_id
+        return response
 
-    def _respond(self, pending: dict | PendingResult) -> None:
-        pending = pending if isinstance(pending, PendingResult) else PendingResult(response=pending)
-        resp = pending.response
-        call_id = resp.get("call_id")
-        wait_start = pending.wait_start_ns
-        if isinstance(wait_start, int):
-            wait_ns = self.metrics.now_ns() - wait_start
-            _add_forward_component_us(resp, "worker_deferred_wait", wait_ns)
+    def _respond(
+        self,
+        pending_response: dict | PendingResult,
+    ) -> None:
+        pending = (
+            pending_response
+            if isinstance(pending_response, PendingResult)
+            else PendingResult(response=pending_response)
+        )
+        response = pending.response
+        call_id = response.get("call_id")
+        wait_started_ns = pending.wait_start_ns
+        if isinstance(wait_started_ns, int):
+            wait_ns = self.metrics.now_ns() - wait_started_ns
+            _add_forward_component_us(
+                response,
+                "worker_deferred_wait",
+                wait_ns,
+            )
             self.metrics.record_pipeline("deferred_wait", wait_ns)
-            _add_deferred_cuda_ready_component(resp)
-        t0 = self.metrics.now_ns()
+            _add_deferred_cuda_ready_component(response)
+        finalize_started_ns = self.metrics.now_ns()
         try:
-            resp = self._prepare_response_for_send(pending)
-        except Exception as exc:  # noqa: BLE001 - late CPU-copy/validation failures.
+            response = self._prepare_response_for_send(pending)
+        except Exception as error:  # noqa: BLE001 - late finalization failures.
             logger.exception("worker response finalization failed")
-            werr = classify(exc, context="respond")
-            self.metrics.record_error(werr.code)
-            resp = werr.to_wire()
+            worker_error = classify(error, context="respond")
+            self.metrics.record_error(worker_error.code)
+            response = worker_error.to_wire()
             if call_id is not None:
-                resp["call_id"] = call_id
+                response["call_id"] = call_id
         # Split deferred-D2H materialize wall time from the ring write for metrics.
-        t1 = self.metrics.now_ns()
-        _add_forward_component_us(resp, "worker_result_finalize", t1 - t0)
-        self.server.respond(_complete_response(resp))
-        self.metrics.record_pipeline("finalize", t1 - t0)
-        self.metrics.record_pipeline("encode_send", self.metrics.now_ns() - t1)
+        finalized_ns = self.metrics.now_ns()
+        _add_forward_component_us(
+            response,
+            "worker_result_finalize",
+            finalized_ns - finalize_started_ns,
+        )
+        self.ipc_endpoint.respond(_complete_response(response))
+        self.metrics.record_pipeline(
+            "finalize",
+            finalized_ns - finalize_started_ns,
+        )
+        self.metrics.record_pipeline(
+            "encode_send",
+            self.metrics.now_ns() - finalized_ns,
+        )
 
     def serve(self) -> None:
         """Run the depth-D pipelined request loop."""
 
-        from .process import WorkerProcess
+        from .process import WorkerServeLoop
 
-        WorkerProcess(self, self.server).run()
+        WorkerServeLoop(self, self.ipc_endpoint).run()
 
-    def result_ready(self, resp: dict | PendingResult) -> bool:
-        return _result_ready(resp)
+    def result_ready(
+        self,
+        response: dict | PendingResult,
+    ) -> bool:
+        return _result_ready(response)
 
-    def respond_pending(self, resp: dict | PendingResult) -> None:
-        self._respond(resp)
+    def respond_pending(
+        self,
+        response: dict | PendingResult,
+    ) -> None:
+        self._respond(response)

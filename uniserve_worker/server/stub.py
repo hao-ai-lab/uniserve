@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
-from typing import Any, cast
+from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
 from PIL import Image
 
 from ..contracts.batch_policy import BatchPolicy
 from ..contracts.batches import UniForwardBatch
-from ..contracts.caps import Caps, ExecutionConstraints
 from ..contracts.forward_mode import ForwardMode
 from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (
@@ -27,13 +26,12 @@ from ..contracts.resource_plan import (
     ResourcePlan,
 )
 from ..execution.model_base import UniModelBase
-from ..execution.runner import ModelRunner, RunnerConfig
 from ..foundation.env import env_int
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.request_state import RequestState
-from .base_driver import BaseWorkerDriver
+from ..worker.model import ModelWorker
 
 STUB_EOS_TOKEN_ID = 151645
 STUB_IMG_START_TOKEN_ID = 151670
@@ -48,8 +46,8 @@ STUB_BYTES_PER_TOKEN = 57344
 STUB_MAX_BATCH_OPS = DEFAULT_MAX_BATCH_OPS
 
 __all__ = [
-    'StubUniModel',
-    'StubEngine',
+    "StubUniModel",
+    "StubWorker",
 ]
 
 
@@ -59,7 +57,7 @@ def _synthetic_png_b64(width: int, height: int) -> str:
     height = max(1, int(height))
     y = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
     x = np.linspace(0, 255, width, dtype=np.uint8)[None, :]
-    image = np.empty((height, width, 3), dtype=np.uint8)
+    image: np.ndarray = np.empty((height, width, 3), dtype=np.uint8)
     image[:, :, 0] = x
     image[:, :, 1] = y
     image[:, :, 2] = ((x.astype(np.uint16) + y.astype(np.uint16)) // 2).astype(np.uint8)
@@ -156,7 +154,7 @@ class StubUniModel(UniModelBase):
         handler = self._FORWARD_BY_MODE.get(batch.mode)
         if handler is None:
             raise RuntimeError(f"unsupported stub forward mode {batch.mode}")
-        return cast(list[ForwardOutput], handler(self, batch))
+        return handler(self, batch)
 
     def _text(self, batch: UniForwardBatch) -> list[TextTokenOutput]:
         out = []
@@ -179,7 +177,9 @@ class StubUniModel(UniModelBase):
             step = self.steps.get(req_id, 0) + 1
             self.steps[req_id] = step
             total = int((self.images.get(req_id) or {}).get("steps", 50) or 50)
-            out.append(DenoiseOutput(req_id=req_id, denoise_done=step >= total, num_steps_done=step))
+            out.append(
+                DenoiseOutput(req_id=req_id, denoise_done=step >= total, num_steps_done=step)
+            )
         return out
 
     def _commit(self, batch: UniForwardBatch) -> list[CommitOutput]:
@@ -211,62 +211,28 @@ class StubUniModel(UniModelBase):
     }
 
 
-class StubEngine(BaseWorkerDriver):
-    """GPU-free echo driver for IPC plumbing tests (mirrors sim)."""
+class StubWorker(ModelWorker):
+    """GPU-free model worker for protocol and serving tests."""
 
-    def __init__(self, block_size: int = DEFAULT_BLOCK_SIZE) -> None:
-        super().__init__(block_size=block_size)
-        self.model = StubUniModel()
-        self.runner = ModelRunner(self.model, config=RunnerConfig(simulation=True))
-        # Aliases onto model state for tests that read emitted/steps/reqs directly.
-        self.emitted = self.model.emitted
-        self.steps = self.model.steps
-        self.reqs = self.model.images
-
-    # Capability surface mirrored from StubUniModel; sleep/wake_up omitted so
-    # unsupported-control rejection can be exercised.
     supported_ops = StubUniModel.supported_ops
     supported_controls = StubUniModel.supported_controls
     adapter_mode = StubUniModel.adapter_mode
     resource_plan = StubUniModel.resource_plan
 
-    def resource_pressure(self) -> list[dict]:
-        return self.runner.resource_runtime.pressure()
-
-    def caps(self) -> Caps:
-        # Build caps through the shared Caps dataclass so the stub validates
-        # the canonical wire schema.
-        return Caps(
-            block_size=self.block_size,
-            num_blocks=STUB_NUM_BLOCKS,
-            num_layers=STUB_NUM_LAYERS,
-            scratch_capacity_tokens=STUB_SCRATCH_TOKENS,
-            supported_ops=tuple(self.supported_ops),
-            max_latent_size=STUB_MAX_LATENT_SIZE,
-            latent_downsample=STUB_LATENT_DOWNSAMPLE,
-            max_vae_grid_tokens=STUB_MAX_LATENT_SIZE,
-            commit_marker_tokens=2,
-            gen_rope_advance=2,
-            max_cfg_branches=3,
-            bytes_per_token=STUB_BYTES_PER_TOKEN,
-            supported_controls=tuple(self.supported_controls),
-            adapter_mode=self.adapter_mode,
-            execution_constraints=ExecutionConstraints(max_batch_ops=STUB_MAX_BATCH_OPS),
-            resource_classes=tuple(self.resource_plan.classes()),
-        )
-
-    def execute(
+    def __init__(
         self,
-        batch: Mapping[str, Any],
+        block_size: int = DEFAULT_BLOCK_SIZE,
         *,
-        defer_text_cpu_results: bool = False,
-    ) -> dict[str, Any]:
-        return self.runner.execute(
-            dict(batch),
-            defer_text_cpu_results=defer_text_cpu_results,
+        pipeline_depth: int = 1,
+    ) -> None:
+        model = StubUniModel()
+        super().__init__(
+            model,
+            allowed_ops=frozenset(model.supported_ops),
+            pipeline_depth=pipeline_depth,
+            block_size=block_size,
+            simulation=True,
         )
-
-    def drop_request(self, rid: int) -> None:
-        self.runner.drop_request(int(rid))
-
-    # Control ops inherit BaseWorkerDriver no-ops: the stub has no physical pools.
+        self.emitted = model.emitted
+        self.steps = model.steps
+        self.reqs = model.images

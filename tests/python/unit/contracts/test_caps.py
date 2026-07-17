@@ -4,7 +4,7 @@ import pytest
 
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints, validate_caps
 from uniserve_worker.nn.mesh import DeviceMesh, use_mesh
-from uniserve_worker.server.runner_driver import RunnerDriver
+from uniserve_worker.worker.model import ModelWorker
 
 pytestmark = pytest.mark.unit
 
@@ -45,9 +45,9 @@ def test_caps_rank_survives_validation_and_wire_conversion():
     assert caps.to_wire()["rank"]["tp_size"] == 2
 
 
-def test_runner_caps_use_current_mesh_rank():
+def test_model_worker_caps_use_current_mesh_rank():
     with use_mesh(DeviceMesh.tp(1, 2, device="cpu")):
-        caps = RunnerDriver._caps_with_current_rank(_caps())
+        caps = ModelWorker._caps_with_current_rank(_caps())
 
     assert caps.to_wire()["rank"]["tp_rank"] == 1
     assert caps.to_wire()["rank"]["tp_size"] == 2

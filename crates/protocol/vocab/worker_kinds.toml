@@ -1,9 +1,6 @@
 # Canonical worker-kind vocabulary: the cross-language single source of truth.
 #
-# Transcribed from (and guarded against) the two hand-written definitions:
-#   - Rust `WorkerKind` + `WorkerKind::supported_ops`  crates/engine/executor/src/lib.rs
-#   - Python `WORKER_KINDS`/`SUPPORTED_OPS`/`RUNNER_BACKED_KINDS`
-#                                                      uniserve_worker/server/worker_kind.py
+# Mirrored by Rust `WorkerKind` and Python `WorkerKind`.
 #
 # Each `[[kind]]` entry pins one worker kind by:
 #   - `token`         : the `--worker-kind`/`--workers` wire/config token
@@ -12,15 +9,10 @@
 #   - `supported_ops` : the OpKind subset (by `op_kinds.toml` wire name) this kind
 #                       handles — the StageRouter routing key. Order is not
 #                       significant; the guards compare as sets.
-#   - `runner_backed` : whether the Python worker for this kind runs the shared
-#                       `ModelRunner` (Python `RUNNER_BACKED_KINDS` membership).
-#                       Rust has no counterpart; this column guards the Python
-#                       constant only.
 
 [[kind]]
 token = "full"
 rust = "Full"
-runner_backed = true
 supported_ops = [
   "prefill_und",
   "decode_und",
@@ -35,37 +27,31 @@ supported_ops = [
 [[kind]]
 token = "encoder"
 rust = "Encoder"
-runner_backed = false
 supported_ops = ["vit_encode", "vae_encode"]
 
 [[kind]]
 token = "prefill"
 rust = "Prefill"
-runner_backed = true
 supported_ops = ["prefill_und"]
 
 [[kind]]
 token = "decode"
 rust = "Decode"
-runner_backed = true
 supported_ops = ["decode_und", "target_verify_und", "denoise_gen", "commit_gen", "commit_writeback"]
 
 [[kind]]
 token = "sampler"
 rust = "Sampler"
-runner_backed = false
 supported_ops = ["sample"]
 
 [[kind]]
 token = "postprocess"
 rust = "PostProcess"
-runner_backed = false
 supported_ops = ["encode_frame"]
 
 [[kind]]
 token = "und"
 rust = "Und"
-runner_backed = true
 supported_ops = [
   "prefill_und",
   "decode_und",
@@ -79,5 +65,4 @@ supported_ops = [
 [[kind]]
 token = "gen"
 rust = "Gen"
-runner_backed = true
 supported_ops = ["denoise_gen", "commit_gen", "encode_frame"]

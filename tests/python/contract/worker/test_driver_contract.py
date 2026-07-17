@@ -3,6 +3,7 @@
 The capability declaration is checked for every backend on CPU (class-level
 introspection). The full caps() schema is checked against the GPU-free Stub.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -67,8 +68,9 @@ def test_declared_controls_have_methods(name):
     cls = load_backend_class(name)
     for ctrl in cls.supported_controls:
         meth = CONTROL_METHODS[ctrl]
-        assert callable(getattr(cls, meth, None)), \
+        assert callable(getattr(cls, meth, None)), (
             f"{name} declares control {ctrl!r} but has no {meth}() method"
+        )
 
 
 @pytest.mark.parametrize("name", ALL_BACKENDS)
@@ -76,8 +78,9 @@ def test_resource_classes_wellformed(name):
     cls = load_backend_class(name)
     declared = set(cls.resource_plan.classes())
     assert declared, f"{name} declares no resource classes"
-    assert declared <= KNOWN_RESOURCE_CLASSES, \
+    assert declared <= KNOWN_RESOURCE_CLASSES, (
         f"{name} declares unknown resource classes {declared - KNOWN_RESOURCE_CLASSES}"
+    )
     # Every backend manages KV.
     assert "kv_block" in declared
 
@@ -88,16 +91,18 @@ def test_adapter_mode_implies_lora_controls(name):
     cls = load_backend_class(name)
     if cls.adapter_mode != "none":
         ctrls = set(cls.supported_controls)
-        assert {"load_lora", "unload_lora"} <= ctrls, \
+        assert {"load_lora", "unload_lora"} <= ctrls, (
             f"{name} adapter_mode != none but does not declare load/unload_lora"
+        )
 
 
 def test_caps_schema_required_keys():
     caps = cpu_engine().caps().to_wire()
     for key, typ in CAPS_REQUIRED.items():
         assert key in caps, f"caps missing required key {key!r}"
-        assert isinstance(caps[key], typ), \
+        assert isinstance(caps[key], typ), (
             f"caps[{key!r}] is {type(caps[key]).__name__}, want {typ.__name__}"
+        )
     ec = caps["execution_constraints"]
     assert "max_batch_ops" in ec
     # und/gen mixing is a non-negotiable invariant (§9.6); the flag is gone.
@@ -113,13 +118,13 @@ def test_caps_values_in_vocabulary():
 
 def test_caps_matches_class_declaration():
     """Instance caps() is the single source of truth's class-level declaration."""
-    from uniserve_worker.server.stub import StubEngine
+    from uniserve_worker.server.stub import StubWorker
 
     caps = cpu_engine().caps()
     caps = caps.to_wire()
-    assert caps["supported_ops"] == list(StubEngine.supported_ops)
-    assert caps["supported_controls"] == list(StubEngine.supported_controls)
-    assert caps["adapter_mode"] == StubEngine.adapter_mode
+    assert caps["supported_ops"] == list(StubWorker.supported_ops)
+    assert caps["supported_controls"] == list(StubWorker.supported_controls)
+    assert caps["adapter_mode"] == StubWorker.adapter_mode
 
 
 @pytest.mark.parametrize("name", ["bagel", "sensenova"])
@@ -141,13 +146,13 @@ def test_new_models_declare_mixed_batch_envelopes(name):
     assert policy.max_batch_ops >= 8
 
 
-def test_runner_caps_declare_mixed_batch_envelope():
+def test_model_worker_caps_declare_mixed_batch_envelope():
     # und/gen mixing is non-negotiable (§9.6): there is no worker launch override
     # that can disable it.
-    from uniserve_worker.server.runner_driver import RunnerDriver
+    from uniserve_worker.worker.model import ModelWorker
 
     cls = load_backend_class("sensenova")
-    caps = RunnerDriver(cls(config=_minimal_model_config("sensenova"))).caps().to_wire()
+    caps = ModelWorker(cls(config=_minimal_model_config("sensenova"))).caps().to_wire()
 
     assert caps["execution_constraints"]["max_batch_ops"] >= 8
     assert "supports_mixed_op_kinds" not in caps["execution_constraints"]

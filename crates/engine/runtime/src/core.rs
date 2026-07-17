@@ -273,7 +273,13 @@ impl EngineCore {
             // The decode↔sampler edge is inter-process, so it needs a real
             // cross-process transport; default to same-node shm when the topology
             // peels a sampler and no explicit --transfer backend was given.
-            let backend = backend_for(pool.kind).or_else(|| has_sampler.then(|| "shm".to_string()));
+            let backend = backend_for(pool.kind).or_else(|| {
+                if is_tower && matches!(pool.kind, WorkerKind::Und | WorkerKind::Gen) {
+                    Some("cuda_ipc".to_string())
+                } else {
+                    has_sampler.then(|| "shm".to_string())
+                }
+            });
             let defer_sampling = has_sampler
                 && matches!(
                     pool.kind,

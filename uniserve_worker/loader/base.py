@@ -18,6 +18,7 @@ class satisfies rather than by incidental attribute reflection:
   may itself delegate the heavy materialization to a registered
   ``BaseModelLoader`` (e.g. sensenova routes through ``NativeTransformersLoader``).
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -27,9 +28,9 @@ from typing import Any, Protocol, Type, runtime_checkable
 from ..contracts.model_protocols import UniModel
 
 __all__ = [
-    'LoadResult',
-    'BaseModelLoader',
-    'ModelBringUp',
+    "LoadResult",
+    "BaseModelLoader",
+    "ModelBringUp",
 ]
 
 
@@ -73,7 +74,7 @@ class BaseModelLoader(ABC):
 class ModelBringUp(Protocol):
     """A model class that owns its bring-up via ``from_pretrained``.
 
-    ``load_runner_engine`` dispatches to this contract when a model class
+    ``load_worker_model`` dispatches to this contract when a model class
     declares it, instead of reflecting an arbitrary ``from_pretrained``
     attribute. The classmethod returns the fully-constructed ``UniModel``
     (including its model-specific wrappers) for the requested serving
@@ -91,5 +92,4 @@ class ModelBringUp(Protocol):
         kv_token_capacity: int | None = ...,
         attention_backend: str | None = ...,
         **kwargs: Any,
-    ) -> UniModel:
-        ...
+    ) -> UniModel: ...
