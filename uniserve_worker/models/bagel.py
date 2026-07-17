@@ -44,7 +44,10 @@ from ..execution.paged_denoise import (
 )
 from ..execution.text_image_generation_session import TextImageGenerationSession
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import decode_graph_padding_block_count, get_worker_config
+from ..foundation.runtime_config import (
+    decode_graph_padding_block_count,
+    get_execution_config,
+)
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
     DEFAULT_MAX_BATCH_OPS,
@@ -287,9 +290,7 @@ class _BagelGraph(nn.Module):
             self.vit_pos_embed = PositionEmbedding(
                 cfg.vit_max_num_patch_per_side, hidden, init_sincos=False
             )
-        self._gen_graph_layouts: dict[
-            tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]
-        ] = {}
+        self._gen_graph_layouts: dict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def num_layers(self) -> int:
@@ -781,7 +782,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
                     block_size=self.block_size,
                     kv_token_capacity=self.kv_token_capacity,
                     bytes_per_token=self.bytes_per_token,
-                    memory_fraction=get_worker_config().kv_memory_fraction,
+                    memory_fraction=get_execution_config().kv_memory_fraction,
                     floor=64,
                 ).token_capacity
             )
@@ -1648,12 +1649,16 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         total_steps = int(gs.schedule.num_steps)
         if gs.paged_branches is None or gs.graph_image is None:
             raise capability_mismatch("BAGEL denoise requires graph-ready paged branch caches")
-        image_embeds = self._ensure_loaded().model.gen_segment_embeds(
-            int(gs.num_vae),
-            gs.vae_pos_ids,
-            gs.x_t,
-            float(t.detach().float().item()),
-        ).unsqueeze(0)
+        image_embeds = (
+            self._ensure_loaded()
+            .model.gen_segment_embeds(
+                int(gs.num_vae),
+                gs.vae_pos_ids,
+                gs.x_t,
+                float(t.detach().float().item()),
+            )
+            .unsqueeze(0)
+        )
         return TextImageDenoiseStep(
             req_id=r,
             state=state,
@@ -1733,18 +1738,12 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         m = self._ensure_loaded().model
         results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
         groups: dict[tuple[Any, ...], list[tuple[int, str, DenoiseRow]]] = {}
-        for step_index, (step, branches) in enumerate(
-            zip(steps, branches_by_step, strict=True)
-        ):
+        for step_index, (step, branches) in enumerate(zip(steps, branches_by_step, strict=True)):
             gs = step.extra["gs"]
             paged_branches = gs.paged_branches
             graph_image = getattr(gs, "graph_image", None)
             names = tuple(str(getattr(branch, "value", branch)) for branch in branches)
-            if (
-                paged_branches is None
-                or graph_image is None
-                or not paged_branches.has_all(names)
-            ):
+            if paged_branches is None or graph_image is None or not paged_branches.has_all(names):
                 return None
             total = int(gs.num_vae) + _BAGEL_IMAGE_MARKER_TOKENS
             embeds = m.gen_segment_embeds(

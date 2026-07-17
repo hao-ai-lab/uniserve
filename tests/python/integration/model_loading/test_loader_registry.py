@@ -1,4 +1,5 @@
 """Conformance for new-style model discovery and dummy loading."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -11,7 +12,13 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 import uniserve_worker.foundation.runtime_config as runtime_config
+from uniserve_worker.bootstrap.model_loader import (
+    WorkerModelLoadRequest,
+    load_worker_model,
+    model_architecture_candidates,
+)
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints, validate_caps
+from uniserve_worker.contracts.model_load import ModelLoadScope
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
@@ -26,7 +33,7 @@ from uniserve_worker.models.registry import resolve_model_cls
 from uniserve_worker.nn import LinearBase
 from uniserve_worker.runtime.lora import MergeOnLoadLoRA
 from uniserve_worker.server.app import dispatch
-from uniserve_worker.server.runner_driver import RunnerDriver, _architectures
+from uniserve_worker.worker.model import ModelWorker
 
 pytestmark = pytest.mark.integration
 
@@ -34,8 +41,8 @@ pytestmark = pytest.mark.integration
 def _set_worker_runtime(monkeypatch, **kwargs):
     monkeypatch.setattr(
         runtime_config,
-        "_CURRENT_CONFIG",
-        replace(runtime_config.get_worker_config(), **kwargs),
+        "_CURRENT_EXECUTION_CONFIG",
+        replace(runtime_config.get_execution_config(), **kwargs),
     )
 
 
@@ -118,14 +125,14 @@ def test_bagel_detection_hook_supplies_architecture_for_stub_config(tmp_path):
     (tmp_path / "model.safetensors").write_bytes(b"")
     (tmp_path / "ae.safetensors").write_bytes(b"")
 
-    archs = _architectures(str(tmp_path))
+    archs = model_architecture_candidates(str(tmp_path))
 
     assert "BagelForUnifiedGeneration" in archs
 
 
-def test_runner_driver_rejects_declared_missing_control():
+def test_model_worker_rejects_declared_missing_control():
     class BadControlModel(ModelHooks):
-        # Minimal valid caps so the driver reaches control validation (which is
+        # Minimal valid caps so the worker reaches control validation (which is
         # what this test exercises), rather than tripping the caps check first.
         supported_ops = ("prefill_und", "decode_und")
         num_layers = 1
@@ -136,7 +143,7 @@ def test_runner_driver_rejects_declared_missing_control():
             raise AssertionError("unreachable")
 
     try:
-        RunnerDriver(BadControlModel(), block_size=256)
+        ModelWorker(BadControlModel(), block_size=256)
     except WorkerError as exc:
         assert exc.code == ErrorCode.CAPABILITY_MISMATCH
         assert "declares control 'missing_control'" in str(exc)
@@ -206,7 +213,7 @@ def test_no_arg_loader_is_default():
 
 
 def test_model_bring_up_contract_selects_the_from_pretrained_path():
-    # load_runner_engine dispatches on the ModelBringUp contract instead of
+    # load_worker_model dispatches on the ModelBringUp contract instead of
     # reflecting an incidental ``from_pretrained`` attribute: model-owned
     # bring-up classes satisfy it, config-driven (registry-loaded) ones do not.
     from uniserve_worker.loader import ModelBringUp
@@ -223,13 +230,34 @@ def test_model_bring_up_contract_selects_the_from_pretrained_path():
     assert not issubclass(StubUniModel, ModelBringUp)
 
 
+def test_partial_model_scope_requires_explicit_model_support(tmp_path):
+    (tmp_path / "config.json").write_text(
+        '{"architectures": ["Qwen3ForCausalLM"]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkerError) as error:
+        load_worker_model(
+            WorkerModelLoadRequest(
+                model_path=str(tmp_path),
+                device="cpu",
+                block_size=16,
+                kv_token_capacity=64,
+                attention_backend="auto",
+                scope=ModelLoadScope.GENERATION,
+            )
+        )
+
+    assert error.value.code is ErrorCode.CAPABILITY_MISMATCH
+
+
 def test_transformers_dtype_typos_fail_loudly():
     assert dtype_from_name("bf16") is torch.bfloat16
     with pytest.raises(ValueError, match="unknown transformer dtype"):
         dtype_from_name("bflaot16")
 
 
-def test_runner_driver_computes_caps_once_and_serves_cached_copy():
+def test_model_worker_computes_caps_once_and_serves_cached_copy():
     class CountingCapsModel(ModelHooks):
         supported_ops = ("prefill_und", "decode_und")
         supported_controls: tuple[str, ...] = ()
@@ -262,19 +290,19 @@ def test_runner_driver_computes_caps_once_and_serves_cached_copy():
             raise AssertionError("unreachable")
 
     model = CountingCapsModel()
-    driver = RunnerDriver(model, block_size=16, kv_token_capacity=64)
+    worker = ModelWorker(model, block_size=16, kv_token_capacity=64)
 
     assert model.calls == 1
-    assert dispatch(driver, set(), {"kind": "get_caps"})["caps"] == driver.caps().to_wire()
+    assert dispatch(worker, set(), {"kind": "get_caps"})["caps"] == worker.caps().to_wire()
     assert model.calls == 1
 
 
-def test_runner_driver_executes_registered_stub_model():
+def test_model_worker_executes_registered_stub_model():
     from uniserve_worker.server.stub import StubUniModel
 
     model = StubUniModel()
-    driver = RunnerDriver(model, block_size=256, simulation=True)
-    result = driver.execute(
+    worker = ModelWorker(model, block_size=256, simulation=True)
+    result = worker.execute(
         {
             "step_id": 7,
             "new_reqs": [{"req_id": 1, "sampling": {}, "image": {"steps": 1}}],
@@ -293,7 +321,7 @@ def test_runner_driver_executes_registered_stub_model():
     assert "sampled_token_id" in result["per_seq"][0]
 
 
-def test_qwen3_entry_executes_through_text_driver():
+def test_qwen3_entry_executes_through_model_worker():
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
     from uniserve_worker.nn import ParallelLMHead, VocabParallelEmbedding
 
@@ -312,13 +340,13 @@ def test_qwen3_entry_executes_through_text_driver():
     )
     assert isinstance(model.model.embed_tokens, VocabParallelEmbedding)
     assert isinstance(model.lm_head, ParallelLMHead)
-    driver = RunnerDriver(
+    worker = ModelWorker(
         model,
         block_size=16,
         kv_token_capacity=64,
         simulation=True,
     )
-    result = driver.execute(
+    result = worker.execute(
         {
             "step_id": 8,
             "new_reqs": [{"req_id": 1, "sampling": {"temperature": 0.0}, "block_ids": []}],
@@ -494,8 +522,8 @@ def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():
     from tests.python.fixtures.zero_day import UniServeZeroDayCfgZeroStarModel
 
     cls = UniServeZeroDayCfgZeroStarModel
-    driver = RunnerDriver(cls(), block_size=256, simulation=True)
-    result = driver.execute(
+    worker = ModelWorker(cls(), block_size=256, simulation=True)
+    result = worker.execute(
         {
             "step_id": 9,
             "new_reqs": [{"req_id": 11, "sampling": {}, "image": {"steps": 1}}],
@@ -516,9 +544,7 @@ def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():
         }
     )
     assert result["step_id"] == 9
-    assert result["per_seq"] == [
-        {"req_id": 11, "denoise_done": True, "num_steps_done": 1}
-    ]
+    assert result["per_seq"] == [{"req_id": 11, "denoise_done": True, "num_steps_done": 1}]
 
 
 class TinyLoadableModel(nn.Module):
@@ -906,14 +932,18 @@ def test_native_transformers_loader_uses_weight_loader_for_padded_vocab_tensors(
     assert model.embed_tokens.weight.shape == (8, 3)
     assert model.lm_head.weight.shape == (8, 3)
     torch.testing.assert_close(model.embed_tokens.weight[:5], table.to(torch.bfloat16))
-    torch.testing.assert_close(model.embed_tokens.weight[5:], torch.zeros(3, 3, dtype=torch.bfloat16))
+    torch.testing.assert_close(
+        model.embed_tokens.weight[5:], torch.zeros(3, 3, dtype=torch.bfloat16)
+    )
     torch.testing.assert_close(model.lm_head.weight[:5], (table + 10).to(torch.bfloat16))
     torch.testing.assert_close(model.lm_head.weight[5:], torch.zeros(3, 3, dtype=torch.bfloat16))
 
     ids = torch.tensor([[0, 4, 2]], dtype=torch.long)
     hidden = torch.randn(2, 3, dtype=torch.bfloat16)
     torch.testing.assert_close(model.embed_tokens(ids), F.embedding(ids, table.to(torch.bfloat16)))
-    torch.testing.assert_close(model.lm_head(hidden), F.linear(hidden, (table + 10).to(torch.bfloat16)))
+    torch.testing.assert_close(
+        model.lm_head(hidden), F.linear(hidden, (table + 10).to(torch.bfloat16))
+    )
 
 
 def test_weight_utils_reads_safetensors_tensor_shape_without_loading_tensor(tmp_path):

@@ -1,4 +1,5 @@
 """Shared Hugging Face Transformers checkpoint loading helpers."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from torch import nn
 
 from ..contracts.model_family import ModelFamilyDescriptor
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 from ..nn.placement import get_shard_plan
 from ..nn.quant import QuantizationConfig, use_quantization_config
 from ..nn.quant.base import process_quantized_modules
@@ -30,11 +31,11 @@ from .registry import register_loader
 from .weight_utils import StackedParamMapping, iter_weights, load_parameter, resolve_weight_files
 
 __all__ = [
-    'dtype_from_name',
-    'infer_input_device',
-    'load_native_transformers_checkpoint',
-    'NativeLoadSpec',
-    'NativeTransformersLoader',
+    "dtype_from_name",
+    "infer_input_device",
+    "load_native_transformers_checkpoint",
+    "NativeLoadSpec",
+    "NativeTransformersLoader",
 ]
 
 ParamFilterFromModel = Callable[[nn.Module, str | None], Callable[[str], bool] | None]
@@ -54,8 +55,7 @@ def dtype_from_name(name: str) -> torch.dtype:
         }[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"unknown transformer dtype {name!r}; expected one of "
-            "bfloat16, float16, or float32"
+            f"unknown transformer dtype {name!r}; expected one of bfloat16, float16, or float32"
         ) from exc
 
 
@@ -77,12 +77,13 @@ def _load_tokenizer(
         )
     except Exception as exc:  # pragma: no cover - error-context wrapper.
         raise RuntimeError(
-            f"failed to load tokenizer from {model_dir!r} "
-            f"(use_fast={use_fast}): {exc}"
+            f"failed to load tokenizer from {model_dir!r} (use_fast={use_fast}): {exc}"
         ) from exc
 
 
-def infer_input_device(model: nn.Module, fallback: str | torch.device | None = None) -> torch.device:
+def infer_input_device(
+    model: nn.Module, fallback: str | torch.device | None = None
+) -> torch.device:
     for param in model.parameters():
         if param.device.type not in {"cpu", "meta"}:
             return param.device
@@ -125,7 +126,7 @@ def load_native_transformers_checkpoint(
             "native checkpoint loading requires accelerate; install it in the worker environment"
         ) from exc
 
-    runtime = get_worker_config()
+    runtime = get_execution_config()
     attn_backend = attention_backend or DEFAULT_ATTENTION_BACKEND
     dtype = dtype_from_name(runtime.model_dtype)
 
@@ -207,7 +208,9 @@ def _materialize_one_tensor(
     attrs = capture_tensor_policy(old_tensor)
     keep_checkpoint_dtype = _should_keep_checkpoint_dtype(tensor, old_tensor)
     if _should_load_with_weight_loader(tensor, old_tensor):
-        target_dtype = _target_dtype_for_loaded_tensor(tensor, old_tensor, dtype, keep_checkpoint_dtype)
+        target_dtype = _target_dtype_for_loaded_tensor(
+            tensor, old_tensor, dtype, keep_checkpoint_dtype
+        )
         target_value = torch.empty(
             tuple(int(dim) for dim in old_tensor.shape),
             dtype=target_dtype,
@@ -222,23 +225,27 @@ def _materialize_one_tensor(
         )
         materialized = getattr(parent, leaf)
         restore_tensor_policy(materialized, attrs)
-        loaded_value = tensor if keep_checkpoint_dtype else (
-            tensor.to(dtype=target_dtype) if tensor.is_floating_point() else tensor
+        loaded_value = (
+            tensor
+            if keep_checkpoint_dtype
+            else (tensor.to(dtype=target_dtype) if tensor.is_floating_point() else tensor)
         )
         get_weight_loader(materialized)(materialized, loaded_value)
         _mark_quant_tensor_loaded(parent, leaf, tensor)
         return
-    value = tensor if keep_checkpoint_dtype else (
-        tensor.to(dtype=dtype) if tensor.is_floating_point() else tensor
+    value = (
+        tensor
+        if keep_checkpoint_dtype
+        else (tensor.to(dtype=dtype) if tensor.is_floating_point() else tensor)
     )
     set_module_tensor_to_device(
         model,
         name,
         device,
         value=value,
-        dtype=tensor.dtype if keep_checkpoint_dtype and tensor.is_floating_point() else (
-            dtype if tensor.is_floating_point() else None
-        ),
+        dtype=tensor.dtype
+        if keep_checkpoint_dtype and tensor.is_floating_point()
+        else (dtype if tensor.is_floating_point() else None),
         clear_cache=False,
     )
     restore_tensor_policy(getattr(parent, leaf), attrs)
@@ -259,7 +266,9 @@ def _materialize_stacked_tensor_if_needed(
         return
     attrs = capture_tensor_policy(old_tensor)
     keep_checkpoint_dtype = _should_keep_checkpoint_dtype(reference, old_tensor)
-    target_dtype = _target_dtype_for_loaded_tensor(reference, old_tensor, dtype, keep_checkpoint_dtype)
+    target_dtype = _target_dtype_for_loaded_tensor(
+        reference, old_tensor, dtype, keep_checkpoint_dtype
+    )
     target_value = torch.empty(
         tuple(int(dim) for dim in old_tensor.shape),
         dtype=target_dtype,
@@ -299,15 +308,9 @@ def _stream_checkpoint_weights(
     """
     expected = set(model.state_dict().keys())
     in_scope = {n for n in expected if param_filter(n)} if param_filter is not None else expected
-    optional = {
-        name
-        for name, param in model.named_parameters()
-        if is_optional_checkpoint(param)
-    }
+    optional = {name for name, param in model.named_parameters() if is_optional_checkpoint(param)}
     if checkpoint_layout is not None:
-        optional.update(
-            name for name in expected if checkpoint_layout.optional_tensor(name)
-        )
+        optional.update(name for name in expected if checkpoint_layout.optional_tensor(name))
     loaded: set[str] = set()
     unexpected: list[str] = []
     params = dict(model.named_parameters())
@@ -343,7 +346,9 @@ def _stream_checkpoint_weights(
                 dtype=dtype,
                 set_module_tensor_to_device=set_module_tensor_to_device,
             )
-            load_parameter(model, target_name, tensor.to(device=device), shard_id=shard_id, dtype=dtype)
+            load_parameter(
+                model, target_name, tensor.to(device=device), shard_id=shard_id, dtype=dtype
+            )
         else:
             _materialize_one_tensor(
                 model,
@@ -386,7 +391,9 @@ def _is_float8_dtype(dtype: torch.dtype) -> bool:
     }
 
 
-def _resolve_module_tensor(module: nn.Module, tensor_name: str) -> tuple[nn.Module, str, torch.Tensor]:
+def _resolve_module_tensor(
+    module: nn.Module, tensor_name: str
+) -> tuple[nn.Module, str, torch.Tensor]:
     parent = module
     leaf = tensor_name
     if "." in tensor_name:

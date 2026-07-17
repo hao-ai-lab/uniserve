@@ -1,4 +1,5 @@
 """Parity tests for the shared layer library."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -54,8 +55,8 @@ pytestmark = pytest.mark.integration
 def _set_worker_runtime(monkeypatch, **kwargs):
     monkeypatch.setattr(
         runtime_config,
-        "_CURRENT_CONFIG",
-        replace(runtime_config.get_worker_config(), **kwargs),
+        "_CURRENT_EXECUTION_CONFIG",
+        replace(runtime_config.get_execution_config(), **kwargs),
     )
 
 
@@ -109,10 +110,9 @@ def test_packed_rotary_apply_matches_declared_formula():
     torch.testing.assert_close(cos, expected_freqs.cos())
     torch.testing.assert_close(sin, expected_freqs.sin())
     out = apply_rotary_emb(x, cos, sin)
-    expected = (
-        x * torch.cat([cos, cos], dim=-1).unsqueeze(1)
-        + rotate_half(x) * torch.cat([sin, sin], dim=-1).unsqueeze(1)
-    )
+    expected = x * torch.cat([cos, cos], dim=-1).unsqueeze(1) + rotate_half(x) * torch.cat(
+        [sin, sin], dim=-1
+    ).unsqueeze(1)
     torch.testing.assert_close(out, expected)
     assert out.shape == x.shape
 
@@ -147,9 +147,7 @@ def test_qwen_rotary_apply_matches_declared_formula():
     torch.testing.assert_close(shared[0], expected_q)
     torch.testing.assert_close(shared[1], expected_k)
     half = q.shape[-1] // 2
-    torch.testing.assert_close(
-        rotate_half(q), torch.cat([-q[..., half:], q[..., :half]], dim=-1)
-    )
+    torch.testing.assert_close(rotate_half(q), torch.cat([-q[..., half:], q[..., :half]], dim=-1))
 
 
 def test_rotary_embedding_matches_qwen3_frequency_range_config():
@@ -182,7 +180,9 @@ def test_linear_weight_loader_and_qkv_shards():
 
     from uniserve_worker.nn import QKVParallelLinear
 
-    qkv = QKVParallelLinear(hidden_size=3, head_size=2, total_num_heads=2, total_num_kv_heads=1, bias=True)
+    qkv = QKVParallelLinear(
+        hidden_size=3, head_size=2, total_num_heads=2, total_num_kv_heads=1, bias=True
+    )
     q = torch.ones(4, 3)
     k = torch.ones(2, 3) * 2
     v = torch.ones(2, 3) * 3
@@ -317,7 +317,7 @@ def test_fp8_linear_cuda_scaled_mm_path_runs_finite():
     dense_weight = (torch.randn(32, 16) * 0.2).cuda()
     layer.weight.weight_loader(layer.weight, dense_weight)
     process_quantized_modules([layer])
-    x = (torch.randn(4, 16, device="cuda", dtype=torch.bfloat16) * 0.2)
+    x = torch.randn(4, 16, device="cuda", dtype=torch.bfloat16) * 0.2
 
     out = layer(x)
 
@@ -581,7 +581,7 @@ def test_flashinfer_paged_varlen_prefill_matches_causal_reference_cuda():
         pages = block_table[row, :page_count].tolist()
         k_full = torch.cat([k_cache[int(page)] for page in pages], dim=0)[:kv_len].float()
         v_full = torch.cat([v_cache[int(page)] for page in pages], dim=0)[:kv_len].float()
-        q_row = q[q_offset:q_offset + query_len].float()
+        q_row = q[q_offset : q_offset + query_len].float()
         scores = torch.einsum("qhd,khd->hqk", q_row, k_full) * (head_dim**-0.5)
         prefix = kv_len - query_len
         keep = torch.zeros((query_len, kv_len), dtype=torch.bool, device=device)
@@ -676,7 +676,9 @@ def test_torch_compile_helper_prepares_blackwell_ptxas(monkeypatch):
 
     monkeypatch.setattr(compile_mod, "_first_module_device", lambda _module: torch.device("cuda"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device=None: (10, 0))
-    monkeypatch.setattr(compile_mod, "ensure_blackwell_ptxas", lambda: calls.append("ptxas") or True)
+    monkeypatch.setattr(
+        compile_mod, "ensure_blackwell_ptxas", lambda: calls.append("ptxas") or True
+    )
     monkeypatch.setattr(torch, "compile", lambda target, **_kwargs: target)
 
     cfg = TorchCompileConfig(
@@ -818,7 +820,9 @@ def test_qkv_parallel_loader_shards_q_and_replicates_small_kv_heads():
     from uniserve_worker.nn import QKVParallelLinear
 
     with use_mesh(DeviceMesh.tp(1, 2)):
-        qkv = QKVParallelLinear(hidden_size=3, head_size=2, total_num_heads=4, total_num_kv_heads=1, bias=True)
+        qkv = QKVParallelLinear(
+            hidden_size=3, head_size=2, total_num_heads=4, total_num_kv_heads=1, bias=True
+        )
 
     q = torch.arange(24, dtype=torch.float32).reshape(8, 3)
     k = torch.ones(2, 3) * 2
@@ -1178,7 +1182,9 @@ def test_sensenova_qk_norm_rope_3d_matches_eager_formula(monkeypatch):
             return apply_rotary_pos_emb(q_axis, k_axis, cos_axis, sin_axis, None, 1)
         cos_axis = cos_axis.unsqueeze(0) if q_axis.ndim == 4 and cos_axis.ndim == 2 else cos_axis
         sin_axis = sin_axis.unsqueeze(0) if k_axis.ndim == 4 and sin_axis.ndim == 2 else sin_axis
-        return apply_rotary_emb(q_axis, cos_axis, sin_axis), apply_rotary_emb(k_axis, cos_axis, sin_axis)
+        return apply_rotary_emb(q_axis, cos_axis, sin_axis), apply_rotary_emb(
+            k_axis, cos_axis, sin_axis
+        )
 
     cos_t, sin_t = (x.unsqueeze(0) for x in attn.rotary_emb.cos_sin_1d(indexes[0]))
     q_t, k_t = apply_axis(q_t, k_t, cos_t, sin_t)
@@ -1280,7 +1286,9 @@ def test_torch_sdpa_matches_bagel_sdpa_causal_gqa():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.skipif(not has_attention_backend("sgl_kernel"), reason="sgl_kernel attention backend unavailable")
+@pytest.mark.skipif(
+    not has_attention_backend("sgl_kernel"), reason="sgl_kernel attention backend unavailable"
+)
 def test_sgl_kernel_attention_matches_torch_sdpa_causal_gqa_cuda():
     torch.manual_seed(407)
     q = torch.randn(2, 16, 9, 128, device="cuda", dtype=torch.bfloat16)
@@ -1317,7 +1325,9 @@ def test_qwen_attention_helper_matches_torch_sdpa_layout():
     cfg.max_position_embeddings_hw = 128
     cfg._attn_implementation = "eager"
     attn = sensenova_u1._SenseNovaAttention(cfg, layer_idx=0)
-    ref = get_attention_backend("torch_sdpa").forward(query, key, value, causal=False, scale=8**-0.5)
+    ref = get_attention_backend("torch_sdpa").forward(
+        query, key, value, causal=False, scale=8**-0.5
+    )
     got, _ = attn._attend_bhld(query, key, value, None)
     torch.testing.assert_close(got, ref.transpose(1, 2).contiguous())
 
@@ -1423,7 +1433,9 @@ def test_uni_attention_reuses_context_attention_plan_for_paged_update(monkeypatc
     )
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)):
+    with use_forward_context(
+        ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)
+    ):
         out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=True)
 
     assert out.shape == q.shape
@@ -1490,7 +1502,9 @@ def test_uni_attention_empty_batched_paged_prefill_appends_current_kv(monkeypatc
     )
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)):
+    with use_forward_context(
+        ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)
+    ):
         out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=True)
 
     assert out.shape == q.shape
@@ -1571,7 +1585,9 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_plan(monkeypatch):
     )
     stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)):
+    with use_forward_context(
+        ForwardContext(attention_backend=backend, attention_plan=plan, stats=stats)
+    ):
         out = attn(q, k, v, kv_cache=cache, update_cache=True, causal=True)
 
     assert out.shape == q.shape
@@ -1707,7 +1723,9 @@ def test_uni_attention_rejects_dense_fallback_for_transient_paged_cache_layout()
 
         def get(self, layer):  # pragma: no cover - guard must fail before dense cache reads
             del layer
-            raise AssertionError("dense fallback must reject 4-D paged cache tensors before reading")
+            raise AssertionError(
+                "dense fallback must reject 4-D paged cache tensors before reading"
+            )
 
     attn = RadixAttention(2, 2, 4, layer_id=0)
     q = torch.randn(2, 2, 3, 4)
@@ -1849,8 +1867,12 @@ def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
                 q_end = int(cu_seqlens_q[row + 1].item())
                 q_row = q[q_start:q_end]
                 pages = [int(page.item()) for page in page_table[row]]
-                full_k = torch.cat([k_cache[page] for page in pages], dim=0)[: int(seqused_k[row].item())]
-                full_v = torch.cat([v_cache[page] for page in pages], dim=0)[: int(seqused_k[row].item())]
+                full_k = torch.cat([k_cache[page] for page in pages], dim=0)[
+                    : int(seqused_k[row].item())
+                ]
+                full_v = torch.cat([v_cache[page] for page in pages], dim=0)[
+                    : int(seqused_k[row].item())
+                ]
                 full_k = full_k.repeat_interleave(q_row.shape[1] // full_k.shape[1], dim=1)
                 full_v = full_v.repeat_interleave(q_row.shape[1] // full_v.shape[1], dim=1)
                 kv_index = torch.arange(full_k.shape[0], device=q.device)[None, :]
@@ -1864,7 +1886,9 @@ def test_sensenova_packed_visible_path_matches_dense_block_diagonal_mot():
                         full_v.transpose(0, 1).unsqueeze(0),
                         attn_mask=mask[None, None],
                         scale=scale,
-                    ).squeeze(0).transpose(0, 1)
+                    )
+                    .squeeze(0)
+                    .transpose(0, 1)
                 )
             return torch.cat(refs, dim=0)
 
@@ -2106,6 +2130,7 @@ def test_sensenova_packed_visible_fully_visible_uses_visible_end_backend():
     q = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
     k = q + 100
     v = q + 200
+
     class FakeAttention:
         def __init__(self):
             self.calls = []
@@ -2162,7 +2187,9 @@ def test_sensenova_admitted_forward_requires_whole_batch_graph(monkeypatch):
             return {"req_id": req_id}
 
     monkeypatch.setattr(wrapper, "prepare_denoise", lambda _state, _op: object())
-    monkeypatch.setattr(packed_batch, "run_packed_visible_forward_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        packed_batch, "run_packed_visible_forward_result", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(packed_batch, "run_packed_mixed_forward", lambda *_args, **_kwargs: False)
 
     def scalar_text_called(_op):
@@ -2274,7 +2301,9 @@ def test_sensenova_forward_sampling_updates_decode_relay():
     assert state.decode_relay.token_id == 2
     torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([2], dtype=torch.long))
     assert state.decode_relay.position_id == 9
-    torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([9], dtype=torch.long))
+    torch.testing.assert_close(
+        state.decode_relay.position_tensor, torch.tensor([9], dtype=torch.long)
+    )
     assert state.decode_relay.position_tensor.data_ptr() == position_tensor.data_ptr()
 
 
@@ -2300,7 +2329,9 @@ def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
             },
         ]
     )
-    plan = packed_mixed_forward.PackedForwardPlan(batch=batch, denoise_steps=[], results=[None, None])
+    plan = packed_mixed_forward.PackedForwardPlan(
+        batch=batch, denoise_steps=[], results=[None, None]
+    )
     cache = SimpleNamespace()
     plan.add_text_slot(
         row_index=0,
@@ -2384,13 +2415,18 @@ def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
 
     assert results == [{"req_id": 7, "sampled_token_id": 4, "sampled_token_ids": [2, 3, 4]}]
     assert [call[0]["pos_range"] for call in owner.driver.calls] == [[4, 5], [5, 6]]
-    assert [call[0]["token_source"] for call in owner.driver.calls] == ["last_sampled", "last_sampled"]
+    assert [call[0]["token_source"] for call in owner.driver.calls] == [
+        "last_sampled",
+        "last_sampled",
+    ]
     assert int(owner.driver.calls[0][0]["token_tensor"].item()) == 2
     assert int(owner.driver.calls[1][0]["token_tensor"].item()) == 3
     assert state.decode_relay.token_id == 4
     torch.testing.assert_close(state.decode_relay.token_tensor, torch.tensor([4], dtype=torch.long))
     assert state.decode_relay.position_id == 6
-    torch.testing.assert_close(state.decode_relay.position_tensor, torch.tensor([6], dtype=torch.long))
+    torch.testing.assert_close(
+        state.decode_relay.position_tensor, torch.tensor([6], dtype=torch.long)
+    )
 
 
 def test_sensenova_text_batch_delegates_to_scalar_text_stepper(monkeypatch):
@@ -2527,7 +2563,9 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
 
     class FakeLanguage(nn.Module):
         def forward(self, **_kwargs):
-            raise AssertionError("CPU decode must fall back to the scalar stepper, not the neural forward")
+            raise AssertionError(
+                "CPU decode must fall back to the scalar stepper, not the neural forward"
+            )
 
     wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
         config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 2}}
@@ -2954,7 +2992,10 @@ def test_sensenova_packed_mixed_sorted_segments_scatter_to_original_rows(monkeyp
         cfg_interval=(0.0, 1.0),
         cfg_renorm_type="none",
         cfg_renorm_min=0.0,
-        extra={"img": SimpleNamespace(token_h=1, token_w=1, width=16, height=16), "image_embeds": image_embeds},
+        extra={
+            "img": SimpleNamespace(token_h=1, token_w=1, width=16, height=16),
+            "image_embeds": image_embeds,
+        },
     )
 
     class Owner:
@@ -3426,7 +3467,8 @@ def test_sensenova_packed_mixed_batches_text_staging_prefix_copies(monkeypatch):
 
     assert owner.checked_staging
     assert any(
-        call == [
+        call
+        == [
             (host_pool, stage_pool, 0, 2),
             (host_pool, stage_pool, 0, 2),
         ]
@@ -4188,7 +4230,11 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
     assert first_sampling.token_id_reads == 1
     assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [1, 0]
     assert isinstance(results[0], DeferredDecodeBurstSeqResult)
-    assert results[0].finalize() == {"req_id": 7, "sampled_token_id": 4, "sampled_token_ids": [2, 3, 4]}
+    assert results[0].finalize() == {
+        "req_id": 7,
+        "sampled_token_id": 4,
+        "sampled_token_ids": [2, 3, 4],
+    }
     assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [1, 1]
     assert state.decode_relay.token_id == 4
 
@@ -4283,7 +4329,11 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
     assert first_sampling.token_id_reads == 0
     assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [0, 0, 0]
     assert isinstance(results[0], DeferredTerminalDecodeBurstSeqResult)
-    assert results[0].finalize() == {"req_id": 7, "sampled_token_id": 7, "sampled_token_ids": [3, 5, 7]}
+    assert results[0].finalize() == {
+        "req_id": 7,
+        "sampled_token_id": 7,
+        "sampled_token_ids": [3, 5, 7],
+    }
     assert first_sampling.token_id_reads == 1
     assert [sampling.token_id_reads for sampling in owner.followup_samplings] == [1, 1, 0]
 
@@ -4305,7 +4355,9 @@ def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(mon
     defer_flags: list[bool] = []
     sampling_metadata: list[tuple[list, list, list]] = []
 
-    def fake_sampling(logits, _sampling_params, recent, allowed, suppress, *, defer_cpu=False, **_kwargs):
+    def fake_sampling(
+        logits, _sampling_params, recent, allowed, suppress, *, defer_cpu=False, **_kwargs
+    ):
         defer_flags.append(bool(defer_cpu))
         sampling_metadata.append((list(recent), list(allowed), list(suppress)))
         tokens = torch.full((int(logits.shape[0]),), 4, dtype=torch.long, device=logits.device)

@@ -1,10 +1,10 @@
-"""Typed worker runtime configuration.
+"""Typed model-execution configuration.
 
-The worker process resolves stable serving configuration at the composition root
-(``main.py``) and deep subsystems read this immutable config instead of ambient
-environment variables. Profiling/debug-only env toggles remain in their narrow
-modules.
+Bootstrap resolves stable execution settings before model materialization.
+Deep execution modules read this immutable snapshot instead of ambient
+environment variables.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,10 +18,10 @@ __all__ = [
     "decode_graph_padding_block_count",
     "FlashInferTuningConfig",
     "TorchCompileRuntimeConfig",
-    "WorkerRuntimeConfig",
-    "get_worker_config",
-    "set_worker_config",
-    "worker_config_from_args",
+    "ExecutionConfig",
+    "execution_config_from_namespace",
+    "get_execution_config",
+    "set_execution_config",
 ]
 
 
@@ -146,7 +146,7 @@ class FlashInferTuningConfig:
 
 
 @dataclass(frozen=True)
-class WorkerRuntimeConfig:
+class ExecutionConfig:
     model_dtype: str = "bfloat16"
     transformers_trust_remote_code: bool = False
     transformers_attn_implementation: str = "uniserve"
@@ -173,64 +173,77 @@ class WorkerRuntimeConfig:
     flashinfer: FlashInferTuningConfig = FlashInferTuningConfig()
 
 
-_CURRENT_CONFIG = WorkerRuntimeConfig()
+_CURRENT_EXECUTION_CONFIG = ExecutionConfig()
 
 
-def get_worker_config() -> WorkerRuntimeConfig:
-    return _CURRENT_CONFIG
+def get_execution_config() -> ExecutionConfig:
+    return _CURRENT_EXECUTION_CONFIG
 
 
-def set_worker_config(config: WorkerRuntimeConfig) -> None:
-    global _CURRENT_CONFIG
-    _CURRENT_CONFIG = config
+def set_execution_config(config: ExecutionConfig) -> None:
+    global _CURRENT_EXECUTION_CONFIG
+    _CURRENT_EXECUTION_CONFIG = config
 
 
-def worker_config_from_args(args: Any) -> WorkerRuntimeConfig:
-    return WorkerRuntimeConfig(
-        model_dtype=str(args.model_dtype),
-        transformers_trust_remote_code=bool(args.transformers_trust_remote_code),
-        transformers_attn_implementation=str(args.transformers_attn_implementation),
-        allow_transformers_fallback=bool(getattr(args, "allow_transformers_fallback", False)),
-        disabled_model_archs=tuple(str(v) for v in (args.disable_model_arch or ())),
-        strict_model_imports=bool(args.strict_model_imports),
-        kv_cache_dtype=_none_if_empty(args.kv_cache_dtype),
-        kv_memory_fraction=_bounded_fraction(float(args.kv_memory_fraction), "kv-memory-fraction"),
-        tp_backend=_none_if_empty(args.tp_backend),
-        tp_init_method=_none_if_empty(args.tp_init_method),
-        mooncake_device=str(args.mooncake_device or ""),
-        mooncake_protocol=str(args.mooncake_protocol or "rdma"),
-        cuda_graph=bool(args.cuda_graph),
-        cuda_graph_warmup=bool(args.cuda_graph_warmup),
+def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
+    return ExecutionConfig(
+        model_dtype=str(namespace.model_dtype),
+        transformers_trust_remote_code=bool(namespace.transformers_trust_remote_code),
+        transformers_attn_implementation=str(namespace.transformers_attn_implementation),
+        allow_transformers_fallback=bool(namespace.allow_transformers_fallback),
+        disabled_model_archs=tuple(str(value) for value in (namespace.disable_model_arch or ())),
+        strict_model_imports=bool(namespace.strict_model_imports),
+        kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),
+        kv_memory_fraction=_bounded_fraction(
+            float(namespace.kv_memory_fraction),
+            "kv-memory-fraction",
+        ),
+        tp_backend=_none_if_empty(namespace.tp_backend),
+        tp_init_method=_none_if_empty(namespace.tp_init_method),
+        mooncake_device=str(namespace.mooncake_device or ""),
+        mooncake_protocol=str(namespace.mooncake_protocol or "rdma"),
+        cuda_graph=bool(namespace.cuda_graph),
+        cuda_graph_warmup=bool(namespace.cuda_graph_warmup),
         cuda_graph_warmup_batches=_parse_positive_int_csv(
-            args.cuda_graph_warmup_batches,
+            namespace.cuda_graph_warmup_batches,
             default=DEFAULT_DECODE_GRAPH_BATCH_SIZES,
         ),
-        prefill_cuda_graph=bool(args.prefill_cuda_graph),
-        prefill_cuda_graph_warmup=bool(args.prefill_cuda_graph_warmup),
+        prefill_cuda_graph=bool(namespace.prefill_cuda_graph),
+        prefill_cuda_graph_warmup=bool(namespace.prefill_cuda_graph_warmup),
         prefill_cuda_graph_warmup_tokens=_parse_positive_int_csv(
-            args.prefill_cuda_graph_warmup_tokens,
+            namespace.prefill_cuda_graph_warmup_tokens,
             default=DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
         ),
-        mixed_text_max_tokens=max(0, int(args.mixed_text_max_tokens)),
-        varlen_prefill=bool(args.varlen_prefill),
-        green_contexts=bool(args.green_contexts),
-        logits_processor_chunk_size=max(0, int(args.logits_processor_chunk_size)),
+        mixed_text_max_tokens=max(0, int(namespace.mixed_text_max_tokens)),
+        varlen_prefill=bool(namespace.varlen_prefill),
+        green_contexts=bool(namespace.green_contexts),
+        logits_processor_chunk_size=max(
+            0,
+            int(namespace.logits_processor_chunk_size),
+        ),
         torch_compile=TorchCompileRuntimeConfig(
-            enabled=bool(args.torch_compile),
-            backend=str(args.torch_compile_backend),
-            mode=_none_if_empty(args.torch_compile_mode),
-            fullgraph=bool(args.torch_compile_fullgraph),
-            dynamic=_parse_optional_bool(args.torch_compile_dynamic),
+            enabled=bool(namespace.torch_compile),
+            backend=str(namespace.torch_compile_backend),
+            mode=_none_if_empty(namespace.torch_compile_mode),
+            fullgraph=bool(namespace.torch_compile_fullgraph),
+            dynamic=_parse_optional_bool(namespace.torch_compile_dynamic),
         ),
         flashinfer=FlashInferTuningConfig(
-            workspace_size=max(1, int(args.flashinfer_workspace_size)),
-            use_tensor_core=_parse_optional_bool(args.flashinfer_use_tensor_core),
-            decode_backend=str(args.flashinfer_decode_backend),
-            prefill_backend=str(args.flashinfer_prefill_backend),
-            decode_split_tile_size=_positive_optional_int(args.flashinfer_decode_split_tile_size),
-            prefill_split_tile_size=_positive_optional_int(args.flashinfer_prefill_split_tile_size),
-            disable_split_kv=bool(args.flashinfer_disable_split_kv),
-            fast_decode_plan=bool(args.flashinfer_fast_decode_plan),
+            workspace_size=max(
+                1,
+                int(namespace.flashinfer_workspace_size),
+            ),
+            use_tensor_core=_parse_optional_bool(namespace.flashinfer_use_tensor_core),
+            decode_backend=str(namespace.flashinfer_decode_backend),
+            prefill_backend=str(namespace.flashinfer_prefill_backend),
+            decode_split_tile_size=_positive_optional_int(
+                namespace.flashinfer_decode_split_tile_size
+            ),
+            prefill_split_tile_size=_positive_optional_int(
+                namespace.flashinfer_prefill_split_tile_size
+            ),
+            disable_split_kv=bool(namespace.flashinfer_disable_split_kv),
+            fast_decode_plan=bool(namespace.flashinfer_fast_decode_plan),
         ),
     )
 

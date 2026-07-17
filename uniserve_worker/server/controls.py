@@ -1,7 +1,7 @@
 """Control-kind dispatch registry.
 
-Each control kind maps to a :class:`ControlSpec` describing the driver method it
-targets and how its (untrusted) wire fields become that method's keyword
+Each control kind maps to a :class:`ControlSpec` describing the worker method it
+targets and how its untrusted wire fields become that method's keyword
 arguments. Control methods are invoked by name with explicit keyword mapping from
 wire fields to driver parameters.
 
@@ -9,6 +9,7 @@ The registry covers exactly ``core.contracts.CONTROL_KINDS``; the equality is
 asserted at import time so a control kind added in one layer cannot silently
 become a ``scheduler_bug`` here.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -17,19 +18,19 @@ from ..contracts.caps import CONTROL_KINDS
 from ..foundation.errors import invalid_descriptor
 
 __all__ = [
-    'ControlSpec',
-    'CONTROL_SPECS',
+    "ControlSpec",
+    "CONTROL_SPECS",
 ]
 
 
 @dataclass(frozen=True)
 class ControlSpec:
-    """How one control kind binds its wire fields to a driver method call.
+    """How one control kind binds its wire fields to a worker method call.
 
     ``method`` is the driver attribute invoked. ``scalars`` and ``lists`` map a
-    *wire field name* to the *driver keyword* it fills; a wire field and the
-    driver keyword usually share a name, but ``free_encoder`` reads wire field
-    ``free_handles`` into the driver's ``handles`` parameter, so the mapping is
+    *wire field name* to the *worker keyword* it fills; a wire field and the
+    worker keyword usually share a name, but ``free_encoder`` reads wire field
+    ``free_handles`` into the worker's ``handles`` parameter, so the mapping is
     explicit rather than positional. ``scalars`` are required (a missing field
     raises ``InvalidDescriptor`` before the driver is touched); ``lists`` default
     to an empty list when absent and reject a non-list payload.
@@ -39,12 +40,12 @@ class ControlSpec:
     scalars: dict[str, str] = field(default_factory=dict)
     lists: dict[str, str] = field(default_factory=dict)
 
-    def build_kwargs(self, kind: str, req) -> dict:
+    def build_kwargs(self, kind: str, request) -> dict:
         kwargs: dict = {}
         for wire_field, param in self.scalars.items():
-            kwargs[param] = _require(req, wire_field, kind)
+            kwargs[param] = _require(request, wire_field, kind)
         for wire_field, param in self.lists.items():
-            kwargs[param] = _require_list(req, wire_field, kind)
+            kwargs[param] = _require_list(request, wire_field, kind)
         return kwargs
 
 
@@ -81,9 +82,7 @@ def _require_list(req, field_name: str, kind: str) -> list:
 # arguments, so their specs carry the target method with no field bindings.
 CONTROL_SPECS: dict[str, ControlSpec] = {
     "copy_blocks": ControlSpec("copy_blocks", lists={"copies": "copies"}),
-    "load_lora": ControlSpec(
-        "load_lora", scalars={"lora_id": "lora_id", "lora_path": "lora_path"}
-    ),
+    "load_lora": ControlSpec("load_lora", scalars={"lora_id": "lora_id", "lora_path": "lora_path"}),
     "unload_lora": ControlSpec("unload_lora", scalars={"lora_id": "lora_id"}),
     "free_encoder": ControlSpec("free_encoder", lists={"free_handles": "handles"}),
     "reset_prefix_cache": ControlSpec("reset_prefix_cache"),

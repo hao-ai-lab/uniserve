@@ -171,9 +171,8 @@ fn extend_unique<T: Clone + Eq + std::hash::Hash>(target: &mut Vec<T>, incoming:
 }
 
 impl StageRouter {
-    /// Build a router from `(WorkerKind, Executor)` pools. Each pool's
-    /// `WorkerKind::supported_ops` defines which op kinds route to it. A kind
-    /// claimed by two pools routes to the first (declaration order).
+    /// Build a router from `(WorkerKind, Executor)` pools. Each operation must
+    /// have exactly one capable pool; ambiguous claims fail during startup.
     #[cfg(test)]
     fn new(pools: Vec<(WorkerKind, Box<dyn Executor>)>) -> Self {
         Self::try_new(pools).expect("invalid StageRouter pool capabilities")
@@ -187,7 +186,11 @@ impl StageRouter {
             let caps = exec.caps();
             for op in kind.supported_ops() {
                 if caps.supported_ops.contains(op) {
-                    routing.entry(*op).or_insert(idx);
+                    anyhow::ensure!(
+                        !routing.contains_key(op),
+                        "multiple staged pools claim operation {op:?}; replication requires an explicit replica-group executor"
+                    );
+                    routing.insert(*op, idx);
                 }
             }
         }
@@ -780,28 +783,26 @@ impl Executor for StageRouter {
 }
 
 impl StageRouter {
-    /// Which pools a control op fans out to. `FreeEncoder` only reaches
-    /// encoder-capable pools (they hold the encoder cache); every other control
-    /// broadcasts. Returns pool indices.
+    /// Route controls to pools that advertise the corresponding method.
+    ///
+    /// `DropRequest` is lifecycle-wide and always reaches every pool because it
+    /// is not part of the optional-control capability vocabulary.
     fn control_targets(&self, op: &ControlOp) -> Vec<usize> {
         match op {
-            ControlOp::FreeEncoder(_) => {
-                let encoder_pools: Vec<usize> = self
-                    .pools
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| {
-                        p.kind.handles(OpKind::VitEncode) || p.kind.handles(OpKind::VaeEncode)
-                    })
-                    .map(|(idx, _)| idx)
-                    .collect();
-                if encoder_pools.is_empty() {
-                    (0..self.pools.len()).collect()
-                } else {
-                    encoder_pools
-                }
-            }
-            _ => (0..self.pools.len()).collect(),
+            ControlOp::DropRequest(_) => (0..self.pools.len()).collect(),
+            _ => self
+                .pools
+                .iter()
+                .enumerate()
+                .filter(|(_, pool)| {
+                    pool.exec
+                        .caps()
+                        .supported_controls
+                        .iter()
+                        .any(|method| method == op.method())
+                })
+                .map(|(index, _)| index)
+                .collect(),
         }
     }
 }
@@ -889,6 +890,30 @@ mod tests {
                 message: None,
             }])
         }
+    }
+
+    #[test]
+    fn duplicate_operation_claims_fail_at_startup() {
+        let result = StageRouter::try_new(vec![
+            (
+                WorkerKind::Sampler,
+                Box::new(PoolExec::for_kind(WorkerKind::Sampler)),
+            ),
+            (
+                WorkerKind::Sampler,
+                Box::new(PoolExec::for_kind(WorkerKind::Sampler)),
+            ),
+        ]);
+
+        let error = match result {
+            Ok(_) => panic!("duplicate operation claim unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("multiple staged pools claim operation")
+        );
     }
 
     #[test]
@@ -1399,15 +1424,47 @@ mod tests {
 
     #[test]
     fn control_wait_acks_have_distinct_ranks() {
+        let mut und = PoolExec::new();
+        und.caps
+            .supported_controls
+            .push("reset_prefix_cache".to_string());
+        let mut generation_pool = PoolExec::new();
+        generation_pool
+            .caps
+            .supported_controls
+            .push("reset_prefix_cache".to_string());
         let mut router = StageRouter::new(vec![
-            (WorkerKind::Und, Box::new(PoolExec::new())),
-            (WorkerKind::Gen, Box::new(PoolExec::new())),
+            (WorkerKind::Und, Box::new(und)),
+            (WorkerKind::Gen, Box::new(generation_pool)),
         ]);
         let acks = router
             .control_wait(ControlOp::ResetPrefixCache, None)
             .unwrap();
         assert_eq!(acks.len(), 2);
         assert_eq!(acks.iter().map(|a| a.rank).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn controls_target_only_pools_that_advertise_them() {
+        let mut model = PoolExec::new();
+        model.caps.supported_controls.push("load_lora".to_string());
+        let sampler = PoolExec::new();
+        let router = StageRouter::new(vec![
+            (WorkerKind::Decode, Box::new(model)),
+            (WorkerKind::Sampler, Box::new(sampler)),
+        ]);
+
+        assert_eq!(
+            router.control_targets(&ControlOp::LoadLora {
+                lora_id: 7,
+                path: "/adapter".to_string(),
+            }),
+            vec![0],
+        );
+        assert_eq!(
+            router.control_targets(&ControlOp::DropRequest(RequestId(9))),
+            vec![0, 1],
+        );
     }
 
     /// Records every op it is submitted (shared handle) and emits one result per

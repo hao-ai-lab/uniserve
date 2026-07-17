@@ -1,4 +1,5 @@
 """Auto-discovery registry for new-style UniModel classes."""
+
 from __future__ import annotations
 
 import importlib
@@ -13,15 +14,15 @@ from ..contracts.model_family import ModelFamilyDescriptor, ModelOperationSet
 from ..contracts.model_protocols import UniModel
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
 from ..foundation.plugins import discover_package_plugins
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 
 __all__ = [
-    'ModelRegistry',
-    'MODEL_REGISTRY',
-    'import_model_classes',
-    'resolve_model_cls',
-    'resolve_model_descriptor',
-    'detect_model_architectures',
+    "ModelRegistry",
+    "MODEL_REGISTRY",
+    "import_model_classes",
+    "resolve_model_cls",
+    "resolve_model_descriptor",
+    "detect_model_architectures",
 ]
 
 logger = logging.getLogger(__name__)
@@ -35,10 +36,14 @@ class ModelRegistry:
         self._descriptors: dict[str, ModelFamilyDescriptor] = {}
         self._fallback_cls: Type[UniModel] | None = None
 
-    def register(self, model_cls: Type[UniModel], *, names: list[str] | tuple[str, ...] | None = None) -> None:
+    def register(
+        self, model_cls: Type[UniModel], *, names: list[str] | tuple[str, ...] | None = None
+    ) -> None:
         _validate_model_contract(model_cls)
         keys = tuple(names or (model_cls.__name__,))
-        descriptor = ModelFamilyDescriptor.from_model_class(model_cls, names=tuple(str(key) for key in keys))
+        descriptor = ModelFamilyDescriptor.from_model_class(
+            model_cls, names=tuple(str(key) for key in keys)
+        )
         if bool(getattr(model_cls, "fallback", False)):
             if self._fallback_cls is not None and self._fallback_cls is not model_cls:
                 raise invalid_descriptor("only one fallback model class can be registered")
@@ -58,24 +63,30 @@ class ModelRegistry:
         self,
         architectures: list[str] | tuple[str, ...],
     ) -> ModelFamilyDescriptor:
-        disabled = set(get_worker_config().disabled_model_archs)
+        disabled = set(get_execution_config().disabled_model_archs)
         for arch in architectures:
             if arch in disabled:
                 continue
             if arch in self._descriptors:
                 return self._descriptors[arch]
-        config = get_worker_config()
+        config = get_execution_config()
         if self._fallback_cls is not None and bool(config.allow_transformers_fallback):
-            fallback_names = tuple(getattr(self._fallback_cls, "architectures", (self._fallback_cls.__name__,)))
+            fallback_names = tuple(
+                getattr(self._fallback_cls, "architectures", (self._fallback_cls.__name__,))
+            )
             if any(name not in disabled for name in fallback_names):
                 logger.warning(
                     "no UniModel registered for requested architectures; explicit fallback is enabled",
                     extra={
                         "architectures": list(architectures),
-                        "fallback_model_class": getattr(self._fallback_cls, "__name__", repr(self._fallback_cls)),
+                        "fallback_model_class": getattr(
+                            self._fallback_cls, "__name__", repr(self._fallback_cls)
+                        ),
                     },
                 )
-                return ModelFamilyDescriptor.from_model_class(self._fallback_cls, names=fallback_names)
+                return ModelFamilyDescriptor.from_model_class(
+                    self._fallback_cls, names=fallback_names
+                )
         known = ", ".join(sorted(self._classes)) or "<none>"
         message = f"no UniModel registered for architectures {architectures!r}; known architectures: {known}"
         if self._fallback_cls is not None and not bool(config.allow_transformers_fallback):
@@ -116,7 +127,7 @@ def _register_module_models(module: ModuleType, *, strict: bool) -> None:
 @lru_cache(maxsize=1)
 def import_model_classes(strict: bool | None = None) -> None:
     if strict is None:
-        strict = get_worker_config().strict_model_imports
+        strict = get_execution_config().strict_model_imports
     discover_package_plugins(
         importlib.import_module(__package__ or "uniserve_worker.models"),
         strict=bool(strict),
@@ -157,9 +168,7 @@ def _missing_capability(model_cls: Type[UniModel], op: str) -> str | None:
     try:
         mode = mode_for_op(op)
     except WorkerError as exc:
-        raise capability_mismatch(
-            f"{model_cls.__name__} declares unknown op {op!r}"
-        ) from exc
+        raise capability_mismatch(f"{model_cls.__name__} declares unknown op {op!r}") from exc
     required: tuple[str, ...]
     if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}:
         required = ("forward",)

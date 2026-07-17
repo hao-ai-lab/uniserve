@@ -1,4 +1,5 @@
 """Core contract conformance for caps and worker results."""
+
 from __future__ import annotations
 
 import pytest
@@ -13,7 +14,7 @@ from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import PagedTextCache
-from uniserve_worker.server.stub import StubEngine, StubUniModel
+from uniserve_worker.server.stub import StubUniModel, StubWorker
 
 pytestmark = pytest.mark.contract
 
@@ -28,7 +29,7 @@ def test_op_kind_table_is_single_source_of_truth():
 
 
 def test_validate_caps_accepts_stub_caps():
-    caps = validate_caps(StubEngine().caps(), owner="StubEngine")
+    caps = validate_caps(StubWorker().caps(), owner="StubWorker")
     assert caps.block_size == 64
     assert "prefill_und" in caps.supported_ops
     assert "kv_block" in caps.resource_classes
@@ -46,14 +47,14 @@ def test_runner_preserves_contextual_auto_attention_backend():
 
 
 def test_validate_caps_accepts_qwen3_target_verify_op():
-    raw = StubEngine().caps().to_wire()
+    raw = StubWorker().caps().to_wire()
     raw["supported_ops"] = ["prefill_und", "decode_und", "target_verify_und"]
     caps = validate_caps(raw, owner="Qwen3ForCausalLM")
     assert caps.supported_ops == ("prefill_und", "decode_und", "target_verify_und")
 
 
 def test_validate_caps_rejects_drift_from_class_vocabulary():
-    raw = StubEngine().caps().to_wire()
+    raw = StubWorker().caps().to_wire()
     raw["supported_ops"] = [*raw["supported_ops"], "not_real"]
     with pytest.raises(WorkerError) as exc:
         validate_caps(raw, owner="BadDriver")
@@ -86,7 +87,7 @@ def test_validate_forward_result_accepts_all_stub_op_shapes():
             {"req_id": 1, "encoder_handle": 99},
         ],
     }
-    assert validate_forward_result(result, batch, owner="StubEngine") is result
+    assert validate_forward_result(result, batch, owner="StubWorker") is result
 
 
 def test_validate_forward_result_rejects_result_count_mismatch():

@@ -1,0 +1,216 @@
+"""Model discovery and materialization for one assembled worker."""
+
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+from ..contracts.model_family import ModelFamilyDescriptor
+from ..contracts.model_load import ModelLoadScope
+from ..contracts.model_protocols import UniModel, verify_model_conformance
+from ..foundation.errors import capability_mismatch
+from ..loader import ModelBringUp, get_loader_for_descriptor
+from ..loader.paths import read_config, resolve_model_path
+from ..models.registry import (
+    detect_model_architectures,
+    resolve_model_descriptor,
+)
+from ..nn.quant.base import process_quantized_modules
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WorkerModelLoadRequest:
+    model_path: str
+    device: str
+    block_size: int
+    kv_token_capacity: int | None
+    attention_backend: str | None
+    scope: ModelLoadScope = ModelLoadScope.WHOLE
+    generation_kv_capacity_tokens: int | None = None
+    load_format: str = "default"
+
+
+@dataclass(frozen=True)
+class LoadedWorkerModel:
+    model: UniModel
+    descriptor: ModelFamilyDescriptor
+    model_path: str
+    scope: ModelLoadScope
+
+
+def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
+    model_path = resolve_model_path(request.model_path)
+    descriptor = resolve_model_descriptor(model_architecture_candidates(model_path))
+    model_class = descriptor.model_class
+    _require_supported_scope(model_class, request.scope)
+
+    if issubclass(model_class, ModelBringUp):
+        model = _load_via_model(model_class, model_path, request)
+    else:
+        loader_override = None if request.load_format.lower() == "default" else request.load_format
+        model = (
+            get_loader_for_descriptor(
+                descriptor,
+                override=loader_override,
+            )
+            .load_model(
+                cast(type[UniModel], model_class),
+                read_config(model_path),
+                device=request.device,
+                model_path=model_path,
+                checkpoint_layout=descriptor.checkpoint_layout,
+                block_size=request.block_size,
+                kv_token_capacity=request.kv_token_capacity,
+                attention_backend=request.attention_backend,
+                gen_snapshot_kv_capacity=(request.generation_kv_capacity_tokens),
+                tower_role=request.scope.tower_role,
+            )
+            .model
+        )
+
+    _configure_model_tokenizer(model, model_path)
+    _check_model_conformance(model)
+    return LoadedWorkerModel(
+        model=model,
+        descriptor=descriptor,
+        model_path=model_path,
+        scope=request.scope,
+    )
+
+
+def _require_supported_scope(
+    model_class: type[UniModel],
+    scope: ModelLoadScope,
+) -> None:
+    if scope is ModelLoadScope.WHOLE:
+        return
+    declared = frozenset(
+        str(value)
+        for value in getattr(
+            model_class,
+            "supported_model_load_scopes",
+            (),
+        )
+    )
+    if scope.value not in declared:
+        raise capability_mismatch(
+            f"{model_class.__name__} does not support {scope.value!r} model materialization"
+        )
+
+
+def _load_via_model(
+    model_class: type[ModelBringUp],
+    model_path: str,
+    request: WorkerModelLoadRequest,
+) -> UniModel:
+    model = model_class.from_pretrained(
+        model_path,
+        device=request.device,
+        block_size=request.block_size,
+        kv_token_capacity=request.kv_token_capacity,
+        attention_backend=request.attention_backend,
+        gen_snapshot_kv_capacity=request.generation_kv_capacity_tokens,
+        tower_role=request.scope.tower_role,
+    )
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        modules = getattr(getattr(model, "model", None), "modules", None)
+    if callable(modules):
+        process_quantized_modules(modules())
+    return model
+
+
+def _check_model_conformance(model: UniModel) -> None:
+    violations = verify_model_conformance(model)
+    if violations:
+        details = "\n  - ".join(violations)
+        raise capability_mismatch(f"{type(model).__name__} fails model conformance:\n  - {details}")
+
+
+def _configure_model_tokenizer(model: UniModel, model_path: str) -> None:
+    hook = getattr(model, "configure_tokenizer", None)
+    if not callable(hook):
+        return
+    _invoke_optional_model_hook(
+        hook,
+        model_path=model_path,
+        tokenizer_vocab_size=_read_tokenizer_vocab_size(model_path),
+    )
+
+
+def _invoke_optional_model_hook(function: Any, **kwargs: Any) -> Any:
+    signature = inspect.signature(function)
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    supported = (
+        kwargs
+        if accepts_kwargs
+        else {key: value for key, value in kwargs.items() if key in signature.parameters}
+    )
+    return function(**supported)
+
+
+def _read_tokenizer_vocab_size(model_path: str) -> int | None:
+    root = Path(model_path)
+    max_token_id = -1
+    tokenizer_json = root / "tokenizer.json"
+    if tokenizer_json.exists():
+        try:
+            data = json.loads(tokenizer_json.read_text(encoding="utf-8"))
+            vocabulary = (data.get("model") or {}).get("vocab") or {}
+            if isinstance(vocabulary, dict):
+                token_ids = [int(value) for value in vocabulary.values() if isinstance(value, int)]
+                if token_ids:
+                    max_token_id = max(max_token_id, max(token_ids))
+            added_tokens = data.get("added_tokens") or []
+            if isinstance(added_tokens, list):
+                token_ids = [
+                    int(token["id"])
+                    for token in added_tokens
+                    if isinstance(token, dict) and isinstance(token.get("id"), int)
+                ]
+                if token_ids:
+                    max_token_id = max(max_token_id, max(token_ids))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            logger.debug(
+                "could not read vocabulary size from %s",
+                tokenizer_json,
+                exc_info=True,
+            )
+
+    tokenizer_config = root / "tokenizer_config.json"
+    if tokenizer_config.exists():
+        try:
+            data = json.loads(tokenizer_config.read_text(encoding="utf-8"))
+            decoder = data.get("added_tokens_decoder") or {}
+            if isinstance(decoder, dict):
+                token_ids = [int(key) for key in decoder]
+                if token_ids:
+                    max_token_id = max(max_token_id, max(token_ids))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            logger.debug(
+                "could not read vocabulary size from %s",
+                tokenizer_config,
+                exc_info=True,
+            )
+    return max_token_id + 1 if max_token_id >= 0 else None
+
+
+def model_architecture_candidates(model_path: str) -> list[str]:
+    config = read_config(model_path)
+    architectures = [str(value) for value in config.get("architectures") or []]
+    model_type = config.get("model_type")
+    if model_type is not None:
+        architectures.append(str(model_type))
+    if not architectures:
+        architectures.append(Path(model_path).name)
+    architectures.extend(detect_model_architectures(model_path))
+    return architectures

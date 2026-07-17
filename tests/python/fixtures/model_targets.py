@@ -1,4 +1,5 @@
 """CPU model-target registry + contract vocabulary for worker contract tests."""
+
 from __future__ import annotations
 
 import importlib
@@ -11,7 +12,7 @@ from uniserve_worker.contracts.op_kinds import OP_KINDS
 # (supported_ops / supported_controls / adapter_mode / resource_plan) needs no
 # GPU; full instantiation (model load) does and is exercised in the e2e GPU run.
 BACKEND_CLASSES: dict[str, tuple[str, str]] = {
-    "stub": ("uniserve_worker.server.stub", "StubEngine"),
+    "stub": ("uniserve_worker.server.stub", "StubWorker"),
     "sensenova": ("uniserve_worker.models.sensenova.model", "SenseNovaU1ForUnifiedGeneration"),
     "bagel": ("uniserve_worker.models.bagel", "BagelForUnifiedGeneration"),
 }
@@ -21,8 +22,13 @@ BACKEND_CLASSES: dict[str, tuple[str, str]] = {
 # and so this set can never drift from op_kinds.py.
 KNOWN_OP_KINDS = frozenset(OP_KINDS)
 KNOWN_CONTROLS = {
-    "copy_blocks", "load_lora", "unload_lora", "free_encoder",
-    "reset_prefix_cache", "sleep", "wake_up",
+    "copy_blocks",
+    "load_lora",
+    "unload_lora",
+    "free_encoder",
+    "reset_prefix_cache",
+    "sleep",
+    "wake_up",
 }
 # control wire name -> engine method name (here they coincide).
 CONTROL_METHODS = {name: name for name in KNOWN_CONTROLS}
@@ -56,7 +62,7 @@ def load_backend_class(name: str):
 
 
 def cpu_engine():
-    """A fully-constructible IPC-facing adapter for runtime conformance."""
-    from uniserve_worker.server.stub import StubEngine
+    """A fully constructible execution worker for runtime conformance."""
+    from uniserve_worker.server.stub import StubWorker
 
-    return StubEngine(block_size=256)
+    return StubWorker(block_size=256)

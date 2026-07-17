@@ -1,4 +1,5 @@
 """FlashInfer wrapper pool, workspace buffers, and plan-tensor workspaces."""
+
 from __future__ import annotations
 
 import itertools
@@ -7,7 +8,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...foundation.runtime_config import get_worker_config
+from ...foundation.runtime_config import get_execution_config
 from .flashinfer_plan import (
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
@@ -84,11 +85,17 @@ class _WrapperPool(PagedAttentionPlanPool):
         super().__init__()
         self._decode_wrappers: dict[WrapperKey, Any] = {}
         self._prefill_wrappers: dict[WrapperKey, Any] = {}
-        self._decode_graph_buffers: dict[WrapperKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._decode_graph_buffers: dict[
+            WrapperKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
         self._decode_plan_workspaces: dict[WrapperKey, _DecodePlanWorkspace] = {}
         self._prefill_plan_workspaces: dict[WrapperKey, _PrefillPlanWorkspace] = {}
-        self._binding_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
-        self._binding_prefill_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
+        self._binding_graph_wrappers: dict[
+            int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]
+        ] = {}
+        self._binding_prefill_graph_wrappers: dict[
+            int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]
+        ] = {}
         self._decode_fast_plan_signatures: dict[WrapperKey, tuple[Any, ...]] = {}
 
     def _decode_wrapper(
@@ -101,7 +108,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = get_worker_config().flashinfer.decode_backend
+        backend = get_execution_config().flashinfer.decode_backend
         use_tensor_cores = _should_use_tensor_cores(
             kv_dtype=kv_dtype,
             num_q_heads=int(num_q_heads),
@@ -137,7 +144,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = get_worker_config().flashinfer.decode_backend
+        backend = get_execution_config().flashinfer.decode_backend
         use_tensor_cores = _should_use_tensor_cores(
             kv_dtype=kv_dtype,
             num_q_heads=int(num_q_heads),
@@ -180,7 +187,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = get_worker_config().flashinfer.prefill_backend
+        backend = get_execution_config().flashinfer.prefill_backend
         key = WrapperKey("prefill", device_key, backend)
         wrapper = self._prefill_wrappers.get(key)
         if wrapper is None:
@@ -217,7 +224,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         batch_size = max(1, int(batch_size))
         max_indices = max(1, int(max_indices))
         device_key = _device_key(device)
-        backend = get_worker_config().flashinfer.prefill_backend
+        backend = get_execution_config().flashinfer.prefill_backend
         key = WrapperKey(
             "prefill",
             device_key,
@@ -387,7 +394,9 @@ class _WrapperPool(PagedAttentionPlanPool):
         global_override_last_page_len_cpu: torch.Tensor | None,
         allow_fast: bool,
     ) -> bool:
-        if not allow_fast or not self._can_use_fast_decode_plan(wrapper_key, wrapper, options.signature):
+        if not allow_fast or not self._can_use_fast_decode_plan(
+            wrapper_key, wrapper, options.signature
+        ):
             return False
         return self._try_fast_decode_plan(
             wrapper,
@@ -431,8 +440,8 @@ class _WrapperPool(PagedAttentionPlanPool):
             kv_data_type=kv_data_type,
         )
         return _DecodePlanOptions(
-            fixed_split_size=get_worker_config().flashinfer.decode_split_tile_size,
-            disable_split_kv=get_worker_config().flashinfer.disable_split_kv,
+            fixed_split_size=get_execution_config().flashinfer.decode_split_tile_size,
+            disable_split_kv=get_execution_config().flashinfer.disable_split_kv,
             signature=signature,
         )
 
@@ -665,12 +674,12 @@ def _device_key(device: torch.device | str) -> str:
 
 
 def _workspace_size() -> int:
-    size = get_worker_config().flashinfer.workspace_size
+    size = get_execution_config().flashinfer.workspace_size
     return max(1, size)
 
 
 def _fast_decode_plan_enabled() -> bool:
-    return get_worker_config().flashinfer.fast_decode_plan
+    return get_execution_config().flashinfer.fast_decode_plan
 
 
 def _should_use_tensor_cores(
@@ -679,7 +688,7 @@ def _should_use_tensor_cores(
     num_q_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    override = get_worker_config().flashinfer.use_tensor_core
+    override = get_execution_config().flashinfer.use_tensor_core
     if override is not None:
         return override
     try:
@@ -688,7 +697,9 @@ def _should_use_tensor_cores(
         return not bool(_grouped_size_compiled_for_decode_kernels(num_q_heads, num_kv_heads))
     except (ImportError, AttributeError):
         pass
-    fp8_dtypes = tuple(getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, name))
+    fp8_dtypes = tuple(
+        getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, name)
+    )
     if kv_dtype in fp8_dtypes:
         return True
     if kv_dtype in {torch.float16, torch.half, torch.bfloat16}:

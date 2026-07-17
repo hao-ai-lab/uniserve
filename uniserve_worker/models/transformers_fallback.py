@@ -4,6 +4,7 @@ This is the day-zero text path: an unported HF causal language model can serve
 prefill/decode through UniServe's shared runner, text driver, and sampler while
 native ports continue to provide the optimized multimodal/diffusion paths.
 """
+
 from __future__ import annotations
 
 import logging
@@ -16,15 +17,15 @@ from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, Res
 from ..execution.interleaved_text_stepper import resolve_op_token_ids
 from ..execution.model_base import UniModelBase
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_lease_violation
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..loader.transformers import dtype_from_name, infer_input_device
 from ..nn import RadixAttention
 from ..nn.logits import forced_eos_logits
 
 __all__ = [
-    'TransformersForCausalLM',
-    'EntryClass',
+    "TransformersForCausalLM",
+    "EntryClass",
 ]
 
 logger = logging.getLogger(__name__)
@@ -33,11 +34,11 @@ _ATTN_IMPL = "uniserve"
 
 
 def _trust_remote_code() -> bool:
-    return get_worker_config().transformers_trust_remote_code
+    return get_execution_config().transformers_trust_remote_code
 
 
 def _attention_implementation() -> str:
-    return get_worker_config().transformers_attn_implementation
+    return get_execution_config().transformers_attn_implementation
 
 
 def _uniserve_attention_forward(
@@ -56,7 +57,9 @@ def _uniserve_attention_forward(
         layer_type = "full_attention" if sliding_window in {None, 1} else "sliding_attention"
         attention_mask = attention_mask[layer_type]
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
-        raise invalid_descriptor("UniServe transformers attention expects [batch, heads, tokens, dim]")
+        raise invalid_descriptor(
+            "UniServe transformers attention expects [batch, heads, tokens, dim]"
+        )
     if dropout and bool(getattr(module, "training", False)):
         raise capability_mismatch("UniServe transformers fallback attention is inference-only")
     num_heads = int(query.shape[1])
@@ -201,9 +204,7 @@ class TransformersForCausalLM(UniModelBase):
         self.num_layers = _num_layers(config)
         self.bytes_per_token = _bytes_per_token(config)
         self.eos_id = int(
-            getattr(tokenizer, "eos_token_id", None)
-            or getattr(config, "eos_token_id", None)
-            or 0
+            getattr(tokenizer, "eos_token_id", None) or getattr(config, "eos_token_id", None) or 0
         )
         self._text = _HFTextPath(self)
 
@@ -221,7 +222,7 @@ class TransformersForCausalLM(UniModelBase):
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
         trust_remote_code = _trust_remote_code()
-        dtype = dtype_from_name(get_worker_config().model_dtype)
+        dtype = dtype_from_name(get_execution_config().model_dtype)
         attn_impl = _attention_implementation()
         if attn_impl == _ATTN_IMPL:
             _register_uniserve_attention()

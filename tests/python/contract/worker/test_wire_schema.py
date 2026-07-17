@@ -1,4 +1,5 @@
 """Python-side wire schema pins for the Rust worker protocol."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,13 +8,13 @@ import pytest
 
 from uniserve_worker.contracts.caps import validate_caps
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
-from uniserve_worker.server.stub import StubEngine
+from uniserve_worker.server.stub import StubWorker
 
 pytestmark = pytest.mark.contract
 
 
 def test_caps_error_and_flatbuffers_schema_are_pinned():
-    caps = validate_caps(StubEngine().caps(), owner="StubEngine").to_wire()
+    caps = validate_caps(StubWorker().caps(), owner="StubWorker").to_wire()
     assert set(caps) == {
         "block_size",
         "num_blocks",

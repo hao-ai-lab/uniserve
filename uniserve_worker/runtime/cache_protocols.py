@@ -7,16 +7,17 @@ concrete classes (``PagedRequestCache``, ``BatchedPagedRequestCache``,
 ``PagedTextCache``, ``TextTensorStagingSlot``, the registered models) satisfy
 them structurally without an explicit subclass relationship.
 """
+
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 __all__ = [
-    'KVCacheView',
-    'BatchedKVCacheView',
-    'BufferStager',
-    'ModelCapabilities',
+    "KVCacheView",
+    "BatchedKVCacheView",
+    "BufferStager",
+    "ModelCapabilities",
 ]
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ class BufferStager(Protocol):
 
 @runtime_checkable
 class ModelCapabilities(Protocol):
-    """Model-level capability surface read by ``RunnerDriver._build_caps``.
+    """Model-level capability surface read by ``ModelWorker``.
 
     Names the capability attributes required by the model protocol boundary when
     a registered model does not expose a prebuilt ``Caps`` snapshot. The members

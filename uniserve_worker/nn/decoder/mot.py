@@ -5,6 +5,7 @@ modality-routed linears/norms/MLP run batched over all segment tokens (two GEMMs
 per op: understanding slice + generation slice), while attention runs per segment
 against that segment's own KV cache so segments stay isolated.
 """
+
 from __future__ import annotations
 
 import enum
@@ -32,16 +33,16 @@ from ..vocab_parallel_embedding import VocabParallelEmbedding
 from .qwen import Qwen3MLP
 
 __all__ = [
-    'Modality',
-    'route_by_modality',
-    'tower_modality_coords',
-    'KVCache',
-    'Segment',
-    'MoTMLP',
-    'ModalityExpert',
-    'MoTDecoderLayer',
-    'MoTLayer',
-    'MoTModel',
+    "Modality",
+    "route_by_modality",
+    "tower_modality_coords",
+    "KVCache",
+    "Segment",
+    "MoTMLP",
+    "ModalityExpert",
+    "MoTDecoderLayer",
+    "MoTLayer",
+    "MoTModel",
 ]
 
 
@@ -50,6 +51,7 @@ class Modality(enum.Enum):
 
     ``TEXT`` is the understanding branch (checkpoint params without a suffix);
     ``GEN`` is the generation/image-latent branch (the ``*_moe_gen`` twins)."""
+
     TEXT = "text"
     GEN = "gen"
 
@@ -217,12 +219,13 @@ class KVCache:
 @dataclass
 class Segment:
     """One lane of work inside a batched forward."""
-    embeds: torch.Tensor       # (n, hidden) input embeddings (already built)
-    positions: torch.Tensor    # (n,) long rope position ids
-    is_gen: torch.Tensor       # (n,) bool — generation-modality tokens routed through _moe_gen params
-    cache: KVCache             # context KV for this lane
-    causal: bool               # attention regime (True=text, False=latents/full)
-    update_cache: bool         # append new K/V into cache after attention
+
+    embeds: torch.Tensor  # (n, hidden) input embeddings (already built)
+    positions: torch.Tensor  # (n,) long rope position ids
+    is_gen: torch.Tensor  # (n,) bool — generation-modality tokens routed through _moe_gen params
+    cache: KVCache  # context KV for this lane
+    causal: bool  # attention regime (True=text, False=latents/full)
+    update_cache: bool  # append new K/V into cache after attention
 
 
 def MoTMLP(hidden: int, inter: int) -> Qwen3MLP:
@@ -232,9 +235,7 @@ def MoTMLP(hidden: int, inter: int) -> Qwen3MLP:
     projection + ``silu_and_mul``); this factory only adapts the MoT
     ``(hidden, inter)`` construction signature onto its config surface.
     """
-    return Qwen3MLP(
-        SimpleNamespace(hidden_size=hidden, intermediate_size=inter, hidden_act="silu")
-    )
+    return Qwen3MLP(SimpleNamespace(hidden_size=hidden, intermediate_size=inter, hidden_act="silu"))
 
 
 @dataclass(frozen=True)
@@ -476,9 +477,7 @@ class MoTDecoderLayer(nn.Module):
                 cancel(layer_idx)
             raise
         past_key_values.finish_layer_update(layer_idx, n_tokens)
-        hidden_states = hidden_states + expert.o_proj(
-            attn_values.reshape(n_tokens, self.q_size)
-        )
+        hidden_states = hidden_states + expert.o_proj(attn_values.reshape(n_tokens, self.q_size))
         normed = expert.post_norm(hidden_states)
         return hidden_states + expert.mlp(normed.to(torch.bfloat16))
 
@@ -573,9 +572,7 @@ class MoTDecoderLayer(nn.Module):
         attn_values = attn.transpose(1, 2).reshape(batch * n_tokens, self.q_size)
         attn_out = gen.o_proj(attn_values)
         if text_idx is not None:
-            attn_out.index_copy_(
-                0, text_idx, text.o_proj(attn_values.index_select(0, text_idx))
-            )
+            attn_out.index_copy_(0, text_idx, text.o_proj(attn_values.index_select(0, text_idx)))
         hidden_states = hidden_states + attn_out
         normed = gen.post_norm(hidden_states)
         normed_text = None
@@ -686,7 +683,11 @@ class MoTDecoderLayer(nn.Module):
         return hidden_states + mlp_out
 
     def _present_routes(
-        self, text_mask, gen_mask, any_text, any_gen,
+        self,
+        text_mask,
+        gen_mask,
+        any_text,
+        any_gen,
     ) -> dict[Modality, tuple[torch.Tensor, ModalityExpert]]:
         """Map each present modality to ``(token_mask, expert)``.
 
@@ -700,8 +701,19 @@ class MoTDecoderLayer(nn.Module):
         return present
 
     def forward(
-        self, layer_idx, H, text_mask, gen_mask, cos, sin, segs, slices,
-        *, any_text=None, any_gen=None, seg_is_gen=None,
+        self,
+        layer_idx,
+        H,
+        text_mask,
+        gen_mask,
+        cos,
+        sin,
+        segs,
+        slices,
+        *,
+        any_text=None,
+        any_gen=None,
+        seg_is_gen=None,
     ):
         # ``forward_segments`` may pass precomputed modality flags to skip GPU syncs.
         if any_text is None:
@@ -942,8 +954,7 @@ class MoTModel(nn.Module):
             text_base = (~is_gen.reshape(-1)).nonzero(as_tuple=False).reshape(-1)
             if int(text_base.numel()):
                 row_offsets = (
-                    torch.arange(batch, device=text_base.device, dtype=text_base.dtype)
-                    * n_tokens
+                    torch.arange(batch, device=text_base.device, dtype=text_base.dtype) * n_tokens
                 )
                 text_idx = (row_offsets.unsqueeze(1) + text_base.unsqueeze(0)).reshape(-1)
         for layer_idx, layer_module in enumerate(self.layers):
@@ -980,12 +991,12 @@ class MoTModel(nn.Module):
         """Run text and image-generation tokens in one packed decoder sweep."""
 
         if inputs_embeds.ndim != 2:
-            raise ValueError("BAGEL packed model expects inputs_embeds [N, C]")
+            raise ValueError("packed MoT model expects inputs_embeds [N, C]")
         token_count = int(inputs_embeds.shape[0])
         if tuple(image_gen_indicators.shape) != (token_count,):
-            raise ValueError("BAGEL packed model expects image_gen_indicators [N]")
+            raise ValueError("packed MoT model expects image_gen_indicators [N]")
         if indexes.ndim != 2 or int(indexes.shape[1]) != token_count:
-            raise ValueError("BAGEL packed model expects one position per token")
+            raise ValueError("packed MoT model expects one position per token")
         gen_mask = image_gen_indicators.to(dtype=torch.bool)
         text_mask = ~gen_mask
         has_gen_segment = any(
@@ -993,7 +1004,7 @@ class MoTModel(nn.Module):
             for segment in forward_stream.segments
         )
         any_gen = has_gen_segment
-        # Every BAGEL image-generation segment contains text-expert marker
+        # Every image-generation segment contains text-expert marker
         # tokens at its boundaries.
         any_text = has_gen_segment or any(
             segment.modality == "und" and int(segment.q_len) > 0
@@ -1001,7 +1012,7 @@ class MoTModel(nn.Module):
         )
         text_indices = getattr(forward_stream, "und_indices", None)
         if any_text and any_gen and not isinstance(text_indices, torch.Tensor):
-            raise ValueError("mixed BAGEL packed model requires static text modality indices")
+            raise ValueError("mixed packed MoT model requires static text modality indices")
         cos, sin = self.rotary.cos_sin_1d(indexes[0].reshape(-1))
         hidden_states = inputs_embeds
         for layer_idx, layer_module in enumerate(self.layers):
@@ -1043,7 +1054,7 @@ class MoTModel(nn.Module):
         positions = torch.cat([s.positions for s in segs], dim=0)
         gen_mask = torch.cat([s.is_gen for s in segs], dim=0)
         text_mask = ~gen_mask
-        cos, sin = self.rotary.cos_sin_1d(positions)          # (N, head_dim/2)
+        cos, sin = self.rotary.cos_sin_1d(positions)  # (N, head_dim/2)
 
         # Resolve modality presence once per forward to avoid per-layer GPU syncs.
         any_text = bool(text_mask.any())
@@ -1053,11 +1064,22 @@ class MoTModel(nn.Module):
         for li, layer_module in enumerate(self.layers):
             layer = cast(MoTDecoderLayer, layer_module)
             H = layer.forward(
-                li, H, text_mask, gen_mask, cos, sin, segs, slices,
-                any_text=any_text, any_gen=any_gen, seg_is_gen=seg_is_gen,
+                li,
+                H,
+                text_mask,
+                gen_mask,
+                cos,
+                sin,
+                segs,
+                slices,
+                any_text=any_text,
+                any_gen=any_gen,
+                seg_is_gen=seg_is_gen,
             )
 
-        final_routes: dict[Modality, tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]] = {}
+        final_routes: dict[
+            Modality, tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]
+        ] = {}
         if any_text:
             final_routes[Modality.TEXT] = (text_mask, self.final_norm[Modality.TEXT])
         if any_gen:

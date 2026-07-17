@@ -2366,6 +2366,7 @@ class SenseNovaU1ForUnifiedGeneration(
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
     architectures = ("NEOChatModel", "neo_chat", "neo-unify", "neo_unify")
+    supported_model_load_scopes = ("understanding", "generation")
     supported_ops = (
         "prefill_und",
         "decode_und",
@@ -3104,9 +3105,7 @@ class SenseNovaU1ForUnifiedGeneration(
 
     def packed_graph_attention(self) -> Any:
         if self.model is None or not self.model.language_model.model.layers:
-            raise capability_mismatch(
-                "SenseNova packed graph requires at least one decoder layer"
-            )
+            raise capability_mismatch("SenseNova packed graph requires at least one decoder layer")
         return self.model.language_model.model.layers[0].self_attn
 
     def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:

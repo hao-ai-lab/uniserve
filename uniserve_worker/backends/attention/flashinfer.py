@@ -1,4 +1,5 @@
 """FlashInfer attention backend."""
+
 from __future__ import annotations
 
 from typing import Any, NamedTuple
@@ -6,12 +7,12 @@ from typing import Any, NamedTuple
 import torch
 
 __all__ = [
-    'WrapperKey',
-    'FlashInferAttentionBackend',
+    "WrapperKey",
+    "FlashInferAttentionBackend",
 ]
 
 from ...contracts.forward_context import get_forward_context
-from ...foundation.runtime_config import get_worker_config
+from ...foundation.runtime_config import get_execution_config
 from .base import AttentionCapabilities
 from .flashinfer_kernels import (
     _decode_effective_seqlens,
@@ -47,12 +48,19 @@ else:  # pragma: no cover
     _flashinfer = _flashinfer_module
 
 _BatchDecodeWithPagedKVCacheWrapper = (
-    getattr(_flashinfer, "BatchDecodeWithPagedKVCacheWrapper", None) if _flashinfer is not None else None
+    getattr(_flashinfer, "BatchDecodeWithPagedKVCacheWrapper", None)
+    if _flashinfer is not None
+    else None
 )
 _BatchPrefillWithPagedKVCacheWrapper = (
-    getattr(_flashinfer, "BatchPrefillWithPagedKVCacheWrapper", None) if _flashinfer is not None else None
+    getattr(_flashinfer, "BatchPrefillWithPagedKVCacheWrapper", None)
+    if _flashinfer is not None
+    else None
 )
-_fast_decode_plan = getattr(_flashinfer, "fast_decode_plan", None) if _flashinfer is not None else None
+_fast_decode_plan = (
+    getattr(_flashinfer, "fast_decode_plan", None) if _flashinfer is not None else None
+)
+
 
 class _PagedDecodeInputs(NamedTuple):
     q_bhd: torch.Tensor
@@ -342,7 +350,9 @@ class FlashInferAttentionBackend(_WrapperPool):
         del max_seqlen_q, max_seqlen_k
         if _BatchPrefillWithPagedKVCacheWrapper is None:
             raise RuntimeError("flashinfer paged prefill wrapper is not available")
-        inputs = self._prepare_varlen_prefill_inputs(q, k, v, cu_seqlens_q, cu_seqlens_k, block_table)
+        inputs = self._prepare_varlen_prefill_inputs(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, block_table
+        )
 
         ctx = get_forward_context()
         plan = getattr(ctx, "attention_plan", None)
@@ -407,7 +417,9 @@ class FlashInferAttentionBackend(_WrapperPool):
         if q.ndim != 3:
             raise ValueError("flashinfer paged varlen expects q in [total, heads, dim] layout")
         if k.shape != v.shape or k.ndim != 4:
-            raise ValueError("flashinfer paged varlen expects k/v caches in [pages, page, heads, dim] layout")
+            raise ValueError(
+                "flashinfer paged varlen expects k/v caches in [pages, page, heads, dim] layout"
+            )
         if q.shape[-1] != k.shape[-1]:
             raise ValueError("query head dim does not match paged KV cache")
         q = q.contiguous()
@@ -446,11 +458,15 @@ class FlashInferAttentionBackend(_WrapperPool):
         scale: float,
     ) -> int:
         kv_seqlens = getattr(plan, "kv_seqlens", None)
-        if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (int(cu_seqlens_k.numel()) - 1,):
+        if not isinstance(kv_seqlens, torch.Tensor) or tuple(kv_seqlens.shape) != (
+            int(cu_seqlens_k.numel()) - 1,
+        ):
             kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         kv_seqlens = kv_seqlens.to(device=cu_seqlens_k.device, dtype=torch.int32).contiguous()
         query_lens = getattr(plan, "query_lens", None)
-        if not isinstance(query_lens, torch.Tensor) or tuple(query_lens.shape) != (int(cu_seqlens_q.numel()) - 1,):
+        if not isinstance(query_lens, torch.Tensor) or tuple(query_lens.shape) != (
+            int(cu_seqlens_q.numel()) - 1,
+        ):
             query_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
         query_lens = query_lens.to(device=cu_seqlens_q.device, dtype=torch.int32).contiguous()
         plan_tensors = self._prefill_plan_tensors(
@@ -508,8 +524,8 @@ class FlashInferAttentionBackend(_WrapperPool):
                 None if scale_value is None else float(scale_value),
                 int(plan.qo_indptr.numel()),
                 int(plan.indices.numel()),
-                get_worker_config().flashinfer.prefill_split_tile_size,
-                get_worker_config().flashinfer.disable_split_kv,
+                get_execution_config().flashinfer.prefill_split_tile_size,
+                get_execution_config().flashinfer.disable_split_kv,
             ),
             workspace=self._workspace(block_table.device),
             wrapper=wrapper,
@@ -532,8 +548,8 @@ class FlashInferAttentionBackend(_WrapperPool):
             seq_lens=kv_seqlens,
             seq_lens_q=query_lens,
             block_tables=block_table,
-            fixed_split_size=get_worker_config().flashinfer.prefill_split_tile_size,
-            disable_split_kv=get_worker_config().flashinfer.disable_split_kv,
+            fixed_split_size=get_execution_config().flashinfer.prefill_split_tile_size,
+            disable_split_kv=get_execution_config().flashinfer.disable_split_kv,
         )
 
     def prepare_paged_prefill_cuda_graph(
@@ -966,7 +982,9 @@ class FlashInferAttentionBackend(_WrapperPool):
                 workspace.last_page_len[:batch_size],
                 count,
             )
-        kv_indptr, indices, last_page_len = _paged_decode_indices(block_table, kv_seqlens, int(page_size))
+        kv_indptr, indices, last_page_len = _paged_decode_indices(
+            block_table, kv_seqlens, int(page_size)
+        )
         return _PrefillPlanTensors(
             cu_seqlens_q[: batch_size + 1],
             kv_indptr,

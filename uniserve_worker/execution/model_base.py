@@ -6,6 +6,7 @@ model-supplied :class:`~uniserve_worker.contracts.resource_plan.CapsDescriptor`
 and owns the KV store-dtype glue. Lives in the execution layer, separate from
 the pure ``contracts.model_protocols`` abstractions.
 """
+
 from __future__ import annotations
 
 import logging
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from ..contracts.batch_policy import BatchPolicy
 from ..contracts.caps import Caps, ExecutionConstraints
 from ..contracts.model_protocols import ModelHooks
-from ..foundation.runtime_config import get_worker_config
+from ..foundation.runtime_config import get_execution_config
 from ..nn.quant import get_current_kv_cache_dtype, kv_store_dtype_name, resolve_kv_store_dtype
 from ..nn.quant.kv_cache import KV_CACHE_NO_OVERRIDE_SENTINELS
 from ..runtime.compile import TorchCompileConfig, compile_model_pieces
@@ -64,8 +65,10 @@ class UniModelBase(ModelHooks):
         return kv_store_dtype_name(self._kv_store_dtype_for(compute_dtype))
 
     def _requested_kv_cache_dtype_for(self, config: Any | None) -> str | None:
-        value = get_worker_config().kv_cache_dtype
-        if value is not None and str(value).lower() not in KV_CACHE_NO_OVERRIDE_SENTINELS | {"null"}:
+        value = get_execution_config().kv_cache_dtype
+        if value is not None and str(value).lower() not in KV_CACHE_NO_OVERRIDE_SENTINELS | {
+            "null"
+        }:
             return value
         return get_current_kv_cache_dtype(config)
 
