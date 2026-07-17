@@ -29,6 +29,8 @@ import hashlib
 from dataclasses import dataclass, fields
 from enum import IntEnum
 
+from .execution import EngineRef, OperationTag, SessionRef
+
 __all__ = [
     "NO_CACHE_DOMAIN",
     "AttentionPattern",
@@ -150,15 +152,6 @@ class PositionSchema(IntEnum):
 class RegionMultiplicity(IntEnum):
     ONE = 1
     CFG_BRANCHES = 2
-
-
-class OperationTag(IntEnum):
-    """The parent's sealed model-backed operation algebra."""
-
-    SEQUENCE_STEP = 1
-    FLOW_STEP = 2
-    ENCODE_STEP = 3
-    MATERIALIZE_STEP = 4
 
 
 class GridFieldTag(IntEnum):
@@ -572,21 +565,10 @@ class FamilyCacheSchema:
 
 # --------------------------------------------------------------------------- #
 # Logical cache sequences (engine-private; never serialized to the scheduler).
+# Engine/session identity and the sealed operation tag are owned by
+# `contracts.execution` (the parent host contract) and re-exported here for
+# the cache companion's public API.
 # --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True, slots=True)
-class EngineRef:
-    deployment_id: int
-    engine_epoch: int
-
-
-@dataclass(frozen=True, slots=True)
-class SessionRef:
-    engine: EngineRef
-    request_id: int
-    incarnation: int
-    session_version: int
 
 
 @dataclass(frozen=True, slots=True)
