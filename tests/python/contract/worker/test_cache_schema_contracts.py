@@ -13,12 +13,6 @@ import dataclasses
 
 import pytest
 
-from uniserve_worker.models.cache_registrations import (
-    PRIMARY_ROLE,
-    bagel_cache_registration,
-    qwen3_cache_registration,
-    sensenova_cache_registration,
-)
 from uniserve_worker.contracts.cache_schema import (
     AttentionPattern,
     AttentionSiteSpec,
@@ -42,6 +36,12 @@ from uniserve_worker.contracts.residency_batch import (
     ResidencyBatchArrays,
     ResidencyBatchCapacity,
     ResidencyBatchError,
+)
+from uniserve_worker.models.cache_registrations import (
+    PRIMARY_ROLE,
+    bagel_cache_registration,
+    qwen3_cache_registration,
+    sensenova_cache_registration,
 )
 
 pytestmark = pytest.mark.contract
