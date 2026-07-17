@@ -47,7 +47,7 @@ class TextBackendGate:
         self.device_type = str(device_type)
         self.paged_storage_ok = bool(paged_storage_ok)
 
-    def batched_capable(self, text: "TextBatch", *, attention_backend_name: str | None) -> bool:
+    def batched_capable(self, text: "TextBatch", *, attention_preference: str | None) -> bool:
         """Whether ``text`` can run as one batched paged/varlen forward."""
 
         if text.mode not in _TEXT_MODES and text.mode != ForwardMode.MIXED:
@@ -60,28 +60,28 @@ class TextBackendGate:
         if text.mode == ForwardMode.MIXED:
             # Heterogeneous extend+decode fuses into one varlen-paged forward
             # (the decode rows carry KV history, so paged KV is required).
-            return self._varlen_available(attention_backend_name, needs_paged_kv=True)
+            return self._varlen_available(attention_preference, needs_paged_kv=True)
         if text.mode == ForwardMode.DECODE and any(length != 1 for length in lengths):
             return False
         if text.mode == ForwardMode.EXTEND:
             initial_extend = self._is_initial_extend(text)
             if len(set(lengths)) != 1:
                 return self._varlen_available(
-                    attention_backend_name,
+                    attention_preference,
                     needs_paged_kv=True,
                 ) or self._varlen_available(
-                    attention_backend_name,
+                    attention_preference,
                     needs_paged_kv=not initial_extend,
                 )
             if not initial_extend and lengths[0] != 1:
-                return self._multi_token_paged_available(attention_backend_name)
-        return self._paged_available(attention_backend_name)
+                return self._multi_token_paged_available(attention_preference)
+        return self._paged_available(attention_preference)
 
     def mixed_capable(
         self,
         ops,
         *,
-        attention_backend_name: str | None,
+        attention_preference: str | None,
     ) -> bool:
         """Whether a heterogeneous extend+decode group can fuse into one forward."""
 
@@ -114,7 +114,7 @@ class TextBackendGate:
         max_tokens = max(0, get_worker_config().mixed_text_max_tokens)
         if max_tokens <= 0 or total_tokens > max_tokens:
             return False
-        return self._varlen_available(attention_backend_name, needs_paged_kv=True)
+        return self._varlen_available(attention_preference, needs_paged_kv=True)
 
     @staticmethod
     def _is_initial_extend(text: "TextBatch") -> bool:

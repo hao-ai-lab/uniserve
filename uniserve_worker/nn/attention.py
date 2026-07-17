@@ -9,6 +9,7 @@ import torch.nn as nn
 
 import uniserve_worker.ops as ops
 
+from ..contracts.attention_plan import PagedDecodePlan, PagedVarlenPlan
 from ..contracts.forward_context import get_forward_context
 from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.torch_compat import torch_is_compiling as _torch_is_compiling
@@ -55,7 +56,7 @@ class RadixAttention(nn.Module):
     The SGLang-shaped attention seam. The model calls ``forward(q, k, v,
     forward_batch, save_kv_cache=…)`` and the op resolves its residency from the
     **system-published** context: the per-forward attention plan
-    (``forward_batch.attn_metadata``, built by the ``ForwardBatchBuilder``) names
+    (``forward_batch.attn_plan``, built by the ``ForwardBatchBuilder``) names
     the paged request-cache view, so the model never owns a pool or threads a
     cache. It keeps the paged/varlen/dense forward paths and a backward-flexible
     ``kv_cache=``/``update_cache=`` entry for the dense (vision) and per-branch
@@ -95,16 +96,16 @@ class RadixAttention(nn.Module):
         scale: float | None = None,
     ) -> torch.Tensor:
         ctx = get_forward_context()
-        preferred = ctx.attention_backend_name or self.backend_name or "torch_sdpa"
+        preferred = ctx.attention_preference or self.backend_name or "torch_sdpa"
         effective_scale = self.scale if scale is None else scale
         # System-managed text path: the cache is the per-forward plan the system
-        # built into ``forward_batch.attn_metadata`` (published on the context);
+        # built into ``forward_batch.attn_plan`` (published on the context);
         # the model passes no cache. Dense (vision) and scratch-KV (generation)
         # callers pass ``kv_cache=`` directly and that wins.
         if kv_cache is None and forward_batch is not None:
-            metadata = getattr(forward_batch, "attn_metadata", None)
-            if metadata is not None:
-                kv_cache = getattr(metadata, "cache", None)
+            plan = getattr(forward_batch, "attn_plan", None)
+            if plan is not None:
+                kv_cache = getattr(plan, "residency_cache", None)
         update = save_kv_cache if update_cache is None else update_cache
 
         run = self.execution_plan.plan(
@@ -171,8 +172,8 @@ class RadixAttention(nn.Module):
         causal: bool,
         scale: float,
     ) -> torch.Tensor:
-        metadata = ctx.attention_metadata
-        assert metadata is not None
+        plan = ctx.attention_plan
+        assert isinstance(plan, PagedVarlenPlan)
         raw_tokens = self._raw_varlen_tokens(ctx, q)
         q_run, k_run, v_run = self._trim_padded_varlen(q, k, v, raw_tokens)
         self._record_varlen_padding(ctx, total_tokens=int(q.shape[0]), raw_tokens=raw_tokens)
@@ -181,24 +182,25 @@ class RadixAttention(nn.Module):
             k_run,
             v_run,
             regime=ops.AttentionRegime.EXTEND,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_q,
-            max_seqlen_q=metadata.max_seqlen_q,
-            max_seqlen_k=metadata.max_seqlen_q,
+            cu_seqlens_q=plan.cu_seqlens_q,
+            cu_seqlens_k=plan.cu_seqlens_q,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_k=plan.max_seqlen_q,
             causal=causal,
             scale=scale,
             block_table=None,
             ctx=ctx,
             override=self._attention_override(ctx, preferred),
         )
-        metadata.cache.append_varlen(
+        assert plan.residency_cache is not None
+        plan.residency_cache.append_varlen(
             self.layer_id,
             k_run,
             v_run,
-            metadata.query_lens_cpu,
-            block_table=metadata.block_table,
-            cache_seqlens=metadata.cache_seqlens,
-            cu_seqlens_q=metadata.cu_seqlens_q,
+            plan.query_lens_cpu,
+            block_table=plan.block_table,
+            cache_seqlens=plan.cache_seqlens,
+            cu_seqlens_q=plan.cu_seqlens_q,
         )
         return self._restore_padded_varlen_output(out, q, raw_tokens)
 
@@ -213,35 +215,36 @@ class RadixAttention(nn.Module):
         causal: bool,
         scale: float,
     ) -> torch.Tensor:
-        metadata = ctx.attention_metadata
-        assert metadata is not None
+        plan = ctx.attention_plan
+        assert isinstance(plan, PagedVarlenPlan)
+        assert plan.residency_cache is not None
         raw_tokens = self._raw_varlen_tokens(ctx, q)
         q_run, k_run, v_run = self._trim_padded_varlen(q, k, v, raw_tokens)
         self._record_varlen_padding(ctx, total_tokens=int(q.shape[0]), raw_tokens=raw_tokens)
-        metadata.cache.append_varlen(
+        plan.residency_cache.append_varlen(
             self.layer_id,
             k_run,
             v_run,
-            metadata.query_lens_cpu,
-            block_table=metadata.block_table,
-            cache_seqlens=metadata.cache_seqlens,
-            cu_seqlens_q=metadata.cu_seqlens_q,
+            plan.query_lens_cpu,
+            block_table=plan.block_table,
+            cache_seqlens=plan.cache_seqlens,
+            cu_seqlens_q=plan.cu_seqlens_q,
         )
-        k_cache, v_cache = metadata.cache.pool.layer_cache(self.layer_id)
+        k_cache, v_cache = plan.residency_cache.pool.layer_cache(self.layer_id)
         out = ops.attention(
             q_run,
             k_cache,
             v_cache,
             regime=ops.AttentionRegime.EXTEND,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_k,
-            max_seqlen_q=metadata.max_seqlen_q,
-            max_seqlen_k=metadata.max_seqlen_k,
+            cu_seqlens_q=plan.cu_seqlens_q,
+            cu_seqlens_k=plan.cu_seqlens_k,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_k=plan.max_seqlen_k,
             causal=causal,
             scale=scale,
-            block_table=metadata.block_table,
+            block_table=plan.block_table,
             ctx=ctx,
-            kv_cache=metadata.cache,
+            kv_cache=plan.residency_cache,
             override=self._attention_override(ctx, preferred),
         )
         return self._restore_padded_varlen_output(out, q, raw_tokens)
@@ -573,7 +576,7 @@ class RadixAttention(nn.Module):
         """Run hybrid ``visible_end`` masked attention via the op dispatcher."""
         ctx = get_forward_context()
         effective_scale = self.scale if scale is None else scale
-        override = ctx.attention_backend_name or self.backend_name
+        override = ctx.attention_preference or self.backend_name
         if ctx.attention_backend is not None:
             override = "context"
         try:
@@ -604,12 +607,12 @@ class RadixAttention(nn.Module):
 
     @staticmethod
     def _paged_metadata_tensors(ctx, kv_cache, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor]:
-        metadata = getattr(ctx, "attention_metadata", None)
+        plan = getattr(ctx, "attention_plan", None)
         stats = getattr(ctx, "stats", None)
-        if metadata is not None and getattr(metadata, "cache", None) is kv_cache:
+        if plan is not None and getattr(plan, "residency_cache", None) is kv_cache:
             if stats is not None and not _torch_is_compiling():
                 stats.attention_metadata_hits += 1
-            return metadata.block_table, metadata.cache_seqlens
+            return plan.block_table, plan.cache_seqlens
         if stats is not None and not _torch_is_compiling():
             stats.attention_metadata_misses += 1
         cache_seqlens = kv_cache.cache_seqlens(device=device)
@@ -654,15 +657,15 @@ class RadixAttention(nn.Module):
         ctx=None,
     ) -> bool:
         ctx = get_forward_context() if ctx is None else ctx
-        selected = preferred or ctx.attention_backend_name or self.backend_name or "torch_sdpa"
+        selected = preferred or ctx.attention_preference or self.backend_name or "torch_sdpa"
         return self._can_run_transient_paged_varlen(ctx, selected, kv_cache, q, k, v)
 
     @staticmethod
     def _can_run_empty_paged_prefill(ctx, kv_cache, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
-        metadata = getattr(ctx, "attention_metadata", None)
-        if metadata is None or getattr(metadata, "cache", None) is not kv_cache:
+        plan = getattr(ctx, "attention_plan", None)
+        if not isinstance(plan, PagedVarlenPlan):
             return False
-        if getattr(metadata, "mode", None) not in {"extend", "mixed"}:
+        if getattr(plan, "residency_cache", None) is not kv_cache:
             return False
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             return False
@@ -683,11 +686,11 @@ class RadixAttention(nn.Module):
     @staticmethod
     def _is_one_token_decode(q: torch.Tensor) -> bool:
         if q.ndim == 3:
-            metadata = getattr(get_forward_context(), "attention_metadata", None)
+            plan = get_forward_context().attention_plan
             if (
-                getattr(metadata, "mode", None) == "decode"
-                and len(getattr(metadata, "query_lens_cpu", ()) or ()) == int(q.shape[0])
-                and all(int(length) == 1 for length in getattr(metadata, "query_lens_cpu", ()) or ())
+                isinstance(plan, PagedDecodePlan)
+                and len(plan.query_lens_cpu) == int(q.shape[0])
+                and all(int(length) == 1 for length in plan.query_lens_cpu)
             ):
                 return True
             return int(q.shape[0]) == 1
@@ -697,8 +700,8 @@ class RadixAttention(nn.Module):
 
     @staticmethod
     def _raw_varlen_tokens(ctx, q: torch.Tensor) -> int:
-        metadata = getattr(ctx, "attention_metadata", None)
-        query_lens_cpu = getattr(metadata, "query_lens_cpu", ()) or ()
+        plan = getattr(ctx, "attention_plan", None)
+        query_lens_cpu = getattr(plan, "query_lens_cpu", ()) or ()
         raw_tokens = sum(int(length) for length in query_lens_cpu)
         if raw_tokens <= 0 or raw_tokens > int(q.shape[0]):
             return int(q.shape[0])
@@ -751,18 +754,18 @@ class RadixAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> bool:
-        metadata = getattr(ctx, "attention_metadata", None)
-        if metadata is None or getattr(metadata, "cache", None) is not kv_cache:
+        plan = getattr(ctx, "attention_plan", None)
+        if not isinstance(plan, PagedVarlenPlan):
             return False
-        if getattr(metadata, "mode", None) not in {"extend", "mixed"}:
+        if getattr(plan, "residency_cache", None) is not kv_cache:
             return False
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
             return False
         if any(int(length) != 0 for length in getattr(kv_cache, "base_lens", [])):
             return False
-        query_lens = getattr(metadata, "query_lens", None)
-        cu_seqlens_q = getattr(metadata, "cu_seqlens_q", None)
-        query_lens_cpu = getattr(metadata, "query_lens_cpu", ())
+        query_lens = getattr(plan, "query_lens", None)
+        cu_seqlens_q = getattr(plan, "cu_seqlens_q", None)
+        query_lens_cpu = getattr(plan, "query_lens_cpu", ())
         if query_lens is None or cu_seqlens_q is None or not query_lens_cpu:
             return False
         raw_tokens = sum(int(x) for x in query_lens_cpu)
@@ -779,8 +782,8 @@ class RadixAttention(nn.Module):
             regime=ops.AttentionRegime.EXTEND,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_q,
-            max_seqlen_q=metadata.max_seqlen_q,
-            max_seqlen_k=metadata.max_seqlen_q,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_k=plan.max_seqlen_q,
             causal=True,
             scale=1.0,
             ctx=ctx,
@@ -796,10 +799,10 @@ class RadixAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> bool:
-        metadata = getattr(ctx, "attention_metadata", None)
-        if metadata is None or getattr(metadata, "cache", None) is not kv_cache:
+        plan = getattr(ctx, "attention_plan", None)
+        if not isinstance(plan, PagedVarlenPlan):
             return False
-        if getattr(metadata, "mode", None) not in {"extend", "mixed"}:
+        if getattr(plan, "residency_cache", None) is not kv_cache:
             return False
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
             return False
@@ -810,9 +813,9 @@ class RadixAttention(nn.Module):
             "max_seqlen_q",
             "max_seqlen_k",
         )
-        if any(getattr(metadata, name, None) is None for name in required):
+        if any(getattr(plan, name, None) is None for name in required):
             return False
-        query_lens_cpu = getattr(metadata, "query_lens_cpu", ())
+        query_lens_cpu = getattr(plan, "query_lens_cpu", ())
         if not query_lens_cpu:
             return False
         raw_tokens = sum(int(x) for x in query_lens_cpu)
@@ -827,13 +830,13 @@ class RadixAttention(nn.Module):
             k,
             v,
             regime=ops.AttentionRegime.EXTEND,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_k,
-            max_seqlen_q=metadata.max_seqlen_q,
-            max_seqlen_k=metadata.max_seqlen_k,
+            cu_seqlens_q=plan.cu_seqlens_q,
+            cu_seqlens_k=plan.cu_seqlens_k,
+            max_seqlen_q=plan.max_seqlen_q,
+            max_seqlen_k=plan.max_seqlen_k,
             causal=True,
             scale=1.0,
-            block_table=metadata.block_table,
+            block_table=plan.block_table,
             kv_cache=kv_cache,
             ctx=ctx,
             override=RadixAttention._attention_override(ctx, preferred),

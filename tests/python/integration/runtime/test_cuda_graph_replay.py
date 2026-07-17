@@ -25,10 +25,14 @@ import pytest
 import torch
 
 import uniserve_worker.execution.forward.graph.text_decode as decode_cuda_graph
+from uniserve_worker.contracts.attention_plan import (
+    GraphBinding,
+    PagedDecodePlan,
+    PagedVarlenPlan,
+)
 from uniserve_worker.contracts.forward_batch import ForwardBatch
 from uniserve_worker.contracts.forward_context import (
     ForwardContext,
-    TextAttentionMetadata,
     use_forward_context,
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
@@ -91,25 +95,29 @@ def _kv_pool(
     )
 
 
-def _decode_metadata(
+def _decode_plan(
     pool: PagedKVPool,
     *,
     block_ids_by_row: list[list[int]],
     cache_seqlens_cpu: tuple[int, ...],
     kv_seqlens_cpu: tuple[int, ...],
     device: torch.device,
-) -> TextAttentionMetadata:
+) -> PagedDecodePlan:
     batch = len(block_ids_by_row)
     cache = BatchedPagedRequestCache(pool, block_ids_by_row, list(cache_seqlens_cpu))
-    return TextAttentionMetadata(
-        cache=cache,
-        block_table=cache.block_table(device=device),
-        cache_seqlens=cache.cache_seqlens(device=device),
+    block_table = cache.block_table(device=device)
+    cache_seqlens = cache.cache_seqlens(device=device)
+    return PagedDecodePlan(
+        residency_cache=cache,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
         cache_seqlens_cpu=cache_seqlens_cpu,
+        kv_seqlens=torch.tensor(kv_seqlens_cpu, dtype=torch.int32, device=device),
         query_lens=torch.ones(batch, dtype=torch.int32, device=device),
         query_lens_cpu=tuple(1 for _ in range(batch)),
         kv_seqlens_cpu=kv_seqlens_cpu,
-        mode=ForwardMode.DECODE,
+        decode_page_ids=torch.zeros(batch, dtype=torch.long, device=device),
+        decode_page_offsets=torch.zeros(batch, dtype=torch.long, device=device),
     )
 
 
@@ -158,7 +166,7 @@ def test_batched_request_cache_append_plan_can_be_invalidated_for_dynamic_length
     torch.testing.assert_close(v_read[1], second_v[0])
 
 
-def _prefill_metadata(
+def _prefill_plan(
     pool: PagedKVPool,
     *,
     block_ids_by_row: list[list[int]],
@@ -166,7 +174,7 @@ def _prefill_metadata(
     query_lens_cpu: tuple[int, ...],
     device: torch.device,
     max_context_len: int = 0,
-) -> TextAttentionMetadata:
+) -> PagedVarlenPlan:
     cache = BatchedPagedRequestCache(pool, block_ids_by_row, list(cache_seqlens_cpu))
     query_lens = torch.tensor(query_lens_cpu, dtype=torch.int32, device=device)
     kv_lens = torch.tensor(
@@ -175,8 +183,8 @@ def _prefill_metadata(
         device=device,
     )
     zero = torch.zeros(1, dtype=torch.int32, device=device)
-    return TextAttentionMetadata(
-        cache=cache,
+    return PagedVarlenPlan(
+        residency_cache=cache,
         block_table=cache.block_table(device=device),
         cache_seqlens=cache.cache_seqlens(device=device),
         cache_seqlens_cpu=cache_seqlens_cpu,
@@ -337,12 +345,12 @@ def test_decode_graph_prepare_accepts_direct_backend_without_plan_hook(monkeypat
         owner=owner,
         kv_pool=kv_pool,
         num_blocks=16,
-        attention_backend_name="fa4_cute",
+        attention_preference="fa4_cute",
         before=lambda state, ctx: before_calls.append((state, ctx)),
     )
 
     assert prepare is not None
-    state = SimpleNamespace(batch_size=8, metadata=object())
+    state = SimpleNamespace(batch_size=8, plan=object(), graph_binding=GraphBinding())
     ctx = SimpleNamespace()
     prepare(state, ctx)
     assert before_calls == [(state, ctx)]
@@ -364,7 +372,7 @@ def test_decode_graph_prepare_rejects_direct_backend_page_size_mismatch(monkeypa
         owner=owner,
         kv_pool=kv_pool,
         num_blocks=16,
-        attention_backend_name="fa4_cute",
+        attention_preference="fa4_cute",
     ) is None
 
 
@@ -380,7 +388,7 @@ def test_prefill_graph_warmup_mode_does_not_live_capture_missing_shape():
         batch_size=1,
         input_ids=torch.zeros(8, dtype=torch.long),
         positions=torch.arange(8, dtype=torch.long),
-        attention_metadata=None,
+        attention_plan=None,
         last_token_indices=torch.tensor([7], dtype=torch.long),
         raw_num_tokens=8,
         ctx=ForwardContext(stats=stats),
@@ -413,18 +421,20 @@ def test_flashinfer_prefill_graph_prepare_replans_live_side_tables(monkeypatch):
     )
     wrapper = RecordingPrefillWrapper()
     wrapper_key = fi.WrapperKey("prefill", "cpu", "fa2", scope=1)
-    metadata = SimpleNamespace(
+    binding = GraphBinding()
+    plan = SimpleNamespace(
         block_table=torch.tensor([[0, 1, 2], [3, 4, 0]], dtype=torch.int32),
         cu_seqlens_q=torch.tensor([0, 2, 5], dtype=torch.int32),
         cu_seqlens_k=torch.tensor([0, 7, 11], dtype=torch.int32),
     )
     backend._prefill_wrappers[wrapper_key] = wrapper
-    backend._metadata_prefill_graph_wrappers[id(metadata)] = (wrapper_key, None)
+    backend._binding_prefill_graph_wrappers[id(binding)] = (wrapper_key, None)
     stats = ForwardStats()
 
     def prepare() -> None:
         backend.prepare_paged_prefill_cuda_graph(
-            metadata,
+            binding,
+            plan,
             num_q_heads=4,
             num_kv_heads=2,
             head_dim=8,
@@ -437,7 +447,7 @@ def test_flashinfer_prefill_graph_prepare_replans_live_side_tables(monkeypatch):
 
     with use_forward_context(ForwardContext(stats=stats)):
         prepare()
-        metadata.cu_seqlens_k.copy_(torch.tensor([0, 8, 14], dtype=torch.int32))
+        plan.cu_seqlens_k.copy_(torch.tensor([0, 8, 14], dtype=torch.int32))
         prepare()
 
     assert len(wrapper.calls) == 2
@@ -449,7 +459,7 @@ def test_flashinfer_prefill_graph_prepare_replans_live_side_tables(monkeypatch):
     assert first_args[3].tolist() == [3, 4]
     assert first_kwargs["seq_lens"].tolist() == [7, 4]
     assert first_kwargs["seq_lens_q"].tolist() == [2, 3]
-    assert first_kwargs["block_tables"] is metadata.block_table
+    assert first_kwargs["block_tables"] is plan.block_table
     assert first_kwargs["q_data_type"] == torch.bfloat16
     assert first_kwargs["kv_data_type"] == torch.bfloat16
     assert first_kwargs["o_data_type"] == torch.bfloat16
@@ -460,7 +470,7 @@ def test_flashinfer_prefill_graph_prepare_replans_live_side_tables(monkeypatch):
     assert second_args[3].tolist() == [4, 2]
     assert second_kwargs["seq_lens"].tolist() == [8, 6]
     assert second_kwargs["seq_lens_q"].tolist() == [2, 3]
-    assert backend.paged_prefill_graph_wrapper_planned(metadata)
+    assert backend.paged_prefill_graph_wrapper_planned(binding)
     assert stats.flashinfer_prefill_plan_calls == 2
     assert stats.flashinfer_prefill_plan_rows == 4
     assert stats.flashinfer_prefill_plan_indices == 7
@@ -482,15 +492,16 @@ def test_flashinfer_prefill_graph_binding_owns_stable_graph_buffers(monkeypatch)
         "_workspace",
         lambda device: torch.empty(1, dtype=torch.uint8, device=device),
     )
-    metadata = SimpleNamespace(
+    binding = GraphBinding()
+    plan = SimpleNamespace(
         block_table=torch.zeros((3, 7), dtype=torch.int32),
         cu_seqlens_q=torch.tensor([0, 2, 5, 9], dtype=torch.int32),
         cu_seqlens_k=torch.tensor([0, 7, 11, 20], dtype=torch.int32),
     )
 
-    backend.bind_paged_prefill_graph_wrapper(metadata, device="cpu")
+    backend.bind_paged_prefill_graph_wrapper(binding, plan, device="cpu")
 
-    wrapper_key, wrapper = backend._prefill_graph_wrapper_for_metadata(metadata)
+    wrapper_key, wrapper = backend._prefill_graph_wrapper_for_binding(binding)
     workspace = backend._prefill_plan_workspaces[wrapper_key]
     assert wrapper_key.batch_size == 3
     assert wrapper_key.max_indices == 21
@@ -509,17 +520,18 @@ def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
             self.calls = []
             self.binds = []
 
-        def bind_paged_prefill_graph_wrapper(self, metadata, *, device) -> None:
-            self.binds.append((metadata, torch.device(device)))
+        def bind_paged_prefill_graph_wrapper(self, binding, plan, *, device) -> None:
+            self.binds.append((binding, plan, torch.device(device)))
 
-        def release_paged_prefill_graph_wrapper(self, metadata) -> None:
-            del metadata
+        def release_paged_prefill_graph_wrapper(self, binding) -> None:
+            del binding
 
-        def prepare_paged_prefill_cuda_graph(self, metadata, **kwargs) -> None:
-            self.calls.append((metadata, kwargs))
+        def prepare_paged_prefill_cuda_graph(self, binding, plan, **kwargs) -> None:
+            self.calls.append((binding, plan, kwargs))
 
     backend = Backend()
-    metadata = object()
+    binding = GraphBinding()
+    plan = object()
     owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
     kv_pool = SimpleNamespace(
         n_kv=2,
@@ -532,21 +544,23 @@ def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
     prepare = pcg.resolve_paged_prefill_graph_prepare(
         owner=owner,
         kv_pool=kv_pool,
-        attention_backend_name="flashinfer",
+        attention_preference="flashinfer",
     )
 
     assert prepare is not None
     state = SimpleNamespace(
-        metadata=metadata,
+        graph_binding=binding,
+        plan=plan,
         input_ids=torch.empty(1),
         release_backend=None,
     )
     prepare(state, SimpleNamespace())
-    assert backend.binds == [(metadata, torch.device("cpu"))]
+    assert backend.binds == [(binding, plan, torch.device("cpu"))]
     assert callable(state.release_backend)
     assert backend.calls == [
         (
-            metadata,
+            binding,
+            plan,
             {
                 "num_q_heads": 4,
                 "num_kv_heads": 2,
@@ -574,7 +588,7 @@ def test_prefill_graph_prepare_resolver_accepts_direct_graph_safe_backend(monkey
     prepare = pcg.resolve_paged_prefill_graph_prepare(
         owner=object(),
         kv_pool=SimpleNamespace(),
-        attention_backend_name="trtllm_mha",
+        attention_preference="trtllm_mha",
         before=lambda state, ctx: calls.append((state, ctx)),
     )
 
@@ -589,10 +603,10 @@ def test_graph_warmup_context_uses_configured_attention_backend(monkeypatch):
     seen: list[tuple[str, str | None]] = []
 
     def capture_decode(self, **kwargs):
-        seen.append(("decode", kwargs["ctx"].attention_backend_name))
+        seen.append(("decode", kwargs["ctx"].attention_preference))
 
     def capture_prefill(self, **kwargs):
-        seen.append(("prefill", kwargs["ctx"].attention_backend_name))
+        seen.append(("prefill", kwargs["ctx"].attention_preference))
 
     monkeypatch.setattr(DecodeCudaGraphRunner, "_warmup_capture_buckets", capture_decode)
     monkeypatch.setattr(PrefillCudaGraphRunner, "_warmup_capture_buckets", capture_prefill)
@@ -601,7 +615,7 @@ def test_graph_warmup_context_uses_configured_attention_backend(monkeypatch):
         kv_pool=SimpleNamespace(),
         num_blocks=1,
         device=torch.device("cpu"),
-        attention_backend_name="flashinfer",
+        attention_preference="flashinfer",
         forward_fn=lambda state: state,
     )
     PrefillCudaGraphRunner(name="t", default_enabled=True, default_warmup=True).warmup(
@@ -609,7 +623,7 @@ def test_graph_warmup_context_uses_configured_attention_backend(monkeypatch):
         num_blocks=1,
         block_size=1,
         device=torch.device("cpu"),
-        attention_backend_name="flashinfer",
+        attention_preference="flashinfer",
         forward_fn=lambda state: state,
     )
 
@@ -638,19 +652,19 @@ def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
     runner.kv_pool = None
     runner.num_blocks = 0
     runner.max_context_len = 128
-    runner.attention_backend_name = None
+    runner.attention_preference = None
     runner._prefill_prepare_backend = lambda *args, **kwargs: lambda state, ctx: None
-    metadata = TextAttentionMetadata(
-        cache=None,
-        block_table=None,
+    plan = PagedVarlenPlan(
+        residency_cache=None,
+        block_table=torch.empty((1, 0), dtype=torch.int32),
         cache_seqlens=None,
         cache_seqlens_cpu=(64,),
         query_lens=None,
         query_lens_cpu=(8,),
         kv_seqlens=None,
         kv_seqlens_cpu=(72,),
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
+        cu_seqlens_q=torch.tensor([0, 8], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 72], dtype=torch.int32),
         max_seqlen_q=8,
         max_seqlen_k=72,
         mode=ForwardMode.EXTEND,
@@ -667,7 +681,7 @@ def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
         torch.zeros(8, dtype=torch.long),
         torch.arange(8, dtype=torch.long),
         fb,
-        metadata,
+        plan,
         ForwardContext(stats=ForwardStats()),
     )
 
@@ -684,8 +698,8 @@ def test_text_graph_runner_routes_mixed_extend_decode_to_prefill_runner():
     calls = {}
     runner._maybe_decode = lambda *a, **k: calls.setdefault("decode", True)
     runner._maybe_prefill = lambda *a, **k: calls.setdefault("prefill", True) or torch.ones(2, _VOCAB)
-    metadata = SimpleNamespace(cache=object.__new__(BatchedPagedRequestCache))
-    fb = SimpleNamespace(forward_mode=ForwardMode.MIXED, attn_metadata=metadata)
+    plan = SimpleNamespace(residency_cache=object.__new__(BatchedPagedRequestCache))
+    fb = SimpleNamespace(forward_mode=ForwardMode.MIXED, attn_plan=plan)
     out = runner.maybe_run(
         None,
         torch.zeros(9, dtype=torch.long, device="cuda"),
@@ -748,7 +762,7 @@ def test_padded_prefill_tokens_accepts_mixed_mode():
         token_ids=[(5,), (1, 2, 3)],
         pos_ranges=[(64, 65), (0, 3)],
     )
-    assert runner.padded_num_tokens(text, attention_backend_name=None) == 8
+    assert runner.padded_num_tokens(text, attention_preference=None) == 8
 
 
 def test_prefill_padding_does_not_depend_on_request_kv_tail_capacity():
@@ -775,7 +789,7 @@ def test_prefill_padding_does_not_depend_on_request_kv_tail_capacity():
         pos_ranges=[(0, 4), (0, 3)],
     )
 
-    assert runner.padded_num_tokens(text, attention_backend_name=None) == 12
+    assert runner.padded_num_tokens(text, attention_preference=None) == 12
 
 
 @requires_cuda
@@ -785,8 +799,8 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
     cache = BatchedPagedRequestCache(pool, [[0, 1, 2, 3], [4, 5, 6, 7]], [5, 7])
     query_lens = torch.tensor([2, 3], dtype=torch.int32, device=device)
     kv_lens = torch.tensor([7, 10], dtype=torch.int32, device=device)
-    metadata = TextAttentionMetadata(
-        cache=cache,
+    plan = PagedVarlenPlan(
+        residency_cache=cache,
         block_table=cache.block_table(device=device),
         cache_seqlens=cache.cache_seqlens(device=device),
         cache_seqlens_cpu=(5, 7),
@@ -813,17 +827,17 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
         state,
         input_ids=torch.arange(5, dtype=torch.long, device=device),
         positions=torch.arange(5, dtype=torch.long, device=device),
-        attention_metadata=metadata,
+        attention_plan=plan,
         raw_num_tokens=5,
         last_token_indices=torch.tensor([1, 4], dtype=torch.long, device=device),
     )
 
     assert state.cache.base_lens == [5, 7, 0]
     assert state.cache.block_ids_by_row[2] == []
-    assert state.metadata.cache_seqlens_cpu == (5, 7, 0)
-    assert state.metadata.query_lens_cpu == (2, 6, 0)
-    assert state.metadata.kv_seqlens_cpu == (7, 13, 0)
-    assert state.metadata.max_seqlen_k == 16
+    assert state.plan.cache_seqlens_cpu == (5, 7, 0)
+    assert state.plan.query_lens_cpu == (2, 6, 0)
+    assert state.plan.kv_seqlens_cpu == (7, 13, 0)
+    assert state.plan.max_seqlen_k == 16
     assert state.cache_seqlens.cpu().tolist() == [5, 7, 0]
     assert state.query_lens.cpu().tolist() == [2, 6, 0]
     assert state.kv_seqlens.cpu().tolist() == [7, 13, 0]
@@ -835,7 +849,7 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
 def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
     device = torch.device("cuda")
     pool = _kv_pool(device, num_blocks=32, block_size=4)
-    metadata = _prefill_metadata(
+    plan = _prefill_plan(
         pool,
         block_ids_by_row=[[0, 1, 2], [3, 4, 5], [6, 7, 8]],
         cache_seqlens_cpu=(5, 6, 7),
@@ -857,16 +871,16 @@ def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
         state,
         input_ids=torch.arange(6, dtype=torch.long, device=device),
         positions=torch.arange(6, dtype=torch.long, device=device),
-        attention_metadata=metadata,
+        attention_plan=plan,
         raw_num_tokens=6,
         last_token_indices=torch.tensor([1, 4, 5], dtype=torch.long, device=device),
     )
     torch.cuda.synchronize()
 
-    assert state.metadata.cache_seqlens_cpu == (5, 6, 7, 0)
+    assert state.plan.cache_seqlens_cpu == (5, 6, 7, 0)
     assert state.cache.block_ids_by_row[3] == []
-    assert state.metadata.query_lens_cpu == (2, 3, 3, 0)
-    assert state.metadata.kv_seqlens_cpu == (7, 9, 10, 0)
+    assert state.plan.query_lens_cpu == (2, 3, 3, 0)
+    assert state.plan.kv_seqlens_cpu == (7, 9, 10, 0)
     assert state.cache_seqlens.cpu().tolist() == [5, 6, 7, 0]
     assert state.query_lens.cpu().tolist() == [2, 3, 3, 0]
     assert state.cu_seqlens_q.cpu().tolist() == [0, 2, 5, 8, 8]
@@ -877,7 +891,7 @@ def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
 def test_prefill_graph_token_tail_uses_sink_pages():
     device = torch.device("cuda")
     pool = _kv_pool(device, num_blocks=32, block_size=4)
-    metadata = _prefill_metadata(
+    plan = _prefill_plan(
         pool,
         block_ids_by_row=[[5, 6]],
         cache_seqlens_cpu=(5,),
@@ -899,7 +913,7 @@ def test_prefill_graph_token_tail_uses_sink_pages():
         state,
         input_ids=torch.arange(2, dtype=torch.long, device=device),
         positions=torch.arange(5, 7, dtype=torch.long, device=device),
-        attention_metadata=metadata,
+        attention_plan=plan,
         raw_num_tokens=2,
         last_token_indices=torch.tensor([1], dtype=torch.long, device=device),
     )
@@ -907,24 +921,24 @@ def test_prefill_graph_token_tail_uses_sink_pages():
 
     assert state.cache.base_lens == [5]
     assert state.cache.block_ids_by_row == [[5, 6, 0, 0]]
-    assert state.metadata.query_lens_cpu == (8,)
-    assert state.metadata.kv_seqlens_cpu == (13,)
+    assert state.plan.query_lens_cpu == (8,)
+    assert state.plan.kv_seqlens_cpu == (13,)
     assert state.query_lens.cpu().tolist() == [8]
     assert state.last_token_indices.cpu().tolist() == [1]
 
 
 def test_padded_prefill_max_kv_tokens_isolates_padding_from_cached_prefix():
-    metadata = TextAttentionMetadata(
-        cache=None,
-        block_table=None,
+    plan = PagedVarlenPlan(
+        residency_cache=None,
+        block_table=torch.empty((1, 0), dtype=torch.int32),
         cache_seqlens=None,
         cache_seqlens_cpu=(1597,),
         query_lens=None,
         query_lens_cpu=(29,),
         kv_seqlens=None,
         kv_seqlens_cpu=(1626,),
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
+        cu_seqlens_q=torch.tensor([0, 29], dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 1626], dtype=torch.int32),
         max_seqlen_q=29,
         max_seqlen_k=1626,
         mode=ForwardMode.EXTEND,
@@ -932,7 +946,7 @@ def test_padded_prefill_max_kv_tokens_isolates_padding_from_cached_prefix():
 
     assert (
         _padded_prefill_max_kv_tokens(
-            metadata,
+            plan,
             padded_tokens=64,
             raw_tokens=29,
             batch_size=1,
@@ -956,7 +970,7 @@ def test_prefill_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
     )
     input_ids = torch.tensor([7, 9, 11, 5, 6, 13], dtype=torch.long, device=device)
     positions = torch.arange(6, dtype=torch.long, device=device)
-    metadata = _prefill_metadata(
+    plan = _prefill_plan(
         pool,
         block_ids_by_row=[[0, 1], [2, 3], [4, 5]],
         cache_seqlens_cpu=(0, 0, 0),
@@ -976,7 +990,7 @@ def test_prefill_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
         batch_size=3,
         input_ids=input_ids,
         positions=positions,
-        attention_metadata=metadata,
+        attention_plan=plan,
         last_token_indices=last_token_indices,
         raw_num_tokens=6,
         ctx=ForwardContext(stats=stats),
@@ -1089,7 +1103,7 @@ def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
     device = torch.device("cuda")
     pool = _kv_pool(device)
     state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
         cache_seqlens_cpu=(3, 5),
@@ -1100,7 +1114,7 @@ def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
     positions = torch.tensor([[3], [5]], dtype=torch.long, device=device)
 
     copy_text_decode_graph_inputs(
-        state, input_ids=input_ids, positions=positions, attention_metadata=metadata
+        state, input_ids=input_ids, positions=positions, attention_plan=plan
     )
     torch.cuda.synchronize()
 
@@ -1108,7 +1122,7 @@ def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
     assert state.input_ids.flatten().tolist() == [11, 22, 0, 0]
     assert state.positions.flatten().tolist() == [3, 5, 0, 0]
     assert state.cache_seqlens.tolist() == [3, 5, 0, 0]
-    assert state.metadata.kv_seqlens.tolist() == [4, 6, 1, 1]
+    assert state.plan.kv_seqlens.tolist() == [4, 6, 1, 1]
 
 
 @requires_cuda
@@ -1116,7 +1130,7 @@ def test_decode_input_copy_extends_cpu_seqlen_mirrors():
     device = torch.device("cuda")
     pool = _kv_pool(device)
     state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
         cache_seqlens_cpu=(3, 5),
@@ -1128,13 +1142,13 @@ def test_decode_input_copy_extends_cpu_seqlen_mirrors():
         state,
         input_ids=torch.tensor([[11], [22]], dtype=torch.long, device=device),
         positions=torch.tensor([[3], [5]], dtype=torch.long, device=device),
-        attention_metadata=metadata,
+        attention_plan=plan,
     )
 
     # cache_seqlens_cpu pads with 0 (no resident KV); kv_seqlens_cpu pads with 1
     # (the padded rows still attend over a single synthetic token).
-    assert state.metadata.cache_seqlens_cpu == (3, 5, 0, 0)
-    assert state.metadata.kv_seqlens_cpu == (4, 6, 1, 1)
+    assert state.plan.cache_seqlens_cpu == (3, 5, 0, 0)
+    assert state.plan.kv_seqlens_cpu == (4, 6, 1, 1)
 
 
 @requires_cuda
@@ -1163,11 +1177,11 @@ def test_decode_host_input_copy_populates_static_bucket_inputs():
     assert state.block_table[:2, 2:].sum().item() == 0
     assert state.block_table[2:].sum().item() == 0
     assert state.cache_seqlens.tolist() == [3, 5, 0, 0]
-    assert state.metadata.kv_seqlens.tolist() == [4, 6, 1, 1]
-    assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
-    assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
-    assert state.metadata.cache_seqlens_cpu == (3, 5, 0, 0)
-    assert state.metadata.kv_seqlens_cpu == (4, 6, 1, 1)
+    assert state.plan.kv_seqlens.tolist() == [4, 6, 1, 1]
+    assert state.plan.decode_page_ids.tolist() == [0, 2, 0, 0]
+    assert state.plan.decode_page_offsets.tolist() == [3, 1, 0, 0]
+    assert state.plan.cache_seqlens_cpu == (3, 5, 0, 0)
+    assert state.plan.kv_seqlens_cpu == (4, 6, 1, 1)
 
 
 @requires_cuda
@@ -1196,8 +1210,8 @@ def test_decode_host_input_copy_dense_replacements_clear_inactive_bucket_rows():
 
     assert state.input_ids.flatten().tolist() == [11, 22, 0, 0]
     assert state.positions.flatten().tolist() == [3, 5, 0, 0]
-    assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
-    assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
+    assert state.plan.decode_page_ids.tolist() == [0, 2, 0, 0]
+    assert state.plan.decode_page_offsets.tolist() == [3, 1, 0, 0]
 
 
 @requires_cuda
@@ -1232,8 +1246,8 @@ def test_decode_host_input_copy_dense_replacements_preserve_contiguous_relay_spa
 
     assert state.input_ids.flatten().tolist() == [31, 41, 0, 0]
     assert state.positions.flatten().tolist() == [3, 5, 0, 0]
-    assert state.metadata.decode_page_ids.tolist() == [0, 2, 0, 0]
-    assert state.metadata.decode_page_offsets.tolist() == [3, 1, 0, 0]
+    assert state.plan.decode_page_ids.tolist() == [0, 2, 0, 0]
+    assert state.plan.decode_page_offsets.tolist() == [3, 1, 0, 0]
 
 
 @requires_cuda
@@ -1313,7 +1327,7 @@ def test_decode_graph_replay_matches_eager_for_exact_bucket_batch():
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)
     positions = torch.tensor([[3], [5]], dtype=torch.long, device=device)
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
         cache_seqlens_cpu=(3, 5),
@@ -1329,7 +1343,7 @@ def test_decode_graph_replay_matches_eager_for_exact_bucket_batch():
         batch_size=2,
         input_ids=input_ids,
         positions=positions,
-        attention_metadata=metadata,
+        attention_plan=plan,
         ctx=ForwardContext(stats=stats),
         forward_fn=lambda state: model.logits(state.input_ids, state.positions),
         prepare_backend=None,
@@ -1357,7 +1371,7 @@ def test_decode_graph_second_call_replays_without_recapture():
     runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4))
 
     def run(ids, pos, seqlens, stats):
-        metadata = _decode_metadata(
+        plan = _decode_plan(
             pool,
             block_ids_by_row=[[0], [1]],
             cache_seqlens_cpu=seqlens,
@@ -1370,7 +1384,7 @@ def test_decode_graph_second_call_replays_without_recapture():
             batch_size=2,
             input_ids=ids,
             positions=pos,
-            attention_metadata=metadata,
+            attention_plan=plan,
             ctx=ForwardContext(stats=stats),
             forward_fn=lambda state: model.logits(state.input_ids, state.positions),
             prepare_backend=None,
@@ -1409,7 +1423,7 @@ def test_decode_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
 
     input_ids = torch.tensor([[7], [9], [11]], dtype=torch.long, device=device)
     positions = torch.tensor([[2], [3], [1]], dtype=torch.long, device=device)
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1], [2]],
         cache_seqlens_cpu=(2, 3, 1),
@@ -1425,7 +1439,7 @@ def test_decode_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
         batch_size=3,
         input_ids=input_ids,
         positions=positions,
-        attention_metadata=metadata,
+        attention_plan=plan,
         ctx=ForwardContext(stats=stats),
         forward_fn=lambda state: model.logits(state.input_ids, state.positions),
         prepare_backend=None,
@@ -1458,7 +1472,7 @@ def test_decode_graph_state_buffers_are_bucket_sized_and_zero_padded():
         batch_size=3,
         input_ids=torch.tensor([[7], [9], [11]], dtype=torch.long, device=device),
         positions=torch.tensor([[2], [3], [1]], dtype=torch.long, device=device),
-        attention_metadata=_decode_metadata(
+        attention_plan=_decode_plan(
             pool,
             block_ids_by_row=[[0], [1], [2]],
             cache_seqlens_cpu=(2, 3, 1),
@@ -1477,8 +1491,8 @@ def test_decode_graph_state_buffers_are_bucket_sized_and_zero_padded():
     assert state.batch_size == 4
     assert state.input_ids.flatten().tolist() == [7, 9, 11, 0]
     assert state.cache_seqlens.tolist() == [2, 3, 1, 0]
-    assert state.metadata.cache_seqlens_cpu == (2, 3, 1, 0)
-    assert state.metadata.kv_seqlens_cpu == (3, 4, 2, 1)
+    assert state.plan.cache_seqlens_cpu == (2, 3, 1, 0)
+    assert state.plan.kv_seqlens_cpu == (3, 4, 2, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -1500,7 +1514,7 @@ def test_text_graph_runner_decode_replay_matches_eager_forward():
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)
     positions = torch.tensor([[2], [3]], dtype=torch.long, device=device)
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
         cache_seqlens_cpu=(2, 3),
@@ -1512,7 +1526,7 @@ def test_text_graph_runner_decode_replay_matches_eager_forward():
         req_ids=(0, 1),
         input_ids=input_ids,
         positions=positions,
-        attn_metadata=metadata,
+        attn_plan=plan,
     )
     reference = model.forward(input_ids, positions, fb)
 
@@ -1541,7 +1555,7 @@ def test_text_graph_runner_skips_non_decode_extend_mode_without_prefill_graph():
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)
     positions = torch.tensor([[2], [3]], dtype=torch.long, device=device)
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
         cache_seqlens_cpu=(2, 3),
@@ -1553,7 +1567,7 @@ def test_text_graph_runner_skips_non_decode_extend_mode_without_prefill_graph():
         req_ids=(0, 1),
         input_ids=input_ids,
         positions=positions,
-        attn_metadata=metadata,
+        attn_plan=plan,
     )
 
     assert runner.maybe_run(model, input_ids, positions, fb, ForwardContext(stats=ForwardStats())) is None
@@ -1568,7 +1582,7 @@ def test_text_graph_runner_skips_cpu_input_tensors():
     pool = _kv_pool(device)
     runner = TextGraphRunner(kv_pool=pool, num_blocks=16, block_size=4, device=device)
 
-    metadata = _decode_metadata(
+    plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
         cache_seqlens_cpu=(2, 3),
@@ -1582,7 +1596,7 @@ def test_text_graph_runner_skips_cpu_input_tensors():
         req_ids=(0, 1),
         input_ids=input_ids_cpu,
         positions=positions_cpu,
-        attn_metadata=metadata,
+        attn_plan=plan,
     )
 
     # CUDA graphs require device inputs; a CPU forward is not graphed.

@@ -87,8 +87,8 @@ class _WrapperPool(PagedAttentionPlanPool):
         self._decode_graph_buffers: dict[WrapperKey, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._decode_plan_workspaces: dict[WrapperKey, _DecodePlanWorkspace] = {}
         self._prefill_plan_workspaces: dict[WrapperKey, _PrefillPlanWorkspace] = {}
-        self._metadata_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
-        self._metadata_prefill_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
+        self._binding_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
+        self._binding_prefill_graph_wrappers: dict[int, tuple[WrapperKey, weakref.ReferenceType[Any] | None]] = {}
         self._decode_fast_plan_signatures: dict[WrapperKey, tuple[Any, ...]] = {}
 
     def _decode_wrapper(
@@ -253,15 +253,15 @@ class _WrapperPool(PagedAttentionPlanPool):
         self.bind_graph(tuple(key), wrapper)
         return key, wrapper
 
-    def _prefill_graph_wrapper_for_metadata(self, metadata: Any) -> tuple[WrapperKey, Any] | None:
-        if metadata is None:
+    def _prefill_graph_wrapper_for_binding(self, binding: Any) -> tuple[WrapperKey, Any] | None:
+        if binding is None:
             return None
-        entry = self._metadata_prefill_graph_wrappers.get(id(metadata))
+        entry = self._binding_prefill_graph_wrappers.get(id(binding))
         if entry is None:
             return None
-        wrapper_key, metadata_ref = entry
-        if metadata_ref is not None and metadata_ref() is not metadata:
-            self._metadata_prefill_graph_wrappers.pop(id(metadata), None)
+        wrapper_key, binding_ref = entry
+        if binding_ref is not None and binding_ref() is not binding:
+            self._binding_prefill_graph_wrappers.pop(id(binding), None)
             return None
         wrapper = self._prefill_wrappers.get(wrapper_key)
         if wrapper is None:
@@ -557,15 +557,15 @@ class _WrapperPool(PagedAttentionPlanPool):
             return False
         return getattr(wrapper, "_cached_module", None) is not None
 
-    def _decode_graph_wrapper_for_metadata(self, metadata: Any) -> tuple[WrapperKey, Any] | None:
-        if metadata is None:
+    def _decode_graph_wrapper_for_binding(self, binding: Any) -> tuple[WrapperKey, Any] | None:
+        if binding is None:
             return None
-        entry = self._metadata_graph_wrappers.get(id(metadata))
+        entry = self._binding_graph_wrappers.get(id(binding))
         if entry is None:
             return None
-        wrapper_key, metadata_ref = entry
-        if metadata_ref is not None and metadata_ref() is not metadata:
-            self._metadata_graph_wrappers.pop(id(metadata), None)
+        wrapper_key, binding_ref = entry
+        if binding_ref is not None and binding_ref() is not binding:
+            self._binding_graph_wrappers.pop(id(binding), None)
             return None
         wrapper = self._decode_wrappers.get(wrapper_key)
         if wrapper is None:

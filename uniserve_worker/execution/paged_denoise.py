@@ -131,7 +131,7 @@ def can_run_paged_denoise_attention(
     _query_lens, block_table, _cache_seqlens, cu_q, cu_k, max_q, max_k = metadata
 
     ctx = get_forward_context()
-    preferred = ctx.attention_backend_name or attention_backend or "auto"
+    preferred = ctx.attention_preference or attention_backend or "auto"
     probe = prototype.new_empty((1, 1, width))
     return ops.can_run_attention(
         probe,

@@ -6,7 +6,7 @@ against the system-owned ``KvPool``, and builds the per-forward attention plan
 (paged request-cache view + block_table / cache_seqlens / cu_seqlens / decode
 write-locations). The model receives the finished :class:`ForwardBatch`.
 
-Attention-plan construction (``build_text_attention_metadata``) is model-neutral
+Attention-plan construction (``build_text_attention_plan``) is model-neutral
 (pool + block ids + the batch) and preserves numerics unchanged.
 """
 from __future__ import annotations
@@ -15,8 +15,8 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
+from ..contracts.attention_plan import AttentionPlanBase
 from ..contracts.forward_batch import ForwardBatch
-from ..contracts.forward_context import TextAttentionMetadata
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
 from .kv_pool import PagedKVPool
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ForwardBatchBuilder",
-    "build_text_attention_metadata",
+    "build_text_attention_plan",
     "state_block_ids_for_op",
 ]
 
@@ -54,13 +54,13 @@ def state_block_ids_for_op(op: Mapping[str, Any], state: Any) -> list[int]:
     return [int(block_id) for block_id in state.block_ids]
 
 
-def build_text_attention_metadata(
+def build_text_attention_plan(
     batch: ForwardBatch,
     cache: BatchedPagedRequestCache,
     *,
     stager: Any | None = None,
     max_context_len: int = 0,
-) -> TextAttentionMetadata:
+) -> AttentionPlanBase:
     """Build the per-forward text attention plan from ``ForwardBatch`` indices.
 
     Relocated from the model: this is the system's per-forward plan (SGLang's
@@ -69,7 +69,7 @@ def build_text_attention_metadata(
     """
 
     if batch.input_ids is None:
-        raise invalid_descriptor("text attention metadata requires input ids")
+        raise invalid_descriptor("text attention plan requires input ids")
     device = batch.input_ids.device
     query_lens_values = tuple(len(op.get("token_ids") or []) for op in batch.ops)
     return TextAttentionPlan.from_cache(
@@ -79,7 +79,7 @@ def build_text_attention_metadata(
         query_lens_cpu=query_lens_values,
         stager=stager,
         max_context_len=max_context_len,
-    ).to_metadata()
+    ).to_plan()
 
 
 class ForwardBatchBuilder:
@@ -89,7 +89,7 @@ class ForwardBatchBuilder:
     tensors then resolves the KV-residency indices (``block_table`` /
     ``cache_seqlens`` / the paged request-cache view) from the host-leased block
     ids against the system pool. The result is a :class:`ForwardBatch` carrying
-    the finished attention plan on ``attn_metadata``.
+    the finished attention plan on ``attn_plan``.
     """
 
     def __init__(self, *, ring_depth: int = 3, max_context_len: int = 0) -> None:

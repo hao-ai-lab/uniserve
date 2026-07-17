@@ -1,4 +1,5 @@
 """CUDA graph plumbing for text initial prefill."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -7,7 +8,12 @@ from typing import Any
 
 import torch
 
-from ....contracts.forward_context import ForwardContext, TextAttentionMetadata, use_forward_context
+from ....contracts.forward_context import (
+    ForwardContext,
+    GraphBinding,
+    PagedVarlenPlan,
+    use_forward_context,
+)
 from ....contracts.forward_mode import ForwardMode
 from ....foundation.errors import invalid_descriptor
 from ....foundation.sizing import ceil_div
@@ -49,7 +55,8 @@ class TextInitialPrefillGraphState:
     last_token_indices: torch.Tensor
     graph: torch.cuda.CUDAGraph
     cache: BatchedPagedRequestCache
-    metadata: TextAttentionMetadata
+    plan: PagedVarlenPlan
+    graph_binding: GraphBinding
     logits: torch.Tensor | None = None
     release_backend: Callable[[], None] | None = None
 
@@ -98,7 +105,9 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
     def warmup_capture_batch_sizes(self) -> tuple[int, ...]:
         return tuple(reversed(self.warmup_batch_sizes()))
 
-    def state_key(self, num_tokens: int, batch_size: int, max_kv_tokens: int) -> tuple[int, int, int]:
+    def state_key(
+        self, num_tokens: int, batch_size: int, max_kv_tokens: int
+    ) -> tuple[int, int, int]:
         return (int(num_tokens), int(batch_size), int(max_kv_tokens))
 
     def has_state(self, num_tokens: int, batch_size: int, max_kv_tokens: int) -> bool:
@@ -106,11 +115,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
 
     def bucket_num_tokens(self, num_tokens: int) -> int:
         num_tokens = int(num_tokens)
-        candidates = [
-            int(size)
-            for size in self.warmup_token_buckets()
-            if int(size) >= num_tokens
-        ]
+        candidates = [int(size) for size in self.warmup_token_buckets() if int(size) >= num_tokens]
         if candidates:
             return min(candidates)
         return num_tokens
@@ -118,11 +123,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
     def bucket_batch_size(self, batch_size: int, *, num_tokens: int | None = None) -> int:
         batch_size = int(batch_size)
         prefer_reusable = num_tokens is not None
-        candidates = [
-            int(size)
-            for size in self.warmup_batch_sizes()
-            if int(size) >= batch_size
-        ]
+        candidates = [int(size) for size in self.warmup_batch_sizes() if int(size) >= batch_size]
         if candidates:
             return max(candidates) if prefer_reusable else min(candidates)
         return batch_size
@@ -144,7 +145,8 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
             if int(state_tokens) == int(num_tokens)
             and int(state_batch_size) >= batch_size
             and int(state_kv_tokens) == int(max_kv_tokens)
-            and (int(state_tokens), int(state_batch_size), int(state_kv_tokens)) not in self.disabled
+            and (int(state_tokens), int(state_batch_size), int(state_kv_tokens))
+            not in self.disabled
         ]
         if candidates:
             return min(candidates)
@@ -157,7 +159,9 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
             return context_len
         return self.bucket_num_tokens(max_kv_tokens)
 
-    def can_use(self, num_tokens: int, batch_size: int = 1, max_kv_tokens: int | None = None) -> bool:
+    def can_use(
+        self, num_tokens: int, batch_size: int = 1, max_kv_tokens: int | None = None
+    ) -> bool:
         max_kv_tokens = int(max_kv_tokens if max_kv_tokens is not None else num_tokens)
         key = self.state_key(num_tokens, batch_size, max_kv_tokens)
         return (
@@ -221,7 +225,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         batch_size: int,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attention_metadata: TextAttentionMetadata,
+        attention_plan: PagedVarlenPlan,
         last_token_indices: torch.Tensor,
         raw_num_tokens: int,
         ctx: Any,
@@ -238,21 +242,29 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
             max_kv_tokens=int(max_kv_tokens),
             batch_size=int(batch_size),
             device=device,
-            max_context_len=int(getattr(attention_metadata, "max_context_len", 0) or 0),
+            max_context_len=int(getattr(attention_plan, "max_context_len", 0) or 0),
         )
         copy_text_initial_prefill_graph_inputs(
             state,
             input_ids=input_ids,
             positions=positions,
-            attention_metadata=attention_metadata,
+            attention_plan=attention_plan,
             raw_num_tokens=raw_num_tokens,
             last_token_indices=last_token_indices,
         )
-        graph_ctx = replace(ctx, attention_metadata=state.metadata, stats=None)
+        graph_ctx = replace(
+            ctx,
+            attention_plan=state.plan,
+            graph_binding=state.graph_binding,
+            stats=None,
+        )
         bind_paged_prefill_graph_wrapper(state, graph_ctx)
 
         def run() -> torch.Tensor:
-            with use_forward_context(graph_ctx):
+            # copy_inputs rebuilds state.plan before each warmup and capture run;
+            # publish that snapshot so capture records the same plan the backend
+            # prepare step plans from.
+            with use_forward_context(replace(graph_ctx, attention_plan=state.plan)):
                 return forward_fn(state)
 
         def copy_inputs(capture_state: TextInitialPrefillGraphState) -> None:
@@ -260,7 +272,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 capture_state,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_plan=attention_plan,
                 raw_num_tokens=raw_num_tokens,
                 last_token_indices=last_token_indices,
             )
@@ -307,7 +319,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         batch_size: int,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attention_metadata: TextAttentionMetadata,
+        attention_plan: PagedVarlenPlan,
         last_token_indices: torch.Tensor,
         raw_num_tokens: int,
         ctx: Any,
@@ -337,7 +349,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 batch_size=graph_batch_size,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_plan=attention_plan,
                 last_token_indices=last_token_indices,
                 raw_num_tokens=raw_num_tokens,
                 ctx=ctx,
@@ -350,7 +362,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 state,
                 input_ids=input_ids,
                 positions=positions,
-                attention_metadata=attention_metadata,
+                attention_plan=attention_plan,
                 raw_num_tokens=raw_num_tokens,
                 last_token_indices=last_token_indices,
             )
@@ -399,14 +411,14 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
         block_size: int,
         device: torch.device,
         max_context_len: int = 0,
-        attention_backend_name: str | None = "auto",
+        attention_preference: str | None = "auto",
         forward_fn: Callable[[TextInitialPrefillGraphState], torch.Tensor],
         prepare_backend: Callable[[TextInitialPrefillGraphState, Any], None] | None = None,
     ) -> None:
         """Pre-capture initial-prefill token/batch buckets ahead of serving."""
 
         max_tokens = int(num_blocks) * int(block_size)
-        ctx = ForwardContext(attention_backend_name=attention_backend_name or "auto")
+        ctx = ForwardContext(attention_preference=attention_preference or "auto")
 
         def max_kv_bucket() -> int:
             context_len = int(max_context_len)
@@ -452,7 +464,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 batch_size=batch_size,
                 input_ids=inputs.input_ids,
                 positions=inputs.positions,
-                attention_metadata=inputs.metadata,
+                attention_plan=inputs.plan,
                 last_token_indices=inputs.last_token_indices,
                 raw_num_tokens=num_tokens,
                 ctx=capture_ctx,
@@ -475,7 +487,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
                 state,
                 input_ids=inputs.input_ids,
                 positions=inputs.positions,
-                attention_metadata=inputs.metadata,
+                attention_plan=inputs.plan,
                 raw_num_tokens=num_tokens,
                 last_token_indices=inputs.last_token_indices,
             )
@@ -520,7 +532,7 @@ class PrefillCudaGraphRunner(_GraphRunnerBase):
 class _SyntheticInitialPrefillInputs:
     input_ids: torch.Tensor
     positions: torch.Tensor
-    metadata: TextAttentionMetadata
+    plan: PagedVarlenPlan
     last_token_indices: torch.Tensor
 
 
@@ -557,7 +569,7 @@ def _synthetic_initial_prefill_inputs(
     return _SyntheticInitialPrefillInputs(
         input_ids=torch.zeros(num_tokens, dtype=torch.long, device=device),
         positions=positions,
-        metadata=_synthetic_initial_prefill_metadata(
+        plan=_synthetic_initial_prefill_plan(
             cache,
             num_tokens,
             batch_size,
@@ -568,20 +580,23 @@ def _synthetic_initial_prefill_inputs(
     )
 
 
-def _synthetic_initial_prefill_metadata(
+def _synthetic_initial_prefill_plan(
     cache: BatchedPagedRequestCache,
     num_tokens: int,
     batch_size: int,
     device: torch.device,
     max_context_len: int = 0,
-) -> TextAttentionMetadata:
+) -> PagedVarlenPlan:
     query_lens_cpu = _synthetic_query_lens(int(num_tokens), int(batch_size))
     query_lens = torch.tensor(query_lens_cpu, dtype=torch.int32, device=device)
     cu_seqlens = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), torch.cumsum(query_lens, dim=0).to(torch.int32)]
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(query_lens, dim=0).to(torch.int32),
+        ]
     )
-    return TextAttentionMetadata(
-        cache=cache,
+    return PagedVarlenPlan(
+        residency_cache=cache,
         block_table=cache.block_table(device=device),
         cache_seqlens=cache.cache_seqlens(device=device),
         cache_seqlens_cpu=tuple(0 for _ in range(int(batch_size))),
@@ -634,58 +649,56 @@ def make_text_initial_prefill_graph_state(
         1,
         min(int(num_blocks), ceil_div(max_kv_tokens, kv_pool.block_size)),
     )
-    graph_cache = BatchedPagedRequestCache(kv_pool, [[] for _ in range(batch_size)], [0] * batch_size)
+    graph_cache = BatchedPagedRequestCache(
+        kv_pool, [[] for _ in range(batch_size)], [0] * batch_size
+    )
     query_lens_cpu = (num_tokens,) + tuple(0 for _ in range(batch_size - 1))
+    input_ids = torch.empty(num_tokens, dtype=torch.long, device=device)
+    positions = torch.empty(num_tokens, dtype=torch.long, device=device)
+    block_table = torch.empty((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device)
+    cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    query_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    kv_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    last_token_indices = torch.zeros(batch_size, dtype=torch.long, device=device)
+    query_lens[0] = num_tokens
+    kv_seqlens[0] = num_tokens
+    cu_seqlens_q[1:] = num_tokens
+    cu_seqlens_k[1:] = num_tokens
     state = TextInitialPrefillGraphState(
         num_tokens=num_tokens,
         max_kv_tokens=max_kv_tokens,
         batch_size=batch_size,
-        input_ids=torch.empty(num_tokens, dtype=torch.long, device=device),
-        positions=torch.empty(num_tokens, dtype=torch.long, device=device),
-        block_table=torch.empty((batch_size, max_blocks_per_seq), dtype=torch.int32, device=device),
-        cache_seqlens=torch.zeros(batch_size, dtype=torch.int32, device=device),
-        query_lens=torch.zeros(batch_size, dtype=torch.int32, device=device),
-        kv_seqlens=torch.zeros(batch_size, dtype=torch.int32, device=device),
-        cu_seqlens_q=torch.zeros(batch_size + 1, dtype=torch.int32, device=device),
-        cu_seqlens_k=torch.zeros(batch_size + 1, dtype=torch.int32, device=device),
-        last_token_indices=torch.zeros(batch_size, dtype=torch.long, device=device),
+        input_ids=input_ids,
+        positions=positions,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        query_lens=query_lens,
+        kv_seqlens=kv_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        last_token_indices=last_token_indices,
         graph=torch.cuda.CUDAGraph(),
         cache=graph_cache,
-        metadata=TextAttentionMetadata(
-            cache=graph_cache,
-            block_table=None,
-            cache_seqlens=None,
+        plan=PagedVarlenPlan(
+            residency_cache=graph_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
             cache_seqlens_cpu=tuple(0 for _ in range(batch_size)),
-            query_lens=None,
+            query_lens=query_lens,
             query_lens_cpu=query_lens_cpu,
-            kv_seqlens=None,
+            kv_seqlens=kv_seqlens,
             kv_seqlens_cpu=query_lens_cpu,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=num_tokens,
             max_seqlen_k=max_kv_tokens,
             max_context_len=int(max_context_len),
             mode=ForwardMode.EXTEND,
         ),
+        graph_binding=GraphBinding(),
     )
-    state.metadata = replace(
-        state.metadata,
-        block_table=state.block_table,
-        cache_seqlens=state.cache_seqlens,
-        query_lens=state.query_lens,
-        kv_seqlens=state.kv_seqlens,
-        cu_seqlens_q=state.cu_seqlens_q,
-        cu_seqlens_k=state.cu_seqlens_k,
-    )
-    state.cache_seqlens.zero_()
-    state.query_lens.zero_()
-    state.query_lens[0] = num_tokens
-    state.kv_seqlens.zero_()
-    state.kv_seqlens[0] = num_tokens
-    state.cu_seqlens_q.zero_()
-    state.cu_seqlens_q[1:] = num_tokens
-    state.cu_seqlens_k.zero_()
-    state.cu_seqlens_k[1:] = num_tokens
     return state
 
 
@@ -694,7 +707,7 @@ def copy_text_initial_prefill_graph_inputs(
     *,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
-    attention_metadata: TextAttentionMetadata,
+    attention_plan: PagedVarlenPlan,
     raw_num_tokens: int,
     last_token_indices: torch.Tensor | None = None,
 ) -> None:
@@ -713,7 +726,7 @@ def copy_text_initial_prefill_graph_inputs(
         state.input_ids[flat_ids.numel() :].zero_()
     if int(flat_positions.numel()) < state.num_tokens:
         state.positions[flat_positions.numel() :].zero_()
-    block_table = attention_metadata.block_table
+    block_table = attention_plan.block_table
     if block_table is None:
         raise invalid_descriptor("prefill CUDA graph block table is missing")
     real_rows = int(block_table.shape[0])
@@ -729,7 +742,7 @@ def copy_text_initial_prefill_graph_inputs(
         state.block_table[:real_rows, block_table.shape[1] :].zero_()
     if real_rows < state.batch_size:
         state.block_table[real_rows:].zero_()
-    cache_seqlens = attention_metadata.cache_seqlens
+    cache_seqlens = attention_plan.cache_seqlens
     if not isinstance(cache_seqlens, torch.Tensor):
         raise invalid_descriptor("prefill CUDA graph cache-seqlens tensor is missing")
     if int(cache_seqlens.numel()) != real_rows:
@@ -737,24 +750,26 @@ def copy_text_initial_prefill_graph_inputs(
     state.cache_seqlens[:real_rows].copy_(cache_seqlens.to(dtype=torch.int32), non_blocking=True)
     if real_rows < state.batch_size:
         state.cache_seqlens[real_rows:].zero_()
-    cache_lens_cpu = tuple(int(length) for length in getattr(attention_metadata, "cache_seqlens_cpu", ()) or ())
+    cache_lens_cpu = tuple(int(length) for length in attention_plan.cache_seqlens_cpu)
     if len(cache_lens_cpu) != real_rows:
         raise invalid_descriptor("prefill CUDA graph cache length count mismatch")
     graph_cache_lens_cpu = cache_lens_cpu + tuple(0 for _ in range(state.batch_size - real_rows))
-    raw_lens = tuple(int(length) for length in getattr(attention_metadata, "query_lens_cpu", ()) or ())
+    raw_lens = tuple(int(length) for length in attention_plan.query_lens_cpu)
     if len(raw_lens) != real_rows:
         raise invalid_descriptor("prefill CUDA graph query lengths mismatch")
     if sum(raw_lens) != raw_num_tokens:
         raise invalid_descriptor("prefill CUDA graph raw token count does not match query lengths")
     graph_lens = list(raw_lens) + [0 for _ in range(state.batch_size - real_rows)]
-    source_cache = getattr(attention_metadata, "cache", None)
+    source_cache = attention_plan.residency_cache
     block_ids_by_row = getattr(source_cache, "block_ids_by_row", None)
     padding_tokens = int(state.num_tokens) - raw_num_tokens
     padding_row = real_rows - 1
     if padding_tokens > 0:
         graph_lens[padding_row] += padding_tokens
     if block_ids_by_row is not None:
-        graph_block_ids = [list(row) for row in block_ids_by_row] + [[] for _ in range(state.batch_size - real_rows)]
+        graph_block_ids = [list(row) for row in block_ids_by_row] + [
+            [] for _ in range(state.batch_size - real_rows)
+        ]
         if padding_tokens > 0:
             required_blocks = ceil_div(
                 int(graph_cache_lens_cpu[padding_row]) + int(graph_lens[padding_row]),
@@ -766,13 +781,18 @@ def copy_text_initial_prefill_graph_inputs(
                     [_PREFILL_GRAPH_PADDING_BLOCK_ID] * missing_blocks
                 )
             if len(graph_block_ids[padding_row]) > int(state.block_table.shape[1]):
-                raise invalid_descriptor("prefill CUDA graph sink tail exceeds block-table capacity")
+                raise invalid_descriptor(
+                    "prefill CUDA graph sink tail exceeds block-table capacity"
+                )
         state.cache.reset_rows(graph_block_ids, graph_cache_lens_cpu)
     graph_lens_tuple = tuple(int(length) for length in graph_lens)
-    kv_lens_tuple = tuple(int(base) + int(query) for base, query in zip(graph_cache_lens_cpu, graph_lens_tuple, strict=True))
+    kv_lens_tuple = tuple(
+        int(base) + int(query)
+        for base, query in zip(graph_cache_lens_cpu, graph_lens_tuple, strict=True)
+    )
     if max(kv_lens_tuple, default=0) > int(state.max_kv_tokens):
         raise invalid_descriptor("prefill CUDA graph KV bucket exceeded")
-    query_lens = attention_metadata.query_lens
+    query_lens = attention_plan.query_lens
     if not isinstance(query_lens, torch.Tensor):
         raise invalid_descriptor("prefill CUDA graph query lens tensor is missing")
     if int(query_lens.numel()) != real_rows:
@@ -788,13 +808,17 @@ def copy_text_initial_prefill_graph_inputs(
     torch.cumsum(state.query_lens, dim=0, out=state.cu_seqlens_q[1:])
     state.cu_seqlens_k[:1].zero_()
     torch.cumsum(state.kv_seqlens, dim=0, out=state.cu_seqlens_k[1:])
-    state.metadata.cache_seqlens_cpu = graph_cache_lens_cpu
-    state.metadata.query_lens_cpu = graph_lens_tuple
-    state.metadata.kv_seqlens_cpu = kv_lens_tuple
-    state.metadata.max_seqlen_q = max(graph_lens_tuple, default=state.num_tokens)
-    state.metadata.max_seqlen_k = state.max_kv_tokens
-    state.metadata.max_context_len = int(
-        getattr(attention_metadata, "max_context_len", 0) or state.metadata.max_context_len
+    # Publish a fresh frozen plan reusing the state's static device tensors with
+    # the current per-replay CPU summaries and varlen extents. The graph reads
+    # the buffers (stable addresses); wrapper identity stays on the binding.
+    state.plan = replace(
+        state.plan,
+        cache_seqlens_cpu=graph_cache_lens_cpu,
+        query_lens_cpu=graph_lens_tuple,
+        kv_seqlens_cpu=kv_lens_tuple,
+        max_seqlen_q=max(graph_lens_tuple, default=state.num_tokens),
+        max_seqlen_k=state.max_kv_tokens,
+        max_context_len=int(attention_plan.max_context_len or state.plan.max_context_len),
     )
     if last_token_indices is None:
         if state.batch_size != 1:
@@ -804,7 +828,9 @@ def copy_text_initial_prefill_graph_inputs(
         flat_indices = last_token_indices.reshape(-1)
         if int(flat_indices.numel()) != real_rows:
             raise invalid_descriptor("prefill CUDA graph last-token index count mismatch")
-        state.last_token_indices[:real_rows].copy_(flat_indices.to(dtype=torch.long), non_blocking=True)
+        state.last_token_indices[:real_rows].copy_(
+            flat_indices.to(dtype=torch.long), non_blocking=True
+        )
         if real_rows < state.batch_size:
             state.last_token_indices[real_rows:].zero_()
 
@@ -813,12 +839,14 @@ def resolve_paged_prefill_graph_prepare(
     *,
     owner: Any,
     kv_pool: PagedKVPool,
-    attention_backend_name: str | None,
+    attention_preference: str | None,
     before: Callable[[TextInitialPrefillGraphState, Any], None] | None = None,
 ) -> Callable[[TextInitialPrefillGraphState, Any], None] | None:
     """Build the per-replay prefill-graph prepare hook, or ``None`` to stay eager."""
 
-    backend = _resolve_graph_prefill_backend(ForwardContext(attention_backend_name=attention_backend_name))
+    backend = _resolve_graph_prefill_backend(
+        ForwardContext(attention_preference=attention_preference)
+    )
     if backend is None:
         return None
     prepare = getattr(backend, "prepare_paged_prefill_cuda_graph", None)
@@ -834,8 +862,8 @@ def resolve_paged_prefill_graph_prepare(
             bind = getattr(backend, "bind_paged_prefill_graph_wrapper", None)
             release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
             if state.release_backend is None and callable(bind) and callable(release):
-                bind(state.metadata, device=state.input_ids.device)
-                state.release_backend = lambda: release(state.metadata)
+                bind(state.graph_binding, state.plan, device=state.input_ids.device)
+                state.release_backend = lambda: release(state.graph_binding)
             prepare_paged_prefill_graph_backend(
                 state,
                 backend=backend,
@@ -880,7 +908,8 @@ def prepare_paged_prefill_graph_backend(
     """Refresh ``backend``'s graph-prefill plan buffers for the pending replay."""
 
     backend.prepare_paged_prefill_cuda_graph(
-        state.metadata,
+        state.graph_binding,
+        state.plan,
         num_q_heads=int(num_q_heads),
         num_kv_heads=int(num_kv_heads),
         head_dim=int(head_dim),
@@ -900,17 +929,21 @@ def bind_paged_prefill_graph_wrapper(state: TextInitialPrefillGraphState, ctx: A
     release = getattr(backend, "release_paged_prefill_graph_wrapper", None)
     if not callable(bind) or not callable(release):
         return
-    bind(state.metadata, device=state.input_ids.device)
-    state.release_backend = lambda: release(state.metadata)
+    bind(state.graph_binding, state.plan, device=state.input_ids.device)
+    state.release_backend = lambda: release(state.graph_binding)
 
 
-def assert_paged_prefill_graph_wrapper_planned(state: TextInitialPrefillGraphState, ctx: Any) -> None:
+def assert_paged_prefill_graph_wrapper_planned(
+    state: TextInitialPrefillGraphState, ctx: Any
+) -> None:
     if state.release_backend is None:
         return
     backend = _resolve_graph_prefill_backend(ctx)
     planned = getattr(backend, "paged_prefill_graph_wrapper_planned", None)
-    if callable(planned) and not planned(state.metadata):
-        raise invalid_descriptor("captured prefill forward did not plan the graph-scoped prefill backend")
+    if callable(planned) and not planned(state.graph_binding):
+        raise invalid_descriptor(
+            "captured prefill forward did not plan the graph-scoped prefill backend"
+        )
 
 
 def _resolve_graph_prefill_backend(ctx: Any) -> Any:
@@ -924,7 +957,7 @@ def _resolve_graph_prefill_backend(ctx: Any) -> Any:
             normalize_attention_backend_name,
         )
 
-        name = normalize_attention_backend_name(getattr(ctx, "attention_backend_name", None))
+        name = normalize_attention_backend_name(getattr(ctx, "attention_preference", None))
         if name == "auto" and has_attention_backend("trtllm_mha"):
             backend = get_attention_backend("trtllm_mha")
             if bool(getattr(backend.capabilities(), "available", True)):

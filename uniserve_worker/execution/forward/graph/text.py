@@ -8,6 +8,7 @@ uses, so the model never knows it is being graphed.
 
 Graph settings are model-neutral and come from the worker runtime config.
 """
+
 from __future__ import annotations
 
 import logging
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["TextGraphRunner"]
 
+
 class TextGraphRunner:
     """Owns the decode + text-prefill CUDA graphs, keyed on the system pool."""
 
@@ -47,7 +49,7 @@ class TextGraphRunner:
         num_blocks: int,
         block_size: int,
         device: "torch.device",
-        attention_backend_name: str | None = None,
+        attention_preference: str | None = None,
         max_context_len: int = 0,
     ) -> None:
         self.kv_pool = kv_pool
@@ -57,7 +59,7 @@ class TextGraphRunner:
         self.max_context_len = max(0, int(max_context_len))
         # Startup (warmup) has no forward context to read the backend name from;
         # per-forward calls prefer the context's resolved name.
-        self.attention_backend_name = attention_backend_name
+        self.attention_preference = attention_preference
         runtime = get_worker_config()
         self._decode = DecodeCudaGraphRunner(
             name="text",
@@ -88,21 +90,21 @@ class TextGraphRunner:
     ) -> "torch.Tensor | None":
         """Replay (or capture) the graph for this forward; ``None`` to fall back."""
 
-        metadata = fb.attn_metadata
-        if not isinstance(getattr(metadata, "cache", None), BatchedPagedRequestCache):
+        plan = fb.attn_plan
+        if not isinstance(getattr(plan, "residency_cache", None), BatchedPagedRequestCache):
             return None
         if getattr(input_ids, "device", None) is None or input_ids.device.type != "cuda":
             return None
         if fb.forward_mode == ForwardMode.DECODE:
-            return self._maybe_decode(model, input_ids, positions, fb, metadata, ctx)
+            return self._maybe_decode(model, input_ids, positions, fb, plan, ctx)
         if fb.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             # A mixed extend+decode group is shape-identical to a cached-prefix
             # extend group (flat varlen rows, per-row context lengths, per-row
             # last-token sampling), so it replays the same prefill buckets.
-            return self._maybe_prefill(model, input_ids, positions, fb, metadata, ctx)
+            return self._maybe_prefill(model, input_ids, positions, fb, plan, ctx)
         return None
 
-    def _maybe_decode(self, model, input_ids, positions, fb, metadata, ctx):
+    def _maybe_decode(self, model, input_ids, positions, fb, plan, ctx):
         if not self._decode.enabled():
             return None
         if input_ids.ndim != 2 or int(input_ids.shape[1]) != 1:
@@ -110,8 +112,8 @@ class TextGraphRunner:
         batch_size = int(input_ids.shape[0])
         prepare_backend = self._decode_prepare_backend(
             model,
-            attention_backend_name=getattr(ctx, "attention_backend_name", None)
-            or self.attention_backend_name,
+            attention_preference=getattr(ctx, "attention_preference", None)
+            or self.attention_preference,
         )
         if prepare_backend is None:
             # A captured paged-decode graph is only correct when the backend can
@@ -125,7 +127,7 @@ class TextGraphRunner:
             batch_size=batch_size,
             input_ids=input_ids,
             positions=positions,
-            attention_metadata=metadata,
+            attention_plan=plan,
             ctx=ctx,
             forward_fn=lambda state: self._decode_forward(model, state),
             prepare_backend=prepare_backend,
@@ -135,16 +137,16 @@ class TextGraphRunner:
         self,
         model: Any,
         *,
-        attention_backend_name: str | None,
+        attention_preference: str | None,
     ) -> Any | None:
         return resolve_paged_decode_graph_prepare(
             owner=model,
             kv_pool=self.kv_pool,
             num_blocks=self.num_blocks,
-            attention_backend_name=attention_backend_name,
+            attention_preference=attention_preference,
         )
 
-    def _maybe_prefill(self, model, input_ids, positions, fb, metadata, ctx):
+    def _maybe_prefill(self, model, input_ids, positions, fb, plan, ctx):
         if not self._prefill.enabled():
             return None
         batch_size = int(fb.batch_size)
@@ -158,7 +160,7 @@ class TextGraphRunner:
             return None
         max_kv_tokens = self._prefill.bucket_kv_tokens(
             _padded_prefill_max_kv_tokens(
-                metadata,
+                plan,
                 padded_tokens=padded_tokens,
                 raw_tokens=raw_tokens,
                 batch_size=batch_size,
@@ -173,8 +175,8 @@ class TextGraphRunner:
             return None
         prepare_backend = self._prefill_prepare_backend(
             model,
-            attention_backend_name=getattr(ctx, "attention_backend_name", None)
-            or getattr(self, "attention_backend_name", None),
+            attention_preference=getattr(ctx, "attention_preference", None)
+            or getattr(self, "attention_preference", None),
         )
         if prepare_backend is None:
             return None
@@ -186,7 +188,7 @@ class TextGraphRunner:
             batch_size=batch_size,
             input_ids=input_ids,
             positions=positions,
-            attention_metadata=metadata,
+            attention_plan=plan,
             last_token_indices=fb.last_token_indices,
             raw_num_tokens=raw_tokens,
             ctx=ctx,
@@ -198,12 +200,12 @@ class TextGraphRunner:
         self,
         model: Any,
         *,
-        attention_backend_name: str | None,
+        attention_preference: str | None,
     ) -> Any | None:
         return resolve_paged_prefill_graph_prepare(
             owner=model,
             kv_pool=self.kv_pool,
-            attention_backend_name=attention_backend_name,
+            attention_preference=attention_preference,
         )
 
     # ---- the graph-unaware model forward ------------------------------------
@@ -214,7 +216,7 @@ class TextGraphRunner:
             req_ids=tuple(range(int(state.batch_size))),
             input_ids=state.input_ids,
             positions=state.positions,
-            attn_metadata=state.metadata,
+            attn_plan=state.plan,
         )
         return model.forward(state.input_ids, state.positions, fb)
 
@@ -225,7 +227,7 @@ class TextGraphRunner:
             input_ids=state.input_ids,
             positions=state.positions,
             last_token_indices=state.last_token_indices,
-            attn_metadata=state.metadata,
+            attn_plan=state.plan,
         )
         return model.forward(state.input_ids, state.positions, fb)
 
@@ -236,10 +238,10 @@ class TextGraphRunner:
 
         return text
 
-    def padded_num_tokens(self, text: Any, *, attention_backend_name: str | None) -> int | None:
+    def padded_num_tokens(self, text: Any, *, attention_preference: str | None) -> int | None:
         """Pad an extend group up to a captured prefill bucket, else ``None``."""
 
-        del attention_backend_name
+        del attention_preference
         if not self._prefill.enabled():
             return None
         if text.mode not in (ForwardMode.EXTEND, ForwardMode.MIXED):
@@ -266,7 +268,7 @@ class TextGraphRunner:
             return
         if self._decode.enabled() and self._decode.warmup_enabled():
             prepare_backend = self._decode_prepare_backend(
-                model, attention_backend_name=self.attention_backend_name
+                model, attention_preference=self.attention_preference
             )
             if prepare_backend is None:
                 logger.info(
@@ -279,13 +281,13 @@ class TextGraphRunner:
                     num_blocks=self.num_blocks,
                     device=self.device,
                     max_context_len=self.max_context_len,
-                    attention_backend_name=self.attention_backend_name,
+                    attention_preference=self.attention_preference,
                     forward_fn=lambda state: self._decode_forward(model, state),
                     prepare_backend=prepare_backend,
                 )
         if self._prefill.enabled() and self._prefill.warmup_enabled():
             prepare_backend = self._prefill_prepare_backend(
-                model, attention_backend_name=self.attention_backend_name
+                model, attention_preference=self.attention_preference
             )
             if prepare_backend is None:
                 logger.info(
@@ -299,23 +301,23 @@ class TextGraphRunner:
                     block_size=self.block_size,
                     device=self.device,
                     max_context_len=self.max_context_len,
-                    attention_backend_name=self.attention_backend_name,
+                    attention_preference=self.attention_preference,
                     forward_fn=lambda state: self._prefill_forward(model, state),
                     prepare_backend=prepare_backend,
                 )
 
 
 def _padded_prefill_max_kv_tokens(
-    metadata: Any,
+    plan: Any,
     *,
     padded_tokens: int,
     raw_tokens: int,
     batch_size: int,
 ) -> int:
     pad = max(0, int(padded_tokens) - int(raw_tokens))
-    fallback = max(int(getattr(metadata, "max_seqlen_k", 0) or 0), pad)
-    cache_lens = tuple(int(length) for length in getattr(metadata, "cache_seqlens_cpu", ()) or ())
-    query_lens = tuple(int(length) for length in getattr(metadata, "query_lens_cpu", ()) or ())
+    fallback = max(int(getattr(plan, "max_seqlen_k", 0) or 0), pad)
+    cache_lens = tuple(int(length) for length in getattr(plan, "cache_seqlens_cpu", ()) or ())
+    query_lens = tuple(int(length) for length in getattr(plan, "query_lens_cpu", ()) or ())
     if len(cache_lens) != int(batch_size) or len(query_lens) != int(batch_size) or not query_lens:
         return max(1, fallback)
     padded_max = max(

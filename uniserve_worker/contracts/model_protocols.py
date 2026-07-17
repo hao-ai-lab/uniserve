@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from ..execution.denoise_driver import TextImageDenoiseStep
     from ..runtime.compile import CompileTarget
     from ..runtime.request_state import RequestStateTable
+    from .attention_plan import AttentionPlanBase
     from .batch_policy import BatchPolicy
     from .caps import Caps
     from .forward_batch import ForwardBatch
@@ -116,13 +117,13 @@ class TextForwardCapable(Protocol):
         request_states: "RequestStateTable",
     ) -> list[Any]: ...
 
-    def prepare_text_attention_metadata(
+    def prepare_text_attention_plan(
         self,
         batch: "ForwardBatch",
         *,
         request_states: "RequestStateTable",
         stager: Any | None = None,
-    ) -> Any: ...
+    ) -> "AttentionPlanBase": ...
 
     def embed_tokens(self, input_ids: "torch.Tensor") -> "torch.Tensor": ...
 

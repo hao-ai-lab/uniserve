@@ -387,8 +387,8 @@ def _write_paged_kv_cache(
 
 
 def _metadata_context_len(default: int) -> int:
-    metadata = getattr(get_forward_context(), "attention_metadata", None)
-    value = getattr(metadata, "max_context_len", 0)
+    plan = get_forward_context().attention_plan
+    value = getattr(plan, "max_context_len", 0)
     try:
         parsed = int(value)
     except (TypeError, ValueError):

@@ -42,7 +42,7 @@ def test_runner_preserves_contextual_auto_attention_backend():
         attention_backend=None,
     )
     assert runner.attention_backend is None
-    assert runner.attention_backend_name == "auto"
+    assert runner.attention_preference == "auto"
 
 
 def test_validate_caps_accepts_qwen3_target_verify_op():
@@ -334,7 +334,7 @@ class ThinTextModel(ModelHooks):
     num_blocks = 8
 
     def __init__(self) -> None:
-        self.context_metadata = None
+        self.context_plan = None
         self.seen_req_ids: tuple[int, ...] | None = None
 
     def kv_cache_spec(self):
@@ -346,7 +346,7 @@ class ThinTextModel(ModelHooks):
         from uniserve_worker.contracts.forward_context import get_forward_context
 
         del input_ids, positions
-        self.context_metadata = get_forward_context().attention_metadata
+        self.context_plan = get_forward_context().attention_plan
         self.seen_req_ids = forward_batch.req_ids
         batch = forward_batch.batch_size
         logits = torch.zeros(batch, 3)
@@ -413,7 +413,7 @@ def test_runner_text_uses_text_driver_for_sampling_masks_and_logprobs():
 
 
 def test_system_builds_and_publishes_attention_plan_to_thin_model():
-    from uniserve_worker.contracts.forward_context import TextAttentionMetadata
+    from uniserve_worker.contracts.attention_plan import PagedDecodePlan
 
     model = ThinTextModel()
     runner = _thin_text_runner(model)
@@ -435,9 +435,9 @@ def test_system_builds_and_publishes_attention_plan_to_thin_model():
 
     assert result["per_seq"][0]["sampled_token_id"] == 1
     assert model.seen_req_ids == (8,)
-    # The model built no metadata: the system constructed and published the plan.
-    assert isinstance(model.context_metadata, TextAttentionMetadata)
-    assert model.context_metadata.cache is not None
+    # The model built no plan: the system constructed and published it.
+    assert isinstance(model.context_plan, PagedDecodePlan)
+    assert model.context_plan.residency_cache is not None
 
 
 def test_runner_request_state_keeps_op_block_deltas_authoritative():

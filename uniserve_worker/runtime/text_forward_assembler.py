@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence, cast
 
 import torch
 
+from ..contracts.attention_plan import AttentionPlanBase, PagedDecodePlan, PagedVarlenPlan
 from ..contracts.forward_batch import ForwardBatch
-from ..contracts.forward_context import AttentionCache, TextAttentionMetadata
+from ..contracts.forward_context import AttentionCache
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
 from .kv_pool import PagedKVPool
@@ -97,18 +98,48 @@ class TextForwardAssembler:
         )
         block_table = cache.block_table(device=target)
         cache_seqlens = torch.tensor([int(pos_range[0])], dtype=torch.int32, device=target)
-        metadata = TextAttentionMetadata(
-            cache=cast(AttentionCache, cache),
-            block_table=block_table,
-            cache_seqlens=cache_seqlens,
-            cache_seqlens_cpu=(int(pos_range[0]),),
-            query_lens_cpu=(query_len,),
-            kv_seqlens_cpu=(int(pos_range[0]) + query_len,),
-            max_seqlen_q=query_len,
-            max_seqlen_k=int(pos_range[0]) + query_len,
-            max_context_len=self.max_context_len,
-            mode=mode,
-        )
+        residency = cast(AttentionCache, cache)
+        if mode == ForwardMode.DECODE and query_len == 1:
+            kv_seqlens = cache_seqlens + 1
+            from ..backends.paged_kv_math import decode_write_locations
+
+            page_ids, page_offsets = decode_write_locations(
+                block_table,
+                cache_seqlens,
+                cache.pool.block_size,
+            )
+            plan: AttentionPlanBase = PagedDecodePlan(
+                residency_cache=residency,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                cache_seqlens_cpu=(int(pos_range[0]),),
+                kv_seqlens=kv_seqlens,
+                query_lens=torch.ones(1, dtype=torch.int32, device=target),
+                query_lens_cpu=(1,),
+                kv_seqlens_cpu=(int(pos_range[0]) + 1,),
+                decode_page_ids=page_ids,
+                decode_page_offsets=page_offsets,
+                max_context_len=self.max_context_len,
+            )
+        else:
+            plan = PagedVarlenPlan(
+                residency_cache=residency,
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
+                cache_seqlens_cpu=(int(pos_range[0]),),
+                query_lens_cpu=(query_len,),
+                kv_seqlens_cpu=(int(pos_range[0]) + query_len,),
+                cu_seqlens_q=torch.tensor([0, query_len], dtype=torch.int32, device=target),
+                cu_seqlens_k=torch.tensor(
+                    [0, int(pos_range[0]) + query_len],
+                    dtype=torch.int32,
+                    device=target,
+                ),
+                max_seqlen_q=query_len,
+                max_seqlen_k=int(pos_range[0]) + query_len,
+                max_context_len=self.max_context_len,
+                mode=mode,
+            )
         last_token = torch.tensor([query_len - 1], dtype=torch.long, device=target)
         return ForwardBatch(
             forward_mode=mode,
@@ -122,7 +153,7 @@ class TextForwardAssembler:
             padded_num_tokens=query_len,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
-            attn_metadata=metadata,
+            attn_plan=plan,
         )
 
     def attach_metadata(
@@ -132,7 +163,7 @@ class TextForwardAssembler:
         kv_pool: PagedKVPool,
         request_states: "RequestStateTable",
         stager: Any | None = None,
-    ) -> TextAttentionMetadata:
+    ) -> AttentionPlanBase:
         rows = [
             self._resolve_row(request_states, int(req_id), op)
             for op, req_id in zip(fb.ops, fb.req_ids)

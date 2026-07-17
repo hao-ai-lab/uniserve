@@ -189,7 +189,7 @@ class ForwardStepExecutor:
                 self.runner._record_group_shape(forward_stats, fb)
             ctx = ForwardContext(
                 attention_backend=self.runner.attention_backend,
-                attention_backend_name=self.runner.attention_backend_name,
+                attention_preference=self.runner.attention_preference,
                 stats=forward_stats,
             )
             group_start = time.perf_counter_ns() if forward_stats is not None else 0
