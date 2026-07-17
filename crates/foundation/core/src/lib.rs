@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub mod generation;
+pub mod program;
 pub mod sampling;
 pub use generation::{
     CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
