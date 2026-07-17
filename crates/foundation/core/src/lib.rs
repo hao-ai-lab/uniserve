@@ -6,6 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod execution_identity;
+#[cfg(test)]
+mod execution_identity_vectors;
 pub mod generation;
 pub mod program;
 pub mod program_cursor;

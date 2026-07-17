@@ -1,0 +1,29 @@
+# Canonical execution-payload fingerprint vectors: the cross-language pin.
+#
+# Stage 1 of specs/unified_forward_execution.md requires Python and Rust to
+# agree byte-for-byte on canonical execution identity. Each [[vector]] names
+# one shared ExecuteBatch constructed identically by:
+#   - Python tests/python/contract/worker/test_execution_contracts_vectors.py
+#     over uniserve_worker/contracts/execution.py
+#   - Rust  crates/foundation/core/src/execution_identity.rs (test module)
+#
+# Both sides compute canonical_payload_fingerprint and must reproduce the
+# digest recorded here. Changing the encoding, a field order, or a value type
+# on either side breaks one of the two tests; updating a digest here is an
+# intentional cross-language protocol change.
+#
+# The vectors intentionally cover: a bare sequence advance; version-0
+# admission with candidate verification plus cache and product leases; and a
+# two-row flow + encode batch (row order sensitivity).
+
+[[vector]]
+name = "single_sequence_row"
+digest = "86f61137666d6bde72281973538a309bf5f342c5ddc23ec5e9c3ef5b211a1a46"
+
+[[vector]]
+name = "admission_verification_and_leases"
+digest = "4792823a7381be97718f557e6490d8eafa8eef4975c07cb7acce0c8c357ba348"
+
+[[vector]]
+name = "flow_and_encode_rows"
+digest = "8e2274ca59c5def7a56f66deea933d8e7466d51f783d105fb2ad53c74506e0ed"
