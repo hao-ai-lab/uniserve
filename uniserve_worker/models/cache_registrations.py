@@ -13,8 +13,6 @@ production execution yet.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from ..contracts.cache_schema import (
     AttentionPattern,
     AttentionSiteSpec,
@@ -32,6 +30,7 @@ from ..contracts.cache_schema import (
     DTypeTag,
     ExtentExpr,
     ExtentOperand,
+    FamilyCacheRegistration,
     FamilyCacheSchema,
     GridFieldTag,
     MhaHistoryLayout,
@@ -48,7 +47,6 @@ from ..contracts.cache_schema import (
     RouteRunSpec,
     Shareability,
     StoreFormat,
-    validate_registration,
 )
 
 __all__ = [
@@ -72,19 +70,6 @@ _GENERATION_ROUTE = 1
 _TOKENS = ExtentExpr.operand(ExtentOperand.INPUT_TOKEN_COUNT)
 _CANDIDATES = ExtentExpr.operand(ExtentOperand.CANDIDATE_COUNT)
 _IMAGE_TOKENS = ExtentExpr.operand(ExtentOperand.IMAGE_TOKEN_COUNT)
-
-
-@dataclass(frozen=True, slots=True)
-class FamilyCacheRegistration:
-    """One family's validated static cache registration."""
-
-    domains: tuple[CacheDomainSpec, ...]
-    sites: tuple[AttentionSiteSpec, ...]
-    schema: FamilyCacheSchema
-
-    def validate(self) -> "FamilyCacheRegistration":
-        validate_registration(self.domains, self.sites, self.schema)
-        return self
 
 
 def _decoder_domain(

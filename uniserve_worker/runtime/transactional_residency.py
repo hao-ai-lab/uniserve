@@ -215,6 +215,11 @@ class _BindingReservation:
     binding: SequenceBinding
     state: _SequenceState
     arena: _Arena
+    # Shared per-sequence provisional chain for this plan: stacked writing
+    # bindings on one sequence extend one chain with consecutive,
+    # nonoverlapping extents (the companion's two-regions-one-sequence rule).
+    chain: list[int] = field(default_factory=list)
+    base_rows: int = 0
     provisional_pages: list[int] = field(default_factory=list)
     cloned_partial: tuple[int, int] | None = None  # (original, clone)
     pinned_leases: tuple[int, ...] = ()
@@ -224,7 +229,7 @@ class _BindingReservation:
         return self.state.committed_rows
 
     def provisional_rows(self) -> int:
-        """Maximum physical row extent reserved for the transaction.
+        """Maximum physical row extent reserved through this binding.
 
         Transient overlays begin on a fresh page boundary after the committed
         chain (a shared partial committed page is never written), so their
@@ -235,42 +240,23 @@ class _BindingReservation:
         effect = self.binding.effect
         if effect is CacheEffect.READ_ONLY:
             return self.state.committed_rows
-        if effect is CacheEffect.TRANSIENT_OVERLAY:
-            aligned = len(self.state.pages) * self.arena.config.page_tokens
-            return aligned + self.binding.reserve_rows
-        return self.state.committed_rows + self.binding.reserve_rows
+        return self.base_rows + self.binding.reserve_rows
 
     def read_chain(self) -> list[int]:
-        """The page chain this transaction reads, with the private clone."""
+        """The page chain this binding reads (shared plan chain)."""
 
-        pages = list(self.state.pages)
-        if self.cloned_partial is not None:
-            pages[-1] = self.cloned_partial[1]
-        if self.binding.effect is CacheEffect.TRANSIENT_OVERLAY:
-            return pages + self.provisional_pages
-        return pages + self.provisional_pages
+        return list(self.chain)
 
     def write_locations(self) -> list[tuple[int, int]]:
         """``(page, offset)`` per written row, in logical row order."""
 
         page_tokens = self.arena.config.page_tokens
-        effect = self.binding.effect
-        if effect is CacheEffect.READ_ONLY:
+        if self.binding.effect is CacheEffect.READ_ONLY:
             return []
-        chain = self.read_chain()
-        if effect is CacheEffect.TRANSIENT_OVERLAY:
-            begin = len(self.state.pages) * page_tokens
-            rows = range(begin, begin + self.binding.reserve_rows)
-            # Overlay rows start on a fresh page boundary after the committed
-            # chain; their logical read position still follows committed_rows.
-            return [
-                (chain[row // page_tokens], row % page_tokens)
-                for row in rows
-            ]
-        rows = range(
-            self.committed_rows, self.committed_rows + self.binding.reserve_rows
-        )
-        return [(chain[row // page_tokens], row % page_tokens) for row in rows]
+        rows = range(self.base_rows, self.base_rows + self.binding.reserve_rows)
+        return [
+            (self.chain[row // page_tokens], row % page_tokens) for row in rows
+        ]
 
 
 class ResidencyReservation:
@@ -301,6 +287,7 @@ class ResidencyReservation:
             raise ResidencyError("reservation is already resolved")
         if len(committed_rows) != len(self._bindings):
             raise ResidencyError("commit needs one extent per binding")
+        fully_committed: dict[int, bool] = {}
         for reservation, advance in zip(self._bindings, committed_rows):
             effect = reservation.binding.effect
             if effect in (CacheEffect.READ_ONLY, CacheEffect.TRANSIENT_OVERLAY):
@@ -312,6 +299,16 @@ class ResidencyReservation:
                 raise ResidencyError(
                     f"accepted extent {advance} is outside the reserved tail"
                 )
+            else:
+                sequence_id = reservation.state.sequence_id
+                if advance > 0 and not fully_committed.get(sequence_id, True):
+                    raise ResidencyError(
+                        "a stacked binding cannot publish rows after a "
+                        "partially committed earlier extent"
+                    )
+                fully_committed[sequence_id] = fully_committed.get(
+                    sequence_id, True
+                ) and advance == reservation.binding.reserve_rows
         # Validation complete; the transition below cannot fail.
         for reservation, advance in zip(self._bindings, committed_rows):
             self._commit_binding(reservation, advance)
@@ -417,6 +414,9 @@ class ResidencyReservation:
             if effect is CacheEffect.TRANSIENT_OVERLAY:
                 state.generation += 1
             return
+        # Stacked bindings commit in plan order: state.pages already reflects
+        # every earlier binding's kept extent, and this binding's provisional
+        # pages continue that chain directly.
         page_tokens = arena.config.page_tokens
         final_rows = state.committed_rows + advance
         needed_pages = -(-final_rows // page_tokens)
@@ -490,13 +490,27 @@ class Residency:
     # ------------------------------------------------------------------ #
 
     def reserve(self, plan: ReservationPlan) -> ResidencyReservation:
-        """All-or-nothing reservation across every row and binding."""
+        """All-or-nothing reservation across every row and binding.
+
+        Stacked writing bindings on one sequence receive consecutive,
+        nonoverlapping provisional extents on one shared chain (the cache
+        companion's rule for two regions appending one sequence in a row).
+        """
 
         bindings: list[_BindingReservation] = []
+        contexts: dict[int, _BindingReservation] = {}
         try:
             for row in plan.rows:
                 for binding in row.bindings:
-                    bindings.append(self._reserve_binding(binding))
+                    reservation = self._reserve_binding(
+                        binding, contexts.get(binding.sequence.sequence_id)
+                    )
+                    bindings.append(reservation)
+                    if binding.effect in (
+                        CacheEffect.PERSISTENT_APPEND,
+                        CacheEffect.TENTATIVE_APPEND,
+                    ):
+                        contexts[binding.sequence.sequence_id] = reservation
         except ResidencyError:
             for reservation in bindings:
                 for page in reservation.provisional_pages:
@@ -507,7 +521,11 @@ class Residency:
             raise
         return ResidencyReservation(self, bindings)
 
-    def _reserve_binding(self, binding: SequenceBinding) -> _BindingReservation:
+    def _reserve_binding(
+        self,
+        binding: SequenceBinding,
+        stacked_on: "_BindingReservation | None",
+    ) -> _BindingReservation:
         state = self._state(binding.sequence.sequence_id)
         if state.generation != binding.sequence.generation:
             raise StaleSequenceError(
@@ -517,35 +535,54 @@ class Residency:
         if state.domain_id != binding.sequence.domain_id:
             raise ResidencyError("binding names the wrong cache domain")
         arena = self._arenas[state.domain_id]
+        page_tokens = arena.config.page_tokens
         pinned = self._pin_leases(binding.input_leases)
         reservation = _BindingReservation(
             binding=binding, state=state, arena=arena, pinned_leases=pinned
         )
         effect = binding.effect
-        if effect is CacheEffect.READ_ONLY:
-            if binding.reserve_rows:
-                raise ResidencyError("read-only bindings reserve no rows")
-            return reservation
-        if binding.reserve_rows <= 0:
-            raise ResidencyError(f"{effect.name} bindings reserve at least one row")
-        page_tokens = arena.config.page_tokens
         try:
+            if effect is CacheEffect.READ_ONLY:
+                if binding.reserve_rows:
+                    raise ResidencyError("read-only bindings reserve no rows")
+                reservation.chain = list(state.pages)
+                reservation.base_rows = state.committed_rows
+                return reservation
+            if binding.reserve_rows <= 0:
+                raise ResidencyError(
+                    f"{effect.name} bindings reserve at least one row"
+                )
             if effect is CacheEffect.TRANSIENT_OVERLAY:
-                reservation.provisional_pages = arena.allocate(
+                if stacked_on is not None:
+                    raise ResidencyError(
+                        "a transient overlay cannot stack on a writing binding"
+                    )
+                overlay_pages = arena.allocate(
                     -(-binding.reserve_rows // page_tokens)
                 )
+                reservation.provisional_pages = overlay_pages
+                reservation.chain = list(state.pages) + overlay_pages
+                reservation.base_rows = len(state.pages) * page_tokens
+                return reservation
+            if stacked_on is not None:
+                # Continue the shared chain exactly where the earlier writing
+                # binding's provisional extent ends.
+                base = stacked_on.base_rows + stacked_on.binding.reserve_rows
+                chain = stacked_on.chain
             else:
-                total = state.committed_rows + binding.reserve_rows
-                needed = -(-total // page_tokens) - len(state.pages)
-                partial = state.committed_rows % page_tokens
-                if (
-                    partial
-                    and state.pages
-                    and arena.refcount(state.pages[-1]) > 1
-                ):
+                base = state.committed_rows
+                chain = list(state.pages)
+                partial = base % page_tokens
+                if partial and chain and arena.refcount(chain[-1]) > 1:
                     clone = arena.allocate(1)[0]
-                    reservation.cloned_partial = (state.pages[-1], clone)
-                reservation.provisional_pages = arena.allocate(max(needed, 0))
+                    reservation.cloned_partial = (chain[-1], clone)
+                    chain[-1] = clone
+            total = base + binding.reserve_rows
+            needed = -(-total // page_tokens) - len(chain)
+            reservation.provisional_pages = arena.allocate(max(needed, 0))
+            chain.extend(reservation.provisional_pages)
+            reservation.chain = chain
+            reservation.base_rows = base
         except ResidencyError:
             if reservation.cloned_partial is not None:
                 arena.release(reservation.cloned_partial[1])

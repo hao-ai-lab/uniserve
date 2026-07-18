@@ -52,6 +52,7 @@ __all__ = [
     "EngineRef",
     "ExtentExpr",
     "ExtentOperand",
+    "FamilyCacheRegistration",
     "FamilyCacheSchema",
     "GridFieldTag",
     "MhaHistoryLayout",
@@ -840,6 +841,25 @@ def _validate_route_partition(region: CacheRegionSpec) -> None:
             f"region {region.local_region_id}: route runs do not partition "
             "query rows"
         )
+
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyCacheRegistration:
+    """One family's validated static cache registration.
+
+    The record shape is family-neutral contract data; concrete family
+    instances are authored beside their family implementations in
+    ``models/cache_registrations.py``.
+    """
+
+    domains: tuple[CacheDomainSpec, ...]
+    sites: tuple[AttentionSiteSpec, ...]
+    schema: FamilyCacheSchema
+
+    def validate(self) -> "FamilyCacheRegistration":
+        validate_registration(self.domains, self.sites, self.schema)
+        return self
 
 
 # --------------------------------------------------------------------------- #
