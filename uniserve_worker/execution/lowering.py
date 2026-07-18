@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from ..contracts.cache_schema import (
     CacheEffect,
     CacheRegionSpec,
+    CommitExpr,
     ExtentOperand,
     FamilyCacheRegistration,
     RoleSelectorKind,
@@ -108,7 +109,13 @@ class LoweredSegment:
 
 @dataclass(frozen=True, slots=True)
 class LoweredBatch:
-    """Segments, reservation plan, and aggregate demand for one transaction."""
+    """Segments, reservation plan, and aggregate demand for one transaction.
+
+    ``binding_commits`` and ``binding_row_ids`` align with the plan's binding
+    order: the declared commit expression and owning row of each reserved
+    binding, so delta derivation consumes the same closed schema source that
+    produced the reservation.
+    """
 
     segments: tuple[LoweredSegment, ...]
     plan: ReservationPlan
@@ -117,6 +124,8 @@ class LoweredBatch:
     branches: int
     candidate_tokens: int
     write_token_begins: tuple[int, ...]
+    binding_commits: tuple[CommitExpr, ...]
+    binding_row_ids: tuple[int, ...]
 
     def demand(self, *, page_tokens: int) -> GraphCapacity:
         """The aggregate capacity vector this transaction requires."""
@@ -200,6 +209,8 @@ def lower_rows(
     segments: list[LoweredSegment] = []
     demands: list[RowDemand] = []
     write_token_begins: list[int] = []
+    binding_commits: list[CommitExpr] = []
+    binding_row_ids: list[int] = []
     token_cursor = 0
     region_counter = 0
     max_branches = 0
@@ -256,6 +267,8 @@ def lower_rows(
                     binding_index = _global_binding_index(demands, bindings)
                     kv_group = domain_by_role[role_id]
                     write_token_begins.append(token_cursor)
+                    binding_commits.append(region.commit_rows)
+                    binding_row_ids.append(row.row_id)
                 is_tentative = region.cache_effect is CacheEffect.TENTATIVE_APPEND
                 if is_tentative:
                     candidate_tokens = max(candidate_tokens, query_rows)
@@ -309,6 +322,8 @@ def lower_rows(
         branches=max_branches,
         candidate_tokens=candidate_tokens,
         write_token_begins=tuple(write_token_begins),
+        binding_commits=tuple(binding_commits),
+        binding_row_ids=tuple(binding_row_ids),
     )
 
 
