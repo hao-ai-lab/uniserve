@@ -1,21 +1,16 @@
-"""The mechanically generated adapter conformance gate (Stage 11, GPU).
+"""Mechanical composition conformance for every registered model family.
 
-Every nonempty advertised operation subset, in every row order, for all
-three registered families, executes through a fresh dormant stack: the batch
-must commit, exactly one adapter/root invocation must serve it, and results
-stay in scheduler order. The manifest machinery is validated separately for
-determinism and stale-hash rejection.
+Every nonempty advertised operation subset, in every row order, executes
+through a fresh transaction stack: the batch must commit, exactly one resident
+adapter invocation must serve it, and results stay in scheduler order. The
+manifest machinery is validated separately for determinism and stale-hash
+rejection.
 """
 
 from __future__ import annotations
 
 import pytest
-import torch
 
-from uniserve_worker.backends.attention.reference_target import (
-    CacheDeviceBinding,
-    ReferenceAttentionBackend,
-)
 from uniserve_worker.contracts.execution import (
     EncodeStep,
     EngineRef,
@@ -30,9 +25,11 @@ from uniserve_worker.contracts.execution import (
     SequenceStep,
     SessionRef,
 )
+from uniserve_worker.contracts.model_family import ModelFamilyDescriptor
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
 from uniserve_worker.execution.engine import (
+    AdapterRowOutcome,
     ExecutionEngine,
     ManifestError,
     StandardTransactionExecutor,
@@ -40,16 +37,9 @@ from uniserve_worker.execution.engine import (
     generate_cases,
     validate_manifest,
 )
-from uniserve_worker.models.bagel_target import BagelTarget
-from uniserve_worker.models.cache_registrations import (
-    bagel_cache_registration,
-    qwen3_cache_registration,
-    sensenova_cache_registration,
-)
-from uniserve_worker.models.qwen3_target import Qwen3Target
-from uniserve_worker.models.sensenova_target import SenseNovaTarget
-from uniserve_worker.models.target_registry import target_registry
-from uniserve_worker.nn.target_decoder import TargetDecoderConfig
+from uniserve_worker.models.bagel import BagelForUnifiedGeneration
+from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
 from uniserve_worker.runtime.transactional_residency import (
     ArenaConfig,
     ProductDemand,
@@ -67,45 +57,43 @@ _SAMPLING = SamplingSpec(0.0, 1.0, 20, 0.0, 1.0, 0.0, 0.0)
 _LATENT_ROWS = 4
 
 
-class _CountingAdapter:
-    def __init__(self, inner) -> None:
-        self.inner = inner
+class _CountingResidentAdapter:
+    """Minimal resident adapter that exposes transaction orchestration only."""
+
+    def __init__(self) -> None:
         self.calls = 0
 
     def forward(self, segments, residency, capacity, payload):
+        del residency, payload
         self.calls += 1
-        return self.inner.forward(segments, residency, capacity, payload)
-
-
-def _config(routes: int) -> TargetDecoderConfig:
-    return TargetDecoderConfig(
-        vocab_size=64,
-        hidden_size=32,
-        layers=1,
-        routes=routes,
-        query_heads=4,
-        kv_heads=2,
-        head_dim=8,
-        mlp_hidden=64,
-    )
+        row_ids = sorted(
+            {
+                int(segments.row_id[index])
+                for index in range(capacity.segments)
+                if segments.segment_active[index]
+            }
+        )
+        return tuple(AdapterRowOutcome(sampled_tokens=(0,)) for _row_id in row_ids)
 
 
 _FAMILIES = {
-    "qwen3": (qwen3_cache_registration, Qwen3Target, 1),
-    "bagel": (bagel_cache_registration, BagelTarget, 2),
-    "sensenova": (sensenova_cache_registration, SenseNovaTarget, 2),
+    model.family: ModelFamilyDescriptor.from_model_class(model)
+    for model in (
+        Qwen3ForCausalLM,
+        BagelForUnifiedGeneration,
+        SenseNovaU1ForUnifiedGeneration,
+    )
 }
 
 
 def _stack(family: str):
-    registration_factory, adapter_type, routes = _FAMILIES[family]
-    config = _config(routes)
-    registration = registration_factory(
-        layer_count=config.layers,
-        query_heads=config.query_heads,
-        kv_heads=config.kv_heads,
-        qk_head_dim=config.head_dim,
-        value_head_dim=config.head_dim,
+    descriptor = _FAMILIES[family]
+    registration = descriptor.build_cache_registration(
+        layer_count=1,
+        query_heads=4,
+        kv_heads=2,
+        qk_head_dim=8,
+        value_head_dim=8,
         page_tokens=_PAGE_TOKENS,
     )
     residency = Residency(
@@ -113,18 +101,7 @@ def _stack(family: str):
         (ArenaConfig(domain_id=1, page_count=129, page_tokens=_PAGE_TOKENS),),
         product_stores=(ProductStoreConfig(schema_id=7, row_capacity=256),),
     )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    binding = CacheDeviceBinding(
-        layers=config.layers,
-        pages=129,
-        page_tokens=_PAGE_TOKENS,
-        kv_heads=config.kv_heads,
-        head_dim=config.head_dim,
-        device=device,
-    )
-    adapter = _CountingAdapter(
-        adapter_type(config, ReferenceAttentionBackend(binding), device=device)
-    )
+    adapter = _CountingResidentAdapter()
     capacity = GraphCapacity(
         rows=4,
         segments=16,
@@ -145,7 +122,7 @@ def _stack(family: str):
     engine = ExecutionEngine(
         engine=_ENGINE,
         executor=executor,
-        advertised_operations=frozenset(OperationTag),
+        advertised_operations=descriptor.operation_tags,
         replay_window=64,
     )
     return engine, residency, adapter
@@ -158,11 +135,7 @@ def _publish_latent(residency, session: SessionRef):
                 RowDemand(
                     row_id=0,
                     bindings=(),
-                    products=(
-                        ProductDemand(
-                            schema_id=7, rows=_LATENT_ROWS, producer=session
-                        ),
-                    ),
+                    products=(ProductDemand(schema_id=7, rows=_LATENT_ROWS, producer=session),),
                 ),
             )
         )
@@ -232,17 +205,15 @@ def _run_case(case) -> None:
         )
     ).result()
     assert adapter.calls == calls_before + 1, case.case_id
-    assert [row.row_id for row in result.row_results] == list(
-        range(len(case.operations))
-    ), case.case_id
+    assert [row.row_id for row in result.row_results] == list(range(len(case.operations))), (
+        case.case_id
+    )
 
 
 def test_manifest_generation_is_deterministic_and_stale_hashes_reject():
-    registry = target_registry()
-    for architecture in ("Qwen3ForCausalLM", "BAGEL", "NEOChatModel"):
-        registration = registry.resolve((architecture,))
-        manifest = build_manifest(registration.family, registration.operations)
-        again = build_manifest(registration.family, registration.operations)
+    for descriptor in _FAMILIES.values():
+        manifest = build_manifest(descriptor.family, descriptor.operation_tags)
+        again = build_manifest(descriptor.family, descriptor.operation_tags)
         assert manifest == again
         validate_manifest(manifest)
         stale = type(manifest)(
@@ -261,18 +232,10 @@ def test_manifest_generation_is_deterministic_and_stale_hashes_reject():
     assert "qwen3_sharegpt_r16" in full.benchmark_references
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("family", sorted(_FAMILIES))
 def test_every_generated_case_commits_with_one_root_invocation(family: str):
-    registry = target_registry()
-    architecture = {
-        "qwen3": "Qwen3ForCausalLM",
-        "bagel": "BAGEL",
-        "sensenova": "NEOChatModel",
-    }[family]
-    registration = registry.resolve((architecture,))
-    cases = generate_cases(family, registration.operations)
+    descriptor = _FAMILIES[family]
+    cases = generate_cases(family, descriptor.operation_tags)
     assert cases
     for case in cases:
         _run_case(case)

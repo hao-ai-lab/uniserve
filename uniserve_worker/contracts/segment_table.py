@@ -1,29 +1,26 @@
 """Closed ``SegmentTable`` device schema and ``GraphCapacity`` axes.
 
-Stage 1 device-contract deliverable from
-``specs/unified_forward_execution.md``, refined by the cache companion
-(``specs/unified_kv_attention_runtime.md``). The segment table is the sole
-structural source for attention planning, route dispatch, cache reads and
-writes, overlay selection, and result projection; no second host-side
-structure may disagree with it.
+The segment table is the sole structural source for attention planning, route
+dispatch, cache reads and writes, overlay selection, and result projection; no
+second host-side structure may disagree with it.
 
 Like :mod:`~uniserve_worker.contracts.residency_batch`, this module is
 torch-free: the schema is expressed over host integer sequences so graph
 buckets, providers, and contract tests validate one description without a
-GPU. The production `contracts.forward_batch.ForwardBatch` remains
-authoritative until the vertical cutover replaces it.
+GPU.
 
 Sentinel semantics: active segments occupy one prefix of the table; every
 inactive entry has ``segment_active == 0`` and zero in every other column.
 No provider or adapter may infer active structure from stale tail contents.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
 from typing import Sequence
 
 from .cache_schema import AttentionPattern, CacheEffect
-from .execution import OperationTag
+from .operations import OperationTag
 from .residency_batch import ResidencyBatchCapacity
 
 __all__ = [
@@ -201,9 +198,7 @@ class SegmentTableArrays:
                 raise SegmentTableError(f"segment_active[{index}] must be 0 or 1")
             if flag == 1:
                 if seen_inactive:
-                    raise SegmentTableError(
-                        "active segments must occupy one prefix of the table"
-                    )
+                    raise SegmentTableError("active segments must occupy one prefix of the table")
                 active += 1
             else:
                 seen_inactive = True
@@ -217,31 +212,21 @@ class SegmentTableArrays:
         for segment in range(active):
             row = self.row_id[segment]
             if row < previous_row:
-                raise SegmentTableError(
-                    f"segment {segment} breaks scheduler row order"
-                )
+                raise SegmentTableError(f"segment {segment} breaks scheduler row order")
             if row > previous_row:
                 if row != previous_row + 1:
-                    raise SegmentTableError(
-                        f"segment {segment} skips row {previous_row + 1}"
-                    )
+                    raise SegmentTableError(f"segment {segment} skips row {previous_row + 1}")
                 expected_local = 0
             if self.local_segment_id[segment] != expected_local:
                 raise SegmentTableError(
                     f"segment {segment} breaks local segment order for row {row}"
                 )
             if self.token_begin[segment] != expected_token_begin:
-                raise SegmentTableError(
-                    f"segment {segment} token span is not packed canonically"
-                )
+                raise SegmentTableError(f"segment {segment} token span is not packed canonically")
             if self.query_begin[segment] != expected_query_begin:
-                raise SegmentTableError(
-                    f"segment {segment} query span is not packed canonically"
-                )
+                raise SegmentTableError(f"segment {segment} query span is not packed canonically")
             if self.token_count[segment] < 0 or self.query_count[segment] < 0:
-                raise SegmentTableError(
-                    f"segment {segment} has negative span extents"
-                )
+                raise SegmentTableError(f"segment {segment} has negative span extents")
             expected_token_begin += self.token_count[segment]
             expected_query_begin += self.query_count[segment]
             previous_row = row
@@ -257,46 +242,34 @@ class SegmentTableArrays:
         cache_effects = {int(effect) for effect in CacheEffect}
         for segment in range(active):
             if self.operation_tag[segment] not in operation_tags:
-                raise SegmentTableError(
-                    f"segment {segment} carries an unsealed operation tag"
-                )
+                raise SegmentTableError(f"segment {segment} carries an unsealed operation tag")
             if self.attention_pattern[segment] not in attention_patterns:
-                raise SegmentTableError(
-                    f"segment {segment} carries an unknown attention pattern"
-                )
+                raise SegmentTableError(f"segment {segment} carries an unknown attention pattern")
             if self.cache_effect[segment] not in cache_effects:
-                raise SegmentTableError(
-                    f"segment {segment} carries an unknown cache effect"
-                )
+                raise SegmentTableError(f"segment {segment} carries an unknown cache effect")
             branch_count = self.branch_count[segment]
             if branch_count > capacity.branches:
-                raise SegmentTableError(
-                    f"segment {segment} branch count exceeds capacity"
-                )
+                raise SegmentTableError(f"segment {segment} branch count exceeds capacity")
             if branch_count > 0 and not 0 <= self.branch_id[segment] < branch_count:
                 raise SegmentTableError(
                     f"segment {segment} branch identity is outside its multiplicity"
                 )
             bindings = capacity.residency.bindings
             if not 0 <= self.kv_read_index[segment] <= bindings:
-                raise SegmentTableError(
-                    f"segment {segment} kv_read_index exceeds binding capacity"
-                )
+                raise SegmentTableError(f"segment {segment} kv_read_index exceeds binding capacity")
             if not 0 <= self.kv_write_index[segment] <= bindings:
                 raise SegmentTableError(
                     f"segment {segment} kv_write_index exceeds binding capacity"
                 )
             effect = self.cache_effect[segment]
             if effect == int(CacheEffect.READ_ONLY) and (
-                self.kv_write_index[segment] != 0
-                or self.cache_write_count[segment] != 0
+                self.kv_write_index[segment] != 0 or self.cache_write_count[segment] != 0
             ):
                 raise SegmentTableError(
                     f"segment {segment}: READ_ONLY segments own no write binding"
                 )
             if effect != int(CacheEffect.READ_ONLY) and (
-                self.kv_write_index[segment] == 0
-                or self.cache_write_count[segment] <= 0
+                self.kv_write_index[segment] == 0 or self.cache_write_count[segment] <= 0
             ):
                 raise SegmentTableError(
                     f"segment {segment}: writing effects need an active write "
@@ -312,20 +285,16 @@ class SegmentTableArrays:
                     f"segment {segment}: NO_CACHE_DOMAIN segments are read-only "
                     "with zero bindings and context"
                 )
-            if self.candidate_count[segment] > 0 and self.operation_tag[
-                segment
-            ] != int(OperationTag.SEQUENCE_STEP):
+            if self.candidate_count[segment] > 0 and self.operation_tag[segment] != int(
+                OperationTag.SEQUENCE_STEP
+            ):
                 raise SegmentTableError(
                     f"segment {segment}: candidate spans belong to sequence steps"
                 )
             if self.candidate_count[segment] > capacity.candidate_tokens:
-                raise SegmentTableError(
-                    f"segment {segment} candidate span exceeds capacity"
-                )
+                raise SegmentTableError(f"segment {segment} candidate span exceeds capacity")
             if self.position_count[segment] != self.query_count[segment]:
-                raise SegmentTableError(
-                    f"segment {segment}: position_count must equal query_count"
-                )
+                raise SegmentTableError(f"segment {segment}: position_count must equal query_count")
             if not 0 <= self.result_slot[segment] < max(capacity.rows, 1):
                 raise SegmentTableError(
                     f"segment {segment} result slot exceeds the bucket row capacity"
@@ -336,6 +305,5 @@ class SegmentTableArrays:
             for name in _COLUMNS:
                 if getattr(self, name)[segment] != 0:
                     raise SegmentTableError(
-                        f"inactive segment {segment} column {name} must hold "
-                        "the zero sentinel"
+                        f"inactive segment {segment} column {name} must hold the zero sentinel"
                     )

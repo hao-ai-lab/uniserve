@@ -66,6 +66,7 @@ from ..nn.quant import (
 )
 from ..runtime.compile import CompileTarget
 from ..runtime.residency import KvCacheSpec
+from .cache_registrations import qwen3_cache_registration
 from .registry import UniModelBase
 
 logger = logging.getLogger(__name__)
@@ -377,8 +378,10 @@ class Qwen3Model(nn.Module):
 class Qwen3ForCausalLM(UniModelBase, nn.Module):
     """Qwen3 serving model — thin: forward(input_ids, positions, forward_batch)."""
 
+    family = "qwen3"
     architectures = ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM")
     supported_ops = ("prefill_und", "decode_und", "target_verify_und")
+    cache_registration_factory = staticmethod(qwen3_cache_registration)
     supported_controls: tuple[str, ...] = ()
     adapter_mode = "none"
     resource_plan = ResourcePlan(kv_block=KvBlockResourcePolicy.PER_BLOCK)

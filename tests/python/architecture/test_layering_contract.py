@@ -312,7 +312,7 @@ def _family_entry_files(models):
     return _py_files(models)
 
 
-def test_models_tree_matches_target_file_set():
+def test_models_tree_matches_canonical_file_set():
     models = WORKER / "models"
     top_level = {p.name for p in models.glob("*.py")}
     assert top_level == {
@@ -324,17 +324,6 @@ def test_models_tree_matches_target_file_set():
         # (specs/unified_kv_attention_runtime.md); family-naming data stays in
         # the models layer, never in model-neutral contracts.
         "cache_registrations.py",
-        # Strict target registry (unified_forward_execution Stage 6):
-        # explicit architecture-to-family resolution, no probing or fallback.
-        "target_registry.py",
-        # Target Qwen3 family root (Stage 6 family port): one resident
-        # root over injected shared attention, no cache or provider ownership.
-        "qwen3_target.py",
-        # Target SenseNova two-route family root (mixed text+denoise
-        # composition through one packed traversal).
-        "sensenova_target.py",
-        # Target BAGEL two-route family root (marker-run denoise).
-        "bagel_target.py",
     }
     # SenseNova-U1 is its own family package; operation lifecycle is system-owned.
     sensenova = {p.name for p in (models / "sensenova").glob("*.py")}

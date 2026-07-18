@@ -103,6 +103,7 @@ from ...runtime.tower_handoff import (
     TowerBinding,
     TowerHandoff,
 )
+from ..cache_registrations import sensenova_cache_registration
 from ..registry import UniModelBase
 from .config import NeoChatConfig
 
@@ -2339,6 +2340,7 @@ class SenseNovaU1ForUnifiedGeneration(
 ):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
+    family = "sensenova"
     architectures = ("NEOChatModel", "neo_chat", "neo-unify", "neo_unify")
     supported_model_load_scopes = ("understanding", "generation")
     supported_ops = (
@@ -2349,6 +2351,7 @@ class SenseNovaU1ForUnifiedGeneration(
         "commit_writeback",
         "vit_encode",
     )
+    cache_registration_factory = staticmethod(sensenova_cache_registration)
     supported_controls: tuple[str, ...] = ("free_encoder",)
     adapter_mode = "none"
     resource_plan = ResourcePlan(

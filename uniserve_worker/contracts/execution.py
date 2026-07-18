@@ -1,8 +1,6 @@
-"""Canonical host execution contracts for the target `ExecutionEngine`.
+"""Canonical host execution contracts for :class:`ExecutionEngine`.
 
-Stage 1 deliverable from ``specs/unified_forward_execution.md``
-("Canonical Host And Device Contracts"). This module owns every host-visible
-typed value of the target data plane:
+This module owns every host-visible typed value of the execution data plane:
 
 * engine and session identity (`EngineRef`, `SessionRef`) and the sealed
   operation algebra tag (`OperationTag`) shared with the cache companion;
@@ -27,11 +25,8 @@ without changing transaction identity. The byte encoding is specified exactly
 (`crates/foundation/core/src/execution_identity.rs`); shared test vectors in
 ``crates/protocol/vocab/execution_fingerprint.toml`` pin byte-for-byte
 agreement.
-
-Nothing in production consumes this module yet: the current wire batch in
-`contracts.batches` and the mutable session table remain authoritative until
-the whole vertical transaction slice activates (parent migration strategy).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -40,6 +35,8 @@ import struct
 from dataclasses import dataclass, fields
 from enum import IntEnum
 from typing import Protocol, Union
+
+from .operations import OperationTag
 
 __all__ = [
     "CacheLease",
@@ -88,20 +85,6 @@ class ExecutionContractError(ValueError):
 # --------------------------------------------------------------------------- #
 # Identity.
 # --------------------------------------------------------------------------- #
-
-
-class OperationTag(IntEnum):
-    """The parent's sealed model-backed operation algebra.
-
-    Canonical integer tags shared with the Rust side and with the cache
-    companion's `FamilyCacheSchema` lowering. Adding a fifth variant is a
-    cross-language protocol change, never a string registration.
-    """
-
-    SEQUENCE_STEP = 1
-    FLOW_STEP = 2
-    ENCODE_STEP = 3
-    MATERIALIZE_STEP = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,9 +484,7 @@ def validate_execute_batch(
             "acknowledged_through is a step id, or -1 for none acknowledged"
         )
     if batch.acknowledged_through >= batch.step_id:
-        raise ExecutionContractError(
-            "a batch cannot acknowledge its own or a future step"
-        )
+        raise ExecutionContractError("a batch cannot acknowledge its own or a future step")
     if not batch.rows:
         raise ExecutionContractError("an execute batch carries at least one row")
     seen_incarnations: set[tuple[int, int]] = set()
@@ -520,9 +501,7 @@ def validate_execute_batch(
             )
         key = (row.session.request_id, row.session.incarnation)
         if key in seen_incarnations:
-            raise ExecutionContractError(
-                f"request incarnation {key} appears in more than one row"
-            )
+            raise ExecutionContractError(f"request incarnation {key} appears in more than one row")
         seen_incarnations.add(key)
         _validate_admission(index, row)
         tag = operation_tag(row.operation)
@@ -557,34 +536,25 @@ def _validate_admission(index: int, row: ExecuteRow) -> None:
             )
     elif row.session.session_version == 0:
         raise ExecutionContractError(
-            f"row {index} references an unadmitted version-0 session without "
-            "a typed admission"
+            f"row {index} references an unadmitted version-0 session without a typed admission"
         )
 
 
 def _validate_operation(index: int, operation: Operation) -> None:
     if isinstance(operation, SequenceStep):
         if not operation.input_tokens and operation.verification is None:
-            raise ExecutionContractError(
-                f"row {index} sequence step evaluates no positions"
-            )
+            raise ExecutionContractError(f"row {index} sequence step evaluates no positions")
         if operation.history_length < 0 or operation.position_begin < 0:
             raise ExecutionContractError(
                 f"row {index} sequence step has negative logical coordinates"
             )
         if operation.requested_outputs <= 0:
-            raise ExecutionContractError(
-                f"row {index} sequence step requests no output"
-            )
+            raise ExecutionContractError(f"row {index} sequence step requests no output")
         verification = operation.verification
         if verification is not None:
             if not verification.candidate_tokens:
-                raise ExecutionContractError(
-                    f"row {index} verification carries no candidates"
-                )
-            if len(verification.candidate_tokens) != len(
-                verification.candidate_positions
-            ):
+                raise ExecutionContractError(f"row {index} verification carries no candidates")
+            if len(verification.candidate_tokens) != len(verification.candidate_positions):
                 raise ExecutionContractError(
                     f"row {index} verification tokens and positions disagree"
                 )
@@ -594,9 +564,7 @@ def _validate_operation(index: int, operation: Operation) -> None:
                 f"row {index} flow step coordinate is outside its schedule"
             )
         if not operation.branch_coefficients:
-            raise ExecutionContractError(
-                f"row {index} flow step declares no branches"
-            )
+            raise ExecutionContractError(f"row {index} flow step declares no branches")
         for coefficient in operation.branch_coefficients:
             if not math.isfinite(coefficient):
                 raise ExecutionContractError(
@@ -604,15 +572,11 @@ def _validate_operation(index: int, operation: Operation) -> None:
                 )
     elif isinstance(operation, EncodeStep):
         if any(dim <= 0 for dim in operation.grid):
-            raise ExecutionContractError(
-                f"row {index} encode step grid must be positive"
-            )
+            raise ExecutionContractError(f"row {index} encode step grid must be positive")
     elif isinstance(operation, MaterializeStep):
         pass
     else:  # pragma: no cover - operation_tag() already rejects foreign types
-        raise ExecutionContractError(
-            f"row {index} carries an unsealed operation type"
-        )
+        raise ExecutionContractError(f"row {index} carries an unsealed operation type")
 
 
 # --------------------------------------------------------------------------- #
