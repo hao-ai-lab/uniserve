@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.forward.graph.programs import PackedVisibleGraphProgram
+from uniserve_worker.execution.cuda_graph import PackedVisibleGraphProgram
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models import bagel as bagel_model
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig

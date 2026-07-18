@@ -1,6 +1,6 @@
 """Closed ``SegmentTable`` device schema and ``GraphCapacity`` axes.
 
-Dormant Stage 1 device-contract deliverable from
+Stage 1 device-contract deliverable from
 ``specs/unified_forward_execution.md``, refined by the cache companion
 (``specs/unified_kv_attention_runtime.md``). The segment table is the sole
 structural source for attention planning, route dispatch, cache reads and

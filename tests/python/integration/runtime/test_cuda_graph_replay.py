@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import uniserve_worker.execution.forward.graph.text_decode as decode_cuda_graph
+import uniserve_worker.execution.cuda_graph as decode_cuda_graph
 from uniserve_worker.contracts.attention_plan import (
     GraphBinding,
     PagedDecodePlan,
@@ -37,20 +37,18 @@ from uniserve_worker.contracts.forward_context import (
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.execution.forward.graph.base import (
-    _reset_for_testing,
-    _share_decode_graph_input_buffer,
-    _share_input_buffer,
-)
-from uniserve_worker.execution.forward.graph.text import (
-    TextGraphRunner,
-    _padded_prefill_max_kv_tokens,
-)
-from uniserve_worker.execution.forward.graph.text_decode import (
+from uniserve_worker.execution import cuda_graph as dcg
+from uniserve_worker.execution import cuda_graph as pcg
+from uniserve_worker.execution.cuda_graph import (
     DecodeCudaGraphRunner,
     PrefillCudaGraphRunner,
     TextDecodeGraphHostInputs,
+    TextGraphRunner,
     _dense_token_replacements,
+    _padded_prefill_max_kv_tokens,
+    _reset_for_testing,
+    _share_decode_graph_input_buffer,
+    _share_input_buffer,
     copy_text_decode_graph_host_inputs,
     copy_text_decode_graph_inputs,
     copy_text_initial_prefill_graph_inputs,
@@ -325,7 +323,6 @@ def test_decode_graph_backend_resolver_accepts_direct_fa4_paged_backend(monkeypa
 
 
 def test_decode_graph_prepare_accepts_direct_backend_without_plan_hook(monkeypatch):
-    from uniserve_worker.execution.forward.graph import text_decode as dcg
 
     backend = SimpleNamespace(
         capabilities=lambda: SimpleNamespace(available=True, paged_kv=True, paged_block_size_multiple=1),
@@ -357,7 +354,6 @@ def test_decode_graph_prepare_accepts_direct_backend_without_plan_hook(monkeypat
 
 
 def test_decode_graph_prepare_rejects_direct_backend_page_size_mismatch(monkeypatch):
-    from uniserve_worker.execution.forward.graph import text_decode as dcg
 
     backend = SimpleNamespace(
         capabilities=lambda: SimpleNamespace(available=True, paged_kv=True, paged_block_size_multiple=256),
@@ -513,7 +509,6 @@ def test_flashinfer_prefill_graph_binding_owns_stable_graph_buffers(monkeypatch)
 
 
 def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
-    from uniserve_worker.execution.forward.graph import text_prefill as pcg
 
     class Backend:
         def __init__(self) -> None:
@@ -576,7 +571,6 @@ def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
 
 
 def test_prefill_graph_prepare_resolver_accepts_direct_graph_safe_backend(monkeypatch):
-    from uniserve_worker.execution.forward.graph import text_prefill as pcg
 
     class Backend:
         def capabilities(self):

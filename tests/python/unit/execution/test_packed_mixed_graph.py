@@ -7,13 +7,13 @@ import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.execution.forward.graph import packed_visible as pmg
-from uniserve_worker.execution.forward.graph.packed_visible import (
+from uniserve_worker.models import packed_forward as packed_program
+from uniserve_worker.models import packed_forward as pmg
+from uniserve_worker.models.packed_forward import (
     PackedMixedGraphRunner,
     packed_mixed_graph_promotions_supported,
 )
-from uniserve_worker.execution.forward.programs import packed_visible as packed_program
-from uniserve_worker.execution.forward.stream import (
+from uniserve_worker.runtime.forward_stream import (
     ForwardPagedKVSegment,
     ForwardPagedKVView,
     ForwardStreamBuilder,

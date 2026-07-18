@@ -19,6 +19,24 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 import uniserve_worker.ops as ops
+from uniserve_worker.execution.engine import TextImageDenoiseStep
+from uniserve_worker.models.interleaved_image import (
+    DenoiseResidualCacheBinding,
+    ImageState,
+    InterleavedImageRequestState,
+    TextImageDenoiseOps,
+)
+from uniserve_worker.models.interleaved_text import InterleavedTextCacheDriver, TextCache
+from uniserve_worker.models.packed_forward import (
+    PackedVisibleBatchExecutor,
+    PackedVisibleModelMixin,
+)
+from uniserve_worker.models.sensenova.interleave_runtime import (
+    GeneratedImageCommitDriver,
+    InputImageIngestDriver,
+    TowerExecutionSession,
+)
+from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
 
 from ...contracts.batches import UniForwardBatch
 from ...contracts.forward_context import get_forward_context
@@ -32,27 +50,6 @@ from ...contracts.resource_plan import (
     ResourcePlan,
     active_latent_capacity_tokens,
 )
-from ...execution.denoise_driver import TextImageDenoiseStep
-from ...execution.denoise_residual_cache import DenoiseResidualCacheAdapter
-from ...execution.forward.programs.packed_batch import PackedVisibleBatchAdapter
-from ...execution.forward.programs.packed_model import PackedVisibleModelMixin
-from ...execution.forward.stream import (
-    ForwardPagedKVView,
-    ForwardStream,
-)
-from ...execution.input_image_ingest import InputImageIngestDriver
-from ...execution.interleaved_image_commit import GeneratedImageCommitDriver
-from ...execution.interleaved_image_denoise import (
-    ImageState,
-    InterleavedImageRequestState,
-    TextImageDenoiseOps,
-)
-from ...execution.interleaved_text_stepper import (
-    InterleavedTextCacheDriver,
-    TextCache,
-)
-from ...execution.model_base import UniModelBase
-from ...execution.tower_execution_session import TowerExecutionSession
 from ...foundation.errors import capability_mismatch, invalid_descriptor
 from ...foundation.runtime_config import decode_graph_padding_block_count
 from ...foundation.sizing import (
@@ -112,6 +109,7 @@ from ...runtime.tower_handoff import (
     TowerBinding,
     TowerHandoff,
 )
+from ..registry import UniModelBase
 from .config import NeoChatConfig
 
 __all__ = [
@@ -3347,7 +3345,7 @@ class SenseNovaU1ForUnifiedGeneration(
             graph_mode=graph_mode,
         )
 
-    def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheAdapter | None:
+    def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheBinding | None:
         """Timestep-aware residual-reuse adapter (TeaCache) for SenseNova-U1.
 
         The decision embedding is the layer-0 generation-branch input norm of
@@ -3362,7 +3360,7 @@ class SenseNovaU1ForUnifiedGeneration(
             decoder = self.model.language_model.model
             decision_norm = decoder.layers[0].input_layernorm_mot_gen
             final_norm = decoder.norm_mot_gen
-            adapter = DenoiseResidualCacheAdapter(
+            adapter = DenoiseResidualCacheBinding(
                 decision_embedding=lambda embeds: decision_norm(embeds),
                 rescale_coefficients=_DENOISE_RESIDUAL_RESCALE_COEFFS,
                 finalize_hidden=lambda hidden: final_norm(hidden),
@@ -3379,7 +3377,7 @@ class SenseNovaU1ForUnifiedGeneration(
         defer_text_cpu_results: bool = False,
     ) -> Any:
         del group
-        return PackedVisibleBatchAdapter(self).execute(
+        return PackedVisibleBatchExecutor(self).execute(
             batch,
             request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.op_kinds import DECODE_UND, DENOISE_GEN, PREFILL_UND
-from uniserve_worker.execution.forward.step import _overlap_eligible
+from uniserve_worker.execution.engine import _overlap_eligible
 
 pytestmark = pytest.mark.unit
 
@@ -27,7 +27,7 @@ def test_overlap_excludes_non_text_groups():
 
 
 def test_coordinator_requires_cuda_device():
-    from uniserve_worker.execution.forward.stream_overlap import PlanStreamOverlap
+    from uniserve_worker.execution.engine import PlanStreamOverlap
 
     with pytest.raises(ValueError):
         PlanStreamOverlap(torch.device("cpu"), max_inflight=3)
@@ -36,7 +36,7 @@ def test_coordinator_requires_cuda_device():
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 def test_prepare_launch_orders_consumption_after_plan_stream():
-    from uniserve_worker.execution.forward.stream_overlap import PlanStreamOverlap
+    from uniserve_worker.execution.engine import PlanStreamOverlap
 
     device = torch.device("cuda", torch.cuda.current_device())
     overlap = PlanStreamOverlap(device, max_inflight=3)
@@ -64,7 +64,7 @@ def test_prepare_launch_orders_consumption_after_plan_stream():
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 def test_inflight_forwards_are_bounded_by_ring_depth():
-    from uniserve_worker.execution.forward.stream_overlap import PlanStreamOverlap
+    from uniserve_worker.execution.engine import PlanStreamOverlap
 
     device = torch.device("cuda", torch.cuda.current_device())
     overlap = PlanStreamOverlap(device, max_inflight=2)

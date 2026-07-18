@@ -9,8 +9,8 @@ import pytest
 import torch
 from PIL import Image
 
-from uniserve_worker.execution.input_image_ingest import InputImageIngestDriver
-from uniserve_worker.execution.interleaved_text_stepper import TextCache
+from uniserve_worker.models.interleaved_text import TextCache
+from uniserve_worker.models.sensenova.interleave_runtime import InputImageIngestDriver
 from uniserve_worker.processors import get_processor_for_model
 from uniserve_worker.processors.sensenova import (
     SENSENOVA_IMAGE_GEOMETRY,

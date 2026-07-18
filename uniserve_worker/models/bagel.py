@@ -18,6 +18,18 @@ import torch.nn as nn
 from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from uniserve_worker.execution.engine import TextImageDenoiseStep, text_image_cfg_branch_count
+from uniserve_worker.models.interleaved_image import DenoiseRow, maybe_run_denoise_step_graph
+from uniserve_worker.models.interleaved_text import InterleavedTextCacheDriver, TextCache
+from uniserve_worker.models.packed_forward import (
+    PackedVisibleBatchExecutor,
+    PackedVisibleModelMixin,
+)
+from uniserve_worker.runtime.paged_denoise import (
+    PagedDenoiseBranchSet,
+    can_run_paged_denoise_attention,
+)
+
 from ..contracts.batches import UniForwardBatch
 from ..contracts.resource_plan import (
     AdapterResourcePolicy,
@@ -29,20 +41,6 @@ from ..contracts.resource_plan import (
     ResourcePlan,
     active_latent_capacity_tokens,
 )
-from ..execution.denoise_driver import TextImageDenoiseStep, text_image_cfg_branch_count
-from ..execution.forward.graph.denoise_step import (
-    maybe_run_denoise_step_graph,
-)
-from ..execution.forward.programs.packed_batch import PackedVisibleBatchAdapter
-from ..execution.forward.programs.packed_model import PackedVisibleModelMixin
-from ..execution.interleaved_image_denoise import DenoiseRow
-from ..execution.interleaved_text_stepper import InterleavedTextCacheDriver, TextCache
-from ..execution.model_base import UniModelBase
-from ..execution.paged_denoise import (
-    PagedDenoiseBranchSet,
-    can_run_paged_denoise_attention,
-)
-from ..execution.text_image_generation_session import TextImageGenerationSession
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import (
     decode_graph_padding_block_count,
@@ -88,6 +86,7 @@ from ..runtime.residency import (
     ResidencyManager,
     encoder_handle_from_mm_hash,
 )
+from .registry import UniModelBase
 
 __all__ = [
     "LLMConfig",
@@ -1861,7 +1860,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         defer_text_cpu_results: bool = False,
     ) -> Any:
         del group
-        return PackedVisibleBatchAdapter(self).execute(
+        return PackedVisibleBatchExecutor(self).execute(
             batch,
             request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,
@@ -1978,3 +1977,102 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
 
 
 EntryClass = BagelForUnifiedGeneration
+
+
+# ---------------------
+# Text-image generation workflow session (family-owned request lifecycle)
+# ---------------------
+
+
+class TextImageGenerationSession:
+    """Owns request lifecycle state for text-image generation flows."""
+
+    def __init__(self, owner: Any, req_id: int | None = None) -> None:
+        self.owner = owner
+        self.req_id = None if req_id is None else int(req_id)
+        self.records: dict[int, dict[str, Any]] = {}
+        self.generated: dict[int, Any] = {}
+
+    def begin_request(
+        self,
+        req_id: int,
+        *,
+        sampling: dict[str, Any] | None = None,
+        image: dict[str, Any] | None = None,
+        neg_token_ids: list[int] | None = None,
+        lora_id: Any = None,
+    ) -> dict[str, Any]:
+        record = {
+            "sampling": dict(sampling or {}),
+            "image": dict(image or {}),
+            "neg_token_ids": list(neg_token_ids or []),
+            "lora_id": lora_id,
+            "dims": None,
+        }
+        self.records[int(req_id)] = record
+        self.release_generated_state(req_id)
+        return record
+
+    def record(self, req_id: int) -> dict[str, Any]:
+        return self.records.setdefault(int(req_id), {})
+
+    def generation_state(self, req_id: int) -> Any | None:
+        return self.generated.get(int(req_id))
+
+    def set_generation_state(self, req_id: int, value: Any) -> None:
+        self.generated[int(req_id)] = value
+
+    def release_generated_state(self, req_id: int) -> Any | None:
+        state = self.generated.pop(int(req_id), None)
+        if state is not None:
+            self.release_paged_branches(state)
+        return state
+
+    def release_request(self, req_id: int, *, request_state: Any | None = None) -> None:
+        target = int(req_id)
+        self.release_generated_state(target)
+        self.records.pop(target, None)
+        if request_state is not None:
+            request_state.kv_lengths.pop("default", None)
+
+    def release_paged_branches(self, state: Any) -> None:
+        branches = getattr(state, "paged_branches", None)
+        if branches is None:
+            return
+        branches.release(self.owner.residency)
+        state.paged_branches = None
+
+    def start(self, op: dict[str, Any]) -> Any:
+        state = getattr(self.owner, "_state", None)
+        if callable(state):
+            return state(int(op["req_id"]))
+        return None
+
+    def encode(self, *args: Any, **kwargs: Any) -> Any:
+        encode = getattr(self.owner, "encode_image", None)
+        if callable(encode):
+            return encode(*args, **kwargs)
+        raise RuntimeError("generation session owner does not expose image encoding")
+
+    def prepare_denoise(self, state: Any, op: dict[str, Any]) -> Any:
+        prepare = getattr(self.owner, "prepare_denoise", None)
+        if callable(prepare):
+            return prepare(state, op)
+        raise RuntimeError("generation session owner does not expose denoise preparation")
+
+    def predict(self, *args: Any, **kwargs: Any) -> Any:
+        predict = getattr(self.owner, "predict_velocity", None)
+        if callable(predict):
+            return predict(*args, **kwargs)
+        raise RuntimeError("generation session owner does not expose denoise prediction")
+
+    def commit(self, *args: Any, **kwargs: Any) -> Any:
+        decode = getattr(self.owner, "decode_image", None)
+        if callable(decode):
+            return decode(*args, **kwargs)
+        raise RuntimeError("generation session owner does not expose image commit")
+
+    def release(self, req_id: int | None = None) -> None:
+        target = self.req_id if req_id is None else int(req_id)
+        if target is not None:
+            self.release_request(target)

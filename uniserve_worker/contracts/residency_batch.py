@@ -1,6 +1,6 @@
 """Packed page-reference ABI for the target ``ResidencyBatch``.
 
-Dormant device-contract companion to :mod:`uniserve_worker.contracts.cache_schema`
+Device-contract companion to :mod:`uniserve_worker.contracts.cache_schema`
 (``specs/unified_kv_attention_runtime.md`` — "Packed Page References"). The
 canonical residency mapping is a packed set of logical page references, not a
 persistent maximum-context rectangular table:

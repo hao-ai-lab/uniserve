@@ -5,12 +5,13 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.denoise_driver import (
+from uniserve_worker.execution.engine import (
     DenoiseDriver,
+    ModelRunner,
+    RunnerConfig,
     TextImageDenoiseStep,
     text_image_cfg_branch_count,
 )
-from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 from uniserve_worker.nn.diffusion import combine_text_image_cfg
 from uniserve_worker.runtime.request_state import RequestState
 

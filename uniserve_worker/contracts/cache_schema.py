@@ -1,6 +1,6 @@
 """Closed cache-domain, attention-site, and family cache-lowering contracts.
 
-Dormant target contracts from ``specs/unified_kv_attention_runtime.md`` (the
+Target contracts from ``specs/unified_kv_attention_runtime.md`` (the
 "Closed contracts and sessions" work package, parent stages 1-2). These types
 extend the parent ``ModelRegistration`` with declarative cache data:
 
@@ -15,7 +15,7 @@ extend the parent ``ModelRegistration`` with declarative cache data:
   logical cache history. It never crosses the worker wire.
 
 Nothing here is wired into production execution: per the spec, companion work
-stays dormant until the parent protocol and engine cut over as one vertical
+activates as the parent protocol and engine cut over as one vertical
 slice. The module is torch-free so validation and fingerprinting run anywhere.
 
 Every enum carries canonical integer tags shared with the future Rust side;

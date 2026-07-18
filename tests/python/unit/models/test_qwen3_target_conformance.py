@@ -30,8 +30,7 @@ from uniserve_worker.contracts.execution import (
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.engine import ExecutionEngine
-from uniserve_worker.execution.transaction import StandardTransactionExecutor
+from uniserve_worker.execution.engine import ExecutionEngine, StandardTransactionExecutor
 from uniserve_worker.models.cache_registrations import qwen3_cache_registration
 from uniserve_worker.models.qwen3_target import Qwen3Target, Qwen3TargetConfig
 from uniserve_worker.runtime.transactional_residency import ArenaConfig, Residency

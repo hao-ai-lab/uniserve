@@ -1,6 +1,6 @@
 """Canonical host execution contracts for the target `ExecutionEngine`.
 
-Dormant Stage 1 deliverable from ``specs/unified_forward_execution.md``
+Stage 1 deliverable from ``specs/unified_forward_execution.md``
 ("Canonical Host And Device Contracts"). This module owns every host-visible
 typed value of the target data plane:
 

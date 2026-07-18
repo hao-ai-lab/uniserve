@@ -1,4 +1,4 @@
-"""Canonical wire envelope for the target execution protocol (dormant).
+"""Canonical wire envelope for the target execution protocol.
 
 Stage 10 slice of ``specs/unified_forward_execution.md``: the new-major
 worker schema's *values and version semantics*, mirrored byte-for-byte with

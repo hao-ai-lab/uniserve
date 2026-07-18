@@ -22,19 +22,15 @@ from uniserve_worker.contracts.execution import (
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.distributed import (
-    DistributedConfigurationError,
-    RankFanOutExecutor,
-    RankMember,
-)
 from uniserve_worker.execution.engine import (
+    AdapterRowOutcome,
+    DistributedConfigurationError,
     EngineBackpressure,
     EnginePoisoned,
     EngineState,
     ExecutionEngine,
-)
-from uniserve_worker.execution.transaction import (
-    AdapterRowOutcome,
+    RankFanOutExecutor,
+    RankMember,
     StandardTransactionExecutor,
 )
 from uniserve_worker.models.cache_registrations import qwen3_cache_registration

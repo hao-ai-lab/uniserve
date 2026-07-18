@@ -1,4 +1,4 @@
-"""Target SenseNova family adapter over the dormant unified stack.
+"""Target SenseNova family adapter over the unified stack.
 
 Stage 6 family port slice: the SenseNova root registers two resident routes
 — text understanding (route 0) and generation (route 1) — over the shared
@@ -15,9 +15,10 @@ fixes the composition semantics the conformance matrix scales up.
 """
 from __future__ import annotations
 
+from uniserve_worker.execution.engine import AdapterPayload, AdapterRowOutcome
+
 from ..contracts.residency_batch import ResidencyBatchArrays
 from ..contracts.segment_table import GraphCapacity, SegmentTableArrays
-from ..execution.transaction import AdapterPayload, AdapterRowOutcome
 from ..nn.grouped_routing import WeightOverlayBank
 from ..nn.target_decoder import SharedAttention, TargetDecoderConfig, TargetDecoderRoot
 from .qwen3_target import project_greedy_outcomes

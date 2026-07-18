@@ -1,6 +1,6 @@
 """Immutable request sessions, exact versioning, and counter-addressed RNG.
 
-Dormant Stage 2 deliverable from ``specs/unified_forward_execution.md``
+Stage 2 deliverable from ``specs/unified_forward_execution.md``
 ("Immutable Sessions, Versioning, And RNG"). This module is the target that
 replaces the mutable `runtime.request_session.RequestSessionTable` at its
 deletion gate; nothing in production consumes it until the vertical

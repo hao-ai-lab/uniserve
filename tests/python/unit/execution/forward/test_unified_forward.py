@@ -7,30 +7,21 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.batches import UniForwardBatch
-from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
-from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.encode_driver import EncodeDriver
-from uniserve_worker.execution.forward import (
+from uniserve_worker.contracts.forward_batch import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
-    EagerFallbackRecorder,
-    ForwardBatchBuilder,
-    ForwardExecutor,
     ForwardGraphPolicy,
-    ForwardModelDescriptor,
-    ForwardModelModules,
     ForwardOutputKind,
-    ForwardPlanBuilder,
-    ForwardPostprocessor,
     ForwardResult,
     ForwardRuntimeHandles,
     StrictForwardGraphError,
     TextPostprocessEntry,
-    WorkerForwardAdapter,
 )
-from uniserve_worker.execution.forward.graph import (
+from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
+from uniserve_worker.contracts.forward_mode import ForwardMode
+from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.contracts.model_protocols import ModelHooks
+from uniserve_worker.execution.cuda_graph import (
     CudaGraphForwardRunner,
     DecodeGraphProgram,
     DenoiseStepGraphProgram,
@@ -42,7 +33,18 @@ from uniserve_worker.execution.forward.graph import (
     SlotAxis,
     graph_shape_key,
 )
-from uniserve_worker.execution.text_driver import TextDriver
+from uniserve_worker.execution.engine import (
+    EagerFallbackRecorder,
+    EncodeDriver,
+    ForwardExecutor,
+    ForwardModelDescriptor,
+    ForwardModelModules,
+    ForwardPlanBuilder,
+    ForwardPostprocessor,
+    TextDriver,
+    WorkerForwardAdapter,
+)
+from uniserve_worker.execution.engine import UnifiedForwardBatchBuilder as ForwardBatchBuilder
 from uniserve_worker.runtime.request_state import RequestStateTable
 
 pytestmark = pytest.mark.unit
@@ -289,7 +291,6 @@ def test_decode_graph_program_runs_bound_text_graph_path():
 
 
 def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch):
-    import uniserve_worker.execution.forward.programs.packed_visible as packed_visible_programs
 
     class RequestStates:
         def __init__(self) -> None:
@@ -344,7 +345,9 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
         }
         return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
 
-    monkeypatch.setattr(packed_visible_programs, "run_packed_visible_forward_result", fake_run)
+    owner.run_packed_visible_forward_result = (
+        lambda *args, **kwargs: fake_run(owner, *args, **kwargs)
+    )
     ops = [
         {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
         {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
@@ -454,7 +457,6 @@ def test_packed_visible_graph_program_runs_decode_burst_as_graph_only_runtime_re
 
 
 def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(monkeypatch):
-    import uniserve_worker.execution.forward.programs.packed_visible as packed_visible_programs
 
     class RequestStates:
         def __init__(self) -> None:
@@ -500,7 +502,9 @@ def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(mon
         assert denoise_steps == []
         return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
 
-    monkeypatch.setattr(packed_visible_programs, "run_packed_visible_forward_result", fake_run)
+    owner.run_packed_visible_forward_result = (
+        lambda *args, **kwargs: fake_run(owner, *args, **kwargs)
+    )
     handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
     plan = ForwardPlanBuilder().build(
         ops,

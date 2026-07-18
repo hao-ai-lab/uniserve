@@ -11,8 +11,8 @@ from __future__ import annotations
 import torch
 
 from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.interleaved_text_stepper import resolve_op_token_ids
-from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
+from uniserve_worker.execution.engine import ModelRunner, RunnerConfig
+from uniserve_worker.models.interleaved_text import resolve_op_token_ids
 
 
 class _ScriptedTextModel(ModelHooks):

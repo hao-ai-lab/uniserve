@@ -1,4 +1,4 @@
-"""Reference attention provider for the packed cache ABI (dormant).
+"""Reference attention provider for the packed cache ABI.
 
 First slice of the "Canonical attention" work package from
 ``specs/unified_kv_attention_runtime.md``: one provider implementation that
@@ -12,7 +12,7 @@ Two owners live here:
   one cache domain: page-granular tensors plus a write primitive. It exposes
   no allocator, release, commit, or page-ownership operation (Law: the
   backend can read and write reserved bytes; it cannot change ownership).
-  In the dormant slice the binding is constructed standalone; at cutover
+  In the standalone slice the binding is constructed directly; at cutover
   residency injects it during engine construction.
 * :class:`ReferenceAttentionBackend` — the two-method provider
   (``prepare``/``forward``). It is a *numerical reference*: unbatched

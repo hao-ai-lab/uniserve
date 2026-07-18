@@ -1,4 +1,4 @@
-"""Target Qwen3 family adapter over the dormant unified stack.
+"""Target Qwen3 family adapter over the unified stack.
 
 Stage 6 family port of ``specs/unified_forward_execution.md``: one adapter,
 one resident root, one packed traversal. The shared route-aware decoder root
@@ -13,10 +13,11 @@ recompute, the Stage 11 shape at unit scale.
 """
 from __future__ import annotations
 
+from uniserve_worker.execution.engine import AdapterPayload, AdapterRowOutcome
+
 from ..contracts.cache_schema import CacheEffect
 from ..contracts.residency_batch import ResidencyBatchArrays
 from ..contracts.segment_table import GraphCapacity, SegmentTableArrays
-from ..execution.transaction import AdapterPayload, AdapterRowOutcome
 from ..nn.grouped_routing import WeightOverlayBank
 from ..nn.target_decoder import SharedAttention, TargetDecoderConfig, TargetDecoderRoot
 

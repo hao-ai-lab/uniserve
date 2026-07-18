@@ -1,6 +1,6 @@
 """Transactional cache residency: reserve, commit, abort, and prefix leases.
 
-Dormant Stage 3 deliverable from ``specs/unified_forward_execution.md``
+Stage 3 deliverable from ``specs/unified_forward_execution.md``
 ("Residency Reservations, Leases, And Products"), covering the cache-sequence
 half of the target ``Residency`` owner: page arenas with domain-scoped sink
 pages, all-or-nothing reservation across rows, provisional append tails,

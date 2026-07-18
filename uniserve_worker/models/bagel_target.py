@@ -1,4 +1,4 @@
-"""Target BAGEL family adapter over the dormant unified stack.
+"""Target BAGEL family adapter over the unified stack.
 
 Stage 6 family port slice: BAGEL registers the understanding route (0) and
 the generation route (1) over the shared route-aware decoder, with the
@@ -11,9 +11,10 @@ cutover; this slice fixes the composition semantics.
 """
 from __future__ import annotations
 
+from uniserve_worker.execution.engine import AdapterPayload, AdapterRowOutcome
+
 from ..contracts.residency_batch import ResidencyBatchArrays
 from ..contracts.segment_table import GraphCapacity, SegmentTableArrays
-from ..execution.transaction import AdapterPayload, AdapterRowOutcome
 from ..nn.grouped_routing import WeightOverlayBank
 from ..nn.target_decoder import SharedAttention, TargetDecoderConfig, TargetDecoderRoot
 from .qwen3_target import project_greedy_outcomes

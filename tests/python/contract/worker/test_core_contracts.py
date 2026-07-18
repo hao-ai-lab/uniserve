@@ -10,7 +10,7 @@ from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.op_kinds import OP_KIND_TABLE, OP_KINDS
 from uniserve_worker.contracts.resource_plan import ResourcePlan
-from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
+from uniserve_worker.execution.engine import ModelRunner, RunnerConfig
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import PagedTextCache

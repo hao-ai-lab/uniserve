@@ -1,4 +1,4 @@
-"""Shared capability probes for paged denoise attention."""
+"""Physical paged-KV eligibility and branch packing for denoise attention."""
 
 from __future__ import annotations
 
@@ -9,17 +9,13 @@ from typing import Any
 import torch
 
 import uniserve_worker.ops as ops
+from uniserve_worker.contracts.forward_context import get_forward_context
+from uniserve_worker.nn.attention import RadixAttention
+from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
-from ..contracts.forward_context import get_forward_context
-from ..nn.attention import RadixAttention
-from ..runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
-
-__all__ = [
-    "PagedDenoiseBranchSet",
-    "batched_paged_denoise_cache",
-    "can_run_paged_denoise_attention",
-]
-
+# ---------------------
+# Paged denoise branches
+# ---------------------
 
 def _branch_key(branch: Any) -> str:
     return str(getattr(branch, "value", branch))

@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
+from uniserve_worker.execution.engine import ModelRunner, RunnerConfig
+
 from ..backends.attention import (
     get_attention_backend,
     has_attention_backend,
@@ -17,7 +19,6 @@ from ..contracts.caps import Caps, validate_caps
 from ..contracts.model_family import ModelFamilyDescriptor
 from ..contracts.model_load import ModelLoadScope
 from ..contracts.model_protocols import UniModel
-from ..execution.runner import ModelRunner, RunnerConfig
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
