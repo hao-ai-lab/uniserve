@@ -17,7 +17,7 @@ from uniserve_worker.bootstrap.model_loader import (
     load_worker_model,
     model_architecture_candidates,
 )
-from uniserve_worker.contracts.caps import Caps, ExecutionConstraints, validate_caps
+from uniserve_worker.contracts.caps import Caps, ExecutionConstraints
 from uniserve_worker.contracts.model_load import ModelLoadScope
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
@@ -52,72 +52,18 @@ def test_registry_resolves_real_model_entries():
     assert resolve_model_cls(("Qwen3ForCausalLM",)).__name__ == "Qwen3ForCausalLM"
 
 
-def test_registry_rejects_unknown_architecture_without_explicit_transformers_fallback(monkeypatch):
-    _set_worker_runtime(monkeypatch, allow_transformers_fallback=False)
+def test_registry_rejects_unknown_architecture(monkeypatch):
+    _set_worker_runtime(monkeypatch)
 
     with pytest.raises(WorkerError) as excinfo:
         resolve_model_cls(("CompletelyNewCausalLM",))
 
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
-    assert "--allow-transformers-fallback" in str(excinfo.value)
+    assert "no UniModel registered" in str(excinfo.value)
 
 
-def test_registry_falls_back_to_generic_transformers_only_when_enabled(monkeypatch):
-    _set_worker_runtime(monkeypatch, allow_transformers_fallback=True)
-
-    cls = resolve_model_cls(("CompletelyNewCausalLM",))
-    assert cls.__name__ == "TransformersForCausalLM"
-    assert cls.fallback is True
 
 
-def test_transformers_fallback_caps_are_text_only_and_validated():
-    from uniserve_worker.models.transformers_fallback import TransformersForCausalLM
-
-    cfg = SimpleNamespace(
-        hidden_size=32,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=8,
-        num_hidden_layers=3,
-        eos_token_id=2,
-    )
-    model = TransformersForCausalLM(
-        model=nn.Linear(1, 1),
-        tokenizer=SimpleNamespace(eos_token_id=2),
-        config=cfg,
-        device="cpu",
-        block_size=16,
-        kv_token_capacity=64,
-    )
-
-    caps = validate_caps(model.caps().to_wire(), owner="TransformersForCausalLM")
-
-    assert caps.supported_ops == ("prefill_und", "decode_und")
-    assert caps.num_blocks == 4
-    assert caps.bytes_per_token == 2 * 8 * 2 * 3 * 2
-
-
-def test_transformers_fallback_registers_uniserve_attention_function():
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-    from uniserve_worker.models.transformers_fallback import (
-        _ATTN_IMPL,
-        _register_uniserve_attention,
-    )
-
-    _register_uniserve_attention()
-    fn = ALL_ATTENTION_FUNCTIONS[_ATTN_IMPL]
-    module = nn.Module()
-    module.layer_idx = 0
-    module.is_causal = False
-    q = torch.randn(1, 2, 3, 4)
-    k = torch.randn(1, 2, 3, 4)
-    v = torch.randn(1, 2, 3, 4)
-
-    out, weights = fn(module, q, k, v, attention_mask=None, scaling=4**-0.5)
-
-    assert weights is None
-    assert out.shape == (1, 3, 2, 4)
 
 
 def test_bagel_detection_hook_supplies_architecture_for_stub_config(tmp_path):
@@ -220,12 +166,10 @@ def test_model_bring_up_contract_selects_the_from_pretrained_path():
     from uniserve_worker.models.bagel import BagelForUnifiedGeneration
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
     from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
-    from uniserve_worker.models.transformers_fallback import TransformersForCausalLM
     from uniserve_worker.server.stub import StubUniModel
 
     assert issubclass(SenseNovaU1ForUnifiedGeneration, ModelBringUp)
     assert issubclass(BagelForUnifiedGeneration, ModelBringUp)
-    assert issubclass(TransformersForCausalLM, ModelBringUp)
     assert not issubclass(Qwen3ForCausalLM, ModelBringUp)
     assert not issubclass(StubUniModel, ModelBringUp)
 

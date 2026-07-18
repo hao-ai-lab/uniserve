@@ -150,7 +150,6 @@ class ExecutionConfig:
     model_dtype: str = "bfloat16"
     transformers_trust_remote_code: bool = False
     transformers_attn_implementation: str = "uniserve"
-    allow_transformers_fallback: bool = False
     disabled_model_archs: tuple[str, ...] = ()
     strict_model_imports: bool = False
     kv_cache_dtype: str | None = None
@@ -190,7 +189,6 @@ def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
         model_dtype=str(namespace.model_dtype),
         transformers_trust_remote_code=bool(namespace.transformers_trust_remote_code),
         transformers_attn_implementation=str(namespace.transformers_attn_implementation),
-        allow_transformers_fallback=bool(namespace.allow_transformers_fallback),
         disabled_model_archs=tuple(str(value) for value in (namespace.disable_model_arch or ())),
         strict_model_imports=bool(namespace.strict_model_imports),
         kv_cache_dtype=_none_if_empty(namespace.kv_cache_dtype),

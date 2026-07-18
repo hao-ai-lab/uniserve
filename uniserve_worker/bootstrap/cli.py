@@ -59,12 +59,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         "--transformers-attn-implementation",
         default="uniserve",
     )
-    parser.add_argument(
-        "--allow-transformers-fallback",
-        action="store_true",
-        default=False,
-        help=("allow the generic Hugging Face fallback for unknown architectures"),
-    )
     parser.add_argument("--disable-model-arch", action="append", default=[])
     parser.add_argument(
         "--strict-model-imports",
