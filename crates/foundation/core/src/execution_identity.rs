@@ -24,11 +24,50 @@
 //!
 //! Dormant: nothing on the production wire consumes these values yet.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Exact new-major wire schema for the target worker protocol (dormant).
+///
+/// Values and version semantics are pinned here and mirrored by
+/// `uniserve_worker/contracts/execution_wire.py`; the canonical JSON
+/// encoding (struct declaration order, `deny_unknown_fields`) is the
+/// cross-language envelope until the FlatBuffers transport lands with the
+/// Stage 10 cutover. Unknown schema majors and unknown fields fail closed.
+pub const EXECUTION_WIRE_SCHEMA_MAJOR: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionWireEnvelope {
+    pub schema_major: u32,
+    pub batch: ExecExecuteBatch,
+}
+
+/// Encode one batch into the canonical wire envelope.
+pub fn encode_execute_batch(batch: &ExecExecuteBatch) -> String {
+    serde_json::to_string(&ExecutionWireEnvelope {
+        schema_major: EXECUTION_WIRE_SCHEMA_MAJOR,
+        batch: batch.clone(),
+    })
+    .expect("wire values always serialize")
+}
+
+/// Decode one envelope, failing closed on unknown majors or fields.
+pub fn decode_execute_batch(wire: &str) -> Result<ExecExecuteBatch, String> {
+    let envelope: ExecutionWireEnvelope =
+        serde_json::from_str(wire).map_err(|error| error.to_string())?;
+    if envelope.schema_major != EXECUTION_WIRE_SCHEMA_MAJOR {
+        return Err(format!(
+            "unsupported execution wire schema {}; this build supports {}",
+            envelope.schema_major, EXECUTION_WIRE_SCHEMA_MAJOR
+        ));
+    }
+    Ok(envelope.batch)
+}
 
 /// Sealed operation tags shared with the Python contract and the program
 /// algebra; adding a variant is a cross-language protocol change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u32)]
 pub enum ExecOperationTag {
     SequenceStep = 1,
@@ -37,13 +76,15 @@ pub enum ExecOperationTag {
     MaterializeStep = 4,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecEngineRef {
     pub deployment_id: i64,
     pub engine_epoch: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecSessionRef {
     pub engine: ExecEngineRef,
     pub request_id: i64,
@@ -51,7 +92,8 @@ pub struct ExecSessionRef {
     pub session_version: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecCacheLease {
     pub lease_id: i64,
     pub engine_epoch: i64,
@@ -62,7 +104,7 @@ pub struct ExecCacheLease {
     pub residency_handle: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u32)]
 pub enum ExecProductLifetime {
     Transition = 1,
@@ -72,7 +114,7 @@ pub enum ExecProductLifetime {
     AcknowledgedOutput = 5,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u32)]
 pub enum ExecTransferKind {
     LocalResidency = 1,
@@ -81,7 +123,8 @@ pub enum ExecTransferKind {
     Mooncake = 4,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecProductLease {
     pub lease_id: i64,
     pub schema_id: i64,
@@ -92,7 +135,8 @@ pub struct ExecProductLease {
     pub transfer: ExecTransferKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecSamplingSpec {
     pub temperature: f64,
     pub top_p: f64,
@@ -103,7 +147,8 @@ pub struct ExecSamplingSpec {
     pub presence_penalty: f64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecNewSession {
     pub request_id: i64,
     pub incarnation: i64,
@@ -112,13 +157,15 @@ pub struct ExecNewSession {
     pub max_history_tokens: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecCandidateVerification {
     pub candidate_tokens: Vec<i64>,
     pub candidate_positions: Vec<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecOperation {
     Sequence {
         input_tokens: Vec<i64>,
@@ -148,7 +195,8 @@ pub enum ExecOperation {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecExecuteRow {
     pub row_id: i64,
     pub session: ExecSessionRef,
@@ -159,7 +207,8 @@ pub struct ExecExecuteRow {
     pub scheduler_op_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecExecuteBatch {
     pub engine_epoch: i64,
     pub step_id: i64,
@@ -414,6 +463,46 @@ mod tests {
                 "fingerprint drift for shared vector {name}"
             );
         }
+    }
+
+    #[test]
+    fn wire_envelope_round_trips_and_matches_the_pinned_encoding() {
+        const FIXTURE: &str = include_str!("../../../protocol/vocab/execution_wire.json");
+        let pinned: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(FIXTURE).expect("valid fixture");
+        assert!(!pinned.is_empty());
+        for (name, wire) in &pinned {
+            let batch = shared_vector(name);
+            assert_eq!(
+                &encode_execute_batch(&batch),
+                wire,
+                "wire encoding drift for shared vector {name}"
+            );
+            assert_eq!(
+                decode_execute_batch(wire).expect("decodes"),
+                batch,
+                "wire decode drift for shared vector {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_decoding_fails_closed() {
+        let batch = shared_vector("single_sequence_row");
+        let wire = encode_execute_batch(&batch);
+        // Unknown schema major.
+        let future = wire.replace("\"schema_major\":1", "\"schema_major\":9");
+        assert!(
+            decode_execute_batch(&future)
+                .unwrap_err()
+                .contains("unsupported execution wire schema")
+        );
+        // Unknown field.
+        let extended = wire.replace(
+            "\"engine_epoch\":7,\"step_id\"",
+            "\"engine_epoch\":7,\"surprise\":1,\"step_id\"",
+        );
+        assert!(decode_execute_batch(&extended).is_err());
     }
 
     #[test]
