@@ -1,6 +1,6 @@
-"""Model-backed execution: one engine, one graph runtime.
+"""System-owned model execution and operation lowering.
 
-Per ``specs/unified_forward_execution.md`` completion criterion 1, this
-package contains exactly the transactional :mod:`~.engine` (the sole
-data-plane seam) and the consolidated :mod:`~.cuda_graph` runtime.
+The engine owns the transaction, sequence/flow/product modules own operation
+lifecycle, segment owns heterogeneous physical lowering, and graph owns
+composition-neutral capture and replay.
 """

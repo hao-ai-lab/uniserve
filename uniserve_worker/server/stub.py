@@ -13,8 +13,8 @@ from ..contracts.forward_mode import ForwardMode
 from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (
     CommitOutput,
-    DenoiseOutput,
     EncodeOutput,
+    FlowOutput,
     ForwardOutput,
     TextTokenOutput,
 )
@@ -170,16 +170,14 @@ class StubUniModel(UniModelBase):
             out.append(TextTokenOutput(req_id=req_id, sampled_token_id=tok))
         return out
 
-    def _denoise(self, batch: UniForwardBatch) -> list[DenoiseOutput]:
+    def _denoise(self, batch: UniForwardBatch) -> list[FlowOutput]:
         view = batch.as_denoise()
         out = []
         for req_id in view.req_ids:
             step = self.steps.get(req_id, 0) + 1
             self.steps[req_id] = step
             total = int((self.images.get(req_id) or {}).get("steps", 50) or 50)
-            out.append(
-                DenoiseOutput(req_id=req_id, denoise_done=step >= total, num_steps_done=step)
-            )
+            out.append(FlowOutput(req_id=req_id, denoise_done=step >= total, num_steps_done=step))
         return out
 
     def _commit(self, batch: UniForwardBatch) -> list[CommitOutput]:

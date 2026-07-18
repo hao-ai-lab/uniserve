@@ -1,9 +1,8 @@
-"""General packed-forward runtime shared by segment-oriented model families.
+"""System-owned segment lowering and packed physical execution.
 
-Family-owned machinery shared by BAGEL and SenseNova for packed forward
-execution: the ``PackedForwardModelMixin`` model base, the packed batch
-adapter that lowers any supported op group into one segment stream, and the
-packed forward CUDA-graph runner built on ``execution.graph`` primitives.
+The module turns heterogeneous operation rows into a segment stream, owns
+cache staging and output scatter, and optionally lowers stable physical layouts
+onto shared graph primitives. Family adapters supply route-specific neural work.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -36,23 +35,22 @@ from uniserve_worker.execution.engine import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
     DeferredTextSeqResult,
-    DenoiseDriver,
+    FlowExecutor,
+    PreparedFlowStep,
     TextDecodeRelay,
-    TextImageDenoiseStep,
+    flow_branches,
+    flow_cfg_plan,
     sample_logits_result,
-    text_image_branches,
-    text_image_cfg_plan,
 )
 from uniserve_worker.execution.graph.bucket import padding_blocks
-from uniserve_worker.execution.graph.capture import Event, record
-from uniserve_worker.execution.graph.capture import Runner as Capture
+from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
 from uniserve_worker.execution.graph.executor import backend_name
+from uniserve_worker.execution.sequence import hydrate_cached_prefix_from_op
 from uniserve_worker.foundation.env import env_flag
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.foundation.profiling import profile_range
 from uniserve_worker.foundation.runtime_config import DEFAULT_DECODE_GRAPH_BATCH_SIZES
 from uniserve_worker.foundation.sizing import DEFAULT_BLOCK_SIZE, ceil_div
-from uniserve_worker.models.interleaved_text import hydrate_cached_prefix_from_op
 from uniserve_worker.nn.diffusion import euler_step
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgPlan
 from uniserve_worker.nn.sampler import (
@@ -86,8 +84,7 @@ from uniserve_worker.runtime.tensor_staging import TextTensorStager, TextTensorS
 logger = logging.getLogger(__name__)
 
 
-_RUNNER_ATTR = "_packed_graph_runner"
-_MAX_FAILURES = 2
+_RUNNER_ATTR = "_segment_graph_runner"
 _MAX_RESIDENT_CAPACITIES = 8
 
 
@@ -96,7 +93,7 @@ class _GraphBackendUnplanned(RuntimeError):
 
 
 @dataclass
-class PackedGraphState:
+class SegmentGraphState:
     key: tuple[Any, ...]
     topology_id: str
     graph: torch.cuda.CUDAGraph
@@ -123,7 +120,7 @@ class PackedGraphState:
     )
 
 
-class PackedGraphRunner(Capture):
+class SegmentGraphRunner(FailureManagedRunner):
     """Own the active-topology CUDA graph for packed forward decoder forwards."""
 
     def __init__(
@@ -133,24 +130,15 @@ class PackedGraphRunner(Capture):
         default_enabled: bool | None = None,
         logger: Any = logger,
     ) -> None:
-        self.name = str(name)
-        self.default_enabled = True if default_enabled is None else bool(default_enabled)
-        self.default_warmup = False
-        self.metric_prefix = "packed_forward_"
-        self.logger = logger
-        self.states: dict[tuple[Any, ...], PackedGraphState] = {}
-        self.disabled: set[tuple[Any, ...]] = set()
-        self._capture_pool: Any = None
-        self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
-        self._failures = 0
-        self._hard_disabled = False
-        self._backend_ineligible = False
-        self._replays = 0
+        super().__init__(
+            name=name,
+            default_enabled=True if default_enabled is None else bool(default_enabled),
+            default_warmup=False,
+            metric_prefix="packed_forward_",
+            logger=logger,
+        )
         self._resident_order: OrderedDict[tuple[Any, ...], None] = OrderedDict()
         self.last_miss_reason: str | None = None
-
-    def enabled(self) -> bool:
-        return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
 
     def capture_pool(self) -> Any:
         # Capacity buckets are captured lazily. The resident topology owns
@@ -204,8 +192,8 @@ class PackedGraphRunner(Capture):
         backend = self._resolve_graph_backend(ctx, owner, packed_embeds, forward_stream, kv_view)
         if backend is None:
             self.last_miss_reason = "backend_ineligible"
-            self._backend_ineligible = True
-            self._record(ctx, Event.MISS, int(packed_embeds.shape[0]))
+            self.reject_backend()
+            self.record_event(ctx, Event.MISS, int(packed_embeds.shape[0]))
             if self.logger is not None:
                 self.logger.warning(
                     "%s CUDA graph unavailable: no graph-capable paged-varlen attention backend",
@@ -229,11 +217,11 @@ class PackedGraphRunner(Capture):
         )
         if key is None or key in self.disabled:
             self.last_miss_reason = "shape_ineligible" if key is None else "shape_disabled"
-            self._record(ctx, Event.MISS, int(packed_embeds.shape[0]))
+            self.record_event(ctx, Event.MISS, int(packed_embeds.shape[0]))
             return None
         if key not in self.states and not ctx.allow_capture:
             self.last_miss_reason = "capture_disabled"
-            self._record(ctx, Event.MISS, int(packed_embeds.shape[0]))
+            self.record_event(ctx, Event.MISS, int(packed_embeds.shape[0]))
             return None
         topology_id = _graph_topology_id(forward_stream)
         self._admit_capacity(
@@ -266,8 +254,8 @@ class PackedGraphRunner(Capture):
                 text_kv_promotions=promotions,
             ),
             replay=self._replay,
-            record=lambda event: self._record(ctx, event, int(packed_embeds.shape[0])),
-            disable=lambda exc: self._disable(key, exc),
+            record=lambda event: self.record_event(ctx, event, int(packed_embeds.shape[0])),
+            disable=lambda exc: self.disable_state(key, exc),
             capture_metric=f"{self.metric_prefix}graph_capture",
             input_copy_metric=f"{self.metric_prefix}graph_input_copy",
             replay_metric=f"{self.metric_prefix}graph_replay_launch",
@@ -278,8 +266,7 @@ class PackedGraphRunner(Capture):
             self.last_miss_reason = "capture_or_replay_failed"
             return None
         self._touch_capacity(key)
-        self._replays += 1
-        if self._replays == 1 and self.logger is not None:
+        if self.replay_completed() and self.logger is not None:
             self.logger.info(
                 "%s CUDA graph active: captured packed forward decoder (tokens=%d, rows=%d)",
                 self.name,
@@ -302,7 +289,7 @@ class PackedGraphRunner(Capture):
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
         text_kv_promotion_capacity: int | None = None,
         topology_id: str,
-    ) -> PackedGraphState:
+    ) -> SegmentGraphState:
         first_attn = _first_attention(owner)
         block_width_capacity = _graph_block_width_capacity(kv_view)
         graph_kv_view = ForwardGraphPagedKVView(
@@ -323,7 +310,7 @@ class PackedGraphRunner(Capture):
             mode=ForwardMode.MIXED,
         )
         graph_binding = GraphBinding()
-        state = PackedGraphState(
+        state = SegmentGraphState(
             key=key,
             topology_id=str(topology_id),
             graph=torch.cuda.CUDAGraph(),
@@ -407,7 +394,7 @@ class PackedGraphRunner(Capture):
 
     @staticmethod
     def _copy_inputs(
-        state: PackedGraphState,
+        state: SegmentGraphState,
         packed_embeds: torch.Tensor,
         *,
         route_indicators: torch.Tensor,
@@ -431,11 +418,11 @@ class PackedGraphRunner(Capture):
             max_context_len=state.kv_view.max_seqlen_k(),
         )
         if state.promotion_source_index is not None and text_kv_promotions:
-            PackedGraphRunner._copy_promotion_indices(state, text_kv_promotions)
+            SegmentGraphRunner._copy_promotion_indices(state, text_kv_promotions)
 
     @staticmethod
     def _copy_promotion_indices(
-        state: PackedGraphState,
+        state: SegmentGraphState,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...],
     ) -> None:
         source_index = state.promotion_source_index
@@ -469,12 +456,17 @@ class PackedGraphRunner(Capture):
             state.promotion_stager.mark_slot_submitted(slot, device=source_index.device)
 
     @staticmethod
-    def _copy_promotions_in_graph(state: PackedGraphState) -> None:
+    def _copy_promotions_in_graph(state: SegmentGraphState) -> None:
         source_index = state.promotion_source_index
         target_index = state.promotion_target_index
         source_pool = state.promotion_source_pool
         target_pool = state.promotion_target_pool
-        if source_index is None or target_index is None or source_pool is None or target_pool is None:
+        if (
+            source_index is None
+            or target_index is None
+            or source_pool is None
+            or target_pool is None
+        ):
             return
         layer_count = int(source_pool.num_layers)
         source_k = source_pool.k.reshape(layer_count, -1, source_pool.n_kv, source_pool.head_dim)
@@ -485,7 +477,7 @@ class PackedGraphRunner(Capture):
         target_v.index_copy_(1, target_index, source_v.index_select(1, source_index))
 
     @staticmethod
-    def _prepare_backend(state: PackedGraphState) -> None:
+    def _prepare_backend(state: SegmentGraphState) -> None:
         prepare = getattr(state.backend, "prepare_paged_prefill_cuda_graph", None)
         if not callable(prepare):
             return
@@ -503,39 +495,13 @@ class PackedGraphRunner(Capture):
         )
 
     @staticmethod
-    def _replay(state: PackedGraphState) -> torch.Tensor:
+    def _replay(state: SegmentGraphState) -> torch.Tensor:
         state.graph.replay()
         assert state.logits is not None
         return state.logits
 
-    def _record(self, ctx: Any, event: Event, tokens: int) -> None:
-        record(
-            ctx,
-            event,
-            unpadded_tokens=int(tokens),
-            padded_tokens=int(tokens),
-        )
-
-    def _disable(self, key: tuple[Any, ...], exc: BaseException) -> None:
-        self.disabled.add(key)
+    def before_disable(self, key: Any) -> None:
         self._resident_order.pop(key, None)
-        state = self.states.pop(key, None)
-        if state is not None and callable(state.release_backend):
-            try:
-                state.release_backend()
-            except Exception:  # pragma: no cover - defensive release
-                pass
-        self._failures += 1
-        if self._failures >= _MAX_FAILURES:
-            self._hard_disabled = True
-        if self.logger is not None:
-            self.logger.warning(
-                "disabling %s CUDA graph (%s failure(s)%s): %s",
-                self.name,
-                self._failures,
-                "; runner hard-disabled" if self._hard_disabled else "",
-                exc,
-            )
 
     def _resolve_graph_backend(
         self,
@@ -582,12 +548,20 @@ class PackedGraphRunner(Capture):
                     continue
                 backend = getattr(provider, "backend", None)
                 if backend is None:
-                    backend = getattr(req, "backend", None) or getattr(ctx, "attention_backend", None)
+                    backend = getattr(req, "backend", None) or getattr(
+                        ctx, "attention_backend", None
+                    )
                 if backend is not None and _backend_can_host_graph(backend):
                     return backend
-                if explicit_backend is not None and str(getattr(provider, "name", "")).lower() == explicit_backend:
+                if (
+                    explicit_backend is not None
+                    and str(getattr(provider, "name", "")).lower() == explicit_backend
+                ):
                     return None
-                if explicit_backend is not None and str(getattr(backend, "name", "")).lower() == explicit_backend:
+                if (
+                    explicit_backend is not None
+                    and str(getattr(backend, "name", "")).lower() == explicit_backend
+                ):
                     return None
         except Exception:
             if self.logger is not None:
@@ -633,7 +607,7 @@ class PackedGraphRunner(Capture):
 
 
 def _first_attention(owner: Any) -> Any:
-    packed_attention = getattr(owner, "packed_graph_attention", None)
+    packed_attention = getattr(owner, "segment_graph_attention", None)
     if not callable(packed_attention):
         raise RuntimeError("packed forward graph requires an explicit attention binding")
     return packed_attention()
@@ -823,7 +797,9 @@ def _cache_positions(pool: Any, block_ids: list[int], start: int, length: int) -
 
 
 def _max_context_len(kv_view: ForwardPagedKVView) -> int:
-    return max((len(seg.block_ids) * int(kv_view.pool.block_size) for seg in kv_view.segments), default=0)
+    return max(
+        (len(seg.block_ids) * int(kv_view.pool.block_size) for seg in kv_view.segments), default=0
+    )
 
 
 def _graph_block_width_capacity(kv_view: ForwardPagedKVView) -> int:
@@ -842,16 +818,16 @@ def _backend_can_host_graph(backend: Any) -> bool:
     return bool(getattr(caps, "visible_end_cuda_graph", False))
 
 
-def packed_graph_runner(owner: Any) -> PackedGraphRunner:
-    runner = getattr(owner, _RUNNER_ATTR, None)
+def segment_graph_runner(runtime: "SegmentRuntime") -> SegmentGraphRunner:
+    runner = getattr(runtime, _RUNNER_ATTR, None)
     if runner is None:
-        runner = PackedGraphRunner()
-        setattr(owner, _RUNNER_ATTR, runner)
+        runner = SegmentGraphRunner()
+        setattr(runtime, _RUNNER_ATTR, runner)
     return runner
 
 
-def maybe_run_packed_graph(
-    owner: Any,
+def maybe_run_segment_graph(
+    runtime: "SegmentRuntime",
     packed_embeds: torch.Tensor,
     *,
     route_indicators: torch.Tensor,
@@ -860,11 +836,11 @@ def maybe_run_packed_graph(
     text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
     text_kv_promotion_capacity: int | None = None,
 ) -> torch.Tensor | None:
-    runner = getattr(owner, _RUNNER_ATTR, None)
+    runner = getattr(runtime, _RUNNER_ATTR, None)
     if runner is None:
-        runner = packed_graph_runner(owner)
+        runner = segment_graph_runner(runtime)
     return runner.maybe_run(
-        owner,
+        runtime.adapter,
         packed_embeds,
         route_indicators=route_indicators,
         forward_stream=forward_stream,
@@ -875,11 +851,58 @@ def maybe_run_packed_graph(
 
 
 # ---------------------
-# Packed model mixin
+# Segment model boundary
 # ---------------------
 
-class PackedForwardModelMixin:
-    """Shared cache staging and segment construction for packed models."""
+
+class SegmentAdapter(Protocol):
+    """Family-specific neural and cache surface consumed by segment execution."""
+
+    model: Any
+    device: Any
+    eos_id: int
+    num_layers: int
+    residency: Any
+
+    def prepare_flow(self, state: Any, op: dict[str, Any]) -> PreparedFlowStep: ...
+    def program_state(self, req_id: int) -> Any: ...
+    def _extend_cache_blocks(self, cache: Any, op: dict[str, Any]) -> None: ...
+    def _ensure_host_cache(self, cache: Any) -> None: ...
+    def _denoise_branch_inputs(self, image: Any, branch: str) -> tuple[torch.Tensor, Any]: ...
+    def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+    def packed_decoder_forward(self, input_embeds: torch.Tensor, **kwargs: Any) -> torch.Tensor: ...
+    def packed_text_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
+    def packed_hidden_to_velocity(
+        self,
+        hidden_states: torch.Tensor,
+        t: torch.Tensor,
+        latent: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int] | None,
+    ) -> torch.Tensor: ...
+    def segment_graph_attention(self) -> Any: ...
+    def accept_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None: ...
+    def decode_image(
+        self,
+        latent: Any,
+        *,
+        req_id: int | None = None,
+        state: Any = None,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any: ...
+
+
+class SegmentRuntime:
+    """Own segment graph state, cache staging, and physical row construction.
+
+    Family models are collaborators, not runtime base classes. A long-lived
+    :class:`SegmentExecutor` binds one family adapter and keeps graph and
+    staging state out of the model inheritance tree.
+    """
+
+    def __init__(self, adapter: SegmentAdapter) -> None:
+        self.adapter = adapter
 
     def run_segment_graph(
         self,
@@ -894,55 +917,37 @@ class PackedForwardModelMixin:
         if not isinstance(dispatch_batch, UniForwardBatch):
             dispatch_batch = UniForwardBatch.from_ops(plan.ops)
         if any(
-            int(op.get("decode_token_count") or 1) > 1
-            or int(op.get("denoise_step_count") or 1) > 1
+            int(op.get("decode_token_count") or 1) > 1 or int(op.get("denoise_step_count") or 1) > 1
             for op in dispatch_batch.ops
         ):
-            run = getattr(self, "_run_forward_adapter", None)
-            if not callable(run):
-                return None
-            outputs = run(
+            outputs = self.execute(
                 dispatch_batch,
                 request_states=request_states,
-                group=list(enumerate(dispatch_batch.ops)),
                 defer_text_cpu_results=bool(
                     plan.runtime_handles.get("defer_text_cpu_results", False)
                 ),
             )
             if isinstance(outputs, ForwardResult):
                 return outputs
-            if not isinstance(outputs, Sequence) or isinstance(
-                outputs, (str, bytes, bytearray)
-            ):
-                raise invalid_descriptor(
-                    "forward adapter must return one result per operation"
-                )
+            if not isinstance(outputs, Sequence) or isinstance(outputs, (str, bytes, bytearray)):
+                raise invalid_descriptor("forward adapter must return one result per operation")
             if len(outputs) != len(plan.rows):
-                raise invalid_descriptor(
-                    "forward adapter returned the wrong number of results"
-                )
+                raise invalid_descriptor("forward adapter returned the wrong number of results")
             return ForwardResult(runtime_outputs=tuple(outputs))
 
-        denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
+        denoise_steps: list[tuple[int, PreparedFlowStep]] = []
         for row in plan.rows:
             if row.mode is not ForwardMode.DENOISE:
                 continue
             state = request_states.get(int(row.req_id))
-            step = self.prepare_denoise(state, dict(row.op))
+            step = self.adapter.prepare_flow(state, dict(row.op))
             denoise_steps.append((int(row.row_index), step))
-            extra = getattr(step, "extra", None)
-            image = extra.get("img") if isinstance(extra, dict) else None
-            residual_state = getattr(image, "residual_cache", None)
-            if residual_state is not None:
-                residual_state.invalidate()
 
-        result = self.run_packed_forward_result(
+        result = self.run_segment_forward_result(
             dispatch_batch,
             request_states,
             denoise_steps,
-            defer_text_cpu_results=bool(
-                plan.runtime_handles.get("defer_text_cpu_results", False)
-            ),
+            defer_text_cpu_results=bool(plan.runtime_handles.get("defer_text_cpu_results", False)),
             allow_graph=True,
             require_graph=True,
         )
@@ -956,7 +961,7 @@ class PackedForwardModelMixin:
                 (int(row.req_id), request_states.get(int(row.req_id)), row.op)
                 for row in commit_rows
             ),
-            self,
+            self.adapter,
             row_indices=tuple(int(row.row_index) for row in commit_rows),
         )
         if not isinstance(commit_result, ForwardResult) or commit_result.commit_outputs is None:
@@ -965,33 +970,68 @@ class PackedForwardModelMixin:
         commit_outputs.update(commit_result.commit_outputs)
         return replace(result, commit_outputs=commit_outputs)
 
-    def run_packed_forward_result(
+    def run_segment_forward_result(
         self,
         batch: UniForwardBatch,
         request_states: Any,
-        denoise_steps: "list[tuple[int, TextImageDenoiseStep]]",
+        denoise_steps: "list[tuple[int, PreparedFlowStep]]",
         *,
         defer_text_cpu_results: bool = False,
         allow_graph: bool = False,
         require_graph: bool = False,
     ) -> "ForwardResult | None":
-        # Family entry the neutral graph program dispatches through; keeps the
-        # packed forward forward owned by the family rather than imported upward.
-        return run_packed_forward_result(
+        plan = SegmentPlan(
+            batch=batch,
+            denoise_steps=denoise_steps,
+            results=[None] * len(batch.ops),
+        )
+        result = _run_segment_forward_impl(
             self,
-            batch,
+            plan,
             request_states,
-            denoise_steps,
+            defer_text_cpu_results=defer_text_cpu_results,
+            return_forward_result=True,
+            allow_graph=allow_graph,
+            require_graph=require_graph,
+        )
+        return result if isinstance(result, ForwardResult) else None
+
+    def run_segment_forward(
+        self,
+        batch: UniForwardBatch,
+        request_states: Any,
+        denoise_steps: list[tuple[int, PreparedFlowStep]],
+        results: list[Any],
+        *,
+        defer_text_cpu_results: bool = False,
+        allow_graph: bool = True,
+        require_graph: bool = False,
+    ) -> bool:
+        plan = SegmentPlan(batch=batch, denoise_steps=denoise_steps, results=results)
+        result = _run_segment_forward_impl(
+            self,
+            plan,
+            request_states,
             defer_text_cpu_results=defer_text_cpu_results,
             allow_graph=allow_graph,
             require_graph=require_graph,
         )
+        return bool(result)
+
+    def execute(
+        self,
+        batch: UniForwardBatch,
+        *,
+        request_states: Any,
+        defer_text_cpu_results: bool = False,
+    ) -> Any:
+        raise NotImplementedError
 
     def _extend_cache_blocks(self, cache: Any, op: dict[str, Any]) -> None:
-        self._text_driver().extend_cache_blocks(cache, op)
+        self.adapter._extend_cache_blocks(cache, op)
 
     def _ensure_host_cache(self, cache: Any) -> None:
-        self._text_driver().ensure_host_cache(cache)
+        self.adapter._ensure_host_cache(cache)
 
     @staticmethod
     def _same_kv_pool(pool: Any, first_pool: Any) -> bool:
@@ -1006,12 +1046,12 @@ class PackedForwardModelMixin:
         pending_prefix_copies: list[PagedTextCacheSpanCopy] | None = None,
     ) -> PagedTextCache:
         scratch_pools = (
-            getattr(self, "scratch_pool", None),
-            getattr(self, "gen_scratch_pool", None),
+            getattr(self.adapter, "scratch_pool", None),
+            getattr(self.adapter, "gen_scratch_pool", None),
         )
         if not any(target_pool is pool for pool in scratch_pools if pool is not None):
             raise RuntimeError("forward text staging target must be a scratch KV pool")
-        allocator = self.residency.require_allocator_for_pool(
+        allocator = self.adapter.residency.require_allocator_for_pool(
             target_pool,
             label="forward scratch KV pool",
         )
@@ -1039,7 +1079,7 @@ class PackedForwardModelMixin:
                         staged,
                         start=copied_len,
                         length=source_len - copied_len,
-                        num_layers=self.num_layers,
+                        num_layers=self.adapter.num_layers,
                         missing_message="cannot extend packed forward staging without a paged source cache",
                     )
                     setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
@@ -1057,11 +1097,11 @@ class PackedForwardModelMixin:
                 setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
             return staged
         if staged is not None:
-            self.residency.release_scratch_cache(staged)
+            self.adapter.residency.release_scratch_cache(staged)
         staged = PagedTextCache(
             target_pool,
             [],
-            num_layers=self.num_layers,
+            num_layers=self.adapter.num_layers,
             length=0,
             allocate_blocks=allocator,
         )
@@ -1073,7 +1113,7 @@ class PackedForwardModelMixin:
                     staged,
                     start=0,
                     length=source_len,
-                    num_layers=self.num_layers,
+                    num_layers=self.adapter.num_layers,
                     missing_message="cannot stage packed forward prefix without a paged source cache",
                 )
                 setattr(staged, "_uniserve_forward_staging_source_prefix", source_prefix)
@@ -1107,7 +1147,9 @@ class PackedForwardModelMixin:
             self._forward_staging_source_prefix(source, int(new_len)),
         )
 
-    def _release_forward_staging_for_cache(self, cache: Any) -> None:
+    def release_staging(self, cache: Any) -> None:
+        """Release every scratch mirror associated with a persistent cache."""
+
         staged_by_pool = getattr(cache, "_uniserve_forward_staging", None)
         if not isinstance(staged_by_pool, dict):
             return
@@ -1117,7 +1159,7 @@ class PackedForwardModelMixin:
             if staged_id in seen:
                 continue
             seen.add(staged_id)
-            self.residency.release_scratch_cache(staged)
+            self.adapter.residency.release_scratch_cache(staged)
         staged_by_pool.clear()
 
     @staticmethod
@@ -1136,13 +1178,13 @@ class PackedForwardModelMixin:
 
     def _forward_target_pool(
         self,
-        denoise_steps: list[tuple[int, TextImageDenoiseStep]],
+        denoise_steps: list[tuple[int, PreparedFlowStep]],
     ) -> PagedKVPool | None:
         target_pool = None
         for _row_index, step in denoise_steps:
             image = step.extra["img"]
-            for branch in text_image_branches(step):
-                _indexes, cache = self._denoise_branch_inputs(image, branch)
+            for branch in flow_branches(step):
+                _indexes, cache = self.adapter._denoise_branch_inputs(image, branch)
                 pool = getattr(cache, "pool", None)
                 if pool is None:
                     return None
@@ -1227,15 +1269,19 @@ class PackedForwardModelMixin:
         )
 
     def _wait_gen_cache_ready(self, cache: Any) -> None:
-        del cache
+        wait = getattr(self.adapter, "_wait_gen_cache_ready", None)
+        if callable(wait):
+            wait(cache)
 
     def packed_denoise_indicators(
         self,
-        step: TextImageDenoiseStep,
+        step: PreparedFlowStep,
         q_len: int,
     ) -> torch.Tensor | None:
-        del step, q_len
-        return None
+        build = getattr(self.adapter, "packed_denoise_indicators", None)
+        if not callable(build):
+            return None
+        return build(step, q_len)
 
 
 # ---------------------
@@ -1250,7 +1296,7 @@ _PACKED_FORWARD_TIMING_SYNC = env_flag("UNISERVE_PACKED_FORWARD_TIMING_SYNC")
 _PACKED_FORWARD_CANONICAL_ORDER = env_flag("UNISERVE_PACKED_FORWARD_CANONICAL_ORDER", default=True)
 
 TextResultSlot = tuple[int, int, int, PagedTextCache, PagedTextCache, int, int]
-DenoiseResultSlot = tuple[int, TextImageDenoiseStep, int, int, Branch]
+DenoiseResultSlot = tuple[int, PreparedFlowStep, int, int, Branch]
 
 
 @dataclass
@@ -1322,15 +1368,15 @@ def _append_decode_graph_padding(
 
 
 @dataclass
-class PackedForwardPlan:
+class SegmentPlan:
     batch: UniForwardBatch
-    denoise_steps: list[tuple[int, TextImageDenoiseStep]]
+    denoise_steps: list[tuple[int, PreparedFlowStep]]
     results: list[Any]
     text_result_slots: list[TextResultSlot] = field(default_factory=list)
     denoise_result_slots: list[DenoiseResultSlot] = field(default_factory=list)
     denoise_cfg_plans: dict[int, CfgPlan] = field(default_factory=dict)
 
-    def denoise_step_for_row(self, row_index: int) -> TextImageDenoiseStep:
+    def denoise_step_for_row(self, row_index: int) -> PreparedFlowStep:
         for result_index, step in self.denoise_steps:
             if int(result_index) == int(row_index):
                 return step
@@ -1363,7 +1409,7 @@ class PackedForwardPlan:
         self,
         *,
         row_index: int,
-        step: TextImageDenoiseStep,
+        step: PreparedFlowStep,
         segment_start: int,
         q_len: int,
         branch: Branch,
@@ -1384,7 +1430,7 @@ class PackedForwardPlan:
     def set_text_result(self, row_index: int, output: Any) -> None:
         self.results[int(row_index)] = output
 
-    def set_denoise_result(self, row_index: int, step: TextImageDenoiseStep) -> None:
+    def set_denoise_result(self, row_index: int, step: PreparedFlowStep) -> None:
         self.results[int(row_index)] = {
             "req_id": step.req_id,
             "denoise_done": step.step_index + 1 >= step.total_steps,
@@ -1392,106 +1438,9 @@ class PackedForwardPlan:
         }
 
 
-class PackedForward:
-    """Owns packed forward-forward row slots, cache writeback, and output order."""
-
-    def __init__(self, owner: Any) -> None:
-        self.owner = owner
-
-    def execute(
-        self,
-        batch: UniForwardBatch,
-        request_states: Any,
-        denoise_steps: list[tuple[int, TextImageDenoiseStep]],
-        results: list[Any],
-        *,
-        defer_text_cpu_results: bool = False,
-        allow_graph: bool = True,
-        require_graph: bool = False,
-    ) -> bool:
-        plan = PackedForwardPlan(batch=batch, denoise_steps=denoise_steps, results=results)
-        result = _run_packed_forward_impl(
-            self.owner,
-            plan,
-            request_states,
-            defer_text_cpu_results=defer_text_cpu_results,
-            allow_graph=allow_graph,
-            require_graph=require_graph,
-        )
-        return bool(result)
-
-    def execute_forward_result(
-        self,
-        batch: UniForwardBatch,
-        request_states: Any,
-        denoise_steps: list[tuple[int, TextImageDenoiseStep]],
-        *,
-        defer_text_cpu_results: bool = False,
-        allow_graph: bool = False,
-        require_graph: bool = False,
-    ) -> ForwardResult | None:
-        plan = PackedForwardPlan(
-            batch=batch,
-            denoise_steps=denoise_steps,
-            results=[None] * len(batch.ops),
-        )
-        result = _run_packed_forward_impl(
-            self.owner,
-            plan,
-            request_states,
-            defer_text_cpu_results=defer_text_cpu_results,
-            return_forward_result=True,
-            allow_graph=allow_graph,
-            require_graph=require_graph,
-        )
-        return result if isinstance(result, ForwardResult) else None
-
-
-def run_packed_forward(
-    owner,
-    batch: UniForwardBatch,
-    request_states: Any,
-    denoise_steps: list[tuple[int, TextImageDenoiseStep]],
-    results: list[Any],
-    *,
-    defer_text_cpu_results: bool = False,
-    allow_graph: bool = True,
-    require_graph: bool = False,
-) -> bool:
-    return PackedForward(owner).execute(
-        batch,
-        request_states,
-        denoise_steps,
-        results,
-        defer_text_cpu_results=defer_text_cpu_results,
-        allow_graph=allow_graph,
-        require_graph=require_graph,
-    )
-
-
-def run_packed_forward_result(
-    owner,
-    batch: UniForwardBatch,
-    request_states: Any,
-    denoise_steps: list[tuple[int, TextImageDenoiseStep]],
-    *,
-    defer_text_cpu_results: bool = False,
-    allow_graph: bool = False,
-    require_graph: bool = False,
-) -> ForwardResult | None:
-    return PackedForward(owner).execute_forward_result(
-        batch,
-        request_states,
-        denoise_steps,
-        defer_text_cpu_results=defer_text_cpu_results,
-        allow_graph=allow_graph,
-        require_graph=require_graph,
-    )
-
-
-def _run_packed_forward_impl(
-    owner,
-    plan: PackedForwardPlan,
+def _run_segment_forward_impl(
+    runtime: SegmentRuntime,
+    plan: SegmentPlan,
     request_states: Any,
     *,
     defer_text_cpu_results: bool = False,
@@ -1499,7 +1448,8 @@ def _run_packed_forward_impl(
     allow_graph: bool = True,
     require_graph: bool = False,
 ) -> bool | ForwardResult:
-    if owner.model is None:
+    adapter = runtime.adapter
+    if adapter.model is None:
         if require_graph:
             raise capability_mismatch("packed forward graph requires a loaded model")
         return False
@@ -1508,8 +1458,8 @@ def _run_packed_forward_impl(
     kv_segments: list[ForwardPagedKVSegment] = []
     embed_chunks: list[torch.Tensor] = []
     indicator_chunks: list[tuple[int, bool] | torch.Tensor] = []
-    first_pool = owner._forward_target_pool(plan.denoise_steps)
-    device = torch.device(str(owner.device))
+    first_pool = runtime._forward_target_pool(plan.denoise_steps)
+    device = torch.device(str(adapter.device))
     current_context: dict[str, Any] | None = None
     ctx = get_forward_context()
     timing = _PackedForwardTiming(device)
@@ -1535,7 +1485,7 @@ def _run_packed_forward_impl(
                     raise invalid_descriptor(
                         "packed forward text input id count does not match row lengths"
                     )
-                text_embeds = owner.packed_text_embeddings(input_ids).reshape(total_q, -1)
+                text_embeds = adapter.packed_text_embeddings(input_ids).reshape(total_q, -1)
             segment_base = _append_packed_chunk(
                 embed_chunks,
                 indicator_chunks,
@@ -1590,10 +1540,10 @@ def _run_packed_forward_impl(
                     "new_block_ids_len": len(op.get("new_block_ids") or []),
                 }
                 if mode in {ForwardMode.EXTEND, ForwardMode.DECODE}:
-                    state = owner.interleaved_image_state(req_id)
+                    state = adapter.program_state(req_id)
                     cache = state.cond
-                    owner._extend_cache_blocks(cache, dict(op))
-                    owner._ensure_host_cache(cache)
+                    runtime._extend_cache_blocks(cache, dict(op))
+                    runtime._ensure_host_cache(cache)
                     if cache.past is None:
                         if require_graph:
                             raise capability_mismatch(
@@ -1611,7 +1561,7 @@ def _run_packed_forward_impl(
                             "cache_t_index_before_sync": int(getattr(cache, "t_index", -1)),
                         }
                     )
-                    _sync_host_cache_blocks(owner, cache, request_states, req_id, dict(op))
+                    _sync_host_cache_blocks(adapter, cache, request_states, req_id, dict(op))
                     current_context.update(
                         {
                             "cache_blocks_after_sync": len(getattr(cache, "block_ids", []) or []),
@@ -1634,7 +1584,7 @@ def _run_packed_forward_impl(
                     )
                     tokens = list(op.get("token_ids") or [])
                     if not tokens:
-                        tokens = [int(owner.eos_id or 0)]
+                        tokens = [int(adapter.eos_id or 0)]
                     pos = op.get("pos_range") or [
                         cache.t_index + 1,
                         cache.t_index + 1 + len(tokens),
@@ -1646,14 +1596,14 @@ def _run_packed_forward_impl(
                     staged_cache = persistent_cache
                     if first_pool is not None and persistent_cache.pool is not first_pool:
                         with profile_range("uniserve.packed_forward.text_cache_stage"):
-                            staged_cache = owner._stage_text_cache_for_forward(
+                            staged_cache = runtime._stage_text_cache_for_forward(
                                 persistent_cache,
                                 target_pool=first_pool,
                                 end_len=persistent_cache.length + q_len,
                                 pending_prefix_copies=text_stage_prefix_copies,
                             )
                     pool = staged_cache.pool
-                    if not owner._same_kv_pool(pool, first_pool):
+                    if not runtime._same_kv_pool(pool, first_pool):
                         if require_graph:
                             raise capability_mismatch(
                                 "packed forward graph requires one KV pool",
@@ -1679,7 +1629,7 @@ def _run_packed_forward_impl(
                         if relay_token is not None:
                             last_input_token = int(relay_token)
                     with profile_range("uniserve.packed_forward.text_segment"):
-                        owner._add_text_forward_segment(
+                        runtime._add_text_forward_segment(
                             builder=builder,
                             kv_segments=kv_segments,
                             row_index=row_index,
@@ -1705,12 +1655,12 @@ def _run_packed_forward_impl(
                 elif mode is ForwardMode.DENOISE:
                     flush_text_rows()
                     step = plan.denoise_step_for_row(row_index)
-                    cfg_plan = text_image_cfg_plan(step)
+                    cfg_plan = flow_cfg_plan(step)
                     plan.set_denoise_cfg_plan(row_index, cfg_plan)
                     for branch_index, branch in enumerate(cfg_plan.branches):
                         img = step.extra["img"]
                         with profile_range("uniserve.packed_forward.denoise_branch_inputs"):
-                            indexes, cache = owner._denoise_branch_inputs(img, branch)
+                            indexes, cache = adapter._denoise_branch_inputs(img, branch)
                         if cache is None or getattr(cache, "pool", None) is None:
                             if require_graph:
                                 raise capability_mismatch(
@@ -1718,9 +1668,9 @@ def _run_packed_forward_impl(
                                     details={**current_context, "branch": str(branch)},
                                 )
                             return False
-                        owner._wait_gen_cache_ready(cache)
+                        runtime._wait_gen_cache_ready(cache)
                         pool = cache.pool
-                        if not owner._same_kv_pool(pool, first_pool):
+                        if not runtime._same_kv_pool(pool, first_pool):
                             if require_graph:
                                 raise capability_mismatch(
                                     "packed forward graph requires one KV pool",
@@ -1756,11 +1706,11 @@ def _run_packed_forward_impl(
                             indicator_chunks,
                             step.extra["image_embeds"].reshape(q_len, -1),
                             image_tokens=True,
-                            indicators=_packed_denoise_indicators(owner, step, q_len),
+                            indicators=_packed_denoise_indicators(runtime, step, q_len),
                             device=device,
                         )
                         with profile_range("uniserve.packed_forward.denoise_segment"):
-                            owner._add_denoise_forward_segment(
+                            runtime._add_denoise_forward_segment(
                                 builder=builder,
                                 kv_segments=kv_segments,
                                 row_index=row_index,
@@ -1799,11 +1749,11 @@ def _run_packed_forward_impl(
             with profile_range("uniserve.packed_forward.text_prefix_stage"):
                 copy_paged_text_cache_spans(
                     text_stage_prefix_copies,
-                    num_layers=owner.num_layers,
+                    num_layers=adapter.num_layers,
                     missing_message="cannot stage a packed-forward prefix without a paged source cache",
                 )
             for span in text_stage_prefix_copies:
-                owner._mark_forward_staging_advanced(
+                runtime._mark_forward_staging_advanced(
                     span.target,
                     span.source,
                     int(span.start) + int(span.length),
@@ -1825,7 +1775,7 @@ def _run_packed_forward_impl(
         stream_start = timing.start()
         with profile_range("uniserve.packed_forward.stream_build"):
             forward_stream = builder.build(device=device)
-            route_indices = getattr(owner, "packed_route_indices", None)
+            route_indices = getattr(adapter, "packed_route_indices", None)
             if callable(route_indices):
                 und_indices, gen_indices = route_indices(
                     forward_stream,
@@ -1845,9 +1795,7 @@ def _run_packed_forward_impl(
                     name="generation",
                 )
                 if int(und_indices.numel()) + int(gen_indices.numel()) != token_count:
-                    raise invalid_descriptor(
-                        "packed route indices must partition the token stream"
-                    )
+                    raise invalid_descriptor("packed route indices must partition the token stream")
                 forward_stream = replace(
                     forward_stream,
                     und_indices=und_indices,
@@ -1885,7 +1833,7 @@ def _run_packed_forward_impl(
         with profile_range("uniserve.packed_forward.decoder_input_pack"):
             packed_embeds = torch.cat(embed_chunks, dim=0)
             packed_indicators = _packed_indicator_tensor(
-                owner,
+                runtime,
                 indicator_chunks,
                 device=device,
             )
@@ -1896,8 +1844,8 @@ def _run_packed_forward_impl(
                 if text_kv_promotion_capacity is not None
                 else {}
             )
-            hidden = maybe_run_packed_graph(
-                owner,
+            hidden = maybe_run_segment_graph(
+                runtime,
                 packed_embeds,
                 route_indicators=packed_indicators,
                 forward_stream=forward_stream,
@@ -1908,7 +1856,7 @@ def _run_packed_forward_impl(
         graph_promoted_text_kv = hidden is not None and bool(graph_text_kv_promotions)
         if hidden is None:
             if require_graph:
-                graph_runner = getattr(owner, "_packed_graph_runner", None)
+                graph_runner = getattr(runtime, "_segment_graph_runner", None)
                 raise capability_mismatch(
                     "packed forward CUDA graph did not produce hidden states",
                     details={
@@ -1922,7 +1870,7 @@ def _run_packed_forward_impl(
                         "promotion_count": len(graph_text_kv_promotions),
                     },
                 )
-            hidden = owner.packed_decoder_forward(
+            hidden = adapter.packed_decoder_forward(
                 packed_embeds,
                 route_indicators=packed_indicators,
                 indexes=forward_stream.indexes,
@@ -1962,7 +1910,7 @@ def _run_packed_forward_impl(
                     dim=0,
                 )
             with profile_range("uniserve.packed_forward.text_logits"):
-                text_logits = owner.packed_text_logits(text_hidden.unsqueeze(0)).squeeze(0)
+                text_logits = adapter.packed_text_logits(text_hidden.unsqueeze(0)).squeeze(0)
             with profile_range("uniserve.packed_forward.text_logits_scatter"):
                 for offset, (row_index, *_rest) in enumerate(plan.text_result_slots):
                     text_logits_by_row[int(row_index)] = text_logits[offset : offset + 1].unsqueeze(
@@ -2032,7 +1980,7 @@ def _run_packed_forward_impl(
                         ]
         with profile_range("uniserve.packed_forward.burst_position_stage"):
             burst_position_tensors_by_row = _forward_burst_position_tensors(
-                owner,
+                runtime,
                 plan,
                 device=device,
             )
@@ -2040,7 +1988,7 @@ def _run_packed_forward_impl(
             with profile_range("uniserve.packed_forward.text_kv_promote"):
                 copy_paged_text_cache_spans(
                     text_kv_promotions,
-                    num_layers=owner.num_layers,
+                    num_layers=adapter.num_layers,
                     missing_message="forward text K/V span is missing from staged cache",
                 )
         with profile_range("uniserve.packed_forward.text_result_publish"):
@@ -2056,7 +2004,7 @@ def _run_packed_forward_impl(
                 op = batch.ops[row_index]
                 req_id = int(op["req_id"])
                 logits = text_logits_by_row[int(row_index)]
-                state = owner.interleaved_image_state(req_id)
+                state = adapter.program_state(req_id)
                 position_id = int((op.get("pos_range") or [0, state.cond.t_index + q_len])[1])
                 new_len = int(base_len) + int(q_len)
                 if return_forward_result:
@@ -2078,12 +2026,12 @@ def _run_packed_forward_impl(
                             position_id=position_id,
                             kv_new_length=new_len,
                             last_input_token=int(last_input_token),
-                            interleaved_state=state,
+                            program_state=state,
                             persistent_cache=persistent_cache,
                             staged_cache=staged_cache,
                             kv_promotion=promotion,
-                            num_layers=int(owner.num_layers),
-                            mark_staging_advanced=owner._mark_forward_staging_advanced,
+                            num_layers=int(adapter.num_layers),
+                            mark_staging_advanced=runtime._mark_forward_staging_advanced,
                         )
                     )
                     continue
@@ -2092,7 +2040,7 @@ def _run_packed_forward_impl(
                 state.cond.last_token_id = int(last_input_token)
                 persistent_cache.length = new_len
                 if staged_cache is not persistent_cache:
-                    owner._mark_forward_staging_advanced(staged_cache, persistent_cache, new_len)
+                    runtime._mark_forward_staging_advanced(staged_cache, persistent_cache, new_len)
                 req_state = request_states.get(req_id)
                 output = text_outputs_by_row.get(int(row_index))
                 if output is None:
@@ -2136,7 +2084,7 @@ def _run_packed_forward_impl(
             for row_index, step, start, q_len, branch in plan.denoise_result_slots:
                 img = step.extra["img"]
                 with profile_range("uniserve.packed_forward.velocity_branch"):
-                    velocity = owner.packed_hidden_to_velocity(
+                    velocity = adapter.packed_hidden_to_velocity(
                         hidden[start : start + q_len].unsqueeze(0),
                         step.t,
                         step.latent,
@@ -2162,10 +2110,10 @@ def _run_packed_forward_impl(
 
                 def accept_update(
                     updated: torch.Tensor,
-                    current_owner: Any = owner,
-                    current_step: TextImageDenoiseStep = step,
+                    current_adapter: Any = adapter,
+                    current_step: PreparedFlowStep = step,
                 ) -> None:
-                    current_owner.accept_denoise_update(current_step, updated)
+                    current_adapter.accept_flow_update(current_step, updated)
 
                 denoise_updates[int(result_index)] = DenoisePostprocessEntry(
                     row_index=int(result_index),
@@ -2208,7 +2156,7 @@ def _run_packed_forward_impl(
                     return False
                 velocity = plan.denoise_cfg_plan_for_row(result_index).combine(velocities)
                 updated = euler_step(step.latent, velocity, step.t, step.t_next)
-                owner.accept_denoise_update(step, updated)
+                adapter.accept_flow_update(step, updated)
                 plan.set_denoise_result(result_index, step)
         timing.stop("denoise_update_ms", update_start)
         ctx.record_component_elapsed("packed_forward_denoise_update", update_stats_start)
@@ -2370,7 +2318,7 @@ def _append_packed_chunk(
 
 def _packed_denoise_indicators(
     owner: Any,
-    step: TextImageDenoiseStep,
+    step: PreparedFlowStep,
     q_len: int,
 ) -> torch.Tensor | None:
     build = getattr(owner, "packed_denoise_indicators", None)
@@ -2389,8 +2337,7 @@ def _packed_indicator_tensor(
     device: torch.device,
 ) -> torch.Tensor:
     total = sum(
-        int(chunk.numel()) if isinstance(chunk, torch.Tensor) else int(chunk[0])
-        for chunk in chunks
+        int(chunk.numel()) if isinstance(chunk, torch.Tensor) else int(chunk[0]) for chunk in chunks
     )
     if total <= 0:
         raise invalid_descriptor("packed forward indicators must not be empty")
@@ -2514,7 +2461,7 @@ def _store_forward_sampled_token_relay(
 
 def _forward_burst_position_tensors(
     owner: Any,
-    plan: PackedForwardPlan,
+    plan: SegmentPlan,
     *,
     device: torch.device,
 ) -> dict[int, torch.Tensor]:
@@ -2598,11 +2545,11 @@ _DECODE_RELAY = TextDecodeRelay()
 _RELAY_PLACEHOLDER_TOKEN_ID = -1
 
 
-class PackedForwardExecutor:
-    """Execute one admitted segment group without mode splitting."""
+class SegmentExecutor(SegmentRuntime):
+    """Long-lived executor for one family's heterogeneous segment programs."""
 
-    def __init__(self, owner: Any) -> None:
-        self.owner = owner
+    def __init__(self, adapter: SegmentAdapter) -> None:
+        super().__init__(adapter)
 
     def execute(
         self,
@@ -2612,7 +2559,7 @@ class PackedForwardExecutor:
         defer_text_cpu_results: bool = False,
     ) -> Any:
         results: list[Any] = [None] * len(batch.ops)
-        denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
+        denoise_steps: list[tuple[int, PreparedFlowStep]] = []
         commit_rows: list[tuple[int, int, dict[str, Any]]] = []
         has_burst_rows = False
         with profile_range("uniserve.packed_forward.prepare_ops"):
@@ -2625,7 +2572,7 @@ class PackedForwardExecutor:
                 ):
                     has_burst_rows = True
                 if mode is ForwardMode.DENOISE:
-                    step = self.owner.prepare_denoise(
+                    step = self.adapter.prepare_flow(
                         request_states.get(req_id),
                         dict(op),
                     )
@@ -2637,15 +2584,8 @@ class PackedForwardExecutor:
                         "packed forward group contains an unsupported mode",
                         details={"mode": mode.value},
                     )
-        for _row_index, step in denoise_steps:
-            extra = getattr(step, "extra", None)
-            image = extra.get("img") if isinstance(extra, dict) else None
-            residual_state = getattr(image, "residual_cache", None)
-            if residual_state is not None:
-                residual_state.invalidate()
         if not commit_rows and not has_burst_rows:
-            result = run_packed_forward_result(
-                self.owner,
+            result = self.run_segment_forward_result(
                 batch,
                 request_states,
                 denoise_steps,
@@ -2655,8 +2595,7 @@ class PackedForwardExecutor:
             )
             if result is not None:
                 return result
-        if not run_packed_forward(
-            self.owner,
+        if not self.run_segment_forward(
             batch,
             request_states,
             denoise_steps,
@@ -2674,7 +2613,7 @@ class PackedForwardExecutor:
         self._complete_denoise_bursts(batch, request_states, results)
         for row_index, req_id, op in commit_rows:
             state = request_states.get(req_id)
-            decoded = self.owner.decode_image(
+            decoded = self.adapter.decode_image(
                 getattr(state, "latent", None),
                 req_id=req_id,
                 state=state,
@@ -2824,7 +2763,7 @@ class PackedForwardExecutor:
         *,
         defer_cpu_results: bool,
     ) -> list[Any] | None:
-        driver = self.owner._text_driver()
+        driver = self.adapter._text_driver()
         run_graph = getattr(driver, "try_run_decode_graph_logits_batch", None)
         if not callable(run_graph):
             return None
@@ -2860,7 +2799,7 @@ class PackedForwardExecutor:
         )
         device = logits_batch.device
         position_ids, position_tensors = _decode_followup_position_tensors(
-            self.owner,
+            self,
             ops,
             device=device,
         )
@@ -2939,7 +2878,7 @@ class PackedForwardExecutor:
             items.append((req_id, request_states.get(req_id), followup))
         if not items:
             return
-        outputs = DenoiseDriver().step_many(items, self.owner, graph_mode="require")
+        outputs = FlowExecutor().step_many(items, self.adapter, graph_mode="require")
         for row_index, output in zip(row_indexes, outputs, strict=True):
             results[row_index] = output
 
@@ -2978,9 +2917,7 @@ def _sampled_token_id(output: Any, *, profile_name: str) -> int:
     materialize = getattr(output, "materialize_sampled_token_id", None)
     with profile_range(profile_name):
         token = (
-            int(materialize())
-            if callable(materialize)
-            else _output_int(output, "sampled_token_id")
+            int(materialize()) if callable(materialize) else _output_int(output, "sampled_token_id")
         )
     if token < 0:
         raise invalid_descriptor("sampled_token_id must be non-negative")

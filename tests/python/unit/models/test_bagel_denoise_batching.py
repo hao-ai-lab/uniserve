@@ -3,8 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.execution.engine import TextImageDenoiseStep
-from uniserve_worker.models import bagel as bagel_model
+from uniserve_worker.execution.engine import PreparedFlowStep
 from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
 from uniserve_worker.nn.diffusion.cfg import Branch
 from uniserve_worker.runtime.paged_denoise import PagedDenoiseBranchSet
@@ -46,7 +45,11 @@ class _Graph:
         return (
             torch.tensor([False, *([True] * int(num_vae)), False]),
             torch.tensor(
-                [offset for row in range(int(batch_size)) for offset in (row * total, (row + 1) * total - 1)]
+                [
+                    offset
+                    for row in range(int(batch_size))
+                    for offset in (row * total, (row + 1) * total - 1)
+                ]
             ),
         )
 
@@ -56,7 +59,7 @@ class _Graph:
 
 
 def _step(req_id, timestep, latent, branches):
-    return TextImageDenoiseStep(
+    return PreparedFlowStep(
         req_id=req_id,
         state=None,
         op={},
@@ -91,9 +94,7 @@ def test_bagel_coalesces_compatible_requests_into_one_denoise_forward(monkeypatc
     def paged(position):
         return PagedDenoiseBranchSet(
             caches={name.value: _Cache(pool) for name in branch_names},
-            positions={
-                name.value: position + offset for offset, name in enumerate(branch_names)
-            },
+            positions={name.value: position + offset for offset, name in enumerate(branch_names)},
         )
 
     first_latent = torch.arange(8, dtype=torch.float32).view(2, 4)
@@ -104,17 +105,16 @@ def test_bagel_coalesces_compatible_requests_into_one_denoise_forward(monkeypatc
     ]
     captured = []
 
-    def graph_forward(owner_arg, rows):
-        assert owner_arg is owner
+    def graph_forward(rows):
         captured.append(rows)
         return torch.stack(
             [row.step.latent + float(row.step.t) for row in rows],
             dim=0,
         )
 
-    monkeypatch.setattr(bagel_model, "maybe_run_denoise_step_graph", graph_forward)
+    monkeypatch.setattr(owner.flow_graph_execution, "maybe_run_graph", graph_forward)
 
-    outputs = owner.predict_text_image_velocity_batch(steps, [branch_names, branch_names])
+    outputs = owner.predict_flow_velocity_batch(steps, [branch_names, branch_names])
 
     assert len(captured) == 1
     assert [row.step.req_id for row in captured[0]] == [1, 1, 2, 2]

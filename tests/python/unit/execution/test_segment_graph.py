@@ -10,10 +10,10 @@ import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.models import packed_forward as packed_runtime
-from uniserve_worker.models import packed_forward as pmg
-from uniserve_worker.models.packed_forward import (
-    PackedGraphRunner,
+from uniserve_worker.execution import segment as packed_runtime
+from uniserve_worker.execution import segment as pmg
+from uniserve_worker.execution.segment import (
+    SegmentGraphRunner,
     packed_graph_promotions_supported,
 )
 from uniserve_worker.runtime.forward_stream import (
@@ -31,12 +31,12 @@ from uniserve_worker.runtime.paged_text_cache import (
 pytestmark = pytest.mark.unit
 
 
-def test_packed_graph_runner_is_enabled_by_default():
-    assert PackedGraphRunner().enabled()
+def test_segment_graph_runner_is_enabled_by_default():
+    assert SegmentGraphRunner().enabled()
 
 
 def test_packed_forward_capacity_buckets_use_private_capture_pools():
-    runner = PackedGraphRunner()
+    runner = SegmentGraphRunner()
 
     assert runner.capture_pool() is None
 
@@ -53,7 +53,7 @@ def test_packed_forward_graph_reclaims_lru_capacity_after_releasing_state(monkey
             self.graph = Graph()
             self.release_backend = lambda: events.append(f"release_backend_{index}")
 
-    runner = PackedGraphRunner()
+    runner = SegmentGraphRunner()
     victim_ref = None
     for index in range(pmg._MAX_RESIDENT_CAPACITIES):
         state = State(index)
@@ -140,7 +140,7 @@ def _resolver_inputs():
         scale=0.5,
     )
     owner = SimpleNamespace(
-        packed_graph_attention=lambda: attention,
+        segment_graph_attention=lambda: attention,
     )
     embeds = torch.zeros((1, 4), dtype=torch.float32)
     indicators = torch.zeros((1,), dtype=torch.bool)
@@ -191,7 +191,7 @@ def test_packed_forward_graph_backend_resolver_skips_non_graph_auto_provider(mon
     )
     owner, embeds, _indicators, stream, kv_view = _resolver_inputs()
 
-    backend = PackedGraphRunner()._resolve_graph_backend(
+    backend = SegmentGraphRunner()._resolve_graph_backend(
         ForwardContext(attention_preference="auto"),
         owner,
         embeds,
@@ -216,7 +216,7 @@ def test_packed_forward_graph_backend_resolver_respects_explicit_non_graph_provi
     )
     owner, embeds, _indicators, stream, kv_view = _resolver_inputs()
 
-    backend = PackedGraphRunner()._resolve_graph_backend(
+    backend = SegmentGraphRunner()._resolve_graph_backend(
         ForwardContext(attention_preference="fa4_cute"),
         owner,
         embeds,
@@ -244,7 +244,7 @@ def test_packed_forward_graph_backend_resolver_accepts_causal_visible_end_graph(
     )
     owner, embeds, _indicators, _stream, kv_view = _resolver_inputs()
 
-    backend = PackedGraphRunner()._resolve_graph_backend(
+    backend = SegmentGraphRunner()._resolve_graph_backend(
         ForwardContext(attention_preference="auto"),
         owner,
         embeds,
@@ -272,7 +272,7 @@ def test_packed_forward_graph_key_reuses_paged_kv_capacity_bucket():
     embeds = torch.zeros((1, 4), dtype=torch.float32)
     indicators = torch.zeros((1,), dtype=torch.bool)
 
-    key_a = PackedGraphRunner._graph_key(
+    key_a = SegmentGraphRunner._graph_key(
         owner,
         embeds,
         indicators,
@@ -283,7 +283,7 @@ def test_packed_forward_graph_key_reuses_paged_kv_capacity_bucket():
         ),
         backend,
     )
-    key_b = PackedGraphRunner._graph_key(
+    key_b = SegmentGraphRunner._graph_key(
         owner,
         embeds,
         indicators,
@@ -294,7 +294,7 @@ def test_packed_forward_graph_key_reuses_paged_kv_capacity_bucket():
         ),
         backend,
     )
-    key_c = PackedGraphRunner._graph_key(
+    key_c = SegmentGraphRunner._graph_key(
         owner,
         embeds,
         indicators,
@@ -317,7 +317,7 @@ def test_packed_forward_graph_key_excludes_ragged_query_distribution():
     embeds = torch.zeros((3, 4), dtype=torch.float32)
     indicators = torch.zeros((3,), dtype=torch.bool)
 
-    key_a = PackedGraphRunner._graph_key(
+    key_a = SegmentGraphRunner._graph_key(
         owner,
         embeds,
         indicators,
@@ -331,7 +331,7 @@ def test_packed_forward_graph_key_excludes_ragged_query_distribution():
         ),
         backend,
     )
-    key_b = PackedGraphRunner._graph_key(
+    key_b = SegmentGraphRunner._graph_key(
         owner,
         embeds,
         indicators,
@@ -413,7 +413,7 @@ def test_packed_forward_graph_promotion_copy_matches_span_copy_across_layers():
         promotion_source_index=torch.tensor([1, 2, 3, 4], dtype=torch.long),
         promotion_target_index=torch.tensor([7, 8, 9, 10], dtype=torch.long),
     )
-    PackedGraphRunner._copy_promotions_in_graph(state)
+    SegmentGraphRunner._copy_promotions_in_graph(state)
     copy_paged_text_cache_span(source, expected_target, start=1, length=4, num_layers=2)
 
     assert torch.equal(graph_target.pool.k, expected_target.pool.k)

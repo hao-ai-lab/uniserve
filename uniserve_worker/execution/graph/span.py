@@ -77,9 +77,13 @@ class Runner(Capture):
         metric_prefix: str = _DEFAULT_METRIC_PREFIX,
         logger: Any = None,
     ) -> None:
-        self.name = str(name)
-        self.default_enabled = bool(default_enabled)
-        self.default_warmup = bool(default_warmup)
+        super().__init__(
+            name=name,
+            default_enabled=default_enabled,
+            default_warmup=default_warmup,
+            metric_prefix=metric_prefix,
+            logger=logger,
+        )
         self.default_warmup_token_buckets = tuple(
             sorted({int(size) for size in default_warmup_token_buckets if int(size) > 0})
         )
@@ -87,12 +91,6 @@ class Runner(Capture):
             sorted({int(size) for size in default_warmup_batch_sizes if int(size) > 0})
         )
         self.token_bucket_parser = token_bucket_parser
-        self.metric_prefix = str(metric_prefix)
-        self.logger = logger
-        self.states: dict[tuple[int, int, int], State] = {}
-        self.disabled: set[tuple[int, int, int]] = set()
-        self._capture_pool: Any = None
-        self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
 
     def warmup_token_buckets(self) -> tuple[int, ...]:
         return self.default_warmup_token_buckets

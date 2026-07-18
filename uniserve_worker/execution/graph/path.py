@@ -14,16 +14,16 @@ from .dispatch import Match, Path
 
 
 class Segment(Path):
-    """Run any active segment composition through its family owner."""
+    """Run any active segment composition through its system executor."""
 
     def __init__(
         self,
         *,
-        owner: Any | None = None,
+        executor: Any | None = None,
         states: Any | None = None,
         publisher: Any | None = None,
     ) -> None:
-        self.owner = owner
+        self.executor = executor
         self.states = states
         self.publisher = publisher
 
@@ -35,19 +35,15 @@ class Segment(Path):
         del batch
         if plan.shape.segment_count <= 0:
             return Match(False, "plan has no active segments")
-        if (
-            self.owner is None
-            or self.states is None
-            or not callable(getattr(self.owner, "run_segment_graph", None))
-        ):
-            return Match(False, "segment owner is unavailable")
+        if self.executor is None or self.states is None:
+            return Match(False, "segment executor is unavailable")
         return Match(True)
 
     def run(self, batch: ForwardBatch, plan: ForwardPlan) -> ForwardResult | None:
         del batch
-        if self.owner is None or self.states is None:
+        if self.executor is None or self.states is None:
             return None
-        result = self.owner.run_segment_graph(
+        result = self.executor.run_segment_graph(
             plan,
             request_states=self.states,
             result_publisher=self.publisher,
@@ -149,8 +145,8 @@ class Batch(Path):
         )
 
 
-class Denoise(Path):
-    """Run a uniform denoise plan through its graph-capable driver."""
+class Flow(Path):
+    """Run a uniform flow plan through its graph-capable executor."""
 
     def __init__(
         self,
@@ -165,14 +161,14 @@ class Denoise(Path):
 
     def name(self, plan: ForwardPlan) -> str:
         del plan
-        return "denoise"
+        return "flow"
 
     def match(self, batch: ForwardBatch, plan: ForwardPlan) -> Match:
         del batch
         if plan.shape.denoise_row_count != plan.shape.row_count:
-            return Match(False, "plan is not uniformly denoise")
+            return Match(False, "plan is not uniformly flow-shaped")
         if not self._bound:
-            return Match(False, "denoise driver is unavailable")
+            return Match(False, "flow executor is unavailable")
         if any(int(op.get("denoise_step_count") or 1) > 1 for op in plan.ops):
             return Match(False, "multi-step rows are not graphable")
         return Match(True)
@@ -197,7 +193,7 @@ class Denoise(Path):
         items = [(int(row.req_id), self.states.get(int(row.req_id)), row.op) for row in plan.rows]
         result = forward(items, self.model, **kwargs)
         if result is not None and not isinstance(result, ForwardResult):
-            raise invalid_descriptor("denoise path must return a ForwardResult")
+            raise invalid_descriptor("flow path must return a ForwardResult")
         return result
 
 

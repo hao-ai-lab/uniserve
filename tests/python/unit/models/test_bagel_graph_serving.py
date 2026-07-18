@@ -6,7 +6,6 @@ import torch.nn as nn
 
 from uniserve_worker.execution.graph.path import Segment
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.models import bagel as bagel_model
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig
 from uniserve_worker.nn.decoder import Modality, MoTModel
 
@@ -27,7 +26,7 @@ pytestmark = pytest.mark.unit
 )
 def test_bagel_binds_segment_graph_program_for_any_active_composition(ops):
     owner = BagelForUnifiedGeneration(device="cpu")
-    program = Segment(owner=owner, states=object())
+    program = Segment(executor=owner.segment_executor, states=object())
     plan = SimpleNamespace(
         shape=SimpleNamespace(segment_count=len(ops)),
         ops=ops,
@@ -43,7 +42,7 @@ def test_bagel_denoise_rejects_eager_execution(monkeypatch):
     monkeypatch.setattr(owner, "_ensure_loaded", lambda: object())
 
     with pytest.raises(WorkerError, match="requires CUDA graphs"):
-        owner.predict_text_image_velocity_batch([], [], graph_mode="eager")
+        owner.predict_flow_velocity_batch([], [], graph_mode="eager")
 
 
 def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
@@ -135,7 +134,9 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
 
     assert len(calls) == 2
     assert all(call["any_text"] is True and call["any_gen"] is True for call in calls)
-    assert all(call["text_mask"].tolist() == [True, True, True, False, False, True] for call in calls)
+    assert all(
+        call["text_mask"].tolist() == [True, True, True, False, False, True] for call in calls
+    )
     assert all(call["gen_mask"].tolist() == is_gen.tolist() for call in calls)
     assert all(call["text_indices"].tolist() == [0, 1, 2, 5] for call in calls)
     torch.testing.assert_close(output, hidden + 2)
@@ -176,7 +177,7 @@ def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
         def _ensure_loaded(self):
             return None
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             assert int(req_id) == 7
             return state
 
@@ -246,9 +247,7 @@ def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
 
     class Owner:
         device = "cpu"
-        _predict_text_image_velocity_graph = (
-            BagelForUnifiedGeneration._predict_text_image_velocity_graph
-        )
+        _predict_flow_velocity_graph = BagelForUnifiedGeneration._predict_flow_velocity_graph
 
         def _ensure_loaded(self):
             return SimpleNamespace(model=Model())
@@ -259,10 +258,12 @@ def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
         captured.append((owner, rows))
         return torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
 
-    monkeypatch.setattr(bagel_model, "maybe_run_denoise_step_graph", graph_forward)
     owner = Owner()
+    owner.flow_graph_execution = SimpleNamespace(
+        maybe_run_graph=lambda rows: graph_forward(owner, rows)
+    )
 
-    result = BagelForUnifiedGeneration.predict_text_image_velocity_batch(
+    result = BagelForUnifiedGeneration.predict_flow_velocity_batch(
         owner,
         [step],
         [("cond", "text_uncond")],
@@ -306,7 +307,7 @@ def test_bagel_denoise_graph_forward_maps_static_positions_and_latent_rows():
     embeds = torch.zeros((2, 4, 3))
     token_by_row_positions = torch.tensor([[5, 8], [5, 8], [5, 8], [5, 8]])
     cache = object()
-    velocity = BagelForUnifiedGeneration.interleaved_image_predict_velocity(
+    velocity = BagelForUnifiedGeneration.flow_predict_velocity(
         Owner(),
         embeds,
         token_by_row_positions,
@@ -325,7 +326,7 @@ def test_bagel_denoise_graph_forward_maps_static_positions_and_latent_rows():
     assert tuple(velocity.shape) == (2, 2, 1)
 
 
-def test_bagel_interleaved_text_decode_uses_row_batched_paged_forward():
+def test_bagel_sequence_decode_uses_row_batched_paged_forward():
     calls = []
 
     class Language:
@@ -345,13 +346,13 @@ def test_bagel_interleaved_text_decode_uses_row_batched_paged_forward():
             return hidden[:, :1].expand(int(hidden.shape[0]), 5)
 
     class Owner:
-        interleaved_text_forward = BagelForUnifiedGeneration.interleaved_text_forward
+        sequence_forward = BagelForUnifiedGeneration.sequence_forward
 
         def _ensure_loaded(self):
             return SimpleNamespace(model=Model())
 
     past = object()
-    output = Owner().interleaved_text_forward(
+    output = Owner().sequence_forward(
         input_ids=torch.tensor([[11], [12]]),
         indexes=torch.tensor([[5, 7]]),
         past_key_values=past,

@@ -1,4 +1,5 @@
 """Typed forward outputs consumed by the shared runner."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ __all__ = [
     "DeferredForwardOutput",
     "FinalizableSeqResult",
     "TextTokenOutput",
-    "DenoiseOutput",
+    "FlowOutput",
     "CommitOutput",
     "EncodeOutput",
     "SampleOutput",
@@ -80,8 +81,8 @@ class TextTokenOutput(ForwardOutputBase):
 
 
 @dataclass(frozen=True)
-class DenoiseOutput(ForwardOutputBase):
-    """Denoise-step progress for one image-generation request."""
+class FlowOutput(ForwardOutputBase):
+    """Flow-step progress for one image-generation request."""
 
     denoise_done: bool
     num_steps_done: int
@@ -140,10 +141,5 @@ class FrameOutput(ForwardOutputBase):
 
 
 ForwardOutput = (
-    TextTokenOutput
-    | DenoiseOutput
-    | CommitOutput
-    | EncodeOutput
-    | FrameOutput
-    | DeferredForwardOutput
+    TextTokenOutput | FlowOutput | CommitOutput | EncodeOutput | FrameOutput | DeferredForwardOutput
 )

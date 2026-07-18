@@ -1,28 +1,25 @@
-"""Interleaved image family runtime: denoise state machine, residual reuse, graphs.
+"""System-owned continuous-flow operation execution.
 
-Family-owned machinery for image generation inside interleaved requests:
-per-request latent/image state, batched denoise rows with flow-match
-schedules and CFG, the residual-reuse (TeaCache-style) adapter, and the
-denoise-step CUDA-graph runner built on ``execution.graph`` primitives.
+The module owns scheduled state updates, branch composition, and graph lowering.
+Family adapters supply neural features and velocity prediction without owning
+the operation lifecycle.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Mapping, Protocol, Sequence
+from typing import Any, Protocol, Sequence
 
 import torch
 
 import uniserve_worker.ops as ops
 from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPlan
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
-from uniserve_worker.execution.engine import TextImageDenoiseStep, text_image_cfg_branch_count
-from uniserve_worker.execution.graph.capture import Event, record
-from uniserve_worker.execution.graph.capture import Runner as Capture
-from uniserve_worker.foundation.env import env_flag, env_str
+from uniserve_worker.execution.engine import PreparedFlowStep, flow_cfg_branch_count
+from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
+from uniserve_worker.execution.sequence import SequenceCache
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
-from uniserve_worker.models.interleaved_text import TextCache
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.nn.diffusion import (
     FlowMatchSchedule,
@@ -30,7 +27,7 @@ from uniserve_worker.nn.diffusion import (
     ScheduleShiftDomain,
     init_latent,
 )
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
+from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
 from uniserve_worker.nn.vision import patchify_batch, unpatchify_batch
 from uniserve_worker.runtime.image_params import (
     TextImageGenerationParams as _ImageParams,
@@ -42,125 +39,11 @@ from uniserve_worker.runtime.paged_denoise import can_run_paged_denoise_attentio
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
 # ---------------------
-# Residual-reuse cache
-# ---------------------
-
-@dataclass(frozen=True)
-class DenoiseResidualCacheBinding:
-    """Model-supplied hooks: decision embedding + calibrated rescale polynomial.
-
-    The cached residual lives in the *pre-final-norm* residual stream (where
-    its magnitude dwarfs the input-embedding delta, so replaying
-    ``embeds' + residual`` is a faithful approximation); ``finalize_hidden``
-    re-applies whatever the model's backbone does after its block stack
-    (typically the final RMSNorm of the generation branch) before the
-    hidden→velocity head consumes the replayed stream.
-    """
-
-    # Maps the step's input embeddings [B, N, C] to the decision embedding the
-    # distance metric runs on (typically a cheap norm of the first row).
-    decision_embedding: Callable[[torch.Tensor], torch.Tensor]
-    # Polynomial coefficients (highest degree first) rescaling the raw
-    # relative-L1 distance into accumulated skip budget, calibrated per model.
-    rescale_coefficients: tuple[float, ...]
-    # Post-block-stack finalization applied to a replayed pre-norm stream.
-    finalize_hidden: Callable[[torch.Tensor], torch.Tensor]
-
-
-@dataclass(frozen=True)
-class DenoiseResidualCachePolicy:
-    enabled: bool
-    threshold: float
-
-    def active(self, adapter: DenoiseResidualCacheBinding | None) -> bool:
-        return self.enabled and adapter is not None
-
-
-def resolve_denoise_residual_cache_policy() -> DenoiseResidualCachePolicy:
-    enabled = env_flag("UNISERVE_DENOISE_RESIDUAL_CACHE", default=False)
-    raw = env_str("UNISERVE_DENOISE_RESIDUAL_CACHE_THRESHOLD", default="0.2")
-    try:
-        threshold = float(raw)
-    except ValueError:
-        threshold = 0.2
-    return DenoiseResidualCachePolicy(enabled=enabled, threshold=max(0.0, threshold))
-
-
-def _poly_eval(coefficients: tuple[float, ...], x: float) -> float:
-    value = 0.0
-    for coefficient in coefficients:
-        value = value * x + coefficient
-    return value
-
-
-@dataclass
-class ImageResidualCacheState:
-    """Per-image reuse state: decision history + per-branch residuals.
-
-    One instance rides on the :class:`ImageState` for the image being
-    denoised, so its lifetime (and memory) ends with the image commit.
-    """
-
-    threshold: float
-    coefficients: tuple[float, ...]
-    accumulated: float = 0.0
-    previous_decision: torch.Tensor | None = None
-    residuals: dict[str, torch.Tensor] = field(default_factory=dict)
-    hits: int = 0
-    misses: int = 0
-
-    def decide_reuse(self, decision: torch.Tensor, branches: tuple[str, ...]) -> bool:
-        """Advance the decision stream; True when every branch can be replayed."""
-        previous = self.previous_decision
-        self.previous_decision = decision
-        if previous is None or previous.shape != decision.shape:
-            self.accumulated = 0.0
-            self.misses += 1
-            return False
-        denom = previous.abs().mean()
-        if float(denom) == 0.0:
-            self.misses += 1
-            return False
-        rel_l1 = float((decision - previous).abs().mean() / denom)
-        self.accumulated += _poly_eval(self.coefficients, rel_l1)
-        if self.accumulated >= self.threshold:
-            self.accumulated = 0.0
-            self.misses += 1
-            return False
-        for branch in branches:
-            if branch not in self.residuals:
-                self.misses += 1
-                return False
-        self.hits += 1
-        return True
-
-    def replay(self, branch: str, input_embeds: torch.Tensor) -> torch.Tensor:
-        return input_embeds + self.residuals[branch]
-
-    def record(self, branch: str, input_embeds: torch.Tensor, hidden: torch.Tensor) -> None:
-        self.residuals[branch] = (hidden - input_embeds).detach()
-
-    def invalidate(self) -> None:
-        """Drop replay state (e.g. the step ran outside this policy's view)."""
-        self.previous_decision = None
-        self.accumulated = 0.0
-        self.residuals.clear()
-
-    def stats(self) -> Mapping[str, int]:
-        return {"hits": self.hits, "misses": self.misses}
-
-
-# ---------------------
-# Denoise-step graph runner
+# Flow-step graph runner
 # ---------------------
 
 logger = logging.getLogger(__name__)
 
-
-# Consecutive capture/replay failures before the runner hard-disables itself.
-_MAX_FAILURES = 2
-
-_RUNNER_ATTR = "_denoise_step_graph_runner"
 
 # Keep graph-resident activation pools bounded while retaining useful GEMM
 # batching: one graph microbatch covers two full three-branch CFG requests.
@@ -172,19 +55,19 @@ class _GraphBackendUnplanned(RuntimeError):
 
 
 @dataclass
-class DenoiseStepGraphState:
+class FlowGraphState:
     """Static buffers and one captured denoise geometry graph."""
 
     key: tuple[Any, ...]
     graph: torch.cuda.CUDAGraph
-    image_embeds: torch.Tensor          # [rows, tokens, hidden] static input
-    t: torch.Tensor                     # timestep static input (shape of step.t)
-    z: torch.Tensor                     # [rows, tokens, latent] static input
-    indexes: torch.Tensor               # [3, rows, tokens] static input
-    cache: BatchedPagedTextCache        # batched view over the rows' caches
-    request_cache: Any                  # stable graph-owned paged side tables
-    plan: PagedVarlenPlan               # stable transient paged-varlen plan
-    graph_binding: GraphBinding         # wrapper-routing identity (kept alive here)
+    image_embeds: torch.Tensor  # [rows, tokens, hidden] static input
+    t: torch.Tensor  # timestep static input (shape of step.t)
+    z: torch.Tensor  # [rows, tokens, latent] static input
+    indexes: torch.Tensor  # [3, rows, tokens] static input
+    cache: BatchedPagedTextCache  # batched view over the rows' caches
+    request_cache: Any  # stable graph-owned paged side tables
+    plan: PagedVarlenPlan  # stable transient paged-varlen plan
+    graph_binding: GraphBinding  # wrapper-routing identity (kept alive here)
     backend: Any
     num_q_heads: int
     num_kv_heads: int
@@ -193,11 +76,11 @@ class DenoiseStepGraphState:
     scale: float
     image_token_num: int
     image_size: tuple[int, int]
-    release_backend: Any = None         # callable dropping the exclusive wrapper
-    logits: Any = None                  # (velocity, hidden|None) written by capture/replay
+    release_backend: Any = None  # callable dropping the exclusive wrapper
+    logits: Any = None  # (velocity, hidden|None) written by capture/replay
 
 
-class DenoiseStepGraphRunner(Capture):
+class FlowGraphRunner(FailureManagedRunner):
     """Own bounded denoise-step CUDA graphs and refreshable request inputs."""
 
     def __init__(
@@ -207,24 +90,13 @@ class DenoiseStepGraphRunner(Capture):
         default_enabled: bool | None = None,
         logger: Any = logger,
     ) -> None:
-        self.name = str(name)
-        self.default_enabled = True if default_enabled is None else bool(default_enabled)
-        self.default_warmup = False
-        self.metric_prefix = "denoise_"
-        self.logger = logger
-        self.states: dict[tuple[Any, ...], DenoiseStepGraphState] = {}
-        self.disabled: set[tuple[Any, ...]] = set()
-        self._capture_pool: Any = None
-        self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
-        self._failures = 0
-        self._hard_disabled = False
-        self._backend_ineligible = False
-        self._replays = 0
-
-    # -- gating ----------------------------------------------------------------
-
-    def enabled(self) -> bool:
-        return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
+        super().__init__(
+            name=name,
+            default_enabled=True if default_enabled is None else bool(default_enabled),
+            default_warmup=False,
+            metric_prefix="denoise_",
+            logger=logger,
+        )
 
     def capture_pool(self) -> Any:
         # Independent geometry graphs can replay in any order. Keep their static
@@ -236,44 +108,55 @@ class DenoiseStepGraphRunner(Capture):
     def maybe_run_rows(
         self,
         owner: Any,
-        rows: "Sequence[DenoiseRow]",
+        rows: "Sequence[FlowRow]",
         *,
         return_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
         """Capture or replay the denoise step for ``rows``; ``None`` is a miss.
 
-        Outputs are cloned per replay so nothing the caller retains (velocity
-        slices, TeaCache hidden records) aliases the graph's static output
-        buffers, which the next replay overwrites.
+        Outputs are cloned per replay so nothing retained by the caller aliases
+        the graph's static output buffers, which the next replay overwrites.
         """
 
         if not self.enabled() or not torch.cuda.is_available():
             return None
         if len(rows) > _MAX_GRAPH_ROWS:
-            chunks = []
+            if return_hidden:
+                paired_chunks: list[tuple[torch.Tensor, torch.Tensor]] = []
+                for start in range(0, len(rows), _MAX_GRAPH_ROWS):
+                    chunk = self.maybe_run_rows(
+                        owner,
+                        rows[start : start + _MAX_GRAPH_ROWS],
+                        return_hidden=True,
+                    )
+                    if chunk is None:
+                        return None
+                    assert isinstance(chunk, tuple)
+                    paired_chunks.append(chunk)
+                velocity_chunks, hidden_chunks = zip(*paired_chunks, strict=True)
+                return torch.cat(velocity_chunks, dim=0), torch.cat(hidden_chunks, dim=0)
+            tensor_chunks: list[torch.Tensor] = []
             for start in range(0, len(rows), _MAX_GRAPH_ROWS):
                 chunk = self.maybe_run_rows(
                     owner,
                     rows[start : start + _MAX_GRAPH_ROWS],
-                    return_hidden=return_hidden,
+                    return_hidden=False,
                 )
                 if chunk is None:
                     return None
-                chunks.append(chunk)
-            if return_hidden:
-                velocities, hidden = zip(*chunks, strict=True)
-                return torch.cat(velocities, dim=0), torch.cat(hidden, dim=0)
-            return torch.cat(chunks, dim=0)
+                assert isinstance(chunk, torch.Tensor)
+                tensor_chunks.append(chunk)
+            return torch.cat(tensor_chunks, dim=0)
         if not self._ensure_transient_capacity(rows):
             return None
         key = self._rows_key(rows, return_hidden)
         ctx = get_forward_context()
         tokens = len(rows) * int(rows[0].img.token_h) * int(rows[0].img.token_w)
         if key is None or key in self.disabled:
-            self._record(ctx, Event.MISS, tokens)
+            self.record_event(ctx, Event.MISS, tokens)
             return None
         if key not in self.states and not ctx.allow_capture:
-            self._record(ctx, Event.MISS, tokens)
+            self.record_event(ctx, Event.MISS, tokens)
             return None
         if key not in self.states:  # capture path resolves the winner backend
             backend = self._resolve_graph_backend(ctx, rows)
@@ -281,14 +164,14 @@ class DenoiseStepGraphRunner(Capture):
                 # Dispatcher-winner probe failed: the backend eager would pick
                 # cannot host the captured graph path. Config-wide, so disable
                 # the runner rather than accumulate geometry-specific miss keys.
-                self._backend_ineligible = True
+                self.reject_backend()
                 if self.logger is not None:
                     self.logger.info(
                         "%s CUDA graph disabled: eager attention winner cannot host a "
                         "graph-scoped prefill plan",
                         self.name,
                     )
-                self._record(ctx, Event.MISS, tokens)
+                self.record_event(ctx, Event.MISS, tokens)
                 return None
         else:
             backend = None  # replay path never touches the backend
@@ -300,8 +183,8 @@ class DenoiseStepGraphRunner(Capture):
             capture=lambda: self._capture(owner, rows, key, ctx, backend, return_hidden),
             copy_inputs=lambda state: self._copy_inputs(state, rows),
             replay=self._replay,
-            record=lambda event: self._record(ctx, event, tokens),
-            disable=lambda exc: self._disable(key, exc),
+            record=lambda event: self.record_event(ctx, event, tokens),
+            disable=lambda exc: self.disable_state(key, exc),
             capture_metric=f"{self.metric_prefix}step_graph_capture",
             input_copy_metric=f"{self.metric_prefix}step_graph_input_copy",
             replay_metric=f"{self.metric_prefix}step_graph_replay_launch",
@@ -310,8 +193,7 @@ class DenoiseStepGraphRunner(Capture):
         )
         if out is None:
             return None
-        self._replays += 1
-        if self._replays == 1 and self.logger is not None:
+        if self.replay_completed() and self.logger is not None:
             self.logger.info(
                 "%s CUDA graph active: captured batched denoise step (rows=%d, tokens=%d)",
                 self.name,
@@ -340,7 +222,7 @@ class DenoiseStepGraphRunner(Capture):
     # -- keying / stats ------------------------------------------------------------
 
     @staticmethod
-    def _ensure_transient_capacity(rows: "Sequence[DenoiseRow]") -> bool:
+    def _ensure_transient_capacity(rows: "Sequence[FlowRow]") -> bool:
         """Extend each row cache for its transient tokens *before* keying.
 
         ``request_cache_for_transient`` grows ``block_ids`` on first use; keying
@@ -358,7 +240,7 @@ class DenoiseStepGraphRunner(Capture):
         return True
 
     @staticmethod
-    def _rows_key(rows: "Sequence[DenoiseRow]", return_hidden: bool) -> tuple[Any, ...] | None:
+    def _rows_key(rows: "Sequence[FlowRow]", return_hidden: bool) -> tuple[Any, ...] | None:
         first = rows[0]
         img = first.img
         embeds = first.step.extra["image_embeds"]
@@ -408,37 +290,9 @@ class DenoiseStepGraphRunner(Capture):
             bool(return_hidden),
         )
 
-    def _record(self, ctx: Any, event: Event, tokens: int) -> None:
-        record(
-            ctx,
-            event,
-            unpadded_tokens=int(tokens),
-            padded_tokens=int(tokens),
-        )
-
-    def _disable(self, key: tuple[Any, ...], exc: BaseException) -> None:
-        self.disabled.add(key)
-        state = self.states.pop(key, None)
-        if state is not None and callable(state.release_backend):
-            try:
-                state.release_backend()
-            except Exception:  # pragma: no cover - defensive release
-                pass
-        self._failures += 1
-        if self._failures >= _MAX_FAILURES:
-            self._hard_disabled = True
-        if self.logger is not None:
-            self.logger.warning(
-                "disabling %s CUDA graph (%s failure(s)%s): %s",
-                self.name,
-                self._failures,
-                "; runner hard-disabled" if self._hard_disabled else "",
-                exc,
-            )
-
     # -- backend probe ---------------------------------------------------------
 
-    def _resolve_graph_backend(self, ctx: Any, rows: "Sequence[DenoiseRow]") -> Any | None:
+    def _resolve_graph_backend(self, ctx: Any, rows: "Sequence[FlowRow]") -> Any | None:
         """First eligible attention provider for the transient varlen denoise step.
 
         Mirrors the transient paged-varlen probe the eager forward runs, but
@@ -489,7 +343,9 @@ class DenoiseStepGraphRunner(Capture):
                     continue
                 backend = getattr(provider, "backend", None)
                 if backend is None:
-                    backend = getattr(req, "backend", None) or getattr(ctx, "attention_backend", None)
+                    backend = getattr(req, "backend", None) or getattr(
+                        ctx, "attention_backend", None
+                    )
                 if backend is not None and self._backend_can_host_graph(backend):
                     return backend
                 return None
@@ -515,12 +371,12 @@ class DenoiseStepGraphRunner(Capture):
     def _capture(
         self,
         owner: Any,
-        rows: "Sequence[DenoiseRow]",
+        rows: "Sequence[FlowRow]",
         key: tuple[Any, ...],
         ctx: Any,
         backend: Any,
         return_hidden: bool,
-    ) -> DenoiseStepGraphState:
+    ) -> FlowGraphState:
         first = rows[0]
         img = first.img
         device = first.step.extra["image_embeds"].device
@@ -528,9 +384,7 @@ class DenoiseStepGraphRunner(Capture):
             [row.cache for row in rows],
             block_table_width=int(key[2]),
         )
-        request_cache = cache.request_cache_for_transient(
-            0, int(img.token_h) * int(img.token_w)
-        )
+        request_cache = cache.request_cache_for_transient(0, int(img.token_h) * int(img.token_w))
         pool = request_cache.pool
         head_dim = int(pool.head_dim)
         q_shape_probe = first.step.extra["image_embeds"].new_empty(
@@ -560,7 +414,7 @@ class DenoiseStepGraphRunner(Capture):
                 raise RuntimeError("denoise graph owner does not expose query geometry")
             num_q_heads = int(first_attention.num_heads)
             scale = float(first_attention.scale)
-        state = DenoiseStepGraphState(
+        state = FlowGraphState(
             key=key,
             graph=torch.cuda.CUDAGraph(),
             image_embeds=torch.cat(
@@ -606,7 +460,7 @@ class DenoiseStepGraphRunner(Capture):
             # are cloned inside the capture so the returned buffers are
             # dedicated graph outputs, not views of reusable intermediates.
             with use_forward_context(graph_ctx):
-                out = owner.interleaved_image_predict_velocity(
+                out = owner.flow_predict_velocity(
                     state.image_embeds,
                     state.indexes,
                     {"full_attention": None},
@@ -644,7 +498,7 @@ class DenoiseStepGraphRunner(Capture):
         return state
 
     @staticmethod
-    def _copy_inputs(state: DenoiseStepGraphState, rows: "Sequence[DenoiseRow]") -> None:
+    def _copy_inputs(state: FlowGraphState, rows: "Sequence[FlowRow]") -> None:
         state.cache.refresh_caches(
             [row.cache for row in rows],
             state.image_token_num,
@@ -658,7 +512,7 @@ class DenoiseStepGraphRunner(Capture):
         state.t.copy_(rows[0].step.t, non_blocking=True)
 
     @staticmethod
-    def _prepare_backend(state: DenoiseStepGraphState) -> None:
+    def _prepare_backend(state: FlowGraphState) -> None:
         prepare = getattr(state.backend, "prepare_paged_prefill_cuda_graph", None)
         if not callable(prepare):
             return
@@ -676,52 +530,37 @@ class DenoiseStepGraphRunner(Capture):
         )
 
     @staticmethod
-    def _replay(state: DenoiseStepGraphState) -> tuple[torch.Tensor, torch.Tensor]:
+    def _replay(state: FlowGraphState) -> tuple[torch.Tensor, torch.Tensor | None]:
         state.graph.replay()
         return state.logits
 
 
-def denoise_step_graph_runner(owner: Any) -> DenoiseStepGraphRunner:
-    """The per-owner runner (graphs close over the owner's weights/caches)."""
+class FlowGraphExecution:
+    """Own CUDA graph state for one family flow adapter."""
 
-    runner = getattr(owner, _RUNNER_ATTR, None)
-    if runner is None:
-        runner = DenoiseStepGraphRunner()
-        setattr(owner, _RUNNER_ATTR, runner)
-    return runner
+    def __init__(self, adapter: Any, *, runner: FlowGraphRunner | None = None) -> None:
+        self.adapter = adapter
+        self.graph_runner = runner or FlowGraphRunner()
 
-
-def maybe_run_denoise_step_graph(
-    owner: Any,
-    rows: "Sequence[DenoiseRow]",
-    *,
-    return_hidden: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-    """Try the denoise-step graph for ``rows``; ``None`` means run eager."""
-
-    runner = getattr(owner, _RUNNER_ATTR, None)
-    if runner is None:
-        runner = denoise_step_graph_runner(owner)
-    return runner.maybe_run_rows(owner, rows, return_hidden=return_hidden)
+    def maybe_run_graph(
+        self,
+        rows: "Sequence[FlowRow]",
+        *,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        return self.graph_runner.maybe_run_rows(
+            self.adapter,
+            rows,
+            return_hidden=return_hidden,
+        )
 
 
 # ---------------------
-# Interleaved image denoise state machine
+# Flow state machine
 # ---------------------
-
-_RESIDUAL_CACHE_POLICY = None
-
-
-def _denoise_residual_cache_policy():
-    """Process-wide policy, resolved from the environment once on first use."""
-    global _RESIDUAL_CACHE_POLICY
-    if _RESIDUAL_CACHE_POLICY is None:
-        _RESIDUAL_CACHE_POLICY = resolve_denoise_residual_cache_policy()
-    return _RESIDUAL_CACHE_POLICY
-
 
 @dataclass
-class ImageState:
+class FlowState:
     """Mutable denoise state for one in-flight image generation request.
 
     The latent trajectory ``x_t`` is not stored on the model state — it lives in
@@ -730,8 +569,8 @@ class ImageState:
     reading/writing that system buffer.
     """
 
-    latent_pool: Any           # system LatentPool (residency.latent)
-    latent_handle: int         # request-scoped handle into the LatentPool
+    latent_pool: Any  # system LatentPool (residency.latent)
+    latent_handle: int  # request-scoped handle into the LatentPool
     schedule: FlowMatchSchedule
     timesteps: torch.Tensor
     token_h: int
@@ -754,10 +593,6 @@ class ImageState:
     height: int
     width: int
     noise_scale_embedding: torch.Tensor | None = None
-    # Timestep-aware residual-reuse state (see denoise_residual_cache); engaged
-    # only when the policy is enabled and the owner supplies an adapter. Rides
-    # the image state so its memory ends with the image commit.
-    residual_cache: ImageResidualCacheState | None = None
 
     @property
     def x_t(self) -> torch.Tensor:
@@ -769,39 +604,43 @@ class ImageState:
 
 
 @dataclass
-class DenoiseRow:
+class FlowRow:
     """One CFG branch of one denoise step queued for batched velocity prediction."""
 
     step_index: int
-    step: TextImageDenoiseStep
+    step: PreparedFlowStep
     branch: str
-    img: ImageState
+    img: FlowState
     indexes: torch.Tensor
     cache: PagedTextCache
 
 
 @dataclass
-class InterleavedImageRequestState:
-    """Per-request interleaved text/image caches and generation state."""
+class ProgramState:
+    """Per-request state shared by composed sequence, flow, and product operations."""
 
     sampling: dict = field(default_factory=dict)
     image: dict = field(default_factory=dict)
     neg_token_ids: list[int] = field(default_factory=list)
-    cond: TextCache = field(default_factory=TextCache)
-    tu: TextCache = field(default_factory=TextCache)
-    iu: TextCache = field(default_factory=TextCache)
-    image_state: ImageState | None = None
+    cond: SequenceCache = field(default_factory=SequenceCache)
+    tu: SequenceCache = field(default_factory=SequenceCache)
+    iu: SequenceCache = field(default_factory=SequenceCache)
+    image_state: FlowState | None = None
     rng: torch.Generator | None = None
 
 
-class TextImageDenoiseOwner(Protocol):
-    """Collaborator surface a concrete model must provide to TextImageDenoiseOps.
+class ProductTransferState(Protocol):
+    """Transfer state consulted while constructing a flow operation."""
 
-    The mixin owns the denoise step/branch/commit flow but delegates model- and
-    cache-specific work back to the concrete owner. Every member declared below
-    is part of the mixin's contract and is called directly: the concrete owner
-    must define all of them, including the ``_denoise`` / ``_wait`` cache and
-    stream hooks.
+    @property
+    def distributed(self) -> bool: ...
+
+
+class FlowAdapter(Protocol):
+    """Family boundary required by system flow execution.
+
+    ``FlowExecution`` owns operation state, branch planning, scheduling, and
+    updates while the adapter supplies family-specific neural computation.
     """
 
     # Collaborator attributes.
@@ -810,9 +649,8 @@ class TextImageDenoiseOwner(Protocol):
     latent_downsample: int
     merge_size: int
     _img_start_token: str
-    residency: Any                 # ResidencyManager; .latent backs ImageState.x_t
-    attention_backend: str         # preferred attention provider ("auto" allowed)
-    _dataplane_handoff: Any | None  # Mode A tower handoff; None on single-device owners
+    residency: Any  # ResidencyManager; .latent backs FlowState.x_t
+    attention_backend: str  # preferred attention provider ("auto" allowed)
 
     # Owner-supplied denoise configuration (models differ only by these enums).
     denoise_schedule_direction: ScheduleDirection
@@ -820,18 +658,16 @@ class TextImageDenoiseOwner(Protocol):
     denoise_cfg_recipe: CfgRecipe
 
     # Collaborator methods.
-    def _state(self, op: dict[str, Any]) -> "InterleavedImageRequestState": ...
-    def _maybe_stage_conditioning_from_op(
-        self, st: "InterleavedImageRequestState", op: dict[str, Any]
-    ) -> None: ...
-    def _extend_cache_blocks(self, cache: "TextCache", op: dict[str, Any]) -> None: ...
-    def _ensure_img_start(self, cache: "TextCache | None") -> None: ...
-    def _prefix_from_query(self, query: str) -> "TextCache": ...
-    def _empty_img_start_prefix(self) -> "TextCache": ...
+    def _state(self, op: dict[str, Any]) -> "ProgramState": ...
+    def _maybe_stage_conditioning_from_op(self, st: "ProgramState", op: dict[str, Any]) -> None: ...
+    def _extend_cache_blocks(self, cache: "SequenceCache", op: dict[str, Any]) -> None: ...
+    def _ensure_img_start(self, cache: "SequenceCache | None") -> None: ...
+    def _prefix_from_query(self, query: str) -> "SequenceCache": ...
+    def _empty_img_start_prefix(self) -> "SequenceCache": ...
     def _denoise_cache(self, cache: Any) -> Any: ...
     def _wait_gen_cache_ready(self, cache: Any) -> None: ...
-    def interleaved_image_query(self, text: str, *, append_text: str) -> str: ...
-    def interleaved_image_indexes(
+    def flow_query(self, text: str, *, append_text: str) -> str: ...
+    def flow_indexes(
         self,
         token_h: int,
         token_w: int,
@@ -839,7 +675,7 @@ class TextImageDenoiseOwner(Protocol):
         *,
         device: Any,
     ) -> torch.Tensor: ...
-    def interleaved_image_predict_velocity(
+    def flow_predict_velocity(
         self,
         image_embeds: torch.Tensor,
         indexes: torch.Tensor,
@@ -861,18 +697,17 @@ class TextImageDenoiseOwner(Protocol):
         image_token_num: int,
         image_size: tuple[int, int] | None,
     ) -> torch.Tensor: ...
-    def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheBinding | None: ...
-    def interleaved_image_patch_size(self) -> int: ...
-    def interleaved_image_features(
+    def image_patch_size(self) -> int: ...
+    def image_features(
         self,
         image_input: torch.Tensor,
         *,
         grid_hw: torch.Tensor,
         gen_model: bool = False,
     ) -> torch.Tensor: ...
-    def interleaved_image_gen_feature_dtype(self) -> torch.dtype: ...
-    def interleaved_image_noise_scale(self, grid_h: int, grid_w: int) -> float: ...
-    def interleaved_image_noise_scale_embedding(
+    def flow_feature_dtype(self) -> torch.dtype: ...
+    def flow_noise_scale(self, grid_h: int, grid_w: int) -> float: ...
+    def flow_noise_scale_embedding(
         self,
         noise_scale: float,
         token_count: int,
@@ -880,88 +715,41 @@ class TextImageDenoiseOwner(Protocol):
         dtype: torch.dtype,
         device: Any,
     ) -> torch.Tensor | None: ...
-    def interleaved_image_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor: ...
+    def flow_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor: ...
 
-    # Mixin methods (from TextImageDenoiseOps) reached through ``self``.
-    def _init_image_state(
-        self, st: "InterleavedImageRequestState", op: dict | None = ...
-    ) -> "ImageState": ...
-    def _parse_image_params(self, ip: dict) -> "_ImageParams": ...
-    def _setup_cfg_caches(
-        self, st: "InterleavedImageRequestState", op: dict | None, params: "_ImageParams"
-    ) -> "TextCache": ...
-    def _build_indexes(
+
+class FlowExecution(FlowGraphExecution):
+    """Implement flow setup, branch batching, velocity prediction, and updates."""
+
+    def __init__(
         self,
-        st: "InterleavedImageRequestState",
-        cond: "TextCache",
-        token_h: int,
-        token_w: int,
-        device: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]: ...
-    def _compute_noise_scale(self, grid_h: int, grid_w: int) -> float: ...
-    def _init_latent(
-        self,
-        st: "InterleavedImageRequestState",
-        params: "_ImageParams",
-        device: Any,
-        noise_scale: float,
-    ) -> torch.Tensor: ...
-    def predict_denoise_velocity(
-        self, step: "TextImageDenoiseStep", branch: str, *, return_hidden: bool = False
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
-    def _denoise_branch_inputs(
-        self, img: "ImageState", branch: str
-    ) -> tuple[torch.Tensor, Any]: ...
-    def _batched_denoise_row_key(self, row: "DenoiseRow") -> "tuple[Any, ...] | None": ...
-    def _batched_paged_denoise_available(
-        self, image_embeds: torch.Tensor, cache: "PagedTextCache"
-    ) -> bool: ...
-    def _predict_v_batched(
-        self,
-        rows: "Sequence[DenoiseRow]",
+        adapter: FlowAdapter,
         *,
-        return_hidden: bool = False,
-        graph_mode: str = "auto",
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None: ...
-    def _predict_v(
-        self,
-        img: "ImageState",
-        image_embeds: torch.Tensor,
-        indexes: torch.Tensor | None,
-        cache: Any,
-        t: torch.Tensor,
-        z: torch.Tensor,
-        *,
-        return_hidden: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
-    def _denoise_residual_state(
-        self, img: "ImageState"
-    ) -> ImageResidualCacheState | None: ...
-    def _predict_row_recorded(
-        self,
-        row: "DenoiseRow",
-        state: ImageResidualCacheState | None,
-    ) -> torch.Tensor: ...
+        transfer: ProductTransferState | None = None,
+    ) -> None:
+        super().__init__(adapter)
+        self.transfer = transfer
 
-
-class TextImageDenoiseOps:
-    """Mixin implementing text/image denoise setup, batching, and velocity prediction."""
+    @property
+    def distributed(self) -> bool:
+        return self.transfer is not None and self.transfer.distributed
 
     def _init_image_state(
-        self: TextImageDenoiseOwner,
-        st: InterleavedImageRequestState,
+        self,
+        st: ProgramState,
         op: dict | None = None,
-    ) -> ImageState:
+    ) -> FlowState:
         ip = st.image or {}
         params = self._parse_image_params(ip)
         cond = self._setup_cfg_caches(st, op, params)
 
-        token_h = params.height // self.latent_downsample
-        token_w = params.width // self.latent_downsample
-        patch_size = self.interleaved_image_patch_size()
+        adapter = self.adapter
+        token_h = params.height // adapter.latent_downsample
+        token_w = params.width // adapter.latent_downsample
+        patch_size = adapter.image_patch_size()
         grid_h = params.height // patch_size
         grid_w = params.width // patch_size
-        device = getattr(self, "gen_device", self.device)
+        device = getattr(adapter, "gen_device", adapter.device)
         indexes_cond, indexes_tu, indexes_iu = self._build_indexes(
             st, cond, token_h, token_w, device
         )
@@ -969,13 +757,13 @@ class TextImageDenoiseOps:
         schedule = FlowMatchSchedule(
             num_steps=params.steps,
             shift=params.timestep_shift,
-            direction=self.denoise_schedule_direction,
-            shift_domain=self.denoise_schedule_shift_domain,
+            direction=adapter.denoise_schedule_direction,
+            shift_domain=adapter.denoise_schedule_shift_domain,
         )
         timesteps = schedule.timesteps(device=device)
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
         noise_scale = self._compute_noise_scale(grid_h, grid_w)
-        noise_scale_embedding = self.interleaved_image_noise_scale_embedding(
+        noise_scale_embedding = adapter.flow_noise_scale_embedding(
             noise_scale,
             token_h * token_w,
             dtype=timesteps.dtype,
@@ -983,14 +771,14 @@ class TextImageDenoiseOps:
         )
 
         x_t = self._init_latent(st, params, device, noise_scale)
-        cond_cache = self._denoise_cache(cond.past)
-        tu_cache = self._denoise_cache(st.tu.past)
-        iu_cache = self._denoise_cache(st.iu.past)
+        cond_cache = adapter._denoise_cache(cond.past)
+        tu_cache = adapter._denoise_cache(st.tu.past)
+        iu_cache = adapter._denoise_cache(st.iu.past)
         # The latent lives in the system-owned LatentPool, keyed by the request
-        # handle; ``ImageState.x_t`` reads/writes that buffer.
+        # handle; ``FlowState.x_t`` reads/writes that buffer.
         latent_handle = int(op["req_id"]) if op and "req_id" in op else id(st)
-        image_state = ImageState(
-            latent_pool=self.residency.latent,
+        image_state = FlowState(
+            latent_pool=adapter.residency.latent,
             latent_handle=latent_handle,
             schedule=schedule,
             timesteps=timesteps,
@@ -1018,96 +806,100 @@ class TextImageDenoiseOps:
         image_state.x_t = x_t  # store the initial noise into the system LatentPool
         return image_state
 
-    def _parse_image_params(self: TextImageDenoiseOwner, ip: dict) -> _ImageParams:
+    def _parse_image_params(self, ip: dict) -> _ImageParams:
         return parse_text_image_generation_params(ip)
 
     def _setup_cfg_caches(
-        self: TextImageDenoiseOwner,
-        st: InterleavedImageRequestState,
+        self,
+        st: ProgramState,
         op: dict | None,
         params: _ImageParams,
-    ) -> TextCache:
+    ) -> SequenceCache:
         """Prepare the cond/text-uncond/img-uncond text caches for denoising.
 
-        Returns the conditioning :class:`TextCache` to use (a fresh image-prompt
+        Returns the conditioning :class:`SequenceCache` to use (a fresh image-prompt
         prefix when ``op`` supplies one, otherwise the request's own ``st.cond``).
         Mutates ``st.tu``/``st.iu`` in place as required by the CFG scales.
         """
         if params.retain_images:
-            self._ensure_img_start(st.cond)
+            self.adapter._ensure_img_start(st.cond)
         cond = st.cond
         image_prompt = (op or {}).get("image_prompt")
         if isinstance(image_prompt, str) and image_prompt.strip():
-            if getattr(self, "_dataplane_handoff", None) is not None:
+            if self.distributed:
                 raise invalid_descriptor(
                     "Mode A cuda_ipc tower split does not support per-op image_prompt overrides yet"
                 )
-            query = self.interleaved_image_query(
+            query = self.adapter.flow_query(
                 image_prompt.strip(),
-                append_text=self._img_start_token,
+                append_text=self.adapter._img_start_token,
             )
-            cond = self._prefix_from_query(query)
+            cond = self.adapter._prefix_from_query(query)
         elif not params.retain_images:
-            self._ensure_img_start(st.cond)
-        cfg_plan = build_text_image_cfg_plan(
+            self.adapter._ensure_img_start(st.cond)
+        cfg_plan = build_flow_cfg_plan(
             cfg_text_scale=params.cfg_text,
             cfg_img_scale=params.cfg_img,
-            recipe=self.denoise_cfg_recipe,
+            recipe=self.adapter.denoise_cfg_recipe,
             renorm=params.cfg_norm,
             renorm_min=params.cfg_renorm_min,
         )
         needs_text_uncond = Branch.TEXT_UNCOND in cfg_plan.branches
         if needs_text_uncond and st.tu.past is None:
-            if getattr(self, "_dataplane_handoff", None) is not None:
-                raise invalid_descriptor("Mode A denoise is missing pre-staged text-unconditional CFG KV")
-            st.tu = self._empty_img_start_prefix()
+            if self.distributed:
+                raise invalid_descriptor(
+                    "Mode A denoise is missing pre-staged text-unconditional CFG KV"
+                )
+            st.tu = self.adapter._empty_img_start_prefix()
         elif needs_text_uncond:
-            self._ensure_img_start(st.tu)
+            self.adapter._ensure_img_start(st.tu)
         needs_img_uncond = Branch.IMG_UNCOND in cfg_plan.branches
         if needs_img_uncond and st.iu.past is None:
-            if getattr(self, "_dataplane_handoff", None) is not None:
-                raise invalid_descriptor("Mode A denoise is missing pre-staged image-unconditional CFG KV")
-            st.iu = self._empty_img_start_prefix()
+            if self.distributed:
+                raise invalid_descriptor(
+                    "Mode A denoise is missing pre-staged image-unconditional CFG KV"
+                )
+            st.iu = self.adapter._empty_img_start_prefix()
         elif needs_img_uncond:
-            self._ensure_img_start(st.iu)
+            self.adapter._ensure_img_start(st.iu)
         return cond
 
     def _build_indexes(
-        self: TextImageDenoiseOwner,
-        st: InterleavedImageRequestState,
-        cond: TextCache,
+        self,
+        st: ProgramState,
+        cond: SequenceCache,
         token_h: int,
         token_w: int,
         device: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        indexes_cond = self.interleaved_image_indexes(
-            token_h, token_w, cond.t_index + 1, device=device
-        )
+        indexes_cond = self.adapter.flow_indexes(token_h, token_w, cond.t_index + 1, device=device)
         indexes_tu = (
-            self.interleaved_image_indexes(token_h, token_w, st.tu.t_index + 1, device=device)
+            self.adapter.flow_indexes(token_h, token_w, st.tu.t_index + 1, device=device)
             if st.tu.past is not None
             else None
         )
         indexes_iu = (
-            self.interleaved_image_indexes(token_h, token_w, st.iu.t_index + 1, device=device)
+            self.adapter.flow_indexes(token_h, token_w, st.iu.t_index + 1, device=device)
             if st.iu.past is not None
             else None
         )
         return indexes_cond, indexes_tu, indexes_iu
 
-    def _compute_noise_scale(self: TextImageDenoiseOwner, grid_h: int, grid_w: int) -> float:
-        return self.interleaved_image_noise_scale(grid_h, grid_w)
+    def _compute_noise_scale(self, grid_h: int, grid_w: int) -> float:
+        return self.adapter.flow_noise_scale(grid_h, grid_w)
 
     def _init_latent(
-        self: TextImageDenoiseOwner,
-        st: InterleavedImageRequestState,
+        self,
+        st: ProgramState,
         params: _ImageParams,
         device: Any,
         noise_scale: float,
     ) -> torch.Tensor:
         if st.rng is None:
             seed = params.seed
-            st.rng = torch.Generator(device=device).manual_seed(int(seed if seed is not None else 0))
+            st.rng = torch.Generator(device=device).manual_seed(
+                int(seed if seed is not None else 0)
+            )
         if st.cond.last_logits is None:
             raise model_execution_error("image denoise requires conditional text logits")
         dtype = st.cond.last_logits.dtype
@@ -1119,53 +911,52 @@ class TextImageDenoiseOps:
             scale=noise_scale,
         )
 
-    def prepare_denoise_step(
-        self: TextImageDenoiseOwner, req_id: int, state: Any, op: dict
-    ) -> TextImageDenoiseStep:
+    def prepare_flow_step(self, req_id: int, state: Any, op: dict) -> PreparedFlowStep:
         ctx = get_forward_context()
         start = ctx.component_timer_start()
-        st = self._state(dict(op))
+        adapter = self.adapter
+        st = adapter._state(dict(op))
         # Mode A (tower disaggregation): the gen pool never ran the und text, so
         # rebuild st.cond from the conditioning KV the und pool published (carried
         # on op["locator"]). A no-op in Mode C / single-device.
-        self._maybe_stage_conditioning_from_op(st, op)
-        self._extend_cache_blocks(st.cond, op)
+        adapter._maybe_stage_conditioning_from_op(st, op)
+        adapter._extend_cache_blocks(st.cond, op)
         if st.image_state is None:
             st.image_state = self._init_image_state(st, op)
         img = st.image_state
         step_i = int(op.get("timestep_idx") or 0)
-        ctx.record_component_elapsed("interleaved_denoise_prepare_state", start)
+        ctx.record_component_elapsed("flow_prepare_state", start)
         # Gen-tower feature extraction and timestep embedding run on the gen
         # coordinate's device (the gen modules are Pinned there); the tower
         # transport, not a dedicated stream, orders the und->gen handoff.
-        device = getattr(self, "gen_device", self.device)
+        device = getattr(adapter, "gen_device", adapter.device)
         t, t_next = img.schedule.pair(step_i, device=device, dtype=img.timesteps.dtype)
         start = ctx.component_timer_start()
-        z = patchify_batch(img.x_t, self.latent_downsample)
+        z = patchify_batch(img.x_t, adapter.latent_downsample)
         image_input = patchify_batch(
             img.x_t,
-            self.interleaved_image_patch_size(),
+            adapter.image_patch_size(),
             channel_first=True,
         )
         image_input = image_input.to(
             device=device,
-            dtype=self.interleaved_image_gen_feature_dtype(),
+            dtype=adapter.flow_feature_dtype(),
         )
-        ctx.record_component_elapsed("interleaved_denoise_patchify", start)
+        ctx.record_component_elapsed("flow_patchify", start)
         start = ctx.component_timer_start()
-        image_embeds = self.interleaved_image_features(
+        image_embeds = adapter.image_features(
             image_input.view(1 * img.grid_h * img.grid_w, -1),
             gen_model=True,
             grid_hw=img.grid_hw,
         ).view(1, img.token_h * img.token_w, -1)
-        ctx.record_component_elapsed("interleaved_denoise_vision_feature", start)
+        ctx.record_component_elapsed("flow_vision_feature", start)
         start = ctx.component_timer_start()
         t_expanded = t.expand(img.token_h * img.token_w)
-        timestep_embeddings = self.interleaved_image_timestep_embeddings(t_expanded).view(
+        timestep_embeddings = adapter.flow_timestep_embeddings(t_expanded).view(
             1, img.token_h * img.token_w, -1
         )
         if img.noise_scale_embedding is None:
-            img.noise_scale_embedding = self.interleaved_image_noise_scale_embedding(
+            img.noise_scale_embedding = adapter.flow_noise_scale_embedding(
                 img.noise_scale,
                 img.token_h * img.token_w,
                 dtype=t_expanded.dtype,
@@ -1174,9 +965,9 @@ class TextImageDenoiseOps:
         if img.noise_scale_embedding is not None:
             timestep_embeddings += img.noise_scale_embedding
         image_embeds = image_embeds + timestep_embeddings
-        ctx.record_component_elapsed("interleaved_denoise_timestep_embed", start)
+        ctx.record_component_elapsed("flow_timestep_embed", start)
         total = int(img.schedule.num_steps)
-        return TextImageDenoiseStep(
+        return PreparedFlowStep(
             req_id=int(req_id),
             state=state,
             op=op,
@@ -1190,17 +981,17 @@ class TextImageDenoiseOps:
             cfg_interval=img.cfg_interval,
             cfg_renorm_type=img.cfg_norm,
             cfg_renorm_min=img.cfg_renorm_min,
-            cfg_branch_count=text_image_cfg_branch_count(op),
-            image_scale_applies_to_text=self.denoise_cfg_recipe,
+            cfg_branch_count=flow_cfg_branch_count(op),
+            image_scale_applies_to_text=adapter.denoise_cfg_recipe,
             extra={
                 "img": img,
                 "image_embeds": image_embeds,
             },
         )
 
-    def predict_denoise_velocity(
-        self: TextImageDenoiseOwner,
-        step: TextImageDenoiseStep,
+    def predict_flow_velocity(
+        self,
+        step: PreparedFlowStep,
         branch: str,
         *,
         return_hidden: bool = False,
@@ -1217,132 +1008,46 @@ class TextImageDenoiseOps:
             return_hidden=return_hidden,
         )
 
-    def _denoise_residual_state(
-        self: TextImageDenoiseOwner, img: ImageState
-    ) -> ImageResidualCacheState | None:
-        policy = _denoise_residual_cache_policy()
-        adapter = self.denoise_residual_cache_adapter()
-        if adapter is None or not policy.active(adapter):
-            return None
-        state = img.residual_cache
-        if state is None:
-            state = ImageResidualCacheState(
-                threshold=policy.threshold,
-                coefficients=adapter.rescale_coefficients,
-            )
-            img.residual_cache = state
-        return state
-
-    def denoise_residual_cache_adapter(
-        self: TextImageDenoiseOwner,
-    ) -> DenoiseResidualCacheBinding | None:
-        """Default: no residual-reuse adapter — the cache never engages."""
-        return None
-
-    def _predict_row_recorded(
-        self: TextImageDenoiseOwner,
-        row: DenoiseRow,
-        state: ImageResidualCacheState | None,
-    ) -> torch.Tensor:
-        if state is None:
-            velocity = self.predict_denoise_velocity(row.step, row.branch)
-            assert isinstance(velocity, torch.Tensor)
-            return velocity
-        velocity, hidden = self.predict_denoise_velocity(
-            row.step, row.branch, return_hidden=True
-        )
-        state.record(str(row.branch), row.step.extra["image_embeds"], hidden)
+    def _predict_row(self, row: FlowRow) -> torch.Tensor:
+        velocity = self.predict_flow_velocity(row.step, row.branch)
+        assert isinstance(velocity, torch.Tensor)
         return velocity
 
-    def predict_text_image_velocity_batch(
-        self: TextImageDenoiseOwner,
-        steps: Sequence[TextImageDenoiseStep],
+    def predict_flow_velocity_batch(
+        self,
+        steps: Sequence[PreparedFlowStep],
         branches_by_step: Sequence[Sequence[str]],
         *,
         graph_mode: str = "auto",
     ) -> list[dict[str, torch.Tensor]] | None:
         results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
-        rows: list[DenoiseRow] = []
-        states: dict[int, ImageResidualCacheState | None] = {}
+        rows: list[FlowRow] = []
         for step_index, (step, branches) in enumerate(zip(steps, branches_by_step)):
             img = step.extra["img"]
-            state = self._denoise_residual_state(img)
-            states[step_index] = state
-            if state is not None:
-                adapter = self.denoise_residual_cache_adapter()
-                assert adapter is not None
-                image_embeds = step.extra["image_embeds"]
-                decision = adapter.decision_embedding(image_embeds)
-                if state.decide_reuse(decision, tuple(str(b) for b in branches)):
-                    if graph_mode == "require":
-                        return None
-                    # Replay: pre-norm hidden ≈ input embeds + previous
-                    # residual, re-finalized (final norm), then the ordinary
-                    # hidden→velocity head. No backbone forward.
-                    for branch in branches:
-                        hidden = adapter.finalize_hidden(
-                            state.replay(str(branch), image_embeds)
-                        )
-                        results[step_index][branch] = self.packed_hidden_to_velocity(
-                            hidden,
-                            step.t,
-                            step.latent,
-                            image_token_num=img.token_h * img.token_w,
-                            image_size=(img.width, img.height),
-                        )
-                    continue
             for branch in branches:
                 indexes, cache = self._denoise_branch_inputs(img, branch)
                 if not isinstance(cache, PagedTextCache):
                     if graph_mode == "require":
                         return None
-                    results[step_index][branch] = self._predict_row_recorded(
-                        DenoiseRow(step_index, step, branch, img, indexes, cache), state
+                    results[step_index][branch] = self._predict_row(
+                        FlowRow(step_index, step, branch, img, indexes, cache)
                     )
                     continue
-                rows.append(DenoiseRow(step_index, step, branch, img, indexes, cache))
+                rows.append(FlowRow(step_index, step, branch, img, indexes, cache))
 
-        def predict_group(group: Sequence[DenoiseRow]) -> bool:
-            record = any(states.get(row.step_index) is not None for row in group)
-            if record:
-                predicted = self._predict_v_batched(
-                    group,
-                    return_hidden=True,
-                    graph_mode=graph_mode,
-                )
-                if predicted is None:
-                    if graph_mode == "require":
-                        return False
-                    for row in group:
-                        results[row.step_index][row.branch] = self._predict_row_recorded(
-                            row,
-                            states.get(row.step_index),
-                        )
-                    return True
-                batched, hidden = predicted
-            else:
-                batched = self._predict_v_batched(group, graph_mode=graph_mode)
-                if batched is None:
-                    if graph_mode == "require":
-                        return False
-                    for row in group:
-                        results[row.step_index][row.branch] = self._predict_row_recorded(
-                            row,
-                            states.get(row.step_index),
-                        )
-                    return True
-                hidden = None
+        def predict_group(group: Sequence[FlowRow]) -> bool:
+            batched = self._predict_v_batched(group, graph_mode=graph_mode)
+            if batched is None:
+                if graph_mode == "require":
+                    return False
+                for row in group:
+                    results[row.step_index][row.branch] = self._predict_row(row)
+                return True
+            assert isinstance(batched, torch.Tensor)
             for row_index, row in enumerate(group):
                 results[row.step_index][row.branch] = batched[
                     row_index : row_index + 1
                 ].contiguous()
-                state = states.get(row.step_index)
-                if state is not None and hidden is not None:
-                    state.record(
-                        str(row.branch),
-                        row.step.extra["image_embeds"],
-                        hidden[row_index : row_index + 1].contiguous(),
-                    )
             return True
 
         if len(rows) == 1:
@@ -1350,15 +1055,13 @@ class TextImageDenoiseOps:
                 return None
             return results
 
-        grouped: dict[tuple[Any, ...], list[DenoiseRow]] = {}
+        grouped: dict[tuple[Any, ...], list[FlowRow]] = {}
         for row in rows:
             key = self._batched_denoise_row_key(row)
             if key is None:
                 if graph_mode == "require":
                     return None
-                results[row.step_index][row.branch] = self._predict_row_recorded(
-                    row, states.get(row.step_index)
-                )
+                results[row.step_index][row.branch] = self._predict_row(row)
                 continue
             grouped.setdefault(key, []).append(row)
 
@@ -1367,7 +1070,7 @@ class TextImageDenoiseOps:
                 return None
         return results
 
-    def _denoise_branch_inputs(self, img: ImageState, branch: str) -> tuple[torch.Tensor, Any]:
+    def _denoise_branch_inputs(self, img: FlowState, branch: str) -> tuple[torch.Tensor, Any]:
         # ``Branch`` is a ``str`` Enum, so this mapping resolves both ``Branch``
         # members and the equivalent bare strings ("cond"/"text_uncond"/
         # "img_uncond") to the same entry.
@@ -1384,7 +1087,7 @@ class TextImageDenoiseOps:
             raise model_execution_error("required CFG cache is not initialized")
         return indexes, cache
 
-    def _batched_denoise_row_key(self, row: DenoiseRow) -> tuple[Any, ...] | None:
+    def _batched_denoise_row_key(self, row: FlowRow) -> tuple[Any, ...] | None:
         step = row.step
         img = row.img
         indexes = row.indexes
@@ -1422,12 +1125,12 @@ class TextImageDenoiseOps:
         return can_run_paged_denoise_attention(
             cache,
             prototype=image_embeds,
-            attention_backend=getattr(self, "attention_backend", "auto"),
+            attention_backend=getattr(self.adapter, "attention_backend", "auto"),
         )
 
     def _predict_v_batched(
-        self: TextImageDenoiseOwner,
-        rows: Sequence[DenoiseRow],
+        self,
+        rows: Sequence[FlowRow],
         *,
         return_hidden: bool = False,
         graph_mode: str = "auto",
@@ -1435,12 +1138,12 @@ class TextImageDenoiseOps:
         first = rows[0]
         img = first.img
         for row in rows:
-            self._wait_gen_cache_ready(row.cache)
+            self.adapter._wait_gen_cache_ready(row.cache)
         # Capture or replay the whole compatible batched step as one CUDA graph.
         # Strict unified-forward callers use ``graph_mode="require"`` and reject
         # the batch when its geometry is not covered.
         if graph_mode != "eager":
-            graphed = maybe_run_denoise_step_graph(self, rows, return_hidden=return_hidden)
+            graphed = self.maybe_run_graph(rows, return_hidden=return_hidden)
             if graphed is not None:
                 return graphed
             if graph_mode == "require":
@@ -1459,20 +1162,18 @@ class TextImageDenoiseOps:
             return_hidden=return_hidden,
         )
 
-    def apply_denoise_update(
-        self: TextImageDenoiseOwner, step: TextImageDenoiseStep, latent: torch.Tensor
-    ) -> None:
+    def apply_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None:
         img = step.extra["img"]
         img.x_t = unpatchify_batch(
             latent,
-            self.latent_downsample,
+            self.adapter.latent_downsample,
             height=img.height,
             width=img.width,
         )
 
     def _predict_v(
-        self: TextImageDenoiseOwner,
-        img: ImageState,
+        self,
+        img: FlowState,
         image_embeds: torch.Tensor,
         indexes: torch.Tensor | None,
         cache: Any,
@@ -1484,8 +1185,8 @@ class TextImageDenoiseOps:
         if indexes is None or cache is None:
             raise model_execution_error("required CFG cache is not initialized")
         # B2: wait the snapshot's readiness before the gen tower reads the replica.
-        self._wait_gen_cache_ready(cache)
-        return self.interleaved_image_predict_velocity(
+        self.adapter._wait_gen_cache_ready(cache)
+        return self.adapter.flow_predict_velocity(
             image_embeds,
             indexes,
             {"full_attention": None},

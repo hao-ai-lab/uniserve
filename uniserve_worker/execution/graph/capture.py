@@ -142,7 +142,7 @@ def _share_input_buffer(
 ) -> torch.Tensor:
     """Pool input buffers by (name, dtype, device), slicing into the largest.
 
-    Production runners usually capture buckets largest-first, but interleaved
+    Production runners usually capture buckets largest-first, but independently
     decode captures lazily from live request batches. If a larger bucket arrives
     after a smaller one, install the larger tensor for future captures; already
     captured graph states keep their own tensor references, so their captured
@@ -189,6 +189,25 @@ class Runner:
     disabled: set[Any]
     _capture_pool: Any
     _graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor]
+
+    def __init__(
+        self,
+        *,
+        name: str = "graph",
+        default_enabled: bool = True,
+        default_warmup: bool = False,
+        metric_prefix: str = _DEFAULT_METRIC_PREFIX,
+        logger: Any = None,
+    ) -> None:
+        self.name = str(name)
+        self.default_enabled = bool(default_enabled)
+        self.default_warmup = bool(default_warmup)
+        self.metric_prefix = str(metric_prefix)
+        self.logger = logger
+        self.states = {}
+        self.disabled = set()
+        self._capture_pool = None
+        self._graph_input_buffer_pool = {}
 
     def enabled(self) -> bool:
         return self.default_enabled
@@ -392,3 +411,81 @@ class Runner:
                     disable(bucket, exc)
         if self.states:
             torch.cuda.synchronize(device)
+
+
+class FailureManagedRunner(Runner):
+    """Add bounded failure handling to lazily captured physical paths."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        default_enabled: bool,
+        default_warmup: bool,
+        metric_prefix: str = _DEFAULT_METRIC_PREFIX,
+        logger: Any = None,
+        max_failures: int = 2,
+    ) -> None:
+        super().__init__(
+            name=name,
+            default_enabled=default_enabled,
+            default_warmup=default_warmup,
+            metric_prefix=metric_prefix,
+            logger=logger,
+        )
+        self.max_failures = int(max_failures)
+        self._failures = 0
+        self._hard_disabled = False
+        self._backend_ineligible = False
+        self._replays = 0
+
+    def enabled(self) -> bool:
+        return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
+
+    def reject_backend(self) -> None:
+        """Disable this path when its selected backend cannot support capture."""
+
+        self._backend_ineligible = True
+
+    @staticmethod
+    def record_event(ctx: Any, event: Event, tokens: int) -> None:
+        record(
+            ctx,
+            event,
+            unpadded_tokens=int(tokens),
+            padded_tokens=int(tokens),
+        )
+
+    def replay_completed(self) -> bool:
+        """Record a successful replay and report whether it is the first one."""
+
+        self._replays += 1
+        return self._replays == 1
+
+    def before_disable(self, key: Any) -> None:
+        """Allow a path to detach key-specific bookkeeping before retirement."""
+
+        del key
+
+    def disable_state(self, key: Any, exc: BaseException) -> None:
+        """Retire a failed state and hard-disable after repeated failures."""
+
+        self.disabled.add(key)
+        self.before_disable(key)
+        state = self.states.pop(key, None)
+        if state is not None:
+            try:
+                self._destroy_graph_state(state)
+            except Exception:  # pragma: no cover - defensive release
+                pass
+        self._failures += 1
+        if self._failures >= self.max_failures:
+            self._hard_disabled = True
+        if self.logger is not None:
+            self.logger.warning(
+                "disabling %s CUDA graph (%s failure(s)%s): %s",
+                self.name,
+                self._failures,
+                "; runner hard-disabled" if self._hard_disabled else "",
+                exc,
+            )

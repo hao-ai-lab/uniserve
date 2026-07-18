@@ -1,10 +1,9 @@
-"""Interleaved text family runtime: per-branch caches, token stepping, graphs.
+"""System-owned sequence execution over paged recurrent state.
 
-Family-owned machinery for interleaved (text+image) generation shared by the
-BAGEL and SenseNova adapters: the paged ``TextCache`` per request branch, the
-``InterleavedTextCacheDriver`` that steps text tokens over paged KV, and the
-interleaved decode/prefill CUDA-graph runners built on the shared primitives
-in ``execution.graph``.
+``SequenceExecutor`` advances sequence operations for any family adapter, while
+``Span`` and ``Step`` lower eligible prefill and decode shapes onto the shared
+graph primitives. Sequence execution is independent of the workload profile
+that produced the operation.
 """
 
 from __future__ import annotations
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
 # ---------------------
 # Text caches and token stepping
 # ---------------------
+
 
 def resolve_op_token_ids(op: Mapping[str, Any]) -> list[int]:
     """Resolve one op's input token ids, synchronizing a pending relay if needed.
@@ -96,8 +96,8 @@ def hydrate_cached_prefix_from_op(cache: Any, op: Mapping[str, Any]) -> None:
     cache.t_index = start - 1
 
 
-class TextCache:
-    """Paged text KV cache and decode state for one interleaved branch.
+class SequenceCache:
+    """Paged recurrent cache and decode state for one sequence branch.
 
     ``last_token_id`` may be committed either as a resolved CPU int or as a
     pending device relay tensor (the pipelined decode burst commits the tensor
@@ -130,15 +130,11 @@ class TextCache:
         self._last_token_tensor = tensor
 
 
-class InterleavedModelOwner(Protocol):
-    """Collaborator surface a concrete model must provide to the interleaved
-    text/image cache and commit drivers.
+class SequenceAdapter(Protocol):
+    """Family boundary required by system sequence and product execution.
 
-    ``InterleavedTextCacheDriver`` owns the cache-append flow (and
-    ``interleaved_image_commit.GeneratedImageCommitOwner`` extends this surface
-    for the commit driver) but delegates model- and pool-specific work back
-    to the concrete owner through the members declared here. Every member is part
-    of the drivers' contract; the concrete owner must define all of them.
+    ``SequenceExecutor`` owns cache mutation and operation progression while
+    the adapter supplies family-specific embeddings and neural computation.
     """
 
     @property
@@ -168,7 +164,7 @@ class InterleavedModelOwner(Protocol):
     # Collaborator methods. Model-specific state types (the request state / image
     # state) are kept ``Any`` here: this system component is duck-typed against the
     # concrete model and must not name model-layer types.
-    def interleaved_text_forward(
+    def sequence_forward(
         self,
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -181,15 +177,15 @@ class InterleavedModelOwner(Protocol):
         causal_paged_update: bool = False,
         return_all_logits: bool = False,
     ) -> Any: ...
-    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+    def sequence_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
 
 
-class InterleavedTextCacheDriver:
+class SequenceExecutor:
     """Own text prefill/decode cache appends for native decoder models."""
 
     def __init__(
         self,
-        owner: InterleavedModelOwner,
+        owner: SequenceAdapter,
         *,
         request_state_factory: Callable[[], Any],
         image_start_token: str,
@@ -202,7 +198,7 @@ class InterleavedTextCacheDriver:
 
     def state(self, op: Mapping[str, Any]) -> Any:
         req_id = int(op["req_id"])
-        hook = getattr(self.owner, "interleaved_image_state", None)
+        hook = getattr(self.owner, "program_state", None)
         if callable(hook):
             return hook(req_id)
         return self.owner.reqs.setdefault(req_id, self.request_state_factory())
@@ -305,7 +301,7 @@ class InterleavedTextCacheDriver:
             self._span_runner = runner
         return runner
 
-    def extend_cache_blocks(self, cache: TextCache, op: Mapping[str, Any]) -> None:
+    def extend_cache_blocks(self, cache: SequenceCache, op: Mapping[str, Any]) -> None:
         # Host-issued KV block ids belong only to host-KV caches. Scratch caches
         # use worker-local block ids and must not ingest host ids.
         if cache.past is None or getattr(cache.past, "pool", None) is self.owner.kv_pool:
@@ -313,7 +309,7 @@ class InterleavedTextCacheDriver:
         if cache.past is not None and getattr(cache.past, "pool", None) is self.owner.kv_pool:
             cache.past.set_blocks(cache.block_ids)
 
-    def ensure_host_cache(self, cache: TextCache) -> None:
+    def ensure_host_cache(self, cache: SequenceCache) -> None:
         if cache.past is not None:
             return
         if self.owner.kv_pool is None:
@@ -324,7 +320,7 @@ class InterleavedTextCacheDriver:
             num_layers=self.owner.num_layers,
         )
 
-    def ensure_scratch_cache(self, cache: TextCache) -> None:
+    def ensure_scratch_cache(self, cache: SequenceCache) -> None:
         if cache.past is not None:
             return
         if self.owner.scratch_pool is None:
@@ -342,7 +338,7 @@ class InterleavedTextCacheDriver:
 
     def prefix_forward_ids(
         self,
-        cache: TextCache,
+        cache: SequenceCache,
         tokens: list[int],
         start: int = 0,
         *,
@@ -356,7 +352,7 @@ class InterleavedTextCacheDriver:
         past_len = cache.past.get_seq_length()
         mask = torch.zeros(1, 1, seq_len, past_len + seq_len, device=self.owner.device)
         mask[:, :, :, past_len:] = create_causal_mask(seq_len, device=self.owner.device)
-        outputs = self.owner.interleaved_text_forward(
+        outputs = self.owner.sequence_forward(
             input_ids=input_ids,
             indexes=indexes,
             text_only_rope=True,
@@ -370,14 +366,14 @@ class InterleavedTextCacheDriver:
         cache.last_logits = outputs.logits
         cache.last_token_id = int(tokens[-1])
 
-    def prefix_from_query(self, query: str) -> TextCache:
-        cache = TextCache()
+    def prefix_from_query(self, query: str) -> SequenceCache:
+        cache = SequenceCache()
         self.ensure_scratch_cache(cache)
-        build_inputs = getattr(self.owner, "interleaved_text_inputs", None)
+        build_inputs = getattr(self.owner, "sequence_inputs", None)
         if not callable(build_inputs):
             raise model_execution_error("model does not support worker-side text tokenization")
         ids, indexes, attn = build_inputs(query)
-        outputs = self.owner.interleaved_text_forward(
+        outputs = self.owner.sequence_forward(
             input_ids=ids,
             indexes=indexes,
             attention_mask=attn,
@@ -392,19 +388,19 @@ class InterleavedTextCacheDriver:
 
     def append_ids(
         self,
-        cache: TextCache,
+        cache: SequenceCache,
         tokens: list[int],
         *,
         return_all_logits: bool = False,
     ) -> None:
         input_ids = torch.tensor([tokens], dtype=torch.long, device=self.owner.device)
         seq_len = input_ids.shape[1]
-        embeds = self.owner.interleaved_text_embeddings(input_ids)
+        embeds = self.owner.sequence_embeddings(input_ids)
         indexes = self.text_indexes(cache.t_index + 1, seq_len)
         past_len = cache.past.get_seq_length()
         mask = torch.zeros(1, 1, seq_len, past_len + seq_len, device=self.owner.device)
         mask[:, :, :, past_len:] = create_causal_mask(seq_len, device=self.owner.device)
-        outputs = self.owner.interleaved_text_forward(
+        outputs = self.owner.sequence_forward(
             inputs_embeds=embeds,
             indexes=indexes,
             text_only_rope=True,
@@ -418,10 +414,10 @@ class InterleavedTextCacheDriver:
         cache.last_logits = outputs.logits
         cache.last_token_id = int(tokens[-1])
 
-    def append_one(self, cache: TextCache, token_id: int) -> None:
+    def append_one(self, cache: SequenceCache, token_id: int) -> None:
         ids = torch.tensor([token_id], dtype=torch.long, device=self.owner.device)
         indexes = self.text_indexes(cache.t_index + 1, 1)
-        outputs = self.owner.interleaved_text_forward(
+        outputs = self.owner.sequence_forward(
             input_ids=ids.unsqueeze(0),
             indexes=indexes,
             past_key_values=cache.past,
@@ -433,13 +429,13 @@ class InterleavedTextCacheDriver:
         cache.last_logits = outputs.logits
         cache.last_token_id = int(token_id)
 
-    def ensure_img_start(self, cache: TextCache | None) -> None:
+    def ensure_img_start(self, cache: SequenceCache | None) -> None:
         if cache is None or cache.past is None or cache.last_token_id == self.owner.img_start_id:
             return
         self.append_one(cache, int(self.owner.img_start_id))
 
-    def empty_img_start_prefix(self) -> TextCache:
-        build_query = getattr(self.owner, "interleaved_empty_image_start_query", None)
+    def empty_img_start_prefix(self) -> SequenceCache:
+        build_query = getattr(self.owner, "empty_image_start_query", None)
         if not callable(build_query):
             raise model_execution_error("model does not support an empty image-start prefix")
         query = str(build_query(self.image_start_token))
@@ -449,16 +445,11 @@ class InterleavedTextCacheDriver:
         return build_text_position_indexes(int(start), int(seq_len), self.owner.device)
 
 
-# The design's vocabulary name for this system component.
-InterleavedTextStepper = InterleavedTextCacheDriver
-
-
 # ---------------------
-# Interleaved text decode/prefill graph runners
+# Sequence decode/prefill graph runners
 # ---------------------
 
 logger = logging.getLogger(__name__)
-
 
 
 def _owner_max_context_len(owner: Any, pool: Any) -> int:
@@ -482,7 +473,7 @@ def _owner_max_context_len(owner: Any, pool: Any) -> int:
     )
 
 
-class _InterleavedDecodeGraphPast:
+class _SequenceDecodeGraphPast:
     """Native-language-model ``past_key_values`` bound to a shared graph cache.
 
     Presents the paged-update protocol the native decoder attention expects, but
@@ -506,7 +497,7 @@ class _InterleavedDecodeGraphPast:
 
     def request_cache_for_update(self, layer_idx: int, n_tokens: int) -> BatchedPagedRequestCache:
         if int(n_tokens) != 1:
-            raise invalid_descriptor("interleaved decode graph requires exactly one token per row")
+            raise invalid_descriptor("sequence decode graph requires exactly one token per row")
         return self.cache
 
     def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
@@ -518,9 +509,9 @@ class _InterleavedDecodeGraphPast:
 
 @dataclass
 class _Sidecar:
-    """Per-graph-state stable adapter the interleaved language-model closure reads."""
+    """Per-graph-state stable adapter read by the sequence closure."""
 
-    past: _InterleavedDecodeGraphPast
+    past: _SequenceDecodeGraphPast
 
 
 @dataclass
@@ -532,7 +523,7 @@ class _Row:
     synchronizes on the token value.
     """
 
-    text_cache: "TextCache"
+    text_cache: "SequenceCache"
     past_cache: PagedTextCache
     token_id: int | None
     pos: int
@@ -541,7 +532,7 @@ class _Row:
     token_tensor: torch.Tensor | None = None
 
 
-class _InterleavedPrefillGraphPast:
+class _SequencePrefillGraphPast:
     """Native-language-model ``past_key_values`` bound to a prefill graph cache."""
 
     supports_batched_paged = True
@@ -556,7 +547,7 @@ class _InterleavedPrefillGraphPast:
 
     def request_cache_for_update(self, layer_idx: int, n_tokens: int) -> BatchedPagedRequestCache:
         if int(n_tokens) <= 0:
-            raise invalid_descriptor("interleaved prefill graph requires positive token count")
+            raise invalid_descriptor("sequence prefill graph requires positive token count")
         return self.cache
 
     def finish_layer_update(self, layer_idx: int, n_tokens: int) -> None:
@@ -568,14 +559,14 @@ class _InterleavedPrefillGraphPast:
 
 @dataclass
 class _PrefillSidecar:
-    """Per-graph-state stable adapter for interleaved prefill replay."""
+    """Per-graph-state stable adapter for sequence prefill replay."""
 
-    past: _InterleavedPrefillGraphPast
+    past: _SequencePrefillGraphPast
 
 
 @dataclass
 class _PrefillRow:
-    text_cache: "TextCache"
+    text_cache: "SequenceCache"
     past_cache: PagedTextCache
     tokens: list[int]
     base_len: int
@@ -584,12 +575,12 @@ class _PrefillRow:
 
 
 class Span:
-    """Route interleaved text prefill through the shared prefill graph."""
+    """Route sequence prefill through the shared prefill graph."""
 
     def __init__(self) -> None:
         runtime = get_execution_config()
         self._runner = SpanCapture(
-            name="interleaved_text",
+            name="sequence",
             default_enabled=runtime.prefill_cuda_graph,
             default_warmup=False,
             default_warmup_token_buckets=runtime.prefill_cuda_graph_warmup_tokens,
@@ -602,10 +593,10 @@ class Span:
 
     def maybe_run_batch(
         self,
-        driver: "InterleavedTextCacheDriver",
+        driver: "SequenceExecutor",
         ops: Sequence[Mapping[str, Any]],
     ) -> list[torch.Tensor] | None:
-        """Capture/replay a single interleaved text extend row, or return ``None``."""
+        """Capture/replay a single sequence extend row, or return ``None``."""
 
         prep = self._prepare(driver, ops)
         if prep is None:
@@ -631,14 +622,14 @@ class Span:
         self._graphed_steps += 1
         if self._graphed_steps == 1:
             logger.info(
-                "interleaved text prefill CUDA graph active: captured bucket(s)=%s (shared Span)",
+                "sequence prefill CUDA graph active: captured bucket(s)=%s (shared Span)",
                 sorted(self._runner.states),
             )
         return self._commit(rows, logits)
 
     def _prepare(
         self,
-        driver: "InterleavedTextCacheDriver",
+        driver: "SequenceExecutor",
         ops: Sequence[Mapping[str, Any]],
     ) -> tuple[list[_PrefillRow], dict[str, Any], Any] | None:
         if not self._runner.enabled() or not torch.cuda.is_available():
@@ -773,17 +764,17 @@ class Span:
     def _sidecar_for(self, state: SpanState) -> _PrefillSidecar:
         sidecar = self._sidecars.get(id(state))
         if sidecar is None:
-            sidecar = _PrefillSidecar(past=_InterleavedPrefillGraphPast(state.cache))
+            sidecar = _PrefillSidecar(past=_SequencePrefillGraphPast(state.cache))
             self._sidecars[id(state)] = sidecar
         return sidecar
 
     def _forward(
         self,
-        driver: "InterleavedTextCacheDriver",
+        driver: "SequenceExecutor",
         state: SpanState,
     ) -> torch.Tensor:
         sidecar = self._sidecar_for(state)
-        outputs = driver.owner.interleaved_text_forward(
+        outputs = driver.owner.sequence_forward(
             input_ids=state.input_ids.reshape(1, int(state.num_tokens)),
             cache_position=state.positions,
             past_key_values=sidecar.past,
@@ -794,7 +785,7 @@ class Span:
         )
         logits = outputs.logits
         if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
-            raise invalid_descriptor("interleaved prefill graph must return batched logits")
+            raise invalid_descriptor("sequence prefill graph must return batched logits")
         batch = int(state.batch_size)
         indices = state.last_token_indices[:batch].to(device=logits.device, dtype=torch.long)
         return logits.reshape(-1, int(logits.shape[-1])).index_select(0, indices)
@@ -813,14 +804,14 @@ class Span:
 
 
 class Step:
-    """Route interleaved one-token text decode through the shared decode graph."""
+    """Route one-token sequence decode through the shared decode graph."""
 
     def __init__(self) -> None:
         runtime = get_execution_config()
         self._runner = StepCapture(
-            name="interleaved_text",
+            name="sequence",
             default_enabled=runtime.cuda_graph,
-            # Lazy capture on the first eligible decode batch: interleaved request
+            # Lazy capture on the first eligible decode batch: request
             # state is only well-formed at request time, so there is nothing safe
             # to warm up ahead of serving.
             default_warmup=False,
@@ -842,7 +833,7 @@ class Step:
 
     def maybe_run_batch(
         self,
-        driver: "InterleavedTextCacheDriver",
+        driver: "SequenceExecutor",
         ops: Sequence[Mapping[str, Any]],
     ) -> list[torch.Tensor] | None:
         """Replay (or capture) the shared decode graph for a one-token decode batch.
@@ -894,14 +885,14 @@ class Step:
         self._graphed_steps += 1
         if self._graphed_steps == 1:
             logger.info(
-                "interleaved text decode CUDA graph active: captured bucket(s)=%s (shared Step)",
+                "sequence decode CUDA graph active: captured bucket(s)=%s (shared Step)",
                 sorted(self._runner.states),
             )
         return self._commit(rows, logits)
 
     def _pad_rows(
         self,
-        driver: "InterleavedTextCacheDriver",
+        driver: "SequenceExecutor",
         rows: list[_Row],
         graph_batch: int,
         pool: Any,
@@ -912,13 +903,13 @@ class Step:
         padding_block_ids = padding_blocks(pool)
         if not padding_block_ids:
             raise invalid_descriptor(
-                "interleaved decode graph padded replay requires reserved KV padding blocks"
+                "sequence decode graph padded replay requires reserved KV padding blocks"
             )
         block_size = int(getattr(pool, "block_size", 0) or 0)
         needed = graph_batch - len(rows)
         if block_size <= 0 or needed > len(padding_block_ids) * block_size:
             raise invalid_descriptor(
-                "interleaved decode graph padding exceeds the reserved KV padding blocks"
+                "sequence decode graph padding exceeds the reserved KV padding blocks"
             )
         base = rows[0]
         padded = list(rows)
@@ -940,7 +931,7 @@ class Step:
 
     def _prepare(
         self,
-        driver: "InterleavedTextCacheDriver",
+        driver: "SequenceExecutor",
         ops: Sequence[Mapping[str, Any]],
     ) -> tuple[list[_Row], Any] | None:
         if not self._runner.enabled() or not torch.cuda.is_available():
@@ -974,7 +965,9 @@ class Step:
 
         # Validation phase: prove every row is a one-token host-KV decode before
         # mutating any cache block ids or lengths.
-        validated: list[tuple[Mapping[str, Any], "TextCache", int | None, torch.Tensor | None]] = []
+        validated: list[
+            tuple[Mapping[str, Any], "SequenceCache", int | None, torch.Tensor | None]
+        ] = []
         padding_block_ids = set(padding_blocks(pool))
         for op in ops:
             tokens = list(op.get("token_ids") or [])
@@ -1023,7 +1016,7 @@ class Step:
             block_ids = list(cache.past.block_ids)
             if padding_block_ids.intersection(block_ids):
                 raise invalid_descriptor(
-                    "scheduler assigned a reserved interleaved decode graph padding block"
+                    "scheduler assigned a reserved sequence decode graph padding block"
                 )
             rows.append(
                 _Row(
@@ -1043,15 +1036,13 @@ class Step:
     def _sidecar_for(self, state: StepState) -> _Sidecar:
         sidecar = self._sidecars.get(id(state))
         if sidecar is None:
-            sidecar = _Sidecar(past=_InterleavedDecodeGraphPast(state.cache))
+            sidecar = _Sidecar(past=_SequenceDecodeGraphPast(state.cache))
             self._sidecars[id(state)] = sidecar
         return sidecar
 
-    def _forward(
-        self, driver: "InterleavedTextCacheDriver", state: StepState
-    ) -> torch.Tensor:
+    def _forward(self, driver: "SequenceExecutor", state: StepState) -> torch.Tensor:
         sidecar = self._sidecar_for(state)
-        outputs = driver.owner.interleaved_text_forward(
+        outputs = driver.owner.sequence_forward(
             input_ids=state.input_ids,
             cache_position=state.positions.reshape(-1),
             past_key_values=sidecar.past,

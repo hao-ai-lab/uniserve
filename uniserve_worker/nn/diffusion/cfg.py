@@ -1,4 +1,5 @@
 """Classifier-free guidance combination."""
+
 from __future__ import annotations
 
 import math
@@ -9,16 +10,16 @@ from typing import Any, Callable, Mapping
 import torch
 
 __all__ = [
-    'approx',
-    'RenormKind',
-    'Branch',
-    'PREV_RESULT',
-    'CfgRecipe',
-    'CfgParams',
-    'combine_cfg',
-    'CfgPlan',
-    'build_text_image_cfg_plan',
-    'combine_text_image_cfg',
+    "approx",
+    "RenormKind",
+    "Branch",
+    "PREV_RESULT",
+    "CfgRecipe",
+    "CfgParams",
+    "combine_cfg",
+    "CfgPlan",
+    "build_flow_cfg_plan",
+    "combine_text_image_cfg",
 ]
 
 
@@ -32,6 +33,7 @@ def approx(a: float, b: float) -> bool:
     """
 
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=0.0)
+
 
 # RESCALE renorm blend: final guidance is ``phi * norm_matched + (1 - phi) * raw_guided``.
 # phi=0.7 follows Lin et al. guidance-rescale (avoids over-exposure after norm matching).
@@ -134,7 +136,9 @@ class CfgParams:
         )
 
 
-def combine_cfg(branch_velocities: torch.Tensor | list[torch.Tensor], params: CfgParams) -> torch.Tensor:
+def combine_cfg(
+    branch_velocities: torch.Tensor | list[torch.Tensor], params: CfgParams
+) -> torch.Tensor:
     """Combine branch velocities into one guided velocity.
 
     Branch 0 is the unconditional/base branch.  If ``scales`` is
@@ -143,7 +147,11 @@ def combine_cfg(branch_velocities: torch.Tensor | list[torch.Tensor], params: Cf
     values are direct branch weights.
     """
 
-    branches = torch.stack(branch_velocities, dim=0) if isinstance(branch_velocities, list) else branch_velocities
+    branches = (
+        torch.stack(branch_velocities, dim=0)
+        if isinstance(branch_velocities, list)
+        else branch_velocities
+    )
     if branches.shape[0] != params.branch_count:
         raise ValueError(f"got {branches.shape[0]} branches, expected {params.branch_count}")
     if params.branch_count == 1:
@@ -219,7 +227,7 @@ class CfgPlan:
         return result
 
 
-def build_text_image_cfg_plan(
+def build_flow_cfg_plan(
     *,
     cfg_text_scale: float,
     cfg_img_scale: float,
@@ -263,7 +271,9 @@ def build_text_image_cfg_plan(
                 cfg_img_scale=cfg_img_scale,
                 renorm_min=renorm_min,
             )
-        return _three_branch_plan(cfg_text_scale, cfg_img_scale, applies_to_text, renorm_kind, renorm_min)
+        return _three_branch_plan(
+            cfg_text_scale, cfg_img_scale, applies_to_text, renorm_kind, renorm_min
+        )
 
     # Two-branch image guidance when text guidance is off or scales coincide.
     # text_uncond is skipped; scale is cfg_img_scale for IMAGE_OVER_TEXT else cfg_text_scale.
@@ -275,7 +285,9 @@ def build_text_image_cfg_plan(
             renorm_min=renorm_min,
         )
 
-    return _three_branch_plan(cfg_text_scale, cfg_img_scale, applies_to_text, renorm_kind, renorm_min)
+    return _three_branch_plan(
+        cfg_text_scale, cfg_img_scale, applies_to_text, renorm_kind, renorm_min
+    )
 
 
 def _two_branch_text_plan(
@@ -391,7 +403,7 @@ def combine_text_image_cfg(
     """
 
     recipe = CfgRecipe.coerce(image_scale_applies_to_text)
-    plan = build_text_image_cfg_plan(
+    plan = build_flow_cfg_plan(
         cfg_text_scale=cfg_text_scale,
         cfg_img_scale=cfg_img_scale,
         recipe=recipe,
@@ -406,23 +418,31 @@ def combine_text_image_cfg(
     return plan.combine(outputs)
 
 
-def _renorm_global(guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float) -> torch.Tensor:
+def _renorm_global(
+    guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
+) -> torch.Tensor:
     dims = tuple(range(1, guided.ndim)) if guided.ndim >= 3 else tuple(range(guided.ndim))
     return _match_norm(guided, ref, dims=dims, minimum=params.renorm_min, eps=eps)
 
 
-def _renorm_channel(guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float) -> torch.Tensor:
+def _renorm_channel(
+    guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
+) -> torch.Tensor:
     dims = (guided.ndim - 1,)
     return _match_norm(guided, ref, dims=dims, minimum=params.renorm_min, eps=eps)
 
 
-def _renorm_rescale(guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float) -> torch.Tensor:
+def _renorm_rescale(
+    guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
+) -> torch.Tensor:
     dims = (guided.ndim - 1,)
     matched = _match_norm(guided, ref, dims=dims, minimum=params.renorm_min, eps=eps)
     return _RESCALE_BLEND_PHI * matched + _RESCALE_BLEND_COMPLEMENT * guided
 
 
-def _renorm_cfg_zero_star(guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float) -> torch.Tensor:
+def _renorm_cfg_zero_star(
+    guided: torch.Tensor, ref: torch.Tensor, params: CfgParams, eps: float
+) -> torch.Tensor:
     del ref, params, eps
     return guided - guided.mean(dim=tuple(range(1, guided.ndim)), keepdim=True)
 

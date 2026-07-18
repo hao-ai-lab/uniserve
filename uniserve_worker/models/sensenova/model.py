@@ -19,23 +19,19 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 import uniserve_worker.ops as ops
-from uniserve_worker.execution.engine import TextImageDenoiseStep
-from uniserve_worker.models.interleaved_image import (
-    DenoiseResidualCacheBinding,
-    ImageState,
-    InterleavedImageRequestState,
-    TextImageDenoiseOps,
+from uniserve_worker.execution.engine import PreparedFlowStep
+from uniserve_worker.execution.flow import (
+    FlowExecution,
+    FlowState,
+    ProgramState,
 )
-from uniserve_worker.models.interleaved_text import InterleavedTextCacheDriver, TextCache
-from uniserve_worker.models.packed_forward import (
-    PackedForwardExecutor,
-    PackedForwardModelMixin,
+from uniserve_worker.execution.products import (
+    ImageEncoder,
+    ImageMaterializer,
+    ProductTransferSession,
 )
-from uniserve_worker.models.sensenova.interleave_runtime import (
-    GeneratedImageCommitDriver,
-    InputImageIngestDriver,
-    TowerExecutionSession,
-)
+from uniserve_worker.execution.segment import SegmentExecutor
+from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
 
 from ...contracts.batches import UniForwardBatch
@@ -89,7 +85,7 @@ from ...nn.quant import (
     kv_cache_bytes_per_token,
     use_quantization_config,
 )
-from ...nn.vision import NeoVitConfig, NeoVitEncoder
+from ...nn.vision import NeoVitConfig, NeoVitEncoder, build_abs_positions_from_grid_hw
 from ...processors.registry import get_processor_for_model
 from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
@@ -103,7 +99,6 @@ from ...runtime.residency import (
 )
 from ...runtime.tower_handoff import (
     ConditioningSnapshot,
-    DataPlaneTowerHandoff,
     LocalP2PTowerHandoff,
     TowerBinding,
     TowerHandoff,
@@ -136,16 +131,8 @@ MAX_BATCH_OPS = DEFAULT_MAX_BATCH_OPS
 MAX_VIT_GRID_TOKENS = 70 * 70
 COMMIT_MARKER_TOKENS = 2
 GEN_ROPE_ADVANCE = 2
-# Rescale polynomial (highest degree first) for the timestep-aware denoise
-# residual cache, calibrated for SenseNova-U1's gen branch by the reference
-# implementation (vLLM-Omni TeaCache coefficients for SenseNovaU1ForCausalLM).
-_DENOISE_RESIDUAL_RESCALE_COEFFS = (
-    9.07281930e04,
-    -2.17699186e04,
-    1.83940990e03,
-    -6.30339273e01,
-    7.61309272e-01,
-)
+_UNDERSTANDING_IMAGE_MEAN = (0.485, 0.456, 0.406)
+_UNDERSTANDING_IMAGE_STD = (0.229, 0.224, 0.225)
 MAX_CFG_BRANCHES = 3
 GENERATION_T_EPS = 0.02
 
@@ -1702,9 +1689,7 @@ class _SenseNovaDecoderModel(nn.Module):
             else:
                 route_indicators = self._resolve_route_indicators(None, inputs_embeds)
         else:
-            route_indicators = self._resolve_route_indicators(
-                route_indicators, inputs_embeds
-            )
+            route_indicators = self._resolve_route_indicators(route_indicators, inputs_embeds)
             if exist_non_image_gen_tokens is None:
                 exist_non_image_gen_tokens = bool((~route_indicators).any())
             if exist_image_gen_tokens is None:
@@ -1862,7 +1847,7 @@ class _SenseNovaDecoderModel(nn.Module):
             )
         norm = self.norm_mot_gen if exist_image_gen_tokens else self.norm
         if pre_norm_out is not None:
-            # Denoise residual-reuse capture: expose the pre-final-norm stream
+            # Flow residual-reuse capture: expose the pre-final-norm stream
             # (block-stack output) alongside the normal normalized output.
             pre_norm = hidden_states if residual is None else hidden_states + residual
             pre_norm_out.append(pre_norm)
@@ -2069,7 +2054,7 @@ class _SenseNovaLanguageModel(nn.Module):
 
 
 class NEOChatModel(nn.Module):
-    """Native SenseNova language model with interleaved vision and flow-matching heads."""
+    """Native SenseNova language model with vision and flow-matching heads."""
 
     config_class = NeoChatConfig
 
@@ -2228,7 +2213,7 @@ class NEOChatModel(nn.Module):
         return_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # timestep_embeddings is part of the cross-file _t2i_predict_v call
-        # contract (interleaved_image / reference denoise drivers pass it) but
+        # contract (flow execution and reference paths pass it) but
         # this native path conditions on t inside _t2i_hidden_to_x_pred, so the
         # precomputed embedding is unused here.
         del timestep_embeddings
@@ -2351,8 +2336,6 @@ def check_checkpoint_compatibility(config_or_dict: Any) -> None:
 
 class SenseNovaU1ForUnifiedGeneration(
     UniModelBase,
-    TextImageDenoiseOps,
-    PackedForwardModelMixin,
 ):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
@@ -2380,7 +2363,7 @@ class SenseNovaU1ForUnifiedGeneration(
     def velocity_parameterization(self) -> str:
         return "velocity"
 
-    # Denoise configuration consumed by the system TextImageDenoiseOps engine.
+    # Flow configuration consumed by the system FlowExecution engine.
     denoise_schedule_direction = ScheduleDirection.ASCENDING
     denoise_schedule_shift_domain = ScheduleShiftDomain.SIGMA
     denoise_cfg_recipe = CfgRecipe.ADDITIVE_DELTAS
@@ -2415,9 +2398,9 @@ class SenseNovaU1ForUnifiedGeneration(
         self.kv_token_capacity = kv_token_capacity
         self.attention_backend = attention_backend or "auto"
         self.runner_states: dict[int, RunnerRequestState] = {}
-        # Model-owned per-request interleaved image state, keyed by req_id and
+        # Per-request program state, keyed by req_id and
         # cleared in drop_request (the authoritative owner).
-        self.reqs: dict[int, InterleavedImageRequestState] = {}
+        self.reqs: dict[int, ProgramState] = {}
 
         llm_cfg = self._init_token_geometry(config)
         self.resource_plan = ResourcePlan(
@@ -2437,12 +2420,9 @@ class SenseNovaU1ForUnifiedGeneration(
         # and degrades to a same-device scratch copy. The binding resolves live
         # so destination residency tracks the tower-vs-trivial choice.
         self._tower_handoff: TowerHandoff = LocalP2PTowerHandoff(self._resolve_tower_binding)
-        # Mode A (tower disaggregation): the cross-process conditioning crossing is a
-        # separate object bound to the worker's data-plane transport by the runner
-        # driver (``bind_data_plane_handoff``). ``None`` in Mode C / single-device,
-        # where the per-branch staging above is the whole crossing.
-        self._dataplane_handoff: DataPlaneTowerHandoff | None = None
-        self.tower_session = TowerExecutionSession(self)
+        self.tower_session = ProductTransferSession(self, states=self.reqs)
+        self.flow_execution = FlowExecution(self, transfer=self.tower_session)
+        self.segment_executor = SegmentExecutor(self)
         self._img_start_token = IMG_START_TOKEN
 
     def _init_tower_profile(self) -> None:
@@ -2770,20 +2750,6 @@ class SenseNovaU1ForUnifiedGeneration(
         """Gen tower waits until the staged snapshot is fully written."""
         self.tower_session.wait_gen_cache_ready(cache)
 
-    def _prepare_generated_image_for_commit(self, image_state: ImageState) -> torch.Tensor:
-        """Bring the finished latent back to the understanding device for commit."""
-        return self.tower_session.prepare_commit_latent(image_state)
-
-    def publish_generated_latent_for_commit(self, image_state: ImageState) -> Any:
-        return self.tower_session.publish_commit_latent(image_state)
-
-    def fetch_commit_latent(self, locator: Any) -> torch.Tensor:
-        return self.tower_session.fetch_commit_latent(locator)
-
-    @staticmethod
-    def encode_commit_locator(locator: Any) -> str:
-        return TowerExecutionSession.encode_commit_locator(locator)
-
     def _resolve_tower_binding(self) -> TowerBinding:
         """Resolve the live destination residency + coordinates for a crossing.
 
@@ -2846,7 +2812,7 @@ class SenseNovaU1ForUnifiedGeneration(
 
     def _stage_text_cache_from_snapshot(
         self,
-        target: TextCache,
+        target: SequenceCache,
         snapshot: ConditioningSnapshot,
         *,
         locators: tuple[Any, ...],
@@ -2872,7 +2838,7 @@ class SenseNovaU1ForUnifiedGeneration(
         scalars the denoise setup reads. A no-op in Mode C / single-device."""
         self.tower_session.stage_conditioning_from_op(st, op)
 
-    def _release_image_state_caches(self, image_state: ImageState | None) -> None:
+    def _release_image_state_caches(self, image_state: FlowState | None) -> None:
         if image_state is None:
             return
         # The latent trajectory lives in the system LatentPool; free its handle
@@ -2890,47 +2856,45 @@ class SenseNovaU1ForUnifiedGeneration(
             if cache is None or cache_id in seen or cache_id in live_cache_ids:
                 continue
             seen.add(cache_id)
-            self._release_forward_staging_for_cache(cache)
+            self.segment_executor.release_staging(cache)
             self.residency.release_scratch_cache(cache)
 
-    def _text_driver(self) -> InterleavedTextCacheDriver:
+    def _text_driver(self) -> SequenceExecutor:
         driver = getattr(self, "_shared_text_driver", None)
         if driver is None:
-            driver = InterleavedTextCacheDriver(
+            driver = SequenceExecutor(
                 self,
-                request_state_factory=InterleavedImageRequestState,
+                request_state_factory=ProgramState,
                 image_start_token=self._img_start_token,
             )
             self._shared_text_driver = driver
         return driver
 
-    def _commit_driver(self) -> GeneratedImageCommitDriver:
+    def _commit_driver(self) -> ImageMaterializer:
         driver = getattr(self, "_shared_commit_driver", None)
         if driver is None:
-            driver = GeneratedImageCommitDriver(self)
+            driver = ImageMaterializer(self, self.tower_session)
             self._shared_commit_driver = driver
         return driver
 
-    def _state(self, op: dict[str, Any]) -> InterleavedImageRequestState:
+    def _state(self, op: dict[str, Any]) -> ProgramState:
         return self._text_driver().state(op)
 
     def run_text_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor]:
-        # Batching and text CUDA graphs are system-owned by the interleaved text
+        # Batching and sequence CUDA graphs are system-owned by the sequence
         # driver; the model only supplies the neural forward.
         return self._text_driver().run_text_logits_batch(ops)
 
-    def try_run_graph_logits_batch(
-        self, ops: list[Mapping[str, Any]]
-    ) -> list[torch.Tensor] | None:
+    def try_run_graph_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[torch.Tensor] | None:
         return self._text_driver().try_run_graph_logits_batch(ops)
 
     def run_text_logits(self, op: Mapping[str, Any]) -> torch.Tensor:
         return self._text_driver().run_text_logits(dict(op))
 
     def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
-        return self.interleaved_image_state(int(req_id)).cond.last_logits
+        return self.program_state(int(req_id)).cond.last_logits
 
-    def interleaved_text_forward(
+    def sequence_forward(
         self,
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -2956,19 +2920,19 @@ class SenseNovaU1ForUnifiedGeneration(
             logits_to_keep=0 if return_all_logits else 1,
         )
 
-    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def sequence_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.language_model.get_input_embeddings()(input_ids)
 
-    def interleaved_text_inputs(self, query: str) -> tuple[torch.Tensor, torch.Tensor, Any]:
+    def sequence_inputs(self, query: str) -> tuple[torch.Tensor, torch.Tensor, Any]:
         return self.model._build_t2i_text_inputs(self.tokenizer, query)
 
-    def interleaved_empty_image_start_query(self, image_start_token: str) -> str:
+    def empty_image_start_query(self, image_start_token: str) -> str:
         return self.model._build_t2i_query("", append_text=image_start_token)
 
-    def interleaved_image_query(self, text: str, *, append_text: str) -> str:
+    def flow_query(self, text: str, *, append_text: str) -> str:
         return self.model._build_t2i_query(text, append_text=append_text)
 
-    def interleaved_image_indexes(
+    def flow_indexes(
         self,
         token_h: int,
         token_w: int,
@@ -2978,7 +2942,7 @@ class SenseNovaU1ForUnifiedGeneration(
     ) -> torch.Tensor:
         return self.model._build_t2i_image_indexes(token_h, token_w, text_len, device=device)
 
-    def interleaved_image_predict_velocity(
+    def flow_predict_velocity(
         self,
         image_embeds: torch.Tensor,
         indexes: torch.Tensor,
@@ -3003,13 +2967,46 @@ class SenseNovaU1ForUnifiedGeneration(
             return_hidden=return_hidden,
         )
 
-    def interleaved_image_patch_size(self) -> int:
+    def image_patch_size(self) -> int:
         return int(self.model.patch_size)
 
-    def interleaved_image_downsample_ratio(self) -> float:
+    def image_downsample_ratio(self) -> float:
         return float(self.model.downsample_ratio)
 
-    def interleaved_image_features(
+    def product_transfer_dtype(self) -> torch.dtype:
+        return next(self.model.parameters()).dtype
+
+    def normalize_materialized_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Normalize a generated image for the understanding vision encoder."""
+
+        raw = image * 0.5 + 0.5
+        mean = raw.new_tensor(_UNDERSTANDING_IMAGE_MEAN).view(1, 3, 1, 1)
+        std = raw.new_tensor(_UNDERSTANDING_IMAGE_STD).view(1, 3, 1, 1)
+        return (raw - mean) / std
+
+    def sequence_position_indexes(
+        self,
+        grid_hw: torch.Tensor,
+        temporal_indexes: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build SenseNova's temporal-height-width position axes."""
+
+        merge = int(1 / self.image_downsample_ratio())
+        abs_w, abs_h = build_abs_positions_from_grid_hw(
+            grid_hw[:1].to(temporal_indexes.device) // merge,
+            device=temporal_indexes.device,
+        )
+        if int(temporal_indexes.numel()) == int(abs_h.numel()) + 1:
+            abs_h = torch.cat((abs_h, abs_h.new_zeros(1)))
+            abs_w = torch.cat((abs_w, abs_w.new_zeros(1)))
+        if int(temporal_indexes.numel()) != int(abs_h.numel()):
+            raise invalid_descriptor("image position axes do not match the sequence length")
+        return torch.stack(
+            (temporal_indexes.to(torch.long), abs_h.to(torch.long), abs_w.to(torch.long)),
+            dim=0,
+        )
+
+    def image_features(
         self,
         image_input: torch.Tensor,
         *,
@@ -3018,11 +3015,11 @@ class SenseNovaU1ForUnifiedGeneration(
     ) -> torch.Tensor:
         return self.model.extract_feature(image_input, gen_model=gen_model, grid_hw=grid_hw)
 
-    def interleaved_image_gen_feature_dtype(self) -> torch.dtype:
+    def flow_feature_dtype(self) -> torch.dtype:
         gen_vit = self.model.fm_modules["vision_model_mot_gen"]
         return next(gen_vit.parameters()).dtype
 
-    def interleaved_image_noise_scale(self, grid_h: int, grid_w: int) -> float:
+    def flow_noise_scale(self, grid_h: int, grid_w: int) -> float:
         noise_scale = self.model.noise_scale
         mode = getattr(self.model.noise_scale_mode, "value", self.model.noise_scale_mode)
         if str(mode) in _NOISE_RESOLUTION_MODES:
@@ -3033,7 +3030,7 @@ class SenseNovaU1ForUnifiedGeneration(
                 noise_scale = noise_scale**_NOISE_DYNAMIC_SQRT_EXPONENT
         return min(float(noise_scale), float(self.model.noise_scale_max_value))
 
-    def interleaved_image_noise_scale_embedding(
+    def flow_noise_scale_embedding(
         self,
         noise_scale: float,
         token_count: int,
@@ -3051,7 +3048,7 @@ class SenseNovaU1ForUnifiedGeneration(
         )
         return self.model.fm_modules["noise_scale_embedder"](ns).view(1, int(token_count), -1)
 
-    def interleaved_image_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor:
+    def flow_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor:
         return self.model.fm_modules["timestep_embedder"](t_values)
 
     def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -3094,7 +3091,7 @@ class SenseNovaU1ForUnifiedGeneration(
             image_size=image_size,
         )
 
-    def packed_graph_attention(self) -> Any:
+    def segment_graph_attention(self) -> Any:
         if self.model is None or not self.model.language_model.model.layers:
             raise capability_mismatch("SenseNova packed graph requires at least one decoder layer")
         return self.model.language_model.model.layers[0].self_attn
@@ -3107,9 +3104,7 @@ class SenseNovaU1ForUnifiedGeneration(
         pool by the system adapter; only these query-side values are model-specific.
         """
 
-        return self._query_geometry_from(
-            self.model.language_model.model.layers[0].self_attn
-        )
+        return self._query_geometry_from(self.model.language_model.model.layers[0].self_attn)
 
     def _text_indexes(
         self, start: int, seq_len: int, *, device: torch.device | str | None = None
@@ -3117,19 +3112,19 @@ class SenseNovaU1ForUnifiedGeneration(
         target = device if device is not None else self.device
         return self._text_driver().text_indexes(int(start), int(seq_len)).to(target)
 
-    def _extend_cache_blocks(self, cache: TextCache, op: dict[str, Any]) -> None:
+    def _extend_cache_blocks(self, cache: SequenceCache, op: dict[str, Any]) -> None:
         self._text_driver().extend_cache_blocks(cache, op)
 
-    def _ensure_host_cache(self, cache: TextCache) -> None:
+    def _ensure_host_cache(self, cache: SequenceCache) -> None:
         self._text_driver().ensure_host_cache(cache)
 
-    def _prefix_from_query(self, query: str) -> TextCache:
+    def _prefix_from_query(self, query: str) -> SequenceCache:
         return self._text_driver().prefix_from_query(query)
 
-    def _ensure_img_start(self, cache: TextCache | None) -> None:
+    def _ensure_img_start(self, cache: SequenceCache | None) -> None:
         self._text_driver().ensure_img_start(cache)
 
-    def _empty_img_start_prefix(self) -> TextCache:
+    def _empty_img_start_prefix(self) -> SequenceCache:
         return self._text_driver().empty_img_start_prefix()
 
     def commit_generated_image(self, req_id: int, state: Any, op: dict[str, Any]) -> dict[str, Any]:
@@ -3138,10 +3133,10 @@ class SenseNovaU1ForUnifiedGeneration(
             return self._commit_driver().commit_writeback(op)
         return self._commit_driver().commit_generated_image(op)
 
-    def _ingest_driver(self) -> InputImageIngestDriver:
+    def _ingest_driver(self) -> ImageEncoder:
         driver = getattr(self, "_shared_ingest_driver", None)
         if driver is None:
-            driver = InputImageIngestDriver(self)
+            driver = ImageEncoder(self)
             self._shared_ingest_driver = driver
         return driver
 
@@ -3256,7 +3251,7 @@ class SenseNovaU1ForUnifiedGeneration(
         req_id = int(req_id)
         self.runner_states[req_id] = state
         existing = self.reqs.get(req_id)
-        if isinstance(existing, InterleavedImageRequestState):
+        if isinstance(existing, ProgramState):
             existing.sampling = dict(state.sampling or existing.sampling or {})
             existing.image = dict(state.image or existing.image or {})
             existing.neg_token_ids = list(state.neg_token_ids or existing.neg_token_ids or [])
@@ -3266,13 +3261,11 @@ class SenseNovaU1ForUnifiedGeneration(
                 if callable(set_blocks):
                     set_blocks(existing.cond.block_ids)
             return
-        image_state = self._new_interleaved_image_state(state)
+        image_state = self._new_program_state(state)
         self.reqs[req_id] = image_state
 
-    def _new_interleaved_image_state(
-        self, state: RunnerRequestState
-    ) -> InterleavedImageRequestState:
-        image_state = InterleavedImageRequestState(
+    def _new_program_state(self, state: RunnerRequestState) -> ProgramState:
+        image_state = ProgramState(
             sampling=dict(state.sampling or {}),
             image=dict(state.image or {}),
             neg_token_ids=list(state.neg_token_ids or []),
@@ -3281,19 +3274,19 @@ class SenseNovaU1ForUnifiedGeneration(
         image_state.rng = state.device_rng(self.gen_device)
         return image_state
 
-    def interleaved_image_state(self, req_id: int) -> InterleavedImageRequestState:
+    def program_state(self, req_id: int) -> ProgramState:
         req_id = int(req_id)
         existing = self.reqs.get(req_id)
-        if isinstance(existing, InterleavedImageRequestState):
+        if isinstance(existing, ProgramState):
             return existing
         state = self.runner_states.get(req_id)
         if state is None:
-            return self.reqs.setdefault(req_id, InterleavedImageRequestState())
-        created = self._new_interleaved_image_state(state)
+            return self.reqs.setdefault(req_id, ProgramState())
+        created = self._new_program_state(state)
         self.reqs[req_id] = created
         return created
 
-    transformers_image_state = interleaved_image_state
+    transformers_image_state = program_state
 
     def drop_request(self, req_id: int) -> None:
         req_id = int(req_id)
@@ -3301,65 +3294,37 @@ class SenseNovaU1ForUnifiedGeneration(
         st = self.reqs.pop(req_id, None)
         if st is not None:
             self._release_image_state_caches(st.image_state)
-            self._release_forward_staging_for_cache(st.cond.past)
-            self._release_forward_staging_for_cache(st.tu.past)
-            self._release_forward_staging_for_cache(st.iu.past)
+            self.segment_executor.release_staging(st.cond.past)
+            self.segment_executor.release_staging(st.tu.past)
+            self.segment_executor.release_staging(st.iu.past)
             self.residency.release_scratch_cache(st.tu.past)
             self.residency.release_scratch_cache(st.iu.past)
 
-    def prepare_denoise(
-        self, state: RunnerRequestState, op: dict[str, Any] | Any
-    ) -> TextImageDenoiseStep:
+    def prepare_flow(self, state: RunnerRequestState, op: dict[str, Any] | Any) -> PreparedFlowStep:
         req_id = int(op["req_id"])
-        return self.prepare_denoise_step(req_id, state, dict(op))
+        return self.flow_execution.prepare_flow_step(req_id, state, dict(op))
 
     def predict_velocity(
         self,
-        ctx: TextImageDenoiseStep,
+        ctx: PreparedFlowStep,
         t: torch.Tensor,
         latent: torch.Tensor,
         branch: str,
     ) -> torch.Tensor:
         del t, latent
-        velocity = self.predict_denoise_velocity(ctx, branch)
+        velocity = self.flow_execution.predict_flow_velocity(ctx, branch)
         if not isinstance(velocity, torch.Tensor):
             raise invalid_descriptor(
                 "SenseNova velocity prediction unexpectedly returned hidden state"
             )
         return velocity
 
-    def predict_text_image_velocity_batch(
-        self, steps, branches_by_step, *, graph_mode: str = "auto"
-    ):
-        return TextImageDenoiseOps.predict_text_image_velocity_batch(
-            self,
+    def predict_flow_velocity_batch(self, steps, branches_by_step, *, graph_mode: str = "auto"):
+        return self.flow_execution.predict_flow_velocity_batch(
             steps,
             branches_by_step,
             graph_mode=graph_mode,
         )
-
-    def denoise_residual_cache_adapter(self) -> DenoiseResidualCacheBinding | None:
-        """Timestep-aware residual-reuse adapter (TeaCache) for SenseNova-U1.
-
-        The decision embedding is the layer-0 generation-branch input norm of
-        the step embeddings — the same signal the reference implementation
-        calibrated its rescale polynomial on (vLLM-Omni TeaCache coefficients
-        for ``SenseNovaU1ForCausalLM``).
-        """
-        if self.model is None:
-            return None
-        adapter = getattr(self, "_shared_denoise_residual_adapter", None)
-        if adapter is None:
-            decoder = self.model.language_model.model
-            decision_norm = decoder.layers[0].input_layernorm_mot_gen
-            final_norm = decoder.norm_mot_gen
-            adapter = DenoiseResidualCacheBinding(
-                decision_embedding=lambda embeds: decision_norm(embeds),
-                rescale_coefficients=_DENOISE_RESIDUAL_RESCALE_COEFFS,
-                finalize_hidden=lambda hidden: final_norm(hidden),
-            )
-            self._shared_denoise_residual_adapter = adapter
-        return adapter
 
     def _run_forward_adapter(
         self,
@@ -3370,14 +3335,17 @@ class SenseNovaU1ForUnifiedGeneration(
         defer_text_cpu_results: bool = False,
     ) -> Any:
         del group
-        return PackedForwardExecutor(self).execute(
+        return self.segment_executor.execute(
             batch,
             request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,
         )
 
-    def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
-        self.apply_denoise_update(ctx, latent)
+    def accept_flow_update(self, ctx: PreparedFlowStep, latent: torch.Tensor) -> None:
+        self.flow_execution.apply_flow_update(ctx, latent)
+
+    def _denoise_branch_inputs(self, image: FlowState, branch: str) -> tuple[torch.Tensor, Any]:
+        return self.flow_execution._denoise_branch_inputs(image, branch)
 
     def decode_image(
         self,

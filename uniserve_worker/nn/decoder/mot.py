@@ -456,7 +456,7 @@ class MoTDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """One text-modality (und) layer step over a shared paged text cache.
 
-        The interleaved text driver's serving path: token-major
+        The sequence executor's serving path: token-major
         ``hidden_states`` ``[tokens, hidden]`` attend causally against the
         request's paged KV through the duck-typed layer-update protocol
         (``request_cache_for_update`` / ``finish_layer_update`` /

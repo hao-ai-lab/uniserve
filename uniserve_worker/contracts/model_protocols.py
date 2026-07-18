@@ -1,11 +1,12 @@
 """Uniform model contract Protocols consumed by the shared drivers.
 
 Structural ``Protocol`` surfaces every registered model satisfies, plus the
-:class:`DenoiseContext` value object. Concrete glue lives in
+:class:`FlowContext` value object. Concrete glue lives in
 ``models.registry`` (``UniModelBase``); resource-rule dataclasses live in
 ``contracts.resource_plan``. Higher-layer type references are annotation-only
 (``from __future__ import annotations``).
 """
+
 from __future__ import annotations
 
 import inspect
@@ -19,7 +20,8 @@ from .resource_plan import ResourcePlan
 if TYPE_CHECKING:
     import torch
 
-    from uniserve_worker.execution.engine import TextImageDenoiseStep
+    from uniserve_worker.execution.engine import PreparedFlowStep
+    from uniserve_worker.execution.segment import SegmentExecutor
 
     from ..runtime.compile import CompileTarget
     from ..runtime.request_state import RequestStateTable
@@ -33,15 +35,15 @@ __all__ = [
     "UniModel",
     "TextForwardCapable",
     "EncodeCapable",
-    "DenoiseCapable",
+    "FlowCapable",
     "ModelHooks",
-    "DenoiseContext",
+    "FlowContext",
     "verify_model_conformance",
 ]
 
 
 @dataclass(frozen=True)
-class DenoiseContext:
+class FlowContext:
     """Context built once by a model and consumed by the denoise driver.
 
     Frozen: the driver and models build a context per step and never reassign
@@ -74,6 +76,7 @@ class UniModel(Protocol):
     supported_controls: tuple[str, ...]
     adapter_mode: str
     resource_plan: "ResourcePlan"
+    segment_executor: "SegmentExecutor | None"
 
     def load_weights(self, weights: "Iterable[tuple[str, torch.Tensor]]") -> object: ...
     def caps(
@@ -143,12 +146,10 @@ class EncodeCapable(Protocol):
 
 
 @runtime_checkable
-class DenoiseCapable(Protocol):
+class FlowCapable(Protocol):
     """Flow-matching surface required by ``denoise_gen``/``commit_gen`` ops."""
 
-    def prepare_denoise(
-        self, state: Any, op: Mapping[str, Any]
-    ) -> DenoiseContext | TextImageDenoiseStep: ...
+    def prepare_flow(self, state: Any, op: Mapping[str, Any]) -> FlowContext | PreparedFlowStep: ...
 
     def predict_velocity(
         self,
@@ -176,6 +177,7 @@ class ModelHooks:
     supported_controls: tuple[str, ...] = ()
     adapter_mode: str = "none"
     resource_plan: "ResourcePlan" = ResourcePlan()
+    segment_executor: "SegmentExecutor | None" = None
 
     def caps(
         self,
@@ -247,7 +249,7 @@ class ModelHooks:
         """Return worker-resident logits that predict the next prompt token."""
         return None
 
-    def accept_denoise_update(self, ctx: Any, latent: Any) -> None:
+    def accept_flow_update(self, ctx: Any, latent: Any) -> None:
         state = getattr(ctx, "state", None)
         if state is not None:
             state.latent = latent
@@ -255,10 +257,14 @@ class ModelHooks:
     def velocity_parameterization(self) -> str:
         return "velocity"
 
-    def encode_image(self, pixels: Any = None, grid: Any = None, *, op: Mapping[str, Any] | None = None) -> Any:
+    def encode_image(
+        self, pixels: Any = None, grid: Any = None, *, op: Mapping[str, Any] | None = None
+    ) -> Any:
         raise invalid_descriptor("encode-capable model must implement encode_image()")
 
-    def encode_latents(self, pixels: Any = None, grid: Any = None, *, op: Mapping[str, Any] | None = None) -> Any:
+    def encode_latents(
+        self, pixels: Any = None, grid: Any = None, *, op: Mapping[str, Any] | None = None
+    ) -> Any:
         raise invalid_descriptor("encode-capable model must implement encode_latents()")
 
     def run_text_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[Any]:
@@ -270,18 +276,25 @@ class ModelHooks:
             "model's run_text_logits[_batch]"
         )
 
-    def prepare_denoise(
-        self, state: Any, op: Mapping[str, Any]
-    ) -> DenoiseContext | TextImageDenoiseStep:
-        return DenoiseContext(state=state, op=op)
+    def prepare_flow(self, state: Any, op: Mapping[str, Any]) -> FlowContext | PreparedFlowStep:
+        return FlowContext(state=state, op=op)
 
     def predict_velocity(self, ctx: Any, t: Any, latent: Any, branch: str) -> Any:
-        raise invalid_descriptor("diffusion model must implement predict_velocity(ctx, t, latent, branch)")
+        raise invalid_descriptor(
+            "diffusion model must implement predict_velocity(ctx, t, latent, branch)"
+        )
 
-    def predict_text_image_velocity_batch(self, steps: Any, branches_by_step: Any) -> Any:
+    def predict_flow_velocity_batch(self, steps: Any, branches_by_step: Any) -> Any:
         return None
 
-    def decode_image(self, latent: Any, *, req_id: int | None = None, state: Any = None, op: Mapping[str, Any] | None = None) -> Any:
+    def decode_image(
+        self,
+        latent: Any,
+        *,
+        req_id: int | None = None,
+        state: Any = None,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any:
         raise invalid_descriptor("commit-capable model must implement decode_image()")
 
     def kv_cache_spec(self) -> Any | None:
@@ -292,11 +305,12 @@ class ModelHooks:
 
         return BatchPolicy(max_batch_ops=DEFAULT_MAX_BATCH_OPS, supports_mixed_modes=True)
 
+
 _CAPABILITY_PROTOCOLS: tuple[type, ...] = (
     UniModel,
     TextForwardCapable,
     EncodeCapable,
-    DenoiseCapable,
+    FlowCapable,
 )
 
 _POSITIONAL_KINDS = (
@@ -314,9 +328,7 @@ def _protocol_method_names(protocol: type) -> tuple[str, ...]:
     """
     declared = getattr(protocol, "__protocol_attrs__", None)
     if declared is None:
-        declared = {
-            name for name in vars(protocol) if callable(vars(protocol).get(name))
-        }
+        declared = {name for name in vars(protocol) if callable(vars(protocol).get(name))}
     names: list[str] = []
     for name in declared:
         member = getattr(protocol, name, None)
@@ -384,8 +396,7 @@ def _method_violations(
             continue
         if name not in have_kw and not have_var_kw:
             violations.append(
-                f"{protocol_name}.{method_name}: model does not accept "
-                f"keyword parameter {name!r}"
+                f"{protocol_name}.{method_name}: model does not accept keyword parameter {name!r}"
             )
     return violations
 
@@ -409,7 +420,5 @@ def verify_model_conformance(model: Any) -> list[str]:
                 )
                 continue
             declared = getattr(protocol, method_name)
-            violations.extend(
-                _method_violations(protocol.__name__, method_name, declared, actual)
-            )
+            violations.extend(_method_violations(protocol.__name__, method_name, declared, actual))
     return violations

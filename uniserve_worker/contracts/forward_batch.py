@@ -10,6 +10,7 @@ never the residency pools themselves. Physical KV, latent, scratch, and encoder
 buffers are resolved through the published
 :class:`~.forward_context.ForwardContext`.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -205,8 +206,8 @@ class EncodeInputs:
 class CommitInputs:
     """Commit sub-block for a ``COMMIT`` forward (VAE-decode the trajectory).
 
-    ``fold_back`` requests re-embedding the generated image into the text KV
-    (interleaved generation); the system owns the residency on both sides.
+    ``fold_back`` requests re-embedding the generated image for subsequent
+    sequence operations; the system owns the residency on both sides.
     """
 
     latent_handle: int
@@ -292,9 +293,8 @@ class ForwardBatch:
 
 # --- Host forward-plan values (canonical row/segment/output planning) ---
 
-_TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
-)
+_TEXT_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
+
 
 class ForwardModality(StrEnum):
     TEXT = "text"
@@ -453,9 +453,7 @@ class ForwardShapeSummary:
         segments: Sequence[ForwardSegmentPlan],
     ) -> "ForwardShapeSummary":
         token_count = sum(int(segment.q_len) for segment in segments)
-        branch_count = sum(
-            int(row.denoise.branch_count) for row in rows if row.denoise is not None
-        )
+        branch_count = sum(int(row.denoise.branch_count) for row in rows if row.denoise is not None)
         return cls(
             forward_mode=forward_mode,
             op_modes=tuple(row.mode for row in rows),
@@ -535,6 +533,7 @@ class ForwardPlan:
 
 # --- Forward graph policy values ---
 
+
 class EagerFallbackReason(StrEnum):
     GRAPH_DISABLED = "graph_disabled"
     GRAPH_MISS = "graph_miss"
@@ -581,8 +580,6 @@ class StrictForwardGraphError(RuntimeError):
 # --- Typed neural forward results ---
 
 
-
-
 @dataclass(frozen=True)
 class DenoiseBranchKey:
     row_index: int
@@ -611,7 +608,7 @@ class TextPostprocessEntry:
     position_id: int
     kv_new_length: int
     last_input_token: int
-    interleaved_state: Any | None = None
+    program_state: Any | None = None
     persistent_cache: Any | None = None
     staged_cache: Any | None = None
     kv_promotion: Any | None = None
@@ -665,28 +662,40 @@ class ForwardResult:
             if len(self.runtime_outputs) != len(plan.output_slots):
                 raise invalid_descriptor("forward runtime output count must match output slots")
             return
-        text_slots = [slot for slot in plan.output_slots if slot.kind is ForwardOutputKind.TEXT_TOKEN]
+        text_slots = [
+            slot for slot in plan.output_slots if slot.kind is ForwardOutputKind.TEXT_TOKEN
+        ]
         if text_slots:
             if not isinstance(self.text_logits, torch.Tensor):
                 raise invalid_descriptor("forward result is missing text logits")
             logits_rows = self.text_logits.reshape(-1, self.text_logits.shape[-1])
             if self.text_logits.ndim == 1:
                 if len(text_slots) != 1:
-                    raise invalid_descriptor("single text logits row cannot satisfy multiple output slots")
+                    raise invalid_descriptor(
+                        "single text logits row cannot satisfy multiple output slots"
+                    )
             elif self.text_logits.ndim < 2:
                 raise invalid_descriptor("text logits must include a vocabulary dimension")
             elif int(logits_rows.shape[0]) < len(text_slots):
                 raise invalid_descriptor("text logits row count is smaller than text output slots")
             if self.text_postprocess is not None:
                 if len(self.text_postprocess) != len(text_slots):
-                    raise invalid_descriptor("text postprocess entry count must match text output slots")
+                    raise invalid_descriptor(
+                        "text postprocess entry count must match text output slots"
+                    )
                 text_rows = {int(slot.row_index): slot for slot in text_slots}
                 for entry in self.text_postprocess:
                     slot = text_rows.get(int(entry.row_index))
                     if slot is None or int(slot.req_id) != int(entry.req_id):
-                        raise invalid_descriptor("text postprocess entry does not align with output slot")
-                    if int(entry.logits_index) < 0 or int(entry.logits_index) >= int(logits_rows.shape[0]):
-                        raise invalid_descriptor("text postprocess entry references an unknown logits row")
+                        raise invalid_descriptor(
+                            "text postprocess entry does not align with output slot"
+                        )
+                    if int(entry.logits_index) < 0 or int(entry.logits_index) >= int(
+                        logits_rows.shape[0]
+                    ):
+                        raise invalid_descriptor(
+                            "text postprocess entry references an unknown logits row"
+                        )
         denoise_slots = [
             slot for slot in plan.output_slots if slot.kind is ForwardOutputKind.DENOISE_STEP
         ]
@@ -696,10 +705,16 @@ class ForwardResult:
             for slot in denoise_slots:
                 update = updates.get(int(slot.row_index))
                 if update is not None:
-                    if int(update.row_index) != int(slot.row_index) or int(update.req_id) != int(slot.req_id):
-                        raise invalid_descriptor("denoise update entry does not align with output slot")
+                    if int(update.row_index) != int(slot.row_index) or int(update.req_id) != int(
+                        slot.req_id
+                    ):
+                        raise invalid_descriptor(
+                            "denoise update entry does not align with output slot"
+                        )
                     if not update.branch_names:
-                        raise invalid_descriptor("denoise update entry must name at least one branch")
+                        raise invalid_descriptor(
+                            "denoise update entry must name at least one branch"
+                        )
                     branch_count = len(update.branch_names)
                 else:
                     row = plan.rows[slot.row_index]
@@ -707,7 +722,9 @@ class ForwardResult:
                 for branch_id in range(branch_count):
                     key = DenoiseBranchKey(slot.row_index, branch_id)
                     if key not in velocities:
-                        raise invalid_descriptor("forward result is missing a denoise branch velocity")
+                        raise invalid_descriptor(
+                            "forward result is missing a denoise branch velocity"
+                        )
         encode_slots = [slot for slot in plan.output_slots if slot.kind is ForwardOutputKind.ENCODE]
         if encode_slots and self.encode_outputs is None:
             raise invalid_descriptor("forward result is missing encode outputs")
