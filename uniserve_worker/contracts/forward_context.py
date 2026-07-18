@@ -110,6 +110,7 @@ class ForwardContext:
     - an optional :class:`~.attention_plan.GraphBinding` identity token for
       CUDA-graph attention wrappers (plan tensors stay on ``attention_plan``;
       backends that need exclusive wrappers route by ``id(graph_binding)``)
+    - whether a missing physical graph may be captured during this forward
     - optional :class:`~.forward_stats.ForwardStats` for per-component timing
 
     Frozen, and so is the plan it references: replace the whole context between
@@ -123,6 +124,7 @@ class ForwardContext:
     graph_binding: GraphBinding | None = None
     kv_pool: "KVPool | None" = None
     stats: ForwardStats | None = None
+    allow_capture: bool = True
 
     def component_timer_start(self) -> int:
         """Start a per-component timer against this context's ``stats``."""

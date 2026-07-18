@@ -983,7 +983,7 @@ class MoTModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         indexes: torch.Tensor,
         forward_stream: Any,
         kv_view: Any,
@@ -993,11 +993,11 @@ class MoTModel(nn.Module):
         if inputs_embeds.ndim != 2:
             raise ValueError("packed MoT model expects inputs_embeds [N, C]")
         token_count = int(inputs_embeds.shape[0])
-        if tuple(image_gen_indicators.shape) != (token_count,):
-            raise ValueError("packed MoT model expects image_gen_indicators [N]")
+        if tuple(route_indicators.shape) != (token_count,):
+            raise ValueError("packed MoT model expects route_indicators [N]")
         if indexes.ndim != 2 or int(indexes.shape[1]) != token_count:
             raise ValueError("packed MoT model expects one position per token")
-        gen_mask = image_gen_indicators.to(dtype=torch.bool)
+        gen_mask = route_indicators.to(dtype=torch.bool)
         text_mask = ~gen_mask
         has_gen_segment = any(
             segment.modality == "gen" and int(segment.q_len) > 0

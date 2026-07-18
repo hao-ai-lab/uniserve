@@ -22,6 +22,7 @@ from uniserve_worker.execution.engine import (
     RunnerConfig,
     text_input_id_replacements_from_relays,
 )
+from uniserve_worker.execution.graph.path import Batch, Denoise, Segment
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.runtime.request_state import RequestStateTable
@@ -187,7 +188,7 @@ def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch()
         {"req_id": 4, "kind": "denoise_gen", "latent_shape": [2, 2]},
     ]
 
-    with pytest.raises(WorkerError, match="admitted mixed forward has no whole-batch executor"):
+    with pytest.raises(WorkerError, match="admitted segment group has no whole-batch executor"):
         planner.groups(submitted)
 
 
@@ -219,7 +220,7 @@ def test_runner_executes_whole_batch_forward_under_inference_mode():
     assert model.inference_modes == [True]
 
 
-def test_und_gen_mixed_policy_keeps_entire_batch_for_whole_batch_forward():
+def test_model_execution_and_publication_groups_preserve_result_alignment():
     model = ForwardHookModel(max_batch_ops=2)
     submitted = ops("decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und")
 
@@ -230,9 +231,10 @@ def test_und_gen_mixed_policy_keeps_entire_batch_for_whole_batch_forward():
     assert model.calls == [
         (
             ForwardMode.MIXED,
-            [1, 2, 3, 4, 5],
-            ["decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und"],
-        )
+            [1, 3, 4, 5],
+            ["decode_und", "denoise_gen", "prefill_und", "decode_und"],
+        ),
+        (ForwardMode.COMMIT, [2], ["commit_gen"]),
     ]
     assert model.forward_calls == []
 
@@ -272,7 +274,7 @@ def test_text_extend_decode_route_prefers_whole_batch_forward_over_legacy_hook()
     assert model.forward_calls == []
 
 
-def test_runner_registers_text_graph_programs_with_forward_executor(monkeypatch):
+def test_runner_registers_batch_path_before_general_segment_path(monkeypatch):
     class Model(ModelHooks):
         device = "cpu"
 
@@ -292,22 +294,14 @@ def test_runner_registers_text_graph_programs_with_forward_executor(monkeypatch)
     assert runner.text_driver.graph_runner is None
     assert runner.forward_executor.graph_runner is runner.forward_graph_runner
     assert runner.forward_graph_runner is not None
-    assert [program.program_id for program in runner.forward_graph_runner.programs] == [
-        "decode",
-        "prefill",
-        "packed_visible",
-        "denoise_step",
+    assert [type(path) for path in runner.forward_graph_runner.paths] == [
+        Batch,
+        Segment,
+        Denoise,
     ]
-    assert all(
-        program.text_driver is runner.text_driver
-        for program in runner.forward_graph_runner.programs
-        if program.program_id in {"decode", "prefill"}
-    )
-    assert all(
-        program.text_graph_runner is graph_runner
-        for program in runner.forward_graph_runner.programs
-        if program.program_id in {"decode", "prefill"}
-    )
+    batch_path = runner.forward_graph_runner.paths[0]
+    assert batch_path.driver is runner.text_driver
+    assert batch_path.executor is graph_runner
 
 
 def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
@@ -340,15 +334,16 @@ def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
     assert flat.positions.tolist() == [3, 0, 1]
 
 
-def test_forward_admission_keeps_extra_rows_with_und_gen_mixed_batch():
+def test_forward_admission_separates_publication_rows_from_segment_batch():
     model = ForwardHookModel(max_batch_ops=8)
     submitted = ops("decode_und", "denoise_gen", "commit_gen")
 
     result = execute(model, submitted)
 
-    assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed", "mixed"]
+    assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed", "commit"]
     assert model.calls == [
-        (ForwardMode.MIXED, [1, 2, 3], ["decode_und", "denoise_gen", "commit_gen"]),
+        (ForwardMode.MIXED, [1, 2], ["decode_und", "denoise_gen"]),
+        (ForwardMode.COMMIT, [3], ["commit_gen"]),
     ]
     assert model.forward_calls == []
 

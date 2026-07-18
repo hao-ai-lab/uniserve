@@ -159,15 +159,12 @@ def _normalize_forward_paged_segments(
 
 def _forward_paged_segment_signature(
     segments: tuple[ForwardPagedKVSegment, ...],
-) -> tuple[tuple[int, bool, bool, int], ...]:
-    return tuple(
-        (
-            int(seg.q_len),
-            bool(seg.write_kv),
-            bool(seg.persist_kv),
-            int(seg.branch_id),
-        )
-        for seg in segments
+) -> tuple[int, int, int, bool]:
+    return (
+        len(segments),
+        sum(int(seg.q_len) for seg in segments),
+        sum(int(seg.q_len) for seg in segments if seg.write_kv),
+        all(bool(seg.write_kv) for seg in segments),
     )
 
 
@@ -398,9 +395,8 @@ class ForwardGraphStreamState:
 
     def refresh(self, stream: ForwardStream) -> ForwardStream:
         if self._stream_signature(stream) != self._signature:
-            raise invalid_descriptor("forward graph stream geometry mismatch")
-        # cu_seqlens_q is fixed by captured segment geometry. Base positions and
-        # exact expert routes may vary while preserving their captured shapes.
+            raise invalid_descriptor("forward graph stream capacity mismatch")
+        self.stream.cu_seqlens_q.copy_(stream.cu_seqlens_q, non_blocking=True)
         self.stream.visible_end.copy_(stream.visible_end, non_blocking=True)
         self.stream.indexes.copy_(stream.indexes, non_blocking=True)
         if self.stream.und_indices is not None and stream.und_indices is not None:
@@ -417,16 +413,6 @@ class ForwardGraphStreamState:
     @staticmethod
     def _stream_signature(stream: ForwardStream) -> tuple[object, ...]:
         return (
-            tuple(
-                (
-                    int(seg.q_len),
-                    seg.modality,
-                    seg.segment_class,
-                    seg.visible_policy,
-                    int(seg.branch_id),
-                )
-                for seg in stream.segments
-            ),
             tuple(stream.cu_seqlens_q.shape),
             str(stream.cu_seqlens_q.dtype),
             str(stream.cu_seqlens_q.device),
@@ -503,7 +489,7 @@ class ForwardGraphPagedKVView:
         self._page_ids = self._write_plan_inputs[: self._write_tokens]
         self._offsets = self._write_plan_inputs[self._write_tokens :]
         self._stager = TextTensorStager(ring_depth=3)
-        token_indices = self._static_token_indices(self.segments)
+        token_indices = self._token_index_values(self.segments)
         self._token_indices = (
             None
             if token_indices is None
@@ -517,7 +503,7 @@ class ForwardGraphPagedKVView:
     ) -> "ForwardGraphPagedKVView":
         normalized = _normalize_forward_paged_segments(self.pool, segments)
         if _forward_paged_segment_signature(normalized) != self._signature:
-            raise invalid_descriptor("forward graph paged KV geometry mismatch")
+            raise invalid_descriptor("forward graph paged KV capacity mismatch")
         if max(len(seg.block_ids) for seg in normalized) > self._block_width:
             raise invalid_descriptor("forward graph paged KV block-table width exceeded")
         self.segments = normalized
@@ -544,6 +530,7 @@ class ForwardGraphPagedKVView:
             )
             page_ids, offsets = self._write_plan_values(normalized)
             self._copy_write_plan_inputs(page_ids, offsets, slot=slot)
+            self._copy_token_indices(normalized, slot=slot)
         finally:
             self._stager.mark_slot_submitted(slot, device=self._device)
         return self
@@ -605,6 +592,27 @@ class ForwardGraphPagedKVView:
         fill_cpu_ints(cpu[: self._write_tokens], page_ids)
         fill_cpu_ints(cpu[self._write_tokens :], offsets)
         self._write_plan_inputs.copy_(cpu, non_blocking=self._non_blocking_cpu_copy(cpu))
+
+    def _copy_token_indices(
+        self,
+        segments: tuple[ForwardPagedKVSegment, ...],
+        *,
+        slot: TextTensorStagingSlot,
+    ) -> None:
+        values = self._token_index_values(segments)
+        if values is None:
+            if self._token_indices is not None:
+                raise invalid_descriptor("forward graph paged KV write topology changed")
+            return
+        if self._token_indices is None or len(values) != int(self._token_indices.numel()):
+            raise invalid_descriptor("forward graph paged KV token-index capacity changed")
+        cpu = slot.long_buffer(
+            "token_indices",
+            len(values),
+            pin=self._device.type == "cuda",
+        )
+        fill_cpu_ints(cpu, values)
+        self._token_indices.copy_(cpu, non_blocking=self._non_blocking_cpu_copy(cpu))
 
     def _non_blocking_cpu_copy(self, cpu: torch.Tensor) -> bool:
         return self._device.type == "cuda" and is_pinned(cpu)
@@ -734,7 +742,7 @@ class ForwardGraphPagedKVView:
         return page_ids, offsets
 
     @staticmethod
-    def _static_token_indices(
+    def _token_index_values(
         segments: tuple[ForwardPagedKVSegment, ...],
     ) -> list[int] | None:
         token_indices: list[int] = []

@@ -574,8 +574,8 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
             store_dtype=self.kv_cache_dtype,
         )
 
-    def text_decode_graph_query_geometry(self) -> tuple[int, float, "torch.dtype"]:
-        return self._text_decode_graph_query_geometry_from(self.model.layers[0].self_attn)
+    def query_geometry(self) -> tuple[int, float, "torch.dtype"]:
+        return self._query_geometry_from(self.model.layers[0].self_attn)
 
     def _runtime_num_blocks(
         self,

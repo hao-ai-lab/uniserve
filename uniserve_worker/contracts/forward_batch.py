@@ -64,7 +64,7 @@ __all__ = [
     "DenoisePostprocessEntry",
     "DenoiseVelocityResult",
     "EncodeResult",
-    "ForwardGraphExecutionInfo",
+    "GraphInfo",
     "ForwardResult",
     "TextLogitsResult",
     "TextPostprocessEntry",
@@ -564,8 +564,8 @@ class EagerFallbackWarning:
     rows: int
     padded_tokens: int
     padded_rows: int
-    program: str | None = None
-    shape_key: Any | None = None
+    topology_id: str | None = None
+    capacity_key: Any | None = None
     backend: str | None = None
 
 
@@ -620,12 +620,9 @@ class TextPostprocessEntry:
 
 
 @dataclass(frozen=True)
-class ForwardGraphExecutionInfo:
-    program: str
-    shape_key: Any
-    captured: bool = False
-    replayed: bool = False
-    fallback_reason: str | None = None
+class GraphInfo:
+    path: str
+    capacity: Any
 
 
 @dataclass(frozen=True)
@@ -658,7 +655,7 @@ class ForwardResult:
     encode_outputs: Mapping[int, Any] | None = None
     commit_outputs: Mapping[int, Any] | None = None
     hidden: torch.Tensor | None = None
-    graph: ForwardGraphExecutionInfo | None = None
+    graph: GraphInfo | None = None
     text_cuda_ready_start_event: Any | None = None
     runtime_outputs: tuple[Any, ...] | None = None
 

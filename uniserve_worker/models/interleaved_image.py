@@ -3,7 +3,7 @@
 Family-owned machinery for image generation inside interleaved requests:
 per-request latent/image state, batched denoise rows with flow-match
 schedules and CFG, the residual-reuse (TeaCache-style) adapter, and the
-denoise-step CUDA-graph runner built on ``execution.cuda_graph`` primitives.
+denoise-step CUDA-graph runner built on ``execution.graph`` primitives.
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ import torch
 import uniserve_worker.ops as ops
 from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPlan
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
-from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.execution.cuda_graph import GraphEvent, _GraphRunnerBase, record_graph_stats
 from uniserve_worker.execution.engine import TextImageDenoiseStep, text_image_cfg_branch_count
+from uniserve_worker.execution.graph.capture import Event, record
+from uniserve_worker.execution.graph.capture import Runner as Capture
 from uniserve_worker.foundation.env import env_flag, env_str
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
 from uniserve_worker.models.interleaved_text import TextCache
@@ -197,7 +197,7 @@ class DenoiseStepGraphState:
     logits: Any = None                  # (velocity, hidden|None) written by capture/replay
 
 
-class DenoiseStepGraphRunner(_GraphRunnerBase):
+class DenoiseStepGraphRunner(Capture):
     """Own bounded denoise-step CUDA graphs and refreshable request inputs."""
 
     def __init__(
@@ -270,7 +270,10 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
         ctx = get_forward_context()
         tokens = len(rows) * int(rows[0].img.token_h) * int(rows[0].img.token_w)
         if key is None or key in self.disabled:
-            self._record(ctx, GraphEvent.MISS, tokens)
+            self._record(ctx, Event.MISS, tokens)
+            return None
+        if key not in self.states and not ctx.allow_capture:
+            self._record(ctx, Event.MISS, tokens)
             return None
         if key not in self.states:  # capture path resolves the winner backend
             backend = self._resolve_graph_backend(ctx, rows)
@@ -285,13 +288,14 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
                         "graph-scoped prefill plan",
                         self.name,
                     )
-                self._record(ctx, GraphEvent.MISS, tokens)
+                self._record(ctx, Event.MISS, tokens)
                 return None
         else:
             backend = None  # replay path never touches the backend
 
         out = self._capture_or_replay(
             key=key,
+            device=rows[0].step.extra["image_embeds"].device,
             ctx=ctx,
             capture=lambda: self._capture(owner, rows, key, ctx, backend, return_hidden),
             copy_inputs=lambda state: self._copy_inputs(state, rows),
@@ -404,11 +408,10 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             bool(return_hidden),
         )
 
-    def _record(self, ctx: Any, event: GraphEvent, tokens: int) -> None:
-        record_graph_stats(
+    def _record(self, ctx: Any, event: Event, tokens: int) -> None:
+        record(
             ctx,
             event,
-            mode=ForwardMode.DENOISE,
             unpadded_tokens=int(tokens),
             padded_tokens=int(tokens),
         )
@@ -548,7 +551,7 @@ class DenoiseStepGraphRunner(_GraphRunnerBase):
             residency_cache=None,
         )
         graph_binding = GraphBinding()
-        geometry = getattr(owner, "text_decode_graph_query_geometry", None)
+        geometry = getattr(owner, "query_geometry", None)
         if callable(geometry):
             num_q_heads, scale, _q_dtype = geometry()
         else:

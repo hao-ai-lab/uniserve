@@ -28,8 +28,8 @@ from uniserve_worker.models.interleaved_image import (
 )
 from uniserve_worker.models.interleaved_text import InterleavedTextCacheDriver, TextCache
 from uniserve_worker.models.packed_forward import (
-    PackedVisibleBatchExecutor,
-    PackedVisibleModelMixin,
+    PackedForwardExecutor,
+    PackedForwardModelMixin,
 )
 from uniserve_worker.models.sensenova.interleave_runtime import (
     GeneratedImageCommitDriver,
@@ -40,7 +40,6 @@ from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardSt
 
 from ...contracts.batches import UniForwardBatch
 from ...contracts.forward_context import get_forward_context
-from ...contracts.forward_mode import ForwardMode
 from ...contracts.resource_plan import (
     CapsDescriptor,
     EncoderResourcePolicy,
@@ -159,39 +158,33 @@ _NOISE_RESOLUTION_MODES = frozenset({"resolution", "dynamic", "dynamic_sqrt"})
 logger = logging.getLogger(__name__)
 
 
-def _packed_mixed_has_und_and_gen(op_modes: Sequence[ForwardMode]) -> bool:
-    has_und = any(mode in {ForwardMode.EXTEND, ForwardMode.DECODE} for mode in op_modes)
-    has_gen = any(mode in {ForwardMode.DENOISE, ForwardMode.COMMIT} for mode in op_modes)
-    return has_und and has_gen
-
-
 def _cat_token_slices(parts: Sequence[torch.Tensor]) -> torch.Tensor:
     tensors = [part for part in parts if int(part.shape[0]) > 0]
     if not tensors:
-        raise invalid_descriptor("modality slice routing requires at least one tensor")
+        raise invalid_descriptor("route slicing requires at least one tensor")
     return tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
 
 
-def _text_first_modality_split(forward_stream: ForwardStream, total_tokens: int) -> int | None:
-    text_tokens = 0
-    gen_tokens = 0
-    seen_gen = False
+def _contiguous_route_split(forward_stream: ForwardStream, total_tokens: int) -> int | None:
+    first_route_tokens = 0
+    second_route_tokens = 0
+    seen_second_route = False
     for seg in forward_stream.segments:
         q_len = int(seg.q_len)
         if seg.modality == "und":
-            if seen_gen:
+            if seen_second_route:
                 return None
-            text_tokens += q_len
+            first_route_tokens += q_len
         elif seg.modality == "gen":
-            seen_gen = True
-            gen_tokens += q_len
+            seen_second_route = True
+            second_route_tokens += q_len
         else:
             return None
-    if text_tokens <= 0 or gen_tokens <= 0:
+    if first_route_tokens <= 0 or second_route_tokens <= 0:
         return None
-    if text_tokens + gen_tokens != int(total_tokens):
+    if first_route_tokens + second_route_tokens != int(total_tokens):
         return None
-    return int(text_tokens)
+    return int(first_route_tokens)
 
 
 @dataclass(frozen=True)
@@ -686,7 +679,7 @@ class _SenseNovaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         indexes: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         *,
         exist_non_image_gen_tokens: bool | None = None,
         exist_image_gen_tokens: bool | None = None,
@@ -697,7 +690,7 @@ class _SenseNovaAttention(nn.Module):
         batch, seq_len, _ = hidden_states.shape
         flat_hidden = hidden_states.reshape(batch * seq_len, -1)
         flat_indexes = _flatten_3d_indexes(indexes, batch, seq_len)
-        flat_gen = image_gen_indicators.reshape(batch * seq_len).to(dtype=torch.bool)
+        flat_gen = route_indicators.reshape(batch * seq_len).to(dtype=torch.bool)
 
         # Callers on the packed forward path know the und/gen split for the whole
         # batch up front; reuse it to skip the per-branch device->host sync that
@@ -755,7 +748,7 @@ class _SenseNovaAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         indexes: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         *,
         exist_non_image_gen_tokens: bool | None = None,
         exist_image_gen_tokens: bool | None = None,
@@ -767,12 +760,12 @@ class _SenseNovaAttention(nn.Module):
             raise ValueError("SenseNova packed routed QKV expects hidden_states [N, C]")
         if indexes.shape != (3, hidden_states.shape[0]):
             raise ValueError("SenseNova packed routed QKV expects indexes [3, N]")
-        if image_gen_indicators.shape != (hidden_states.shape[0],):
-            raise ValueError("SenseNova packed routed QKV expects image_gen_indicators [N]")
+        if route_indicators.shape != (hidden_states.shape[0],):
+            raise ValueError("SenseNova packed routed QKV expects route_indicators [N]")
         q, k, v = self._project_qkv_routed(
             hidden_states.unsqueeze(0),
             indexes,
-            image_gen_indicators.unsqueeze(0),
+            route_indicators.unsqueeze(0),
             exist_non_image_gen_tokens=exist_non_image_gen_tokens,
             exist_image_gen_tokens=exist_image_gen_tokens,
             packed_rope=packed_rope,
@@ -862,7 +855,7 @@ class _SenseNovaAttention(nn.Module):
     def forward_packed_visible(
         self,
         hidden_states: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         indexes: torch.Tensor,
         *,
         exist_non_image_gen_tokens: bool,
@@ -875,10 +868,10 @@ class _SenseNovaAttention(nn.Module):
         dense_gen_route: bool = False,
         modality_split: int | None = None,
     ) -> torch.Tensor:
-        # gen mask (image_gen_indicators) and its complement (und) plus the exist
+        # gen mask (route_indicators) and its complement (und) plus the exist
         # flags are precomputed once by the model; reuse them so the o_proj
         # routing avoids a per-layer device->host sync.
-        gen = image_gen_indicators
+        gen = route_indicators
         ctx = get_forward_context()
         qkv_start = ctx.component_timer_start()
         if exist_non_image_gen_tokens != exist_image_gen_tokens:
@@ -1246,7 +1239,7 @@ class _SenseNovaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
@@ -1275,13 +1268,13 @@ class _SenseNovaAttention(nn.Module):
             )
 
         input_shape = hidden_states.shape[:-1]
-        text_mask = ~image_gen_indicators
+        text_mask = ~route_indicators
         if packed_rope is None:
             packed_rope = self._packed_rope(
                 _flatten_3d_indexes(indexes, hidden_states.shape[0], hidden_states.shape[1])
             )
         q, k, v = self._project_qkv_routed(
-            hidden_states, indexes, image_gen_indicators, packed_rope=packed_rope
+            hidden_states, indexes, route_indicators, packed_rope=packed_rope
         )
 
         if past_key_values is not None:
@@ -1296,7 +1289,7 @@ class _SenseNovaAttention(nn.Module):
                     routed = self._route_o_proj(
                         out,
                         text_mask=text_mask,
-                        gen_mask=image_gen_indicators,
+                        gen_mask=route_indicators,
                         exist_text=exist_non_image_gen_tokens,
                         exist_gen=exist_image_gen_tokens,
                         out=out.new_zeros((*input_shape, self.config.hidden_size)),
@@ -1314,7 +1307,7 @@ class _SenseNovaAttention(nn.Module):
         routed = self._route_o_proj(
             out,
             text_mask=text_mask,
-            gen_mask=image_gen_indicators,
+            gen_mask=route_indicators,
             exist_text=exist_non_image_gen_tokens,
             exist_gen=exist_image_gen_tokens,
             out=out.new_zeros((*input_shape, self.config.hidden_size)),
@@ -1349,7 +1342,7 @@ class _SenseNovaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
@@ -1364,7 +1357,7 @@ class _SenseNovaDecoderLayer(nn.Module):
             hidden_states, residual = self.forward_with_residual(
                 hidden_states,
                 None,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1377,13 +1370,13 @@ class _SenseNovaDecoderLayer(nn.Module):
                 raise RuntimeError("single-modality layer did not return a residual")
             return hidden_states + residual
 
-        text_mask = ~image_gen_indicators
+        text_mask = ~route_indicators
         residual = hidden_states
         routed = route_by_modality(
             hidden_states,
             {
                 Modality.TEXT: (text_mask, self._input_norm_by_modality[Modality.TEXT]),
-                Modality.GEN: (image_gen_indicators, self._input_norm_by_modality[Modality.GEN]),
+                Modality.GEN: (route_indicators, self._input_norm_by_modality[Modality.GEN]),
             },
             out=hidden_states.new_zeros(hidden_states.shape),
             transport=self._tower_transport,
@@ -1391,7 +1384,7 @@ class _SenseNovaDecoderLayer(nn.Module):
         )
         hidden_states, _ = self.self_attn(
             routed,
-            image_gen_indicators,
+            route_indicators,
             exist_non_image_gen_tokens,
             exist_image_gen_tokens,
             indexes,
@@ -1411,7 +1404,7 @@ class _SenseNovaDecoderLayer(nn.Module):
             hidden_states,
             {
                 Modality.TEXT: (text_mask, _mlp(Modality.TEXT)),
-                Modality.GEN: (image_gen_indicators, _mlp(Modality.GEN)),
+                Modality.GEN: (route_indicators, _mlp(Modality.GEN)),
             },
             out=hidden_states.new_zeros(hidden_states.shape),
             transport=self._tower_transport,
@@ -1424,7 +1417,7 @@ class _SenseNovaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
@@ -1437,7 +1430,7 @@ class _SenseNovaDecoderLayer(nn.Module):
             return self._forward_single_modality_with_residual(
                 hidden_states,
                 residual,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1453,7 +1446,7 @@ class _SenseNovaDecoderLayer(nn.Module):
             return self._forward_single_modality_with_residual(
                 hidden_states,
                 residual,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1467,7 +1460,7 @@ class _SenseNovaDecoderLayer(nn.Module):
             )
         return self(
             hidden_states,
-            image_gen_indicators=image_gen_indicators,
+            route_indicators=route_indicators,
             exist_non_image_gen_tokens=exist_non_image_gen_tokens,
             exist_image_gen_tokens=exist_image_gen_tokens,
             indexes=indexes,
@@ -1482,7 +1475,7 @@ class _SenseNovaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
@@ -1505,7 +1498,7 @@ class _SenseNovaDecoderLayer(nn.Module):
             )
         attn_out, _ = self.self_attn(
             attn_in,
-            image_gen_indicators,
+            route_indicators,
             exist_non_image_gen_tokens,
             exist_image_gen_tokens,
             indexes,
@@ -1682,7 +1675,7 @@ class _SenseNovaDecoderModel(nn.Module):
         self,
         input_ids: torch.Tensor | None = None,
         *,
-        image_gen_indicators: torch.Tensor | None = None,
+        route_indicators: torch.Tensor | None = None,
         indexes: torch.Tensor | None = None,
         attention_mask: Any = None,
         position_ids: torch.Tensor | None = None,
@@ -1697,7 +1690,7 @@ class _SenseNovaDecoderModel(nn.Module):
     ) -> BaseModelOutputWithPast:
         del position_ids
         inputs_embeds = self._resolve_inputs_embeds(input_ids, inputs_embeds)
-        if image_gen_indicators is None:
+        if route_indicators is None:
             exist_non_image_gen_tokens = (
                 True if exist_non_image_gen_tokens is None else bool(exist_non_image_gen_tokens)
             )
@@ -1705,17 +1698,17 @@ class _SenseNovaDecoderModel(nn.Module):
                 False if exist_image_gen_tokens is None else bool(exist_image_gen_tokens)
             )
             if exist_non_image_gen_tokens != exist_image_gen_tokens:
-                image_gen_indicators = torch.empty(0, dtype=torch.bool, device=inputs_embeds.device)
+                route_indicators = torch.empty(0, dtype=torch.bool, device=inputs_embeds.device)
             else:
-                image_gen_indicators = self._resolve_image_gen_indicators(None, inputs_embeds)
+                route_indicators = self._resolve_route_indicators(None, inputs_embeds)
         else:
-            image_gen_indicators = self._resolve_image_gen_indicators(
-                image_gen_indicators, inputs_embeds
+            route_indicators = self._resolve_route_indicators(
+                route_indicators, inputs_embeds
             )
             if exist_non_image_gen_tokens is None:
-                exist_non_image_gen_tokens = bool((~image_gen_indicators).any())
+                exist_non_image_gen_tokens = bool((~route_indicators).any())
             if exist_image_gen_tokens is None:
-                exist_image_gen_tokens = bool(image_gen_indicators.any())
+                exist_image_gen_tokens = bool(route_indicators.any())
         if use_cache and past_key_values is None:
             raise RuntimeError("native decoder serving requires an explicit paged cache")
         if indexes is None:
@@ -1742,7 +1735,7 @@ class _SenseNovaDecoderModel(nn.Module):
         if exist_non_image_gen_tokens != exist_image_gen_tokens:
             hidden_states = self._forward_single_modality_layers(
                 inputs_embeds,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1755,7 +1748,7 @@ class _SenseNovaDecoderModel(nn.Module):
         else:
             hidden_states = self._forward_mixed_modality_layers(
                 inputs_embeds,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1780,13 +1773,13 @@ class _SenseNovaDecoderModel(nn.Module):
             raise ValueError("exactly one of input_ids or inputs_embeds is required")
         return self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
 
-    def _resolve_image_gen_indicators(
+    def _resolve_route_indicators(
         self,
-        image_gen_indicators: torch.Tensor | None,
+        route_indicators: torch.Tensor | None,
         inputs_embeds: torch.Tensor,
     ) -> torch.Tensor:
-        if image_gen_indicators is not None:
-            return image_gen_indicators
+        if route_indicators is not None:
+            return route_indicators
         return torch.zeros(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
 
     def _resolve_cache_position(
@@ -1840,7 +1833,7 @@ class _SenseNovaDecoderModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
@@ -1857,7 +1850,7 @@ class _SenseNovaDecoderModel(nn.Module):
             hidden_states, residual = layer.forward_with_residual(
                 hidden_states,
                 residual,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1883,7 +1876,7 @@ class _SenseNovaDecoderModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         exist_non_image_gen_tokens: bool,
         exist_image_gen_tokens: bool,
         indexes: torch.Tensor,
@@ -1898,7 +1891,7 @@ class _SenseNovaDecoderModel(nn.Module):
             layer = cast(_SenseNovaDecoderLayer, layer_module)
             hidden_states = layer(
                 hidden_states,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 exist_non_image_gen_tokens=exist_non_image_gen_tokens,
                 exist_image_gen_tokens=exist_image_gen_tokens,
                 indexes=indexes,
@@ -1912,8 +1905,8 @@ class _SenseNovaDecoderModel(nn.Module):
         return route_by_modality(
             hidden_states,
             {
-                Modality.TEXT: (~image_gen_indicators, self._final_norm_by_modality[Modality.TEXT]),
-                Modality.GEN: (image_gen_indicators, self._final_norm_by_modality[Modality.GEN]),
+                Modality.TEXT: (~route_indicators, self._final_norm_by_modality[Modality.TEXT]),
+                Modality.GEN: (route_indicators, self._final_norm_by_modality[Modality.GEN]),
             },
             out=hidden_states.new_zeros(hidden_states.shape),
             transport=self._tower_transport,
@@ -1924,18 +1917,18 @@ class _SenseNovaDecoderModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         indexes: torch.Tensor,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
     ) -> torch.Tensor:
         if inputs_embeds.ndim != 2:
             raise ValueError("SenseNova packed model expects inputs_embeds [N, C]")
-        if image_gen_indicators.shape != (inputs_embeds.shape[0],):
-            raise ValueError("SenseNova packed model expects image_gen_indicators [N]")
+        if route_indicators.shape != (inputs_embeds.shape[0],):
+            raise ValueError("SenseNova packed model expects route_indicators [N]")
         if indexes.shape != (3, inputs_embeds.shape[0]):
             raise ValueError("SenseNova packed model expects indexes [3, N]")
-        gen = image_gen_indicators.to(dtype=torch.bool)
+        gen = route_indicators.to(dtype=torch.bool)
         und = ~gen
         und_indices = forward_stream.und_indices
         exist_non_image_gen_tokens = any(
@@ -1952,7 +1945,7 @@ class _SenseNovaDecoderModel(nn.Module):
         und_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "und")
         gen_tokens = sum(seg.q_len for seg in forward_stream.segments if seg.modality == "gen")
         modality_split = (
-            _text_first_modality_split(forward_stream, inputs_embeds.shape[0])
+            _contiguous_route_split(forward_stream, inputs_embeds.shape[0])
             if self._tower_transport is None
             else None
         )
@@ -2242,7 +2235,7 @@ class NEOChatModel(nn.Module):
         pre_norm_out: list[torch.Tensor] | None = [] if return_hidden else None
         outputs = self.language_model.model(
             inputs_embeds=input_embeds,
-            image_gen_indicators=torch.ones(
+            route_indicators=torch.ones(
                 input_embeds.shape[:2],
                 dtype=torch.bool,
                 device=input_embeds.device,
@@ -2359,7 +2352,7 @@ def check_checkpoint_compatibility(config_or_dict: Any) -> None:
 class SenseNovaU1ForUnifiedGeneration(
     UniModelBase,
     TextImageDenoiseOps,
-    PackedVisibleModelMixin,
+    PackedForwardModelMixin,
 ):
     """SenseNova-U1 serving model: text prefill/decode, image denoise, and commit."""
 
@@ -2926,10 +2919,10 @@ class SenseNovaU1ForUnifiedGeneration(
         # driver; the model only supplies the neural forward.
         return self._text_driver().run_text_logits_batch(ops)
 
-    def try_run_text_graph_logits_batch(
+    def try_run_graph_logits_batch(
         self, ops: list[Mapping[str, Any]]
     ) -> list[torch.Tensor] | None:
-        return self._text_driver().try_run_text_graph_logits_batch(ops)
+        return self._text_driver().try_run_graph_logits_batch(ops)
 
     def run_text_logits(self, op: Mapping[str, Any]) -> torch.Tensor:
         return self._text_driver().run_text_logits(dict(op))
@@ -3068,14 +3061,14 @@ class SenseNovaU1ForUnifiedGeneration(
         self,
         input_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         indexes: torch.Tensor,
         forward_stream: Any,
         kv_view: Any,
     ) -> torch.Tensor:
         return self.model.language_model.model.forward_packed_visible(
             input_embeds,
-            image_gen_indicators=image_gen_indicators,
+            route_indicators=route_indicators,
             indexes=indexes,
             forward_stream=forward_stream,
             kv_view=kv_view,
@@ -3106,7 +3099,7 @@ class SenseNovaU1ForUnifiedGeneration(
             raise capability_mismatch("SenseNova packed graph requires at least one decoder layer")
         return self.model.language_model.model.layers[0].self_attn
 
-    def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
+    def query_geometry(self) -> tuple[int, float, torch.dtype]:
         """Query-side geometry for the system decode-graph FlashInfer planner.
 
         Returns ``(num_query_heads, attention_scale, query_dtype)``. The KV-side
@@ -3114,7 +3107,7 @@ class SenseNovaU1ForUnifiedGeneration(
         pool by the system adapter; only these query-side values are model-specific.
         """
 
-        return self._text_decode_graph_query_geometry_from(
+        return self._query_geometry_from(
             self.model.language_model.model.layers[0].self_attn
         )
 
@@ -3377,7 +3370,7 @@ class SenseNovaU1ForUnifiedGeneration(
         defer_text_cpu_results: bool = False,
     ) -> Any:
         del group
-        return PackedVisibleBatchExecutor(self).execute(
+        return PackedForwardExecutor(self).execute(
             batch,
             request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,

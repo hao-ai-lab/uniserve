@@ -4,7 +4,7 @@ Family-owned machinery for interleaved (text+image) generation shared by the
 BAGEL and SenseNova adapters: the paged ``TextCache`` per request branch, the
 ``InterleavedTextCacheDriver`` that steps text tokens over paged KV, and the
 interleaved decode/prefill CUDA-graph runners built on the shared primitives
-in ``execution.cuda_graph``.
+in ``execution.graph``.
 """
 
 from __future__ import annotations
@@ -19,16 +19,14 @@ import torch
 from uniserve_worker.contracts.attention_plan import PagedVarlenPlan
 from uniserve_worker.contracts.forward_context import get_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
-from uniserve_worker.execution.cuda_graph import (
-    DecodeCudaGraphRunner,
-    PrefillCudaGraphRunner,
-    TextDecodeGraphHostInputs,
-    TextDecodeGraphState,
-    TextInitialPrefillGraphState,
-    decode_graph_padding_block_ids,
-    resolve_paged_decode_graph_prepare,
-    resolve_paged_prefill_graph_prepare,
-)
+from uniserve_worker.execution.graph.bucket import padding_blocks
+from uniserve_worker.execution.graph.span import Runner as SpanCapture
+from uniserve_worker.execution.graph.span import State as SpanState
+from uniserve_worker.execution.graph.span import resolve_prepare as resolve_span
+from uniserve_worker.execution.graph.step import Inputs as StepInputs
+from uniserve_worker.execution.graph.step import Runner as StepCapture
+from uniserve_worker.execution.graph.step import State as StepState
+from uniserve_worker.execution.graph.step import resolve_prepare as resolve_step
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
 from uniserve_worker.foundation.runtime_config import get_execution_config
 from uniserve_worker.nn.logits import forced_eos_logits
@@ -199,10 +197,8 @@ class InterleavedTextCacheDriver:
         self.owner = owner
         self.request_state_factory = request_state_factory
         self.image_start_token = image_start_token
-        # System-owned CUDA graph adapters, constructed lazily on first use so
-        # CPU/eager and non-CUDA integrations never import the graph stack.
-        self._decode_graph_runner: Any | None = None
-        self._prefill_graph_runner: Any | None = None
+        self._step_runner: Any | None = None
+        self._span_runner: Any | None = None
 
     def state(self, op: Mapping[str, Any]) -> Any:
         req_id = int(op["req_id"])
@@ -223,12 +219,12 @@ class InterleavedTextCacheDriver:
         op_list = [dict(op) for op in ops]
         if not op_list:
             return []
-        graphed = self.try_run_text_graph_logits_batch(op_list)
+        graphed = self.try_run_graph_logits_batch(op_list)
         if graphed is not None:
             return graphed
         return [self._run_text_logits_one(op) for op in op_list]
 
-    def try_run_text_graph_logits_batch(
+    def try_run_graph_logits_batch(
         self,
         ops: Sequence[Mapping[str, Any]],
     ) -> list[torch.Tensor] | None:
@@ -239,7 +235,7 @@ class InterleavedTextCacheDriver:
             return []
         if any(bool(op.get("return_all_logits")) for op in op_list):
             return None
-        graphed = self._prefill_graph().maybe_run_batch(self, op_list)
+        graphed = self._span().maybe_run_batch(self, op_list)
         if graphed is not None:
             return graphed
         return self.try_run_decode_graph_logits_batch(op_list)
@@ -258,7 +254,7 @@ class InterleavedTextCacheDriver:
         op_list = [dict(op) for op in ops]
         if not op_list:
             return []
-        return self._decode_graph().maybe_run_batch(self, op_list)
+        return self._step().maybe_run_batch(self, op_list)
 
     def run_text_logits(self, op: dict[str, Any]) -> torch.Tensor:
         return self._run_text_logits_one(dict(op))
@@ -295,22 +291,18 @@ class InterleavedTextCacheDriver:
             return st.cond.last_logits
         return st.cond.last_logits[:, -1, :]
 
-    def _decode_graph(self) -> Any:
-        runner = self._decode_graph_runner
+    def _step(self) -> Any:
+        runner = self._step_runner
         if runner is None:
-            pass
-
-            runner = InterleavedTextDecodeGraphRunner()
-            self._decode_graph_runner = runner
+            runner = Step()
+            self._step_runner = runner
         return runner
 
-    def _prefill_graph(self) -> Any:
-        runner = self._prefill_graph_runner
+    def _span(self) -> Any:
+        runner = self._span_runner
         if runner is None:
-            pass
-
-            runner = InterleavedTextPrefillGraphRunner()
-            self._prefill_graph_runner = runner
+            runner = Span()
+            self._span_runner = runner
         return runner
 
     def extend_cache_blocks(self, cache: TextCache, op: Mapping[str, Any]) -> None:
@@ -591,18 +583,18 @@ class _PrefillRow:
     block_ids: list[int]
 
 
-class InterleavedTextPrefillGraphRunner:
+class Span:
     """Route interleaved text prefill through the shared prefill graph."""
 
     def __init__(self) -> None:
         runtime = get_execution_config()
-        self._prefill = PrefillCudaGraphRunner(
+        self._runner = SpanCapture(
             name="interleaved_text",
             default_enabled=runtime.prefill_cuda_graph,
             default_warmup=False,
             default_warmup_token_buckets=runtime.prefill_cuda_graph_warmup_tokens,
             default_warmup_batch_sizes=runtime.cuda_graph_warmup_batches,
-            metric_prefix="text_",
+            metric_prefix="owner_",
             logger=logger,
         )
         self._sidecars: dict[int, _PrefillSidecar] = {}
@@ -619,7 +611,7 @@ class InterleavedTextPrefillGraphRunner:
         if prep is None:
             return None
         rows, inputs, prepare_backend = prep
-        logits = self._prefill.maybe_run(
+        logits = self._runner.maybe_run(
             kv_pool=rows[0].past_cache.pool,
             num_blocks=int(rows[0].past_cache.pool.num_blocks),
             num_tokens=int(inputs["num_tokens"]),
@@ -639,8 +631,8 @@ class InterleavedTextPrefillGraphRunner:
         self._graphed_steps += 1
         if self._graphed_steps == 1:
             logger.info(
-                "interleaved text prefill CUDA graph active: captured bucket(s)=%s (shared PrefillCudaGraphRunner)",
-                sorted(self._prefill.states),
+                "interleaved text prefill CUDA graph active: captured bucket(s)=%s (shared Span)",
+                sorted(self._runner.states),
             )
         return self._commit(rows, logits)
 
@@ -649,7 +641,7 @@ class InterleavedTextPrefillGraphRunner:
         driver: "InterleavedTextCacheDriver",
         ops: Sequence[Mapping[str, Any]],
     ) -> tuple[list[_PrefillRow], dict[str, Any], Any] | None:
-        if not self._prefill.enabled() or not torch.cuda.is_available():
+        if not self._runner.enabled() or not torch.cuda.is_available():
             return None
         if not ops:
             return None
@@ -665,7 +657,7 @@ class InterleavedTextPrefillGraphRunner:
             getattr(pool, "supports_paged_attention_storage", True)
         ):
             return None
-        prepare_backend = resolve_paged_prefill_graph_prepare(
+        prepare_backend = resolve_span(
             owner=owner,
             kv_pool=pool,
             attention_preference=getattr(get_forward_context(), "attention_preference", None),
@@ -708,9 +700,9 @@ class InterleavedTextPrefillGraphRunner:
             )
 
         raw_num_tokens = sum(row.raw_len for row in rows)
-        num_tokens = self._prefill.bucket_num_tokens(raw_num_tokens)
+        num_tokens = self._runner.bucket_num_tokens(raw_num_tokens)
         padding_tokens = num_tokens - raw_num_tokens
-        max_kv_tokens = self._prefill.bucket_kv_tokens(
+        max_kv_tokens = self._runner.bucket_kv_tokens(
             max(
                 row.base_len + row.raw_len + (padding_tokens if index == len(rows) - 1 else 0)
                 for index, row in enumerate(rows)
@@ -778,7 +770,7 @@ class InterleavedTextPrefillGraphRunner:
         }
         return rows, inputs, prepare_backend
 
-    def _sidecar_for(self, state: TextInitialPrefillGraphState) -> _PrefillSidecar:
+    def _sidecar_for(self, state: SpanState) -> _PrefillSidecar:
         sidecar = self._sidecars.get(id(state))
         if sidecar is None:
             sidecar = _PrefillSidecar(past=_InterleavedPrefillGraphPast(state.cache))
@@ -788,7 +780,7 @@ class InterleavedTextPrefillGraphRunner:
     def _forward(
         self,
         driver: "InterleavedTextCacheDriver",
-        state: TextInitialPrefillGraphState,
+        state: SpanState,
     ) -> torch.Tensor:
         sidecar = self._sidecar_for(state)
         outputs = driver.owner.interleaved_text_forward(
@@ -820,12 +812,12 @@ class InterleavedTextPrefillGraphRunner:
         return outputs
 
 
-class InterleavedTextDecodeGraphRunner:
+class Step:
     """Route interleaved one-token text decode through the shared decode graph."""
 
     def __init__(self) -> None:
         runtime = get_execution_config()
-        self._decode = DecodeCudaGraphRunner(
+        self._runner = StepCapture(
             name="interleaved_text",
             default_enabled=runtime.cuda_graph,
             # Lazy capture on the first eligible decode batch: interleaved request
@@ -833,7 +825,7 @@ class InterleavedTextDecodeGraphRunner:
             # to warm up ahead of serving.
             default_warmup=False,
             default_warmup_batch_sizes=(),
-            metric_prefix="text_",
+            metric_prefix="owner_",
             logger=logger,
         )
         self._sidecars: dict[int, _Sidecar] = {}
@@ -865,12 +857,12 @@ class InterleavedTextDecodeGraphRunner:
             return None
         rows, prepare_backend = prep
         batch = len(rows)
-        graph_batch = self._decode.resolve_bucket(batch)
+        graph_batch = self._runner.resolve_bucket(batch)
         device = rows[0].past_cache.pool.k.device
         pool = rows[0].past_cache.pool
         graph_rows = self._pad_rows(driver, rows, graph_batch, pool)
         slot = self._stager.acquire_slot(device=device)
-        host_inputs = TextDecodeGraphHostInputs(
+        host_inputs = StepInputs(
             input_ids=tuple(r.token_id if r.token_id is not None else 0 for r in graph_rows),
             positions=tuple(r.pos for r in graph_rows),
             block_ids_by_row=tuple(tuple(r.block_ids) for r in graph_rows),
@@ -885,7 +877,7 @@ class InterleavedTextDecodeGraphRunner:
         )
 
         try:
-            logits = self._decode.maybe_run_host_inputs(
+            logits = self._runner.maybe_run_host_inputs(
                 kv_pool=pool,
                 num_blocks=int(pool.num_blocks),
                 device=device,
@@ -902,8 +894,8 @@ class InterleavedTextDecodeGraphRunner:
         self._graphed_steps += 1
         if self._graphed_steps == 1:
             logger.info(
-                "interleaved text decode CUDA graph active: captured bucket(s)=%s (shared DecodeCudaGraphRunner)",
-                sorted(self._decode.states),
+                "interleaved text decode CUDA graph active: captured bucket(s)=%s (shared Step)",
+                sorted(self._runner.states),
             )
         return self._commit(rows, logits)
 
@@ -917,7 +909,7 @@ class InterleavedTextDecodeGraphRunner:
         graph_batch = int(graph_batch)
         if graph_batch <= len(rows):
             return rows
-        padding_block_ids = decode_graph_padding_block_ids(pool)
+        padding_block_ids = padding_blocks(pool)
         if not padding_block_ids:
             raise invalid_descriptor(
                 "interleaved decode graph padded replay requires reserved KV padding blocks"
@@ -951,7 +943,7 @@ class InterleavedTextDecodeGraphRunner:
         driver: "InterleavedTextCacheDriver",
         ops: Sequence[Mapping[str, Any]],
     ) -> tuple[list[_Row], Any] | None:
-        if not self._decode.enabled() or not torch.cuda.is_available():
+        if not self._runner.enabled() or not torch.cuda.is_available():
             return None
         owner = driver.owner
         model = getattr(owner, "model", None)
@@ -968,7 +960,7 @@ class InterleavedTextDecodeGraphRunner:
             getattr(pool, "supports_paged_attention_storage", True)
         ):
             return None
-        prepare_backend = resolve_paged_decode_graph_prepare(
+        prepare_backend = resolve_step(
             owner=owner,
             kv_pool=pool,
             num_blocks=int(pool.num_blocks),
@@ -983,7 +975,7 @@ class InterleavedTextDecodeGraphRunner:
         # Validation phase: prove every row is a one-token host-KV decode before
         # mutating any cache block ids or lengths.
         validated: list[tuple[Mapping[str, Any], "TextCache", int | None, torch.Tensor | None]] = []
-        padding_block_ids = set(decode_graph_padding_block_ids(pool))
+        padding_block_ids = set(padding_blocks(pool))
         for op in ops:
             tokens = list(op.get("token_ids") or [])
             if len(tokens) != 1:
@@ -1048,7 +1040,7 @@ class InterleavedTextDecodeGraphRunner:
 
     # -- forward closure + commit --------------------------------------------
 
-    def _sidecar_for(self, state: TextDecodeGraphState) -> _Sidecar:
+    def _sidecar_for(self, state: StepState) -> _Sidecar:
         sidecar = self._sidecars.get(id(state))
         if sidecar is None:
             sidecar = _Sidecar(past=_InterleavedDecodeGraphPast(state.cache))
@@ -1056,7 +1048,7 @@ class InterleavedTextDecodeGraphRunner:
         return sidecar
 
     def _forward(
-        self, driver: "InterleavedTextCacheDriver", state: TextDecodeGraphState
+        self, driver: "InterleavedTextCacheDriver", state: StepState
     ) -> torch.Tensor:
         sidecar = self._sidecar_for(state)
         outputs = driver.owner.interleaved_text_forward(
@@ -1066,7 +1058,7 @@ class InterleavedTextDecodeGraphRunner:
             use_cache=True,
             text_only_rope=True,
         )
-        # Return ``[batch, vocab]``; DecodeCudaGraphRunner slices dim 0 back to the
+        # Return ``[batch, vocab]``; Step slices dim 0 back to the
         # actual batch and the commit restores the scalar ``[1, 1, vocab]`` shape.
         return outputs.logits[:, -1, :]
 

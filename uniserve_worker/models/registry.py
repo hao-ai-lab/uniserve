@@ -88,11 +88,11 @@ class UniModelBase(ModelHooks):
             return value
         return get_current_kv_cache_dtype(config)
 
-    def _text_decode_graph_query_geometry_from(self, attn: Any) -> tuple[int, float, "torch.dtype"]:
+    def _query_geometry_from(self, attn: Any) -> tuple[int, float, "torch.dtype"]:
         """Query-side decode-graph geometry read off one attention module.
 
         The shared extraction behind each model's
-        ``text_decode_graph_query_geometry`` hook: the module's (tensor-parallel
+        ``query_geometry`` hook: the module's (tensor-parallel
         local) head count, its softmax scale, and the query dtype. ``q_norm``'s
         weight stays in compute dtype even under weight quantization, so it is
         the faithful dtype of the query tensor the decode kernel sees.

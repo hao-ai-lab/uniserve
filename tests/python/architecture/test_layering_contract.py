@@ -489,7 +489,7 @@ def test_sensenova_does_not_define_a_second_native_qwen3_backbone_namespace():
     assert "_NativeQwen3" not in source
 
 
-def test_packed_mixed_forward_uses_owner_adapter_not_model_backbone():
+def test_packed_forward_uses_owner_adapter_not_model_backbone():
     source = (WORKER / "models" / "packed_forward.py").read_text(encoding="utf-8")
     assert "owner.model." not in source
 
@@ -501,10 +501,7 @@ FORBIDDEN_MODEL_CONSTRUCTIONS = frozenset(
     {
         "PagedKVPool",
         "BatchedPagedTextCache",
-        "DecodeCudaGraphRunner",
-        "PrefillCudaGraphRunner",
-        "TextGraphRunner",
-        "InterleavedTextDecodeGraphRunner",
+        "Executor",
         # ``torch.cuda.CUDAGraph()`` — no model-local CUDA graph lifecycle. The
         # old set omitted this, so the model-local ``_SenseNovaTextDecodeGraphRunner``
         # (which captured its own ``torch.cuda.CUDAGraph``) slipped past the guard.
@@ -525,7 +522,7 @@ MODEL_GRAPH_OWNER_CLASS_NAME = re.compile(
 def test_models_tree_owns_no_pools_or_graphs():
     """Models declare residency geometry; the system constructs + owns the pools.
 
-    The worker runtime (``ResidencyManager`` / ``TextGraphRunner``) is the single
+    The worker runtime (``ResidencyManager`` / graph ``Executor``) is the single
     owner of the KV pools and CUDA graphs. A model may name these types in an
     annotation but must not instantiate one — that ownership moved to the system.
     """
@@ -915,17 +912,47 @@ def test_torch_is_compiling_has_a_single_owner():
     assert offenders == []
 
 
-def test_execution_package_matches_completion_criterion_file_set():
-    """unified_forward_execution completion criterion 1: the execution package
-    contains exactly the engine and the consolidated CUDA graph runtime."""
+def test_execution_graph_packages_match_completion_criterion():
+    """Graph responsibilities live in one namespace with explicit physical seams."""
 
     execution = WORKER / "execution"
     assert {p.name for p in execution.glob("*.py")} == {
         "__init__.py",
         "engine.py",
-        "cuda_graph.py",
     }
-    assert [p for p in execution.iterdir() if p.is_dir() and p.name != "__pycache__"] == []
+    assert {
+        p.name for p in execution.iterdir() if p.is_dir() and p.name != "__pycache__"
+    } == {"graph"}
+
+    graph_core = execution / "graph"
+    assert {p.name for p in graph_core.glob("*.py")} == {
+        "__init__.py",
+        "bucket.py",
+        "capture.py",
+        "dispatch.py",
+        "executor.py",
+        "path.py",
+        "span.py",
+        "step.py",
+    }
+    assert [p for p in graph_core.iterdir() if p.is_dir() and p.name != "__pycache__"] == []
+
+
+def test_graph_core_identity_excludes_dynamic_query_and_composition_data():
+    source = "\n".join(
+        (WORKER / "execution" / "graph" / name).read_text(encoding="utf-8")
+        for name in ("bucket.py", "capture.py", "dispatch.py")
+    )
+    forbidden = (
+        "ForwardMode",
+        "op_modes",
+        "segment_geometry",
+        "unit_query",
+        "ragged_query",
+        "modality",
+    )
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
 
 
 def test_deleted_execution_modules_are_absent_everywhere():
