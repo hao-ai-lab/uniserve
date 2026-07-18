@@ -65,10 +65,9 @@ class FlowContext:
 class UniModel(Protocol):
     """Minimal contract every registered model satisfies.
 
-    Which method each ``supported_ops`` entry requires is enforced at
-    registration (``models.registry._missing_capability``). Capability
-    Protocols below document method groups for type-checkers; a model implements
-    exactly the ones its declared ops need.
+    Each ``supported_ops`` entry resolves to a typed model operation at
+    registration. Capability Protocols below document the corresponding method
+    groups for type-checkers.
     """
 
     architectures: tuple[str, ...]

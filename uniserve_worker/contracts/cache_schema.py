@@ -1,8 +1,6 @@
 """Closed cache-domain, attention-site, and family cache-lowering contracts.
 
-Target contracts from ``specs/unified_kv_attention_runtime.md`` (the
-"Closed contracts and sessions" work package, parent stages 1-2). These types
-extend the parent ``ModelRegistration`` with declarative cache data:
+These types extend model-family registration with declarative cache data:
 
 * :class:`CacheDomainSpec` — static physical compatibility of one cache state
   family (layers, layout, page geometry, retention, placement, shareability).
@@ -14,14 +12,13 @@ extend the parent ``ModelRegistration`` with declarative cache data:
 * :class:`CacheSequenceRef` — the engine-private versioned reference to one
   logical cache history. It never crosses the worker wire.
 
-Nothing here is wired into production execution: per the spec, companion work
-activates as the parent protocol and engine cut over as one vertical
-slice. The module is torch-free so validation and fingerprinting run anywhere.
+The module is torch-free so validation and fingerprinting run anywhere.
 
-Every enum carries canonical integer tags shared with the future Rust side;
+Every enum carries canonical integer tags shared with protocol peers;
 :func:`registration_fingerprint` serializes declarations by field order, so a
 tag or field-order change is a contract change by construction.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -29,7 +26,8 @@ import hashlib
 from dataclasses import dataclass, fields
 from enum import IntEnum
 
-from .execution import EngineRef, OperationTag, SessionRef
+from .execution import EngineRef, SessionRef
+from .operations import OperationTag
 
 __all__ = [
     "NO_CACHE_DOMAIN",
@@ -620,15 +618,11 @@ def _validate_domains(
     owned_layers: dict[int, int] = {}
     for domain in domains:
         if domain.domain_id <= NO_CACHE_DOMAIN:
-            raise CacheSchemaError(
-                f"cache domain ids must be positive; got {domain.domain_id}"
-            )
+            raise CacheSchemaError(f"cache domain ids must be positive; got {domain.domain_id}")
         if domain.domain_id in domain_by_id:
             raise CacheSchemaError(f"duplicate cache domain id {domain.domain_id}")
         if domain.page_tokens <= 0:
-            raise CacheSchemaError(
-                f"cache domain {domain.domain_id} page_tokens must be positive"
-            )
+            raise CacheSchemaError(f"cache domain {domain.domain_id} page_tokens must be positive")
         if not domain.layer_ids:
             raise CacheSchemaError(f"cache domain {domain.domain_id} owns no layers")
         for layer_id in domain.layer_ids:
@@ -653,9 +647,7 @@ def _validate_sites(
             raise CacheSchemaError(f"duplicate attention site id {site.site_id}")
         seen_sites.add(site.site_id)
         if not site.visibility_domain:
-            raise CacheSchemaError(
-                f"attention site {site.site_id} advertises no attention pattern"
-            )
+            raise CacheSchemaError(f"attention site {site.site_id} advertises no attention pattern")
         if site.cache_domain_id == NO_CACHE_DOMAIN:
             continue
         domain = domain_by_id.get(site.cache_domain_id)
@@ -703,8 +695,7 @@ def _validate_roles(
                 RoleInitializationKind.FORK_ROLE,
             ):
                 raise CacheSchemaError(
-                    f"branch-lifetime role {role.role_id} needs an open expression "
-                    "or fork source"
+                    f"branch-lifetime role {role.role_id} needs an open expression or fork source"
                 )
             if role.release.kind is not RoleReleaseKind.RELEASE_WHEN:
                 raise CacheSchemaError(
@@ -717,10 +708,7 @@ def _validate_roles(
             raise CacheSchemaError(
                 f"role {role.role_id} EMPTY_WHEN initialization has no open expression"
             )
-        if (
-            role.release.kind is RoleReleaseKind.RELEASE_WHEN
-            and role.release.close_expr is None
-        ):
+        if role.release.kind is RoleReleaseKind.RELEASE_WHEN and role.release.close_expr is None:
             raise CacheSchemaError(
                 f"role {role.role_id} RELEASE_WHEN release has no close expression"
             )
@@ -729,8 +717,7 @@ def _validate_roles(
         if role.initialization.kind is RoleInitializationKind.FORK_ROLE:
             if role.initialization.source_role_id not in role_by_id:
                 raise CacheSchemaError(
-                    f"role {role.role_id} forks unknown role "
-                    f"{role.initialization.source_role_id}"
+                    f"role {role.role_id} forks unknown role {role.initialization.source_role_id}"
                 )
     return role_by_id
 
@@ -793,8 +780,7 @@ def _validate_region_effect(region: CacheRegionSpec) -> None:
     elif effect is CacheEffect.TRANSIENT_OVERLAY:
         if region.commit_rows.kind is not CommitExprKind.ZERO:
             raise CacheSchemaError(
-                f"region {region.local_region_id}: transient effects commit zero "
-                "cache rows"
+                f"region {region.local_region_id}: transient effects commit zero cache rows"
             )
     elif effect is CacheEffect.TENTATIVE_APPEND:
         if region.commit_rows.kind not in (
@@ -824,9 +810,7 @@ def _validate_route_partition(region: CacheRegionSpec) -> None:
     """Route-run extents must exactly partition the region's query rows."""
 
     if not region.route_runs:
-        raise CacheSchemaError(
-            f"region {region.local_region_id} declares no route runs"
-        )
+        raise CacheSchemaError(f"region {region.local_region_id} declares no route runs")
     total_constant = sum(run.extent.constant for run in region.route_runs)
     total_terms: dict[ExtentOperand, int] = {}
     for run in region.route_runs:
@@ -838,10 +822,8 @@ def _validate_route_partition(region: CacheRegionSpec) -> None:
         or total_terms != region.query_rows.canonical_terms()
     ):
         raise CacheSchemaError(
-            f"region {region.local_region_id}: route runs do not partition "
-            "query rows"
+            f"region {region.local_region_id}: route runs do not partition query rows"
         )
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -865,6 +847,7 @@ class FamilyCacheRegistration:
 # --------------------------------------------------------------------------- #
 # Registration fingerprint.
 # --------------------------------------------------------------------------- #
+
 
 def _canonical_encode(value: object, out: list[str]) -> None:
     if isinstance(value, IntEnum):
@@ -896,8 +879,7 @@ def _canonical_encode(value: object, out: list[str]) -> None:
         out.append("]")
     else:
         raise CacheSchemaError(
-            f"value of type {type(value).__name__} cannot join a registration "
-            "fingerprint"
+            f"value of type {type(value).__name__} cannot join a registration fingerprint"
         )
 
 

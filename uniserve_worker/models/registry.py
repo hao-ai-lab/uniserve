@@ -1,10 +1,8 @@
 """Model registry: architecture resolution plus the shared ``UniModelBase`` glue.
 
-Owns both halves of the family-adapter surface named by
-``specs/unified_forward_execution.md`` (source migration map, ``model_base.py``
-row): the architecture-to-class registration and the concrete contract mixin
-every registered family lists first. Family implementations stay in their
-family files.
+The registry owns architecture-to-class registration and the concrete contract
+base shared by registered families. Family implementations stay in their
+family modules.
 """
 
 from __future__ import annotations
@@ -18,7 +16,6 @@ from typing import TYPE_CHECKING, Any, Type
 
 from ..contracts.batch_policy import BatchPolicy
 from ..contracts.caps import Caps, ExecutionConstraints
-from ..contracts.forward_mode import ForwardMode, mode_for_op
 from ..contracts.model_family import ModelFamilyDescriptor, ModelOperationSet
 from ..contracts.model_protocols import ModelHooks, UniModel
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
@@ -279,27 +276,3 @@ def detect_model_architectures(model_path: str | Path) -> list[str]:
 
 def _validate_model_contract(model_cls: Type[UniModel]) -> None:
     ModelOperationSet.from_model_class(model_cls).validate(model_cls)
-
-
-def _missing_capability(model_cls: Type[UniModel], op: str) -> str | None:
-    try:
-        mode = mode_for_op(op)
-    except WorkerError as exc:
-        raise capability_mismatch(f"{model_cls.__name__} declares unknown op {op!r}") from exc
-    required: tuple[str, ...]
-    if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}:
-        required = ("forward",)
-    elif mode == ForwardMode.DENOISE:
-        required = ("predict_velocity",)
-    elif mode == ForwardMode.COMMIT:
-        required = ("decode_image",)
-    elif mode == ForwardMode.ENCODE and op == "vit_encode":
-        required = ("encode_image",)
-    elif mode == ForwardMode.ENCODE and op == "vae_encode":
-        required = ("encode_latents",)
-    else:
-        required = ("forward",)
-    for method in required:
-        if callable(getattr(model_cls, method, None)):
-            return None
-    return " or ".join(f"{method}()" for method in required)
