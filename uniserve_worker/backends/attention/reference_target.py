@@ -47,8 +47,10 @@ class ReferenceAttentionError(RuntimeError):
 class CacheDeviceBinding:
     """Residency-owned page storage for one domain, one layer set.
 
-    Layout is ``[layer, page, page_tokens, 2 (K/V), kv_heads, head_dim]``.
-    Page ``0`` is the sink page; writes there are legal and meaningless.
+    Layout is ``[layer, page, 2 (K/V), page_tokens, kv_heads, head_dim]`` —
+    per layer exactly FlashInfer's NHD paged KV cache, so fused providers
+    consume the same storage the reference provider proves. Page ``0`` is the
+    sink page; writes there are legal and meaningless.
     """
 
     def __init__(
@@ -64,7 +66,7 @@ class CacheDeviceBinding:
     ) -> None:
         self.page_tokens = page_tokens
         self.storage = torch.zeros(
-            (layers, pages, page_tokens, 2, kv_heads, head_dim),
+            (layers, pages, 2, page_tokens, kv_heads, head_dim),
             device=device,
             dtype=dtype,
         )
@@ -92,10 +94,10 @@ class CacheDeviceBinding:
         page_index = torch.tensor(page_ids, device=device, dtype=torch.long)
         offset_index = torch.tensor(offsets, device=device, dtype=torch.long)
         slot_index = torch.tensor(slots, device=device, dtype=torch.long)
-        self.storage[layer_id, page_index, offset_index, 0] = keys[slot_index].to(
+        self.storage[layer_id, page_index, 0, offset_index] = keys[slot_index].to(
             self.storage.dtype
         )
-        self.storage[layer_id, page_index, offset_index, 1] = values[
+        self.storage[layer_id, page_index, 1, offset_index] = values[
             slot_index
         ].to(self.storage.dtype)
 
@@ -125,10 +127,12 @@ class CacheDeviceBinding:
         page_index = torch.tensor(
             chain[:needed_pages], device=self.storage.device, dtype=torch.long
         )
-        gathered = self.storage[layer_id, page_index].reshape(
-            needed_pages * self.page_tokens, 2, *self.storage.shape[4:]
+        gathered = (
+            self.storage[layer_id, page_index]
+            .permute(0, 2, 1, 3, 4)
+            .reshape(needed_pages * self.page_tokens, 2, *self.storage.shape[4:])
         )[:rows]
-        return gathered[:, 0], gathered[:, 1]
+        return gathered[:, 0].contiguous(), gathered[:, 1].contiguous()
 
 
 class ReferenceAttentionBackend:
