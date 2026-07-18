@@ -39,7 +39,7 @@ def test_decide_empty_group_routes_per_mode():
     assert decision.modes == ()
 
 
-def test_decide_text_extend_plus_decode_routes_forward():
+def test_decide_extend_plus_decode_routes_forward():
     router = ForwardAdmissionRouter()
     ops = [
         {"kind": PREFILL_UND, "token_ids": [1, 2, 3]},
@@ -52,7 +52,7 @@ def test_decide_text_extend_plus_decode_routes_forward():
     assert decision.use_forward is True
 
 
-def test_decide_text_extend_plus_decode_with_spec_tokens_routes_per_mode():
+def test_decide_candidate_expansion_routes_to_dedicated_path():
     router = ForwardAdmissionRouter()
     ops = [
         {"kind": PREFILL_UND, "token_ids": [1, 2, 3]},
@@ -91,7 +91,7 @@ def test_decide_prefill_plus_denoise_routes_forward():
     assert decision.use_forward is True
 
 
-def test_decide_decode_plus_commit_routes_forward():
+def test_decide_decode_plus_commit_separates_publication_from_model_execution():
     router = ForwardAdmissionRouter()
     ops = [
         {"kind": DECODE_UND, "token_ids": [1]},
@@ -100,8 +100,20 @@ def test_decide_decode_plus_commit_routes_forward():
 
     decision = router.decide(ops)
 
-    assert decision.route is Route.FORWARD
-    assert decision.use_forward is True
+    assert decision.route is Route.PER_MODE
+    assert decision.use_forward is False
+
+
+def test_partition_keeps_publication_rows_out_of_model_execution_group():
+    router = ForwardAdmissionRouter()
+    decode = {"kind": DECODE_UND, "token_ids": [1]}
+    denoise = {"kind": DENOISE_GEN}
+    commit = {"kind": COMMIT_GEN}
+
+    supported, delegated = router.partition_supported([decode, commit, denoise])
+
+    assert supported == [(0, decode), (2, denoise)]
+    assert delegated == [(1, commit)]
 
 
 def test_decide_encode_with_text_and_denoise_does_not_admit_whole_batch():
@@ -118,11 +130,27 @@ def test_decide_encode_with_text_and_denoise_does_not_admit_whole_batch():
     assert decision.use_forward is False
 
 
-def test_decide_denoise_without_decode_routes_per_mode():
+@pytest.mark.parametrize(
+    "op",
+    [
+        {"kind": PREFILL_UND, "token_ids": [1, 2, 3]},
+        {"kind": DECODE_UND, "token_ids": [4]},
+        {"kind": DENOISE_GEN},
+    ],
+)
+def test_decide_single_operation_segment_groups_route_forward(op):
     router = ForwardAdmissionRouter()
-    ops = [{"kind": DENOISE_GEN}]
 
-    decision = router.decide(ops)
+    decision = router.decide([op])
+
+    assert decision.route is Route.FORWARD
+    assert decision.use_forward is True
+
+
+def test_decide_commit_without_model_segment_routes_per_mode():
+    router = ForwardAdmissionRouter()
+
+    decision = router.decide([{"kind": COMMIT_GEN}])
 
     assert decision.route is Route.PER_MODE
     assert decision.use_forward is False

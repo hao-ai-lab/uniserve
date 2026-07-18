@@ -1,9 +1,9 @@
-"""Packed visible-batch family runtime: one mixed und+gen forward per step.
+"""General packed-forward runtime shared by segment-oriented model families.
 
-Family-owned machinery shared by BAGEL and SenseNova for packed mixed
-execution: the ``PackedVisibleModelMixin`` model base, the packed batch
-adapter that lowers a mixed op group into one visible-token forward, and the
-packed mixed CUDA-graph runner built on ``execution.cuda_graph`` primitives.
+Family-owned machinery shared by BAGEL and SenseNova for packed forward
+execution: the ``PackedForwardModelMixin`` model base, the packed batch
+adapter that lowers any supported op group into one segment stream, and the
+packed forward CUDA-graph runner built on ``execution.graph`` primitives.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
@@ -24,19 +25,13 @@ from uniserve_worker.contracts.batches import UniForwardBatch
 from uniserve_worker.contracts.forward_batch import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
+    ForwardPlan,
     ForwardResult,
     TextPostprocessEntry,
 )
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.outputs import TextTokenOutput
-from uniserve_worker.execution.cuda_graph import (
-    GraphEvent,
-    _GraphRunnerBase,
-    decode_graph_padding_block_ids,
-    explicit_attention_backend_name,
-    record_graph_stats,
-)
 from uniserve_worker.execution.engine import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
@@ -48,6 +43,10 @@ from uniserve_worker.execution.engine import (
     text_image_branches,
     text_image_cfg_plan,
 )
+from uniserve_worker.execution.graph.bucket import padding_blocks
+from uniserve_worker.execution.graph.capture import Event, record
+from uniserve_worker.execution.graph.capture import Runner as Capture
+from uniserve_worker.execution.graph.executor import backend_name
 from uniserve_worker.foundation.env import env_flag
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
 from uniserve_worker.foundation.profiling import profile_range
@@ -81,24 +80,25 @@ from uniserve_worker.runtime.paged_text_cache import (
 from uniserve_worker.runtime.tensor_staging import TextTensorStager, TextTensorStagingSlot
 
 # ---------------------
-# Packed mixed graph runner
+# Packed forward graph runner
 # ---------------------
 
 logger = logging.getLogger(__name__)
 
 
-_RUNNER_ATTR = "_packed_mixed_graph_runner"
+_RUNNER_ATTR = "_packed_graph_runner"
 _MAX_FAILURES = 2
+_MAX_RESIDENT_CAPACITIES = 8
 
 
-class _MixedGraphBackendUnplanned(RuntimeError):
+class _GraphBackendUnplanned(RuntimeError):
     """Capture completed without planning the graph-scoped attention backend."""
 
 
 @dataclass
-class PackedMixedGraphState:
+class PackedGraphState:
     key: tuple[Any, ...]
-    family: str
+    topology_id: str
     graph: torch.cuda.CUDAGraph
     packed_embeds: torch.Tensor
     indicators: torch.Tensor
@@ -123,22 +123,22 @@ class PackedMixedGraphState:
     )
 
 
-class PackedMixedGraphRunner(_GraphRunnerBase):
-    """Own the active-topology CUDA graph for packed mixed decoder forwards."""
+class PackedGraphRunner(Capture):
+    """Own the active-topology CUDA graph for packed forward decoder forwards."""
 
     def __init__(
         self,
         *,
-        name: str = "packed_mixed",
+        name: str = "packed_forward",
         default_enabled: bool | None = None,
         logger: Any = logger,
     ) -> None:
         self.name = str(name)
         self.default_enabled = True if default_enabled is None else bool(default_enabled)
         self.default_warmup = False
-        self.metric_prefix = "packed_mixed_"
+        self.metric_prefix = "packed_forward_"
         self.logger = logger
-        self.states: dict[tuple[Any, ...], PackedMixedGraphState] = {}
+        self.states: dict[tuple[Any, ...], PackedGraphState] = {}
         self.disabled: set[tuple[Any, ...]] = set()
         self._capture_pool: Any = None
         self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
@@ -146,37 +146,45 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         self._hard_disabled = False
         self._backend_ineligible = False
         self._replays = 0
+        self._resident_order: OrderedDict[tuple[Any, ...], None] = OrderedDict()
         self.last_miss_reason: str | None = None
 
     def enabled(self) -> bool:
         return self.default_enabled and not self._hard_disabled and not self._backend_ineligible
 
     def capture_pool(self) -> Any:
-        # Exact mixed geometries are captured lazily. The resident topology owns
+        # Capacity buckets are captured lazily. The resident topology owns
         # its activation pool so its static allocations cannot alias another
         # graph executable.
         return None
 
-    def _retire_inactive_geometry(
+    def _admit_capacity(
         self,
         key: tuple[Any, ...],
         *,
-        family: str,
         device: torch.device | str,
     ) -> None:
-        inactive = tuple(
-            existing
-            for existing, state in self.states.items()
-            if existing != key and str(getattr(state, "family", family)) == str(family)
-        )
-        self._retire_graph_states(inactive, device=device, reclaim=True)
+        if key in self.states:
+            self._touch_capacity(key)
+            return
+        while len(self.states) >= _MAX_RESIDENT_CAPACITIES:
+            victim = next(
+                (candidate for candidate in self._resident_order if candidate in self.states),
+                next(iter(self.states)),
+            )
+            self._resident_order.pop(victim, None)
+            self._retire_graph_states((victim,), device=device)
+
+    def _touch_capacity(self, key: tuple[Any, ...]) -> None:
+        self._resident_order.pop(key, None)
+        self._resident_order[key] = None
 
     def maybe_run(
         self,
         owner: Any,
         packed_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
@@ -197,7 +205,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         if backend is None:
             self.last_miss_reason = "backend_ineligible"
             self._backend_ineligible = True
-            self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
+            self._record(ctx, Event.MISS, int(packed_embeds.shape[0]))
             if self.logger is not None:
                 self.logger.warning(
                     "%s CUDA graph unavailable: no graph-capable paged-varlen attention backend",
@@ -206,13 +214,13 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             return None
         promotions = (
             tuple(text_kv_promotions)
-            if packed_mixed_graph_promotions_supported(text_kv_promotions)
+            if packed_graph_promotions_supported(text_kv_promotions)
             else ()
         )
         key = self._graph_key(
             owner,
             packed_embeds,
-            image_gen_indicators,
+            route_indicators,
             forward_stream,
             kv_view,
             backend,
@@ -221,26 +229,30 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         )
         if key is None or key in self.disabled:
             self.last_miss_reason = "shape_ineligible" if key is None else "shape_disabled"
-            self._record(ctx, GraphEvent.MISS, int(packed_embeds.shape[0]))
+            self._record(ctx, Event.MISS, int(packed_embeds.shape[0]))
             return None
-        family = _graph_family(forward_stream)
-        self._retire_inactive_geometry(
+        if key not in self.states and not ctx.allow_capture:
+            self.last_miss_reason = "capture_disabled"
+            self._record(ctx, Event.MISS, int(packed_embeds.shape[0]))
+            return None
+        topology_id = _graph_topology_id(forward_stream)
+        self._admit_capacity(
             key,
-            family=family,
             device=packed_embeds.device,
         )
         out = self._capture_or_replay(
             key=key,
+            device=packed_embeds.device,
             ctx=ctx,
             capture=lambda: self._capture(
                 owner,
                 packed_embeds,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 forward_stream=forward_stream,
                 kv_view=kv_view,
                 text_kv_promotions=promotions,
                 text_kv_promotion_capacity=text_kv_promotion_capacity,
-                family=family,
+                topology_id=topology_id,
                 key=key,
                 ctx=ctx,
                 backend=backend,
@@ -248,7 +260,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             copy_inputs=lambda state: self._copy_inputs(
                 state,
                 packed_embeds,
-                image_gen_indicators=image_gen_indicators,
+                route_indicators=route_indicators,
                 forward_stream=forward_stream,
                 kv_view=kv_view,
                 text_kv_promotions=promotions,
@@ -265,10 +277,11 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         if out is None:
             self.last_miss_reason = "capture_or_replay_failed"
             return None
+        self._touch_capacity(key)
         self._replays += 1
         if self._replays == 1 and self.logger is not None:
             self.logger.info(
-                "%s CUDA graph active: captured packed mixed decoder (tokens=%d, rows=%d)",
+                "%s CUDA graph active: captured packed forward decoder (tokens=%d, rows=%d)",
                 self.name,
                 int(packed_embeds.shape[0]),
                 len(forward_stream.segments),
@@ -280,7 +293,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         owner: Any,
         packed_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         key: tuple[Any, ...],
@@ -288,8 +301,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         backend: Any,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
         text_kv_promotion_capacity: int | None = None,
-        family: str,
-    ) -> PackedMixedGraphState:
+        topology_id: str,
+    ) -> PackedGraphState:
         first_attn = _first_attention(owner)
         block_width_capacity = _graph_block_width_capacity(kv_view)
         graph_kv_view = ForwardGraphPagedKVView(
@@ -310,12 +323,12 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             mode=ForwardMode.MIXED,
         )
         graph_binding = GraphBinding()
-        state = PackedMixedGraphState(
+        state = PackedGraphState(
             key=key,
-            family=str(family),
+            topology_id=str(topology_id),
             graph=torch.cuda.CUDAGraph(),
             packed_embeds=packed_embeds.detach().clone(),
-            indicators=image_gen_indicators.detach().clone(),
+            indicators=route_indicators.detach().clone(),
             stream_state=ForwardGraphStreamState.from_stream(forward_stream),
             kv_view=graph_kv_view,
             plan=plan,
@@ -356,7 +369,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             with use_forward_context(replace(graph_ctx, attention_plan=state.plan)):
                 hidden = owner.packed_decoder_forward(
                     state.packed_embeds,
-                    image_gen_indicators=state.indicators,
+                    route_indicators=state.indicators,
                     indexes=state.stream_state.stream.indexes,
                     forward_stream=state.stream_state.stream,
                     kv_view=state.kv_view,
@@ -372,7 +385,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
                 copy_inputs=lambda capture_state: self._copy_inputs(
                     capture_state,
                     packed_embeds,
-                    image_gen_indicators=image_gen_indicators,
+                    route_indicators=route_indicators,
                     forward_stream=forward_stream,
                     kv_view=kv_view,
                     text_kv_promotions=text_kv_promotions,
@@ -381,8 +394,8 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             )
             planned = getattr(backend, "paged_prefill_graph_wrapper_planned", None)
             if callable(planned) and not planned(graph_binding):
-                raise _MixedGraphBackendUnplanned(
-                    "captured packed mixed forward did not plan the graph-scoped prefill wrapper"
+                raise _GraphBackendUnplanned(
+                    "captured packed forward forward did not plan the graph-scoped prefill wrapper"
                 )
         except BaseException:
             release_backend = state.release_backend
@@ -394,16 +407,16 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
 
     @staticmethod
     def _copy_inputs(
-        state: PackedMixedGraphState,
+        state: PackedGraphState,
         packed_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
     ) -> None:
         state.packed_embeds.copy_(packed_embeds, non_blocking=True)
-        state.indicators.copy_(image_gen_indicators, non_blocking=True)
+        state.indicators.copy_(route_indicators, non_blocking=True)
         state.stream_state.refresh(forward_stream)
         state.kv_view.refresh(kv_view.segments)
         # Publish a fresh frozen plan reusing the kv-view's stable device tensors
@@ -418,11 +431,11 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             max_context_len=state.kv_view.max_seqlen_k(),
         )
         if state.promotion_source_index is not None and text_kv_promotions:
-            PackedMixedGraphRunner._copy_promotion_indices(state, text_kv_promotions)
+            PackedGraphRunner._copy_promotion_indices(state, text_kv_promotions)
 
     @staticmethod
     def _copy_promotion_indices(
-        state: PackedMixedGraphState,
+        state: PackedGraphState,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...],
     ) -> None:
         source_index = state.promotion_source_index
@@ -437,7 +450,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             source_pool is not state.promotion_source_pool
             or target_pool is not state.promotion_target_pool
         ):
-            raise invalid_descriptor("packed mixed graph promotion pool changed")
+            raise invalid_descriptor("packed forward graph promotion pool changed")
         slot = state.promotion_stager.acquire_slot(device=source_index.device)
         try:
             _copy_long_values_to_tensor(
@@ -456,7 +469,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             state.promotion_stager.mark_slot_submitted(slot, device=source_index.device)
 
     @staticmethod
-    def _copy_promotions_in_graph(state: PackedMixedGraphState) -> None:
+    def _copy_promotions_in_graph(state: PackedGraphState) -> None:
         source_index = state.promotion_source_index
         target_index = state.promotion_target_index
         source_pool = state.promotion_source_pool
@@ -472,7 +485,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         target_v.index_copy_(1, target_index, source_v.index_select(1, source_index))
 
     @staticmethod
-    def _prepare_backend(state: PackedMixedGraphState) -> None:
+    def _prepare_backend(state: PackedGraphState) -> None:
         prepare = getattr(state.backend, "prepare_paged_prefill_cuda_graph", None)
         if not callable(prepare):
             return
@@ -490,22 +503,22 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         )
 
     @staticmethod
-    def _replay(state: PackedMixedGraphState) -> torch.Tensor:
+    def _replay(state: PackedGraphState) -> torch.Tensor:
         state.graph.replay()
         assert state.logits is not None
         return state.logits
 
-    def _record(self, ctx: Any, event: GraphEvent, tokens: int) -> None:
-        record_graph_stats(
+    def _record(self, ctx: Any, event: Event, tokens: int) -> None:
+        record(
             ctx,
             event,
-            mode=ForwardMode.MIXED,
             unpadded_tokens=int(tokens),
             padded_tokens=int(tokens),
         )
 
     def _disable(self, key: tuple[Any, ...], exc: BaseException) -> None:
         self.disabled.add(key)
+        self._resident_order.pop(key, None)
         state = self.states.pop(key, None)
         if state is not None and callable(state.release_backend):
             try:
@@ -535,7 +548,7 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
         try:
             first_attn = _first_attention(owner)
             preferred = getattr(ctx, "attention_preference", None)
-            explicit_backend = explicit_attention_backend_name(preferred)
+            explicit_backend = backend_name(preferred)
             q_probe = packed_embeds.new_empty(
                 (
                     int(packed_embeds.shape[0]),
@@ -585,14 +598,14 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
     def _graph_key(
         owner: Any,
         packed_embeds: torch.Tensor,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         forward_stream: ForwardStream,
         kv_view: ForwardPagedKVView,
         backend: Any,
         text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
         text_kv_promotion_capacity: int | None = None,
     ) -> tuple[Any, ...] | None:
-        if tuple(image_gen_indicators.shape) != (int(packed_embeds.shape[0]),):
+        if tuple(route_indicators.shape) != (int(packed_embeds.shape[0]),):
             return None
         block_width_capacity = _graph_block_width_capacity(kv_view)
         if block_width_capacity <= 0:
@@ -604,11 +617,11 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
             str(packed_embeds.device),
             str(packed_embeds.dtype),
             tuple(int(dim) for dim in packed_embeds.shape),
-            str(image_gen_indicators.dtype),
-            tuple(int(dim) for dim in image_gen_indicators.shape),
-            _stream_geometry(forward_stream),
-            _modality_index_geometry(forward_stream),
-            _kv_geometry(kv_view),
+            str(route_indicators.dtype),
+            tuple(int(dim) for dim in route_indicators.shape),
+            _stream_capacity(forward_stream),
+            _route_index_capacity(forward_stream),
+            _kv_capacity(kv_view),
             int(block_width_capacity),
             int(kv_view.pool.block_size),
             int(block_width_capacity * int(kv_view.pool.block_size)),
@@ -622,14 +635,12 @@ class PackedMixedGraphRunner(_GraphRunnerBase):
 def _first_attention(owner: Any) -> Any:
     packed_attention = getattr(owner, "packed_graph_attention", None)
     if not callable(packed_attention):
-        raise RuntimeError("packed mixed graph requires an explicit attention binding")
+        raise RuntimeError("packed forward graph requires an explicit attention binding")
     return packed_attention()
 
 
-def _graph_family(forward_stream: ForwardStream) -> str:
-    if any(segment.mode is ForwardMode.DECODE for segment in forward_stream.segments):
-        return "decode"
-    return "context"
+def _graph_topology_id(forward_stream: ForwardStream) -> str:
+    return "fully_visible" if forward_stream.fully_visible else "visible_end"
 
 
 def _attention_scale(attention: Any) -> float:
@@ -637,46 +648,43 @@ def _attention_scale(attention: Any) -> float:
     if scale is None:
         scale = getattr(attention, "scale", None)
     if scale is None:
-        raise RuntimeError("packed mixed graph attention does not expose a scale")
+        raise RuntimeError("packed forward graph attention does not expose a scale")
     return float(scale)
 
 
-def _stream_geometry(forward_stream: ForwardStream) -> tuple[tuple[Any, ...], ...]:
-    return tuple(
-        (
-            int(seg.q_len),
-            str(seg.mode.value),
-            seg.modality,
-            seg.segment_class,
-            seg.visible_policy,
-            int(seg.branch_id),
-        )
-        for seg in forward_stream.segments
+def _stream_capacity(forward_stream: ForwardStream) -> tuple[Any, ...]:
+    return (
+        len(forward_stream.segments),
+        sum(int(segment.q_len) for segment in forward_stream.segments),
+        tuple(int(dim) for dim in forward_stream.cu_seqlens_q.shape),
+        tuple(int(dim) for dim in forward_stream.visible_end.shape),
+        tuple(int(dim) for dim in forward_stream.indexes.shape),
+        bool(forward_stream.fully_visible),
     )
 
 
-def _kv_geometry(kv_view: ForwardPagedKVView) -> tuple[tuple[int, bool, bool, int], ...]:
-    return tuple(
-        (
-            int(seg.q_len),
-            bool(seg.write_kv),
-            bool(seg.persist_kv),
-            int(seg.branch_id),
-        )
-        for seg in kv_view.segments
+def _kv_capacity(kv_view: ForwardPagedKVView) -> tuple[int, int, int, bool]:
+    return (
+        len(kv_view.segments),
+        sum(int(segment.q_len) for segment in kv_view.segments),
+        sum(int(segment.q_len) for segment in kv_view.segments if segment.write_kv),
+        all(bool(segment.write_kv) for segment in kv_view.segments),
     )
 
 
-def _modality_index_geometry(forward_stream: ForwardStream) -> tuple[Any, ...]:
-    def geometry(indices: torch.Tensor | None) -> tuple[Any, ...] | None:
+def _route_index_capacity(forward_stream: ForwardStream) -> tuple[Any, ...]:
+    def capacity(indices: torch.Tensor | None) -> tuple[Any, ...] | None:
         if indices is None:
             return None
         return (tuple(int(dim) for dim in indices.shape), str(indices.dtype))
 
-    return (geometry(forward_stream.und_indices), geometry(forward_stream.gen_indices))
+    return (
+        capacity(forward_stream.und_indices),
+        capacity(forward_stream.gen_indices),
+    )
 
 
-def packed_mixed_graph_promotions_supported(
+def packed_graph_promotions_supported(
     promotions: tuple[PagedTextCacheSpanCopy, ...] | list[PagedTextCacheSpanCopy],
 ) -> bool:
     if not promotions:
@@ -785,7 +793,7 @@ def _promotion_index_values(
     )
     if resolved_capacity > len(source_positions):
         if not source_positions:
-            raise invalid_descriptor("packed mixed graph promotion capacity requires an index")
+            raise invalid_descriptor("packed forward graph promotion capacity requires an index")
         source_positions.extend([source_positions[0]] * (resolved_capacity - len(source_positions)))
         target_positions.extend([target_positions[0]] * (resolved_capacity - len(target_positions)))
     return source_pool, target_pool, source_positions, target_positions
@@ -799,7 +807,7 @@ def _copy_long_values_to_tensor(
     slot: TextTensorStagingSlot,
 ) -> None:
     if int(target.numel()) != len(values):
-        raise invalid_descriptor("packed mixed graph promotion index length changed")
+        raise invalid_descriptor("packed forward graph promotion index length changed")
     cpu = slot.long_buffer(name, len(values), pin=target.device.type == "cuda")
     fill_cpu_ints(cpu, values)
     target.copy_(cpu, non_blocking=target.device.type == "cuda" and is_pinned(cpu))
@@ -834,19 +842,19 @@ def _backend_can_host_graph(backend: Any) -> bool:
     return bool(getattr(caps, "visible_end_cuda_graph", False))
 
 
-def packed_mixed_graph_runner(owner: Any) -> PackedMixedGraphRunner:
+def packed_graph_runner(owner: Any) -> PackedGraphRunner:
     runner = getattr(owner, _RUNNER_ATTR, None)
     if runner is None:
-        runner = PackedMixedGraphRunner()
+        runner = PackedGraphRunner()
         setattr(owner, _RUNNER_ATTR, runner)
     return runner
 
 
-def maybe_run_packed_mixed_graph(
+def maybe_run_packed_graph(
     owner: Any,
     packed_embeds: torch.Tensor,
     *,
-    image_gen_indicators: torch.Tensor,
+    route_indicators: torch.Tensor,
     forward_stream: ForwardStream,
     kv_view: ForwardPagedKVView,
     text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
@@ -854,11 +862,11 @@ def maybe_run_packed_mixed_graph(
 ) -> torch.Tensor | None:
     runner = getattr(owner, _RUNNER_ATTR, None)
     if runner is None:
-        runner = packed_mixed_graph_runner(owner)
+        runner = packed_graph_runner(owner)
     return runner.maybe_run(
         owner,
         packed_embeds,
-        image_gen_indicators=image_gen_indicators,
+        route_indicators=route_indicators,
         forward_stream=forward_stream,
         kv_view=kv_view,
         text_kv_promotions=text_kv_promotions,
@@ -870,10 +878,94 @@ def maybe_run_packed_mixed_graph(
 # Packed model mixin
 # ---------------------
 
-class PackedVisibleModelMixin:
+class PackedForwardModelMixin:
     """Shared cache staging and segment construction for packed models."""
 
-    def run_packed_visible_forward_result(
+    def run_segment_graph(
+        self,
+        plan: ForwardPlan,
+        *,
+        request_states: Any,
+        result_publisher: Any | None = None,
+    ) -> ForwardResult | None:
+        """Execute any graphable segment-table composition owned by this family."""
+
+        dispatch_batch = plan.runtime_handles.get("dispatch_batch")
+        if not isinstance(dispatch_batch, UniForwardBatch):
+            dispatch_batch = UniForwardBatch.from_ops(plan.ops)
+        if any(
+            int(op.get("decode_token_count") or 1) > 1
+            or int(op.get("denoise_step_count") or 1) > 1
+            for op in dispatch_batch.ops
+        ):
+            run = getattr(self, "_run_forward_adapter", None)
+            if not callable(run):
+                return None
+            outputs = run(
+                dispatch_batch,
+                request_states=request_states,
+                group=list(enumerate(dispatch_batch.ops)),
+                defer_text_cpu_results=bool(
+                    plan.runtime_handles.get("defer_text_cpu_results", False)
+                ),
+            )
+            if isinstance(outputs, ForwardResult):
+                return outputs
+            if not isinstance(outputs, Sequence) or isinstance(
+                outputs, (str, bytes, bytearray)
+            ):
+                raise invalid_descriptor(
+                    "forward adapter must return one result per operation"
+                )
+            if len(outputs) != len(plan.rows):
+                raise invalid_descriptor(
+                    "forward adapter returned the wrong number of results"
+                )
+            return ForwardResult(runtime_outputs=tuple(outputs))
+
+        denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
+        for row in plan.rows:
+            if row.mode is not ForwardMode.DENOISE:
+                continue
+            state = request_states.get(int(row.req_id))
+            step = self.prepare_denoise(state, dict(row.op))
+            denoise_steps.append((int(row.row_index), step))
+            extra = getattr(step, "extra", None)
+            image = extra.get("img") if isinstance(extra, dict) else None
+            residual_state = getattr(image, "residual_cache", None)
+            if residual_state is not None:
+                residual_state.invalidate()
+
+        result = self.run_packed_forward_result(
+            dispatch_batch,
+            request_states,
+            denoise_steps,
+            defer_text_cpu_results=bool(
+                plan.runtime_handles.get("defer_text_cpu_results", False)
+            ),
+            allow_graph=True,
+            require_graph=True,
+        )
+        if result is None or not plan.shape.commit_row_count:
+            return result
+        if result_publisher is None:
+            raise invalid_descriptor("segment result publication is not bound")
+        commit_rows = tuple(row for row in plan.rows if row.mode is ForwardMode.COMMIT)
+        commit_result = result_publisher.forward_result(
+            tuple(
+                (int(row.req_id), request_states.get(int(row.req_id)), row.op)
+                for row in commit_rows
+            ),
+            self,
+            row_indices=tuple(int(row.row_index) for row in commit_rows),
+        )
+        if not isinstance(commit_result, ForwardResult) or commit_result.commit_outputs is None:
+            raise invalid_descriptor("segment result publisher returned no outputs")
+        commit_outputs = dict(result.commit_outputs or {})
+        commit_outputs.update(commit_result.commit_outputs)
+        return replace(result, commit_outputs=commit_outputs)
+
+    def run_packed_forward_result(
         self,
         batch: UniForwardBatch,
         request_states: Any,
@@ -884,8 +976,8 @@ class PackedVisibleModelMixin:
         require_graph: bool = False,
     ) -> "ForwardResult | None":
         # Family entry the neutral graph program dispatches through; keeps the
-        # packed mixed forward owned by the family rather than imported upward.
-        return run_packed_visible_forward_result(
+        # packed forward forward owned by the family rather than imported upward.
+        return run_packed_forward_result(
             self,
             batch,
             request_states,
@@ -1153,9 +1245,9 @@ class PackedVisibleModelMixin:
 logger = logging.getLogger(__name__)
 _DECODE_RELAY = TextDecodeRelay()
 
-_PACKED_MIXED_TIMING = env_flag("UNISERVE_PACKED_MIXED_TIMING")
-_PACKED_MIXED_TIMING_SYNC = env_flag("UNISERVE_PACKED_MIXED_TIMING_SYNC")
-_PACKED_MIXED_SORT_BY_MODALITY = env_flag("UNISERVE_PACKED_MIXED_SORT_BY_MODALITY", default=True)
+_PACKED_FORWARD_TIMING = env_flag("UNISERVE_PACKED_FORWARD_TIMING")
+_PACKED_FORWARD_TIMING_SYNC = env_flag("UNISERVE_PACKED_FORWARD_TIMING_SYNC")
+_PACKED_FORWARD_CANONICAL_ORDER = env_flag("UNISERVE_PACKED_FORWARD_CANONICAL_ORDER", default=True)
 
 TextResultSlot = tuple[int, int, int, PagedTextCache, PagedTextCache, int, int]
 DenoiseResultSlot = tuple[int, TextImageDenoiseStep, int, int, Branch]
@@ -1189,7 +1281,7 @@ def _append_decode_graph_padding(
     if decode_rows <= 0 or decode_rows >= capacity:
         return decode_rows
     padding_rows = capacity - decode_rows
-    block_ids = decode_graph_padding_block_ids(padding_pool)
+    block_ids = padding_blocks(padding_pool)
     block_size = int(getattr(padding_pool, "block_size", 0) or 0)
     if not block_ids:
         raise invalid_descriptor("packed decode graph padding requires reserved KV blocks")
@@ -1242,7 +1334,7 @@ class PackedForwardPlan:
         for result_index, step in self.denoise_steps:
             if int(result_index) == int(row_index):
                 return step
-        raise invalid_descriptor(f"no denoise step prepared for mixed row {int(row_index)}")
+        raise invalid_descriptor(f"no denoise step prepared for row {int(row_index)}")
 
     def add_text_slot(
         self,
@@ -1286,7 +1378,7 @@ class PackedForwardPlan:
     def denoise_cfg_plan_for_row(self, row_index: int) -> CfgPlan:
         cfg_plan = self.denoise_cfg_plans.get(int(row_index))
         if cfg_plan is None:
-            raise invalid_descriptor(f"no denoise CFG plan prepared for mixed row {int(row_index)}")
+            raise invalid_descriptor(f"no denoise CFG plan prepared for row {int(row_index)}")
         return cfg_plan
 
     def set_text_result(self, row_index: int, output: Any) -> None:
@@ -1300,8 +1392,8 @@ class PackedForwardPlan:
         }
 
 
-class PackedMixedForward:
-    """Owns packed mixed-forward row slots, cache writeback, and output order."""
+class PackedForward:
+    """Owns packed forward-forward row slots, cache writeback, and output order."""
 
     def __init__(self, owner: Any) -> None:
         self.owner = owner
@@ -1318,7 +1410,7 @@ class PackedMixedForward:
         require_graph: bool = False,
     ) -> bool:
         plan = PackedForwardPlan(batch=batch, denoise_steps=denoise_steps, results=results)
-        result = _run_packed_mixed_forward_impl(
+        result = _run_packed_forward_impl(
             self.owner,
             plan,
             request_states,
@@ -1343,7 +1435,7 @@ class PackedMixedForward:
             denoise_steps=denoise_steps,
             results=[None] * len(batch.ops),
         )
-        result = _run_packed_mixed_forward_impl(
+        result = _run_packed_forward_impl(
             self.owner,
             plan,
             request_states,
@@ -1355,7 +1447,7 @@ class PackedMixedForward:
         return result if isinstance(result, ForwardResult) else None
 
 
-def run_packed_mixed_forward(
+def run_packed_forward(
     owner,
     batch: UniForwardBatch,
     request_states: Any,
@@ -1366,7 +1458,7 @@ def run_packed_mixed_forward(
     allow_graph: bool = True,
     require_graph: bool = False,
 ) -> bool:
-    return PackedMixedForward(owner).execute(
+    return PackedForward(owner).execute(
         batch,
         request_states,
         denoise_steps,
@@ -1377,7 +1469,7 @@ def run_packed_mixed_forward(
     )
 
 
-def run_packed_visible_forward_result(
+def run_packed_forward_result(
     owner,
     batch: UniForwardBatch,
     request_states: Any,
@@ -1387,7 +1479,7 @@ def run_packed_visible_forward_result(
     allow_graph: bool = False,
     require_graph: bool = False,
 ) -> ForwardResult | None:
-    return PackedMixedForward(owner).execute_forward_result(
+    return PackedForward(owner).execute_forward_result(
         batch,
         request_states,
         denoise_steps,
@@ -1397,7 +1489,7 @@ def run_packed_visible_forward_result(
     )
 
 
-def _run_packed_mixed_forward_impl(
+def _run_packed_forward_impl(
     owner,
     plan: PackedForwardPlan,
     request_states: Any,
@@ -1409,7 +1501,7 @@ def _run_packed_mixed_forward_impl(
 ) -> bool | ForwardResult:
     if owner.model is None:
         if require_graph:
-            raise capability_mismatch("packed mixed graph requires a loaded model")
+            raise capability_mismatch("packed forward graph requires a loaded model")
         return False
     batch = plan.batch
     builder = ForwardStreamBuilder()
@@ -1420,7 +1512,7 @@ def _run_packed_mixed_forward_impl(
     device = torch.device(str(owner.device))
     current_context: dict[str, Any] | None = None
     ctx = get_forward_context()
-    timing = _PackedMixedTiming(device)
+    timing = _PackedForwardTiming(device)
     total_start = timing.start()
 
     try:
@@ -1435,13 +1527,13 @@ def _run_packed_mixed_forward_impl(
             if not pending_text_rows:
                 return None
             total_q = sum(int(row.q_len) for row in pending_text_rows)
-            with profile_range("uniserve.packed_mixed.text_embed"):
+            with profile_range("uniserve.packed_forward.text_embed"):
                 input_ids = torch.cat(
                     [row.input_ids.reshape(-1) for row in pending_text_rows], dim=0
                 )
                 if int(input_ids.numel()) != int(total_q):
                     raise invalid_descriptor(
-                        "packed mixed text input id count does not match row lengths"
+                        "packed forward text input id count does not match row lengths"
                     )
                 text_embeds = owner.packed_text_embeddings(input_ids).reshape(total_q, -1)
             segment_base = _append_packed_chunk(
@@ -1481,8 +1573,8 @@ def _run_packed_mixed_forward_impl(
             pending_text_rows.clear()
             return capacity
 
-        with profile_range("uniserve.packed_mixed.build"):
-            for row_index in _packed_mixed_row_order(batch):
+        with profile_range("uniserve.packed_forward.build"):
+            for row_index in _packed_row_order(batch):
                 op = batch.ops[row_index]
                 mode = batch.op_modes[row_index]
                 if require_graph and mode is not ForwardMode.DECODE and not decode_boundary_flushed:
@@ -1505,7 +1597,7 @@ def _run_packed_mixed_forward_impl(
                     if cache.past is None:
                         if require_graph:
                             raise capability_mismatch(
-                                "packed mixed graph requires a paged text cache",
+                                "packed forward graph requires a paged text cache",
                                 details=current_context,
                             )
                         return False
@@ -1553,7 +1645,7 @@ def _run_packed_mixed_forward_impl(
                     persistent_cache = cache.past
                     staged_cache = persistent_cache
                     if first_pool is not None and persistent_cache.pool is not first_pool:
-                        with profile_range("uniserve.packed_mixed.text_cache_stage"):
+                        with profile_range("uniserve.packed_forward.text_cache_stage"):
                             staged_cache = owner._stage_text_cache_for_forward(
                                 persistent_cache,
                                 target_pool=first_pool,
@@ -1564,7 +1656,7 @@ def _run_packed_mixed_forward_impl(
                     if not owner._same_kv_pool(pool, first_pool):
                         if require_graph:
                             raise capability_mismatch(
-                                "packed mixed graph requires one KV pool",
+                                "packed forward graph requires one KV pool",
                                 details={
                                     **current_context,
                                     "target_pool": type(first_pool).__name__,
@@ -1586,7 +1678,7 @@ def _run_packed_mixed_forward_impl(
                         relay_token = getattr(relay, "token_id", None)
                         if relay_token is not None:
                             last_input_token = int(relay_token)
-                    with profile_range("uniserve.packed_mixed.text_segment"):
+                    with profile_range("uniserve.packed_forward.text_segment"):
                         owner._add_text_forward_segment(
                             builder=builder,
                             kv_segments=kv_segments,
@@ -1617,12 +1709,12 @@ def _run_packed_mixed_forward_impl(
                     plan.set_denoise_cfg_plan(row_index, cfg_plan)
                     for branch_index, branch in enumerate(cfg_plan.branches):
                         img = step.extra["img"]
-                        with profile_range("uniserve.packed_mixed.denoise_branch_inputs"):
+                        with profile_range("uniserve.packed_forward.denoise_branch_inputs"):
                             indexes, cache = owner._denoise_branch_inputs(img, branch)
                         if cache is None or getattr(cache, "pool", None) is None:
                             if require_graph:
                                 raise capability_mismatch(
-                                    "packed mixed graph requires a paged denoise cache",
+                                    "packed forward graph requires a paged denoise cache",
                                     details={**current_context, "branch": str(branch)},
                                 )
                             return False
@@ -1631,7 +1723,7 @@ def _run_packed_mixed_forward_impl(
                         if not owner._same_kv_pool(pool, first_pool):
                             if require_graph:
                                 raise capability_mismatch(
-                                    "packed mixed graph requires one KV pool",
+                                    "packed forward graph requires one KV pool",
                                     details={
                                         **current_context,
                                         "branch": str(branch),
@@ -1648,7 +1740,7 @@ def _run_packed_mixed_forward_impl(
                         if indexes is None or tuple(indexes.shape) != (3, q_len):
                             if require_graph:
                                 raise capability_mismatch(
-                                    "packed mixed graph denoise indexes do not match the token geometry",
+                                    "packed forward graph denoise indexes do not match the token geometry",
                                     details={
                                         **current_context,
                                         "branch": str(branch),
@@ -1667,7 +1759,7 @@ def _run_packed_mixed_forward_impl(
                             indicators=_packed_denoise_indicators(owner, step, q_len),
                             device=device,
                         )
-                        with profile_range("uniserve.packed_mixed.denoise_segment"):
+                        with profile_range("uniserve.packed_forward.denoise_segment"):
                             owner._add_denoise_forward_segment(
                                 builder=builder,
                                 kv_segments=kv_segments,
@@ -1688,14 +1780,13 @@ def _run_packed_mixed_forward_impl(
                             branch=branch,
                         )
                 elif mode is ForwardMode.COMMIT:
-                    # Commit rows are part of the same admitted mixed batch, but they do
-                    # not contribute hidden-state segments. The model hook decodes them
-                    # after this packed text/denoise forward has updated latent state.
+                    # Publication-only rows contribute no hidden-state segment; the
+                    # model hook publishes them after the packed forward updates state.
                     pass
                 else:
                     if require_graph:
                         raise capability_mismatch(
-                            "packed mixed graph received an unsupported mode",
+                            "packed forward graph received an unsupported mode",
                             details=current_context,
                         )
                     return False
@@ -1705,11 +1796,11 @@ def _run_packed_mixed_forward_impl(
             else:
                 flush_text_rows()
         if text_stage_prefix_copies:
-            with profile_range("uniserve.packed_mixed.text_prefix_stage"):
+            with profile_range("uniserve.packed_forward.text_prefix_stage"):
                 copy_paged_text_cache_spans(
                     text_stage_prefix_copies,
                     num_layers=owner.num_layers,
-                    missing_message="cannot stage mixed forward prefix without a paged source cache",
+                    missing_message="cannot stage a packed-forward prefix without a paged source cache",
                 )
             for span in text_stage_prefix_copies:
                 owner._mark_forward_staging_advanced(
@@ -1718,11 +1809,11 @@ def _run_packed_mixed_forward_impl(
                     int(span.start) + int(span.length),
                 )
         timing.stop("build_ms", build_start)
-        ctx.record_component_elapsed("packed_mixed_build", build_stats_start)
+        ctx.record_component_elapsed("packed_forward_build", build_stats_start)
         if first_pool is None or not embed_chunks:
             if require_graph:
                 raise capability_mismatch(
-                    "packed mixed graph has no decoder segments",
+                    "packed forward graph has no decoder segments",
                     details={
                         "pool_available": first_pool is not None,
                         "embed_chunk_count": len(embed_chunks),
@@ -1732,22 +1823,22 @@ def _run_packed_mixed_forward_impl(
             return False
         stream_stats_start = ctx.component_timer_start()
         stream_start = timing.start()
-        with profile_range("uniserve.packed_mixed.stream_build"):
+        with profile_range("uniserve.packed_forward.stream_build"):
             forward_stream = builder.build(device=device)
-            modality_indices = getattr(owner, "packed_modality_indices", None)
-            if callable(modality_indices):
-                und_indices, gen_indices = modality_indices(
+            route_indices = getattr(owner, "packed_route_indices", None)
+            if callable(route_indices):
+                und_indices, gen_indices = route_indices(
                     forward_stream,
                     device=device,
                 )
                 token_count = int(forward_stream.indexes.shape[1])
-                und_indices = _validate_modality_indices(
+                und_indices = _validate_route_indices(
                     und_indices,
                     token_count=token_count,
                     device=device,
                     name="text",
                 )
-                gen_indices = _validate_modality_indices(
+                gen_indices = _validate_route_indices(
                     gen_indices,
                     token_count=token_count,
                     device=device,
@@ -1755,7 +1846,7 @@ def _run_packed_mixed_forward_impl(
                 )
                 if int(und_indices.numel()) + int(gen_indices.numel()) != token_count:
                     raise invalid_descriptor(
-                        "packed modality indices must partition the token stream"
+                        "packed route indices must partition the token stream"
                     )
                 forward_stream = replace(
                     forward_stream,
@@ -1764,7 +1855,7 @@ def _run_packed_mixed_forward_impl(
                 )
             kv_view = ForwardPagedKVView(first_pool, kv_segments)
         timing.stop("stream_build_ms", stream_start)
-        ctx.record_component_elapsed("packed_mixed_stream_build", stream_stats_start)
+        ctx.record_component_elapsed("packed_forward_stream_build", stream_stats_start)
         text_kv_promotions = [
             PagedTextCacheSpanCopy(
                 source=staged_cache,
@@ -1785,13 +1876,13 @@ def _run_packed_mixed_forward_impl(
         ]
         graph_text_kv_promotions = (
             tuple(text_kv_promotions)
-            if packed_mixed_graph_promotions_supported(text_kv_promotions)
+            if packed_graph_promotions_supported(text_kv_promotions)
             else ()
         )
         decoder_stats_start = ctx.component_timer_start()
         decoder_start = timing.start()
         decoder_component_start = timing.component_snapshot(ctx)
-        with profile_range("uniserve.packed_mixed.decoder_input_pack"):
+        with profile_range("uniserve.packed_forward.decoder_input_pack"):
             packed_embeds = torch.cat(embed_chunks, dim=0)
             packed_indicators = _packed_indicator_tensor(
                 owner,
@@ -1805,10 +1896,10 @@ def _run_packed_mixed_forward_impl(
                 if text_kv_promotion_capacity is not None
                 else {}
             )
-            hidden = maybe_run_packed_mixed_graph(
+            hidden = maybe_run_packed_graph(
                 owner,
                 packed_embeds,
-                image_gen_indicators=packed_indicators,
+                route_indicators=packed_indicators,
                 forward_stream=forward_stream,
                 kv_view=kv_view,
                 text_kv_promotions=graph_text_kv_promotions,
@@ -1817,9 +1908,9 @@ def _run_packed_mixed_forward_impl(
         graph_promoted_text_kv = hidden is not None and bool(graph_text_kv_promotions)
         if hidden is None:
             if require_graph:
-                graph_runner = getattr(owner, "_packed_mixed_graph_runner", None)
+                graph_runner = getattr(owner, "_packed_graph_runner", None)
                 raise capability_mismatch(
-                    "packed mixed CUDA graph did not produce hidden states",
+                    "packed forward CUDA graph did not produce hidden states",
                     details={
                         "graph_miss_reason": getattr(graph_runner, "last_miss_reason", None),
                         "packed_tokens": int(packed_embeds.shape[0]),
@@ -1833,7 +1924,7 @@ def _run_packed_mixed_forward_impl(
                 )
             hidden = owner.packed_decoder_forward(
                 packed_embeds,
-                image_gen_indicators=packed_indicators,
+                route_indicators=packed_indicators,
                 indexes=forward_stream.indexes,
                 forward_stream=forward_stream,
                 kv_view=kv_view,
@@ -1851,7 +1942,7 @@ def _run_packed_mixed_forward_impl(
             ),
         )
         timing.stop("decoder_ms", decoder_start)
-        ctx.record_component_elapsed("packed_mixed_decoder", decoder_stats_start)
+        ctx.record_component_elapsed("packed_forward_decoder", decoder_stats_start)
         text_stats_start = ctx.component_timer_start()
         text_start = timing.start()
         text_logits_by_row: dict[int, torch.Tensor] = {}
@@ -1862,7 +1953,7 @@ def _run_packed_mixed_forward_impl(
         text_logits_for_result: torch.Tensor | None = None
         text_postprocess_entries: list[TextPostprocessEntry] = []
         if plan.text_result_slots:
-            with profile_range("uniserve.packed_mixed.text_last_hidden"):
+            with profile_range("uniserve.packed_forward.text_last_hidden"):
                 text_hidden = torch.stack(
                     [
                         hidden[int(start) + int(q_len) - 1]
@@ -1870,9 +1961,9 @@ def _run_packed_mixed_forward_impl(
                     ],
                     dim=0,
                 )
-            with profile_range("uniserve.packed_mixed.text_logits"):
+            with profile_range("uniserve.packed_forward.text_logits"):
                 text_logits = owner.packed_text_logits(text_hidden.unsqueeze(0)).squeeze(0)
-            with profile_range("uniserve.packed_mixed.text_logits_scatter"):
+            with profile_range("uniserve.packed_forward.text_logits_scatter"):
                 for offset, (row_index, *_rest) in enumerate(plan.text_result_slots):
                     text_logits_by_row[int(row_index)] = text_logits[offset : offset + 1].unsqueeze(
                         0
@@ -1883,7 +1974,7 @@ def _run_packed_mixed_forward_impl(
                 sample_logits: list[torch.Tensor] = []
                 sampling_params: list[dict[str, Any]] = []
                 sampling_generators: list[torch.Generator] = []
-                with profile_range("uniserve.packed_mixed.text_sampling_inputs"):
+                with profile_range("uniserve.packed_forward.text_sampling_inputs"):
                     for row_index, *_rest in plan.text_result_slots:
                         req_id = int(batch.ops[row_index]["req_id"])
                         state = request_states.get(req_id)
@@ -1900,7 +1991,7 @@ def _run_packed_mixed_forward_impl(
                             ]
                         )
                 can_defer_text_cpu = bool(defer_text_cpu_results)
-                with profile_range("uniserve.packed_mixed.text_sampling"):
+                with profile_range("uniserve.packed_forward.text_sampling"):
                     sampled = apply_sampling_batched_with_device_tokens(
                         torch.stack(sample_logits, dim=0),
                         sampling_params,
@@ -1939,20 +2030,20 @@ def _run_packed_mixed_forward_impl(
                         text_device_tokens_by_row[int(row_index)] = sampled.device_tokens[
                             sample_index : sample_index + 1
                         ]
-        with profile_range("uniserve.packed_mixed.burst_position_stage"):
+        with profile_range("uniserve.packed_forward.burst_position_stage"):
             burst_position_tensors_by_row = _forward_burst_position_tensors(
                 owner,
                 plan,
                 device=device,
             )
         if text_kv_promotions and not graph_promoted_text_kv and not return_forward_result:
-            with profile_range("uniserve.packed_mixed.text_kv_promote"):
+            with profile_range("uniserve.packed_forward.text_kv_promote"):
                 copy_paged_text_cache_spans(
                     text_kv_promotions,
                     num_layers=owner.num_layers,
                     missing_message="forward text K/V span is missing from staged cache",
                 )
-        with profile_range("uniserve.packed_mixed.text_result_publish"):
+        with profile_range("uniserve.packed_forward.text_result_publish"):
             for logits_index, (
                 row_index,
                 start,
@@ -2006,7 +2097,7 @@ def _run_packed_mixed_forward_impl(
                 output = text_outputs_by_row.get(int(row_index))
                 if output is None:
                     if deferred_text_sampling is None:
-                        raise invalid_descriptor("packed mixed text sampling result is missing")
+                        raise invalid_descriptor("packed forward text sampling result is missing")
                     sample_index = text_sample_indices_by_row[int(row_index)]
                     _store_forward_sampled_token_relay(
                         req_state,
@@ -2035,16 +2126,16 @@ def _run_packed_mixed_forward_impl(
                     )
                 plan.set_text_result(row_index, output)
         timing.stop("text_post_ms", text_start)
-        ctx.record_component_elapsed("packed_mixed_text_post", text_stats_start)
+        ctx.record_component_elapsed("packed_forward_text_post", text_stats_start)
         velocity_stats_start = ctx.component_timer_start()
         velocity_start = timing.start()
         branch_velocities: dict[int, dict[str, torch.Tensor]] = {}
         denoise_velocities: dict[DenoiseBranchKey, torch.Tensor] = {}
         denoise_branch_counts: dict[int, int] = {}
-        with profile_range("uniserve.packed_mixed.velocity"):
+        with profile_range("uniserve.packed_forward.velocity"):
             for row_index, step, start, q_len, branch in plan.denoise_result_slots:
                 img = step.extra["img"]
-                with profile_range("uniserve.packed_mixed.velocity_branch"):
+                with profile_range("uniserve.packed_forward.velocity_branch"):
                     velocity = owner.packed_hidden_to_velocity(
                         hidden[start : start + q_len].unsqueeze(0),
                         step.t,
@@ -2057,7 +2148,7 @@ def _run_packed_mixed_forward_impl(
                 denoise_velocities[DenoiseBranchKey(int(row_index), branch_id)] = velocity
                 denoise_branch_counts[int(row_index)] = branch_id + 1
         timing.stop("velocity_ms", velocity_start)
-        ctx.record_component_elapsed("packed_mixed_velocity", velocity_stats_start)
+        ctx.record_component_elapsed("packed_forward_velocity", velocity_stats_start)
         if return_forward_result:
             denoise_updates: dict[int, DenoisePostprocessEntry] = {}
             for result_index, step in plan.denoise_steps:
@@ -2105,13 +2196,13 @@ def _run_packed_mixed_forward_impl(
             )
         update_stats_start = ctx.component_timer_start()
         update_start = timing.start()
-        with profile_range("uniserve.packed_mixed.denoise_update"):
+        with profile_range("uniserve.packed_forward.denoise_update"):
             for result_index, step in plan.denoise_steps:
                 velocities = branch_velocities.get(result_index)
                 if not velocities:
                     if require_graph:
                         raise capability_mismatch(
-                            "packed mixed graph produced no denoise velocities",
+                            "packed forward graph produced no denoise velocities",
                             details={"row_index": int(result_index)},
                         )
                     return False
@@ -2120,7 +2211,7 @@ def _run_packed_mixed_forward_impl(
                 owner.accept_denoise_update(step, updated)
                 plan.set_denoise_result(result_index, step)
         timing.stop("denoise_update_ms", update_start)
-        ctx.record_component_elapsed("packed_mixed_denoise_update", update_stats_start)
+        ctx.record_component_elapsed("packed_forward_denoise_update", update_stats_start)
         timing.stop("total_ms", total_start)
         timing.log(
             batch=batch,
@@ -2134,22 +2225,22 @@ def _run_packed_mixed_forward_impl(
     except Exception as exc:
         if current_context:
             logger.exception(
-                "packed mixed forward failed for an admitted mixed batch: context=%s",
+                "packed forward failed for an admitted segment group: context=%s",
                 current_context,
             )
         else:
-            logger.exception("packed mixed forward failed for an admitted mixed batch")
+            logger.exception("packed forward failed for an admitted segment group")
         raise capability_mismatch(
-            "packed mixed forward failed for an admitted mixed batch",
+            "packed forward failed for an admitted segment group",
             details={"cause_type": type(exc).__name__, "cause": str(exc)[:500]},
         ) from exc
 
 
-class _PackedMixedTiming:
+class _PackedForwardTiming:
     def __init__(self, device: torch.device) -> None:
         self.device = device
-        self.enabled = _PACKED_MIXED_TIMING
-        self.sync = _PACKED_MIXED_TIMING_SYNC
+        self.enabled = _PACKED_FORWARD_TIMING
+        self.sync = _PACKED_FORWARD_TIMING_SYNC
         self.values: dict[str, float] = {}
 
     def start(self) -> int:
@@ -2220,7 +2311,7 @@ class _PackedMixedTiming:
             "fully_visible": bool(getattr(forward_stream, "fully_visible", False)),
             **self.values,
         }
-        logger.info("packed_mixed_timing %s", json.dumps(payload, sort_keys=True))
+        logger.info("packed_forward_timing %s", json.dumps(payload, sort_keys=True))
 
     def _sync(self) -> None:
         if self.sync and self.device.type == "cuda":
@@ -2272,7 +2363,7 @@ def _append_packed_chunk(
     else:
         flat = indicators.reshape(-1)
         if int(flat.numel()) != q_len:
-            raise invalid_descriptor("packed mixed modality mask does not match chunk length")
+            raise invalid_descriptor("packed forward route mask does not match chunk length")
         indicator_chunks.append(flat)
     return start
 
@@ -2287,7 +2378,7 @@ def _packed_denoise_indicators(
         return None
     indicators = build(step, int(q_len))
     if indicators is not None and not isinstance(indicators, torch.Tensor):
-        raise invalid_descriptor("packed denoise modality indicators must be a tensor")
+        raise invalid_descriptor("packed route indicators must be a tensor")
     return indicators
 
 
@@ -2302,7 +2393,7 @@ def _packed_indicator_tensor(
         for chunk in chunks
     )
     if total <= 0:
-        raise invalid_descriptor("packed mixed indicators must not be empty")
+        raise invalid_descriptor("packed forward indicators must not be empty")
     if device.type != "cuda" or any(isinstance(chunk, torch.Tensor) for chunk in chunks):
         tensors: list[torch.Tensor] = []
         for chunk in chunks:
@@ -2323,16 +2414,16 @@ def _packed_indicator_tensor(
         if len(tensors) == 1:
             return tensors[0]
         return torch.cat(tensors, dim=0)
-    stager = getattr(owner, "_packed_mixed_indicator_stager", None)
+    stager = getattr(owner, "_packed_forward_indicator_stager", None)
     if not isinstance(stager, TextTensorStager):
         stager = TextTensorStager(ring_depth=3)
-        setattr(owner, "_packed_mixed_indicator_stager", stager)
+        setattr(owner, "_packed_forward_indicator_stager", stager)
     slot = stager.next_slot()
-    cpu = slot.bool_buffer("packed_mixed_indicators", total, pin=True)
+    cpu = slot.bool_buffer("packed_forward_indicators", total, pin=True)
     offset = 0
     for chunk in chunks:
         if isinstance(chunk, torch.Tensor):
-            raise invalid_descriptor("CUDA tensor modality chunks must use tensor packing")
+            raise invalid_descriptor("CUDA tensor route chunks must use tensor packing")
         length, value = chunk
         length = int(length)
         if length <= 0:
@@ -2340,7 +2431,7 @@ def _packed_indicator_tensor(
         cpu[offset : offset + length].fill_(bool(value))
         offset += length
     indicators = slot.device_buffer(
-        "packed_mixed_indicators",
+        "packed_forward_indicators",
         total,
         dtype=torch.bool,
         device=device,
@@ -2349,7 +2440,7 @@ def _packed_indicator_tensor(
     return indicators
 
 
-def _validate_modality_indices(
+def _validate_route_indices(
     indices: torch.Tensor,
     *,
     token_count: int,
@@ -2357,15 +2448,15 @@ def _validate_modality_indices(
     name: str,
 ) -> torch.Tensor:
     if not isinstance(indices, torch.Tensor):
-        raise invalid_descriptor(f"packed {name} modality indices must be a tensor")
+        raise invalid_descriptor(f"packed {name} route indices must be a tensor")
     resolved = indices.reshape(-1).to(device=device, dtype=torch.long)
     if int(resolved.numel()) > int(token_count):
-        raise invalid_descriptor(f"packed {name} modality indices exceed the token count")
+        raise invalid_descriptor(f"packed {name} route indices exceed the token count")
     return resolved
 
 
-def _packed_mixed_row_order(batch: UniForwardBatch) -> list[int]:
-    if not _PACKED_MIXED_SORT_BY_MODALITY:
+def _packed_row_order(batch: UniForwardBatch) -> list[int]:
+    if not _PACKED_FORWARD_CANONICAL_ORDER:
         return list(range(len(batch.ops)))
     decode_rows: list[int] = []
     extend_rows: list[int] = []
@@ -2400,7 +2491,7 @@ def _store_forward_sampled_token_relay(
         return
     if token_tensor is None:
         if token_id is None:
-            raise invalid_descriptor("packed mixed relay publish requires a token tensor")
+            raise invalid_descriptor("packed forward relay publish requires a token tensor")
         token_tensor = torch.tensor([int(token_id)], dtype=torch.long, device=device)
     else:
         token_tensor = token_tensor.reshape(1).to(device=device, dtype=torch.long)
@@ -2453,15 +2544,15 @@ def _forward_burst_position_tensors(
     if device.type != "cuda":
         positions = torch.tensor(position_ids, dtype=torch.long, device=device)
     else:
-        stager = getattr(owner, "_packed_mixed_burst_position_stager", None)
+        stager = getattr(owner, "_packed_forward_burst_position_stager", None)
         if not isinstance(stager, TextTensorStager):
             stager = TextTensorStager(ring_depth=3)
-            setattr(owner, "_packed_mixed_burst_position_stager", stager)
+            setattr(owner, "_packed_forward_burst_position_stager", stager)
         slot = stager.next_slot()
-        cpu = slot.long_buffer("packed_mixed_burst_positions", len(position_ids), pin=True)
+        cpu = slot.long_buffer("packed_forward_burst_positions", len(position_ids), pin=True)
         fill_cpu_ints(cpu, position_ids)
         positions = slot.device_buffer(
-            "packed_mixed_burst_positions",
+            "packed_forward_burst_positions",
             len(position_ids),
             dtype=torch.long,
             device=device,
@@ -2507,8 +2598,8 @@ _DECODE_RELAY = TextDecodeRelay()
 _RELAY_PLACEHOLDER_TOKEN_ID = -1
 
 
-class PackedVisibleBatchExecutor:
-    """Executes one admitted text/denoise batch without mode splitting."""
+class PackedForwardExecutor:
+    """Execute one admitted segment group without mode splitting."""
 
     def __init__(self, owner: Any) -> None:
         self.owner = owner
@@ -2524,7 +2615,7 @@ class PackedVisibleBatchExecutor:
         denoise_steps: list[tuple[int, TextImageDenoiseStep]] = []
         commit_rows: list[tuple[int, int, dict[str, Any]]] = []
         has_burst_rows = False
-        with profile_range("uniserve.packed_visible.prepare_ops"):
+        with profile_range("uniserve.packed_forward.prepare_ops"):
             for row_index, op in enumerate(batch.ops):
                 mode = batch.op_modes[row_index]
                 req_id = int(op["req_id"])
@@ -2543,7 +2634,7 @@ class PackedVisibleBatchExecutor:
                     commit_rows.append((row_index, req_id, dict(op)))
                 elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
                     raise capability_mismatch(
-                        "packed visible batch contains an unsupported mode",
+                        "packed forward group contains an unsupported mode",
                         details={"mode": mode.value},
                     )
         for _row_index, step in denoise_steps:
@@ -2553,7 +2644,7 @@ class PackedVisibleBatchExecutor:
             if residual_state is not None:
                 residual_state.invalidate()
         if not commit_rows and not has_burst_rows:
-            result = run_packed_visible_forward_result(
+            result = run_packed_forward_result(
                 self.owner,
                 batch,
                 request_states,
@@ -2564,7 +2655,7 @@ class PackedVisibleBatchExecutor:
             )
             if result is not None:
                 return result
-        if not run_packed_mixed_forward(
+        if not run_packed_forward(
             self.owner,
             batch,
             request_states,
@@ -2573,7 +2664,7 @@ class PackedVisibleBatchExecutor:
             defer_text_cpu_results=defer_text_cpu_results,
             require_graph=True,
         ):
-            raise capability_mismatch("admitted mixed batch did not execute as one packed graph")
+            raise capability_mismatch("admitted segment group did not execute as one packed graph")
         self._complete_decode_bursts(
             batch,
             request_states,
@@ -2866,20 +2957,20 @@ def _output_value(output: Any, field: str) -> Any:
     to_seq_result = getattr(output, "to_seq_result", None)
     if callable(to_seq_result):
         return dict(to_seq_result()).get(field)
-    raise invalid_descriptor(f"packed mixed output does not expose {field!r}")
+    raise invalid_descriptor(f"packed forward output does not expose {field!r}")
 
 
 def _output_int(output: Any, field: str) -> int:
     value = _output_value(output, field)
     if not isinstance(value, int) or isinstance(value, bool):
-        raise invalid_descriptor(f"packed mixed output field {field!r} must be an integer")
+        raise invalid_descriptor(f"packed forward output field {field!r} must be an integer")
     return int(value)
 
 
 def _output_bool(output: Any, field: str) -> bool:
     value = _output_value(output, field)
     if not isinstance(value, bool):
-        raise invalid_descriptor(f"packed mixed output field {field!r} must be a boolean")
+        raise invalid_descriptor(f"packed forward output field {field!r} must be a boolean")
     return bool(value)
 
 

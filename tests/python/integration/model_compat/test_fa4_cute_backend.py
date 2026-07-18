@@ -435,7 +435,7 @@ def test_sensenova_packed_visible_path_uses_real_fa4_and_matches_dense() -> None
     dense_mask[0, 0, 2:5, 2:5] = 0
     dense = model(
         inputs_embeds=hidden.unsqueeze(0),
-        image_gen_indicators=indicators.unsqueeze(0),
+        route_indicators=indicators.unsqueeze(0),
         indexes=indexes,
         attention_mask={"full_attention": dense_mask},
     ).last_hidden_state.squeeze(0)
@@ -487,7 +487,7 @@ def test_sensenova_packed_visible_path_uses_real_fa4_and_matches_dense() -> None
     with use_forward_context(ForwardContext(attention_backend=get_attention_backend("fa4_cute"))):
         packed = model.forward_packed_visible(
             hidden,
-            image_gen_indicators=indicators,
+            route_indicators=indicators,
             indexes=stream.indexes,
             forward_stream=stream,
             kv_view=view,

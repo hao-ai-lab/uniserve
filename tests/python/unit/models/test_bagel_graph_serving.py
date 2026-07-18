@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.cuda_graph import PackedVisibleGraphProgram
+from uniserve_worker.execution.graph.path import Segment
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models import bagel as bagel_model
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig
@@ -13,20 +13,29 @@ from uniserve_worker.nn.decoder import Modality, MoTModel
 pytestmark = pytest.mark.unit
 
 
-def test_bagel_binds_packed_visible_mixed_graph_program():
-    owner = BagelForUnifiedGeneration(device="cpu")
-    program = PackedVisibleGraphProgram(owner=owner, request_states=object())
-    plan = SimpleNamespace(
-        shape=SimpleNamespace(text_row_count=1, denoise_row_count=1, commit_row_count=0),
-        ops=[
+@pytest.mark.parametrize(
+    "ops",
+    [
+        [{"req_id": 1, "kind": "prefill_und"}],
+        [{"req_id": 1, "kind": "decode_und"}],
+        [{"req_id": 1, "kind": "denoise_gen"}],
+        [
             {"req_id": 1, "kind": "decode_und"},
             {"req_id": 2, "kind": "denoise_gen"},
         ],
+    ],
+)
+def test_bagel_binds_segment_graph_program_for_any_active_composition(ops):
+    owner = BagelForUnifiedGeneration(device="cpu")
+    program = Segment(owner=owner, states=object())
+    plan = SimpleNamespace(
+        shape=SimpleNamespace(segment_count=len(ops)),
+        ops=ops,
     )
 
-    eligibility = program.can_run(SimpleNamespace(), plan)
+    match = program.match(SimpleNamespace(), plan)
 
-    assert eligibility.eligible is True
+    assert match.accepted is True
 
 
 def test_bagel_denoise_rejects_eager_execution(monkeypatch):
@@ -118,7 +127,7 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
 
     output = model.forward_packed_visible(
         hidden,
-        image_gen_indicators=is_gen,
+        route_indicators=is_gen,
         indexes=indexes,
         forward_stream=stream,
         kv_view=kv_view,
@@ -132,7 +141,7 @@ def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
     torch.testing.assert_close(output, hidden + 2)
 
 
-def test_bagel_packed_modality_indices_include_text_rows_and_generation_markers():
+def test_bagel_packed_route_indices_include_text_rows_and_generation_markers():
     owner = BagelForUnifiedGeneration(device="cpu")
     stream = SimpleNamespace(
         segments=(
@@ -142,7 +151,7 @@ def test_bagel_packed_modality_indices_include_text_rows_and_generation_markers(
         )
     )
 
-    text_indices, gen_indices = owner.packed_modality_indices(stream, device="cpu")
+    text_indices, gen_indices = owner.packed_route_indices(stream, device="cpu")
 
     torch.testing.assert_close(text_indices, torch.tensor([0, 1, 2, 3, 7, 8, 11]))
     torch.testing.assert_close(gen_indices, torch.tensor([4, 5, 6, 9, 10]))
@@ -156,7 +165,7 @@ def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
     logits = [torch.tensor([[1.0, 2.0]])]
 
     class GraphDriver:
-        def try_run_text_graph_logits_batch(self, ops):
+        def try_run_graph_logits_batch(self, ops):
             calls.append([dict(op) for op in ops])
             return logits
 
@@ -185,7 +194,7 @@ def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
     }
     owner = Owner()
 
-    result = BagelForUnifiedGeneration.try_run_text_graph_logits_batch(owner, [op])
+    result = BagelForUnifiedGeneration.try_run_graph_logits_batch(owner, [op])
 
     assert result is logits
     assert calls == [[op]]

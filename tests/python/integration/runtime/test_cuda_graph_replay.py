@@ -1,8 +1,7 @@
-"""CUDA-graph capture/replay behavior for text decode.
+"""CUDA-graph capture/replay behavior for the step and span implementations.
 
-Covers the observable contract of the decode CUDA-graph runner and shared graph
-plumbing in ``uniserve_worker.execution.forward.graph.base`` /
-``text_decode`` / ``text``:
+Covers the observable contract of ``execution.graph.capture``, ``step``,
+``span``, and ``executor``:
 
 * batch-size bucketing rounds a request up to the nearest configured warmup
   bucket (and prefill token bucketing likewise);
@@ -24,7 +23,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import uniserve_worker.execution.cuda_graph as decode_cuda_graph
 from uniserve_worker.contracts.attention_plan import (
     GraphBinding,
     PagedDecodePlan,
@@ -37,26 +35,26 @@ from uniserve_worker.contracts.forward_context import (
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.execution import cuda_graph as dcg
-from uniserve_worker.execution import cuda_graph as pcg
-from uniserve_worker.execution.cuda_graph import (
-    DecodeCudaGraphRunner,
-    PrefillCudaGraphRunner,
-    TextDecodeGraphHostInputs,
-    TextGraphRunner,
-    _dense_token_replacements,
-    _padded_prefill_max_kv_tokens,
+from uniserve_worker.execution.graph import Executor, span, step
+from uniserve_worker.execution.graph.capture import (
     _reset_for_testing,
-    _share_decode_graph_input_buffer,
     _share_input_buffer,
-    copy_text_decode_graph_host_inputs,
-    copy_text_decode_graph_inputs,
-    copy_text_initial_prefill_graph_inputs,
-    make_text_decode_graph_state,
-    make_text_initial_prefill_graph_state,
-    resolve_paged_decode_graph_backend,
-    resolve_paged_decode_graph_prepare,
+    _share_step_input,
 )
+from uniserve_worker.execution.graph.executor import _padded_max_tokens
+from uniserve_worker.execution.graph.span import Runner as Span
+from uniserve_worker.execution.graph.span import copy_inputs as copy_span
+from uniserve_worker.execution.graph.span import make_state as make_span
+from uniserve_worker.execution.graph.step import Inputs as StepInputs
+from uniserve_worker.execution.graph.step import Runner as Step
+from uniserve_worker.execution.graph.step import (
+    copy_host,
+    dense_replacements,
+    resolve_backend,
+    resolve_prepare,
+)
+from uniserve_worker.execution.graph.step import copy_inputs as copy_step
+from uniserve_worker.execution.graph.step import make_state as make_step
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedRequestCache
 
@@ -67,8 +65,8 @@ requires_cuda = pytest.mark.skipif(
 )
 
 requires_decode_graph_backend = pytest.mark.skipif(
-    resolve_paged_decode_graph_backend(None) is None,
-    reason="TextGraphRunner decode replay requires a graph-aware paged decode backend",
+    resolve_backend(None) is None,
+    reason="step replay requires a graph-aware paged decode backend",
 )
 
 _VOCAB = 32
@@ -220,7 +218,7 @@ class _LinearLogitsModel:
         del fb
         return self.logits(input_ids, positions)
 
-    def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
+    def query_geometry(self) -> tuple[int, float, torch.dtype]:
         # Plausible query geometry matching the test pool; the fake forward
         # never runs attention, but declaring it keeps the model eligible for
         # the decode graph and exercises the real FlashInfer re-plan hook.
@@ -233,27 +231,27 @@ class _LinearLogitsModel:
 
 
 def test_decode_bucket_rounds_up_to_nearest_configured_bucket():
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4, 8, 16))
+    runner = Step(name="t", default_warmup_batch_sizes=(1, 2, 4, 8, 16))
 
     assert runner.bucket_batch_size(3) == 4
     assert runner.bucket_batch_size(5) == 8
 
 
 def test_decode_bucket_keeps_exact_batch_when_it_equals_a_bucket():
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4, 8, 16))
+    runner = Step(name="t", default_warmup_batch_sizes=(1, 2, 4, 8, 16))
 
     assert runner.bucket_batch_size(8) == 8
 
 
 def test_decode_bucket_falls_back_to_raw_batch_above_largest_bucket():
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4, 8, 16))
+    runner = Step(name="t", default_warmup_batch_sizes=(1, 2, 4, 8, 16))
 
     # No configured bucket is >= 20, so the runner uses the request size verbatim.
     assert runner.bucket_batch_size(20) == 20
 
 
 def test_decode_bucket_skips_disabled_bucket_and_picks_next_larger():
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(2, 4, 8))
+    runner = Step(name="t", default_warmup_batch_sizes=(2, 4, 8))
     runner.disabled.add(4)
 
     # batch 3 would normally round to 4, but 4 is disabled -> next bucket is 8.
@@ -261,34 +259,34 @@ def test_decode_bucket_skips_disabled_bucket_and_picks_next_larger():
 
 
 def test_prefill_token_bucket_rounds_up_to_nearest_configured_bucket():
-    runner = PrefillCudaGraphRunner(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
+    runner = Span(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
 
     assert runner.bucket_num_tokens(5) == 8
     assert runner.bucket_num_tokens(16) == 16
 
 
 def test_prefill_token_bucket_falls_back_to_raw_count_above_largest_bucket():
-    runner = PrefillCudaGraphRunner(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
+    runner = Span(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
 
     assert runner.bucket_num_tokens(33) == 33
 
 
 def test_prefill_batch_bucket_rounds_up_to_nearest_configured_bucket():
-    runner = PrefillCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4, 8))
+    runner = Span(name="t", default_warmup_batch_sizes=(1, 2, 4, 8))
 
     assert runner.bucket_batch_size(3) == 4
     assert runner.bucket_batch_size(6) == 8
 
 
 def test_prefill_batch_bucket_uses_largest_viable_bucket_for_token_bucket():
-    runner = PrefillCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4, 8))
+    runner = Span(name="t", default_warmup_batch_sizes=(1, 2, 4, 8))
 
     assert runner.bucket_batch_size(1, num_tokens=4) == 8
     assert runner.bucket_batch_size(3, num_tokens=12) == 8
 
 
 def test_prefill_warmup_uses_declared_batch_capacity():
-    runner = PrefillCudaGraphRunner(
+    runner = Span(
         name="t",
         default_warmup_token_buckets=(4, 8),
         default_warmup_batch_sizes=(1, 2, 4, 8),
@@ -298,7 +296,7 @@ def test_prefill_warmup_uses_declared_batch_capacity():
 
 
 def test_prefill_kv_bucket_uses_context_capacity_when_available():
-    runner = PrefillCudaGraphRunner(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
+    runner = Span(name="t", default_warmup_token_buckets=(4, 8, 16, 32))
 
     assert runner.bucket_kv_tokens(24, max_context_len=128) == 128
     assert runner.bucket_kv_tokens(160, max_context_len=128) == 160
@@ -319,7 +317,7 @@ def test_decode_graph_backend_resolver_accepts_direct_fa4_paged_backend(monkeypa
     monkeypatch.setattr(attention_registry, "has_attention_backend", lambda name: name == "fa4_cute")
     monkeypatch.setattr(attention_registry, "get_attention_backend", lambda name: backend)
 
-    assert resolve_paged_decode_graph_backend("fa4_cute") is backend
+    assert resolve_backend("fa4_cute") is backend
 
 
 def test_decode_graph_prepare_accepts_direct_backend_without_plan_hook(monkeypatch):
@@ -329,16 +327,16 @@ def test_decode_graph_prepare_accepts_direct_backend_without_plan_hook(monkeypat
         forward_paged=lambda *args, **kwargs: None,
     )
     before_calls: list[tuple[object, object]] = []
-    monkeypatch.setattr(dcg, "resolve_paged_decode_graph_backend", lambda _name: backend)
+    monkeypatch.setattr(step, "resolve_backend", lambda _name: backend)
 
-    owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
+    owner = SimpleNamespace(query_geometry=lambda: (4, 0.125, torch.bfloat16))
     kv_pool = SimpleNamespace(
         block_size=64,
         n_kv=2,
         head_dim=128,
         k=torch.empty(1, dtype=torch.bfloat16),
     )
-    prepare = resolve_paged_decode_graph_prepare(
+    prepare = resolve_prepare(
         owner=owner,
         kv_pool=kv_pool,
         num_blocks=16,
@@ -359,12 +357,12 @@ def test_decode_graph_prepare_rejects_direct_backend_page_size_mismatch(monkeypa
         capabilities=lambda: SimpleNamespace(available=True, paged_kv=True, paged_block_size_multiple=256),
         forward_paged=lambda *args, **kwargs: None,
     )
-    monkeypatch.setattr(dcg, "resolve_paged_decode_graph_backend", lambda _name: backend)
+    monkeypatch.setattr(step, "resolve_backend", lambda _name: backend)
 
-    owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
+    owner = SimpleNamespace(query_geometry=lambda: (4, 0.125, torch.bfloat16))
     kv_pool = SimpleNamespace(block_size=64, n_kv=2, head_dim=128, k=torch.empty(1))
 
-    assert resolve_paged_decode_graph_prepare(
+    assert resolve_prepare(
         owner=owner,
         kv_pool=kv_pool,
         num_blocks=16,
@@ -373,7 +371,7 @@ def test_decode_graph_prepare_rejects_direct_backend_page_size_mismatch(monkeypa
 
 
 def test_prefill_graph_warmup_mode_does_not_live_capture_missing_shape():
-    runner = PrefillCudaGraphRunner(name="t", default_enabled=True, default_warmup=True)
+    runner = Span(name="t", default_enabled=True, default_warmup=True)
     stats = ForwardStats()
 
     out = runner.maybe_run(
@@ -527,16 +525,16 @@ def test_prefill_graph_prepare_resolver_uses_owner_geometry(monkeypatch):
     backend = Backend()
     binding = GraphBinding()
     plan = object()
-    owner = SimpleNamespace(text_decode_graph_query_geometry=lambda: (4, 0.125, torch.bfloat16))
+    owner = SimpleNamespace(query_geometry=lambda: (4, 0.125, torch.bfloat16))
     kv_pool = SimpleNamespace(
         n_kv=2,
         head_dim=8,
         block_size=4,
         k=torch.empty(1, dtype=torch.float16),
     )
-    monkeypatch.setattr(pcg, "_resolve_graph_prefill_backend", lambda ctx: backend)
+    monkeypatch.setattr(span, "_resolve_backend", lambda ctx: backend)
 
-    prepare = pcg.resolve_paged_prefill_graph_prepare(
+    prepare = span.resolve_prepare(
         owner=owner,
         kv_pool=kv_pool,
         attention_preference="flashinfer",
@@ -577,9 +575,9 @@ def test_prefill_graph_prepare_resolver_accepts_direct_graph_safe_backend(monkey
             return SimpleNamespace(paged_varlen_cuda_graph=True)
 
     calls = []
-    monkeypatch.setattr(pcg, "_resolve_graph_prefill_backend", lambda ctx: Backend())
+    monkeypatch.setattr(span, "_resolve_backend", lambda ctx: Backend())
 
-    prepare = pcg.resolve_paged_prefill_graph_prepare(
+    prepare = span.resolve_prepare(
         owner=object(),
         kv_pool=SimpleNamespace(),
         attention_preference="trtllm_mha",
@@ -602,17 +600,17 @@ def test_graph_warmup_context_uses_configured_attention_backend(monkeypatch):
     def capture_prefill(self, **kwargs):
         seen.append(("prefill", kwargs["ctx"].attention_preference))
 
-    monkeypatch.setattr(DecodeCudaGraphRunner, "_warmup_capture_buckets", capture_decode)
-    monkeypatch.setattr(PrefillCudaGraphRunner, "_warmup_capture_buckets", capture_prefill)
+    monkeypatch.setattr(Step, "_warmup_capture_buckets", capture_decode)
+    monkeypatch.setattr(Span, "_warmup_capture_buckets", capture_prefill)
 
-    DecodeCudaGraphRunner(name="t", default_enabled=True, default_warmup=True).warmup(
+    Step(name="t", default_enabled=True, default_warmup=True).warmup(
         kv_pool=SimpleNamespace(),
         num_blocks=1,
         device=torch.device("cpu"),
         attention_preference="flashinfer",
         forward_fn=lambda state: state,
     )
-    PrefillCudaGraphRunner(name="t", default_enabled=True, default_warmup=True).warmup(
+    Span(name="t", default_enabled=True, default_warmup=True).warmup(
         kv_pool=SimpleNamespace(),
         num_blocks=1,
         block_size=1,
@@ -641,13 +639,13 @@ def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
 
     prefill = PrefillStub()
 
-    runner = TextGraphRunner.__new__(TextGraphRunner)
-    runner._prefill = prefill
+    runner = Executor.__new__(Executor)
+    runner._span = prefill
     runner.kv_pool = None
     runner.num_blocks = 0
     runner.max_context_len = 128
     runner.attention_preference = None
-    runner._prefill_prepare_backend = lambda *args, **kwargs: lambda state, ctx: None
+    runner._span_prepare = lambda *args, **kwargs: lambda state, ctx: None
     plan = PagedVarlenPlan(
         residency_cache=None,
         block_table=torch.empty((1, 0), dtype=torch.int32),
@@ -670,7 +668,7 @@ def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
         num_token_non_padded=8,
     )
 
-    out = runner._maybe_prefill(
+    out = runner._maybe_span(
         None,
         torch.zeros(8, dtype=torch.long),
         torch.arange(8, dtype=torch.long),
@@ -688,10 +686,10 @@ def test_text_graph_runner_routes_cached_prefix_prefill_to_prefill_runner():
 def test_text_graph_runner_routes_mixed_extend_decode_to_prefill_runner():
     """A mixed extend+decode group replays through the prefill graph buckets."""
 
-    runner = TextGraphRunner.__new__(TextGraphRunner)
+    runner = Executor.__new__(Executor)
     calls = {}
-    runner._maybe_decode = lambda *a, **k: calls.setdefault("decode", True)
-    runner._maybe_prefill = lambda *a, **k: calls.setdefault("prefill", True) or torch.ones(2, _VOCAB)
+    runner._maybe_step = lambda *a, **k: calls.setdefault("decode", True)
+    runner._maybe_span = lambda *a, **k: calls.setdefault("prefill", True) or torch.ones(2, _VOCAB)
     plan = SimpleNamespace(residency_cache=object.__new__(BatchedPagedRequestCache))
     fb = SimpleNamespace(forward_mode=ForwardMode.MIXED, attn_plan=plan)
     out = runner.maybe_run(
@@ -717,8 +715,8 @@ def test_prefill_graph_padding_preserves_row_order():
         def bucket_num_tokens(self, num_tokens: int) -> int:
             return 80
 
-    runner = TextGraphRunner.__new__(TextGraphRunner)
-    runner._prefill = PrefillStub()
+    runner = Executor.__new__(Executor)
+    runner._span = PrefillStub()
     runner.block_size = 64
     ops = (
         {"req_id": 1, "kind": "decode_und", "token_ids": [7], "pos_range": [10, 11]},
@@ -747,8 +745,8 @@ def test_padded_prefill_tokens_accepts_mixed_mode():
             del batch_size, num_tokens
             return 4
 
-    runner = TextGraphRunner.__new__(TextGraphRunner)
-    runner._prefill = PrefillStub()
+    runner = Executor.__new__(Executor)
+    runner._span = PrefillStub()
     runner.block_size = 64
     text = SimpleNamespace(
         mode=ForwardMode.MIXED,
@@ -773,8 +771,8 @@ def test_prefill_padding_does_not_depend_on_request_kv_tail_capacity():
             del batch_size, num_tokens
             return 4
 
-    runner = TextGraphRunner.__new__(TextGraphRunner)
-    runner._prefill = PrefillStub()
+    runner = Executor.__new__(Executor)
+    runner._span = PrefillStub()
     runner.block_size = 4
     text = SimpleNamespace(
         mode=ForwardMode.EXTEND,
@@ -808,7 +806,7 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
         max_seqlen_k=10,
         mode=ForwardMode.EXTEND,
     )
-    state = make_text_initial_prefill_graph_state(
+    state = make_span(
         kv_pool=pool,
         num_blocks=16,
         num_tokens=8,
@@ -817,7 +815,7 @@ def test_prefill_graph_inputs_preserve_cached_prefix_lengths():
         device=device,
     )
 
-    copy_text_initial_prefill_graph_inputs(
+    copy_span(
         state,
         input_ids=torch.arange(5, dtype=torch.long, device=device),
         positions=torch.arange(5, dtype=torch.long, device=device),
@@ -851,7 +849,7 @@ def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
         device=device,
         max_context_len=32,
     )
-    state = make_text_initial_prefill_graph_state(
+    state = make_span(
         kv_pool=pool,
         num_blocks=32,
         num_tokens=8,
@@ -861,7 +859,7 @@ def test_prefill_graph_inputs_pad_short_batch_to_graph_bucket():
         max_context_len=32,
     )
 
-    copy_text_initial_prefill_graph_inputs(
+    copy_span(
         state,
         input_ids=torch.arange(6, dtype=torch.long, device=device),
         positions=torch.arange(6, dtype=torch.long, device=device),
@@ -893,7 +891,7 @@ def test_prefill_graph_token_tail_uses_sink_pages():
         device=device,
         max_context_len=16,
     )
-    state = make_text_initial_prefill_graph_state(
+    state = make_span(
         kv_pool=pool,
         num_blocks=32,
         num_tokens=8,
@@ -903,7 +901,7 @@ def test_prefill_graph_token_tail_uses_sink_pages():
         max_context_len=16,
     )
 
-    copy_text_initial_prefill_graph_inputs(
+    copy_span(
         state,
         input_ids=torch.arange(2, dtype=torch.long, device=device),
         positions=torch.arange(5, 7, dtype=torch.long, device=device),
@@ -921,7 +919,7 @@ def test_prefill_graph_token_tail_uses_sink_pages():
     assert state.last_token_indices.cpu().tolist() == [1]
 
 
-def test_padded_prefill_max_kv_tokens_isolates_padding_from_cached_prefix():
+def test_padded_max_tokens_isolates_padding_from_cached_prefix():
     plan = PagedVarlenPlan(
         residency_cache=None,
         block_table=torch.empty((1, 0), dtype=torch.int32),
@@ -939,7 +937,7 @@ def test_padded_prefill_max_kv_tokens_isolates_padding_from_cached_prefix():
     )
 
     assert (
-        _padded_prefill_max_kv_tokens(
+        _padded_max_tokens(
             plan,
             padded_tokens=64,
             raw_tokens=29,
@@ -956,7 +954,7 @@ def test_prefill_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
     torch.manual_seed(7)
     model = _LinearLogitsModel(device, seed=7)
     pool = _kv_pool(device, num_blocks=32, block_size=4)
-    runner = PrefillCudaGraphRunner(
+    runner = Span(
         name="t",
         default_enabled=True,
         default_warmup=False,
@@ -1070,9 +1068,9 @@ def test_module_level_decode_buffer_pool_slices_then_resets():
     device = torch.device("cuda")
     try:
         largest = torch.empty((8, 2), dtype=torch.int32, device=device)
-        first = _share_decode_graph_input_buffer("text_decode.block_table", largest)
+        first = _share_step_input("graph.step.block_table", largest)
         smaller = torch.empty((3, 2), dtype=torch.int32, device=device)
-        sliced = _share_decode_graph_input_buffer("text_decode.block_table", smaller)
+        sliced = _share_step_input("graph.step.block_table", smaller)
 
         assert first is largest
         assert sliced.data_ptr() == largest.data_ptr()
@@ -1082,7 +1080,7 @@ def test_module_level_decode_buffer_pool_slices_then_resets():
         # After reset the pool is empty, so a fresh smaller tensor becomes the
         # new resident buffer (returned as itself, not a stale slice).
         fresh = torch.empty((2, 2), dtype=torch.int32, device=device)
-        assert _share_decode_graph_input_buffer("text_decode.block_table", fresh) is fresh
+        assert _share_step_input("graph.step.block_table", fresh) is fresh
     finally:
         _reset_for_testing()
 
@@ -1096,7 +1094,7 @@ def test_module_level_decode_buffer_pool_slices_then_resets():
 def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
     device = torch.device("cuda")
     pool = _kv_pool(device)
-    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state = make_step(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
     plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
@@ -1107,7 +1105,7 @@ def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
     input_ids = torch.tensor([[11], [22]], dtype=torch.long, device=device)
     positions = torch.tensor([[3], [5]], dtype=torch.long, device=device)
 
-    copy_text_decode_graph_inputs(
+    copy_step(
         state, input_ids=input_ids, positions=positions, attention_plan=plan
     )
     torch.cuda.synchronize()
@@ -1123,7 +1121,7 @@ def test_decode_input_copy_pads_short_batch_to_bucket_with_zeros():
 def test_decode_input_copy_extends_cpu_seqlen_mirrors():
     device = torch.device("cuda")
     pool = _kv_pool(device)
-    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state = make_step(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
     plan = _decode_plan(
         pool,
         block_ids_by_row=[[0], [1]],
@@ -1132,7 +1130,7 @@ def test_decode_input_copy_extends_cpu_seqlen_mirrors():
         device=device,
     )
 
-    copy_text_decode_graph_inputs(
+    copy_step(
         state,
         input_ids=torch.tensor([[11], [22]], dtype=torch.long, device=device),
         positions=torch.tensor([[3], [5]], dtype=torch.long, device=device),
@@ -1149,12 +1147,12 @@ def test_decode_input_copy_extends_cpu_seqlen_mirrors():
 def test_decode_host_input_copy_populates_static_bucket_inputs():
     device = torch.device("cuda")
     pool = _kv_pool(device)
-    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state = make_step(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
     replacement = torch.tensor([99], dtype=torch.long, device=device)
 
-    copy_text_decode_graph_host_inputs(
+    copy_host(
         state,
-        TextDecodeGraphHostInputs(
+        StepInputs(
             input_ids=(11, 0),
             positions=(3, 5),
             block_ids_by_row=((0,), (1, 2)),
@@ -1182,16 +1180,16 @@ def test_decode_host_input_copy_populates_static_bucket_inputs():
 def test_decode_host_input_copy_dense_replacements_clear_inactive_bucket_rows():
     device = torch.device("cuda")
     pool = _kv_pool(device)
-    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state = make_step(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
     state.input_ids.copy_(torch.tensor([[7], [8], [777], [888]], dtype=torch.long, device=device))
     replacements = (
         (0, torch.tensor([11], dtype=torch.long, device=device)),
         (1, torch.tensor([22], dtype=torch.long, device=device)),
     )
 
-    copy_text_decode_graph_host_inputs(
+    copy_host(
         state,
-        TextDecodeGraphHostInputs(
+        StepInputs(
             input_ids=(0, 0),
             positions=(3, 5),
             block_ids_by_row=((0,), (1, 2)),
@@ -1212,22 +1210,22 @@ def test_decode_host_input_copy_dense_replacements_clear_inactive_bucket_rows():
 def test_decode_host_input_copy_dense_replacements_preserve_contiguous_relay_span():
     device = torch.device("cuda")
     pool = _kv_pool(device)
-    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state = make_step(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
     relay_tokens = torch.tensor([31, 41], dtype=torch.long, device=device)
     replacements = (
         (0, relay_tokens[0:1]),
         (1, relay_tokens[1:2]),
     )
 
-    dense = _dense_token_replacements(state, replacements, actual_batch=2)
+    dense = dense_replacements(state, replacements, actual_batch=2)
 
     assert isinstance(dense, torch.Tensor)
     assert dense.data_ptr() == relay_tokens.data_ptr()
     assert tuple(dense.shape) == (2,)
 
-    copy_text_decode_graph_host_inputs(
+    copy_host(
         state,
-        TextDecodeGraphHostInputs(
+        StepInputs(
             input_ids=(0, 0),
             positions=(3, 5),
             block_ids_by_row=((0,), (1, 2)),
@@ -1248,20 +1246,20 @@ def test_decode_host_input_copy_dense_replacements_preserve_contiguous_relay_spa
 def test_decode_host_input_copy_reuses_unchanged_block_table(monkeypatch):
     device = torch.device("cuda")
     pool = _kv_pool(device)
-    state = make_text_decode_graph_state(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
+    state = make_step(kv_pool=pool, num_blocks=16, batch_size=4, device=device)
     calls: list[str] = []
-    original = decode_cuda_graph._copy_host_ints_to_device
+    original = step._copy_host_ints_to_device
 
     def record_copy(values, target, *, dtype, slot, name, view_shape=None):
         calls.append(str(name))
         return original(values, target, dtype=dtype, slot=slot, name=name, view_shape=view_shape)
 
-    monkeypatch.setattr(decode_cuda_graph, "_copy_host_ints_to_device", record_copy)
+    monkeypatch.setattr(step, "_copy_host_ints_to_device", record_copy)
     stable_rows = ((0, 4), (1, 2))
 
-    copy_text_decode_graph_host_inputs(
+    copy_host(
         state,
-        TextDecodeGraphHostInputs(
+        StepInputs(
             input_ids=(11, 22),
             positions=(3, 5),
             block_ids_by_row=stable_rows,
@@ -1271,9 +1269,9 @@ def test_decode_host_input_copy_reuses_unchanged_block_table(monkeypatch):
     )
     calls.clear()
 
-    copy_text_decode_graph_host_inputs(
+    copy_host(
         state,
-        TextDecodeGraphHostInputs(
+        StepInputs(
             input_ids=(33, 44),
             positions=(4, 6),
             block_ids_by_row=stable_rows,
@@ -1283,14 +1281,14 @@ def test_decode_host_input_copy_reuses_unchanged_block_table(monkeypatch):
     )
     torch.cuda.synchronize()
 
-    assert "text_decode.block_table" not in calls
+    assert "graph.step.block_table" not in calls
     assert state.block_table[:2, :2].tolist() == [[0, 4], [1, 2]]
     assert state.cache_seqlens.tolist() == [4, 6, 0, 0]
     calls.clear()
 
-    copy_text_decode_graph_host_inputs(
+    copy_host(
         state,
-        TextDecodeGraphHostInputs(
+        StepInputs(
             input_ids=(55, 66),
             positions=(5, 7),
             block_ids_by_row=((0, 4), (1, 2, 3)),
@@ -1300,7 +1298,7 @@ def test_decode_host_input_copy_reuses_unchanged_block_table(monkeypatch):
     )
     torch.cuda.synchronize()
 
-    assert "text_decode.block_table" in calls
+    assert "graph.step.block_table" in calls
     assert state.block_table[:2, :3].tolist() == [[0, 4, 0], [1, 2, 3]]
     assert state.cache_seqlens.tolist() == [5, 8, 0, 0]
 
@@ -1317,7 +1315,7 @@ def test_decode_graph_replay_matches_eager_for_exact_bucket_batch():
     torch.manual_seed(0)
     model = _LinearLogitsModel(device, seed=0)
     pool = _kv_pool(device)
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4))
+    runner = Step(name="t", default_warmup_batch_sizes=(1, 2, 4))
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)
     positions = torch.tensor([[3], [5]], dtype=torch.long, device=device)
@@ -1362,7 +1360,7 @@ def test_decode_graph_second_call_replays_without_recapture():
     torch.manual_seed(1)
     model = _LinearLogitsModel(device, seed=1)
     pool = _kv_pool(device)
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(1, 2, 4))
+    runner = Step(name="t", default_warmup_batch_sizes=(1, 2, 4))
 
     def run(ids, pos, seqlens, stats):
         plan = _decode_plan(
@@ -1413,7 +1411,7 @@ def test_decode_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
     model = _LinearLogitsModel(device, seed=2)
     pool = _kv_pool(device)
     # Only bucket 4 is configured, so a batch of 3 is padded up to 4.
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(4,))
+    runner = Step(name="t", default_warmup_batch_sizes=(4,))
 
     input_ids = torch.tensor([[7], [9], [11]], dtype=torch.long, device=device)
     positions = torch.tensor([[2], [3], [1]], dtype=torch.long, device=device)
@@ -1458,7 +1456,7 @@ def test_decode_graph_state_buffers_are_bucket_sized_and_zero_padded():
     torch.manual_seed(3)
     model = _LinearLogitsModel(device, seed=3)
     pool = _kv_pool(device)
-    runner = DecodeCudaGraphRunner(name="t", default_warmup_batch_sizes=(4,))
+    runner = Step(name="t", default_warmup_batch_sizes=(4,))
 
     runner.maybe_run(
         kv_pool=pool,
@@ -1490,7 +1488,7 @@ def test_decode_graph_state_buffers_are_bucket_sized_and_zero_padded():
 
 
 # --------------------------------------------------------------------------- #
-# TextGraphRunner end-to-end dispatch (CUDA)
+# Executor end-to-end dispatch (CUDA)
 # --------------------------------------------------------------------------- #
 
 
@@ -1504,7 +1502,7 @@ def test_text_graph_runner_decode_replay_matches_eager_forward():
     # FlashInfer's decode kernels require a real head_dim; the graph runner now
     # re-plans the backend before every replay, so the pool must be plannable.
     pool = _kv_pool(device, head_dim=64)
-    runner = TextGraphRunner(kv_pool=pool, num_blocks=16, block_size=4, device=device)
+    runner = Executor(kv_pool=pool, num_blocks=16, block_size=4, device=device)
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)
     positions = torch.tensor([[2], [3]], dtype=torch.long, device=device)
@@ -1545,7 +1543,7 @@ def test_text_graph_runner_skips_non_decode_extend_mode_without_prefill_graph():
     # Default worker config leaves prefill CUDA graphs disabled, so an ENCODE
     # (neither DECODE nor EXTEND) forward is never graphed -> the runner returns
     # None so the caller falls back to eager.
-    runner = TextGraphRunner(kv_pool=pool, num_blocks=16, block_size=4, device=device)
+    runner = Executor(kv_pool=pool, num_blocks=16, block_size=4, device=device)
 
     input_ids = torch.tensor([[7], [9]], dtype=torch.long, device=device)
     positions = torch.tensor([[2], [3]], dtype=torch.long, device=device)
@@ -1574,7 +1572,7 @@ def test_text_graph_runner_skips_cpu_input_tensors():
     torch.manual_seed(6)
     model = _LinearLogitsModel(device, seed=6)
     pool = _kv_pool(device)
-    runner = TextGraphRunner(kv_pool=pool, num_blocks=16, block_size=4, device=device)
+    runner = Executor(kv_pool=pool, num_blocks=16, block_size=4, device=device)
 
     plan = _decode_plan(
         pool,

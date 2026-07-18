@@ -22,8 +22,8 @@ from uniserve_worker.execution.engine import TextImageDenoiseStep, text_image_cf
 from uniserve_worker.models.interleaved_image import DenoiseRow, maybe_run_denoise_step_graph
 from uniserve_worker.models.interleaved_text import InterleavedTextCacheDriver, TextCache
 from uniserve_worker.models.packed_forward import (
-    PackedVisibleBatchExecutor,
-    PackedVisibleModelMixin,
+    PackedForwardExecutor,
+    PackedForwardModelMixin,
 )
 from uniserve_worker.runtime.paged_denoise import (
     PagedDenoiseBranchSet,
@@ -689,7 +689,7 @@ class BagelTextRequestState:
     cond: TextCache = field(default_factory=TextCache)
 
 
-class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
+class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
     """BAGEL unified text/image model with VAE denoise and ViT/VAE encode paths."""
 
     architectures = ("BagelForUnifiedGeneration", "BAGEL", "bagel")
@@ -1046,14 +1046,14 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         self,
         input_embeds: torch.Tensor,
         *,
-        image_gen_indicators: torch.Tensor,
+        route_indicators: torch.Tensor,
         indexes: torch.Tensor,
         forward_stream: Any,
         kv_view: Any,
     ) -> torch.Tensor:
         return self._ensure_loaded().model.lm.forward_packed_visible(
             input_embeds,
-            image_gen_indicators=image_gen_indicators,
+            route_indicators=route_indicators,
             indexes=indexes,
             forward_stream=forward_stream,
             kv_view=kv_view,
@@ -1097,7 +1097,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
             raise invalid_descriptor("BAGEL denoise modality mask does not match token geometry")
         return indicators
 
-    def packed_modality_indices(
+    def packed_route_indices(
         self,
         forward_stream: Any,
         *,
@@ -1192,7 +1192,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
             past_key_values=past_key_values,
         )
 
-    def text_decode_graph_query_geometry(self) -> tuple[int, float, torch.dtype]:
+    def query_geometry(self) -> tuple[int, float, torch.dtype]:
         """Query-side geometry for the system decode-graph FlashInfer planner.
 
         KV-side geometry (heads / head dim / page size / dtype) is read off the
@@ -1418,11 +1418,11 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         self._sync_text_cache_lengths(op_list)
         return out
 
-    def try_run_text_graph_logits_batch(self, ops):
+    def try_run_graph_logits_batch(self, ops):
         """Return text logits only when the shared CUDA graph covers the batch."""
         self._ensure_loaded()
         op_list = self._prepare_text_logits_batch(ops)
-        out = self._text_driver().try_run_text_graph_logits_batch(op_list)
+        out = self._text_driver().try_run_graph_logits_batch(op_list)
         if out is None:
             return None
         self._sync_text_cache_lengths(op_list)
@@ -1860,7 +1860,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedVisibleModelMixin):
         defer_text_cpu_results: bool = False,
     ) -> Any:
         del group
-        return PackedVisibleBatchExecutor(self).execute(
+        return PackedForwardExecutor(self).execute(
             batch,
             request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,

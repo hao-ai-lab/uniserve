@@ -533,6 +533,12 @@ class ForwardStats:
             self.cuda_graph.runtime_mode_counts.get(name, 0)
         ) + 1
 
+    def record_runtime_graph_topology(self, topology_id: str) -> None:
+        name = str(topology_id)
+        self.cuda_graph.runtime_mode_counts[name] = int(
+            self.cuda_graph.runtime_mode_counts.get(name, 0)
+        ) + 1
+
     def record_spec_path(self, path: str) -> None:
         name = str(path)
         self.spec_verify.path_counts[name] = int(self.spec_verify.path_counts.get(name, 0)) + 1

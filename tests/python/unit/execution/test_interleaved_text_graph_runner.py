@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from uniserve_worker.models.interleaved_text import (
-    InterleavedTextDecodeGraphRunner,
-    InterleavedTextPrefillGraphRunner,
+    Span,
+    Step,
     _InterleavedDecodeGraphPast,
     _Row,
 )
@@ -30,7 +30,7 @@ def _row(pool, *, block_ids=None, base_len=3):
 
 def test_interleaved_decode_graph_padding_uses_reserved_block_offsets():
     pool = SimpleNamespace(num_blocks=64, block_size=16, reserved_block_ids=(62, 63))
-    runner = InterleavedTextDecodeGraphRunner()
+    runner = Step()
     driver = SimpleNamespace(owner=_Owner())
     rows = [_row(pool, block_ids=[3], base_len=11)]
 
@@ -45,7 +45,7 @@ def test_interleaved_decode_graph_padding_uses_reserved_block_offsets():
 
 def test_interleaved_decode_graph_padding_requires_reserved_blocks():
     pool = SimpleNamespace(num_blocks=64, block_size=16)
-    runner = InterleavedTextDecodeGraphRunner()
+    runner = Step()
     driver = SimpleNamespace(owner=object())
 
     with pytest.raises(Exception, match="reserved KV padding blocks"):
@@ -61,9 +61,9 @@ def test_interleaved_decode_graph_fences_staging_after_graph_submission():
         k=SimpleNamespace(device=device),
     )
     row = _row(pool)
-    runner = InterleavedTextDecodeGraphRunner()
+    runner = Step()
     runner._prepare = lambda driver, ops: ([row], None)
-    runner._decode = SimpleNamespace(
+    runner._runner = SimpleNamespace(
         resolve_bucket=lambda batch: batch,
         maybe_run_host_inputs=lambda **kwargs: calls.append("submit"),
     )
@@ -87,7 +87,7 @@ def test_interleaved_decode_graph_fences_staging_after_graph_submission():
 
 
 def test_interleaved_decode_graph_forward_uses_cache_position_without_index_sidecar():
-    runner = InterleavedTextDecodeGraphRunner()
+    runner = Step()
     input_ids = torch.tensor([[5], [6]], dtype=torch.long)
     positions = torch.tensor([[11], [12]], dtype=torch.long)
     cache = SimpleNamespace(pool=object(), base_len=11)
@@ -120,7 +120,7 @@ def test_interleaved_decode_graph_past_accepts_one_token_per_batch_row():
 
 
 def test_interleaved_prefill_graph_selects_last_real_token_from_all_logits():
-    runner = InterleavedTextPrefillGraphRunner()
+    runner = Span()
     input_ids = torch.tensor([5, 6, 0, 0], dtype=torch.long)
     positions = torch.tensor([0, 1, 0, 0], dtype=torch.long)
     cache = SimpleNamespace(pool=object(), base_len=0)
@@ -147,7 +147,7 @@ def test_interleaved_prefill_graph_selects_last_real_token_from_all_logits():
 
 
 def test_interleaved_prefill_graph_selects_packed_row_logits():
-    runner = InterleavedTextPrefillGraphRunner()
+    runner = Span()
     input_ids = torch.tensor([5, 6, 7, 8, 9, 10, 0, 0], dtype=torch.long)
     positions = torch.arange(8, dtype=torch.long)
     cache = SimpleNamespace(pool=object(), base_len=0)

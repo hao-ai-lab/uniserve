@@ -21,18 +21,6 @@ from uniserve_worker.contracts.forward_context import ForwardContext, use_forwar
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.cuda_graph import (
-    CudaGraphForwardRunner,
-    DecodeGraphProgram,
-    DenoiseStepGraphProgram,
-    ForwardGraphBufferRegistry,
-    ForwardGraphStats,
-    ModelOwnedTextGraphProgram,
-    PackedVisibleGraphProgram,
-    PaddingPolicy,
-    SlotAxis,
-    graph_shape_key,
-)
 from uniserve_worker.execution.engine import (
     EagerFallbackRecorder,
     EncodeDriver,
@@ -45,6 +33,9 @@ from uniserve_worker.execution.engine import (
     WorkerForwardAdapter,
 )
 from uniserve_worker.execution.engine import UnifiedForwardBatchBuilder as ForwardBatchBuilder
+from uniserve_worker.execution.graph import Dispatch, key
+from uniserve_worker.execution.graph.path import Batch, Denoise, Segment
+from uniserve_worker.models.packed_forward import PackedForwardModelMixin
 from uniserve_worker.runtime.request_state import RequestStateTable
 
 pytestmark = pytest.mark.unit
@@ -101,7 +92,7 @@ def test_batch_builder_flattens_mixed_text_tokens_and_segment_tables():
     assert [segment.length for segment in batch.segments] == [1, 2]
 
 
-def test_graph_shape_key_excludes_refreshable_runtime_values():
+def test_graph_capacity_key_excludes_refreshable_runtime_values():
     builder = ForwardPlanBuilder()
     batch_builder = ForwardBatchBuilder()
     plan_a = builder.build(
@@ -111,115 +102,51 @@ def test_graph_shape_key_excludes_refreshable_runtime_values():
         [{"req_id": 9, "kind": "decode_und", "token_ids": [99], "pos_range": [128, 129]}]
     )
 
-    key_a = graph_shape_key(program="decode", batch=batch_builder.build(plan_a), plan=plan_a)
-    key_b = graph_shape_key(program="decode", batch=batch_builder.build(plan_b), plan=plan_b)
+    key_a = key(
+        path="step",
+        batch=batch_builder.build(plan_a),
+        plan=plan_a,
+    )
+    key_b = key(
+        path="step",
+        batch=batch_builder.build(plan_b),
+        plan=plan_b,
+    )
 
     assert key_a == key_b
 
 
-def test_graph_buffer_registry_preserves_identity_and_applies_padding():
-    registry = ForwardGraphBufferRegistry()
-    slot = registry.register_slot(
-        "tokens",
-        axis=SlotAxis.TOKENS,
-        shape=(4,),
-        dtype=torch.long,
-        device="cpu",
-        padding=PaddingPolicy.SENTINEL,
-        sentinel=-1,
-    )
-    ptr = slot.tensor.data_ptr()
-
-    registry.refresh_slot("tokens", torch.tensor([3, 4], dtype=torch.long))
-
-    assert registry.tensor("tokens").data_ptr() == ptr
-    torch.testing.assert_close(registry.tensor("tokens"), torch.tensor([3, 4, -1, -1]))
-
-
-def test_cuda_graph_runner_replays_same_shape_with_refreshed_runtime_values():
-    class Adapter:
-        def __init__(self) -> None:
-            self.tokens: list[int] = []
-
-        def forward(self, batch):
-            token = int(batch.input_ids.reshape(-1)[0].item())
-            self.tokens.append(token)
-            return ForwardResult(
-                runtime_outputs=({"req_id": int(batch.req_ids[0]), "token": token},)
-            )
-
-    stats = ForwardGraphStats()
-    graph_runner = CudaGraphForwardRunner(
-        programs=(DecodeGraphProgram(),),
-        stats=stats,
-    )
-    executor = ForwardExecutor(
-        model=Adapter(),
-        graph_runner=graph_runner,
-        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-    )
+def test_graph_capacity_key_excludes_operation_composition():
     builder = ForwardPlanBuilder()
     batch_builder = ForwardBatchBuilder()
-    plan_a = builder.build(
-        [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
-        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    homogeneous = builder.build(
+        [
+            {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
+            {"req_id": 2, "kind": "decode_und", "token_ids": [11], "pos_range": [1, 2]},
+        ]
     )
-    plan_b = builder.build(
-        [{"req_id": 9, "kind": "decode_und", "token_ids": [99], "pos_range": [128, 129]}],
-        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    heterogeneous = builder.build(
+        [
+            {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
+            {"req_id": 2, "kind": "prefill_und", "token_ids": [11], "pos_range": [0, 1]},
+        ]
     )
 
-    first = executor.execute(batch_builder.build(plan_a), plan_a)
-    second = executor.execute(batch_builder.build(plan_b), plan_b)
-
-    assert first.graph is not None and first.graph.captured and not first.graph.replayed
-    assert second.graph is not None and second.graph.replayed
-    assert first.runtime_outputs == ({"req_id": 1, "token": 10},)
-    assert second.runtime_outputs == ({"req_id": 9, "token": 99},)
-    assert stats.captures == 1
-    assert stats.replays == 1
-    assert stats.misses == 0
-    assert stats.unpadded_tokens == 2
-
-
-def test_cuda_graph_runner_projects_metrics_to_forward_context():
-    class Adapter:
-        def forward(self, batch):
-            return ForwardResult(runtime_outputs=({"req_id": int(batch.req_ids[0])},))
-
-    graph_runner = CudaGraphForwardRunner(programs=(DecodeGraphProgram(),))
-    executor = ForwardExecutor(
-        model=Adapter(),
-        graph_runner=graph_runner,
-        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    homogeneous_key = key(
+        path="segment",
+        batch=batch_builder.build(homogeneous),
+        plan=homogeneous,
     )
-    builder = ForwardPlanBuilder()
-    batch_builder = ForwardBatchBuilder()
-    plan_a = builder.build(
-        [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
-        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    heterogeneous_key = key(
+        path="segment",
+        batch=batch_builder.build(heterogeneous),
+        plan=heterogeneous,
     )
-    plan_b = builder.build(
-        [{"req_id": 9, "kind": "decode_und", "token_ids": [99], "pos_range": [128, 129]}],
-        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-    )
-    stats = ForwardStats()
 
-    with use_forward_context(ForwardContext(stats=stats)):
-        executor.execute(batch_builder.build(plan_a), plan_a)
-        executor.execute(batch_builder.build(plan_b), plan_b)
-
-    wire = stats.to_wire()
-    assert wire["forward_graph_captures"] == 1
-    assert wire["forward_graph_replays"] == 1
-    assert wire["forward_graph_misses"] == 0
-    assert wire["forward_graph_unpadded_tokens"] == 2
-    assert wire["forward_graph_padded_tokens"] == 2
-    assert wire["forward_graph_runtime_mode_counts"] == {"decode": 2}
-    assert len(wire["forward_graph_shape_counts"]) == 1
+    assert homogeneous_key == heterogeneous_key
 
 
-def test_decode_graph_program_runs_bound_text_graph_path():
+def test_batch_path_runs_bound_step_executor_without_dispatch_cache():
     graph_object = object()
     request_states = object()
 
@@ -250,13 +177,13 @@ def test_decode_graph_program_runs_bound_text_graph_path():
             )
 
     text_driver = TextDriver()
-    graph_runner = CudaGraphForwardRunner(
-        programs=(
-            DecodeGraphProgram(
-                text_driver=text_driver,
+    graph_runner = Dispatch(
+        paths=(
+            Batch(
+                driver=text_driver,
                 model="model",
-                request_states=request_states,
-                text_graph_runner=graph_object,
+                states=request_states,
+                executor=graph_object,
             ),
         )
     )
@@ -283,14 +210,104 @@ def test_decode_graph_program_runs_bound_text_graph_path():
     first = executor.execute(batch_a, plan_a)
     second = executor.execute(batch_b, plan_b)
 
-    assert first.graph is not None and first.graph.captured
-    assert second.graph is not None and second.graph.replayed
+    assert first.graph is not None and first.graph.path == "step"
+    assert second.graph is not None and second.graph.path == "step"
     torch.testing.assert_close(first.text_logits, torch.tensor([[1.0]]))
     torch.testing.assert_close(second.text_logits, torch.tensor([[2.0]]))
     assert len(text_driver.calls) == 2
 
 
-def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch):
+def test_dispatch_preserves_explicit_path_precedence():
+    class Owner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_segment_graph(self, plan, *, request_states, result_publisher):
+            del plan, request_states, result_publisher
+            self.calls += 1
+            return ForwardResult(text_logits=torch.tensor([[3.0]]))
+
+        def try_run_graph_logits_batch(self, ops):
+            del ops
+            raise AssertionError("the batch specialization must not preempt the segment path")
+
+    class Driver:
+        def forward_graph_result(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("the batch specialization must not run")
+
+    owner = Owner()
+    states = object()
+    op = {
+        "req_id": 1,
+        "kind": "decode_und",
+        "token_ids": [7],
+        "pos_range": [0, 1],
+    }
+    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
+    plan = ForwardPlanBuilder().build(
+        [op],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+        runtime_handles=handles,
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    dispatch = Dispatch(
+        paths=(
+            Segment(owner=owner, states=states),
+            Batch(driver=Driver(), model=owner, states=states),
+        )
+    )
+
+    with use_forward_context(ForwardContext(stats=ForwardStats())):
+        result = dispatch.run(batch, plan)
+
+    assert result is not None and result.graph is not None
+    assert result.graph.path == "segment"
+    assert owner.calls == 1
+
+
+def test_general_segment_path_owns_uniform_denoise_when_available():
+    class Owner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run_segment_graph(self, plan, *, request_states, result_publisher):
+            del plan, request_states, result_publisher
+            self.calls += 1
+            return ForwardResult(
+                denoise_velocities={
+                    DenoiseBranchKey(0, 0): torch.tensor([1.0], dtype=torch.float32)
+                }
+            )
+
+    class Driver:
+        def forward_result(self, *args, **kwargs):
+            del args, kwargs
+            raise AssertionError("the denoise fallback must not duplicate a general segment graph")
+
+    owner = Owner()
+    states = object()
+    plan = ForwardPlanBuilder().build(
+        [{"req_id": 1, "kind": "denoise_gen", "cfg": {"branch_count": 1}}],
+        graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
+    )
+    batch = ForwardBatchBuilder().build(plan)
+    dispatch = Dispatch(
+        paths=(
+            Segment(owner=owner, states=states),
+            Denoise(driver=Driver(), model=owner, states=states),
+        )
+    )
+
+    with use_forward_context(ForwardContext(stats=ForwardStats())):
+        result = dispatch.run(batch, plan)
+
+    assert result is not None and result.graph is not None
+    assert result.graph.path == "segment"
+    assert owner.calls == 1
+
+
+def test_segment_path_runs_graph_only_forward_result(monkeypatch):
 
     class RequestStates:
         def __init__(self) -> None:
@@ -306,7 +323,7 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
         def invalidate(self) -> None:
             self.invalidated = True
 
-    class Owner:
+    class Owner(PackedForwardModelMixin):
         def __init__(self) -> None:
             self.residual = Residual()
             self.prepared: list[tuple[Any, dict[str, Any]]] = []
@@ -345,7 +362,7 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
         }
         return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
 
-    owner.run_packed_visible_forward_result = (
+    owner.run_packed_forward_result = (
         lambda *args, **kwargs: fake_run(owner, *args, **kwargs)
     )
     ops = [
@@ -360,25 +377,25 @@ def test_packed_visible_graph_program_runs_graph_only_forward_result(monkeypatch
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=CudaGraphForwardRunner(
-            programs=(PackedVisibleGraphProgram(owner=owner, request_states=states),)
+        graph_runner=Dispatch(
+            paths=(Segment(owner=owner, states=states),)
         ),
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
 
     result = executor.execute(batch, plan)
 
-    assert result.graph is not None and result.graph.captured
+    assert result.graph is not None and result.graph.path == "segment"
     torch.testing.assert_close(result.text_logits, torch.tensor([[3.0]]))
     assert owner.prepared == [(states.states[2], ops[1])]
     assert owner.residual.invalidated is True
 
 
-def test_packed_visible_graph_program_runs_decode_burst_as_graph_only_runtime_result():
+def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
     class RequestStates:
         pass
 
-    class Owner:
+    class Owner(PackedForwardModelMixin):
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
@@ -433,15 +450,15 @@ def test_packed_visible_graph_program_runs_decode_burst_as_graph_only_runtime_re
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=CudaGraphForwardRunner(
-            programs=(PackedVisibleGraphProgram(owner=owner, request_states=states),)
+        graph_runner=Dispatch(
+            paths=(Segment(owner=owner, states=states),)
         ),
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
 
     result = executor.execute(batch, plan)
 
-    assert result.graph is not None and result.graph.captured
+    assert result.graph is not None and result.graph.path == "segment"
     assert result.runtime_outputs == (
         {"req_id": 1, "sampled_token_id": 17, "sampled_token_ids": [10, 17]},
         {"req_id": 2, "denoise_done": False, "num_steps_done": 1},
@@ -456,7 +473,7 @@ def test_packed_visible_graph_program_runs_decode_burst_as_graph_only_runtime_re
     ]
 
 
-def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(monkeypatch):
+def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
 
     class RequestStates:
         def __init__(self) -> None:
@@ -465,7 +482,7 @@ def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(mon
         def get(self, req_id: int):
             return self.states[int(req_id)]
 
-    class Owner:
+    class Owner(PackedForwardModelMixin):
         def prepare_denoise(self, state, op):
             return SimpleNamespace(extra={})
 
@@ -502,7 +519,7 @@ def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(mon
         assert denoise_steps == []
         return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
 
-    owner.run_packed_visible_forward_result = (
+    owner.run_packed_forward_result = (
         lambda *args, **kwargs: fake_run(owner, *args, **kwargs)
     )
     handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
@@ -513,12 +530,12 @@ def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(mon
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=CudaGraphForwardRunner(
-            programs=(
-                PackedVisibleGraphProgram(
+        graph_runner=Dispatch(
+            paths=(
+                Segment(
                     owner=owner,
-                    request_states=states,
-                    image_decode_driver=ImageDecodeDriver(),
+                    states=states,
+                    publisher=ImageDecodeDriver(),
                 ),
             )
         ),
@@ -533,11 +550,11 @@ def test_packed_visible_graph_program_publishes_commit_outputs_without_eager(mon
         ),
     )
 
-    assert result.graph is not None and result.graph.captured
+    assert result.graph is not None and result.graph.path == "segment"
     assert result.commit_outputs == {1: {"image_hw": [4, 5]}}
 
 
-def test_denoise_step_graph_program_runs_required_graph_mode():
+def test_denoise_path_runs_required_graph_mode():
     class RequestStates:
         def __init__(self) -> None:
             self.states = {5: object()}
@@ -566,10 +583,10 @@ def test_denoise_step_graph_program_runs_required_graph_mode():
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=CudaGraphForwardRunner(
-            programs=(
-                DenoiseStepGraphProgram(
-                    denoise_driver=driver, model="model", request_states=states
+        graph_runner=Dispatch(
+            paths=(
+                Denoise(
+                    driver=driver, model="model", states=states
                 ),
             )
         ),
@@ -578,7 +595,7 @@ def test_denoise_step_graph_program_runs_required_graph_mode():
 
     result = executor.execute(batch, plan)
 
-    assert result.graph is not None and result.graph.captured
+    assert result.graph is not None and result.graph.path == "denoise"
     assert driver.calls == [
         (
             [(5, states.states[5], op)],
@@ -588,7 +605,7 @@ def test_denoise_step_graph_program_runs_required_graph_mode():
     ]
 
 
-def test_model_owned_text_graph_program_uses_graph_only_text_driver():
+def test_owner_batch_path_uses_graph_only_driver():
     class RequestStates:
         def get(self, req_id: int):
             return {"req_id": int(req_id)}
@@ -620,7 +637,7 @@ def test_model_owned_text_graph_program_uses_graph_only_text_driver():
             return SimpleNamespace(logits=torch.tensor([[8.0, 9.0]]), req_ids=(7,))
 
     class Model:
-        def try_run_text_graph_logits_batch(self, _ops):
+        def try_run_graph_logits_batch(self, _ops):
             raise AssertionError("program must route through TextDriver graph logits")
 
     states = RequestStates()
@@ -641,12 +658,12 @@ def test_model_owned_text_graph_program_uses_graph_only_text_driver():
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=CudaGraphForwardRunner(
-            programs=(
-                ModelOwnedTextGraphProgram(
-                    text_driver=text_driver,
+        graph_runner=Dispatch(
+            paths=(
+                Batch(
+                    driver=text_driver,
                     model=model,
-                    request_states=states,
+                    states=states,
                 ),
             )
         ),
@@ -655,7 +672,7 @@ def test_model_owned_text_graph_program_uses_graph_only_text_driver():
 
     result = executor.execute(batch, plan)
 
-    assert result.graph is not None and result.graph.captured
+    assert result.graph is not None and result.graph.path == "span"
     torch.testing.assert_close(result.text_logits, torch.tensor([[8.0, 9.0]]))
     assert text_driver.calls == [
         {
@@ -669,7 +686,7 @@ def test_model_owned_text_graph_program_uses_graph_only_text_driver():
     ]
 
 
-def test_model_owned_text_graph_program_uses_runtime_result_for_decode_burst():
+def test_owner_batch_path_uses_runtime_result_for_multi_step_row():
     class RequestStates:
         def get(self, req_id: int):
             return {"req_id": int(req_id)}
@@ -701,7 +718,7 @@ def test_model_owned_text_graph_program_uses_runtime_result_for_decode_burst():
             return ForwardResult(runtime_outputs=({"req_id": 7, "sampled_token_ids": [4, 5]},))
 
     class Model:
-        def try_run_text_graph_logits_batch(self, _ops):
+        def try_run_graph_logits_batch(self, _ops):
             raise AssertionError("program must route through TextDriver graph result")
 
     states = RequestStates()
@@ -722,12 +739,12 @@ def test_model_owned_text_graph_program_uses_runtime_result_for_decode_burst():
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=CudaGraphForwardRunner(
-            programs=(
-                ModelOwnedTextGraphProgram(
-                    text_driver=text_driver,
+        graph_runner=Dispatch(
+            paths=(
+                Batch(
+                    driver=text_driver,
                     model=model,
-                    request_states=states,
+                    states=states,
                 ),
             )
         ),
@@ -736,7 +753,7 @@ def test_model_owned_text_graph_program_uses_runtime_result_for_decode_burst():
 
     result = executor.execute(batch, plan)
 
-    assert result.graph is not None and result.graph.captured
+    assert result.graph is not None and result.graph.path == "step"
     assert result.runtime_outputs == ({"req_id": 7, "sampled_token_ids": [4, 5]},)
     assert text_driver.calls == [
         {
@@ -759,7 +776,7 @@ def test_text_driver_graph_result_runs_decode_burst_without_eager_fallback():
         def __init__(self) -> None:
             self.calls: list[list[dict[str, Any]]] = []
 
-        def try_run_text_graph_logits_batch(self, ops):
+        def try_run_graph_logits_batch(self, ops):
             self.calls.append([dict(op) for op in ops])
             token = 4 if len(self.calls) == 1 else 5
             logits = torch.full((1, 8), -10.0, dtype=torch.float32)
@@ -1444,6 +1461,65 @@ def test_worker_adapter_private_mixed_hook_can_return_forward_result():
     fb = UniForwardBatch.from_ops(ops)
 
     with adapter.bind(dispatch_batch=fb, group=list(enumerate(ops)), defer_text_cpu_results=False):
+        result = adapter.forward(batch)
+
+    assert result is expected
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        {"req_id": 7, "kind": "prefill_und", "token_ids": [4, 5], "pos_range": [0, 2]},
+        {"req_id": 7, "kind": "decode_und", "token_ids": [4], "pos_range": [2, 3]},
+        {"req_id": 7, "kind": "denoise_gen"},
+    ],
+)
+def test_worker_adapter_private_hook_accepts_any_segment_group(op):
+    expected = ForwardResult(runtime_outputs=({"req_id": 7},))
+
+    class Model(ModelHooks):
+        device = "cpu"
+
+        def _run_forward_adapter(
+            self, batch, *, request_states, group, defer_text_cpu_results=False
+        ):
+            assert request_states is states
+            assert group == [(0, op)]
+            assert defer_text_cpu_results is False
+            assert batch.ops == (op,)
+            return expected
+
+    states = _FakeRequestStates({7: SimpleNamespace()})
+    descriptor = ForwardModelDescriptor(
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        hidden_size=1,
+        vocab_size=2,
+        num_layers=1,
+        num_q_heads=1,
+        num_kv_heads=1,
+        head_dim=1,
+        supports_text=True,
+        supports_denoise=True,
+    )
+    adapter = WorkerForwardAdapter(
+        model=Model(),
+        request_states=states,
+        text_driver=object(),
+        denoise_driver=object(),
+        encode_driver=object(),
+        image_decode_driver=object(),
+        descriptor=descriptor,
+    )
+    plan = ForwardPlanBuilder().build([op], request_states=states)
+    batch = ForwardBatchBuilder().build(plan)
+    dispatch_batch = UniForwardBatch.from_ops([op])
+
+    with adapter.bind(
+        dispatch_batch=dispatch_batch,
+        group=[(0, op)],
+        defer_text_cpu_results=False,
+    ):
         result = adapter.forward(batch)
 
     assert result is expected
