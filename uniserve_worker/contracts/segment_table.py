@@ -27,6 +27,7 @@ from .execution import OperationTag
 from .residency_batch import ResidencyBatchCapacity
 
 __all__ = [
+    "AttentionLayerSpec",
     "GraphCapacity",
     "SegmentTableArrays",
     "SegmentTableError",
@@ -35,6 +36,25 @@ __all__ = [
 
 class SegmentTableError(ValueError):
     """A populated segment table violates the closed device schema."""
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionLayerSpec:
+    """Narrow immutable layer description handed to the attention backend.
+
+    The model-facing attention contract: family code passes Q/K/V and this
+    static description to the shared attention layer; providers own cache
+    writes, metadata, and kernels behind it.
+    """
+
+    layer_id: int
+    site_id: int
+    domain_id: int
+    query_heads: int
+    kv_heads: int
+    qk_head_dim: int
+    value_head_dim: int
+    scale: float
 
 
 @dataclass(frozen=True, slots=True)

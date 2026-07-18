@@ -67,6 +67,7 @@ from ..runtime.transactional_residency import (
 )
 
 __all__ = [
+    "AdapterPayload",
     "AdapterRowOutcome",
     "PreparedTransaction",
     "ResidentAdapter",
@@ -82,6 +83,14 @@ class AdapterRowOutcome:
     accepted_candidates: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class AdapterPayload:
+    """Packed numerical payload columns (canonical token order)."""
+
+    token_ids: tuple[int, ...]
+    positions: tuple[int, ...]
+
+
 class ResidentAdapter(Protocol):
     """One packed traversal over the transaction's device tables."""
 
@@ -90,6 +99,7 @@ class ResidentAdapter(Protocol):
         segments: SegmentTableArrays,
         residency: ResidencyBatchArrays,
         capacity: GraphCapacity,
+        payload: AdapterPayload,
     ) -> tuple[AdapterRowOutcome, ...]: ...
 
 
@@ -188,6 +198,10 @@ class StandardTransactionExecutor:
                 prepared.segments,
                 prepared.residency_arrays,
                 prepared.capacity,
+                AdapterPayload(
+                    token_ids=prepared.lowered.token_ids,
+                    positions=prepared.lowered.positions,
+                ),
             )
             if len(outcomes) != len(prepared.batch.rows):
                 raise RuntimeError(

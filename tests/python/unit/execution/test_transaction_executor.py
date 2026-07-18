@@ -68,7 +68,7 @@ class StubAdapter:
         self.accept = 0
         self.fail_next = False
 
-    def forward(self, segments, residency, capacity):
+    def forward(self, segments, residency, capacity, payload):
         self.calls += 1
         if self.fail_next:
             raise RuntimeError("injected replay failure")
