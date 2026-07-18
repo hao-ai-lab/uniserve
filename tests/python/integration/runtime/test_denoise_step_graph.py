@@ -27,7 +27,7 @@ import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.execution import paged_denoise as paged_denoise_mod
+from uniserve_worker.runtime import paged_denoise as paged_denoise_mod
 from uniserve_worker.models.interleaved_image import (
     DenoiseRow,
     DenoiseStepGraphRunner,
