@@ -915,6 +915,45 @@ def test_torch_is_compiling_has_a_single_owner():
     assert offenders == []
 
 
+def test_execution_package_matches_completion_criterion_file_set():
+    """unified_forward_execution completion criterion 1: the execution package
+    contains exactly the engine and the consolidated CUDA graph runtime."""
+
+    execution = WORKER / "execution"
+    assert {p.name for p in execution.glob("*.py")} == {
+        "__init__.py",
+        "engine.py",
+        "cuda_graph.py",
+    }
+    assert [p for p in execution.iterdir() if p.is_dir() and p.name != "__pycache__"] == []
+
+
+def test_deleted_execution_modules_are_absent_everywhere():
+    """The source migration map's deleted modules may not reappear anywhere."""
+
+    deleted = {
+        "text_driver.py",
+        "text_decode_relay.py",
+        "decode_burst.py",
+        "spec_verify.py",
+        "encode_driver.py",
+        "image_decode_driver.py",
+        "denoise_driver.py",
+        "text_image_denoise_session.py",
+        "text_image_generation_session.py",
+        "tower_execution_session.py",
+        "interleaved_text_stepper.py",
+        "interleaved_image_denoise.py",
+        "interleaved_image_commit.py",
+        "input_image_ingest.py",
+        "denoise_residual_cache.py",
+        "model_base.py",
+        "transformers_fallback.py",
+    }
+    offenders = [_rel(p) for p in _py_files(WORKER) if p.name in deleted]
+    assert offenders == []
+
+
 def test_piecewise_compile_helper_has_a_single_owner():
     """Config-gated piecewise torch.compile application is UniModelBase glue.
 
