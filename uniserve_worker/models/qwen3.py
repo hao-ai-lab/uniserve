@@ -36,7 +36,6 @@ if TYPE_CHECKING:
 import torch.nn as nn
 
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
-from ..execution.model_base import UniModelBase
 from ..foundation.runtime_config import get_execution_config
 from ..foundation.sizing import (
     DEFAULT_BLOCK_SIZE,
@@ -67,6 +66,7 @@ from ..nn.quant import (
 )
 from ..runtime.compile import CompileTarget
 from ..runtime.residency import KvCacheSpec
+from .registry import UniModelBase
 
 logger = logging.getLogger(__name__)
 

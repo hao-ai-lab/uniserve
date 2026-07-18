@@ -17,8 +17,11 @@ from uniserve_worker.contracts.batches import CfgBatch, UniForwardBatch
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
-from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
-from uniserve_worker.execution.text_driver import text_input_id_replacements_from_relays
+from uniserve_worker.execution.engine import (
+    ModelRunner,
+    RunnerConfig,
+    text_input_id_replacements_from_relays,
+)
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.runtime.request_state import RequestStateTable
@@ -170,7 +173,7 @@ def test_strict_policy_preserves_contiguous_order_and_splits_by_max_batch():
 
 
 def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch():
-    from uniserve_worker.execution.forward.step import ForwardGroupPlanner
+    from uniserve_worker.execution.engine import ForwardGroupPlanner
 
     planner = ForwardGroupPlanner(
         BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),
@@ -189,7 +192,7 @@ def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch()
 
 
 def test_mixed_planner_peels_encode_rows_and_keeps_text_denoise_packed():
-    from uniserve_worker.execution.forward.step import ForwardGroupPlanner
+    from uniserve_worker.execution.engine import ForwardGroupPlanner
 
     planner = ForwardGroupPlanner(
         BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),

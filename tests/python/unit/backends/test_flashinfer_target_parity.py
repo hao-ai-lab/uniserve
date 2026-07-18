@@ -32,7 +32,7 @@ from uniserve_worker.contracts.segment_table import (
     AttentionLayerSpec,
     GraphCapacity,
 )
-from uniserve_worker.execution.lowering import RoleSequences, lower_rows
+from uniserve_worker.execution.engine import RoleSequences, lower_rows
 from uniserve_worker.models.cache_registrations import (
     IMAGE_UNCONDITIONAL_ROLE,
     PRIMARY_ROLE,

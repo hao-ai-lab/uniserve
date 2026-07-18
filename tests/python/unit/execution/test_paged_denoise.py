@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.execution.paged_denoise import PagedDenoiseBranchSet
 from uniserve_worker.nn.diffusion.cfg import Branch
+from uniserve_worker.runtime.paged_denoise import PagedDenoiseBranchSet
 from uniserve_worker.runtime.paged_text_cache import PagedTextCache
 from uniserve_worker.runtime.residency import ResidencyManager, ScratchKvPool
 

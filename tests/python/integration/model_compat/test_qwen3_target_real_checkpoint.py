@@ -64,8 +64,7 @@ def test_real_checkpoint_greedy_decode_matches_dense_recompute():
         AttentionLayerSpec,
         GraphCapacity,
     )
-    from uniserve_worker.execution.engine import ExecutionEngine
-    from uniserve_worker.execution.transaction import StandardTransactionExecutor
+    from uniserve_worker.execution.engine import ExecutionEngine, StandardTransactionExecutor
     from uniserve_worker.models.cache_registrations import qwen3_cache_registration
     from uniserve_worker.models.qwen3_target import (
         Qwen3Target,

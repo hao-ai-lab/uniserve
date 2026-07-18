@@ -28,15 +28,15 @@ import torch
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.execution import paged_denoise as paged_denoise_mod
-from uniserve_worker.execution.forward.graph.denoise_step import (
+from uniserve_worker.models.interleaved_image import (
+    DenoiseRow,
     DenoiseStepGraphRunner,
     maybe_run_denoise_step_graph,
 )
-from uniserve_worker.execution.interleaved_image_denoise import DenoiseRow
-from uniserve_worker.execution.paged_denoise import can_run_paged_denoise_attention
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.ops import AttentionRegime
 from uniserve_worker.runtime.kv_pool import PagedKVPool
+from uniserve_worker.runtime.paged_denoise import can_run_paged_denoise_attention
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
 
 pytestmark = pytest.mark.integration

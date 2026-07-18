@@ -1,4 +1,4 @@
-"""Shared route-aware decoder root for target family adapters (dormant).
+"""Shared route-aware decoder root for target family adapters.
 
 The reusable numerical composition family roots build on (Stage 5/6 of
 ``specs/unified_forward_execution.md``): token embedding, RMSNorm, rotary

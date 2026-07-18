@@ -2,7 +2,7 @@
 
 Structural ``Protocol`` surfaces every registered model satisfies, plus the
 :class:`DenoiseContext` value object. Concrete glue lives in
-``execution.model_base``; resource-rule dataclasses live in
+``models.registry`` (``UniModelBase``); resource-rule dataclasses live in
 ``contracts.resource_plan``. Higher-layer type references are annotation-only
 (``from __future__ import annotations``).
 """
@@ -19,7 +19,8 @@ from .resource_plan import ResourcePlan
 if TYPE_CHECKING:
     import torch
 
-    from ..execution.denoise_driver import TextImageDenoiseStep
+    from uniserve_worker.execution.engine import TextImageDenoiseStep
+
     from ..runtime.compile import CompileTarget
     from ..runtime.request_state import RequestStateTable
     from .attention_plan import AttentionPlanBase

@@ -1,4 +1,4 @@
-"""Closed transfer-handle family for typed product components (dormant).
+"""Closed transfer-handle family for typed product components.
 
 Stage 3's transfer slice from ``specs/unified_forward_execution.md``:
 `TransferHandle` is a closed tagged union — local residency, shared memory,
@@ -6,7 +6,7 @@ CUDA IPC, and Mooncake — where each variant carries only the descriptor
 fields its genuine transport requires. Only residency and the transfer layer
 interpret the tag; schedulers route the opaque typed descriptor.
 
-This dormant slice binds two genuine transports and types the rest:
+This slice binds two genuine transports and types the rest:
 
 * :class:`LocalResidencyHandle` — same-process consumption of a committed
   product lease (identity only; no bytes move).

@@ -6,14 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import uniserve_worker.execution.interleaved_image_denoise as denoise_mod
-from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-from uniserve_worker.execution.denoise_residual_cache import (
-    DenoiseResidualCacheAdapter,
+import uniserve_worker.models.interleaved_image as denoise_mod
+from uniserve_worker.execution.engine import TextImageDenoiseStep
+from uniserve_worker.models.interleaved_image import (
+    DenoiseResidualCacheBinding,
     DenoiseResidualCachePolicy,
     ImageResidualCacheState,
-)
-from uniserve_worker.execution.interleaved_image_denoise import (
     ImageState,
     TextImageDenoiseOps,
 )
@@ -88,7 +86,7 @@ class _FakeOwner(TextImageDenoiseOps):
             self.finalize_calls += 1
             return hidden
 
-        self._adapter = DenoiseResidualCacheAdapter(
+        self._adapter = DenoiseResidualCacheBinding(
             decision_embedding=lambda embeds: norm(embeds),
             rescale_coefficients=IDENTITY_POLY,
             finalize_hidden=_finalize,

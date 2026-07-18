@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.execution.forward.graph.interleaved_text import (
+from uniserve_worker.models.interleaved_text import (
     InterleavedTextDecodeGraphRunner,
     InterleavedTextPrefillGraphRunner,
     _InterleavedDecodeGraphPast,

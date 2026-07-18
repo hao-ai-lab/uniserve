@@ -1,4 +1,4 @@
-"""Dormant family cache-schema registrations for the target cache runtime.
+"""Family cache-schema registrations for the target cache runtime.
 
 The "Family Mappings" of ``specs/unified_kv_attention_runtime.md`` expressed as
 :mod:`~uniserve_worker.contracts.cache_schema` data. These factories prove the

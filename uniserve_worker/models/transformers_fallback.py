@@ -13,15 +13,16 @@ from typing import Any
 
 import torch
 
+from uniserve_worker.models.interleaved_text import resolve_op_token_ids
+
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
-from ..execution.interleaved_text_stepper import resolve_op_token_ids
-from ..execution.model_base import UniModelBase
 from ..foundation.errors import capability_mismatch, invalid_descriptor, resource_lease_violation
 from ..foundation.runtime_config import get_execution_config
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..loader.transformers import dtype_from_name, infer_input_device
 from ..nn import RadixAttention
 from ..nn.logits import forced_eos_logits
+from .registry import UniModelBase
 
 __all__ = [
     "TransformersForCausalLM",
@@ -307,7 +308,7 @@ class TransformersForCausalLM(UniModelBase):
 
         Unlike the system-managed text models, this fallback has no paged KV
         pool — it grows HF ``past_key_values`` per request — so the
-        :class:`~uniserve_worker.execution.text_driver.TextDriver` routes it
+        :class:`~uniserve_worker.execution.engine.TextDriver` routes it
         through ``run_text_logits_batch`` rather than the system forward.
         """
         del positions, forward_batch

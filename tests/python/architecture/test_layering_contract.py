@@ -308,6 +308,20 @@ def test_models_tree_has_no_runtime_packages_or_adapter_classes():
     assert adapter_classes == []
 
 
+# Family-owned runtime modules (unified_forward_execution source migration
+# map): interleaved and packed machinery is family compute expressed next to
+# the family adapters, not a specially-labelled execution module. These files
+# are the single owners of that machinery and are exempt from the family-entry
+# duplication bans below.
+FAMILY_RUNTIME_MODULES = frozenset(
+    {"interleaved_text.py", "interleaved_image.py", "packed_forward.py", "interleave_runtime.py"}
+)
+
+
+def _family_entry_files(models):
+    return [p for p in _py_files(models) if p.name not in FAMILY_RUNTIME_MODULES]
+
+
 def test_models_tree_matches_target_file_set():
     models = WORKER / "models"
     top_level = {p.name for p in models.glob("*.py")}
@@ -317,26 +331,32 @@ def test_models_tree_matches_target_file_set():
         "transformers_fallback.py",
         "qwen3.py",
         "bagel.py",
-        # Dormant family cache registrations for the target unified KV runtime
+        # Family cache registrations for the unified KV runtime
         # (specs/unified_kv_attention_runtime.md); family-naming data stays in
         # the models layer, never in model-neutral contracts.
         "cache_registrations.py",
-        # Dormant strict target registry (unified_forward_execution Stage 6):
+        # Strict target registry (unified_forward_execution Stage 6):
         # explicit architecture-to-family resolution, no probing or fallback.
         "target_registry.py",
-        # Dormant target Qwen3 family root (Stage 6 family port): one resident
+        # Target Qwen3 family root (Stage 6 family port): one resident
         # root over injected shared attention, no cache or provider ownership.
         "qwen3_target.py",
-        # Dormant target SenseNova two-route family root (mixed text+denoise
+        # Target SenseNova two-route family root (mixed text+denoise
         # composition through one packed traversal).
         "sensenova_target.py",
-        # Dormant target BAGEL two-route family root (marker-run denoise).
+        # Target BAGEL two-route family root (marker-run denoise).
         "bagel_target.py",
+        # Family-owned interleaved/packed runtime (unified_forward_execution
+        # source migration map): behavior expressed through the four generic
+        # operations and the family adapters.
+        "interleaved_text.py",
+        "interleaved_image.py",
+        "packed_forward.py",
     }
-    # SenseNova-U1 is its own package; the interleaved image denoise/commit
-    # orchestration is system-owned under execution/, not model-local.
+    # SenseNova-U1 is its own package; its commit/ingest/tower interleave
+    # runtime is family-owned next to the model.
     sensenova = {p.name for p in (models / "sensenova").glob("*.py")}
-    assert sensenova == {"__init__.py", "model.py", "config.py"}
+    assert sensenova == {"__init__.py", "model.py", "config.py", "interleave_runtime.py"}
 
 
 def test_openai_chat_protocol_stays_out_of_worker_runtime_layers():
@@ -362,18 +382,18 @@ def test_openai_chat_protocol_stays_out_of_worker_runtime_layers():
     assert offenders == []
 
 
-def test_interleaved_text_stepper_is_system_owned():
-    """The interleaved text-decode orchestration is a system component.
+def test_interleaved_text_runtime_has_a_single_owner():
+    """Interleaved text-decode orchestration has exactly one family-owned home.
 
     The text metadata-building + forward orchestration (``InterleavedTextCacheDriver``
-    / ``TextCache`` / ``InterleavedModelOwner``) lives under ``execution`` (the system),
-    not ``models`` -- a model only provides the duck-typed compute primitives. A model
-    file may import these names (re-export), but must not *define* them.
+    / ``TextCache`` / ``InterleavedModelOwner``) lives in the family runtime module
+    ``models/interleaved_text.py`` -- a family entry file only provides the
+    duck-typed compute primitives and may import these names, never *define* them.
     """
 
-    stepper = WORKER / "execution" / "interleaved_text_stepper.py"
+    stepper = WORKER / "models" / "interleaved_text.py"
     assert stepper.is_file(), (
-        "execution/interleaved_text_stepper.py must exist (system InterleavedStepper)"
+        "models/interleaved_text.py must exist (family interleaved text runtime)"
     )
     owned = {"InterleavedTextCacheDriver", "TextCache", "InterleavedModelOwner"}
     defined_in_stepper = {
@@ -382,55 +402,52 @@ def test_interleaved_text_stepper_is_system_owned():
         if isinstance(node, ast.ClassDef)
     }
     assert owned <= defined_in_stepper, (
-        f"system stepper must define {owned}, has {defined_in_stepper}"
+        f"family text runtime must define {owned}, has {defined_in_stepper}"
     )
 
     offenders: list[str] = []
-    for path in _py_files(WORKER / "models"):
+    for path in _family_entry_files(WORKER / "models"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name in owned:
                 offenders.append(f"{_rel(path)}::{node.name}")
-    assert offenders == [], f"models/ must not define system stepper classes: {offenders}"
+    assert offenders == [], f"family entry files must not redefine the text runtime: {offenders}"
 
 
 def test_interleaved_text_execution_uses_owner_adapter_not_model_backbone():
+    source = (WORKER / "models" / "interleaved_text.py").read_text(encoding="utf-8")
     offenders: list[str] = []
-    for rel in (
-        "execution/interleaved_text_stepper.py",
-        "execution/forward/graph/interleaved_text.py",
-    ):
-        source = (WORKER / rel).read_text(encoding="utf-8")
-        for needle in ("owner.model.language_model", "owner.model._build_t2i"):
-            if needle in source:
-                offenders.append(f"{rel} contains {needle}")
+    for needle in ("owner.model.language_model", "owner.model._build_t2i"):
+        if needle in source:
+            offenders.append(f"models/interleaved_text.py contains {needle}")
     assert offenders == []
 
 
-def test_interleaved_image_engine_is_system_owned():
-    """The interleaved image denoise/commit orchestration is a system component.
+def test_interleaved_image_runtime_has_a_single_owner():
+    """Interleaved image denoise/commit orchestration has one family-owned home.
 
-    The denoise engine (``TextImageDenoiseOps`` + state/protocol types) and the
-    generated-image commit driver live under ``execution`` (the system), not
-    ``models`` -- a model only provides the duck-typed compute primitives. A
-    model file may import these names (re-export), but must not *define* them.
+    The denoise engine (``TextImageDenoiseOps`` + state/protocol types) lives in
+    ``models/interleaved_image.py``; the generated-image commit driver lives in
+    ``models/sensenova/interleave_runtime.py``. A family entry file only provides
+    the duck-typed compute primitives and may import these names, never *define*
+    them.
     """
 
     owned_by_module = {
-        WORKER / "execution" / "interleaved_image_denoise.py": {
+        WORKER / "models" / "interleaved_image.py": {
             "ImageState",
             "DenoiseRow",
             "InterleavedImageRequestState",
             "TextImageDenoiseOwner",
             "TextImageDenoiseOps",
         },
-        WORKER / "execution" / "interleaved_image_commit.py": {
+        WORKER / "models" / "sensenova" / "interleave_runtime.py": {
             "GeneratedImageCommitOwner",
             "GeneratedImageCommitDriver",
         },
     }
     for module, owned in owned_by_module.items():
-        assert module.is_file(), f"{_rel(module)} must exist (system interleaved image engine)"
+        assert module.is_file(), f"{_rel(module)} must exist (family interleaved image runtime)"
         defined = {
             node.name
             for node in ast.walk(ast.parse(module.read_text(encoding="utf-8")))
@@ -440,22 +457,29 @@ def test_interleaved_image_engine_is_system_owned():
 
     all_owned = set().union(*owned_by_module.values())
     offenders: list[str] = []
-    for path in _py_files(WORKER / "models"):
+    for path in _family_entry_files(WORKER / "models"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name in all_owned:
                 offenders.append(f"{_rel(path)}::{node.name}")
-    assert offenders == [], f"models/ must not define system image-engine classes: {offenders}"
+    assert offenders == [], f"family entry files must not redefine the image runtime: {offenders}"
 
 
 def test_generated_image_commit_driver_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "execution" / "interleaved_image_commit.py").read_text(encoding="utf-8")
-    commit_driver_source = source[source.index("class GeneratedImageCommitDriver") :]
+    path = WORKER / "models" / "sensenova" / "interleave_runtime.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    lines = source.splitlines()
+    commit_driver_source = ""
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "GeneratedImageCommitDriver":
+            commit_driver_source = "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    assert commit_driver_source, "GeneratedImageCommitDriver must be defined"
     assert "self.owner.model." not in commit_driver_source
 
 
 def test_interleaved_image_mixin_uses_owner_adapter_for_t2i_model_primitives():
-    source = (WORKER / "execution" / "interleaved_image_denoise.py").read_text(encoding="utf-8")
+    source = (WORKER / "models" / "interleaved_image.py").read_text(encoding="utf-8")
     forbidden = ("self.model.",)
     offenders = [needle for needle in forbidden if needle in source]
     assert offenders == []
@@ -467,9 +491,7 @@ def test_sensenova_does_not_define_a_second_native_qwen3_backbone_namespace():
 
 
 def test_packed_mixed_forward_uses_owner_adapter_not_model_backbone():
-    source = (WORKER / "execution" / "forward" / "programs" / "packed_visible.py").read_text(
-        encoding="utf-8"
-    )
+    source = (WORKER / "models" / "packed_forward.py").read_text(encoding="utf-8")
     assert "owner.model." not in source
 
 
@@ -510,7 +532,7 @@ def test_models_tree_owns_no_pools_or_graphs():
     """
 
     offenders: list[str] = []
-    for path in _py_files(WORKER / "models"):
+    for path in _family_entry_files(WORKER / "models"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -525,7 +547,10 @@ def test_models_tree_owns_no_pools_or_graphs():
             )
             if name in FORBIDDEN_MODEL_CONSTRUCTIONS:
                 offenders.append(f"{_rel(path)}:{node.lineno} constructs {name}")
-    assert offenders == [], f"models/ must not construct system-owned pools/graphs: {offenders}"
+    assert offenders == [], (
+        f"family entry files must not construct pools/graphs (the family runtime "
+        f"modules are the single owners): {offenders}"
+    )
 
 
 def test_models_do_not_query_cuda_memory_directly():
@@ -575,7 +600,7 @@ def test_models_do_not_define_local_text_image_param_parsers():
 def test_models_do_not_define_local_paged_cache_copy_helpers():
     offenders: list[str] = []
     forbidden = ("def _copy_cache_prefix", "def _copy_cache_span", "def _append_packed_chunk")
-    for path in _py_files(WORKER / "models"):
+    for path in _family_entry_files(WORKER / "models"):
         text = path.read_text(encoding="utf-8")
         for needle in forbidden:
             if needle in text:
@@ -590,7 +615,7 @@ def test_models_do_not_define_packed_forward_sampling_or_relay_helpers():
         "def _store_forward_sampled_token_relay",
         "def _forward_text_input_ids",
     )
-    for path in _py_files(WORKER / "models"):
+    for path in _family_entry_files(WORKER / "models"):
         text = path.read_text(encoding="utf-8")
         for needle in forbidden:
             if needle in text:
@@ -609,12 +634,15 @@ def test_models_tree_defines_no_cuda_graph_runner_classes():
     """
 
     offenders: list[str] = []
-    for path in _py_files(WORKER / "models"):
+    for path in _family_entry_files(WORKER / "models"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and MODEL_GRAPH_OWNER_CLASS_NAME.search(node.name):
                 offenders.append(f"{_rel(path)}::{node.name}")
-    assert offenders == [], f"models/ must not define CUDA-graph runner/state classes: {offenders}"
+    assert offenders == [], (
+        f"family entry files must not define CUDA-graph runner/state classes (family "
+        f"graph runners live in the family runtime modules): {offenders}"
+    )
 
 
 def test_python_tests_do_not_use_deleted_model_modules_as_live_oracles():
@@ -786,7 +814,7 @@ def test_shared_layers_do_not_use_legacy_kernel_router():
 
 
 def test_mixed_forward_side_tables_use_forward_names():
-    assert (WORKER / "execution" / "forward" / "stream.py").exists()
+    assert (WORKER / "runtime" / "forward_stream.py").exists()
     assert not (WORKER / "execution" / "forward_stream.py").exists()
     assert not (WORKER / "execution" / "fused_stream.py").exists()
     offenders: list[str] = []
@@ -888,11 +916,18 @@ def test_torch_is_compiling_has_a_single_owner():
     assert offenders == []
 
 
-def test_models_do_not_redefine_piecewise_compile_helper():
-    """Config-gated piecewise torch.compile application is UniModelBase glue."""
+def test_piecewise_compile_helper_has_a_single_owner():
+    """Config-gated piecewise torch.compile application is UniModelBase glue.
+
+    ``UniModelBase`` lives in ``models/registry.py`` (unified_forward_execution
+    source migration map); no family file or other layer redefines the helper.
+    """
 
     offenders: list[str] = []
-    for path in _py_files(WORKER / "models"):
+    owner = WORKER / "models" / "registry.py"
+    for path in _py_files(WORKER):
+        if path == owner:
+            continue
         text = path.read_text(encoding="utf-8")
         if "def _maybe_compile_piecewise" in text:
             offenders.append(_rel(path))

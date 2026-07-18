@@ -121,7 +121,7 @@ def test_qwen3_spec_row_uses_sglang_target_only_path_for_stochastic_verify():
 
     state.set_kv_length = set_kv_length
     from uniserve_worker.contracts.forward_stats import ForwardStats
-    from uniserve_worker.execution.spec_verify import _verify_spec_row
+    from uniserve_worker.execution.engine import _verify_spec_row
 
     stats = ForwardStats()
 

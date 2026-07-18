@@ -1,4 +1,4 @@
-"""Grouped route dispatch and weight-overlay application (dormant target).
+"""Grouped route dispatch and weight-overlay application for target roots.
 
 Stage 5 of ``specs/unified_forward_execution.md``: route and overlay
 variation is device data inside one packed layer traversal. This module owns

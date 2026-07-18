@@ -1,6 +1,6 @@
 """Strict target model registry: explicit registrations, no probing.
 
-Dormant Stage 6 slice from ``specs/unified_forward_execution.md``. The
+Stage 6 slice from ``specs/unified_forward_execution.md``. The
 target `ModelRegistration` is a frozen record binding architecture names to
 one family, one closed advertised operation set, and the family's static
 cache registration factory. Resolution is explicit: an unknown or ambiguous

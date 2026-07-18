@@ -3,11 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-from uniserve_worker.execution.paged_denoise import PagedDenoiseBranchSet
+from uniserve_worker.execution.engine import TextImageDenoiseStep
 from uniserve_worker.models import bagel as bagel_model
 from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
 from uniserve_worker.nn.diffusion.cfg import Branch
+from uniserve_worker.runtime.paged_denoise import PagedDenoiseBranchSet
 
 pytestmark = pytest.mark.unit
 

@@ -4,8 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.denoise_driver import TextImageDenoiseStep
-from uniserve_worker.execution.text_image_denoise_session import TextImageDenoiseSession
+from uniserve_worker.execution.engine import TextImageDenoiseSession, TextImageDenoiseStep
 from uniserve_worker.models.bagel import (
     BagelConfig,
     BagelForUnifiedGeneration,

@@ -23,7 +23,7 @@ from uniserve_worker.contracts.execution import (
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.lowering import (
+from uniserve_worker.execution.engine import (
     LoweringError,
     RoleSequences,
     lower_rows,

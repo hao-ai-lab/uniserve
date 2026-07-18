@@ -31,8 +31,7 @@ from uniserve_worker.contracts.execution import (
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.engine import ExecutionEngine
-from uniserve_worker.execution.transaction import StandardTransactionExecutor
+from uniserve_worker.execution.engine import ExecutionEngine, StandardTransactionExecutor
 from uniserve_worker.models.cache_registrations import (
     sensenova_cache_registration,
 )

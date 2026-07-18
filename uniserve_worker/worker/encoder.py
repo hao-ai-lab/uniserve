@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from uniserve_worker.execution.engine import EncodeDriver
+
 from ..contracts.batches import UniForwardBatch
 from ..contracts.model_protocols import ModelHooks
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
-from ..execution.encode_driver import EncodeDriver
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..runtime.request_state import RequestStateTable

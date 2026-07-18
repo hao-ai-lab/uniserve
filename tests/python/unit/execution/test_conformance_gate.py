@@ -32,14 +32,14 @@ from uniserve_worker.contracts.execution import (
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.conformance import (
+from uniserve_worker.execution.engine import (
+    ExecutionEngine,
     ManifestError,
+    StandardTransactionExecutor,
     build_manifest,
     generate_cases,
     validate_manifest,
 )
-from uniserve_worker.execution.engine import ExecutionEngine
-from uniserve_worker.execution.transaction import StandardTransactionExecutor
 from uniserve_worker.models.bagel_target import BagelTarget
 from uniserve_worker.models.cache_registrations import (
     bagel_cache_registration,

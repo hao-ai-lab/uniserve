@@ -1,4 +1,5 @@
-"""Side-table builder for packed multimodal forward streams."""
+"""Device-side forward stream views and staging for packed multimodal batches."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
@@ -8,30 +9,17 @@ from typing import Literal
 
 import torch
 
-from ...backends.paged_kv_math import paged_kv_write
-from ...contracts.forward_mode import ForwardMode
-from ...foundation.errors import invalid_descriptor
-from ...runtime.cache_protocols import KVCacheView
-from ...runtime.host_staging import fill_cpu_ints, is_pinned
-from ...runtime.kv_pool import PagedKVPool
-from ...runtime.tensor_staging import TextTensorStager, TextTensorStagingSlot
+from uniserve_worker.backends.paged_kv_math import paged_kv_write
+from uniserve_worker.contracts.forward_mode import ForwardMode
+from uniserve_worker.foundation.errors import invalid_descriptor
+from uniserve_worker.runtime.cache_protocols import KVCacheView
+from uniserve_worker.runtime.host_staging import fill_cpu_ints, is_pinned
+from uniserve_worker.runtime.kv_pool import PagedKVPool
+from uniserve_worker.runtime.tensor_staging import TextTensorStager, TextTensorStagingSlot
 
-__all__ = [
-    'SegmentClass',
-    'SegmentModality',
-    'VisiblePolicy',
-    'SegmentClassId',
-    'SegmentModalityId',
-    'VisiblePolicyKind',
-    'ForwardSegmentSpec',
-    'ForwardStream',
-    'ForwardPagedKVSegment',
-    'ForwardPagedKVView',
-    'ForwardGraphStreamState',
-    'ForwardGraphPagedKVView',
-    'ForwardStreamBuilder',
-    'build_text_position_indexes',
-]
+# ---------------------
+# Forward stream views
+# ---------------------
 
 SegmentClass = Literal["extend", "decode", "denoise", "reencode"]
 SegmentModality = Literal["und", "gen"]
