@@ -49,10 +49,8 @@ logger = logging.getLogger(__name__)
 class UniModelBase(ModelHooks):
     """Concrete glue shared by the registered model entries.
 
-    This is a composition-friendly *mixin* (it carries no ``__init__`` and no
-    real superclass), so a model keeps its own base — ``nn.Module``,
-    ``TextImageDenoiseOps``, or plain ``object`` — and lists ``UniModelBase``
-    first to pick up the shared implementations. It complements the
+    The base carries no ``__init__`` and keeps model entries free to compose
+    system execution objects around their family-specific neural adapters. It complements the
     :class:`~uniserve_worker.contracts.model_protocols.UniModel` structural
     Protocol rather than duplicating it.
 
@@ -63,9 +61,8 @@ class UniModelBase(ModelHooks):
     * a single ``batch_policy()`` and ``caps()`` driven by ``_caps_descriptor``,
       both reading ``max_batch_ops`` from the same descriptor so the two stay aligned.
 
-    The model-specific ``__init__`` bodies (cuda-graph runners, LoRA/enc_store,
-    dual-device pools) stay in the subclasses; only the caps/batch_policy/
-    kv-dtype glue is shared.
+    Model-specific initialization retains family weights, constants, and
+    placement bindings; operation and graph lifecycle remain system-owned.
     """
 
     kv_cache_dtype: Any

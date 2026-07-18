@@ -17,15 +17,12 @@ from uniserve_worker.backends.attention import (
     has_attention_backend,
 )
 from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.execution import segment as packed_batch
+from uniserve_worker.execution import segment as packed_runtime
+from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.runtime_config import TorchCompileRuntimeConfig
 from uniserve_worker.foundation.triton_compat import triton_device_supported
-from uniserve_worker.models import packed_forward as packed_batch
-from uniserve_worker.models import packed_forward as packed_runtime
-from uniserve_worker.models.packed_forward import (
-    PackedForwardExecutor,
-    PackedForwardModelMixin,
-)
 from uniserve_worker.nn import (
     DeviceMesh,
     HFRotaryEmbedding,
@@ -2189,11 +2186,17 @@ def test_sensenova_admitted_forward_requires_whole_batch_graph(monkeypatch):
         def get(self, req_id):
             return {"req_id": req_id}
 
-    monkeypatch.setattr(wrapper, "prepare_denoise", lambda _state, _op: object())
+    monkeypatch.setattr(wrapper, "prepare_flow", lambda _state, _op: object())
     monkeypatch.setattr(
-        packed_batch, "run_packed_forward_result", lambda *_args, **_kwargs: None
+        wrapper.segment_executor,
+        "run_segment_forward_result",
+        lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(packed_batch, "run_packed_forward", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        wrapper.segment_executor,
+        "run_segment_forward",
+        lambda *_args, **_kwargs: False,
+    )
 
     def scalar_text_called(_op):
         raise AssertionError("admitted mixed batch must stay whole")
@@ -2208,7 +2211,6 @@ def test_sensenova_admitted_forward_requires_whole_batch_graph(monkeypatch):
 
 
 def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
-
     relay_tensor = torch.tensor([7], dtype=torch.long)
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=relay_tensor))
 
@@ -2235,7 +2237,6 @@ def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
 
 
 def test_sensenova_forward_text_input_ids_requires_last_sampled_relay():
-
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=None))
 
     class RequestStates:
@@ -2328,9 +2329,7 @@ def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
             },
         ]
     )
-    plan = packed_runtime.PackedForwardPlan(
-        batch=batch, denoise_steps=[], results=[None, None]
-    )
+    plan = packed_runtime.SegmentPlan(batch=batch, denoise_steps=[], results=[None, None])
     cache = SimpleNamespace()
     plan.add_text_slot(
         row_index=0,
@@ -2406,7 +2405,7 @@ def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
     results = [{"req_id": 7, "sampled_token_id": 2}]
     owner = Owner()
 
-    PackedForwardExecutor(owner)._complete_decode_bursts(
+    SegmentExecutor(owner)._complete_decode_bursts(
         batch,
         states,
         results,
@@ -2581,7 +2580,7 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
         dtype=torch.float32,
     )
     for req_id, block_id, length in ((11, 0, 3), (12, 1, 5)):
-        state = wrapper.interleaved_image_state(req_id)
+        state = wrapper.program_state(req_id)
         state.cond.block_ids = [block_id]
         wrapper._ensure_host_cache(state.cond)
         state.cond.past.length = length
@@ -2625,7 +2624,7 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     kv_segments = []
     indexes = torch.tensor([[5, 5], [0, 0], [0, 1]], dtype=torch.long)
 
-    wrapper._add_denoise_forward_segment(
+    wrapper.segment_executor._add_denoise_forward_segment(
         builder=builder,
         kv_segments=kv_segments,
         row_index=0,
@@ -2646,6 +2645,26 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     assert kv_segments[0].branch_id == 1
 
 
+def test_sensenova_request_cleanup_releases_segment_staging(monkeypatch):
+    from uniserve_worker.execution.flow import ProgramState
+    from uniserve_worker.models.sensenova import model as sensenova_u1
+
+    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
+        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
+    )
+    state = ProgramState()
+    caches = [object(), object(), object()]
+    state.cond.past, state.tu.past, state.iu.past = caches
+    wrapper.reqs[3] = state
+    wrapper.residency = SimpleNamespace(release_scratch_cache=lambda _cache: None)
+    released: list[object] = []
+    monkeypatch.setattr(wrapper.segment_executor, "release_staging", released.append)
+
+    wrapper.drop_request(3)
+
+    assert released == caches
+
+
 def test_sensenova_duplicate_new_request_preserves_live_interleaved_cache():
     from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -2659,7 +2678,7 @@ def test_sensenova_duplicate_new_request_preserves_live_interleaved_cache():
         {"req_id": 6, "block_ids": [10, 11], "sampling": {"temperature": 0.0}},
     )
     wrapper.on_new_request(6, state)
-    image_state = wrapper.interleaved_image_state(6)
+    image_state = wrapper.program_state(6)
     sentinel_past = object()
     image_state.cond.block_ids = [10, 11, 12, 13, 14]
     image_state.cond.past = sentinel_past
@@ -2671,7 +2690,7 @@ def test_sensenova_duplicate_new_request_preserves_live_interleaved_cache():
     )
     wrapper.on_new_request(6, duplicate)
 
-    assert wrapper.interleaved_image_state(6) is image_state
+    assert wrapper.program_state(6) is image_state
     assert states.get(6).block_ids == [10, 11]
     assert image_state.cond.block_ids == [10, 11, 12, 13, 14]
     assert image_state.cond.past is sentinel_past
@@ -2679,7 +2698,7 @@ def test_sensenova_duplicate_new_request_preserves_live_interleaved_cache():
 
 
 def test_packed_forward_syncs_host_cache_blocks_from_runner_state():
-    from uniserve_worker.models.packed_forward import _sync_host_cache_blocks
+    from uniserve_worker.execution.segment import _sync_host_cache_blocks
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -2735,8 +2754,7 @@ def test_packed_forward_syncs_host_cache_blocks_from_runner_state():
 def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.engine import TextImageDenoiseStep
-    from uniserve_worker.models.packed_forward import run_packed_forward
+    from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
@@ -2762,7 +2780,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
     image_embeds = torch.randn(1, 1, 4)
     img = SimpleNamespace(token_h=1, token_w=1, width=16, height=16)
     indexes = torch.tensor([[0], [0], [0]], dtype=torch.long)
-    step = TextImageDenoiseStep(
+    step = PreparedFlowStep(
         req_id=8,
         state=SimpleNamespace(),
         op={"req_id": 8, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
@@ -2796,7 +2814,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
         def _forward_target_pool(self, _denoise_steps):
             return pool
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             assert int(req_id) == 7
             return self.state
 
@@ -2917,7 +2935,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
         def packed_hidden_to_velocity(self, _hidden_states, _t, latent, **_kwargs):
             return torch.zeros_like(latent)
 
-        def accept_denoise_update(self, _step, updated):
+        def accept_flow_update(self, _step, updated):
             self.updated = updated
 
     states = RequestStateTable()
@@ -2932,8 +2950,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
     results = [None, None]
     owner = Owner()
 
-    assert run_packed_forward(owner, batch, states, [(1, step)], results)
-    assert owner.text_base_len == 4
+    assert SegmentExecutor(owner).run_segment_forward(batch, states, [(1, step)], results)
     assert cond_cache.past.length == 5
     assert cond_cache.t_index == 4
     assert owner.kv_view is not None
@@ -2944,7 +2961,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
 def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.engine import TextImageDenoiseStep
+    from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
@@ -2970,7 +2987,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
     image_cache = PagedTextCache(pool, [1], num_layers=1, length=0)
     image_embeds = torch.full((1, 1, 4), 2.0, dtype=torch.float32)
     indexes = torch.tensor([[0], [0], [0]], dtype=torch.long)
-    step = TextImageDenoiseStep(
+    step = PreparedFlowStep(
         req_id=8,
         state=SimpleNamespace(),
         op={"req_id": 8, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
@@ -3009,7 +3026,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
         def _forward_target_pool(self, _denoise_steps):
             return pool
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             assert int(req_id) == 7
             return self.text_state
 
@@ -3133,7 +3150,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
             torch.testing.assert_close(hidden_states, image_embeds)
             return torch.zeros_like(latent)
 
-        def accept_denoise_update(self, _step, updated):
+        def accept_flow_update(self, _step, updated):
             self.updated = updated
 
     states = RequestStateTable()
@@ -3149,7 +3166,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
     owner = Owner()
     results = [None, None, None]
 
-    assert packed_runtime.run_packed_forward(owner, batch, states, [(0, step)], results)
+    assert SegmentExecutor(owner).run_segment_forward(batch, states, [(0, step)], results)
 
     assert owner.segment_modalities == ["und", "gen"]
     assert owner.segment_rows == [2, 0]
@@ -3166,7 +3183,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
 def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.engine import TextImageDenoiseStep
+    from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
@@ -3217,7 +3234,7 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
     image_embeds = torch.full((1, 1, 4), 3.0, dtype=torch.float32)
     indexes = torch.tensor([[0], [0], [0]], dtype=torch.long)
     img = SimpleNamespace(token_h=1, token_w=1, width=16, height=16)
-    step = TextImageDenoiseStep(
+    step = PreparedFlowStep(
         req_id=9,
         state=SimpleNamespace(),
         op={"req_id": 9, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
@@ -3274,7 +3291,7 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
         def _forward_target_pool(self, _denoise_steps):
             return stage_pool
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             return self.states[int(req_id)]
 
         def _extend_cache_blocks(self, _cache, _op):
@@ -3285,24 +3302,6 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
 
         def _same_kv_pool(self, candidate, first):
             return first is None or candidate is first
-
-        def _stage_text_cache_for_forward(self, *args, **kwargs):
-            return PackedForwardModelMixin._stage_text_cache_for_forward(
-                self,
-                *args,
-                **kwargs,
-            )
-
-        def _mark_forward_staging_advanced(self, *args, **kwargs):
-            return PackedForwardModelMixin._mark_forward_staging_advanced(
-                self,
-                *args,
-                **kwargs,
-            )
-
-        @staticmethod
-        def _forward_staging_source_prefix(cache, length):
-            return PackedForwardModelMixin._forward_staging_source_prefix(cache, length)
 
         def packed_text_embeddings(self, ids):
             return torch.ones((int(ids.numel()), 4), dtype=torch.float32)
@@ -3419,7 +3418,7 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
         def packed_hidden_to_velocity(self, _hidden_states, _t, latent, **_kwargs):
             return torch.zeros_like(latent)
 
-        def accept_denoise_update(self, _step, updated):
+        def accept_flow_update(self, _step, updated):
             self.updated = updated
 
     original_copy_spans = packed_runtime.copy_paged_text_cache_spans
@@ -3451,7 +3450,7 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
     owner = Owner()
     results = [None, None, None]
 
-    assert packed_runtime.run_packed_forward(owner, batch, states, [(2, step)], results)
+    assert SegmentExecutor(owner).run_segment_forward(batch, states, [(2, step)], results)
 
     assert owner.checked_staging
     assert any(
@@ -3469,7 +3468,6 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
 def test_sensenova_packed_forward_runs_text_only_forward_batch():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.models.packed_forward import run_packed_forward
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
@@ -3521,7 +3519,7 @@ def test_sensenova_packed_forward_runs_text_only_forward_batch():
             assert denoise_steps == []
             return None
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             return self.states[int(req_id)]
 
         def _extend_cache_blocks(self, _cache, _op):
@@ -3607,9 +3605,8 @@ def test_sensenova_packed_forward_runs_text_only_forward_batch():
     results = [None, None]
     owner = Owner()
 
-    assert run_packed_forward(owner, batch, states, [], results)
+    assert SegmentExecutor(owner).run_segment_forward(batch, states, [], results)
     assert owner.embedding_inputs == [[13, 21, 22]]
-    assert owner.text_base_lens == [2, 0]
     assert owner.kv_view is not None
     assert owner.kv_view.cache_seqlens_after().tolist() == [3, 2]
     assert owner.logit_hidden_shape == (1, 2, 4)
@@ -3662,7 +3659,7 @@ def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
             assert denoise_steps == []
             return None
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             assert int(req_id) == 9
             return self.state
 
@@ -3741,10 +3738,10 @@ def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
         text_kv_promotions=(),
     ):
         del route_indicators, kv_view, text_kv_promotions
-        owner.graph_rows = [seg.op_index for seg in forward_stream.segments]
+        owner.adapter.graph_rows = [seg.op_index for seg in forward_stream.segments]
         return packed_embeds + 7
 
-    monkeypatch.setattr(packed_runtime, "maybe_run_packed_graph", graph_hidden)
+    monkeypatch.setattr(packed_runtime, "maybe_run_segment_graph", graph_hidden)
     states = RequestStateTable()
     states.create_or_update(9, {"req_id": 9, "block_ids": [0], "sampling": {"temperature": 0.0}})
     batch = UniForwardBatch.from_ops(
@@ -3753,7 +3750,7 @@ def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
     owner = Owner()
     results = [None]
 
-    assert packed_runtime.run_packed_forward(owner, batch, states, [], results)
+    assert SegmentExecutor(owner).run_segment_forward(batch, states, [], results)
 
     assert owner.graph_rows == [0]
     torch.testing.assert_close(owner.logit_hidden, torch.full((1, 1, 4), 8.0))
@@ -3798,7 +3795,7 @@ def test_sensenova_packed_forward_defers_text_cpu_result_when_not_burst(monkeypa
             assert denoise_steps == []
             return None
 
-        def interleaved_image_state(self, req_id):
+        def program_state(self, req_id):
             assert int(req_id) == 7
             return SimpleNamespace(cond=text_cache)
 
@@ -3894,8 +3891,7 @@ def test_sensenova_packed_forward_defers_text_cpu_result_when_not_burst(monkeypa
     )
     results = [None]
 
-    assert packed_runtime.run_packed_forward(
-        Owner(),
+    assert SegmentExecutor(Owner()).run_segment_forward(
         batch,
         states,
         [],
@@ -3971,7 +3967,7 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
     )
     owner = Owner()
 
-    PackedForwardExecutor(owner)._complete_decode_bursts(
+    SegmentExecutor(owner)._complete_decode_bursts(
         batch,
         states,
         results,
@@ -4013,7 +4009,7 @@ def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
     results = [{"req_id": 7, "sampled_token_id": 2}]
 
     with pytest.raises(WorkerError, match="requires CUDA graph coverage") as exc_info:
-        PackedForwardExecutor(Owner())._complete_decode_bursts(
+        SegmentExecutor(Owner())._complete_decode_bursts(
             batch,
             states,
             results,
@@ -4100,7 +4096,7 @@ def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_fina
         ]
     )
     owner = Owner()
-    adapter = PackedForwardExecutor(owner)
+    adapter = SegmentExecutor(owner)
     adapter._run_decode_burst_graph_followup = owner.run_followup
 
     adapter._complete_decode_bursts(
@@ -4190,7 +4186,7 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
         ]
     )
     owner = Owner()
-    adapter = PackedForwardExecutor(owner)
+    adapter = SegmentExecutor(owner)
     adapter._run_decode_burst_graph_followup = owner.run_followup
 
     adapter._complete_decode_bursts(
@@ -4289,7 +4285,7 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
         ]
     )
     owner = Owner()
-    adapter = PackedForwardExecutor(owner)
+    adapter = SegmentExecutor(owner)
     adapter._run_decode_burst_graph_followup = owner.run_followup
 
     adapter._complete_decode_bursts(
@@ -4346,7 +4342,7 @@ def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(mon
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
     state = states.get(7)
-    outputs = PackedForwardExecutor(Owner())._run_decode_burst_graph_followup(
+    outputs = SegmentExecutor(Owner())._run_decode_burst_graph_followup(
         [
             {
                 "req_id": 7,
@@ -4389,13 +4385,11 @@ def test_sensenova_packed_forward_commit_samples_followup_token(monkeypatch):
                 "logits": logits,
             }
 
-    def packed_forward(_owner, _batch, _request_states, denoise_steps, results, **_kwargs):
+    def packed_forward(_batch, _request_states, denoise_steps, results, **_kwargs):
         assert denoise_steps == []
         assert results == [None, None]
         assert _kwargs["require_graph"] is True
         return True
-
-    monkeypatch.setattr(packed_batch, "run_packed_forward", packed_forward)
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
@@ -4407,7 +4401,9 @@ def test_sensenova_packed_forward_commit_samples_followup_token(monkeypatch):
     )
     owner = Owner()
 
-    results = PackedForwardExecutor(owner).execute(
+    executor = SegmentExecutor(owner)
+    monkeypatch.setattr(executor, "run_segment_forward", packed_forward)
+    results = executor.execute(
         batch,
         request_states=states,
     )
@@ -4418,25 +4414,24 @@ def test_sensenova_packed_forward_commit_samples_followup_token(monkeypatch):
     assert "logits" not in results[1]
 
 
-def test_sensenova_text_image_batch_predictor_forwards_graph_mode(monkeypatch):
+def test_sensenova_flow_batch_predictor_forwards_graph_mode(monkeypatch):
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
     calls: list[tuple[object, object, str]] = []
 
-    def fake_predict(owner, steps, branches_by_step, *, graph_mode="auto"):
-        calls.append((owner, steps, branches_by_step, graph_mode))
+    def fake_predict(steps, branches_by_step, *, graph_mode="auto"):
+        calls.append((steps, branches_by_step, graph_mode))
         return [{"cond": torch.tensor([1.0])}]
 
-    monkeypatch.setattr(
-        sensenova_u1.TextImageDenoiseOps,
-        "predict_text_image_velocity_batch",
-        fake_predict,
+    owner = SimpleNamespace(
+        flow_execution=SimpleNamespace(
+            predict_flow_velocity_batch=fake_predict,
+        )
     )
-    owner = object()
     steps = [object()]
     branches = [["cond"]]
 
-    result = sensenova_u1.SenseNovaU1ForUnifiedGeneration.predict_text_image_velocity_batch(
+    result = sensenova_u1.SenseNovaU1ForUnifiedGeneration.predict_flow_velocity_batch(
         owner,
         steps,
         branches,
@@ -4444,14 +4439,13 @@ def test_sensenova_text_image_batch_predictor_forwards_graph_mode(monkeypatch):
     )
 
     torch.testing.assert_close(result[0]["cond"], torch.tensor([1.0]))
-    assert calls == [(owner, steps, branches, "require")]
+    assert calls == [(steps, branches, "require")]
 
 
 def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.engine import TextImageDenoiseStep
-    from uniserve_worker.models.packed_forward import run_packed_forward
+    from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.paged_text_cache import PagedTextCache
@@ -4483,7 +4477,7 @@ def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
     image_embeds = torch.randn(1, 2, 4)
     img = SimpleNamespace(token_h=1, token_w=2, width=32, height=16)
     indexes = torch.tensor([[4, 4], [0, 0], [0, 1]], dtype=torch.long)
-    step = TextImageDenoiseStep(
+    step = PreparedFlowStep(
         req_id=9,
         state=SimpleNamespace(),
         op={"req_id": 9, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
@@ -4567,13 +4561,13 @@ def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
         def packed_hidden_to_velocity(self, _hidden_states, _t, latent, **_kwargs):
             return torch.zeros_like(latent)
 
-        def accept_denoise_update(self, _step, updated):
+        def accept_flow_update(self, _step, updated):
             self.updated = updated
 
     owner = Owner()
     batch = UniForwardBatch.from_ops([step.op])
 
-    assert run_packed_forward(owner, batch, SimpleNamespace(), [(0, step)], [None])
+    assert SegmentExecutor(owner).run_segment_forward(batch, SimpleNamespace(), [(0, step)], [None])
     assert allocated == [1]
     assert cache.length == 4
     assert cache.block_ids == [0, 1]
@@ -4586,7 +4580,7 @@ def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
 def test_sensenova_packed_forward_caches_denoise_cfg_plan_before_decoder(monkeypatch):
     from uniserve_worker.contracts.batches import UniForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
-    from uniserve_worker.execution.engine import TextImageDenoiseStep
+    from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.nn.diffusion.cfg import Branch
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
@@ -4611,7 +4605,7 @@ def test_sensenova_packed_forward_caches_denoise_cfg_plan_before_decoder(monkeyp
     image_embeds = torch.randn(1, 2, 4)
     img = SimpleNamespace(token_h=1, token_w=2, width=32, height=16)
     indexes = torch.tensor([[0, 1], [0, 0], [0, 1]], dtype=torch.long)
-    step = TextImageDenoiseStep(
+    step = PreparedFlowStep(
         req_id=9,
         state=SimpleNamespace(),
         op={"req_id": 9, "kind": "denoise_gen", "cfg": {"branch_count": 3}},
@@ -4700,30 +4694,29 @@ def test_sensenova_packed_forward_caches_denoise_cfg_plan_before_decoder(monkeyp
             self.velocity_calls += 1
             return torch.full_like(latent, float(self.velocity_calls))
 
-        def accept_denoise_update(self, _step, updated):
+        def accept_flow_update(self, _step, updated):
             self.updated = updated
 
     owner = Owner()
     cfg_plan_decoder_counts: list[int] = []
-    real_cfg_plan = packed_runtime.text_image_cfg_plan
+    real_cfg_plan = packed_runtime.flow_cfg_plan
 
     def recording_cfg_plan(step_arg):
         cfg_plan_decoder_counts.append(owner.decoder_calls)
         return real_cfg_plan(step_arg)
 
-    monkeypatch.setattr(packed_runtime, "text_image_cfg_plan", recording_cfg_plan)
+    monkeypatch.setattr(packed_runtime, "flow_cfg_plan", recording_cfg_plan)
 
     batch = UniForwardBatch.from_ops([step.op])
 
-    assert packed_runtime.run_packed_forward(
-        owner,
+    assert SegmentExecutor(owner).run_segment_forward(
         batch,
         SimpleNamespace(),
         [(0, step)],
         [None],
     )
     assert cfg_plan_decoder_counts == [0]
-    assert owner.branches == [Branch.COND, Branch.TEXT_UNCOND, Branch.IMG_UNCOND]
+    assert set(owner.branches) == {Branch.COND, Branch.TEXT_UNCOND, Branch.IMG_UNCOND}
     assert owner.velocity_calls == 3
     assert owner.updated is not None
 

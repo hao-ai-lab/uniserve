@@ -66,9 +66,7 @@ class VisiblePolicyKind(str, Enum):
         """Per-token visible key extent for this policy."""
 
         if self is VisiblePolicyKind.causal:
-            return prefix_len + torch.arange(
-                1, q_len + 1, dtype=torch.int32, device=device
-            )
+            return prefix_len + torch.arange(1, q_len + 1, dtype=torch.int32, device=device)
         return torch.full((q_len,), prefix_len + q_len, dtype=torch.int32, device=device)
 
 
@@ -114,7 +112,7 @@ class ForwardPagedKVSegment:
     block_ids: tuple[int, ...]
     base_len: int
     q_len: int
-    # Physical write flag for the current forward span. Denoise rows use this as
+    # Physical write flag for the current forward span. Flow rows use this as
     # a transient in-pool staging write so visible-end attention can see current
     # image-token K/V without making those tokens part of the persistent cache.
     write_kv: bool = True
@@ -245,10 +243,7 @@ class ForwardPagedKVView:
     ) -> torch.Tensor:
         return self._cached_int_vector(
             self._persistent_cache_seqlens_after_cache,
-            (
-                seg.base_len + seg.q_len if seg.persist_kv else seg.base_len
-                for seg in self.segments
-            ),
+            (seg.base_len + seg.q_len if seg.persist_kv else seg.base_len for seg in self.segments),
             device=device,
         )
 
@@ -329,7 +324,9 @@ class ForwardPagedKVView:
                 position = int(seg.base_len) + local
                 block_slot = position // self.pool.block_size
                 if block_slot >= len(seg.block_ids):
-                    raise invalid_descriptor("forward paged segment blocks do not cover current append")
+                    raise invalid_descriptor(
+                        "forward paged segment blocks do not cover current append"
+                    )
                 page_ids.append(int(seg.block_ids[block_slot]))
                 offsets.append(position % self.pool.block_size)
                 token_indices.append(flat + local)
@@ -425,10 +422,18 @@ class ForwardGraphStreamState:
             bool(stream.fully_visible),
             None
             if stream.und_indices is None
-            else (tuple(stream.und_indices.shape), str(stream.und_indices.dtype), str(stream.und_indices.device)),
+            else (
+                tuple(stream.und_indices.shape),
+                str(stream.und_indices.dtype),
+                str(stream.und_indices.device),
+            ),
             None
             if stream.gen_indices is None
-            else (tuple(stream.gen_indices.shape), str(stream.gen_indices.dtype), str(stream.gen_indices.device)),
+            else (
+                tuple(stream.gen_indices.shape),
+                str(stream.gen_indices.dtype),
+                str(stream.gen_indices.device),
+            ),
         )
 
 
@@ -451,9 +456,7 @@ class ForwardGraphPagedKVView:
             raise invalid_descriptor("forward graph paged KV view device must match the pool")
         required_block_width = max(len(seg.block_ids) for seg in self.segments)
         self._block_width = (
-            required_block_width
-            if block_width_capacity is None
-            else int(block_width_capacity)
+            required_block_width if block_width_capacity is None else int(block_width_capacity)
         )
         if self._block_width < required_block_width or self._block_width > int(pool.num_blocks):
             raise invalid_descriptor("forward graph paged KV block-table capacity is invalid")
@@ -471,12 +474,8 @@ class ForwardGraphPagedKVView:
             segment_count,
             self._block_width,
         )
-        self._cache_seqlens_before = self._int32_inputs[
-            cache_before_start:cache_after_start
-        ]
-        self._cache_seqlens_after = self._int32_inputs[
-            cache_after_start:persistent_after_start
-        ]
+        self._cache_seqlens_before = self._int32_inputs[cache_before_start:cache_after_start]
+        self._cache_seqlens_after = self._int32_inputs[cache_after_start:persistent_after_start]
         self._persistent_cache_seqlens_after = self._int32_inputs[
             persistent_after_start:cu_after_start
         ]
@@ -736,7 +735,9 @@ class ForwardGraphPagedKVView:
                 position = int(seg.base_len) + local
                 block_slot = position // self.pool.block_size
                 if block_slot >= len(seg.block_ids):
-                    raise invalid_descriptor("forward paged segment blocks do not cover current append")
+                    raise invalid_descriptor(
+                        "forward paged segment blocks do not cover current append"
+                    )
                 page_ids.append(int(seg.block_ids[block_slot]))
                 offsets.append(position % self.pool.block_size)
         return page_ids, offsets
@@ -796,7 +797,9 @@ class ForwardStreamBuilder:
         if indexes is not None and tuple(indexes.shape) != (3, q_len):
             raise invalid_descriptor("forward segment indexes must be shaped [3, q_len]")
         if indexes is not None and index_start is not None:
-            raise invalid_descriptor("forward segment index_start is only valid for generated indexes")
+            raise invalid_descriptor(
+                "forward segment index_start is only valid for generated indexes"
+            )
         if visible_policy not in VisiblePolicyKind.__members__:
             raise invalid_descriptor(f"unknown forward visible policy {visible_policy!r}")
         self._segments.append(
@@ -820,8 +823,10 @@ class ForwardStreamBuilder:
         if not self._segments:
             raise invalid_descriptor("forward stream requires at least one segment")
         first_index = next((seg.indexes for seg in self._segments if seg.indexes is not None), None)
-        target_device = torch.device(device) if device is not None else (
-            first_index.device if first_index is not None else torch.device("cpu")
+        target_device = (
+            torch.device(device)
+            if device is not None
+            else (first_index.device if first_index is not None else torch.device("cpu"))
         )
         max_q = max(seg.q_len for seg in self._segments)
         cu_q = [0]
@@ -849,7 +854,9 @@ class ForwardStreamBuilder:
             target_indices.extend(range(token_start, token_start + seg.q_len))
             policy = VisiblePolicyKind(seg.visible_policy)
             if policy is VisiblePolicyKind.causal:
-                visible_values.extend(int(seg.prefix_len) + offset + 1 for offset in range(seg.q_len))
+                visible_values.extend(
+                    int(seg.prefix_len) + offset + 1 for offset in range(seg.q_len)
+                )
             else:
                 visible_values.extend([int(seg.prefix_len) + int(seg.q_len)] * int(seg.q_len))
             visible_values.extend([0] * (max_q - int(seg.q_len)))
@@ -885,7 +892,7 @@ def build_text_position_indexes(
 
     Row 0 is the contiguous ``[start, start + length)`` temporal position; the
     height/width rows are zero because text tokens carry no spatial position.
-    Shared by the forward-stream side-table and the interleaved text caches.
+    Shared by the forward-stream side table and sequence caches.
     """
     t = torch.arange(start, start + length, dtype=torch.long, device=device)
     zeros = torch.zeros(length, dtype=torch.long, device=device)

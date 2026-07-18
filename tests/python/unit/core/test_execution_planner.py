@@ -1,9 +1,5 @@
-"""Runner-owned execution grouping (plan §6.7/§10.8, DoD 8).
+"""Runner-owned execution grouping derived from each model's ``BatchPolicy``."""
 
-The previous driver-side planner is gone: grouping is a `ModelRunner` responsibility
-derived from each model's `BatchPolicy`, and every model still receives typed
-single-mode `UniForwardBatch` values.
-"""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -22,7 +18,7 @@ from uniserve_worker.execution.engine import (
     RunnerConfig,
     text_input_id_replacements_from_relays,
 )
-from uniserve_worker.execution.graph.path import Batch, Denoise, Segment
+from uniserve_worker.execution.graph.path import Batch, Flow, Segment
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.runtime.request_state import RequestStateTable
@@ -143,8 +139,10 @@ def _cpu_pool_runner(model):
 
 
 def ops(*kinds: str) -> list[dict[str, Any]]:
-    return [{"req_id": i + 1, "kind": kind, "token_ids": [101 + i], "pos_range": [i, i + 1]}
-            for i, kind in enumerate(kinds)]
+    return [
+        {"req_id": i + 1, "kind": kind, "token_ids": [101 + i], "pos_range": [i, i + 1]}
+        for i, kind in enumerate(kinds)
+    ]
 
 
 def execute(model: RecordingModel, submitted_ops: list[dict[str, Any]]) -> dict[str, Any]:
@@ -274,7 +272,7 @@ def test_text_extend_decode_route_prefers_whole_batch_forward_over_legacy_hook()
     assert model.forward_calls == []
 
 
-def test_runner_registers_batch_path_before_general_segment_path(monkeypatch):
+def test_runner_dispatches_sequence_specialization_before_general_segment(monkeypatch):
     class Model(ModelHooks):
         device = "cpu"
 
@@ -297,7 +295,7 @@ def test_runner_registers_batch_path_before_general_segment_path(monkeypatch):
     assert [type(path) for path in runner.forward_graph_runner.paths] == [
         Batch,
         Segment,
-        Denoise,
+        Flow,
     ]
     batch_path = runner.forward_graph_runner.paths[0]
     assert batch_path.driver is runner.text_driver
@@ -373,9 +371,7 @@ def test_system_speculative_verify_runs_over_thin_model_forward():
 
     # The model's verify logits fix the argmax at 7 for every position, so both
     # draft 7s are accepted and the sampled continuation is 7.
-    assert result["per_seq"] == [
-        {"req_id": 1, "sampled_token_id": 7, "num_accepted_tokens": 2}
-    ]
+    assert result["per_seq"] == [{"req_id": 1, "sampled_token_id": 7, "num_accepted_tokens": 2}]
     assert runner.request_states.get(1).decode_relay.token_id == 7
 
 
@@ -414,9 +410,7 @@ def test_per_op_decode_consumes_last_sampled_relay_token(monkeypatch):
         {
             "step_id": 1,
             "new_reqs": [{"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}}],
-            "ops": [
-                {"req_id": 1, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}
-            ],
+            "ops": [{"req_id": 1, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}],
         }
     )
     # The sampled token (7) was kept on device; the next step reads it via the
@@ -544,7 +538,9 @@ def test_text_forward_batch_tracks_padded_token_bucket_contract():
     assert built.num_token_non_padded == 3
     assert built.padded_num_tokens == 6
     assert built.has_padding
-    torch.testing.assert_close(built.input_ids, torch.tensor([10, 11, 12, 0, 0, 0], dtype=torch.long))
+    torch.testing.assert_close(
+        built.input_ids, torch.tensor([10, 11, 12, 0, 0, 0], dtype=torch.long)
+    )
     torch.testing.assert_close(built.positions, torch.tensor([4, 5, 9, 0, 0, 0], dtype=torch.long))
     torch.testing.assert_close(built.extend_start_loc, torch.tensor([0, 2], dtype=torch.long))
     torch.testing.assert_close(built.last_token_indices, torch.tensor([1, 2], dtype=torch.long))
@@ -653,7 +649,12 @@ def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
             "step_id": 7,
             "new_reqs": [{"req_id": 1, "block_ids": []}, {"req_id": 2, "block_ids": []}],
             "ops": [
-                {"req_id": 1, "kind": "prefill_und", "token_ids": [11, 12, 13], "pos_range": [0, 3]},
+                {
+                    "req_id": 1,
+                    "kind": "prefill_und",
+                    "token_ids": [11, 12, 13],
+                    "pos_range": [0, 3],
+                },
                 {
                     "req_id": 2,
                     "kind": "denoise_gen",

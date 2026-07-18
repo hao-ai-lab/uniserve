@@ -6,13 +6,14 @@ token sequences to the sequential loop, ``last_sampled`` relay ops after the
 first step, and exactly one speculative forward (whose input is the stop
 token) when a stop token ends the burst early.
 """
+
 from __future__ import annotations
 
 import torch
 
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.execution.engine import ModelRunner, RunnerConfig
-from uniserve_worker.models.interleaved_text import resolve_op_token_ids
+from uniserve_worker.execution.sequence import resolve_op_token_ids
 
 
 class _ScriptedTextModel(ModelHooks):
@@ -145,7 +146,13 @@ def test_relay_started_burst_continues_from_the_previous_burst_tail():
     assert first["sampled_token_ids"] == [5, 6, 8]
     assert second["sampled_token_ids"] == [9, 10]
     assert model.seen_tokens == [[11], [5], [6], [8], [9]]
-    assert model.seen_sources == ["wire", "last_sampled", "last_sampled", "last_sampled", "last_sampled"]
+    assert model.seen_sources == [
+        "wire",
+        "last_sampled",
+        "last_sampled",
+        "last_sampled",
+        "last_sampled",
+    ]
 
 
 def test_multi_row_burst_returns_token_lists_for_each_row():

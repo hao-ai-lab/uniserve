@@ -1,4 +1,5 @@
-"""SenseNova understanding-input contract: preprocessing + patch-block ingest."""
+"""Image preprocessing and sequence-cache ingestion contracts."""
+
 from __future__ import annotations
 
 import base64
@@ -9,8 +10,9 @@ import pytest
 import torch
 from PIL import Image
 
-from uniserve_worker.models.interleaved_text import TextCache
-from uniserve_worker.models.sensenova.interleave_runtime import InputImageIngestDriver
+from uniserve_worker.execution.products import ImageEncoder
+from uniserve_worker.execution.sequence import SequenceCache
+from uniserve_worker.nn.vision import build_abs_positions_from_grid_hw
 from uniserve_worker.processors import get_processor_for_model
 from uniserve_worker.processors.sensenova import (
     SENSENOVA_IMAGE_GEOMETRY,
@@ -21,7 +23,7 @@ from uniserve_worker.runtime.residency import encoder_handle_from_mm_hash
 
 
 def _reference_smart_resize(height, width, factor=32, min_pixels=512 * 512, max_pixels=2048 * 2048):
-    """Reference pipeline formula (vLLM-Omni ``_smart_resize``), kept verbatim."""
+    """Independent resize formula used to validate image geometry."""
     if max(height, width) / min(height, width) > 200:
         raise ValueError("aspect")
     h_bar = max(factor, round(height / factor) * factor)
@@ -54,7 +56,9 @@ def test_smart_resize_matches_reference(height, width):
 
 def test_understanding_patch_geometry():
     processor = SenseNovaImageProcessor()
-    flattened, grid_hw = processor.understanding_patches(Image.new("RGB", (1000, 700), (10, 20, 30)))
+    flattened, grid_hw = processor.understanding_patches(
+        Image.new("RGB", (1000, 700), (10, 20, 30))
+    )
     grid_h, grid_w = (int(v) for v in grid_hw[0])
     # 700x1000 rounds to 704x992 at factor 32.
     assert (grid_h, grid_w) == (44, 62)
@@ -100,7 +104,7 @@ class _FakeOutputs:
 
 
 class _FakeOwner:
-    """Minimal InputImageIngestOwner double recording the forward call."""
+    """Minimal ImageEncodeAdapter double recording the forward call."""
 
     device = "cpu"
     hidden = 8
@@ -109,17 +113,21 @@ class _FakeOwner:
         self.calls: list[dict] = []
         self.feature_calls = 0
 
-    def interleaved_image_features(self, image_input, *, grid_hw, gen_model=False):
+    def image_features(self, image_input, *, grid_hw, gen_model=False):
         assert not gen_model
         self.feature_calls += 1
         merge = 2
         tokens = int(grid_hw[0, 0]) * int(grid_hw[0, 1]) // (merge * merge)
         return torch.zeros(tokens, self.hidden)
 
-    def interleaved_image_downsample_ratio(self) -> float:
-        return 0.5
+    def sequence_position_indexes(self, grid_hw, temporal_indexes):
+        abs_w, abs_h = build_abs_positions_from_grid_hw(
+            grid_hw[:1] // 2,
+            device=temporal_indexes.device,
+        )
+        return torch.stack((temporal_indexes, abs_h, abs_w), dim=0)
 
-    def interleaved_text_forward(self, **kwargs):
+    def sequence_forward(self, **kwargs):
         self.calls.append(kwargs)
         past = kwargs["past_key_values"]
         past.appended += kwargs["inputs_embeds"].shape[1]
@@ -128,8 +136,8 @@ class _FakeOwner:
 
 def test_ingest_appends_patch_block_at_shared_t_index():
     owner = _FakeOwner()
-    driver = InputImageIngestDriver(owner)
-    cache = TextCache()
+    driver = ImageEncoder(owner)
+    cache = SequenceCache()
     cache.past = _FakePast()
     cache.t_index = 11
 
@@ -152,20 +160,23 @@ def test_ingest_appends_patch_block_at_shared_t_index():
 
 def test_reusable_embeddings_attach_to_each_request_cache_without_reencoding():
     owner = _FakeOwner()
-    driver = InputImageIngestDriver(owner)
+    driver = ImageEncoder(owner)
     grid_hw = torch.tensor([[4, 6]])
     flattened = torch.zeros(24, 3 * 16 * 16)
     embeddings = driver.encode_understanding_image(flattened, grid_hw)
 
     for t_index in (3, 9):
-        cache = TextCache()
+        cache = SequenceCache()
         cache.past = _FakePast()
-        assert driver.ingest_understanding_embeddings(
-            cache,
-            embeddings,
-            grid_hw,
-            t_index=t_index,
-        ) == 6
+        assert (
+            driver.ingest_understanding_embeddings(
+                cache,
+                embeddings,
+                grid_hw,
+                t_index=t_index,
+            )
+            == 6
+        )
         assert cache.t_index == t_index
 
     assert owner.feature_calls == 1

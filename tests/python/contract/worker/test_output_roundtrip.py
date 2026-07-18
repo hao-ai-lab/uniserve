@@ -7,6 +7,7 @@ via ``to_seq_result()``, then validated against the per-op-kind schema published
 in ``contracts.op_kinds`` through ``validate_seq_result(seq_result, op, index)``.
 A passing validation means the serialized dict is wire-legal for that op kind.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -27,8 +28,8 @@ from uniserve_worker.contracts.op_kinds import (
 )
 from uniserve_worker.contracts.outputs import (
     CommitOutput,
-    DenoiseOutput,
     EncodeOutput,
+    FlowOutput,
     FrameOutput,
     TextTokenOutput,
 )
@@ -104,7 +105,7 @@ def test_text_token_output_omits_absent_optional_fields():
 
 def test_denoise_output_roundtrips_and_validates():
     """denoise_done + num_steps_done satisfy the denoise_gen schema."""
-    output = DenoiseOutput(req_id=2, denoise_done=True, num_steps_done=3)
+    output = FlowOutput(req_id=2, denoise_done=True, num_steps_done=3)
 
     seq_result = output.to_seq_result()
 

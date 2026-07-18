@@ -67,9 +67,7 @@ def _capacity(**overrides) -> GraphCapacity:
         candidate_tokens=8,
         position_axes=3,
         visibility_payload_entries=0,
-        residency=ResidencyBatchCapacity(
-            bindings=6, page_references=64, tokens=128
-        ),
+        residency=ResidencyBatchCapacity(bindings=6, page_references=64, tokens=128),
     )
     values.update(overrides)
     return GraphCapacity(**values)
@@ -104,9 +102,7 @@ def _publish_latent(residency: Residency, rows: int) -> ProductLease:
                 RowDemand(
                     row_id=0,
                     bindings=(),
-                    products=(
-                        ProductDemand(schema_id=7, rows=rows, producer=_SESSION),
-                    ),
+                    products=(ProductDemand(schema_id=7, rows=rows, producer=_SESSION),),
                 ),
             )
         )
@@ -135,9 +131,10 @@ def test_qwen3_extend_and_verification_stack_one_sequence():
     assert [segment.query_count for segment in lowered.segments] == [3, 2]
     assert [segment.context_length for segment in lowered.segments] == [0, 3]
     assert [segment.candidate_count for segment in lowered.segments] == [0, 2]
-    assert [
-        segment.cache_effect for segment in lowered.segments
-    ] == [CacheEffect.PERSISTENT_APPEND, CacheEffect.TENTATIVE_APPEND]
+    assert [segment.cache_effect for segment in lowered.segments] == [
+        CacheEffect.PERSISTENT_APPEND,
+        CacheEffect.TENTATIVE_APPEND,
+    ]
     assert lowered.tokens == 5
 
     capacity = _capacity()
@@ -145,9 +142,7 @@ def test_qwen3_extend_and_verification_stack_one_sequence():
     table.validate(capacity)
 
     reservation = residency.reserve(lowered.plan)
-    arrays = reservation.batch_arrays(
-        capacity.residency, lowered.write_token_begins
-    )
+    arrays = reservation.batch_arrays(capacity.residency, lowered.write_token_begins)
     arrays.validate(capacity.residency, page_tokens=16)
     # Text rows commit fully; one accepted candidate publishes one more row.
     reservation.commit((3, 1))
@@ -189,8 +184,7 @@ def test_sensenova_flow_lowers_one_segment_per_cfg_branch():
     assert [segment.branch_id for segment in lowered.segments] == [0, 1, 2]
     assert all(segment.branch_count == 3 for segment in lowered.segments)
     assert all(
-        segment.cache_effect is CacheEffect.TRANSIENT_OVERLAY
-        for segment in lowered.segments
+        segment.cache_effect is CacheEffect.TRANSIENT_OVERLAY for segment in lowered.segments
     )
     assert lowered.tokens == 96
 
@@ -199,11 +193,9 @@ def test_sensenova_flow_lowers_one_segment_per_cfg_branch():
     table.validate(capacity)
 
     reservation = residency.reserve(lowered.plan)
-    arrays = reservation.batch_arrays(
-        capacity.residency, lowered.write_token_begins
-    )
+    arrays = reservation.batch_arrays(capacity.residency, lowered.write_token_begins)
     arrays.validate(capacity.residency, page_tokens=16)
-    # Denoise commits zero rows everywhere; overlay pages return.
+    # Flow commits zero rows everywhere; overlay pages return.
     free_before = residency.pressure()[1]["free_pages"]
     reservation.commit((0, 0, 0))
     assert residency.pressure()[1]["free_pages"] == free_before + 6
@@ -287,6 +279,4 @@ def test_operation_tags_without_regions_fail_closed():
             ),
             _QWEN3,
         )
-    assert OperationTag.FLOW_STEP not in {
-        region.operation_tag for region in _QWEN3.schema.regions
-    }
+    assert OperationTag.FLOW_STEP not in {region.operation_tag for region in _QWEN3.schema.regions}

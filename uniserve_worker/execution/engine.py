@@ -72,7 +72,6 @@ from uniserve_worker.contracts.execution import (
     ExecuteResult,
     ExecuteRow,
     ExecutionContractError,
-    FlowStep,
     MaterializeStep,
     OperationTag,
     Quiesce,
@@ -85,6 +84,9 @@ from uniserve_worker.contracts.execution import (
     canonical_payload_fingerprint,
     operation_tag,
     validate_execute_batch,
+)
+from uniserve_worker.contracts.execution import (
+    FlowStep as FlowOperation,
 )
 from uniserve_worker.contracts.forward_batch import (
     BranchSpec,
@@ -132,13 +134,13 @@ from uniserve_worker.contracts.forward_context import (
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.contracts.model_protocols import DenoiseContext, ModelHooks, UniModel
+from uniserve_worker.contracts.model_protocols import FlowContext, ModelHooks, UniModel
 from uniserve_worker.contracts.op_kinds import TARGET_VERIFY_UND, VAE_ENCODE, VIT_ENCODE
 from uniserve_worker.contracts.outputs import (
     CommitOutput,
     DeferredForwardOutput,
-    DenoiseOutput,
     EncodeOutput,
+    FlowOutput,
     ForwardOutput,
     ForwardOutputBase,
     TextTokenOutput,
@@ -159,7 +161,7 @@ from uniserve_worker.nn.diffusion import (
     init_latent,
     x_pred_to_velocity,
 )
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_text_image_cfg_plan
+from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
 from uniserve_worker.nn.diffusion.cfg import CfgPlan as DiffusionCfgPlan
 from uniserve_worker.nn.sampler import (
     DeferredBatchedSamplingResult,
@@ -203,20 +205,18 @@ if TYPE_CHECKING:
     from uniserve_worker.contracts.batches import TextBatch, UniForwardBatch
     from uniserve_worker.contracts.forward_batch import ForwardBatch, ForwardGraphPolicy
     from uniserve_worker.contracts.forward_stats import ForwardStats
-    from uniserve_worker.contracts.model_protocols import DenoiseCapable
+    from uniserve_worker.contracts.model_protocols import FlowCapable
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.request_state import RequestState, RequestStateTable
     from uniserve_worker.runtime.residency import ResidencyManager
 
 """Transactional ``ExecutionEngine``: one data plane with exact retry.
 
-Stage 8 of ``specs/unified_forward_execution.md``. This section owns the
-transaction semantics the spec fixes — engine lifecycle state, the fixed
-replay window with `(engine_epoch, step_id)` identity and canonical payload
-fingerprints, cumulative acknowledgement eviction, exactly-once duplicate
-handling, exact session resolution and provisional admission, atomic
-session-delta commit, typed retryable errors, the closed administrative seam,
-and epoch poisoning.
+This section owns engine lifecycle state, the fixed replay window with
+`(engine_epoch, step_id)` identity and canonical payload fingerprints,
+cumulative acknowledgement eviction, exactly-once duplicate handling, exact
+session resolution and provisional admission, atomic session-delta commit,
+typed retryable errors, the closed administrative seam, and epoch poisoning.
 
 The model-backed half — residency reservation, graph refresh, one replay,
 finalization against device results — sits behind one internal
@@ -224,7 +224,7 @@ finalization against device results — sits behind one internal
 capacity-only graph runtime by :class:`StandardTransactionExecutor` and the
 rank fan-out executor below.
 
-Semantics enforced here, straight from the spec:
+Semantics enforced here:
 
 * Execution identity is ``(engine_epoch, step_id)``; the canonical payload
   fingerprint excludes cumulative acknowledgement, so a retry may advance
@@ -240,7 +240,6 @@ Semantics enforced here, straight from the spec:
 * One logical engine owns one unresolved transaction at a time.
 * Commands execute only at a transaction boundary.
 """
-
 
 
 __all__ = [
@@ -340,9 +339,7 @@ class _Receipt:
     def result(self) -> ExecuteResult:
         record = self._engine._records.get(self._step_id)
         if record is None or record.result is None:
-            raise EngineExecutionError(
-                f"step {self._step_id} has no durable result in the window"
-            )
+            raise EngineExecutionError(f"step {self._step_id} has no durable result in the window")
         return record.result
 
 
@@ -390,21 +387,16 @@ class ExecutionEngine:
         self._require_state(EngineState.READY)
         if batch.engine_epoch != self.engine.engine_epoch:
             raise ExecutionContractError(
-                f"batch names epoch {batch.engine_epoch}; engine is "
-                f"{self.engine.engine_epoch}"
+                f"batch names epoch {batch.engine_epoch}; engine is {self.engine.engine_epoch}"
             )
         if batch.acknowledged_through >= batch.step_id:
-            raise ExecutionContractError(
-                "a batch cannot acknowledge its own or a future step"
-            )
+            raise ExecutionContractError("a batch cannot acknowledge its own or a future step")
         self._apply_acknowledgement(batch.acknowledged_through)
         retained = self._records.get(batch.step_id)
         if retained is not None:
             fingerprint = canonical_payload_fingerprint(batch)
             if fingerprint != retained.fingerprint:
-                self._poison(
-                    f"step {batch.step_id} retried with a conflicting payload"
-                )
+                self._poison(f"step {batch.step_id} retried with a conflicting payload")
             return _Receipt(self, batch.step_id)
         if batch.step_id <= self._acknowledged_through:
             raise StaleStep(
@@ -412,17 +404,11 @@ class ExecutionEngine:
                 f"{self._acknowledged_through} and cannot re-execute"
             )
         if batch.step_id != self._next_step:
-            raise StaleStep(
-                f"first unseen step must be {self._next_step}; got {batch.step_id}"
-            )
+            raise StaleStep(f"first unseen step must be {self._next_step}; got {batch.step_id}")
         if self._unresolved_step is not None:
-            raise EngineBackpressure(
-                f"transaction {self._unresolved_step} is still unresolved"
-            )
+            raise EngineBackpressure(f"transaction {self._unresolved_step} is still unresolved")
         if len(self._records) >= self._window_capacity:
-            raise EngineBackpressure(
-                "replay window is full; acknowledge completed steps first"
-            )
+            raise EngineBackpressure("replay window is full; acknowledge completed steps first")
         # Pre-launch phase: every failure through prepare() is noncommitted
         # and leaves no record, so the scheduler may retry the same step
         # after correction (or after backpressure clears).
@@ -464,11 +450,7 @@ class ExecutionEngine:
             raise EngineBackpressure("commands execute at transaction boundaries")
         if isinstance(command, DropSession):
             outcome = self.sessions.drop(command)
-            return (
-                AdminOutcome.APPLIED
-                if outcome is DropOutcome.DROPPED
-                else AdminOutcome.STALE
-            )
+            return AdminOutcome.APPLIED if outcome is DropOutcome.DROPPED else AdminOutcome.STALE
         if isinstance(command, Quiesce):
             self._state = EngineState.QUIESCED
             return AdminOutcome.APPLIED
@@ -476,8 +458,7 @@ class ExecutionEngine:
             if self._state is EngineState.QUIESCED:
                 self._state = EngineState.READY
             return AdminOutcome.APPLIED
-        # Residency-backed commands (lease release, residency copy, prefix
-        # reset, overlays) activate with Stage 3; the union stays closed.
+        # This engine instance has no residency-backed command executor.
         return AdminOutcome.UNSUPPORTED
 
     @property
@@ -533,14 +514,10 @@ class ExecutionEngine:
         provisional: dict[int, RequestSession],
     ) -> ExecuteResult:
         if len(row_results) != len(batch.rows) or len(deltas) != len(batch.rows):
-            raise ExecutionContractError(
-                "executor must return one result and one delta per row"
-            )
+            raise ExecutionContractError("executor must return one result and one delta per row")
         for index, (row, result) in enumerate(zip(batch.rows, row_results)):
             if result.row_id != index:
-                raise ExecutionContractError(
-                    f"row result {index} is out of scheduler order"
-                )
+                raise ExecutionContractError(f"row result {index} is out of scheduler order")
             if (
                 result.request_id != row.session.request_id
                 or result.incarnation != row.session.incarnation
@@ -566,6 +543,7 @@ class ExecutionEngine:
 # ---------------------
 # Schema-driven lowering: typed rows to segment tables and reservations
 # ---------------------
+
 
 class LoweringError(ValueError):
     """A row cannot be lowered under the family's closed cache schema."""
@@ -661,8 +639,7 @@ class LoweredBatch:
         if len(self.segments) > capacity.segments:
             raise LoweringError("transaction exceeds the bucket segment capacity")
         columns: dict[str, list[int]] = {
-            name: [0] * capacity.segments
-            for name in SegmentTableArrays.__dataclass_fields__
+            name: [0] * capacity.segments for name in SegmentTableArrays.__dataclass_fields__
         }
         token_cursor = 0
         for index, segment in enumerate(self.segments):
@@ -684,9 +661,7 @@ class LoweredBatch:
             columns["kv_group"][index] = segment.kv_group
             columns["kv_read_index"][index] = segment.binding_index
             columns["kv_write_index"][index] = (
-                segment.binding_index
-                if segment.cache_effect is not CacheEffect.READ_ONLY
-                else 0
+                segment.binding_index if segment.cache_effect is not CacheEffect.READ_ONLY else 0
             )
             columns["cache_effect"][index] = int(segment.cache_effect)
             columns["cache_write_count"][index] = segment.cache_write_count
@@ -707,9 +682,7 @@ def lower_rows(
 ) -> LoweredBatch:
     """Lower one transaction's rows under the family's closed cache schema."""
 
-    domain_by_role = {
-        role.role_id: role.domain_id for role in registration.schema.roles
-    }
+    domain_by_role = {role.role_id: role.domain_id for role in registration.schema.roles}
     segments: list[LoweredSegment] = []
     demands: list[RowDemand] = []
     write_token_begins: list[int] = []
@@ -724,15 +697,9 @@ def lower_rows(
     for row, roles in rows:
         operands = _operand_values(row)
         tag = operation_tag(row.operation)
-        regions = [
-            region
-            for region in registration.schema.regions
-            if region.operation_tag is tag
-        ]
+        regions = [region for region in registration.schema.regions if region.operation_tag is tag]
         if not regions:
-            raise LoweringError(
-                f"row {row.row_id}: the family schema lowers no {tag.name} regions"
-            )
+            raise LoweringError(f"row {row.row_id}: the family schema lowers no {tag.name} regions")
         bindings: list[SequenceBinding] = []
         stacked_rows: dict[int, int] = {}
         emitted = 0
@@ -796,14 +763,10 @@ def lower_rows(
                             binding_index=binding_index,
                             cache_effect=region.cache_effect,
                             cache_write_count=(
-                                extent
-                                if region.cache_effect is not CacheEffect.READ_ONLY
-                                else 0
+                                extent if region.cache_effect is not CacheEffect.READ_ONLY else 0
                             ),
                             branch_id=branch_id if len(instances) > 1 else 0,
-                            branch_count=(
-                                len(instances) if len(instances) > 1 else 0
-                            ),
+                            branch_count=(len(instances) if len(instances) > 1 else 0),
                             candidate_count=extent if is_tentative else 0,
                             result_slot=row.row_id,
                         )
@@ -821,17 +784,13 @@ def lower_rows(
                 positions.extend(region_positions)
                 token_cursor += query_rows
         if emitted == 0:
-            raise LoweringError(
-                f"row {row.row_id}: no region evaluates to any query rows"
-            )
+            raise LoweringError(f"row {row.row_id}: no region evaluates to any query rows")
         demands.append(
             RowDemand(
                 row_id=row.row_id,
                 bindings=tuple(bindings),
                 products=_published_products(row, operands),
-                input_products=tuple(
-                    lease.lease_id for lease in row.product_leases
-                ),
+                input_products=tuple(lease.lease_id for lease in row.product_leases),
             )
         )
     return LoweredBatch(
@@ -855,9 +814,7 @@ def select_capacity(
 ) -> GraphCapacity:
     """Smallest configured capacity that dominates the demand (spec rule)."""
 
-    dominating = [
-        capacity for capacity in capacities if capacity.dominates(demand)
-    ]
+    dominating = [capacity for capacity in capacities if capacity.dominates(demand)]
     if not dominating:
         raise LoweringError("no configured graph capacity dominates the demand")
     return min(
@@ -886,22 +843,17 @@ def _operand_values(row: ExecuteRow) -> dict[ExtentOperand, int]:
     if isinstance(operation, SequenceStep):
         values[ExtentOperand.INPUT_TOKEN_COUNT] = len(operation.input_tokens)
         if operation.verification is not None:
-            values[ExtentOperand.CANDIDATE_COUNT] = len(
-                operation.verification.candidate_tokens
-            )
+            values[ExtentOperand.CANDIDATE_COUNT] = len(operation.verification.candidate_tokens)
         if row.product_leases:
             # Generated-image feedback appends an explicitly encoded region:
             # a sequence row carrying exactly one conditioning product lends
             # that product's extent to the image-token operand.
             if len(row.product_leases) != 1:
                 raise LoweringError(
-                    f"row {row.row_id}: sequence rows carry at most one "
-                    "conditioning product"
+                    f"row {row.row_id}: sequence rows carry at most one conditioning product"
                 )
-            values[ExtentOperand.IMAGE_TOKEN_COUNT] = row.product_leases[
-                0
-            ].extent_rows
-    elif isinstance(operation, FlowStep):
+            values[ExtentOperand.IMAGE_TOKEN_COUNT] = row.product_leases[0].extent_rows
+    elif isinstance(operation, FlowOperation):
         values[ExtentOperand.CFG_BRANCH_COUNT] = len(operation.branch_coefficients)
         extent = _product_extent(row, operation.input_product)
         values[ExtentOperand.IMAGE_TOKEN_COUNT] = extent
@@ -911,9 +863,7 @@ def _operand_values(row: ExecuteRow) -> dict[ExtentOperand, int]:
         values[ExtentOperand.IMAGE_TOKEN_COUNT] = tokens
         values[ExtentOperand.PRODUCT_ROW_COUNT] = tokens
     elif isinstance(operation, MaterializeStep):
-        values[ExtentOperand.PRODUCT_ROW_COUNT] = _product_extent(
-            row, operation.input_product
-        )
+        values[ExtentOperand.PRODUCT_ROW_COUNT] = _product_extent(row, operation.input_product)
     return values
 
 
@@ -978,9 +928,7 @@ def _product_extent(row: ExecuteRow, lease_id: int) -> int:
     for lease in row.product_leases:
         if lease.lease_id == lease_id:
             return lease.extent_rows
-    raise LoweringError(
-        f"row {row.row_id} names input product {lease_id} without its lease"
-    )
+    raise LoweringError(f"row {row.row_id} names input product {lease_id} without its lease")
 
 
 def _instances(
@@ -998,13 +946,8 @@ def _instances(
     if branch_count <= 0:
         raise LoweringError("branch-role regions require a CFG branch count")
     if branch_count > len(selector.branch_role_ids):
-        raise LoweringError(
-            f"{branch_count} CFG branches exceed the declared branch roles"
-        )
-    return [
-        (branch, selector.branch_role_ids[branch])
-        for branch in range(branch_count)
-    ]
+        raise LoweringError(f"{branch_count} CFG branches exceed the declared branch roles")
+    return [(branch, selector.branch_role_ids[branch]) for branch in range(branch_count)]
 
 
 def _global_binding_index(
@@ -1019,6 +962,7 @@ def _global_binding_index(
 # ---------------------
 # Standard transaction executor over family adapters
 # ---------------------
+
 
 @dataclass(frozen=True, slots=True)
 class AdapterRowOutcome:
@@ -1114,9 +1058,7 @@ class StandardTransactionExecutor:
             residency_arrays = reservation.batch_arrays(
                 capacity.residency, lowered.write_token_begins
             )
-            residency_arrays.validate(
-                capacity.residency, page_tokens=self._page_tokens
-            )
+            residency_arrays.validate(capacity.residency, page_tokens=self._page_tokens)
         except Exception:
             reservation.abort()
             raise
@@ -1149,9 +1091,7 @@ class StandardTransactionExecutor:
                 ),
             )
             if len(outcomes) != len(prepared.batch.rows):
-                raise RuntimeError(
-                    "adapter returned the wrong number of row outcomes"
-                )
+                raise RuntimeError("adapter returned the wrong number of row outcomes")
             committed = self._committed_extents(prepared, outcomes)
             published = prepared.reservation.commit(committed)
             return self._derive_results(prepared, outcomes, committed, published)
@@ -1175,8 +1115,7 @@ class StandardTransactionExecutor:
             sequence_id = role_map.get(role.role_id)
             if sequence_id is None:
                 create = (
-                    role.initialization.kind
-                    is not RoleInitializationKind.EMPTY_WHEN
+                    role.initialization.kind is not RoleInitializationKind.EMPTY_WHEN
                     or self._role_opens_for(row, role.role_id)
                 )
                 if not create:
@@ -1198,8 +1137,7 @@ class StandardTransactionExecutor:
 
         tag = operation_tag(row.operation)
         return any(
-            region.operation_tag is tag
-            and role_id in region.role.referenced_role_ids()
+            region.operation_tag is tag and role_id in region.role.referenced_role_ids()
             for region in self._registration.schema.regions
         )
 
@@ -1212,9 +1150,7 @@ class StandardTransactionExecutor:
 
         lowered = prepared.lowered
         extents: list[int] = []
-        bindings = [
-            binding for row in lowered.plan.rows for binding in row.bindings
-        ]
+        bindings = [binding for row in lowered.plan.rows for binding in row.bindings]
         for binding, commit, row_id in zip(
             bindings, lowered.binding_commits, lowered.binding_row_ids
         ):
@@ -1225,9 +1161,7 @@ class StandardTransactionExecutor:
             elif commit.kind is CommitExprKind.ACCEPTED_CANDIDATE_PREFIX:
                 accepted = outcomes[row_id].accepted_candidates
                 if not 0 <= accepted <= binding.reserve_rows:
-                    raise RuntimeError(
-                        "accepted candidates exceed the reserved tail"
-                    )
+                    raise RuntimeError("accepted candidates exceed the reserved tail")
                 extents.append(accepted)
             else:  # RESULT_AFFINE — bounded literal expressions only for now.
                 extents.append(
@@ -1253,15 +1187,11 @@ class StandardTransactionExecutor:
         cursor = 0
         for demand_row in lowered.plan.rows:
             for _ in demand_row.products:
-                published_by_row.setdefault(demand_row.row_id, []).append(
-                    published[cursor]
-                )
+                published_by_row.setdefault(demand_row.row_id, []).append(published[cursor])
                 cursor += 1
         results: list[RowResult] = []
         deltas: list[SessionDelta] = []
-        for row, session, outcome in zip(
-            prepared.batch.rows, prepared.sessions, outcomes
-        ):
+        for row, session, outcome in zip(prepared.batch.rows, prepared.sessions, outcomes):
             results.append(
                 RowResult(
                     row_id=row.row_id,
@@ -1286,9 +1216,7 @@ class StandardTransactionExecutor:
                     history_append=outcome.sampled_tokens,
                     cache_leases_added=(),
                     cache_leases_released=(),
-                    product_leases_added=tuple(
-                        published_by_row.get(row.row_id, ())
-                    ),
+                    product_leases_added=tuple(published_by_row.get(row.row_id, ())),
                     product_leases_released=(),
                     terminal=TerminalStatus.ACTIVE,
                 )
@@ -1299,6 +1227,7 @@ class StandardTransactionExecutor:
 # ---------------------
 # Distributed rank fan-out executor
 # ---------------------
+
 
 class DistributedConfigurationError(RuntimeError):
     """Ranks disagree about static configuration before readiness."""
@@ -1336,8 +1265,7 @@ class RankFanOutExecutor:
         fingerprints = {member.configuration_fingerprint for member in members}
         if len(fingerprints) != 1:
             raise DistributedConfigurationError(
-                "all ranks must share one configuration fingerprint; got "
-                f"{sorted(fingerprints)}"
+                f"all ranks must share one configuration fingerprint; got {sorted(fingerprints)}"
             )
         if result_rank not in ranks:
             raise DistributedConfigurationError(
@@ -1387,9 +1315,7 @@ class RankFanOutExecutor:
         designated = outcomes[self._result_rank]
         for member, outcome in zip(self._members, outcomes):
             if outcome != designated:
-                raise RankDisagreement(
-                    f"rank {member.rank} finalized conflicting logical results"
-                )
+                raise RankDisagreement(f"rank {member.rank} finalized conflicting logical results")
         return designated
 
 
@@ -1492,18 +1418,15 @@ def validate_manifest(manifest: ConformanceManifest) -> None:
         frozenset(OperationTag(tag) for tag in manifest.advertised_operations),
     )
     if tuple(case.case_id for case in regenerated) != manifest.case_ids:
-        raise ManifestError(
-            f"manifest {manifest.family} lists a stale case set"
-        )
+        raise ManifestError(f"manifest {manifest.family} lists a stale case set")
     if case_set_hash(regenerated) != manifest.case_set_hash:
-        raise ManifestError(
-            f"manifest {manifest.family} hash does not match the regenerated set"
-        )
+        raise ManifestError(f"manifest {manifest.family} hash does not match the regenerated set")
 
 
 # ---------------------
 # Decode token/position relays (device-resident sequence feedback)
 # ---------------------
+
 
 class TextDecodeRelay:
     """Publishes and consumes device-resident decode token/position relays."""
@@ -1762,6 +1685,7 @@ class TextDecodeRelay:
                 "decode op requested token_source='last_sampled' but the relay tensor is unavailable"
             )
         return None
+
 
 def _same_tensor(lhs: Any, rhs: torch.Tensor) -> bool:
     if not isinstance(lhs, torch.Tensor):
@@ -2131,7 +2055,9 @@ class DeferredDecodeBurstSeqResult:
         pending: Any,
     ) -> None:
         object.__setattr__(self, "req_id", int(req_id))
-        object.__setattr__(self, "_prefix_token_ids", tuple(int(token) for token in prefix_token_ids))
+        object.__setattr__(
+            self, "_prefix_token_ids", tuple(int(token) for token in prefix_token_ids)
+        )
         object.__setattr__(self, "_pending", pending)
         object.__setattr__(self, "_finalized", None)
 
@@ -2186,7 +2112,9 @@ class DeferredTerminalDecodeBurstSeqResult:
     ) -> None:
         object.__setattr__(self, "req_id", int(req_id))
         object.__setattr__(self, "_pending_tokens", tuple(pending_tokens))
-        object.__setattr__(self, "_stop_token_ids", frozenset(int(token) for token in stop_token_ids))
+        object.__setattr__(
+            self, "_stop_token_ids", frozenset(int(token) for token in stop_token_ids)
+        )
         object.__setattr__(self, "_finalized", None)
 
     def to_seq_result(self) -> "DeferredTerminalDecodeBurstSeqResult":
@@ -2318,9 +2246,7 @@ def verify_speculative_tokens(
             raise invalid_descriptor("speculative verification batch is missing text inputs")
         input_ids = fb.input_ids.reshape(len(rows), length)
         positions = fb.positions.reshape(len(rows), length)
-        with use_forward_context(
-            replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)
-        ):
+        with use_forward_context(replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)):
             logits = model.forward(input_ids, positions, fb)
         for row, (original_idx, op, spec) in enumerate(rows):
             results[original_idx] = _verify_spec_row(
@@ -3106,7 +3032,7 @@ class TextDriver:
     ) -> tuple[torch.Tensor, list[int]] | None:
         if self.builder is None or self.kv_pool is None:
             # Self-managing text models (the HF day-zero fallback and the
-            # multimodal/interleaved models whose KV is intrinsically coupled to
+            # composed multimodal programs whose KV is intrinsically coupled to
             # their modality FSM) declare no ``kv_cache_spec``; the system owns no
             # pool for them. They expose their own per-op text logits and the
             # driver still owns the post-model sampler.
@@ -3317,9 +3243,7 @@ class TextDriver:
         input_ids, positions = self._reshape_inputs(fb, text)
         start = component_timer_start(stats)
         with profile_range("uniserve.text.model_forward"):
-            with use_forward_context(
-                replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)
-            ):
+            with use_forward_context(replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)):
                 logits = self._run_model_forward(
                     model,
                     input_ids,
@@ -3367,9 +3291,7 @@ class TextDriver:
                 request_states=request_states,
                 input_ids_override=relay,
             )
-            with use_forward_context(
-                replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)
-            ):
+            with use_forward_context(replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)):
                 logits = model.forward(fb.input_ids, fb.positions, fb)
             rows.append(logits.reshape(-1, logits.shape[-1])[-1])
             next_positions.append((int(req_id), int(pos_range[1])))
@@ -3817,14 +3739,6 @@ def _can_decode_burst(
         raise
 
 
-
-
-
-
-
-
-
-
 def _record_cuda_ready_start_event(
     kv_pool: "PagedKVPool | None",
     *,
@@ -3842,15 +3756,12 @@ def _record_cuda_ready_start_event(
     return event
 
 
-
-
-
-
 # ---------------------
 # Flow-step session (single denoise update)
 # ---------------------
 
-class TextImageDenoiseSession:
+
+class FlowSession:
     """Owns branch prediction and latent update semantics for one denoise step."""
 
     def __init__(
@@ -3878,15 +3789,17 @@ class TextImageDenoiseSession:
             branch,
         )
         if not isinstance(velocity, torch.Tensor) or velocity.shape != self.step.latent.shape:
-            raise invalid_descriptor(f"{branch} velocity must be a tensor matching the denoise latent")
+            raise invalid_descriptor(
+                f"{branch} velocity must be a tensor matching the denoise latent"
+            )
         return velocity
 
-    def apply_update(self, velocities: Mapping[str, torch.Tensor]) -> DenoiseOutput:
+    def apply_update(self, velocities: Mapping[str, torch.Tensor]) -> FlowOutput:
         velocity = self._combine_velocity(self.step, velocities)
         updated = euler_step(self.step.latent, velocity, self.step.t, self.step.t_next)
         self._accept_update(self.model, self.step, updated)
         done = self.step.step_index + 1 >= self.step.total_steps
-        return DenoiseOutput(
+        return FlowOutput(
             req_id=self.step.req_id,
             denoise_done=done,
             num_steps_done=self.step.step_index + 1,
@@ -3911,7 +3824,7 @@ _DEFAULT_LATENT_CHANNELS = 4
 
 
 @dataclass(frozen=True)
-class TextImageDenoiseStep:
+class PreparedFlowStep:
     req_id: int
     state: RequestState
     op: Mapping[str, Any]
@@ -3944,30 +3857,34 @@ class TextImageDenoiseStep:
             object.__setattr__(self, "cfg_branch_count", branch_count)
 
 
-class DenoiseDriver:
+class FlowExecutor:
     """Execute one model-neutral flow-matching denoise step."""
 
-    def __init__(self, *, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32) -> None:
+    def __init__(
+        self, *, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32
+    ) -> None:
         # ``device``/``dtype`` take effect only on the model-neutral generic
-        # ``DenoiseContext``/``_latent`` path (see ``_finish_prepared_step``).
-        # Production diffusion models return a ``TextImageDenoiseStep`` and run
-        # on their own device/dtype, and the runner constructs ``DenoiseDriver()``
+        # ``FlowContext``/``_latent`` path (see ``_finish_prepared_step``).
+        # Production diffusion models return a ``PreparedFlowStep`` and run
+        # on their own device/dtype, and the runner constructs ``FlowExecutor()``
         # with no arguments -- so these defaults are inert for them.
         self.device = device
         self.dtype = dtype
 
     @torch.inference_mode()
-    def step(self, req_id: int, state: RequestState, model: "DenoiseCapable", op: Mapping[str, Any]) -> DenoiseOutput:
+    def step(
+        self, req_id: int, state: RequestState, model: "FlowCapable", op: Mapping[str, Any]
+    ) -> FlowOutput:
         return self.step_many([(req_id, state, op)], model)[0]
 
     @torch.inference_mode()
     def step_many(
         self,
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
-        model: "DenoiseCapable",
+        model: "FlowCapable",
         *,
         graph_mode: str = "auto",
-    ) -> list[DenoiseOutput]:
+    ) -> list[FlowOutput]:
         step_counts = [_denoise_step_count(op) for _req_id, _state, op in items]
         if any(count > 1 for count in step_counts):
             return self._step_many_burst(items, model, step_counts, graph_mode=graph_mode)
@@ -3975,10 +3892,10 @@ class DenoiseDriver:
             (int(req_id), state, op, self._prepare(req_id, state, model, op))
             for req_id, state, op in items
         ]
-        if all(isinstance(item[3], TextImageDenoiseStep) for item in prepared):
-            return self._text_image_steps(
+        if all(isinstance(item[3], PreparedFlowStep) for item in prepared):
+            return self._flow_steps(
                 model,
-                [item[3] for item in prepared if isinstance(item[3], TextImageDenoiseStep)],
+                [item[3] for item in prepared if isinstance(item[3], PreparedFlowStep)],
                 graph_mode=graph_mode,
             )
         return [
@@ -3990,7 +3907,7 @@ class DenoiseDriver:
     def forward_result(
         self,
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
-        model: "DenoiseCapable",
+        model: "FlowCapable",
         *,
         row_indices: Sequence[int] | None = None,
         graph_mode: str = "auto",
@@ -3998,33 +3915,37 @@ class DenoiseDriver:
         step_counts = [_denoise_step_count(op) for _req_id, _state, op in items]
         if any(count > 1 for count in step_counts):
             return None
-        rows = tuple(range(len(items))) if row_indices is None else tuple(int(row) for row in row_indices)
+        rows = (
+            tuple(range(len(items)))
+            if row_indices is None
+            else tuple(int(row) for row in row_indices)
+        )
         if len(rows) != len(items):
             raise invalid_descriptor("denoise row_indices must align with denoise items")
         prepared = [
             (int(row_index), int(req_id), state, op, self._prepare(req_id, state, model, op))
             for row_index, (req_id, state, op) in zip(rows, items, strict=True)
         ]
-        text_image_items = [
+        flow_items = [
             (row_index, step)
             for row_index, _req_id, _state, _op, step in prepared
-            if isinstance(step, TextImageDenoiseStep)
+            if isinstance(step, PreparedFlowStep)
         ]
         velocities: dict[DenoiseBranchKey, torch.Tensor] = {}
         updates: dict[int, DenoisePostprocessEntry] = {}
-        if text_image_items:
-            text_entries = self._text_image_forward_entries(
+        if flow_items:
+            flow_entries = self._flow_forward_entries(
                 model,
-                text_image_items,
+                flow_items,
                 graph_mode=graph_mode,
             )
-            if text_entries is None:
+            if flow_entries is None:
                 return None
-            text_velocities, text_updates = text_entries
-            velocities.update(text_velocities)
-            updates.update(text_updates)
+            flow_velocities, flow_updates = flow_entries
+            velocities.update(flow_velocities)
+            updates.update(flow_updates)
         for row_index, req_id, state, op, ctx in prepared:
-            if isinstance(ctx, TextImageDenoiseStep):
+            if isinstance(ctx, PreparedFlowStep):
                 continue
             if graph_mode == "require":
                 return None
@@ -4043,14 +3964,16 @@ class DenoiseDriver:
     def _step_many_burst(
         self,
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
-        model: "DenoiseCapable",
+        model: "FlowCapable",
         step_counts: Sequence[int],
         *,
         graph_mode: str,
-    ) -> list[DenoiseOutput]:
-        outputs: list[DenoiseOutput | None] = [None] * len(items)
+    ) -> list[FlowOutput]:
+        outputs: list[FlowOutput | None] = [None] * len(items)
         active: list[dict[str, Any]] = []
-        for index, ((req_id, state, op), step_count) in enumerate(zip(items, step_counts, strict=True)):
+        for index, ((req_id, state, op), step_count) in enumerate(
+            zip(items, step_counts, strict=True)
+        ):
             op_dict = dict(op)
             cursor = int(op_dict.get("timestep_idx", state.schedule_cursor) or 0)
             active.append(
@@ -4065,7 +3988,9 @@ class DenoiseDriver:
             )
 
         while active:
-            prepared: list[tuple[dict[str, Any], Mapping[str, Any], DenoiseContext | TextImageDenoiseStep]] = []
+            prepared: list[
+                tuple[dict[str, Any], Mapping[str, Any], FlowContext | PreparedFlowStep]
+            ] = []
             for item in active:
                 op = dict(item["op"])
                 op["timestep_idx"] = int(item["cursor"])
@@ -4077,10 +4002,10 @@ class DenoiseDriver:
                     )
                 )
 
-            if all(isinstance(ctx, TextImageDenoiseStep) for _item, _op, ctx in prepared):
-                step_outputs = self._text_image_steps(
+            if all(isinstance(ctx, PreparedFlowStep) for _item, _op, ctx in prepared):
+                step_outputs = self._flow_steps(
                     model,
-                    [ctx for _item, _op, ctx in prepared if isinstance(ctx, TextImageDenoiseStep)],
+                    [ctx for _item, _op, ctx in prepared if isinstance(ctx, PreparedFlowStep)],
                     graph_mode=graph_mode,
                 )
             else:
@@ -4112,31 +4037,31 @@ class DenoiseDriver:
         self,
         req_id: int,
         state: RequestState,
-        model: "DenoiseCapable",
+        model: "FlowCapable",
         op: Mapping[str, Any],
-    ) -> DenoiseContext | TextImageDenoiseStep:
+    ) -> FlowContext | PreparedFlowStep:
         del req_id
-        prepared = _prepare_denoise(model, state, op)
-        if isinstance(prepared, TextImageDenoiseStep):
+        prepared = _prepare_flow(model, state, op)
+        if isinstance(prepared, PreparedFlowStep):
             return prepared
-        if not isinstance(prepared, DenoiseContext):
-            raise invalid_descriptor("prepare_denoise(state, op) must return DenoiseContext")
+        if not isinstance(prepared, FlowContext):
+            raise invalid_descriptor("prepare_flow(state, op) must return FlowContext")
         return prepared
 
     def _finish_prepared_step(
         self,
         req_id: int,
         state: RequestState,
-        model: "DenoiseCapable",
+        model: "FlowCapable",
         op: Mapping[str, Any],
-        prepared: DenoiseContext | TextImageDenoiseStep,
-    ) -> DenoiseOutput:
-        if isinstance(prepared, TextImageDenoiseStep):
-            return self._text_image_steps(model, [prepared])[0]
+        prepared: FlowContext | PreparedFlowStep,
+    ) -> FlowOutput:
+        if isinstance(prepared, PreparedFlowStep):
+            return self._flow_steps(model, [prepared])[0]
         # Model-neutral generic flow-matching path. It is the contract for models
-        # that return a DenoiseContext (and is exercised by the synthetic
+        # that return a FlowContext (and is exercised by the synthetic
         # velocity-only test model); the production diffusion models instead
-        # return a TextImageDenoiseStep above and build their own
+        # return a PreparedFlowStep above and build their own
         # schedule with model-specific direction/shift-domain defaults. As a
         # consequence the op-level schedule_direction/schedule_shift/flow_shift
         # keys read below (and the equivalent DiffusionConfig fields) are INERT
@@ -4160,7 +4085,9 @@ class DenoiseDriver:
             branch = _branch_name(branch_index, cfg.branch_count)
             velocity = model.predict_velocity(prepared, t, latent, branch)
             if not isinstance(velocity, torch.Tensor):
-                raise invalid_descriptor("predict_velocity(ctx, t, latent, branch) must return a tensor")
+                raise invalid_descriptor(
+                    "predict_velocity(ctx, t, latent, branch) must return a tensor"
+                )
             velocity = _maybe_convert_parameterization(model, velocity, latent, t)
             if velocity.shape != latent.shape:
                 raise invalid_descriptor(
@@ -4169,21 +4096,21 @@ class DenoiseDriver:
             velocities.append(velocity)
         velocity = combine_cfg(velocities, cfg)
         state.latent = euler_step(latent, velocity, t, t_next)
-        _accept_denoise_update(model, prepared, state.latent)
+        _accept_flow_update(model, prepared, state.latent)
         done = cursor + 1 >= steps
-        return DenoiseOutput(req_id=req_id, denoise_done=done, num_steps_done=cursor + 1)
+        return FlowOutput(req_id=req_id, denoise_done=done, num_steps_done=cursor + 1)
 
-    def _text_image_steps(
+    def _flow_steps(
         self,
-        model: "DenoiseCapable",
-        steps: Sequence[TextImageDenoiseStep],
+        model: "FlowCapable",
+        steps: Sequence[PreparedFlowStep],
         *,
         graph_mode: str = "auto",
-    ) -> list[DenoiseOutput]:
-        branches_by_step = [text_image_branches(step) for step in steps]
-        batch_predict = _text_image_batch_predictor(model)
+    ) -> list[FlowOutput]:
+        branches_by_step = [flow_branches(step) for step in steps]
+        batch_predict = _flow_batch_predictor(model)
         if batch_predict is not None:
-            predicted = _call_text_image_batch_predictor(
+            predicted = _call_flow_batch_predictor(
                 batch_predict,
                 steps,
                 branches_by_step,
@@ -4192,46 +4119,50 @@ class DenoiseDriver:
         else:
             predicted = None
         if predicted is None and graph_mode == "require":
-            raise invalid_descriptor("denoise graph mode required a graphable text-image batch")
+            raise invalid_descriptor("flow graph mode required a graphable batch")
         if predicted is None:
             branch_outputs = [
                 {
-                    branch: self._predict_text_image_branch(model.predict_velocity, step, branch)
+                    branch: self._predict_flow_branch(model.predict_velocity, step, branch)
                     for branch in branches
                 }
                 for step, branches in zip(steps, branches_by_step)
             ]
         else:
-            branch_outputs = _validate_batched_text_image_outputs(steps, branches_by_step, predicted)
+            branch_outputs = _validate_batched_flow_outputs(steps, branches_by_step, predicted)
         outputs = []
         for step, velocities in zip(steps, branch_outputs):
-            session = TextImageDenoiseSession(
+            session = FlowSession(
                 model,
                 step,
-                combine_velocity=combine_text_image_velocity,
-                accept_update=_accept_denoise_update,
+                combine_velocity=combine_flow_velocity,
+                accept_update=_accept_flow_update,
             )
             outputs.append(session.apply_update(velocities))
         return outputs
 
-    def _predict_text_image_branch(self, predict: Any, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:
+    def _predict_flow_branch(
+        self, predict: Any, step: PreparedFlowStep, branch: str
+    ) -> torch.Tensor:
         velocity = predict(step, step.t, step.latent, branch)
         if not isinstance(velocity, torch.Tensor) or velocity.shape != step.latent.shape:
-            raise invalid_descriptor(f"{branch} velocity must be a tensor matching the denoise latent")
+            raise invalid_descriptor(
+                f"{branch} velocity must be a tensor matching the denoise latent"
+            )
         return velocity
 
-    def _text_image_forward_entries(
+    def _flow_forward_entries(
         self,
-        model: "DenoiseCapable",
-        items: Sequence[tuple[int, TextImageDenoiseStep]],
+        model: "FlowCapable",
+        items: Sequence[tuple[int, PreparedFlowStep]],
         *,
         graph_mode: str = "auto",
     ) -> tuple[dict[DenoiseBranchKey, torch.Tensor], dict[int, DenoisePostprocessEntry]] | None:
         steps = [step for _row_index, step in items]
-        branches_by_step = [text_image_branches(step) for step in steps]
-        batch_predict = _text_image_batch_predictor(model)
+        branches_by_step = [flow_branches(step) for step in steps]
+        batch_predict = _flow_batch_predictor(model)
         predicted = (
-            _call_text_image_batch_predictor(
+            _call_flow_batch_predictor(
                 batch_predict,
                 steps,
                 branches_by_step,
@@ -4245,13 +4176,13 @@ class DenoiseDriver:
         if predicted is None:
             branch_outputs = [
                 {
-                    branch: self._predict_text_image_branch(model.predict_velocity, step, branch)
+                    branch: self._predict_flow_branch(model.predict_velocity, step, branch)
                     for branch in branches
                 }
                 for step, branches in zip(steps, branches_by_step, strict=True)
             ]
         else:
-            branch_outputs = _validate_batched_text_image_outputs(steps, branches_by_step, predicted)
+            branch_outputs = _validate_batched_flow_outputs(steps, branches_by_step, predicted)
         velocities: dict[DenoiseBranchKey, torch.Tensor] = {}
         updates: dict[int, DenoisePostprocessEntry] = {}
         for (row_index, step), branches, outputs in zip(
@@ -4265,16 +4196,16 @@ class DenoiseDriver:
 
             def combine_step_velocity(
                 values: Mapping[Any, torch.Tensor],
-                current_step: TextImageDenoiseStep = step,
+                current_step: PreparedFlowStep = step,
             ) -> torch.Tensor:
-                return combine_text_image_velocity(current_step, values)
+                return combine_flow_velocity(current_step, values)
 
             def accept_step_update(
                 latent: torch.Tensor,
                 current_model: Any = model,
-                current_step: TextImageDenoiseStep = step,
+                current_step: PreparedFlowStep = step,
             ) -> None:
-                _accept_denoise_update(current_model, current_step, latent)
+                _accept_flow_update(current_model, current_step, latent)
 
             updates[int(row_index)] = DenoisePostprocessEntry(
                 row_index=int(row_index),
@@ -4295,9 +4226,9 @@ class DenoiseDriver:
         row_index: int,
         req_id: int,
         state: RequestState,
-        model: "DenoiseCapable",
+        model: "FlowCapable",
         op: Mapping[str, Any],
-        prepared: DenoiseContext,
+        prepared: FlowContext,
     ) -> tuple[DenoisePostprocessEntry, dict[DenoiseBranchKey, torch.Tensor]]:
         image = dict(state.image or {})
         image.update(op.get("image") or {})
@@ -4313,23 +4244,28 @@ class DenoiseDriver:
         t, t_next = schedule.pair(cursor, device=self.device, dtype=self.dtype)
         latent = self._latent(state, image, op)
         cfg = CfgParams.from_mapping(op.get("cfg") or state.cfg_geometry)
-        branch_names = tuple(_branch_name(index, cfg.branch_count) for index in range(cfg.branch_count))
+        branch_names = tuple(
+            _branch_name(index, cfg.branch_count) for index in range(cfg.branch_count)
+        )
         velocities: dict[DenoiseBranchKey, torch.Tensor] = {}
         for branch_id, branch in enumerate(branch_names):
             velocity = model.predict_velocity(prepared, t, latent, branch)
             if not isinstance(velocity, torch.Tensor):
-                raise invalid_descriptor("predict_velocity(ctx, t, latent, branch) must return a tensor")
+                raise invalid_descriptor(
+                    "predict_velocity(ctx, t, latent, branch) must return a tensor"
+                )
             velocity = _maybe_convert_parameterization(model, velocity, latent, t)
             if velocity.shape != latent.shape:
                 raise invalid_descriptor(
                     f"velocity shape {tuple(velocity.shape)} does not match latent {tuple(latent.shape)}"
                 )
             velocities[DenoiseBranchKey(int(row_index), int(branch_id))] = velocity
+
         def combine_generic_velocity(values: Mapping[Any, torch.Tensor]) -> torch.Tensor:
             return combine_cfg([values[branch] for branch in branch_names], cfg)
 
         def accept_generic_update(latent_value: torch.Tensor) -> None:
-            _accept_denoise_update(model, prepared, latent_value)
+            _accept_flow_update(model, prepared, latent_value)
 
         entry = DenoisePostprocessEntry(
             row_index=int(row_index),
@@ -4345,15 +4281,22 @@ class DenoiseDriver:
         )
         return entry, velocities
 
-    def _latent(self, state: RequestState, image: Mapping[str, Any], op: Mapping[str, Any]) -> torch.Tensor:
+    def _latent(
+        self, state: RequestState, image: Mapping[str, Any], op: Mapping[str, Any]
+    ) -> torch.Tensor:
         if isinstance(state.latent, torch.Tensor):
             return state.latent.to(device=self.device, dtype=self.dtype)
         shape = op.get("latent_shape") or image.get("latent_shape")
         if shape is None:
             h = required_image_height(image)
             w = required_image_width(image)
-            downsample = int(image.get("latent_downsample", _DEFAULT_LATENT_DOWNSAMPLE) or _DEFAULT_LATENT_DOWNSAMPLE)
-            channels = int(image.get("latent_channels", _DEFAULT_LATENT_CHANNELS) or _DEFAULT_LATENT_CHANNELS)
+            downsample = int(
+                image.get("latent_downsample", _DEFAULT_LATENT_DOWNSAMPLE)
+                or _DEFAULT_LATENT_DOWNSAMPLE
+            )
+            channels = int(
+                image.get("latent_channels", _DEFAULT_LATENT_CHANNELS) or _DEFAULT_LATENT_CHANNELS
+            )
             shape = (channels, max(1, h // downsample), max(1, w // downsample))
         shape_tuple = tuple(int(v) for v in shape)
         if state.rng is None:
@@ -4377,12 +4320,12 @@ def _branch_name(branch_index: int, branch_count: int) -> str:
     return f"branch_{branch_index}"
 
 
-def _prepare_denoise(
+def _prepare_flow(
     model: Any,
     state: RequestState,
     op: Mapping[str, Any],
-) -> DenoiseContext | TextImageDenoiseStep:
-    return model.prepare_denoise(state, op)
+) -> FlowContext | PreparedFlowStep:
+    return model.prepare_flow(state, op)
 
 
 def _denoise_step_count(op: Mapping[str, Any]) -> int:
@@ -4396,13 +4339,13 @@ def _denoise_step_count(op: Mapping[str, Any]) -> int:
     return value
 
 
-def _text_image_batch_predictor(model: Any) -> Any | None:
-    return model.predict_text_image_velocity_batch
+def _flow_batch_predictor(model: Any) -> Any | None:
+    return model.predict_flow_velocity_batch
 
 
-def _call_text_image_batch_predictor(
+def _call_flow_batch_predictor(
     predictor: Any,
-    steps: Sequence[TextImageDenoiseStep],
+    steps: Sequence[PreparedFlowStep],
     branches_by_step: Sequence[Sequence[str]],
     *,
     graph_mode: str,
@@ -4425,12 +4368,12 @@ def _accepts_graph_mode(callable_obj: Any) -> bool:
     return "graph_mode" in signature.parameters
 
 
-def _accept_denoise_update(
+def _accept_flow_update(
     model: Any,
-    ctx: DenoiseContext | TextImageDenoiseStep,
+    ctx: FlowContext | PreparedFlowStep,
     latent: torch.Tensor,
 ) -> None:
-    accept = _denoise_update_acceptor(model)
+    accept = _flow_update_acceptor(model)
     if accept is not None:
         accept(ctx, latent)
         return
@@ -4439,11 +4382,11 @@ def _accept_denoise_update(
         state.latent = latent
 
 
-def _denoise_update_acceptor(model: Any) -> Any | None:
-    return model.accept_denoise_update
+def _flow_update_acceptor(model: Any) -> Any | None:
+    return model.accept_flow_update
 
 
-def _text_image_cfg_plan(step: TextImageDenoiseStep) -> DiffusionCfgPlan:
+def _flow_cfg_plan(step: PreparedFlowStep) -> DiffusionCfgPlan:
     """Single source of truth for a step's branch set and combination weights.
 
     CFG runs only while the timestep lies within ``cfg_interval`` ``[lo, hi]``
@@ -4458,7 +4401,7 @@ def _text_image_cfg_plan(step: TextImageDenoiseStep) -> DiffusionCfgPlan:
     t_value = float(step.t.detach().float().item())
     lo, hi = step.cfg_interval
     use_cfg = lo <= t_value <= hi
-    return build_text_image_cfg_plan(
+    return build_flow_cfg_plan(
         cfg_text_scale=step.cfg_text_scale,
         cfg_img_scale=step.cfg_img_scale,
         recipe=step.image_scale_applies_to_text,
@@ -4468,15 +4411,15 @@ def _text_image_cfg_plan(step: TextImageDenoiseStep) -> DiffusionCfgPlan:
     )
 
 
-def text_image_branches(step: TextImageDenoiseStep) -> tuple[str, ...]:
-    return text_image_cfg_plan(step).branches
+def flow_branches(step: PreparedFlowStep) -> tuple[str, ...]:
+    return flow_cfg_plan(step).branches
 
 
-def text_image_cfg_plan(step: TextImageDenoiseStep) -> DiffusionCfgPlan:
-    return _text_image_cfg_plan(step)
+def flow_cfg_plan(step: PreparedFlowStep) -> DiffusionCfgPlan:
+    return _flow_cfg_plan(step)
 
 
-def text_image_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
+def flow_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
     cfg = op.get("cfg")
     if not isinstance(cfg, Mapping) or cfg.get("branch_count") is None:
         return None
@@ -4489,31 +4432,33 @@ def text_image_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
     return branch_count
 
 
-def combine_text_image_velocity(
-    step: TextImageDenoiseStep,
+def combine_flow_velocity(
+    step: PreparedFlowStep,
     outputs: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
-    return text_image_cfg_plan(step).combine(outputs)
+    return flow_cfg_plan(step).combine(outputs)
 
 
-def _validate_batched_text_image_outputs(
-    steps: Sequence[TextImageDenoiseStep],
+def _validate_batched_flow_outputs(
+    steps: Sequence[PreparedFlowStep],
     branches_by_step: Sequence[Sequence[str]],
     predicted: Any,
 ) -> list[dict[str, torch.Tensor]]:
     if not isinstance(predicted, Sequence) or isinstance(predicted, (str, bytes, bytearray)):
-        raise invalid_descriptor("predict_text_image_velocity_batch must return one mapping per step")
+        raise invalid_descriptor("predict_flow_velocity_batch must return one mapping per step")
     if len(predicted) != len(steps):
-        raise invalid_descriptor("predict_text_image_velocity_batch returned the wrong number of steps")
+        raise invalid_descriptor("predict_flow_velocity_batch returned the wrong number of steps")
     out: list[dict[str, torch.Tensor]] = []
     for step, branches, values in zip(steps, branches_by_step, predicted):
         if not isinstance(values, Mapping):
-            raise invalid_descriptor("predict_text_image_velocity_batch entries must be mappings")
+            raise invalid_descriptor("predict_flow_velocity_batch entries must be mappings")
         checked: dict[str, torch.Tensor] = {}
         for branch in branches:
             velocity = values.get(branch)
             if not isinstance(velocity, torch.Tensor) or velocity.shape != step.latent.shape:
-                raise invalid_descriptor(f"{branch} velocity must be a tensor matching the denoise latent")
+                raise invalid_descriptor(
+                    f"{branch} velocity must be a tensor matching the denoise latent"
+                )
             checked[branch] = velocity
         out.append(checked)
     return out
@@ -4541,6 +4486,7 @@ def _velocity_parameterization(model: Any) -> str:
 # Encode-step execution
 # ---------------------
 
+
 class EncodeDriver:
     """Run model-provided image/text encoder primitives for ENCODE ops."""
 
@@ -4561,7 +4507,11 @@ class EncodeDriver:
         row_indices: tuple[int, ...] | list[int] | None = None,
     ) -> ForwardResult:
         ops = fb.as_encode().ops
-        rows = tuple(range(len(ops))) if row_indices is None else tuple(int(row) for row in row_indices)
+        rows = (
+            tuple(range(len(ops)))
+            if row_indices is None
+            else tuple(int(row) for row in row_indices)
+        )
         if len(rows) != len(ops):
             raise invalid_descriptor("encode row_indices must align with encode ops")
         outputs = dict(zip(rows, self._run_many(model, ops), strict=True))
@@ -4636,9 +4586,12 @@ def _image_hw(value: Any) -> tuple[int, int] | None:
 # Materialize-step execution (image decode)
 # ---------------------
 
+
 class ImageDecodeDriver:
     @torch.inference_mode()
-    def step(self, req_id: int, state: RequestState, model: Any, op: Mapping[str, Any]) -> CommitOutput:
+    def step(
+        self, req_id: int, state: RequestState, model: Any, op: Mapping[str, Any]
+    ) -> CommitOutput:
         result = model.decode_image(state.latent, req_id=int(req_id), state=state, op=op)
         out = dict(result) if isinstance(result, Mapping) else _image_to_result(int(req_id), result)
         logits = out.pop("logits", None)
@@ -4651,17 +4604,24 @@ class ImageDecodeDriver:
     @torch.inference_mode()
     def forward_result(
         self,
-        items: list[tuple[int, RequestState, Mapping[str, Any]]] | tuple[tuple[int, RequestState, Mapping[str, Any]], ...],
+        items: list[tuple[int, RequestState, Mapping[str, Any]]]
+        | tuple[tuple[int, RequestState, Mapping[str, Any]], ...],
         model: Any,
         *,
         row_indices: tuple[int, ...] | list[int] | None = None,
     ) -> ForwardResult:
-        rows = tuple(range(len(items))) if row_indices is None else tuple(int(row) for row in row_indices)
+        rows = (
+            tuple(range(len(items)))
+            if row_indices is None
+            else tuple(int(row) for row in row_indices)
+        )
         if len(rows) != len(items):
             raise invalid_descriptor("commit row_indices must align with commit items")
         outputs: dict[int, Any] = {}
         for row, (req_id, state, op) in zip(rows, items, strict=True):
-            outputs[int(row)] = model.decode_image(state.latent, req_id=int(req_id), state=state, op=op)
+            outputs[int(row)] = model.decode_image(
+                state.latent, req_id=int(req_id), state=state, op=op
+            )
         return ForwardResult(commit_outputs=outputs)
 
 
@@ -4705,12 +4665,8 @@ def _image_to_result(req_id: int, image: Any) -> dict[str, Any]:
 # Canonical plan construction (rows, segments, output slots)
 # ---------------------
 
-_TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
-)
-_SEGMENT_PRODUCING_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE}
-)
+_TEXT_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
+_SEGMENT_PRODUCING_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE})
 
 
 class Route(str, Enum):
@@ -4773,7 +4729,6 @@ class ForwardAdmissionRouter:
             target = supported if mode in _SEGMENT_PRODUCING_MODES else delegated
             target.append((index, op))
         return supported, delegated
-
 
 
 class ForwardPlanBuilder:
@@ -4856,7 +4811,8 @@ class ForwardPlanBuilder:
             position_start=start,
             position_end=end,
             token_source=str(op.get("token_source") or "wire"),
-            last_token_only=mode in {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.VERIFY_DRAFT},
+            last_token_only=mode
+            in {ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.VERIFY_DRAFT},
         )
 
     @staticmethod
@@ -4879,7 +4835,7 @@ class ForwardPlanBuilder:
         state_blocks = tuple(int(block) for block in getattr(state, "block_ids", ()) or ())
         new_blocks = tuple(int(block) for block in (op.get("new_block_ids") or ()))
         block_ids = state_blocks
-        if new_blocks and not block_ids[-len(new_blocks):] == new_blocks:
+        if new_blocks and not block_ids[-len(new_blocks) :] == new_blocks:
             block_ids = (*block_ids, *new_blocks)
         return CacheSpanPlan(
             block_ids=block_ids,
@@ -5180,8 +5136,14 @@ def _bump_stats(stats: Any | None, warning: EagerFallbackWarning) -> None:
         except Exception:
             pass
     try:
-        setattr(stats, "forward_eager_tokens", int(getattr(stats, "forward_eager_tokens", 0)) + warning.tokens)
-        setattr(stats, "forward_eager_rows", int(getattr(stats, "forward_eager_rows", 0)) + warning.rows)
+        setattr(
+            stats,
+            "forward_eager_tokens",
+            int(getattr(stats, "forward_eager_tokens", 0)) + warning.tokens,
+        )
+        setattr(
+            stats, "forward_eager_rows", int(getattr(stats, "forward_eager_rows", 0)) + warning.rows
+        )
     except Exception:
         pass
 
@@ -5189,7 +5151,6 @@ def _bump_stats(stats: Any | None, warning: EagerFallbackWarning) -> None:
 # ---------------------
 # Device batch construction
 # ---------------------
-
 
 
 class UnifiedForwardBatchBuilder:
@@ -5376,6 +5337,7 @@ def _scalar_tensor(value: Any, device: torch.device) -> torch.Tensor | None:
 # Model descriptor
 # ---------------------
 
+
 @dataclass(frozen=True)
 class ForwardModelModules:
     embed_text: Callable[..., Any] | None = None
@@ -5436,7 +5398,9 @@ def descriptor_from_model(model: Any) -> ForwardModelDescriptor:
     dtype = _dtype(getattr(model, "dtype", None))
     modules = ForwardModelModules(
         embed_text=_first_callable(model, ("embed_tokens", "packed_text_embeddings")),
-        embed_generation=_first_callable(model, ("embed_generation", "prepare_generation_embeddings")),
+        embed_generation=_first_callable(
+            model, ("embed_generation", "prepare_generation_embeddings")
+        ),
         decoder=_first_callable(model, ("forward", "decoder_forward", "packed_decoder_forward")),
         logits=_first_callable(model, ("compute_logits", "logits", "lm_head"))
         or _first_overridden_callable(model, ("run_text_logits_batch", "run_text_logits")),
@@ -5531,9 +5495,7 @@ def _overrides(model: Any, name: str) -> bool:
 # Family adapter dispatch
 # ---------------------
 
-_TEXT_DRIVER_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
-)
+_TEXT_DRIVER_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
 
 
 @runtime_checkable
@@ -5727,12 +5689,14 @@ class WorkerForwardAdapter:
                     self.model,
                     defer_cpu_results=defer_text_cpu_results,
                     defer_sampling=self.defer_sampling,
-            )
+                )
             if text_result is not None:
                 req_ids = tuple(int(req_id) for req_id in getattr(text_result, "req_ids", ()))
                 expected_req_ids = tuple(int(op["req_id"]) for op in fb.ops)
                 if req_ids != expected_req_ids:
-                    raise invalid_descriptor("text logits result req_ids must align with forward ops")
+                    raise invalid_descriptor(
+                        "text logits result req_ids must align with forward ops"
+                    )
                 return ForwardResult(
                     text_logits=text_result.logits,
                     text_cuda_ready_start_event=getattr(
@@ -5762,8 +5726,7 @@ class WorkerForwardAdapter:
             return None
         forward_result = getattr(self.denoise_driver, "forward_result", None)
         items = [
-            (int(op["req_id"]), self.request_states.get(int(op["req_id"])), op)
-            for _, op in group
+            (int(op["req_id"]), self.request_states.get(int(op["req_id"])), op) for _, op in group
         ]
         if callable(forward_result):
             with profile_range("uniserve.forward_adapter.denoise_forward"):
@@ -5778,7 +5741,11 @@ class WorkerForwardAdapter:
             if result is not None:
                 return result
         with profile_range("uniserve.forward_adapter.denoise_driver"):
-            kwargs = {"graph_mode": "eager"} if _accepts_keyword(self.denoise_driver.step_many, "graph_mode") else {}
+            kwargs = (
+                {"graph_mode": "eager"}
+                if _accepts_keyword(self.denoise_driver.step_many, "graph_mode")
+                else {}
+            )
             return self.denoise_driver.step_many(items, self.model, **kwargs)
 
     def _run_commit_mode(
@@ -5791,8 +5758,7 @@ class WorkerForwardAdapter:
         if not self._has_decode_image:
             return None
         items = [
-            (int(op["req_id"]), self.request_states.get(int(op["req_id"])), op)
-            for _, op in group
+            (int(op["req_id"]), self.request_states.get(int(op["req_id"])), op) for _, op in group
         ]
         forward_result = getattr(self.image_decode_driver, "forward_result", None)
         if callable(forward_result):
@@ -5919,6 +5885,7 @@ def _accepts_keyword(hook: Any, name: str) -> bool:
 # Eager forward runner
 # ---------------------
 
+
 class ForwardRunner(ABC):
     @abstractmethod
     def run(
@@ -5952,6 +5919,7 @@ class EagerForwardRunner(ForwardRunner):
 # ---------------------
 # One-selection forward executor
 # ---------------------
+
 
 class ForwardExecutor:
     def __init__(
@@ -6022,7 +5990,6 @@ class ForwardExecutor:
 # ---------------------
 # Result projection and postprocess
 # ---------------------
-
 
 
 class ForwardPostprocessor:
@@ -6392,7 +6359,7 @@ class ForwardPostprocessor:
 
     @staticmethod
     def _publish_text_entry_state(entry: TextPostprocessEntry, logits: torch.Tensor) -> None:
-        state = entry.interleaved_state
+        state = entry.program_state
         cond = getattr(state, "cond", None)
         if cond is not None:
             cond.t_index = int(entry.position_id) - 1
@@ -6412,7 +6379,7 @@ class ForwardPostprocessor:
             )
 
     @staticmethod
-    def _apply_denoise(plan: ForwardPlan, row_index: int, result: ForwardResult) -> DenoiseOutput:
+    def _apply_denoise(plan: ForwardPlan, row_index: int, result: ForwardResult) -> FlowOutput:
         row = plan.rows[row_index]
         denoise = row.denoise
         if denoise is None:
@@ -6435,7 +6402,7 @@ class ForwardPostprocessor:
             updated = euler_step(update.latent, combined, update.t, update.t_next)
             update.accept_update(updated)
             done = update.step_index + 1 >= update.total_steps
-            return DenoiseOutput(
+            return FlowOutput(
                 req_id=update.req_id,
                 denoise_done=done,
                 num_steps_done=update.step_index + 1,
@@ -6445,7 +6412,7 @@ class ForwardPostprocessor:
             if key not in velocities:
                 raise invalid_descriptor("denoise output is missing branch velocity")
         done = denoise.step_index + 1 >= denoise.total_steps
-        return DenoiseOutput(
+        return FlowOutput(
             req_id=row.req_id,
             denoise_done=done,
             num_steps_done=denoise.step_index + 1,
@@ -6494,16 +6461,6 @@ def _commit_output_from_value(
     return _commit_output_from_dict(req_id, out)
 
 
-
-
-
-
-
-
-
-
-
-
 # ---------------------
 # Step execution over parsed batches
 # ---------------------
@@ -6518,7 +6475,7 @@ _STREAM_OVERLAP_MODES = frozenset(
 def _overlap_eligible(group: list[tuple[int, Mapping[str, Any]]]) -> bool:
     """Plan/forward stream overlap covers text-only groups.
 
-    Denoise, encode, and commit groups run packed graph programs with their own
+    Flow, encode, and commit groups run packed graph programs with their own
     buffer ownership; their prepare phases stay on the forward stream.
     """
 
@@ -6613,7 +6570,7 @@ class ForwardGroupPlanner:
         for mode in ordered_modes:
             items = buckets[mode]
             for start in range(0, len(items), max_batch_ops):
-                groups.append(items[start:start + max_batch_ops])
+                groups.append(items[start : start + max_batch_ops])
         return groups
 
     def _order_groups(
@@ -6926,7 +6883,7 @@ class RunnerComponents:
     additionally wired to the system text-execution stack built in ``__init__``.
     """
 
-    denoise_driver: DenoiseDriver | None = None
+    denoise_driver: FlowExecutor | None = None
     encode_driver: EncodeDriver | None = None
     image_decode_driver: ImageDecodeDriver | None = None
     text_driver: TextDriver | None = None
@@ -6952,7 +6909,7 @@ class RunnerConfig:
 class _ResolvedRunnerDependencies:
     batch_policy: BatchPolicy | None
     attention_backend: Any | None
-    denoise_driver: DenoiseDriver | None
+    denoise_driver: FlowExecutor | None
     encode_driver: EncodeDriver | None
     image_decode_driver: ImageDecodeDriver | None
     text_driver: TextDriver | None
@@ -6983,7 +6940,7 @@ class ModelRunner:
         residency: "ResidencyManager | None" = None,
         batch_policy: BatchPolicy | None = None,
         attention_backend: Any | None = None,
-        denoise_driver: DenoiseDriver | None = None,
+        denoise_driver: FlowExecutor | None = None,
         encode_driver: EncodeDriver | None = None,
         image_decode_driver: ImageDecodeDriver | None = None,
         text_driver: TextDriver | None = None,
@@ -7022,7 +6979,7 @@ class ModelRunner:
         self.attention_backend, self.attention_preference = self._resolve_attention_backend(
             dependencies.attention_backend
         )
-        self.denoise_driver = dependencies.denoise_driver or DenoiseDriver()
+        self.denoise_driver = dependencies.denoise_driver or FlowExecutor()
         self.encode_driver = dependencies.encode_driver or EncodeDriver()
         self.image_decode_driver = dependencies.image_decode_driver or ImageDecodeDriver()
         self._init_text_execution(
@@ -7107,7 +7064,7 @@ class ModelRunner:
 
     def _build_forward_graph_runner(self, model: UniModel) -> Any | None:
         from uniserve_worker.execution.graph import Dispatch
-        from uniserve_worker.execution.graph.path import Batch, Denoise, Segment
+        from uniserve_worker.execution.graph.path import Batch, Flow, Segment
 
         paths = []
         if self.text_graph_runner is not None or callable(
@@ -7121,15 +7078,18 @@ class ModelRunner:
                     executor=self.text_graph_runner,
                 )
             )
+        # Dispatch follows a specialization chain: constrained sequence batches
+        # use their narrower graph program before the general segment program.
+        # Heterogeneous compositions fall through to Segment unchanged.
         paths.append(
             Segment(
-                owner=model,
+                executor=model.segment_executor,
                 states=self.request_states,
                 publisher=self.image_decode_driver,
             )
         )
         paths.append(
-            Denoise(
+            Flow(
                 driver=self.denoise_driver,
                 model=model,
                 states=self.request_states,
@@ -7183,7 +7143,7 @@ class ModelRunner:
         config: RunnerConfig | None,
         batch_policy: BatchPolicy | None,
         attention_backend: Any | None,
-        denoise_driver: DenoiseDriver | None,
+        denoise_driver: FlowExecutor | None,
         encode_driver: EncodeDriver | None,
         image_decode_driver: ImageDecodeDriver | None,
         text_driver: TextDriver | None,

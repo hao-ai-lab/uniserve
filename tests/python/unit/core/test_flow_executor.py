@@ -1,17 +1,22 @@
 """Conformance for runner-owned denoise execution."""
+
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+import uniserve_worker.execution.flow as flow_module
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.execution.engine import (
-    DenoiseDriver,
+    FlowExecutor,
     ModelRunner,
+    PreparedFlowStep,
     RunnerConfig,
-    TextImageDenoiseStep,
-    text_image_cfg_branch_count,
+    flow_cfg_branch_count,
 )
+from uniserve_worker.execution.flow import FlowExecution, FlowState
 from uniserve_worker.nn.diffusion import combine_text_image_cfg
 from uniserve_worker.runtime.request_state import RequestState
 
@@ -28,7 +33,7 @@ class VelocityOnlyModel(ModelHooks):
         return torch.full_like(latent, float(branch.rsplit("_", 1)[-1]))
 
     def forward(self, batch):  # pragma: no cover - denoise must not route here
-        raise AssertionError("denoise should be owned by DenoiseDriver")
+        raise AssertionError("denoise should be owned by FlowExecutor")
 
 
 def test_runner_denoise_driver_threads_rng_cfg_and_cursor():
@@ -69,8 +74,8 @@ class TextImageCapabilityModel(ModelHooks):
         self.applied: torch.Tensor | None = None
         self.inference_modes: list[bool] = []
 
-    def prepare_denoise(self, state, op):
-        return TextImageDenoiseStep(
+    def prepare_flow(self, state, op):
+        return PreparedFlowStep(
             req_id=int(op.get("req_id", 1)),
             state=state,
             op=op,
@@ -84,7 +89,7 @@ class TextImageCapabilityModel(ModelHooks):
             cfg_interval=(0.0, 1.0),
             cfg_renorm_type="none",
             cfg_renorm_min=0.0,
-            cfg_branch_count=text_image_cfg_branch_count(op),
+            cfg_branch_count=flow_cfg_branch_count(op),
             image_scale_applies_to_text=True,
         )
 
@@ -95,14 +100,14 @@ class TextImageCapabilityModel(ModelHooks):
         values = {"cond": 3.0, "text_uncond": 2.0, "img_uncond": 1.0}
         return torch.full_like(step.latent, values[branch])
 
-    def accept_denoise_update(self, step, latent):
+    def accept_flow_update(self, step, latent):
         self.applied = latent
 
 
 def test_text_image_driver_uses_image_scale_when_only_image_branch_is_needed():
     model = TextImageCapabilityModel(text_scale=1.0, img_scale=3.0)
 
-    DenoiseDriver().step(1, RequestState(), model, {})
+    FlowExecutor().step(1, RequestState(), model, {})
 
     assert model.calls == ["cond", "img_uncond"]
     # Cross-check against the production combiner with the branches the driver
@@ -125,7 +130,7 @@ def test_text_image_driver_uses_image_scale_when_only_image_branch_is_needed():
 def test_text_image_driver_honors_explicit_single_branch_cfg_bound():
     model = TextImageCapabilityModel(text_scale=4.0, img_scale=1.0)
 
-    DenoiseDriver().step(1, RequestState(), model, {"cfg": {"branch_count": 1}})
+    FlowExecutor().step(1, RequestState(), model, {"cfg": {"branch_count": 1}})
 
     assert model.calls == ["cond"]
     torch.testing.assert_close(model.applied, torch.tensor([[3.0]]))
@@ -137,9 +142,9 @@ class BatchedTextImageCapabilityModel(ModelHooks):
         self.predict_calls: list[str] = []
         self.applied: dict[int, torch.Tensor] = {}
 
-    def prepare_denoise(self, state, op):
+    def prepare_flow(self, state, op):
         req_id = int(op["req_id"])
-        return TextImageDenoiseStep(
+        return PreparedFlowStep(
             req_id=req_id,
             state=state,
             op=op,
@@ -155,12 +160,14 @@ class BatchedTextImageCapabilityModel(ModelHooks):
             cfg_renorm_min=0.0,
         )
 
-    def predict_velocity(self, step, t, latent, branch):  # pragma: no cover - batch hook should handle it.
+    def predict_velocity(
+        self, step, t, latent, branch
+    ):  # pragma: no cover - batch hook should handle it.
         del step, t, latent
         self.predict_calls.append(branch)
         raise AssertionError("sequential text-image branch predictor should not be called")
 
-    def predict_text_image_velocity_batch(self, steps, branches_by_step):
+    def predict_flow_velocity_batch(self, steps, branches_by_step):
         self.batch_calls.append([list(branches) for branches in branches_by_step])
         outputs = []
         for step, branches in zip(steps, branches_by_step):
@@ -171,7 +178,7 @@ class BatchedTextImageCapabilityModel(ModelHooks):
             outputs.append(values)
         return outputs
 
-    def accept_denoise_update(self, step, latent):
+    def accept_flow_update(self, step, latent):
         self.applied[int(step.req_id)] = latent
 
 
@@ -209,8 +216,8 @@ class IntervalGatedTextImageModel(ModelHooks):
         self.calls: list[str] = []
         self.applied: torch.Tensor | None = None
 
-    def prepare_denoise(self, state, op):
-        return TextImageDenoiseStep(
+    def prepare_flow(self, state, op):
+        return PreparedFlowStep(
             req_id=int(op.get("req_id", 1)),
             state=state,
             op=op,
@@ -232,18 +239,20 @@ class IntervalGatedTextImageModel(ModelHooks):
     def predict_velocity(self, step, t, latent, branch):
         del t, latent
         self.calls.append(branch)
-        return torch.full_like(step.latent, {"cond": 3.0, "text_uncond": 2.0, "img_uncond": 1.0}[branch])
+        return torch.full_like(
+            step.latent, {"cond": 3.0, "text_uncond": 2.0, "img_uncond": 1.0}[branch]
+        )
 
-    def accept_denoise_update(self, step, latent):
+    def accept_flow_update(self, step, latent):
         self.applied = latent
 
 
 def test_text_image_driver_skips_cfg_branches_when_t_falls_outside_interval():
-    # ``_text_image_branches`` host-syncs ``step.t`` and disables CFG when the
+    # ``_flow_branches`` host-syncs ``step.t`` and disables CFG when the
     # timestep is outside ``cfg_interval``; only the conditioned branch should run.
     model = IntervalGatedTextImageModel(t=0.9, interval=(0.2, 0.8))
 
-    DenoiseDriver().step(1, RequestState(), model, {})
+    FlowExecutor().step(1, RequestState(), model, {})
 
     assert model.calls == ["cond"]
     # With CFG gated off the combiner returns ``out_cond`` unchanged.
@@ -255,13 +264,13 @@ def test_text_image_driver_runs_cfg_branches_when_t_inside_interval():
     # the gate is driven by the timestep value and not statically disabled.
     model = IntervalGatedTextImageModel(t=0.5, interval=(0.2, 0.8))
 
-    DenoiseDriver().step(1, RequestState(), model, {})
+    FlowExecutor().step(1, RequestState(), model, {})
 
     assert model.calls == ["cond", "text_uncond", "img_uncond"]
 
 
 def test_generic_latent_init_lands_on_driver_device_and_seeds_from_rng():
-    # Covers DenoiseDriver._latent: the lazily-initialised latent must live on
+    # Covers FlowExecutor._latent: the lazily-initialised latent must live on
     # the driver's device and be reproducible from the request seed.
     model = VelocityOnlyModel()
     op = {
@@ -272,7 +281,7 @@ def test_generic_latent_init_lands_on_driver_device_and_seeds_from_rng():
     }
 
     state_a = RequestState()
-    DenoiseDriver(device="cpu").step(11, state_a, model, op)
+    FlowExecutor(device="cpu").step(11, state_a, model, op)
     assert isinstance(state_a.latent, torch.Tensor)
     assert state_a.latent.device.type == "cpu"
 
@@ -284,5 +293,75 @@ def test_generic_latent_init_lands_on_driver_device_and_seeds_from_rng():
     state_b = RequestState()
     model_b = VelocityOnlyModel()
     # branch_0 velocity equals 0.0, so euler_step leaves the initial latent intact.
-    DenoiseDriver(device="cpu").step(11, state_b, model_b, op)
+    FlowExecutor(device="cpu").step(11, state_b, model_b, op)
     torch.testing.assert_close(state_b.latent, expected_noise)
+
+
+def test_single_flow_row_uses_required_graph_batch_path(monkeypatch):
+    class PagedCache:
+        pass
+
+    class Adapter:
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, bool, str]] = []
+
+    monkeypatch.setattr(flow_module, "PagedTextCache", PagedCache)
+    adapter = Adapter()
+    execution = FlowExecution(adapter)
+    latent = torch.zeros(1)
+    pool = SimpleNamespace(get=lambda handle: latent, set=lambda handle, value: None)
+    state = FlowState(
+        latent_pool=pool,
+        latent_handle=0,
+        schedule=None,
+        timesteps=torch.zeros(2),
+        token_h=2,
+        token_w=2,
+        grid_h=4,
+        grid_w=4,
+        grid_hw=torch.tensor([[4, 4]]),
+        indexes_cond=torch.zeros(3, 4, dtype=torch.long),
+        indexes_tu=None,
+        indexes_iu=None,
+        cond_cache=PagedCache(),
+        tu_cache=None,
+        iu_cache=None,
+        cfg_text_scale=1.0,
+        cfg_img_scale=1.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_norm="none",
+        cfg_renorm_min=0.0,
+        noise_scale=0.0,
+        height=64,
+        width=64,
+    )
+    step = PreparedFlowStep(
+        req_id=1,
+        state=None,
+        op={},
+        latent=torch.zeros(1, 4, 8),
+        t=torch.zeros(1),
+        t_next=torch.zeros(1),
+        step_index=0,
+        total_steps=8,
+        cfg_text_scale=1.0,
+        cfg_img_scale=1.0,
+        cfg_interval=(0.0, 1.0),
+        cfg_renorm_type="none",
+        cfg_renorm_min=0.0,
+        extra={"img": state, "image_embeds": torch.ones(1, 4, 8)},
+    )
+
+    def predict_batched(rows, *, return_hidden=False, graph_mode="auto"):
+        adapter.calls.append((len(rows), bool(return_hidden), str(graph_mode)))
+        return torch.ones_like(rows[0].step.latent)
+
+    execution._predict_v_batched = predict_batched
+
+    result = execution.predict_flow_velocity_batch([step], [["cond"]], graph_mode="require")
+
+    assert result is not None
+    torch.testing.assert_close(result[0]["cond"], torch.ones(1, 4, 8))
+    assert adapter.calls == [(1, False, "require")]

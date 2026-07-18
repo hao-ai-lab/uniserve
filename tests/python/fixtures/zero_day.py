@@ -4,6 +4,7 @@ This model is intentionally tiny, but it exercises the real runner-owned
 denoise path and the new ``cfg_zero_star`` guidance primitive as a model add
 without being auto-discovered as a production model.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -53,7 +54,7 @@ class UniServeZeroDayCfgZeroStarModel(ModelHooks):
         return BatchPolicy(max_batch_ops=1024, supports_mixed_modes=True)
 
     def forward(self, _batch):
-        raise AssertionError("zero-day diffusion must be driven by DenoiseDriver")
+        raise AssertionError("zero-day diffusion must be driven by FlowExecutor")
 
     def predict_velocity(self, ctx, t, latent, branch):
         del ctx, t

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from uniserve_worker.execution.flow import FlowExecution
 from uniserve_worker.foundation.errors import WorkerError
-from uniserve_worker.models.interleaved_image import TextImageDenoiseOps
 from uniserve_worker.runtime.image_params import parse_text_image_generation_params
 from uniserve_worker.runtime.masks import build_commit_attention_mask
 
@@ -23,7 +25,7 @@ def test_commit_attention_mask_blocks_image_tokens_from_end_marker_only():
 
 
 def test_image_params_preserve_zero_cfg_values_and_reject_zero_steps():
-    ops = TextImageDenoiseOps()
+    ops = FlowExecution(SimpleNamespace())
 
     params = ops._parse_image_params(
         {

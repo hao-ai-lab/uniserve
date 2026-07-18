@@ -1,4 +1,5 @@
 """Audited normalization primitives shared by all model ports."""
+
 from __future__ import annotations
 
 from typing import overload
@@ -9,8 +10,8 @@ import torch.nn as nn
 from ..foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
 
 __all__ = [
-    'RMSNorm',
-    'try_triton_qk_rms_norm',
+    "RMSNorm",
+    "try_triton_qk_rms_norm",
 ]
 
 try:  # pragma: no cover - availability depends on the serving environment.
@@ -35,7 +36,9 @@ _NORM_NARROW_WARPS = 4
 if triton is not None:
 
     @triton.jit
-    def _rms_norm_kernel(x_ptr, w_ptr, y_ptr, n_cols: tl.constexpr, eps: tl.constexpr, block: tl.constexpr):
+    def _rms_norm_kernel(
+        x_ptr, w_ptr, y_ptr, n_cols: tl.constexpr, eps: tl.constexpr, block: tl.constexpr
+    ):
         row = tl.program_id(0)
         offs = tl.arange(0, block)
         mask = offs < n_cols
@@ -123,13 +126,12 @@ if triton is not None:
         tl.store(k_out_ptr + k_pid * n_cols + offs, k_out, mask=k_mask)
 
 
-
 class RMSNorm(nn.Module):
     """RMSNorm with fp32 variance accumulation.
 
     Matches the local RMSNorm variants used by current model ports. Uses fp32
     for the variance reduction because low-precision norm drift is visible in
-    long interleaved generations.
+    long composed generations.
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -180,11 +182,7 @@ def _norm_inputs_eligible(hidden_states: torch.Tensor, weight: torch.Tensor) -> 
 
 
 def _triton_norm_available(device: torch.device) -> bool:
-    return (
-        triton is not None
-        and triton_fused_layers_enabled()
-        and triton_device_supported(device)
-    )
+    return triton is not None and triton_fused_layers_enabled() and triton_device_supported(device)
 
 
 def _sgl_rms_norm_input(hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -206,7 +204,6 @@ def _norm_launch_config(hidden_size: int) -> tuple[int, int]:
 
 def _reshape_norm_rows(tensor: torch.Tensor, hidden_size: int) -> torch.Tensor:
     return tensor.reshape(tensor.numel() // int(hidden_size), int(hidden_size))
-
 
 
 class _TritonRmsNorm:
@@ -245,7 +242,6 @@ class _EagerRmsNorm:
 
 
 _AddRmsResult = tuple[torch.Tensor, torch.Tensor]
-
 
 
 class _TritonAddRmsNorm:

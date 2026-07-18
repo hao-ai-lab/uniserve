@@ -1,4 +1,4 @@
-"""Denoise-step CUDA graph capture/replay on the real transient paged-varlen path.
+"""Flow-step CUDA graph capture/replay on the real transient paged-varlen path.
 
 Covers the observable contract of ``uniserve_worker.execution.forward.graph.denoise_step``:
 
@@ -18,6 +18,7 @@ Covers the observable contract of ``uniserve_worker.execution.forward.graph.deno
 The capture/replay tests need a CUDA device plus the FlashInfer paged prefill
 wrapper; they skip cleanly elsewhere. Key-shape tests are pure Python.
 """
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -27,10 +28,10 @@ import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.models.interleaved_image import (
-    DenoiseRow,
-    DenoiseStepGraphRunner,
-    maybe_run_denoise_step_graph,
+from uniserve_worker.execution.flow import (
+    FlowGraphExecution,
+    FlowGraphRunner,
+    FlowRow,
 )
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.ops import AttentionRegime
@@ -62,15 +63,15 @@ requires_flashinfer = pytest.mark.skipif(
 _HEAD_DIM = 64
 _TOKEN_H, _TOKEN_W = 4, 8
 _N_TOKENS = _TOKEN_H * _TOKEN_W  # 32 transient tokens per branch
-_BASE_LEN = 16                   # one full block of conditioning KV per branch
+_BASE_LEN = 16  # one full block of conditioning KV per branch
 _BLOCK_SIZE = 16
 _DTYPE = torch.bfloat16
 
 
 class _TinyDenoiseOwner:
-    """Minimal ``TextImageDenoiseOwner`` slice driving the real transient path.
+    """Minimal ``FlowAdapter`` slice driving the real transient path.
 
-    ``interleaved_image_predict_velocity`` mirrors the production contract: a
+    ``flow_predict_velocity`` mirrors the production contract: a
     projection into q/k/v, the transient paged-varlen attention through
     ``RadixAttention`` (writing transient KV into the caches' scratch pages and
     attending over the conditioning prefix), then a deterministic velocity head
@@ -83,14 +84,16 @@ class _TinyDenoiseOwner:
         self.pool = pool
         self.attention_backend = "auto"
         self.attn = RadixAttention(1, 1, _HEAD_DIM, layer_id=0)
+
         def _w() -> torch.Tensor:
             return torch.randn(_HEAD_DIM, _HEAD_DIM, device=device, dtype=_DTYPE, generator=gen)
+
         self.wq, self.wk, self.wv, self.wo = _w(), _w(), _w(), _w()
 
     def _wait_gen_cache_ready(self, cache) -> None:
         return None
 
-    def interleaved_image_predict_velocity(
+    def flow_predict_velocity(
         self,
         image_embeds: torch.Tensor,
         indexes: torch.Tensor,
@@ -123,7 +126,7 @@ class _TinyDenoiseOwner:
 class _FailingOwner(_TinyDenoiseOwner):
     """Owner whose denoise forward always fails (capture warmup raises)."""
 
-    def interleaved_image_predict_velocity(self, *args, **kwargs):
+    def flow_predict_velocity(self, *args, **kwargs):
         raise ValueError("synthetic denoise forward failure")
 
 
@@ -250,7 +253,7 @@ def _make_rows(
     *,
     seed: int,
     t_value: float,
-) -> list[DenoiseRow]:
+) -> list[FlowRow]:
     """One denoise step's grouped CFG rows (shared img geometry, per-row inputs)."""
 
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -279,7 +282,7 @@ def _make_rows(
         )
         step = SimpleNamespace(extra={"image_embeds": embeds}, latent=latent, t=t)
         rows.append(
-            DenoiseRow(
+            FlowRow(
                 step_index=0,
                 step=step,
                 branch="cond" if row_index == 0 else "text_uncond",
@@ -291,7 +294,7 @@ def _make_rows(
     return rows
 
 
-def _eager_reference(owner: _TinyDenoiseOwner, rows: list[DenoiseRow], *, return_hidden: bool = False):
+def _eager_reference(owner: _TinyDenoiseOwner, rows: list[FlowRow], *, return_hidden: bool = False):
     """The exact eager ``_predict_v_batched`` tail the graph replaces."""
 
     first = rows[0]
@@ -299,7 +302,7 @@ def _eager_reference(owner: _TinyDenoiseOwner, rows: list[DenoiseRow], *, return
     indexes = torch.stack([row.indexes for row in rows], dim=1).contiguous()
     cache = BatchedPagedTextCache([row.cache for row in rows])
     z = torch.cat([row.step.latent for row in rows], dim=0)
-    return owner.interleaved_image_predict_velocity(
+    return owner.flow_predict_velocity(
         image_embeds,
         indexes,
         {"full_attention": None},
@@ -322,7 +325,7 @@ def _scoped_prefill_keys(backend) -> list:
     return [key for key in backend._prefill_wrappers if key.scope is not None]
 
 
-def _run(runner: DenoiseStepGraphRunner, owner, rows, *, return_hidden: bool = False):
+def _run(runner: FlowGraphRunner, owner, rows, *, return_hidden: bool = False):
     stats = ForwardStats()
     with torch.inference_mode(), use_forward_context(ForwardContext(stats=stats)):
         out = runner.maybe_run_rows(owner, rows, return_hidden=return_hidden)
@@ -343,10 +346,10 @@ def test_rows_key_rejects_non_cuda_inputs():
     )
     img = SimpleNamespace(token_h=2, token_w=2, height=32, width=32)
     cache = SimpleNamespace(pool=SimpleNamespace(), length=16, block_ids=[3, 4])
-    row = DenoiseRow(0, step, "cond", img, torch.zeros(3, 4, dtype=torch.long), cache)
+    row = FlowRow(0, step, "cond", img, torch.zeros(3, 4, dtype=torch.long), cache)
 
     # CPU inputs are never graph-eligible.
-    assert DenoiseStepGraphRunner._rows_key([row], False) is None
+    assert FlowGraphRunner._rows_key([row], False) is None
 
 
 def test_rows_key_component_stability_and_change_detection():
@@ -370,24 +373,26 @@ def test_rows_key_component_stability_and_change_detection():
                 t=t,
             )
             out.append(
-                DenoiseRow(0, step, "cond", img, torch.zeros(3, 4, dtype=torch.long, device=device), cache)
+                FlowRow(
+                    0, step, "cond", img, torch.zeros(3, 4, dtype=torch.long, device=device), cache
+                )
             )
         return out
 
-    key_a = DenoiseStepGraphRunner._rows_key(rows(), False)
-    key_b = DenoiseStepGraphRunner._rows_key(rows(), False)
+    key_a = FlowGraphRunner._rows_key(rows(), False)
+    key_b = FlowGraphRunner._rows_key(rows(), False)
     assert key_a is not None and key_a == key_b
 
-    assert DenoiseStepGraphRunner._rows_key(rows(), True) != key_a  # return_hidden in key
+    assert FlowGraphRunner._rows_key(rows(), True) != key_a  # return_hidden in key
 
     caches[0].length = 17
-    assert DenoiseStepGraphRunner._rows_key(rows(), False) == key_a
+    assert FlowGraphRunner._rows_key(rows(), False) == key_a
     caches[0].length = 16
 
     caches[1].block_ids = [3, 5]
-    assert DenoiseStepGraphRunner._rows_key(rows(), False) == key_a
+    assert FlowGraphRunner._rows_key(rows(), False) == key_a
     caches[1].block_ids = [3, 4, 5]
-    assert DenoiseStepGraphRunner._rows_key(rows(), False) != key_a
+    assert FlowGraphRunner._rows_key(rows(), False) != key_a
 
 
 # --------------------------------------------------------------------------- #
@@ -403,7 +408,7 @@ def test_denoise_step_graph_replay_is_bitwise_identical_to_eager():
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=0)
     caches = _make_caches(pool, device, seed=1)
-    runner = DenoiseStepGraphRunner(default_enabled=True)
+    runner = FlowGraphRunner(default_enabled=True)
 
     rows_a = _make_rows(caches, device, seed=10, t_value=0.9)
     with torch.inference_mode():
@@ -436,7 +441,7 @@ def test_denoise_step_graph_microbatches_large_row_groups():
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=14)
     caches = _make_caches(pool, device, seed=15, row_count=8)
-    runner = DenoiseStepGraphRunner(default_enabled=True)
+    runner = FlowGraphRunner(default_enabled=True)
     rows = _make_rows(caches, device, seed=130, t_value=0.7)
 
     with torch.inference_mode():
@@ -466,7 +471,7 @@ def test_denoise_step_graph_survives_foreign_shared_wrapper_replans():
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=2)
     caches = _make_caches(pool, device, seed=3)
-    runner = DenoiseStepGraphRunner(default_enabled=True)
+    runner = FlowGraphRunner(default_enabled=True)
 
     rows_a = _make_rows(caches, device, seed=30, t_value=0.8)
     out_a, _ = _run(runner, owner, rows_a)
@@ -503,7 +508,7 @@ def test_denoise_step_graph_outputs_do_not_alias_static_buffers():
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=5)
     caches = _make_caches(pool, device, seed=6)
-    runner = DenoiseStepGraphRunner(default_enabled=True)
+    runner = FlowGraphRunner(default_enabled=True)
 
     rows_a = _make_rows(caches, device, seed=60, t_value=0.9)
     with torch.inference_mode():
@@ -538,8 +543,7 @@ def test_denoise_step_graph_rebinds_across_images_and_clear_frees_bindings():
     pool = _make_pool(device)
     owner = _TinyDenoiseOwner(device, pool, seed=7)
     caches = _make_caches(pool, device, seed=8)
-    runner = DenoiseStepGraphRunner(default_enabled=True)
-    owner._denoise_step_graph_runner = runner
+    runner = FlowGraphRunner(default_enabled=True)
     backend = _flashinfer_backend()
     scoped_before = set(_scoped_prefill_keys(backend))
 
@@ -585,11 +589,12 @@ def test_denoise_step_graph_is_enabled_by_default():
     with torch.inference_mode():
         eager = _eager_reference(owner, rows)
     with torch.inference_mode(), use_forward_context(ForwardContext(stats=ForwardStats())):
-        out = maybe_run_denoise_step_graph(owner, rows)
+        execution = FlowGraphExecution(owner)
+        out = execution.maybe_run_graph(rows)
     torch.cuda.synchronize()
     assert out is not None
     assert torch.equal(out, eager)
-    runner = owner._denoise_step_graph_runner
+    runner = execution.graph_runner
     runner.clear()
     assert runner.states == {}
 
@@ -602,7 +607,7 @@ def test_denoise_step_graph_capture_failure_falls_back_then_hard_disables():
     pool = _make_pool(device)
     owner = _FailingOwner(device, pool, seed=11)
     caches = _make_caches(pool, device, seed=12)
-    runner = DenoiseStepGraphRunner(default_enabled=True)
+    runner = FlowGraphRunner(default_enabled=True)
     backend = _flashinfer_backend()
     scoped_before = set(_scoped_prefill_keys(backend))
 

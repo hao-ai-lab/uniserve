@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.engine import TextImageDenoiseSession, TextImageDenoiseStep
+from uniserve_worker.execution.engine import FlowSession, PreparedFlowStep
 from uniserve_worker.models.bagel import (
     BagelConfig,
     BagelForUnifiedGeneration,
@@ -117,7 +117,7 @@ def test_bagel_euler_update_keeps_fp32_state_and_matches_reference_arithmetic(de
     t_next = torch.tensor(0.7, dtype=torch.float32, device=device)
     expected = latent - velocity * (t - t_next)
     generation_state = SimpleNamespace(x_t=latent)
-    step = TextImageDenoiseStep(
+    step = PreparedFlowStep(
         req_id=1,
         state=RequestState(),
         op={},
@@ -134,11 +134,11 @@ def test_bagel_euler_update_keeps_fp32_state_and_matches_reference_arithmetic(de
         extra={"gs": generation_state},
     )
 
-    session = TextImageDenoiseSession(
+    session = FlowSession(
         owner,
         step,
         combine_velocity=lambda _step, values: values["cond"],
-        accept_update=lambda model, current_step, updated: model.apply_denoise_update(
+        accept_update=lambda model, current_step, updated: model.apply_flow_update(
             current_step, updated
         ),
     )

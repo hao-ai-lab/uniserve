@@ -91,18 +91,16 @@ class Runner(Capture):
         metric_prefix: str = _DEFAULT_METRIC_PREFIX,
         logger: Any = None,
     ) -> None:
-        self.name = str(name)
-        self.default_enabled = bool(default_enabled)
-        self.default_warmup = bool(default_warmup)
+        super().__init__(
+            name=name,
+            default_enabled=default_enabled,
+            default_warmup=default_warmup,
+            metric_prefix=metric_prefix,
+            logger=logger,
+        )
         self.default_warmup_batch_sizes = tuple(
             sorted({int(size) for size in default_warmup_batch_sizes if int(size) > 0})
         )
-        self.metric_prefix = str(metric_prefix)
-        self.logger = logger
-        self.states: dict[int, State] = {}
-        self.disabled: set[int] = set()
-        self._capture_pool: Any = None
-        self._graph_input_buffer_pool: dict[tuple[str, str, str], torch.Tensor] = {}
 
     def warmup_batch_sizes(self) -> tuple[int, ...]:
         return self.default_warmup_batch_sizes
@@ -1224,7 +1222,7 @@ def resolve_prepare(
     ``query_geometry`` hook, and the backend must expose
     graph-aware planning (otherwise the capture-time plan would be baked in and
     the caller must stay eager). ``before`` runs first on every capture/replay
-    for caller-specific static state (e.g. the interleaved indexes sidecar).
+    for caller-specific static state (for example a sequence-index sidecar).
     """
 
     geometry_hook = getattr(owner, "query_geometry", None)

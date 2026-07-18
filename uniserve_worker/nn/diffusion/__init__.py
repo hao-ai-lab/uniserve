@@ -1,11 +1,12 @@
 """Shared diffusion execution primitives."""
+
 from .cfg import (
     Branch,
     CfgParams,
     CfgPlan,
     CfgRecipe,
     RenormKind,
-    build_text_image_cfg_plan,
+    build_flow_cfg_plan,
     combine_cfg,
     combine_text_image_cfg,
 )
@@ -27,7 +28,7 @@ __all__ = [
     "ScheduleDirection",
     "ScheduleShiftDomain",
     "TimestepEmbedder",
-    "build_text_image_cfg_plan",
+    "build_flow_cfg_plan",
     "combine_cfg",
     "combine_text_image_cfg",
     "euler_step",

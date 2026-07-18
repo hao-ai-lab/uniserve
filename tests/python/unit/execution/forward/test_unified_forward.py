@@ -34,8 +34,8 @@ from uniserve_worker.execution.engine import (
 )
 from uniserve_worker.execution.engine import UnifiedForwardBatchBuilder as ForwardBatchBuilder
 from uniserve_worker.execution.graph import Dispatch, key
-from uniserve_worker.execution.graph.path import Batch, Denoise, Segment
-from uniserve_worker.models.packed_forward import PackedForwardModelMixin
+from uniserve_worker.execution.graph.path import Batch, Flow, Segment
+from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.runtime.request_state import RequestStateTable
 
 pytestmark = pytest.mark.unit
@@ -253,7 +253,7 @@ def test_dispatch_preserves_explicit_path_precedence():
     batch = ForwardBatchBuilder().build(plan)
     dispatch = Dispatch(
         paths=(
-            Segment(owner=owner, states=states),
+            Segment(executor=owner, states=states),
             Batch(driver=Driver(), model=owner, states=states),
         )
     )
@@ -294,8 +294,8 @@ def test_general_segment_path_owns_uniform_denoise_when_available():
     batch = ForwardBatchBuilder().build(plan)
     dispatch = Dispatch(
         paths=(
-            Segment(owner=owner, states=states),
-            Denoise(driver=Driver(), model=owner, states=states),
+            Segment(executor=owner, states=states),
+            Flow(driver=Driver(), model=owner, states=states),
         )
     )
 
@@ -308,7 +308,6 @@ def test_general_segment_path_owns_uniform_denoise_when_available():
 
 
 def test_segment_path_runs_graph_only_forward_result(monkeypatch):
-
     class RequestStates:
         def __init__(self) -> None:
             self.states = {2: object()}
@@ -316,21 +315,13 @@ def test_segment_path_runs_graph_only_forward_result(monkeypatch):
         def get(self, req_id: int):
             return self.states[int(req_id)]
 
-    class Residual:
+    class Owner:
         def __init__(self) -> None:
-            self.invalidated = False
-
-        def invalidate(self) -> None:
-            self.invalidated = True
-
-    class Owner(PackedForwardModelMixin):
-        def __init__(self) -> None:
-            self.residual = Residual()
             self.prepared: list[tuple[Any, dict[str, Any]]] = []
 
-        def prepare_denoise(self, state, op):
+        def prepare_flow(self, state, op):
             self.prepared.append((state, op))
-            return SimpleNamespace(extra={"img": SimpleNamespace(residual_cache=self.residual)})
+            return SimpleNamespace(extra={})
 
         def packed_decoder_forward(self):
             raise AssertionError("packed graph program should require the graph path")
@@ -344,14 +335,15 @@ def test_segment_path_runs_graph_only_forward_result(monkeypatch):
         def packed_hidden_to_velocity(self):
             raise AssertionError("fake packed runner owns the graph-only result")
 
-        def packed_graph_attention(self):
+        def segment_graph_attention(self):
             raise AssertionError("fake packed runner owns the graph-only result")
 
     owner = Owner()
+    segment_executor = SegmentExecutor(owner)
     states = RequestStates()
 
     def fake_run(owner_arg, dispatch_batch, states_arg, denoise_steps, **kwargs):
-        assert owner_arg is owner
+        assert owner_arg is segment_executor
         assert states_arg is states
         assert [op["req_id"] for op in dispatch_batch.ops] == [1, 2]
         assert [row for row, _step in denoise_steps] == [1]
@@ -362,8 +354,8 @@ def test_segment_path_runs_graph_only_forward_result(monkeypatch):
         }
         return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
 
-    owner.run_packed_forward_result = (
-        lambda *args, **kwargs: fake_run(owner, *args, **kwargs)
+    segment_executor.run_segment_forward_result = lambda *args, **kwargs: fake_run(
+        segment_executor, *args, **kwargs
     )
     ops = [
         {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
@@ -377,9 +369,7 @@ def test_segment_path_runs_graph_only_forward_result(monkeypatch):
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=Dispatch(
-            paths=(Segment(owner=owner, states=states),)
-        ),
+        graph_runner=Dispatch(paths=(Segment(executor=segment_executor, states=states),)),
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
 
@@ -388,18 +378,17 @@ def test_segment_path_runs_graph_only_forward_result(monkeypatch):
     assert result.graph is not None and result.graph.path == "segment"
     torch.testing.assert_close(result.text_logits, torch.tensor([[3.0]]))
     assert owner.prepared == [(states.states[2], ops[1])]
-    assert owner.residual.invalidated is True
 
 
 def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
     class RequestStates:
         pass
 
-    class Owner(PackedForwardModelMixin):
+    class Owner:
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
-        def prepare_denoise(self, state, op):
+        def prepare_flow(self, state, op):
             raise AssertionError("burst execution must stay inside the composite graph adapter")
 
         def packed_decoder_forward(self):
@@ -414,17 +403,26 @@ def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
         def packed_hidden_to_velocity(self):
             raise AssertionError("outer graph execution must not invoke velocity projection")
 
-        def packed_graph_attention(self):
+        def segment_graph_attention(self):
             raise AssertionError("outer graph execution must not inspect attention")
 
-        def _run_forward_adapter(self, batch, **kwargs):
-            self.calls.append({"batch": batch, **kwargs})
-            return [
-                {"req_id": 1, "sampled_token_id": 17, "sampled_token_ids": [10, 17]},
-                {"req_id": 2, "denoise_done": False, "num_steps_done": 1},
-            ]
-
     owner = Owner()
+    segment_executor = SegmentExecutor(owner)
+
+    def execute(batch, *, request_states, defer_text_cpu_results=False):
+        owner.calls.append(
+            {
+                "batch": batch,
+                "request_states": request_states,
+                "defer_text_cpu_results": defer_text_cpu_results,
+            }
+        )
+        return [
+            {"req_id": 1, "sampled_token_id": 17, "sampled_token_ids": [10, 17]},
+            {"req_id": 2, "denoise_done": False, "num_steps_done": 1},
+        ]
+
+    segment_executor.execute = execute
     states = RequestStates()
     ops = [
         {
@@ -450,9 +448,7 @@ def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=Dispatch(
-            paths=(Segment(owner=owner, states=states),)
-        ),
+        graph_runner=Dispatch(paths=(Segment(executor=segment_executor, states=states),)),
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
 
@@ -467,14 +463,12 @@ def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
         {
             "batch": dispatch_batch,
             "request_states": states,
-            "group": list(enumerate(ops)),
             "defer_text_cpu_results": True,
         }
     ]
 
 
 def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
-
     class RequestStates:
         def __init__(self) -> None:
             self.states = {3: SimpleNamespace(latent="latent")}
@@ -482,8 +476,8 @@ def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
         def get(self, req_id: int):
             return self.states[int(req_id)]
 
-    class Owner(PackedForwardModelMixin):
-        def prepare_denoise(self, state, op):
+    class Owner:
+        def prepare_flow(self, state, op):
             return SimpleNamespace(extra={})
 
         def packed_decoder_forward(self):
@@ -495,7 +489,7 @@ def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
         def packed_text_logits(self):
             raise AssertionError("fake packed runner owns the graph result")
 
-        def packed_graph_attention(self):
+        def segment_graph_attention(self):
             raise AssertionError("fake packed runner owns the graph result")
 
     class ImageDecodeDriver:
@@ -506,6 +500,7 @@ def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
             return ForwardResult(commit_outputs={1: {"image_hw": [4, 5]}})
 
     owner = Owner()
+    segment_executor = SegmentExecutor(owner)
     states = RequestStates()
     ops = [
         {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
@@ -513,14 +508,14 @@ def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
     ]
 
     def fake_run(owner_arg, dispatch_batch, states_arg, denoise_steps, **kwargs):
-        assert owner_arg is owner
+        assert owner_arg is segment_executor
         assert states_arg is states
         assert [dict(op) for op in dispatch_batch.ops] == ops
         assert denoise_steps == []
         return ForwardResult(text_logits=torch.tensor([[3.0]], dtype=torch.float32))
 
-    owner.run_packed_forward_result = (
-        lambda *args, **kwargs: fake_run(owner, *args, **kwargs)
+    segment_executor.run_segment_forward_result = lambda *args, **kwargs: fake_run(
+        segment_executor, *args, **kwargs
     )
     handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
     plan = ForwardPlanBuilder().build(
@@ -533,7 +528,7 @@ def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
         graph_runner=Dispatch(
             paths=(
                 Segment(
-                    owner=owner,
+                    executor=segment_executor,
                     states=states,
                     publisher=ImageDecodeDriver(),
                 ),
@@ -583,19 +578,13 @@ def test_denoise_path_runs_required_graph_mode():
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
-        graph_runner=Dispatch(
-            paths=(
-                Denoise(
-                    driver=driver, model="model", states=states
-                ),
-            )
-        ),
+        graph_runner=Dispatch(paths=(Flow(driver=driver, model="model", states=states),)),
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
 
     result = executor.execute(batch, plan)
 
-    assert result.graph is not None and result.graph.path == "denoise"
+    assert result.graph is not None and result.graph.path == "flow"
     assert driver.calls == [
         (
             [(5, states.states[5], op)],
@@ -1198,7 +1187,7 @@ def test_worker_adapter_denoise_result_updates_latent_only_in_postprocess():
 
         def step_many(self, *args, **kwargs):
             raise AssertionError(
-                "typed denoise adapter path should not call DenoiseDriver.step_many"
+                "typed denoise adapter path should not call FlowExecutor.step_many"
             )
 
     class Model(ModelHooks):
@@ -1525,7 +1514,7 @@ def test_worker_adapter_private_hook_accepts_any_segment_group(op):
     assert result is expected
 
 
-def test_postprocessor_mixed_text_entry_samples_relays_and_advances_interleaved_state():
+def test_postprocessor_mixed_text_entry_samples_relays_and_advances_program_state():
     text_op = {"req_id": 4, "kind": "decode_und", "token_ids": [8], "pos_range": [6, 7]}
     denoise_op = {"req_id": 5, "kind": "denoise_gen"}
     text_state = _FakeTextState()
@@ -1555,7 +1544,7 @@ def test_postprocessor_mixed_text_entry_samples_relays_and_advances_interleaved_
                 position_id=7,
                 kv_new_length=7,
                 last_input_token=8,
-                interleaved_state=image_state,
+                program_state=image_state,
                 persistent_cache=cache,
             ),
         ),

@@ -18,13 +18,10 @@ import torch.nn as nn
 from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from uniserve_worker.execution.engine import TextImageDenoiseStep, text_image_cfg_branch_count
-from uniserve_worker.models.interleaved_image import DenoiseRow, maybe_run_denoise_step_graph
-from uniserve_worker.models.interleaved_text import InterleavedTextCacheDriver, TextCache
-from uniserve_worker.models.packed_forward import (
-    PackedForwardExecutor,
-    PackedForwardModelMixin,
-)
+from uniserve_worker.execution.engine import PreparedFlowStep, flow_cfg_branch_count
+from uniserve_worker.execution.flow import FlowGraphExecution, FlowRow
+from uniserve_worker.execution.segment import SegmentExecutor
+from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.paged_denoise import (
     PagedDenoiseBranchSet,
     can_run_paged_denoise_attention,
@@ -678,7 +675,7 @@ _BAGEL_SCRATCH_CAPACITY_TOKENS = 65536
 
 @dataclass
 class BagelTextRequestState:
-    """Per-request text-cache state for the shared interleaved text driver.
+    """Per-request state for system sequence execution.
 
     ``cond`` is the single conditional text branch; its ``block_ids`` list is
     shared (same object) with the runner ``RequestState.block_ids`` so the
@@ -686,10 +683,10 @@ class BagelTextRequestState:
     ``new_block_ids`` into one list and every path sees every block.
     """
 
-    cond: TextCache = field(default_factory=TextCache)
+    cond: SequenceCache = field(default_factory=SequenceCache)
 
 
-class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
+class BagelForUnifiedGeneration(UniModelBase):
     """BAGEL unified text/image model with VAE denoise and ViT/VAE encode paths."""
 
     architectures = ("BagelForUnifiedGeneration", "BAGEL", "bagel")
@@ -763,7 +760,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         self.eos_id = int(self.cfg.llm.eos_token_id)
         self.img_start_id = int(self.cfg.start_of_image_id)
         self.img_end_id = int(self.cfg.end_of_image_id)
-        self._shared_text_driver: InterleavedTextCacheDriver | None = None
+        self._shared_text_driver: SequenceExecutor | None = None
         self.pool: PagedKVPool | None = None
         self.residency = ResidencyManager(encoder_cache_budget=self.ENCODER_CACHE_BUDGET)
         self.lora: MergeOnLoadLoRA | None = None
@@ -793,6 +790,8 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             self.lora = MergeOnLoadLoRA(self.model)
         else:
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
+        self.flow_graph_execution = FlowGraphExecution(self)
+        self.segment_executor = SegmentExecutor(self)
 
     def _build_resource_plan(self) -> ResourcePlan:
         return ResourcePlan(
@@ -915,7 +914,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         r = int(req_id)
         self.states[r] = state
         self.reqs.pop(r, None)
-        self.interleaved_image_state(r)
+        self.program_state(r)
         self.generation_session.begin_request(
             r,
             sampling=state.sampling,
@@ -929,7 +928,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         state = self.states.pop(r, None)
         text_state = self.reqs.pop(r, None)
         if text_state is not None:
-            self._release_forward_staging_for_cache(text_state.cond.past)
+            self.segment_executor.release_staging(text_state.cond.past)
         self.generation_session.release_request(r, request_state=state)
 
     def free_encoder(self, handles) -> None:
@@ -991,21 +990,21 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         state.append_new_block_ids(op.get("new_block_ids"))
         return state.block_ids
 
-    # ---- shared interleaved text driver (owner surface) --------------------
+    # ---- sequence adapter surface ------------------------------------------
 
     @property
     def kv_pool(self) -> PagedKVPool | None:
-        # The interleaved text driver's name for the request KV pool.
+        # Sequence execution uses this request KV pool.
         return self.pool
 
     @property
     def num_layers(self) -> int:
         return int(self.cfg.llm.num_hidden_layers)
 
-    def _text_driver(self) -> InterleavedTextCacheDriver:
+    def _text_driver(self) -> SequenceExecutor:
         driver = self._shared_text_driver
         if driver is None:
-            driver = InterleavedTextCacheDriver(
+            driver = SequenceExecutor(
                 self,
                 request_state_factory=BagelTextRequestState,
                 image_start_token=_BAGEL_IMG_START_TOKEN,
@@ -1013,7 +1012,13 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             self._shared_text_driver = driver
         return driver
 
-    def interleaved_image_state(self, req_id: int) -> BagelTextRequestState:
+    def _extend_cache_blocks(self, cache: SequenceCache, op: dict[str, Any]) -> None:
+        self._text_driver().extend_cache_blocks(cache, op)
+
+    def _ensure_host_cache(self, cache: SequenceCache) -> None:
+        self._text_driver().ensure_host_cache(cache)
+
+    def program_state(self, req_id: int) -> BagelTextRequestState:
         req_id = int(req_id)
         st = self.reqs.get(req_id)
         if st is None:
@@ -1024,7 +1029,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             self.reqs[req_id] = st
         return st
 
-    def interleaved_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def sequence_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._ensure_loaded().model.embed_tokens(input_ids).to(torch.bfloat16)
 
     def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1077,7 +1082,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             raise invalid_descriptor("BAGEL packed hidden states do not match image geometry")
         return self._ensure_loaded().model.velocity_from_hidden(hidden_states[0], num_vae)
 
-    def packed_graph_attention(self) -> Any:
+    def segment_graph_attention(self) -> Any:
         layers = self._ensure_loaded().model.lm.layers
         if not layers:
             raise capability_mismatch("BAGEL packed graph requires at least one decoder layer")
@@ -1085,7 +1090,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
 
     def packed_denoise_indicators(
         self,
-        step: TextImageDenoiseStep,
+        step: PreparedFlowStep,
         q_len: int,
     ) -> torch.Tensor:
         generation = step.extra["gs"]
@@ -1125,7 +1130,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             torch.tensor(gen_indices, dtype=torch.long, device=device),
         )
 
-    def interleaved_text_forward(
+    def sequence_forward(
         self,
         input_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -1140,7 +1145,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
     ) -> CausalLMOutputWithPast:
         """Run the MoT understanding expert stack over the shared paged text KV.
 
-        The interleaved text driver sends strictly-causal pure-text spans here
+        The sequence executor sends strictly-causal token spans here
         (BAGEL is 1-D rope, so only ``indexes[0]`` is consumed; the spatial rows
         are zero). Its block-causal / past-visible masks are equivalent to plain
         causal attention, so ``attention_mask`` is not materialized.
@@ -1149,18 +1154,16 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         m = self._ensure_loaded().model
         if input_ids is None and inputs_embeds is None:
             raise invalid_descriptor(
-                "BAGEL interleaved text forward requires exactly one of input_ids or inputs_embeds"
+                "BAGEL sequence forward requires exactly one of input_ids or inputs_embeds"
             )
         if input_ids is not None and inputs_embeds is not None:
             raise invalid_descriptor(
-                "BAGEL interleaved text forward requires exactly one of input_ids or inputs_embeds"
+                "BAGEL sequence forward requires exactly one of input_ids or inputs_embeds"
             )
         if indexes is None and cache_position is not None:
             indexes = cache_position.reshape(1, -1)
         if indexes is None or past_key_values is None:
-            raise invalid_descriptor(
-                "BAGEL interleaved text forward requires indexes and a paged cache"
-            )
+            raise invalid_descriptor("BAGEL sequence forward requires indexes and a paged cache")
         if inputs_embeds is None:
             if input_ids is None:
                 raise invalid_descriptor("BAGEL text input ids are missing")
@@ -1169,7 +1172,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         if batch > 1:
             if seq_len != 1:
                 raise invalid_descriptor(
-                    "BAGEL batched interleaved text forward requires one token per row"
+                    "BAGEL batched sequence forward requires one token per row"
                 )
             hidden = m.lm.forward_paged_text_batch(
                 inputs_embeds,
@@ -1223,7 +1226,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             kind = str(op["kind"])
             if kind not in {"vae_encode", "vit_encode"}:
                 raise invalid_descriptor(f"unsupported image encode kind: {kind}")
-            state = self.interleaved_image_state(req_id)
+            state = self.program_state(req_id)
             driver.extend_cache_blocks(state.cond, op)
             driver.ensure_host_cache(state.cond)
             base_len = int(state.cond.past.length)
@@ -1374,7 +1377,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         return self.encode_many((op,))[0]
 
     def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
-        return self.interleaved_image_state(int(req_id)).cond.last_logits
+        return self.program_state(int(req_id)).cond.last_logits
 
     def encode_image(
         self,
@@ -1401,11 +1404,11 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         return self.run_encode(dict(op))
 
     def run_text_logits_batch(self, ops):
-        """Text prefill/decode through the shared interleaved text driver.
+        """Sequence prefill/decode through the system executor.
 
         Batching and the one-token decode CUDA graph are system-owned by the
         driver; BAGEL contributes only the MoT und-expert forward
-        (``interleaved_text_forward``). The host's ``pos_range`` stays
+        (``sequence_forward``). The host's ``pos_range`` stays
         authoritative for every op's rope position — matching the pre-driver
         Segment path, since BAGEL's 1-D positions do not advance across image
         spans the way KV length does — and the request-state KV-length mirror
@@ -1431,7 +1434,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
     def _prepare_text_logits_batch(self, ops):
         op_list = [dict(op) for op in ops]
         for op in op_list:
-            st = self.interleaved_image_state(int(op["req_id"]))
+            st = self.program_state(int(op["req_id"]))
             pos_range = op.get("pos_range")
             if st.cond.past is not None and pos_range:
                 st.cond.t_index = int(pos_range[0]) - 1
@@ -1440,7 +1443,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
     def _sync_text_cache_lengths(self, ops) -> None:
         for op in ops:
             r = int(op["req_id"])
-            st = self.interleaved_image_state(r)
+            st = self.program_state(r)
             if st.cond.past is not None:
                 self._set_length(r, int(st.cond.past.length))
 
@@ -1635,7 +1638,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             },
         )
 
-    def prepare_denoise_step(self, req_id: int, state, op: dict) -> TextImageDenoiseStep:
+    def prepare_flow_step(self, req_id: int, state, op: dict) -> PreparedFlowStep:
         r = int(req_id)
         self._extend_blocks(op)
         if int(op.get("timestep_idx") or 0) == 0 and self._gen_state(r) is None:
@@ -1658,7 +1661,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             )
             .unsqueeze(0)
         )
-        return TextImageDenoiseStep(
+        return PreparedFlowStep(
             req_id=r,
             state=state,
             op=op,
@@ -1672,27 +1675,27 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             cfg_interval=(float(gs.cfg_interval[0]), float(gs.cfg_interval[1])),
             cfg_renorm_type=str(gs.cfg_renorm_type),
             cfg_renorm_min=float(gs.cfg_renorm_min),
-            cfg_branch_count=text_image_cfg_branch_count(op),
+            cfg_branch_count=flow_cfg_branch_count(op),
             image_scale_applies_to_text=CfgRecipe.IMAGE_OVER_TEXT,
             extra={"gs": gs, "img": gs.graph_image, "image_embeds": image_embeds},
         )
 
-    def prepare_denoise(
+    def prepare_flow(
         self,
         state: Any,
         op: Mapping[str, Any],
-    ) -> TextImageDenoiseStep:
-        return self.prepare_denoise_step(int(op["req_id"]), state, dict(op))
+    ) -> PreparedFlowStep:
+        return self.prepare_flow_step(int(op["req_id"]), state, dict(op))
 
     def predict_velocity(
         self,
-        ctx: TextImageDenoiseStep,
+        ctx: PreparedFlowStep,
         t: torch.Tensor,
         latent: torch.Tensor,
         branch: str,
     ) -> torch.Tensor:
         del t, latent
-        return self.predict_denoise_velocity(ctx, branch)
+        return self.predict_flow_velocity(ctx, branch)
 
     def _denoise_branch_inputs(
         self,
@@ -1711,7 +1714,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             raise invalid_descriptor(f"BAGEL denoise branch {name!r} is not initialized")
         return indexes, cache
 
-    def predict_text_image_velocity_batch(
+    def predict_flow_velocity_batch(
         self,
         steps,
         branches_by_step,
@@ -1722,21 +1725,21 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         self._ensure_loaded()
         if graph_mode == "eager":
             raise capability_mismatch("BAGEL denoise execution requires CUDA graphs")
-        graphed = self._predict_text_image_velocity_graph(steps, branches_by_step)
+        graphed = self._predict_flow_velocity_graph(steps, branches_by_step)
         if graphed is None and graph_mode == "require":
             return None
         if graphed is None:
             raise capability_mismatch("BAGEL denoise CUDA graph did not cover the batch")
         return graphed
 
-    def _predict_text_image_velocity_graph(
+    def _predict_flow_velocity_graph(
         self,
         steps,
         branches_by_step,
     ) -> list[dict[str, torch.Tensor]] | None:
         m = self._ensure_loaded().model
         results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
-        groups: dict[tuple[Any, ...], list[tuple[int, str, DenoiseRow]]] = {}
+        groups: dict[tuple[Any, ...], list[tuple[int, str, FlowRow]]] = {}
         for step_index, (step, branches) in enumerate(zip(steps, branches_by_step, strict=True)):
             gs = step.extra["gs"]
             paged_branches = gs.paged_branches
@@ -1776,7 +1779,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
                     (
                         step_index,
                         name,
-                        DenoiseRow(
+                        FlowRow(
                             step_index=step_index,
                             step=step,
                             branch=name,
@@ -1791,7 +1794,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             rows = [entry[2] for entry in group]
             group_num_vae = int(rows[0].img.token_w) - _BAGEL_IMAGE_MARKER_TOKENS
             m.gen_segment_graph_layout(len(rows), group_num_vae)
-            velocity = maybe_run_denoise_step_graph(self, rows)
+            velocity = self.flow_graph_execution.maybe_run_graph(rows)
             if not isinstance(velocity, torch.Tensor):
                 return None
             if int(velocity.shape[0]) != len(group):
@@ -1800,7 +1803,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
                 results[step_index][name] = velocity[row_index]
         return results
 
-    def interleaved_image_predict_velocity(
+    def flow_predict_velocity(
         self,
         image_embeds: torch.Tensor,
         indexes: torch.Tensor,
@@ -1834,8 +1837,8 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             return velocity, hidden
         return velocity
 
-    def predict_denoise_velocity(self, step: TextImageDenoiseStep, branch: str) -> torch.Tensor:
-        result = self.predict_text_image_velocity_batch(
+    def predict_flow_velocity(self, step: PreparedFlowStep, branch: str) -> torch.Tensor:
+        result = self.predict_flow_velocity_batch(
             [step],
             [(branch,)],
             graph_mode="require",
@@ -1844,12 +1847,12 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
             raise capability_mismatch("BAGEL denoise CUDA graph did not cover the branch")
         return result[0][branch]
 
-    def apply_denoise_update(self, step: TextImageDenoiseStep, latent: torch.Tensor) -> None:
+    def apply_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None:
         gs = step.extra["gs"]
         gs.x_t = latent.to(dtype=gs.x_t.dtype, device=gs.x_t.device)
 
-    def accept_denoise_update(self, ctx: TextImageDenoiseStep, latent: torch.Tensor) -> None:
-        self.apply_denoise_update(ctx, latent)
+    def accept_flow_update(self, ctx: PreparedFlowStep, latent: torch.Tensor) -> None:
+        self.apply_flow_update(ctx, latent)
 
     def _run_forward_adapter(
         self,
@@ -1860,7 +1863,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         defer_text_cpu_results: bool = False,
     ) -> Any:
         del group
-        return PackedForwardExecutor(self).execute(
+        return self.segment_executor.execute(
             batch,
             request_states=request_states,
             defer_text_cpu_results=defer_text_cpu_results,
@@ -1873,7 +1876,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         driver must resume text from the post-image KV length and rope
         position (block ids are already shared, so only length/position move).
         """
-        st = self.interleaved_image_state(int(req_id))
+        st = self.program_state(int(req_id))
         self._text_driver().ensure_host_cache(st.cond)
         st.cond.past.length = int(length)
         st.cond.t_index = int(last_position)
@@ -1908,7 +1911,7 @@ class BagelForUnifiedGeneration(UniModelBase, PackedForwardModelMixin):
         retain_images = bool((rec.get("image") or {}).get("retain_images", True))
         added = 0
         if retain_images:
-            # Interleave continuation: persist the generated latents into the
+            # Program continuation: persist the generated latents into the
             # request KV so following text conditions on the image. The engine
             # allocates these blocks only when retention is requested (pure
             # image mode ends at the commit and skips both).
@@ -2054,8 +2057,8 @@ class TextImageGenerationSession:
             return encode(*args, **kwargs)
         raise RuntimeError("generation session owner does not expose image encoding")
 
-    def prepare_denoise(self, state: Any, op: dict[str, Any]) -> Any:
-        prepare = getattr(self.owner, "prepare_denoise", None)
+    def prepare_flow(self, state: Any, op: dict[str, Any]) -> Any:
+        prepare = getattr(self.owner, "prepare_flow", None)
         if callable(prepare):
             return prepare(state, op)
         raise RuntimeError("generation session owner does not expose denoise preparation")

@@ -3,11 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.models.interleaved_text import (
+from uniserve_worker.execution.sequence import (
     Span,
     Step,
-    _InterleavedDecodeGraphPast,
     _Row,
+    _SequenceDecodeGraphPast,
 )
 from uniserve_worker.models.sensenova.model import _SenseNovaDecoderModel
 
@@ -95,7 +95,7 @@ def test_interleaved_decode_graph_forward_uses_cache_position_without_index_side
     calls = []
 
     class Owner:
-        def interleaved_text_forward(self, **kwargs):
+        def sequence_forward(self, **kwargs):
             calls.append(kwargs)
             assert "indexes" not in kwargs
             assert kwargs["cache_position"].data_ptr() == positions.reshape(-1).data_ptr()
@@ -111,7 +111,7 @@ def test_interleaved_decode_graph_forward_uses_cache_position_without_index_side
 
 def test_interleaved_decode_graph_past_accepts_one_token_per_batch_row():
     cache = SimpleNamespace(pool=object(), block_ids_by_row=[[1], [2]])
-    past = _InterleavedDecodeGraphPast(cache)
+    past = _SequenceDecodeGraphPast(cache)
 
     assert past.request_cache_for_update(layer_idx=0, n_tokens=1) is cache
 
@@ -135,7 +135,7 @@ def test_interleaved_prefill_graph_selects_last_real_token_from_all_logits():
     calls = []
 
     class Owner:
-        def interleaved_text_forward(self, **kwargs):
+        def sequence_forward(self, **kwargs):
             calls.append(kwargs)
             assert kwargs["return_all_logits"] is True
             return SimpleNamespace(logits=torch.arange(12, dtype=torch.float32).view(1, 4, 3))
@@ -161,7 +161,7 @@ def test_interleaved_prefill_graph_selects_packed_row_logits():
     )
 
     class Owner:
-        def interleaved_text_forward(self, **kwargs):
+        def sequence_forward(self, **kwargs):
             return SimpleNamespace(logits=torch.arange(24, dtype=torch.float32).view(1, 8, 3))
 
     logits = runner._forward(SimpleNamespace(owner=Owner()), state)
