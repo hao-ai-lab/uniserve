@@ -23,11 +23,8 @@ from uniserve_worker.contracts.execution import (
     EngineRef,
     ExecuteRow,
     FlowStep,
-    ProductLease,
-    ProductLifetime,
     SequenceStep,
     SessionRef,
-    TransferKind,
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
@@ -41,7 +38,11 @@ from uniserve_worker.models.cache_registrations import (
 )
 from uniserve_worker.runtime.transactional_residency import (
     ArenaConfig,
+    ProductDemand,
+    ProductStoreConfig,
+    ReservationPlan,
     Residency,
+    RowDemand,
 )
 
 pytestmark = [
@@ -227,7 +228,9 @@ def test_verification_stacks_and_publishes_only_the_accepted_prefix():
 
 def test_transient_overlays_read_the_prefix_and_leave_it_untouched():
     residency = Residency(
-        _ENGINE, (ArenaConfig(domain_id=1, page_count=33, page_tokens=_PAGE_TOKENS),)
+        _ENGINE,
+        (ArenaConfig(domain_id=1, page_count=33, page_tokens=_PAGE_TOKENS),),
+        product_stores=(ProductStoreConfig(schema_id=7, row_capacity=64),),
     )
     binding = CacheDeviceBinding(
         layers=1, pages=33, page_tokens=_PAGE_TOKENS,
@@ -247,12 +250,21 @@ def test_transient_overlays_read_the_prefix_and_leave_it_untouched():
     )
     reservation.commit((5,))
 
-    latent = ProductLease(
-        lease_id=9, schema_id=7, producer=_SESSION, product_version=1,
-        extent_rows=6, lifetime=ProductLifetime.REQUEST,
-        transfer=TransferKind.LOCAL_RESIDENCY,
+    publish = residency.reserve(
+        ReservationPlan(
+            rows=(
+                RowDemand(
+                    row_id=0,
+                    bindings=(),
+                    products=(
+                        ProductDemand(schema_id=7, rows=6, producer=_SESSION),
+                    ),
+                ),
+            )
+        )
     )
-    flow = FlowStep(1, 0, 50, 9, (4.0, 1.0, 1.0), (), 7)
+    (latent,) = publish.commit(())
+    flow = FlowStep(1, 0, 50, latent.lease_id, (4.0, 1.0, 1.0), (), 7)
     roles = RoleSequences(
         {
             PRIMARY_ROLE: residency.sequence_ref(

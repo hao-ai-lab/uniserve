@@ -50,6 +50,7 @@ from ..contracts.execution import (
 from ..contracts.residency_batch import ResidencyBatchCapacity
 from ..contracts.segment_table import GraphCapacity, SegmentTableArrays
 from ..runtime.transactional_residency import (
+    ProductDemand,
     ReservationPlan,
     RowDemand,
     SequenceBinding,
@@ -313,7 +314,16 @@ def lower_rows(
             raise LoweringError(
                 f"row {row.row_id}: no region evaluates to any query rows"
             )
-        demands.append(RowDemand(row_id=row.row_id, bindings=tuple(bindings)))
+        demands.append(
+            RowDemand(
+                row_id=row.row_id,
+                bindings=tuple(bindings),
+                products=_published_products(row, operands),
+                input_products=tuple(
+                    lease.lease_id for lease in row.product_leases
+                ),
+            )
+        )
     return LoweredBatch(
         segments=tuple(segments),
         plan=ReservationPlan(rows=tuple(demands)),
@@ -393,6 +403,32 @@ def _operand_values(row: ExecuteRow) -> dict[ExtentOperand, int]:
             row, operation.input_product
         )
     return values
+
+
+def _published_products(
+    row: ExecuteRow,
+    operands: dict[ExtentOperand, int],
+) -> tuple[ProductDemand, ...]:
+    """Encode and materialize rows publish one typed product at commit."""
+
+    operation = row.operation
+    if isinstance(operation, EncodeStep):
+        return (
+            ProductDemand(
+                schema_id=operation.output_schema,
+                rows=operands[ExtentOperand.IMAGE_TOKEN_COUNT],
+                producer=row.session,
+            ),
+        )
+    if isinstance(operation, MaterializeStep):
+        return (
+            ProductDemand(
+                schema_id=operation.output_schema,
+                rows=operands[ExtentOperand.PRODUCT_ROW_COUNT],
+                producer=row.session,
+            ),
+        )
+    return ()
 
 
 def _product_extent(row: ExecuteRow, lease_id: int) -> int:

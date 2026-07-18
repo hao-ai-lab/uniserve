@@ -120,7 +120,12 @@ def target_registry() -> TargetModelRegistry:
             family="bagel",
             architectures=("BagelForUnifiedGeneration", "BAGEL", "bagel"),
             operations=frozenset(
-                {OperationTag.SEQUENCE_STEP, OperationTag.FLOW_STEP}
+                {
+                    OperationTag.SEQUENCE_STEP,
+                    OperationTag.FLOW_STEP,
+                    OperationTag.ENCODE_STEP,
+                    OperationTag.MATERIALIZE_STEP,
+                }
             ),
             cache_registration=bagel_cache_registration,
         )
@@ -130,7 +135,12 @@ def target_registry() -> TargetModelRegistry:
             family="sensenova",
             architectures=("NEOChatModel", "neo_chat", "neo-unify", "neo_unify"),
             operations=frozenset(
-                {OperationTag.SEQUENCE_STEP, OperationTag.FLOW_STEP}
+                {
+                    OperationTag.SEQUENCE_STEP,
+                    OperationTag.FLOW_STEP,
+                    OperationTag.ENCODE_STEP,
+                    OperationTag.MATERIALIZE_STEP,
+                }
             ),
             cache_registration=sensenova_cache_registration,
         )

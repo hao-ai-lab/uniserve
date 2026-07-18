@@ -242,6 +242,41 @@ def _image_generation_schema(
             RouteRunSpec(route_id=_GENERATION_ROUTE, extent=_IMAGE_TOKENS),
         )
         denoise_rows = _IMAGE_TOKENS
+    encode_region = CacheRegionSpec(
+        operation_tag=OperationTag.ENCODE_STEP,
+        local_region_id=0,
+        multiplicity=RegionMultiplicity.ONE,
+        role=CacheRoleSelector.no_cache(),
+        route_runs=(
+            RouteRunSpec(route_id=_GENERATION_ROUTE, extent=_IMAGE_TOKENS),
+        ),
+        query_rows=_IMAGE_TOKENS,
+        reserve_rows=ExtentExpr.literal(0),
+        commit_rows=CommitExpr.zero(),
+        cache_effect=CacheEffect.READ_ONLY,
+        attention_pattern=AttentionPattern.FULL_QUERY_PREFIX,
+        position=position,
+        logical_position_commit=CommitExpr.zero(),
+    )
+    materialize_region = CacheRegionSpec(
+        operation_tag=OperationTag.MATERIALIZE_STEP,
+        local_region_id=0,
+        multiplicity=RegionMultiplicity.ONE,
+        role=CacheRoleSelector.no_cache(),
+        route_runs=(
+            RouteRunSpec(
+                route_id=_GENERATION_ROUTE,
+                extent=ExtentExpr.operand(ExtentOperand.PRODUCT_ROW_COUNT),
+            ),
+        ),
+        query_rows=ExtentExpr.operand(ExtentOperand.PRODUCT_ROW_COUNT),
+        reserve_rows=ExtentExpr.literal(0),
+        commit_rows=CommitExpr.zero(),
+        cache_effect=CacheEffect.READ_ONLY,
+        attention_pattern=AttentionPattern.FULL_QUERY_PREFIX,
+        position=position,
+        logical_position_commit=CommitExpr.zero(),
+    )
     return FamilyCacheSchema(
         roles=(
             CacheRoleSpec(
@@ -256,6 +291,8 @@ def _image_generation_schema(
             _branch_role(IMAGE_UNCONDITIONAL_ROLE),
         ),
         regions=(
+            encode_region,
+            materialize_region,
             _text_region(0),
             CacheRegionSpec(
                 operation_tag=OperationTag.FLOW_STEP,
