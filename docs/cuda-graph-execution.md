@@ -61,9 +61,9 @@ sequenceDiagram
 
 ## 第 0 站：应用启动时，Graph 系统已经被装配
 
-应用侧构建 [`ServingRuntime`](../crates/frontend/serving/src/lib.rs#L1284)，Worker 侧构建 `ModelRunner`。当模型声明系统可管理的 KV cache、设备是 CUDA 且配置启用 Graph 时，[`ModelRunner._build_text_execution`](../uniserve_worker/execution/runner.py#L396-L446) 创建一个 [`TextGraphRunner`](../uniserve_worker/execution/forward/graph/text.py#L42)，其中包含 decode 和 prefill 两类物理 runner。
+应用侧构建 [`ServingRuntime`](../crates/frontend/serving/src/lib.rs#L1284)，Worker 侧构建 `ModelRunner`。当模型声明系统可管理的 KV cache、设备是 CUDA 且配置启用 Graph 时，[`ModelRunner._build_text_execution`](../uniserve_worker/execution/engine.py) 创建一个 [`TextGraphRunner`](../uniserve_worker/execution/cuda_graph.py)，其中包含 decode 和 prefill 两类物理 runner。
 
-随后 [`TextGraphRunner.warmup`](../uniserve_worker/execution/forward/graph/text.py#L266) 可以用合成输入预先捕获配置中的 bucket。这样真实请求第一次命中某个 bucket 时直接 replay；若某类 runner 允许 lazy capture，则缺失的 shape 也可能由首个真实请求触发 capture。prefill 在启用 warmup 时对未预捕获的完整物理 key 直接报 miss，而不是临时捕获，具体判断在 [`PrefillCudaGraphRunner.maybe_run`](../uniserve_worker/execution/forward/graph/text_prefill.py#L312)。
+随后 [`TextGraphRunner.warmup`](../uniserve_worker/execution/cuda_graph.py) 可以用合成输入预先捕获配置中的 bucket。这样真实请求第一次命中某个 bucket 时直接 replay；若某类 runner 允许 lazy capture，则缺失的 shape 也可能由首个真实请求触发 capture。prefill 在启用 warmup 时对未预捕获的完整物理 key 直接报 miss，而不是临时捕获，具体判断在 [`PrefillCudaGraphRunner.maybe_run`](../uniserve_worker/execution/cuda_graph.py)。
 
 这一站只需得到两个认识：Graph runner 是模型/Worker 级服务；warmup 决定请求到来之前有哪些物理 shape 已经存在。
 
@@ -105,7 +105,7 @@ CUDA Graph 的第一个上游影响在这里出现：Scheduler 决定哪些请�
 
 ## 第 3 站：Worker 把 wire 操作变成一次可执行快照
 
-Worker dispatch 最终进入 [`ModelRunner.execute`](../uniserve_worker/execution/runner.py#L502)，先由 [`ExecuteBatch.from_wire`](../uniserve_worker/contracts/batches.py#L34) 解析边界，再交给 [`ForwardStepExecutor.execute`](../uniserve_worker/execution/forward/step.py#L155)。
+Worker dispatch 最终进入 [`ModelRunner.execute`](../uniserve_worker/execution/engine.py)，先由 [`ExecuteBatch.from_wire`](../uniserve_worker/contracts/batches.py#L34) 解析边界，再交给 [`ForwardStepExecutor.execute`](../uniserve_worker/execution/engine.py)。
 
 一次 step 在 Worker 中经历以下转换：
 
@@ -120,11 +120,11 @@ Rust ForwardBatch {new_reqs, ops}
 
 具体阅读顺序如下：
 
-1. [`ModelRunner._register_new_reqs`](../uniserve_worker/execution/runner.py#L514) 把 `NewRequestData` 放入 Worker [`RequestStateTable`](../uniserve_worker/runtime/request_state.py#L185)。
-2. [`ForwardGroupPlanner`](../uniserve_worker/execution/forward/step.py#L32-L146) 决定 Scheduler 给出的 ops 是否保持为 whole-batch mixed group，或按模型的 `BatchPolicy` 分组。
-3. [`ForwardPlanBuilder`](../uniserve_worker/execution/forward/plan.py#L350) 将每个 op 固化为 row、segment、cache span、output slot 和 shape summary。
-4. [`ForwardBatchBuilder`](../uniserve_worker/execution/forward/batch.py#L30) 将计划物化成内部 [`ForwardBatch`](../uniserve_worker/contracts/forward_batch.py#L182)，包括 `input_ids`、`positions`、segment、last-token index 和 attention plan。
-5. [`ForwardStepExecutor._execute_unified_group`](../uniserve_worker/execution/forward/step.py#L217) 把 plan、batch、请求状态句柄和 postprocess callback 一起交给执行器。
+1. [`ModelRunner._register_new_reqs`](../uniserve_worker/execution/engine.py) 把 `NewRequestData` 放入 Worker [`RequestStateTable`](../uniserve_worker/runtime/request_state.py#L185)。
+2. [`ForwardGroupPlanner`](../uniserve_worker/execution/engine.py) 决定 Scheduler 给出的 ops 是否保持为 whole-batch mixed group，或按模型的 `BatchPolicy` 分组。
+3. [`ForwardPlanBuilder`](../uniserve_worker/execution/engine.py) 将每个 op 固化为 row、segment、cache span、output slot 和 shape summary。
+4. [`ForwardBatchBuilder`](../uniserve_worker/execution/engine.py) 将计划物化成内部 [`ForwardBatch`](../uniserve_worker/contracts/forward_batch.py#L182)，包括 `input_ids`、`positions`、segment、last-token index 和 attention plan。
+5. [`ForwardStepExecutor._execute_unified_group`](../uniserve_worker/execution/engine.py) 把 plan、batch、请求状态句柄和 postprocess callback 一起交给执行器。
 
 这里必须区分“持久请求状态”和“本轮设备快照”：`RequestState.block_ids` 可以跨 step 增长，而 `ForwardBatch` 只描述当前 group；Graph 层消费后者，但通过 plan/runtime handles 在成功后更新前者。
 
@@ -132,9 +132,9 @@ Rust ForwardBatch {new_reqs, ops}
 
 ## 第 4 站：逻辑 Graph 层决定本轮应该走哪一种程序
 
-[`ForwardExecutor.execute`](../uniserve_worker/execution/forward/executor.py#L38-L78) 是 Graph-first 策略门：在 policy 允许时先调用 [`CudaGraphForwardRunner.run`](../uniserve_worker/execution/forward/graph/runner.py#L33-L122)，成功则直接返回 `ForwardResult`，miss 或异常则按 strict/fallback policy 处理。
+[`ForwardExecutor.execute`](../uniserve_worker/execution/engine.py) 是 Graph-first 策略门：在 policy 允许时先调用 [`CudaGraphForwardRunner.run`](../uniserve_worker/execution/cuda_graph.py)，成功则直接返回 `ForwardResult`，miss 或异常则按 strict/fallback policy 处理。
 
-`CudaGraphForwardRunner` 遍历注册的 `ForwardGraphProgram`，根据完整 `ForwardPlan` 选择语义路径。注册顺序可从 [`ModelRunner._build_forward_graph_runner`](../uniserve_worker/execution/runner.py#L241-L299) 看到：系统 text decode/prefill、packed visible、model-owned text、pure denoise。
+`CudaGraphForwardRunner` 遍历注册的 `ForwardGraphProgram`，根据完整 `ForwardPlan` 选择语义路径。注册顺序可从 [`ModelRunner._build_forward_graph_runner`](../uniserve_worker/execution/engine.py) 看到：系统 text decode/prefill、packed visible、model-owned text、pure denoise。
 
 | 本轮 Worker group | 首个匹配的逻辑 program | 接下来进入的物理系统 |
 |---|---|---|
@@ -145,9 +145,9 @@ Rust ForwardBatch {new_reqs, ops}
 | text 与 denoise/commit 同批 | `PackedVisibleGraphProgram` | packed mixed graph |
 | 全部是单步 denoise | `DenoiseStepGraphProgram` | denoise-step graph |
 
-[`CapturedForwardGraph`](../uniserve_worker/execution/forward/graph/programs.py#L30-L79) 只是逻辑 program 和 `ForwardGraphShapeKey` 的缓存包装；它不包含真实 CUDA executable。真实 `torch.cuda.CUDAGraph` 位于 `TextDecodeGraphState`、`TextInitialPrefillGraphState`、`PackedMixedGraphState` 或 `DenoiseStepGraphState`。
+[`CapturedForwardGraph`](../uniserve_worker/execution/cuda_graph.py) 只是逻辑 program 和 `ForwardGraphShapeKey` 的缓存包装；它不包含真实 CUDA executable。真实 `torch.cuda.CUDAGraph` 位于 `TextDecodeGraphState`、`TextInitialPrefillGraphState`、`PackedMixedGraphState` 或 `DenoiseStepGraphState`。
 
-阅读目标：给定一个 `ForwardPlan`，先预测哪个 `can_run` 返回 true，再读 [`programs.py`](../uniserve_worker/execution/forward/graph/programs.py#L187-L470) 验证。此时不要进入物理 capture 代码。
+阅读目标：给定一个 `ForwardPlan`，先预测哪个 `can_run` 返回 true，再读 [`programs.py`](../uniserve_worker/execution/cuda_graph.py) 验证。此时不要进入物理 capture 代码。
 
 ## 第 5 站：请求 A 的一次 decode 如何真正 replay
 
@@ -174,14 +174,14 @@ ForwardExecutor.execute
 
 按以下顺序阅读物理代码：
 
-1. [`TextDecodeGraphState`](../uniserve_worker/execution/forward/graph/text_decode.py#L55-L72) 持有 bucket 大小、稳定的 token/position/block/length tensors、paged cache、attention plan/binding、输出 logits 和真实 `CUDAGraph`。
+1. [`TextDecodeGraphState`](../uniserve_worker/execution/cuda_graph.py) 持有 bucket 大小、稳定的 token/position/block/length tensors、paged cache、attention plan/binding、输出 logits 和真实 `CUDAGraph`。
 2. `DecodeCudaGraphRunner.resolve_bucket` 在已有 state 与配置 bucket 中选择能容纳 live batch 的最小容量；请求 ID 不参与物理 key。
-3. [`DecodeCudaGraphRunner.maybe_run`](../uniserve_worker/execution/forward/graph/text_decode.py#L378-L435) 把当前 batch 及 capture、copy、prepare、replay callbacks 交给共享模板。
-4. [`_GraphRunnerBase._capture_or_replay`](../uniserve_worker/execution/forward/graph/base.py#L253-L309) 先查 `states[key]`，必要时捕获，然后每次都 copy 当前输入、刷新 attention backend 状态并 replay。
-5. [`copy_text_decode_graph_inputs`](../uniserve_worker/execution/forward/graph/text_decode.py#L692) 用 `copy_`/原位更新把 A、B、C 的 token、position、page mapping 和长度写进容量为 4 的稳定 buffers，并填充第 4 行。
-6. [`_replay_decode_graph`](../uniserve_worker/execution/forward/graph/text_decode.py#L584) 调用 `state.graph.replay()`，随后只返回 `state.logits[:live_batch_size]`。
+3. [`DecodeCudaGraphRunner.maybe_run`](../uniserve_worker/execution/cuda_graph.py) 把当前 batch 及 capture、copy、prepare、replay callbacks 交给共享模板。
+4. [`_GraphRunnerBase._capture_or_replay`](../uniserve_worker/execution/cuda_graph.py) 先查 `states[key]`，必要时捕获，然后每次都 copy 当前输入、刷新 attention backend 状态并 replay。
+5. [`copy_text_decode_graph_inputs`](../uniserve_worker/execution/cuda_graph.py) 用 `copy_`/原位更新把 A、B、C 的 token、position、page mapping 和长度写进容量为 4 的稳定 buffers，并填充第 4 行。
+6. [`_replay_decode_graph`](../uniserve_worker/execution/cuda_graph.py) 调用 `state.graph.replay()`，随后只返回 `state.logits[:live_batch_size]`。
 
-如果 state 不存在，[`_capture_graph_state`](../uniserve_worker/execution/forward/graph/base.py#L311-L343) 会在独立 stream 上 warmup，重新 copy/prepare 后进入 `torch.cuda.graph(state.graph)` 捕获 `model.forward`。capture 结束后，`_capture_or_replay` 仍会重新装载真实请求数据并执行一次 replay，因此 lazy 首次命中是“capture + replay”，不是把 capture 期间的输出直接当作本轮结果。
+如果 state 不存在，[`_capture_graph_state`](../uniserve_worker/execution/cuda_graph.py) 会在独立 stream 上 warmup，重新 copy/prepare 后进入 `torch.cuda.graph(state.graph)` 捕获 `model.forward`。capture 结束后，`_capture_or_replay` 仍会重新装载真实请求数据并执行一次 replay，因此 lazy 首次命中是“capture + replay”，不是把 capture 期间的输出直接当作本轮结果。
 
 `TextGraphRunner._decode_forward` 构造的捕获批次甚至使用 `0..batch_size` 的占位 req ids；真实请求身份只在 Graph 外用于 row 对齐、采样和状态推进。这是“Graph 属于拓扑而不属于请求”的直接证据。
 
@@ -189,7 +189,7 @@ ForwardExecutor.execute
 
 ## 第 6 站：Graph 输出如何变成请求的下一步
 
-CUDA Graph 只产出 logits、hidden 或 velocity；它没有完成请求状态迁移。普通文本结果进入 [`ForwardPostprocessor.apply`](../uniserve_worker/execution/forward/postprocess.py#L38-L106)，随后执行 batched sampling、发布 decode relay、更新 Worker request 的 KV length，并把输出规范化为与原始 ops 一一对齐的 `per_seq` 结果。文本 KV 长度的提交点是 [`_advance_text_kv_lengths`](../uniserve_worker/execution/forward/postprocess.py#L274-L282)。
+CUDA Graph 只产出 logits、hidden 或 velocity；它没有完成请求状态迁移。普通文本结果进入 [`ForwardPostprocessor.apply`](../uniserve_worker/execution/engine.py)，随后执行 batched sampling、发布 decode relay、更新 Worker request 的 KV length，并把输出规范化为与原始 ops 一一对齐的 `per_seq` 结果。文本 KV 长度的提交点是 [`_advance_text_kv_lengths`](../uniserve_worker/execution/engine.py)。
 
 结果返回 Scheduler 后，[`apply_result`](../crates/engine/scheduler/src/scheduler.rs#L2068-L2273) 按 `req_id + op_id` 找到准确的 in-flight transition，先验证 Worker 结果，再将 transition 应用到请求 cursor，释放本轮预留资源，最后 emit token/image event。下一次 `step_nonblocking` 再根据推进后的 cursor 产生请求 A 的下一个 `ForwardOp`。
 
@@ -205,7 +205,7 @@ Scheduler 当前 cursor
   -> 下一轮 ForwardOp 使用刚产生的 token 与 position
 ```
 
-请求结束时，[`finish_with`](../crates/engine/scheduler/src/scheduler.rs#L4907-L4973) 释放 Scheduler 资源、发送 finished event，并向 Worker 发出 `DropRequest`；[`ModelRunner.drop_request`](../uniserve_worker/execution/runner.py#L497-L500) 删除模型请求状态、accounting 和 `RequestState`。它没有删除 `DecodeCudaGraphRunner.states`，所以相同 bucket 可被未来请求继续 replay。
+请求结束时，[`finish_with`](../crates/engine/scheduler/src/scheduler.rs#L4907-L4973) 释放 Scheduler 资源、发送 finished event，并向 Worker 发出 `DropRequest`；[`ModelRunner.drop_request`](../uniserve_worker/execution/engine.py) 删除模型请求状态、accounting 和 `RequestState`。它没有删除 `DecodeCudaGraphRunner.states`，所以相同 bucket 可被未来请求继续 replay。
 
 阅读目标：从 `state.logits` 一直跟到 Scheduler cursor 的下一状态，并明确每个副作用发生在 replay 前、captured body 内、replay 后 Worker 侧还是 Scheduler 侧。
 
@@ -218,7 +218,7 @@ Worker 中发生四步：
 1. `ForwardGroupPlanner` 仅在模型 `BatchPolicy` 和 whole-batch forward adapter 都支持时保留 mixed group；否则它按可执行边界分组，或在已承诺 whole-batch 但没有执行器时拒绝。
 2. `ForwardPlanBuilder` 得到 `ForwardMode.MIXED`，其中 A 的 query length 是 1、cached prefix 非零，B 的 query length 大于 1、cached prefix 可为零或非零。
 3. `DecodeGraphProgram` 因为不是 pure decode 而拒绝；`PrefillGraphProgram` 因为所有 row 都是 text 且 token count 非零而接受。
-4. [`TextGraphRunner.maybe_run`](../uniserve_worker/execution/forward/graph/text.py#L83-L106) 将 `EXTEND` 和 `MIXED` 都路由到 `_maybe_prefill`。
+4. [`TextGraphRunner.maybe_run`](../uniserve_worker/execution/cuda_graph.py) 将 `EXTEND` 和 `MIXED` 都路由到 `_maybe_prefill`。
 
 物理表示可以简化为：
 
@@ -236,18 +236,18 @@ last-token rows   = [A 的第 1 个 query, B 的第 5 个 query]
 
 这里要区分两个概念：**mixed text** 是 extend 与 decode 行共享 varlen prefill 拓扑；**packed mixed** 是 text 与 denoise/commit segment 共享一个多模态 decoder 拓扑。二者都来自 Scheduler 的跨请求组批，但物理 GraphState、key 和 postprocess 完全不同。
 
-阅读 mixed 的最短顺序是：Scheduler `assemble_pass` → `ForwardGroupPlanner.groups` → `PrefillGraphProgram.can_run` → `TextGraphRunner.maybe_run` → [`PrefillCudaGraphRunner.maybe_run`](../uniserve_worker/execution/forward/graph/text_prefill.py#L312-L392) → [`test_text_graph_runner_routes_mixed_extend_decode_to_prefill_runner`](../tests/python/integration/runtime/test_cuda_graph_replay.py#L680)。
+阅读 mixed 的最短顺序是：Scheduler `assemble_pass` → `ForwardGroupPlanner.groups` → `PrefillGraphProgram.can_run` → `TextGraphRunner.maybe_run` → [`PrefillCudaGraphRunner.maybe_run`](../uniserve_worker/execution/cuda_graph.py) → [`test_text_graph_runner_routes_mixed_extend_decode_to_prefill_runner`](../tests/python/integration/runtime/test_cuda_graph_replay.py#L680)。
 
 ## 从请求场景扩展到其他 Graph 家族
 
 | 应用/请求场景 | 请求循环中的特殊点 | 逻辑入口 | 物理入口 | 最后再读的内容 |
 |---|---|---|---|---|
-| 普通单 token decode | 每轮结果决定下一轮 token | `DecodeGraphProgram` | [`DecodeCudaGraphRunner`](../uniserve_worker/execution/forward/graph/text_decode.py#L90) | host staging、buffer sharing、backend-specific prepare |
-| prompt、chunked prefill、mixed text | 每行 query 长度不同，但都能表达为 varlen extend | `PrefillGraphProgram` | [`PrefillCudaGraphRunner`](../uniserve_worker/execution/forward/graph/text_prefill.py#L76) | token/row/max-KV 三维 key 与 padding row |
+| 普通单 token decode | 每轮结果决定下一轮 token | `DecodeGraphProgram` | [`DecodeCudaGraphRunner`](../uniserve_worker/execution/cuda_graph.py) | host staging、buffer sharing、backend-specific prepare |
+| prompt、chunked prefill、mixed text | 每行 query 长度不同，但都能表达为 varlen extend | `PrefillGraphProgram` | [`PrefillCudaGraphRunner`](../uniserve_worker/execution/cuda_graph.py) | token/row/max-KV 三维 key 与 padding row |
 | decode burst | 一个 Scheduler op 请求多个顺序相关 token | text program 的 graph-only burst path | 同一个 one-token decode graph 被多次 replay | [`DecodeBurstExecutor`](../uniserve_worker/execution/decode_burst.py#L20-L205)；理解它为何在 replay 之间 sampling、更新 relay 和 position，而不是捕获一个 N-token Graph |
-| self-managed KV / interleaved model | 模型的 modality FSM 与 cache 所有权无法交给通用 text runner | `ModelOwnedTextGraphProgram` | [`InterleavedTextPrefillGraphRunner`](../uniserve_worker/execution/forward/graph/interleaved_text.py#L191) 与 [`InterleavedTextDecodeGraphRunner`](../uniserve_worker/execution/forward/graph/interleaved_text.py#L422) | model-owned cache commit 与 homogeneous batch 限制 |
-| text 与 denoise/commit 同一 forward | 不同请求/阶段的 segment 进入同一个 decoder launch | `PackedVisibleGraphProgram` | [`PackedMixedGraphRunner`](../uniserve_worker/execution/forward/graph/packed_visible.py#L71) | [`PackedMixedForward`](../uniserve_worker/execution/forward/programs/packed_visible.py#L215) 中的 packing、visibility、KV promotion、scatter 和各类 commit |
-| pure denoise step | 请求 cursor 按 timestep 前进，输出是 velocity/latent update | `DenoiseStepGraphProgram` | [`DenoiseStepGraphRunner`](../uniserve_worker/execution/forward/graph/denoise_step.py#L98) | CFG branch packing、输出 clone 与 latent accept-update |
+| self-managed KV / interleaved model | 模型的 modality FSM 与 cache 所有权无法交给通用 text runner | `ModelOwnedTextGraphProgram` | [`InterleavedTextPrefillGraphRunner`](../uniserve_worker/models/interleaved_text.py) 与 [`InterleavedTextDecodeGraphRunner`](../uniserve_worker/models/interleaved_text.py) | model-owned cache commit 与 homogeneous batch 限制 |
+| text 与 denoise/commit 同一 forward | 不同请求/阶段的 segment 进入同一个 decoder launch | `PackedVisibleGraphProgram` | [`PackedMixedGraphRunner`](../uniserve_worker/models/packed_forward.py) | [`PackedMixedForward`](../uniserve_worker/models/packed_forward.py) 中的 packing、visibility、KV promotion、scatter 和各类 commit |
+| pure denoise step | 请求 cursor 按 timestep 前进，输出是 velocity/latent update | `DenoiseStepGraphProgram` | [`DenoiseStepGraphRunner`](../uniserve_worker/models/interleaved_image.py) | CFG branch packing、输出 clone 与 latent accept-update |
 | pure encode、pure commit 或不满足 eligibility 的形状 | 不一定属于通用 Graph program 的覆盖面 | delegated/private/eager path | 无统一物理 runner | 先确认 policy 与 adapter ownership，不要假设所有 GPU 工作都必须由这套 Graph 覆盖 |
 
 每读一个新家族，都重复同样六个问题：Scheduler 为什么产生这种 group？Worker 用什么 plan 表达它？逻辑 program 为什么接受？物理 key 是什么？哪些请求值写入稳定 buffers？replay 成功后谁提交请求状态？
@@ -260,9 +260,9 @@ Graph 命中不是一个布尔开关，而是请求在生命周期中连续通�
 2. **Worker 语义门：** `BatchPolicy`、`ForwardGroupPlanner` 和 `ForwardGraphProgram.can_run` 是否接受完整 group，是否存在 speculative tokens、burst、unsupported row 或 delegated mode。
 3. **物理执行门：** 对应 runner 是否启用，设备和 paged cache 是否匹配，attention backend 是否提供 graph-safe prepare，物理 key/bucket 是否存在或允许 capture。
 
-任何一门失败都会返回 miss 或抛出分类异常，最终由 [`ForwardGraphPolicy`](../uniserve_worker/execution/forward/fallback.py#L35-L47) 与 `ForwardExecutor` 决定 eager fallback 还是 strict failure。当前 `ModelRunner` 在非 simulation 模式下构造 strict policy，因此不能把 miss 理解成“生产环境总会自动跑 eager”；先检查 mode 是否把 Graph 选择委托给 adapter，以及当前 policy 是否允许 capture/fallback。
+任何一门失败都会返回 miss 或抛出分类异常，最终由 [`ForwardGraphPolicy`](../uniserve_worker/contracts/forward_batch.py) 与 `ForwardExecutor` 决定 eager fallback 还是 strict failure。当前 `ModelRunner` 在非 simulation 模式下构造 strict policy，因此不能把 miss 理解成“生产环境总会自动跑 eager”；先检查 mode 是否把 Graph 选择委托给 adapter，以及当前 policy 是否允许 capture/fallback。
 
-共享物理模板 [`_GraphRunnerBase`](../uniserve_worker/execution/forward/graph/base.py#L176-L375) 只统一 capture/replay、输入刷新、backend prepare、统计和失败分类。每个家族仍负责自己的 eligibility、key、静态 state、动态 copy、输出切片和 post-replay commit。
+共享物理模板 [`_GraphRunnerBase`](../uniserve_worker/execution/cuda_graph.py) 只统一 capture/replay、输入刷新、backend prepare、统计和失败分类。每个家族仍负责自己的 eligibility、key、静态 state、动态 copy、输出切片和 post-replay commit。
 
 ## 实际阅读顺序
 
