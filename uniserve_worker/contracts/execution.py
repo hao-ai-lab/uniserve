@@ -494,8 +494,16 @@ def validate_execute_batch(
     capacity selection are engine obligations at their owning seams.
     """
 
-    if batch.engine_epoch < 0 or batch.step_id < 0 or batch.acknowledged_through < 0:
+    if batch.engine_epoch < 0 or batch.step_id < 0:
         raise ExecutionContractError("batch identity fields must be non-negative")
+    if batch.acknowledged_through < -1:
+        raise ExecutionContractError(
+            "acknowledged_through is a step id, or -1 for none acknowledged"
+        )
+    if batch.acknowledged_through >= batch.step_id:
+        raise ExecutionContractError(
+            "a batch cannot acknowledge its own or a future step"
+        )
     if not batch.rows:
         raise ExecutionContractError("an execute batch carries at least one row")
     seen_incarnations: set[tuple[int, int]] = set()
