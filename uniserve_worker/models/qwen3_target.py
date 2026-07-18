@@ -85,11 +85,22 @@ class Qwen3Target:
         device: str = "cuda",
         seed: int = 0,
         overlay_bank: WeightOverlayBank | None = None,
+        dtype=None,
+        zero_init: bool = False,
     ) -> None:
+        import torch
+
+        dtype = dtype if dtype is not None else torch.float32
         if config.routes != 1:
             raise ValueError("Qwen3 registers one text route")
         self.root = TargetDecoderRoot(
-            config, attention, device=device, seed=seed, overlay_bank=overlay_bank
+            config,
+            attention,
+            device=device,
+            seed=seed,
+            overlay_bank=overlay_bank,
+            dtype=dtype,
+            zero_init=zero_init,
         )
 
     @property
@@ -127,3 +138,71 @@ class Qwen3Target:
             segments, residency, capacity, payload.token_ids, payload.positions
         )
         return project_greedy_outcomes(segments, capacity, payload, logits)
+
+
+def load_qwen3_checkpoint(target: Qwen3Target, checkpoint_dir: str) -> None:
+    """Bind a real Qwen3 checkpoint's weights into the target root.
+
+    Checkpoint reuse is the spec's sanctioned family-port path: the resident
+    neural weights are the family's; the runtime architecture around them is
+    the target's. Mapping covers the dense Qwen3 layout (embed, per-layer
+    norms, q/k/v/o with per-head q/k norms, gated MLP, final norm, untied or
+    tied LM head).
+    """
+
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    directory = Path(checkpoint_dir)
+    root = target.root
+    layers = root.layers
+
+    def assign(name: str, tensor) -> bool:
+        value = tensor.to(root.device, root.dtype)
+        if name == "model.embed_tokens.weight":
+            root.embedding.copy_(value)
+            if tied_lm_head:
+                root.lm_head.copy_(value)
+            return True
+        if name == "lm_head.weight":
+            root.lm_head.copy_(value)
+            return True
+        if name == "model.norm.weight":
+            root.final_norm.copy_(value)
+            return True
+        parts = name.split(".")
+        if len(parts) < 4 or parts[1] != "layers":
+            return False
+        layer = layers[int(parts[2])]
+        leaf = ".".join(parts[3:])
+        mapping = {
+            "input_layernorm.weight": layer.input_norm,
+            "post_attention_layernorm.weight": layer.post_norm,
+            "self_attn.q_proj.weight": layer.q.weights[0],
+            "self_attn.k_proj.weight": layer.k.weights[0],
+            "self_attn.v_proj.weight": layer.v.weights[0],
+            "self_attn.o_proj.weight": layer.o.weights[0],
+            "self_attn.q_norm.weight": layer.q_norm,
+            "self_attn.k_norm.weight": layer.k_norm,
+            "mlp.gate_proj.weight": layer.gate.weights[0],
+            "mlp.up_proj.weight": layer.up.weights[0],
+            "mlp.down_proj.weight": layer.down.weights[0],
+        }
+        destination = mapping.get(leaf)
+        if destination is None:
+            return False
+        destination.copy_(value)
+        return True
+
+    config = json.loads((directory / "config.json").read_text())
+    tied_lm_head = bool(config.get("tie_word_embeddings", False))
+    unmapped: list[str] = []
+    for shard in sorted(directory.glob("*.safetensors")):
+        with safe_open(str(shard), framework="pt") as handle:
+            for name in handle.keys():
+                if not assign(name, handle.get_tensor(name)):
+                    unmapped.append(name)
+    if unmapped:
+        raise ValueError(f"unmapped checkpoint tensors: {unmapped[:8]}")

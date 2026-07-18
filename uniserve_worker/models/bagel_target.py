@@ -32,13 +32,24 @@ class BagelTarget:
         device: str = "cuda",
         seed: int = 0,
         overlay_bank: WeightOverlayBank | None = None,
+        dtype=None,
+        zero_init: bool = False,
     ) -> None:
+        import torch
+
+        dtype = dtype if dtype is not None else torch.float32
         if config.routes != 2:
             raise ValueError(
                 "BAGEL registers an understanding route and a generation route"
             )
         self.root = TargetDecoderRoot(
-            config, attention, device=device, seed=seed, overlay_bank=overlay_bank
+            config,
+            attention,
+            device=device,
+            seed=seed,
+            overlay_bank=overlay_bank,
+            dtype=dtype,
+            zero_init=zero_init,
         )
 
     @property
