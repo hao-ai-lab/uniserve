@@ -330,6 +330,8 @@ def test_models_tree_matches_target_file_set():
         # Dormant target SenseNova two-route family root (mixed text+denoise
         # composition through one packed traversal).
         "sensenova_target.py",
+        # Dormant target BAGEL two-route family root (marker-run denoise).
+        "bagel_target.py",
     }
     # SenseNova-U1 is its own package; the interleaved image denoise/commit
     # orchestration is system-owned under execution/, not model-local.
