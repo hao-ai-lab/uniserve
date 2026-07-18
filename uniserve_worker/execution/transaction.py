@@ -136,6 +136,9 @@ class StandardTransactionExecutor:
         sessions: tuple[RequestSession, ...],
     ) -> PreparedTransaction:
         try:
+            for row in batch.rows:
+                for lease in row.product_leases:
+                    self._residency.validate_product(lease)
             lowered_rows = tuple(
                 (row, self._resolve_roles(row, session))
                 for row, session in zip(batch.rows, sessions)
@@ -191,8 +194,8 @@ class StandardTransactionExecutor:
                     "adapter returned the wrong number of row outcomes"
                 )
             committed = self._committed_extents(prepared, outcomes)
-            prepared.reservation.commit(committed)
-            return self._derive_results(prepared, outcomes, committed)
+            published = prepared.reservation.commit(committed)
+            return self._derive_results(prepared, outcomes, committed, published)
         except Exception:
             prepared.reservation.abort()
             raise
@@ -280,11 +283,21 @@ class StandardTransactionExecutor:
         prepared: PreparedTransaction,
         outcomes: tuple[AdapterRowOutcome, ...],
         committed: tuple[int, ...],
+        published: tuple,
     ) -> tuple[tuple[RowResult, ...], tuple[SessionDelta, ...]]:
         lowered = prepared.lowered
         committed_by_row: dict[int, int] = {}
         for extent, row_id in zip(committed, lowered.binding_row_ids):
             committed_by_row[row_id] = committed_by_row.get(row_id, 0) + extent
+        # Published product leases in plan order map back to their rows.
+        published_by_row: dict[int, list] = {}
+        cursor = 0
+        for demand_row in lowered.plan.rows:
+            for _ in demand_row.products:
+                published_by_row.setdefault(demand_row.row_id, []).append(
+                    published[cursor]
+                )
+                cursor += 1
         results: list[RowResult] = []
         deltas: list[SessionDelta] = []
         for row, session, outcome in zip(
@@ -314,7 +327,9 @@ class StandardTransactionExecutor:
                     history_append=outcome.sampled_tokens,
                     cache_leases_added=(),
                     cache_leases_released=(),
-                    product_leases_added=(),
+                    product_leases_added=tuple(
+                        published_by_row.get(row.row_id, ())
+                    ),
                     product_leases_released=(),
                     terminal=TerminalStatus.ACTIVE,
                 )

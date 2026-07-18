@@ -18,10 +18,8 @@ from uniserve_worker.contracts.execution import (
     FlowStep,
     OperationTag,
     ProductLease,
-    ProductLifetime,
     SequenceStep,
     SessionRef,
-    TransferKind,
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
 from uniserve_worker.contracts.segment_table import GraphCapacity
@@ -40,7 +38,11 @@ from uniserve_worker.models.cache_registrations import (
 )
 from uniserve_worker.runtime.transactional_residency import (
     ArenaConfig,
+    ProductDemand,
+    ProductStoreConfig,
+    ReservationPlan,
     Residency,
+    RowDemand,
 )
 
 pytestmark = pytest.mark.unit
@@ -74,7 +76,11 @@ def _capacity(**overrides) -> GraphCapacity:
 
 
 def _residency() -> Residency:
-    return Residency(_ENGINE, (ArenaConfig(domain_id=1, page_count=65, page_tokens=16),))
+    return Residency(
+        _ENGINE,
+        (ArenaConfig(domain_id=1, page_count=65, page_tokens=16),),
+        product_stores=(ProductStoreConfig(schema_id=7, row_capacity=256),),
+    )
 
 
 def _row(operation, *, row_id: int = 0, product_leases=()) -> ExecuteRow:
@@ -89,16 +95,24 @@ def _row(operation, *, row_id: int = 0, product_leases=()) -> ExecuteRow:
     )
 
 
-def _latent_lease(lease_id: int, rows: int) -> ProductLease:
-    return ProductLease(
-        lease_id=lease_id,
-        schema_id=7,
-        producer=_SESSION,
-        product_version=1,
-        extent_rows=rows,
-        lifetime=ProductLifetime.REQUEST,
-        transfer=TransferKind.LOCAL_RESIDENCY,
+def _publish_latent(residency: Residency, rows: int) -> ProductLease:
+    """Publish one committed latent product (an encode row's outcome)."""
+
+    reservation = residency.reserve(
+        ReservationPlan(
+            rows=(
+                RowDemand(
+                    row_id=0,
+                    bindings=(),
+                    products=(
+                        ProductDemand(schema_id=7, rows=rows, producer=_SESSION),
+                    ),
+                ),
+            )
+        )
     )
+    (lease,) = reservation.commit(())
+    return lease
 
 
 def test_qwen3_extend_and_verification_stack_one_sequence():
@@ -157,17 +171,18 @@ def test_sensenova_flow_lowers_one_segment_per_cfg_branch():
             )
         }
     )
+    latent = _publish_latent(residency, 32)
     operation = FlowStep(
         schedule_id=1,
         step_index=3,
         total_steps=50,
-        input_product=9,
+        input_product=latent.lease_id,
         branch_coefficients=(4.0, 1.0, 1.0),
         conditioning_products=(),
         output_schema=7,
     )
     lowered = lower_rows(
-        ((_row(operation, product_leases=(_latent_lease(9, 32),)), roles),),
+        ((_row(operation, product_leases=(latent,)), roles),),
         _SENSENOVA,
     )
     assert len(lowered.segments) == 3
@@ -208,7 +223,7 @@ def test_sensenova_feedback_appends_the_encoded_image_region():
     lowered = lower_rows(
         (
             (
-                _row(feedback, product_leases=(_latent_lease(3, 48),)),
+                _row(feedback, product_leases=(_publish_latent(residency, 48),)),
                 RoleSequences({PRIMARY_ROLE: primary}),
             ),
         ),
@@ -260,12 +275,13 @@ def test_operation_tags_without_regions_fail_closed():
     primary = residency.create_sequence(
         _SESSION, domain_id=1, role_id=PRIMARY_ROLE, lifetime=CacheLifetime.REQUEST
     )
-    flow = FlowStep(1, 0, 50, 9, (1.0,), (), 7)
+    latent = _publish_latent(residency, 8)
+    flow = FlowStep(1, 0, 50, latent.lease_id, (1.0,), (), 7)
     with pytest.raises(LoweringError, match="no FLOW_STEP regions|lowers no"):
         lower_rows(
             (
                 (
-                    _row(flow, product_leases=(_latent_lease(9, 8),)),
+                    _row(flow, product_leases=(latent,)),
                     RoleSequences({PRIMARY_ROLE: primary}),
                 ),
             ),

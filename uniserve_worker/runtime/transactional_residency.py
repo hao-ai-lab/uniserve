@@ -37,7 +37,14 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 
 from ..contracts.cache_schema import CacheEffect, CacheLifetime, CacheSequenceRef
-from ..contracts.execution import CacheLease, EngineRef, SessionRef
+from ..contracts.execution import (
+    CacheLease,
+    EngineRef,
+    ProductLease,
+    ProductLifetime,
+    SessionRef,
+    TransferKind,
+)
 from ..contracts.residency_batch import (
     SINK_PAGE_ID,
     ResidencyBatchArrays,
@@ -47,6 +54,8 @@ from ..contracts.residency_batch import (
 __all__ = [
     "ArenaConfig",
     "LeaseReleaseOutcome",
+    "ProductDemand",
+    "ProductStoreConfig",
     "Residency",
     "ResidencyError",
     "ResidencyExhausted",
@@ -96,9 +105,57 @@ class SequenceBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductDemand:
+    """One durable product region reserved by a row (published at commit)."""
+
+    schema_id: int
+    rows: int
+    producer: SessionRef
+
+
+@dataclass(frozen=True, slots=True)
+class ProductStoreConfig:
+    """Fixed row capacity for one registered product schema."""
+
+    schema_id: int
+    row_capacity: int
+
+
+@dataclass(slots=True)
+class _ProductRecord:
+    lease_id: int
+    schema_id: int
+    rows: int
+    version: int
+    producer: SessionRef
+    pins: int = 0
+
+
+class _ProductStore:
+    def __init__(self, config: ProductStoreConfig) -> None:
+        self.config = config
+        self.rows_used = 0
+
+    def reserve(self, rows: int) -> None:
+        if rows <= 0:
+            raise ResidencyError("product regions reserve at least one row")
+        if self.rows_used + rows > self.config.row_capacity:
+            raise ResidencyExhausted(
+                f"product schema {self.config.schema_id} needs {rows} rows; "
+                f"{self.config.row_capacity - self.rows_used} free"
+            )
+        self.rows_used += rows
+
+    def release(self, rows: int) -> None:
+        self.rows_used -= rows
+
+
+@dataclass(frozen=True, slots=True)
 class RowDemand:
     row_id: int
     bindings: tuple[SequenceBinding, ...]
+    products: tuple[ProductDemand, ...] = ()
+    input_products: tuple[int, ...] = ()  # lease ids validated and pinned
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,16 +323,20 @@ class ResidencyReservation:
         self,
         residency: "Residency",
         bindings: list[_BindingReservation],
+        products: list[ProductDemand],
+        pinned_products: list[int],
     ) -> None:
         self._residency = residency
         self._bindings = bindings
+        self._products = products
+        self._pinned_products = pinned_products
         self._resolved = False
 
     @property
     def bindings(self) -> tuple[_BindingReservation, ...]:
         return tuple(self._bindings)
 
-    def commit(self, committed_rows: tuple[int, ...]) -> None:
+    def commit(self, committed_rows: tuple[int, ...]) -> tuple[ProductLease, ...]:
         """Publish exactly the accepted extents; non-failing after validation.
 
         ``committed_rows[i]`` is binding ``i``'s accepted row count: all
@@ -312,8 +373,13 @@ class ResidencyReservation:
         # Validation complete; the transition below cannot fail.
         for reservation, advance in zip(self._bindings, committed_rows):
             self._commit_binding(reservation, advance)
+        published = tuple(
+            self._residency._publish_product(demand) for demand in self._products
+        )
         self._residency._release_pins(self._bindings)
+        self._residency._unpin_products(self._pinned_products)
         self._resolved = True
+        return published
 
     def abort(self) -> None:
         """Release every provisional page; idempotent; committed state intact."""
@@ -325,7 +391,10 @@ class ResidencyReservation:
                 reservation.arena.release(page)
             if reservation.cloned_partial is not None:
                 reservation.arena.release(reservation.cloned_partial[1])
+        for demand in self._products:
+            self._residency._product_stores[demand.schema_id].release(demand.rows)
         self._residency._release_pins(self._bindings)
+        self._residency._unpin_products(self._pinned_products)
         self._resolved = True
 
     def batch_arrays(
@@ -439,7 +508,12 @@ class ResidencyReservation:
 class Residency:
     """Sole owner of cache pages, sequences, prefix pins, and reservations."""
 
-    def __init__(self, engine: EngineRef, arenas: tuple[ArenaConfig, ...]) -> None:
+    def __init__(
+        self,
+        engine: EngineRef,
+        arenas: tuple[ArenaConfig, ...],
+        product_stores: tuple[ProductStoreConfig, ...] = (),
+    ) -> None:
         self.engine = engine
         self._arenas = {config.domain_id: _Arena(config) for config in arenas}
         if len(self._arenas) != len(arenas):
@@ -448,6 +522,11 @@ class Residency:
         self._sequence_ids = itertools.count(1)
         self._leases: dict[int, _PrefixRecord] = {}
         self._lease_ids = itertools.count(1)
+        self._product_stores = {
+            config.schema_id: _ProductStore(config) for config in product_stores
+        }
+        self._products: dict[int, _ProductRecord] = {}
+        self._product_ids = itertools.count(1)
 
     # ------------------------------------------------------------------ #
     # Sequences.
@@ -499,6 +578,8 @@ class Residency:
 
         bindings: list[_BindingReservation] = []
         contexts: dict[int, _BindingReservation] = {}
+        products: list[ProductDemand] = []
+        pinned_products: list[int] = []
         try:
             for row in plan.rows:
                 for binding in row.bindings:
@@ -511,15 +592,29 @@ class Residency:
                         CacheEffect.TENTATIVE_APPEND,
                     ):
                         contexts[binding.sequence.sequence_id] = reservation
+                for lease_id in row.input_products:
+                    self._pin_product(lease_id)
+                    pinned_products.append(lease_id)
+                for demand in row.products:
+                    store = self._product_stores.get(demand.schema_id)
+                    if store is None:
+                        raise ResidencyError(
+                            f"no product store for schema {demand.schema_id}"
+                        )
+                    store.reserve(demand.rows)
+                    products.append(demand)
         except ResidencyError:
             for reservation in bindings:
                 for page in reservation.provisional_pages:
                     reservation.arena.release(page)
                 if reservation.cloned_partial is not None:
                     reservation.arena.release(reservation.cloned_partial[1])
+            for demand in products:
+                self._product_stores[demand.schema_id].release(demand.rows)
             self._release_pins(bindings)
+            self._unpin_products(pinned_products)
             raise
-        return ResidencyReservation(self, bindings)
+        return ResidencyReservation(self, bindings, products, pinned_products)
 
     def _reserve_binding(
         self,
@@ -701,6 +796,73 @@ class Residency:
         if lease.engine_epoch != self.engine.engine_epoch:
             raise StaleSequenceError("lease names a foreign engine epoch")
         return record
+
+    # ------------------------------------------------------------------ #
+    # Products.
+    # ------------------------------------------------------------------ #
+
+    def _publish_product(self, demand: ProductDemand) -> ProductLease:
+        record = _ProductRecord(
+            lease_id=next(self._product_ids),
+            schema_id=demand.schema_id,
+            rows=demand.rows,
+            version=1,
+            producer=demand.producer,
+        )
+        self._products[record.lease_id] = record
+        return ProductLease(
+            lease_id=record.lease_id,
+            schema_id=record.schema_id,
+            producer=record.producer,
+            product_version=record.version,
+            extent_rows=record.rows,
+            lifetime=ProductLifetime.REQUEST,
+            transfer=TransferKind.LOCAL_RESIDENCY,
+        )
+
+    def validate_product(self, lease: ProductLease) -> None:
+        """Typed pre-launch validation of one committed product lease."""
+
+        record = self._products.get(lease.lease_id)
+        if record is None:
+            raise StaleSequenceError(
+                f"product lease {lease.lease_id} is not committed"
+            )
+        if (
+            record.version != lease.product_version
+            or record.schema_id != lease.schema_id
+            or record.rows != lease.extent_rows
+        ):
+            raise StaleSequenceError(
+                f"product lease {lease.lease_id} identity is stale"
+            )
+
+    def release_product(self, lease: ProductLease) -> LeaseReleaseOutcome:
+        record = self._products.get(lease.lease_id)
+        if record is None or record.version != lease.product_version:
+            return LeaseReleaseOutcome.STALE
+        if record.pins:
+            return LeaseReleaseOutcome.BUSY
+        self._product_stores[record.schema_id].release(record.rows)
+        del self._products[lease.lease_id]
+        return LeaseReleaseOutcome.RELEASED
+
+    def product_rows_used(self, schema_id: int) -> int:
+        return self._product_stores[schema_id].rows_used
+
+    def _pin_product(self, lease_id: int) -> None:
+        record = self._products.get(lease_id)
+        if record is None:
+            raise StaleSequenceError(
+                f"input product lease {lease_id} is not committed"
+            )
+        record.pins += 1
+
+    def _unpin_products(self, lease_ids: list[int]) -> None:
+        for lease_id in lease_ids:
+            record = self._products.get(lease_id)
+            if record is not None and record.pins > 0:
+                record.pins -= 1
 
     def _pin_leases(self, lease_ids: tuple[int, ...]) -> tuple[int, ...]:
         pinned: list[int] = []

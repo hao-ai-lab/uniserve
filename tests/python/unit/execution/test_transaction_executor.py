@@ -14,6 +14,7 @@ import pytest
 
 from uniserve_worker.contracts.execution import (
     CandidateVerification,
+    EncodeStep,
     EngineRef,
     ExecuteBatch,
     ExecuteRow,
@@ -22,6 +23,7 @@ from uniserve_worker.contracts.execution import (
     OperationTag,
     ProductLease,
     ProductLifetime,
+    RepresentationKind,
     SamplingSpec,
     SequenceStep,
     SessionRef,
@@ -42,7 +44,14 @@ from uniserve_worker.models.cache_registrations import (
     qwen3_cache_registration,
     sensenova_cache_registration,
 )
-from uniserve_worker.runtime.transactional_residency import ArenaConfig, Residency
+from uniserve_worker.runtime.transactional_residency import (
+    ArenaConfig,
+    ProductDemand,
+    ProductStoreConfig,
+    ReservationPlan,
+    Residency,
+    RowDemand,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -94,7 +103,9 @@ def _capacity(tokens: int = 64) -> GraphCapacity:
 
 def _stack(registration, *, pages: int = 33):
     residency = Residency(
-        _ENGINE, (ArenaConfig(domain_id=1, page_count=pages, page_tokens=_PAGE_TOKENS),)
+        _ENGINE,
+        (ArenaConfig(domain_id=1, page_count=pages, page_tokens=_PAGE_TOKENS),),
+        product_stores=(ProductStoreConfig(schema_id=7, row_capacity=64),),
     )
     adapter = StubAdapter()
     executor = StandardTransactionExecutor(
@@ -179,12 +190,25 @@ def test_denoise_transaction_overlays_and_releases():
     prefill = SequenceStep((5, 6), 0, 0, 1)
     engine.execute(_batch(0, _row(prefill, version=0, admission=_admission())))
     free_before = residency.pressure()[1]["free_pages"]
-    latent = ProductLease(
-        lease_id=9, schema_id=7, producer=SessionRef(_ENGINE, 41, 1, 1),
-        product_version=1, extent_rows=16, lifetime=ProductLifetime.REQUEST,
-        transfer=TransferKind.LOCAL_RESIDENCY,
+    publish = residency.reserve(
+        ReservationPlan(
+            rows=(
+                RowDemand(
+                    row_id=0,
+                    bindings=(),
+                    products=(
+                        ProductDemand(
+                            schema_id=7,
+                            rows=16,
+                            producer=SessionRef(_ENGINE, 41, 1, 1),
+                        ),
+                    ),
+                ),
+            )
+        )
     )
-    flow = FlowStep(1, 0, 50, 9, (4.0, 1.0, 1.0), (), 7)
+    (latent,) = publish.commit(())
+    flow = FlowStep(1, 0, 50, latent.lease_id, (4.0, 1.0, 1.0), (), 7)
     result = engine.execute(
         _batch(1, _row(flow, version=1, leases=(latent,)))
     ).result()
@@ -227,3 +251,70 @@ def test_launch_failure_aborts_the_reservation_and_poisons():
         engine.execute(_batch(0, _row(prefill, version=0, admission=_admission())))
     # The reservation aborted: no page leaked despite the poisoned epoch.
     assert residency.pressure()[1]["free_pages"] == free_before
+
+
+def test_encode_publishes_a_product_only_at_commit():
+    engine, residency, adapter = _stack(
+        sensenova_cache_registration(
+            layer_count=2, query_heads=8, kv_heads=2,
+            qk_head_dim=64, value_head_dim=64, page_tokens=_PAGE_TOKENS,
+        )
+    )
+    prefill = SequenceStep((5, 6), 0, 0, 1)
+    engine.execute(_batch(0, _row(prefill, version=0, admission=_admission())))
+    encode = EncodeStep(RepresentationKind.IMAGE_PATCH, 0, 7, (1, 4, 4))
+    result = engine.execute(_batch(1, _row(encode, version=1))).result()
+    (lease,) = result.session_deltas[0].product_leases_added
+    assert lease.schema_id == 7
+    assert lease.extent_rows == 16
+    residency.validate_product(lease)
+    # The committed product feeds the next flow transaction as a real input.
+    flow = FlowStep(1, 0, 50, lease.lease_id, (4.0, 1.0, 1.0), (), 7)
+    engine.execute(_batch(2, _row(flow, version=2, leases=(lease,)))).result()
+    # Explicit versioned release; a second release is stale.
+    from uniserve_worker.runtime.transactional_residency import (
+        LeaseReleaseOutcome,
+    )
+    assert residency.release_product(lease) is LeaseReleaseOutcome.RELEASED
+    assert residency.release_product(lease) is LeaseReleaseOutcome.STALE
+
+
+def test_aborted_products_never_publish_and_stale_inputs_reject():
+    engine, residency, adapter = _stack(
+        sensenova_cache_registration(
+            layer_count=2, query_heads=8, kv_heads=2,
+            qk_head_dim=64, value_head_dim=64, page_tokens=_PAGE_TOKENS,
+        )
+    )
+    rows_before = residency.product_rows_used(7)
+    publish = residency.reserve(
+        ReservationPlan(
+            rows=(
+                RowDemand(
+                    row_id=0,
+                    bindings=(),
+                    products=(
+                        ProductDemand(
+                            schema_id=7, rows=16,
+                            producer=SessionRef(_ENGINE, 41, 1, 1),
+                        ),
+                    ),
+                ),
+            )
+        )
+    )
+    publish.abort()
+    assert residency.product_rows_used(7) == rows_before
+    # Consuming a never-committed lease is a typed pre-launch rejection.
+    from uniserve_worker.execution.engine import PreLaunchRejection
+
+    fabricated = ProductLease(
+        lease_id=99, schema_id=7, producer=SessionRef(_ENGINE, 41, 1, 1),
+        product_version=1, extent_rows=16, lifetime=ProductLifetime.REQUEST,
+        transfer=TransferKind.LOCAL_RESIDENCY,
+    )
+    prefill = SequenceStep((5, 6), 0, 0, 1)
+    engine.execute(_batch(0, _row(prefill, version=0, admission=_admission())))
+    flow = FlowStep(1, 0, 50, 99, (4.0, 1.0, 1.0), (), 7)
+    with pytest.raises(PreLaunchRejection):
+        engine.execute(_batch(1, _row(flow, version=1, leases=(fabricated,))))
