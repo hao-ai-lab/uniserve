@@ -27,7 +27,6 @@ import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.runtime import paged_denoise as paged_denoise_mod
 from uniserve_worker.models.interleaved_image import (
     DenoiseRow,
     DenoiseStepGraphRunner,
@@ -35,6 +34,7 @@ from uniserve_worker.models.interleaved_image import (
 )
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.ops import AttentionRegime
+from uniserve_worker.runtime import paged_denoise as paged_denoise_mod
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_denoise import can_run_paged_denoise_attention
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache

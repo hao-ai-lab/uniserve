@@ -177,7 +177,6 @@ class ModelRegistry:
     def __init__(self) -> None:
         self._classes: dict[str, Type[UniModel]] = {}
         self._descriptors: dict[str, ModelFamilyDescriptor] = {}
-        self._fallback_cls: Type[UniModel] | None = None
 
     def register(
         self, model_cls: Type[UniModel], *, names: list[str] | tuple[str, ...] | None = None
@@ -187,10 +186,6 @@ class ModelRegistry:
         descriptor = ModelFamilyDescriptor.from_model_class(
             model_cls, names=tuple(str(key) for key in keys)
         )
-        if bool(getattr(model_cls, "fallback", False)):
-            if self._fallback_cls is not None and self._fallback_cls is not model_cls:
-                raise invalid_descriptor("only one fallback model class can be registered")
-            self._fallback_cls = model_cls
         for key in keys:
             if key in self._classes:
                 if self._classes[key] is model_cls:
@@ -212,29 +207,11 @@ class ModelRegistry:
                 continue
             if arch in self._descriptors:
                 return self._descriptors[arch]
-        config = get_execution_config()
-        if self._fallback_cls is not None and bool(config.allow_transformers_fallback):
-            fallback_names = tuple(
-                getattr(self._fallback_cls, "architectures", (self._fallback_cls.__name__,))
-            )
-            if any(name not in disabled for name in fallback_names):
-                logger.warning(
-                    "no UniModel registered for requested architectures; explicit fallback is enabled",
-                    extra={
-                        "architectures": list(architectures),
-                        "fallback_model_class": getattr(
-                            self._fallback_cls, "__name__", repr(self._fallback_cls)
-                        ),
-                    },
-                )
-                return ModelFamilyDescriptor.from_model_class(
-                    self._fallback_cls, names=fallback_names
-                )
         known = ", ".join(sorted(self._classes)) or "<none>"
-        message = f"no UniModel registered for architectures {architectures!r}; known architectures: {known}"
-        if self._fallback_cls is not None and not bool(config.allow_transformers_fallback):
-            message += "; generic Transformers fallback is disabled by default, pass --allow-transformers-fallback to opt in"
-        raise capability_mismatch(message)
+        raise capability_mismatch(
+            f"no UniModel registered for architectures {architectures!r}; "
+            f"known architectures: {known}"
+        )
 
     def registered_classes(self) -> tuple[Type[UniModel], ...]:
         """Distinct registered model classes (a name may map several aliases)."""

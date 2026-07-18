@@ -328,7 +328,6 @@ def test_models_tree_matches_target_file_set():
     assert top_level == {
         "__init__.py",
         "registry.py",
-        "transformers_fallback.py",
         "qwen3.py",
         "bagel.py",
         # Family cache registrations for the unified KV runtime

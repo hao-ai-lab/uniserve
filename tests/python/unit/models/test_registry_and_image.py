@@ -3,7 +3,7 @@
 Covers three public surfaces:
 
 * :class:`uniserve_worker.models.registry.ModelRegistry` -- duplicate-arch and
-  multi-fallback rejection, and ``resolve()`` filtering of disabled archs.
+  strict unknown-architecture rejection, and ``resolve()`` filtering of disabled archs.
 * :meth:`uniserve_worker.processors.bagel.BagelImageProcessor.decode_image_b64`
   -- compositing of transparent / RGBA / palette-with-transparency inputs over
   opaque white, and the straight RGB conversion of an opaque input.
@@ -54,13 +54,6 @@ class _ModelArch2:
 class _FallbackA:
     architectures = ("FallbackA",)
     supported_ops = ()
-    fallback = True
-
-
-class _FallbackB:
-    architectures = ("FallbackB",)
-    supported_ops = ()
-    fallback = True
 
 
 # --------------------------------------------------------------------------- #
@@ -89,14 +82,6 @@ def test_register_same_class_under_same_arch_is_idempotent():
     assert registry.resolve(("Arch1",)) is _ModelArch1
 
 
-def test_register_rejects_second_fallback_class_with_invalid_descriptor():
-    registry = ModelRegistry()
-    registry.register(_FallbackA, names=_FallbackA.architectures)
-
-    with pytest.raises(WorkerError) as excinfo:
-        registry.register(_FallbackB, names=_FallbackB.architectures)
-
-    assert excinfo.value.code == ErrorCode.INVALID_DESCRIPTOR
 
 
 # --------------------------------------------------------------------------- #
@@ -171,28 +156,15 @@ def test_resolve_raises_capability_mismatch_for_unknown_arch(_two_arch_registry)
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
 
 
-def test_resolve_rejects_unknown_arch_with_fallback_disabled(_restore_worker_config):
+def test_resolve_rejects_unknown_arch(_restore_worker_config):
     registry = ModelRegistry()
     registry.register(_FallbackA, names=_FallbackA.architectures)
-    runtime_config_module.set_execution_config(
-        replace(_restore_worker_config, allow_transformers_fallback=False)
-    )
 
     with pytest.raises(WorkerError) as excinfo:
         registry.resolve(("NoSuchArch",))
 
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
-    assert "--allow-transformers-fallback" in str(excinfo.value)
-
-
-def test_resolve_returns_fallback_only_when_explicitly_enabled(_restore_worker_config):
-    registry = ModelRegistry()
-    registry.register(_FallbackA, names=_FallbackA.architectures)
-    runtime_config_module.set_execution_config(
-        replace(_restore_worker_config, allow_transformers_fallback=True)
-    )
-
-    assert registry.resolve(("NoSuchArch",)) is _FallbackA
+    assert "no UniModel registered" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
