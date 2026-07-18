@@ -67,6 +67,7 @@ __all__ = [
     "EngineState",
     "ExecutionEngine",
     "PayloadConflict",
+    "PreLaunchRejection",
     "StaleStep",
     "TransactionExecutor",
 ]
@@ -98,20 +99,33 @@ class EnginePoisoned(EngineExecutionError):
     """The epoch is poisoned; the engine requires controlled reconstruction."""
 
 
+class PreLaunchRejection(EngineExecutionError):
+    """Typed noncommitted pre-launch failure: no record, retry permitted."""
+
+
 class TransactionExecutor(Protocol):
     """Internal seam for the model-backed half of one transaction.
 
-    Receives the validated batch and the exact resolved session snapshots in
-    row order; returns row results and authoritative deltas in row order.
-    Raising any exception is treated as a post-acceptance execution failure
-    and poisons the epoch — pre-launch rejection belongs to validation,
-    before acceptance.
+    ``prepare`` performs every fallible step — lowering, capacity selection,
+    residency reservation, lease pinning, metadata refresh — and may raise
+    :class:`PreLaunchRejection` or :class:`EngineBackpressure`; the engine
+    treats those as noncommitted (no replay record, the step may retry).
+
+    ``launch`` replays the prepared transaction and returns row results and
+    authoritative deltas in row order. Acceptance has happened by then: any
+    exception from ``launch`` poisons the epoch, and the executor must
+    abort its reservation before raising.
     """
 
-    def run(
+    def prepare(
         self,
         batch: ExecuteBatch,
         sessions: tuple[RequestSession, ...],
+    ) -> object: ...
+
+    def launch(
+        self,
+        prepared: object,
     ) -> tuple[tuple[RowResult, ...], tuple[SessionDelta, ...]]: ...
 
 
@@ -225,10 +239,14 @@ class ExecutionEngine:
             raise EngineBackpressure(
                 "replay window is full; acknowledge completed steps first"
             )
-        # Pre-launch validation: rejection here is noncommitted and leaves no
-        # record, so the scheduler may retry the same step after correction.
+        # Pre-launch phase: every failure through prepare() is noncommitted
+        # and leaves no record, so the scheduler may retry the same step
+        # after correction (or after backpressure clears).
         validate_execute_batch(batch, advertised_operations=self._advertised)
         provisional, snapshots = self._resolve_sessions(batch.rows)
+        prepared = self._executor.prepare(batch, snapshots)
+        # Acceptance: from here the identity is retained and never returns to
+        # an unobserved state within the epoch.
         fingerprint = canonical_payload_fingerprint(batch)
         record = _ReplayRecord(
             step_id=batch.step_id,
@@ -240,9 +258,9 @@ class ExecutionEngine:
         self._next_step = batch.step_id + 1
         self._unresolved_step = batch.step_id
         try:
-            row_results, deltas = self._executor.run(batch, snapshots)
+            row_results, deltas = self._executor.launch(prepared)
             result = self._finalize(batch, row_results, deltas, provisional)
-        except EngineExecutionError:
+        except EnginePoisoned:
             raise
         except Exception as error:  # noqa: BLE001 — any post-acceptance failure
             self._poison(f"transaction {batch.step_id} failed after acceptance: {error}")

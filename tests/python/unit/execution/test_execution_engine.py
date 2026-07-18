@@ -38,6 +38,7 @@ from uniserve_worker.execution.engine import (
     EnginePoisoned,
     EngineState,
     ExecutionEngine,
+    PreLaunchRejection,
     StaleStep,
 )
 
@@ -53,8 +54,15 @@ class StubExecutor:
     def __init__(self) -> None:
         self.calls = 0
         self.fail_next = False
+        self.reject_prepare = False
 
-    def run(self, batch, sessions):
+    def prepare(self, batch, sessions):
+        if self.reject_prepare:
+            raise PreLaunchRejection("injected reservation exhaustion")
+        return (batch, sessions)
+
+    def launch(self, prepared):
+        batch, sessions = prepared
         self.calls += 1
         if self.fail_next:
             raise RuntimeError("injected device failure")
@@ -218,6 +226,19 @@ def test_post_acceptance_failure_poisons_the_epoch():
     with pytest.raises(EnginePoisoned, match="after acceptance"):
         engine.execute(_batch(0, _admission_row(41)))
     assert engine.state is EngineState.POISONED
+
+
+def test_executor_prepare_rejection_is_noncommitted_and_retryable():
+    engine, executor = _engine()
+    executor.reject_prepare = True
+    with pytest.raises(PreLaunchRejection):
+        engine.execute(_batch(0, _admission_row(41)))
+    assert engine.state is EngineState.READY
+    assert executor.calls == 0
+    executor.reject_prepare = False
+    # The same step retries once the pre-launch condition clears.
+    receipt = engine.execute(_batch(0, _admission_row(41)))
+    assert receipt.ready()
 
 
 def test_commands_execute_at_transaction_boundaries_only():
