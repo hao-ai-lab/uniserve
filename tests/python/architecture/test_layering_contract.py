@@ -327,6 +327,9 @@ def test_models_tree_matches_target_file_set():
         # Dormant target Qwen3 family root (Stage 6 family port): one resident
         # root over injected shared attention, no cache or provider ownership.
         "qwen3_target.py",
+        # Dormant target SenseNova two-route family root (mixed text+denoise
+        # composition through one packed traversal).
+        "sensenova_target.py",
     }
     # SenseNova-U1 is its own package; the interleaved image denoise/commit
     # orchestration is system-owned under execution/, not model-local.

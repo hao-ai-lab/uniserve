@@ -48,6 +48,7 @@ _CONFIG = Qwen3TargetConfig(
     vocab_size=64,
     hidden_size=32,
     layers=2,
+    routes=1,
     query_heads=4,
     kv_heads=2,
     head_dim=8,
