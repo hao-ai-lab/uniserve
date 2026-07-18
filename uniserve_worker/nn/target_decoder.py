@@ -64,6 +64,8 @@ class TargetDecoderConfig:
     mlp_hidden: int
     rope_theta: float = 10_000.0
     rms_eps: float = 1e-6
+    # Qwen3-style per-head RMSNorm on Q and K before rotary embedding.
+    qk_norm: bool = False
 
 
 @dataclass(slots=True)
@@ -77,6 +79,8 @@ class DecoderLayerWeights:
     gate: GroupedLinear
     up: GroupedLinear
     down: GroupedLinear
+    q_norm: torch.Tensor | None = None
+    k_norm: torch.Tensor | None = None
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -112,16 +116,23 @@ class TargetDecoderRoot:
         device: torch.device | str = "cuda",
         seed: int = 0,
         overlay_bank: WeightOverlayBank | None = None,
+        dtype: torch.dtype = torch.float32,
+        zero_init: bool = False,
     ) -> None:
         self.config = config
         self.device = torch.device(device)
+        self.dtype = dtype
         self.attention = attention
         generator = torch.Generator(device="cpu").manual_seed(seed)
 
         def weight(*shape: int) -> torch.Tensor:
+            if zero_init:
+                return torch.zeros(*shape, device=self.device, dtype=dtype)
             return (
-                torch.randn(*shape, generator=generator) * (shape[-1] ** -0.5)
-            ).to(self.device)
+                (torch.randn(*shape, generator=generator) * (shape[-1] ** -0.5))
+                .to(dtype)
+                .to(self.device)
+            )
 
         c = config
         q_dim = c.query_heads * c.head_dim
@@ -131,20 +142,30 @@ class TargetDecoderRoot:
         for _ in range(c.layers):
             self.layers.append(
                 DecoderLayerWeights(
-                    input_norm=torch.ones(c.hidden_size, device=self.device),
+                    input_norm=torch.ones(c.hidden_size, device=self.device, dtype=dtype),
                     q=GroupedLinear(
                         weight(c.routes, q_dim, c.hidden_size), overlay_bank
                     ),
                     k=GroupedLinear(weight(c.routes, kv_dim, c.hidden_size)),
                     v=GroupedLinear(weight(c.routes, kv_dim, c.hidden_size)),
                     o=GroupedLinear(weight(c.routes, c.hidden_size, q_dim)),
-                    post_norm=torch.ones(c.hidden_size, device=self.device),
+                    post_norm=torch.ones(c.hidden_size, device=self.device, dtype=dtype),
                     gate=GroupedLinear(weight(c.routes, c.mlp_hidden, c.hidden_size)),
                     up=GroupedLinear(weight(c.routes, c.mlp_hidden, c.hidden_size)),
                     down=GroupedLinear(weight(c.routes, c.hidden_size, c.mlp_hidden)),
+                    q_norm=(
+                        torch.ones(c.head_dim, device=self.device, dtype=dtype)
+                        if c.qk_norm
+                        else None
+                    ),
+                    k_norm=(
+                        torch.ones(c.head_dim, device=self.device, dtype=dtype)
+                        if c.qk_norm
+                        else None
+                    ),
                 )
             )
-        self.final_norm = torch.ones(c.hidden_size, device=self.device)
+        self.final_norm = torch.ones(c.hidden_size, device=self.device, dtype=dtype)
         self.lm_head = weight(c.vocab_size, c.hidden_size)
 
     # ------------------------------------------------------------------ #
@@ -191,6 +212,9 @@ class TargetDecoderRoot:
             positions[:active_tokens], device=self.device, dtype=torch.long
         )
         hidden = self.embedding.index_select(0, ids)
+        route_of_token = route_of_token.to(self.device)
+        if overlay_of_token is not None:
+            overlay_of_token = overlay_of_token.to(self.device)
         self.attention.prepare(segments, residency)
         for layer_id, layer in enumerate(self.layers):
             normed = _rms_norm(hidden, layer.input_norm, config.rms_eps)
@@ -200,6 +224,10 @@ class TargetDecoderRoot:
             q = q.view(active_tokens, config.query_heads, config.head_dim)
             k = k.view(active_tokens, config.kv_heads, config.head_dim)
             v = v.view(active_tokens, config.kv_heads, config.head_dim)
+            if layer.q_norm is not None:
+                q = _rms_norm(q, layer.q_norm, config.rms_eps)
+            if layer.k_norm is not None:
+                k = _rms_norm(k, layer.k_norm, config.rms_eps)
             q = _rope(q, position_column, config.rope_theta)
             k = _rope(k, position_column, config.rope_theta)
             spec = AttentionLayerSpec(
