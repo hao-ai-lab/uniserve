@@ -26,13 +26,11 @@ production routes through here until the vertical slice activates.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
 from ...contracts.cache_schema import AttentionPattern
 from ...contracts.residency_batch import ResidencyBatchArrays
-from ...contracts.segment_table import SegmentTableArrays
+from ...contracts.segment_table import AttentionLayerSpec, SegmentTableArrays
 
 __all__ = [
     "AttentionLayerSpec",
@@ -44,20 +42,6 @@ __all__ = [
 
 class ReferenceAttentionError(RuntimeError):
     """The provider received inputs outside its proven coverage."""
-
-
-@dataclass(frozen=True, slots=True)
-class AttentionLayerSpec:
-    """Narrow immutable layer description (the model-facing contract)."""
-
-    layer_id: int
-    site_id: int
-    domain_id: int
-    query_heads: int
-    kv_heads: int
-    qk_head_dim: int
-    value_head_dim: int
-    scale: float
 
 
 class CacheDeviceBinding:

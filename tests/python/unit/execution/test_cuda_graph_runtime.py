@@ -174,7 +174,7 @@ class GraphResidentAdapter:
         self._runtime = runtime
         self._page_tokens = page_tokens
 
-    def forward(self, segments, residency, capacity):
+    def forward(self, segments, residency, capacity, payload):
         demand = capacity  # the executor already selected this capacity
         view = self._runtime.execute(demand, segments, residency)
         rows = 1 + max(

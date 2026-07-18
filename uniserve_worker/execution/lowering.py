@@ -127,6 +127,8 @@ class LoweredBatch:
     write_token_begins: tuple[int, ...]
     binding_commits: tuple[CommitExpr, ...]
     binding_row_ids: tuple[int, ...]
+    token_ids: tuple[int, ...]
+    positions: tuple[int, ...]
 
     def demand(self, *, page_tokens: int) -> GraphCapacity:
         """The aggregate capacity vector this transaction requires."""
@@ -212,6 +214,8 @@ def lower_rows(
     write_token_begins: list[int] = []
     binding_commits: list[CommitExpr] = []
     binding_row_ids: list[int] = []
+    token_ids: list[int] = []
+    positions: list[int] = []
     token_cursor = 0
     region_counter = 0
     max_branches = 0
@@ -309,6 +313,11 @@ def lower_rows(
                         f"row {row.row_id}: route runs cover {run_cursor} of "
                         f"{query_rows} query rows"
                     )
+                ids, region_positions = _region_payload(
+                    row.operation, region, query_rows, context_length
+                )
+                token_ids.extend(ids)
+                positions.extend(region_positions)
                 token_cursor += query_rows
         if emitted == 0:
             raise LoweringError(
@@ -334,6 +343,8 @@ def lower_rows(
         write_token_begins=tuple(write_token_begins),
         binding_commits=tuple(binding_commits),
         binding_row_ids=tuple(binding_row_ids),
+        token_ids=tuple(token_ids),
+        positions=tuple(positions),
     )
 
 
@@ -403,6 +414,37 @@ def _operand_values(row: ExecuteRow) -> dict[ExtentOperand, int]:
             row, operation.input_product
         )
     return values
+
+
+def _region_payload(
+    operation: object,
+    region: CacheRegionSpec,
+    query_rows: int,
+    context_length: int,
+) -> tuple[list[int], list[int]]:
+    """Packed token ids and positions for one region instance.
+
+    Sequence regions carry the operation's real token spans and linear
+    positions; verification regions carry the candidate span at candidate
+    positions; non-token regions pack zero ids with region-local positions.
+    """
+
+    if isinstance(operation, SequenceStep):
+        if (
+            region.cache_effect is CacheEffect.TENTATIVE_APPEND
+            and operation.verification is not None
+        ):
+            return (
+                list(operation.verification.candidate_tokens),
+                list(operation.verification.candidate_positions),
+            )
+        if operation.input_tokens:
+            begin = operation.position_begin
+            return (
+                list(operation.input_tokens),
+                list(range(begin, begin + len(operation.input_tokens))),
+            )
+    return [0] * query_rows, list(range(context_length, context_length + query_rows))
 
 
 def _published_products(
