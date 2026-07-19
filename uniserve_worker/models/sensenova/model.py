@@ -3329,21 +3329,6 @@ class SenseNovaU1ForUnifiedGeneration(
             graph_mode=graph_mode,
         )
 
-    def _run_forward_adapter(
-        self,
-        batch: ForwardBatch,
-        *,
-        request_states: Any,
-        group: Any,
-        defer_text_cpu_results: bool = False,
-    ) -> Any:
-        del group
-        return self.segment_executor.execute(
-            batch,
-            request_states=request_states,
-            defer_text_cpu_results=defer_text_cpu_results,
-        )
-
     def accept_flow_update(self, ctx: PreparedFlowStep, latent: torch.Tensor) -> None:
         self.flow_execution.apply_flow_update(ctx, latent)
 
@@ -3364,27 +3349,26 @@ class SenseNovaU1ForUnifiedGeneration(
         return self.commit_generated_image(int(req_id), None, dict(op))
 
     @torch.inference_mode()
-    def forward(
-        self,
-        input_ids: Any,
-        positions: Any | None = None,
-        *,
-        kv: Any = None,
-        mode: str | None = None,
-        input_embeds: torch.Tensor | None = None,
-        op: dict[str, Any] | None = None,
-        request_state: RunnerRequestState | None = None,
-    ) -> Any:
+    def forward(self, batch: ForwardBatch) -> Any:
         if self.model is None:
             raise RuntimeError("SenseNova model weights are not loaded")
-        if isinstance(input_ids, ForwardBatch):
-            raise RuntimeError(
-                f"SenseNova direct batch forward is unsupported for {input_ids.mode}"
-            )
-        del positions, kv, mode, input_embeds, request_state
-        if op is None:
-            raise RuntimeError("SenseNova text forward requires the source op")
-        return self.run_text_logits(dict(op))
+        options = get_forward_context().execution_options
+        return self.segment_executor.execute(
+            batch,
+            request_states=self.runner_states,
+            defer_text_cpu_results=bool(getattr(options, "defer_text_cpu_results", False)),
+        )
+
+    @torch.inference_mode()
+    def forward_text(self, batch: ForwardBatch) -> torch.Tensor:
+        if self.model is None:
+            raise RuntimeError("SenseNova model weights are not loaded")
+        if len(batch.ops) != 1:
+            raise invalid_descriptor("SenseNova tensor text forward requires one operation")
+        logits = self.run_text_logits(dict(batch.ops[0]))
+        if not isinstance(logits, torch.Tensor):
+            raise invalid_descriptor("SenseNova text forward must return logits")
+        return logits
 
 
 EntryClass = SenseNovaU1ForUnifiedGeneration

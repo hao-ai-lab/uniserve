@@ -1857,21 +1857,6 @@ class BagelForUnifiedGeneration(UniModelBase):
     def accept_flow_update(self, ctx: PreparedFlowStep, latent: torch.Tensor) -> None:
         self.apply_flow_update(ctx, latent)
 
-    def _run_forward_adapter(
-        self,
-        batch: ForwardBatch,
-        *,
-        request_states: Any,
-        group: Any,
-        defer_text_cpu_results: bool = False,
-    ) -> Any:
-        del group
-        return self.segment_executor.execute(
-            batch,
-            request_states=request_states,
-            defer_text_cpu_results=defer_text_cpu_results,
-        )
-
     def _sync_text_cache_after_image(self, req_id: int, *, length: int, last_position: int) -> None:
         """Advance the driver's text cache past an image KV span written outside it.
 
@@ -1940,27 +1925,31 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     @torch.no_grad()
     def forward(
-        self,
-        input_ids: Any,
-        positions: Any | None = None,
-        *,
-        kv: Any = None,
-        mode: str | None = None,
-        input_embeds: torch.Tensor | None = None,
-        op: dict[str, Any] | None = None,
-        request_state: RequestState | None = None,
+        self, batch: ForwardBatch
     ) -> Any:
-        loaded = self._ensure_loaded()
+        from ..contracts.forward_context import get_forward_context
+
+        self._ensure_loaded()
+        options = get_forward_context().execution_options
         with self._autocast():
-            if isinstance(input_ids, ForwardBatch):
-                batch = input_ids
-                raise capability_mismatch(
-                    f"BAGEL direct batch forward is unsupported for {batch.mode}"
-                )
-            del loaded, positions, kv, mode, input_embeds, request_state
-            if op is None:
-                raise invalid_descriptor("BAGEL text forward requires the source op")
-            return self.run_text_logits(dict(op))
+            return self.segment_executor.execute(
+                batch,
+                request_states=self.states,
+                defer_text_cpu_results=bool(
+                    getattr(options, "defer_text_cpu_results", False)
+                ),
+            )
+
+    @torch.no_grad()
+    def forward_text(self, batch: ForwardBatch) -> torch.Tensor:
+        self._ensure_loaded()
+        if len(batch.ops) != 1:
+            raise invalid_descriptor("BAGEL tensor text forward requires one operation")
+        with self._autocast():
+            logits = self.run_text_logits(dict(batch.ops[0]))
+        if not isinstance(logits, torch.Tensor):
+            raise invalid_descriptor("BAGEL text forward must return logits")
+        return logits
 
     def _ensure_loaded(self) -> _LoadedBagelRuntime:
         model = self.model

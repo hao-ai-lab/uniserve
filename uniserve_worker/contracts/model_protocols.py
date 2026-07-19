@@ -171,12 +171,63 @@ class FlowCapable(Protocol):
 class ModelHooks:
     """Default no-op lifecycle/control hooks for runner-backed models."""
 
-    whole_batch_forward: bool = False
     supported_ops: tuple[str, ...] = ("prefill_und",)
     supported_controls: tuple[str, ...] = ()
     adapter_mode: str = "none"
     resource_plan: "ResourcePlan" = ResourcePlan()
     segment_executor: "SegmentExecutor | None" = None
+
+    def forward(self, batch: "ForwardBatch") -> Any:
+        """Execute a complete homogeneous batch through runner-bound runtime services."""
+
+        from .forward_batch import ForwardExecutionOptions, ForwardResult
+        from .forward_context import get_forward_context
+        from .forward_mode import ForwardMode
+
+        ctx = get_forward_context()
+        if ctx.request_states is None:
+            raise invalid_descriptor("model forward requires runner-bound request state")
+        options = ctx.execution_options
+        if not isinstance(options, ForwardExecutionOptions):
+            options = ForwardExecutionOptions()
+        if batch.mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}:
+            if ctx.text_driver is None:
+                raise invalid_descriptor("text forward requires a bound text runtime")
+            return ctx.text_driver.forward_result(
+                batch,
+                ctx.request_states,
+                self,
+                options=options,
+                tensor_store=ctx.tensor_store,
+            )
+        items = [
+            (int(op["req_id"]), ctx.request_states.get(int(op["req_id"])), op)
+            for op in batch.ops
+        ]
+        rows = tuple(range(len(items)))
+        if batch.mode is ForwardMode.DENOISE:
+            if ctx.denoise_driver is None:
+                raise invalid_descriptor("denoise forward requires a bound diffusion runtime")
+            result = ctx.denoise_driver.forward_result(
+                items,
+                self,
+                row_indices=rows,
+                graph_mode="eager",
+            )
+            if result is not None:
+                return result
+            return ForwardResult(
+                runtime_outputs=tuple(ctx.denoise_driver.step_many(items, self))
+            )
+        if batch.mode is ForwardMode.COMMIT:
+            if ctx.image_decode_driver is None:
+                raise invalid_descriptor("commit forward requires a bound codec runtime")
+            return ctx.image_decode_driver.forward_result(items, self, row_indices=rows)
+        if batch.mode is ForwardMode.ENCODE:
+            if ctx.encode_driver is None:
+                raise invalid_descriptor("encode forward requires a bound codec runtime")
+            return ctx.encode_driver.forward_result(batch, self, row_indices=rows)
+        raise invalid_descriptor("mixed-mode models must implement forward(batch)")
 
     def caps(
         self,

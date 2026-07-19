@@ -53,9 +53,6 @@ class UniServeZeroDayCfgZeroStarModel(ModelHooks):
     def batch_policy(self) -> BatchPolicy:
         return BatchPolicy(max_batch_ops=1024, supports_mixed_modes=True)
 
-    def forward(self, _batch):
-        raise AssertionError("zero-day diffusion must be driven by FlowExecutor")
-
     def predict_velocity(self, ctx, t, latent, branch):
         del ctx, t
         if branch == "cond":

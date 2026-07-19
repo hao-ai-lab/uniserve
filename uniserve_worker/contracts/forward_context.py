@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Protocol
 
 from .attention_plan import (
     AttentionPlanBase,
@@ -125,6 +125,13 @@ class ForwardContext:
     kv_pool: "KVPool | None" = None
     stats: ForwardStats | None = None
     allow_capture: bool = True
+    request_states: Any = None
+    execution_options: Any = None
+    text_driver: Any = None
+    denoise_driver: Any = None
+    encode_driver: Any = None
+    image_decode_driver: Any = None
+    tensor_store: Any = None
 
     def component_timer_start(self) -> int:
         """Start a per-component timer against this context's ``stats``."""

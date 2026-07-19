@@ -1727,9 +1727,9 @@ def _run_segment_forward_impl(
                             q_len=q_len,
                             branch=branch,
                         )
-                elif mode is ForwardMode.COMMIT:
-                    # Publication-only rows contribute no hidden-state segment; the
-                    # model hook publishes them after the packed forward updates state.
+                elif mode in {ForwardMode.COMMIT, ForwardMode.ENCODE}:
+                    # Publication-only rows contribute no hidden-state segment; their
+                    # model hooks run around the packed decoder work.
                     pass
                 else:
                     if require_graph:
@@ -2559,6 +2559,7 @@ class SegmentExecutor(SegmentRuntime):
         results: list[Any] = [None] * len(batch.ops)
         denoise_steps: list[tuple[int, PreparedFlowStep]] = []
         commit_rows: list[tuple[int, int, dict[str, Any]]] = []
+        encode_rows: list[tuple[int, dict[str, Any]]] = []
         has_burst_rows = False
         with profile_range("uniserve.packed_forward.prepare_ops"):
             for row_index, op in enumerate(batch.ops):
@@ -2577,12 +2578,22 @@ class SegmentExecutor(SegmentRuntime):
                     denoise_steps.append((row_index, step))
                 elif mode is ForwardMode.COMMIT:
                     commit_rows.append((row_index, req_id, dict(op)))
+                elif mode is ForwardMode.ENCODE:
+                    encode_rows.append((row_index, dict(op)))
                 elif mode not in {ForwardMode.EXTEND, ForwardMode.DECODE}:
                     raise capability_mismatch(
                         "packed forward group contains an unsupported mode",
                         details={"mode": mode.value},
                     )
-        if not commit_rows and not has_burst_rows:
+        self._complete_encode_rows(encode_rows, results)
+        has_decoder_rows = any(
+            mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.DENOISE}
+            for mode in batch.op_modes
+        )
+        if not has_decoder_rows:
+            self._complete_commit_rows(commit_rows, request_states, results)
+            return results
+        if not commit_rows and not encode_rows and not has_burst_rows:
             result = self.run_segment_forward_result(
                 batch,
                 request_states,
@@ -2609,7 +2620,46 @@ class SegmentExecutor(SegmentRuntime):
             defer_final_cpu_results=defer_text_cpu_results,
         )
         self._complete_denoise_bursts(batch, request_states, results)
-        for row_index, req_id, op in commit_rows:
+        self._complete_commit_rows(commit_rows, request_states, results)
+        return results
+
+    def _complete_encode_rows(
+        self,
+        rows: list[tuple[int, dict[str, Any]]],
+        results: list[Any],
+    ) -> None:
+        if not rows:
+            return
+        ops = [op for _row_index, op in rows]
+        encode_many = getattr(self.adapter, "encode_many", None)
+        if callable(encode_many):
+            encoded = list(encode_many(tuple(ops)))
+        else:
+            encoded = []
+            for op in ops:
+                kind = str(op.get("kind"))
+                if kind == "vit_encode":
+                    encoded.append(
+                        self.adapter.encode_image(op.get("pixels"), op.get("grid"), op=op)
+                    )
+                elif kind == "vae_encode":
+                    encoded.append(
+                        self.adapter.encode_latents(op.get("pixels"), op.get("grid"), op=op)
+                    )
+                else:
+                    raise invalid_descriptor(f"unsupported encode op {kind!r}")
+        if len(encoded) != len(rows):
+            raise invalid_descriptor("model returned the wrong number of encode outputs")
+        for (row_index, _op), output in zip(rows, encoded, strict=True):
+            results[row_index] = output
+
+    def _complete_commit_rows(
+        self,
+        rows: list[tuple[int, int, dict[str, Any]]],
+        request_states: Any,
+        results: list[Any],
+    ) -> None:
+        for row_index, req_id, op in rows:
             state = request_states.get(req_id)
             decoded = self.adapter.decode_image(
                 getattr(state, "latent", None),
@@ -2629,7 +2679,6 @@ class SegmentExecutor(SegmentRuntime):
                 sampled.pop("req_id", None)
                 out.update(sampled)
             results[row_index] = out
-        return results
 
     def _complete_decode_bursts(
         self,

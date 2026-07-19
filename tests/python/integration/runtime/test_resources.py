@@ -55,7 +55,6 @@ def test_model_runner_default_resource_runtime_enforces_model_totals():
     class TinyBlockModel(ModelHooks):
         resource_plan = ResourcePlan(kv_block="per_block")
         num_blocks = 1
-        whole_batch_forward = True
 
         def forward(self, batch):  # pragma: no cover - admission fails first.
             raise AssertionError("unreachable")

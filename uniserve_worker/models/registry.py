@@ -68,6 +68,34 @@ class UniModelBase(ModelHooks):
     # instance; subclasses call this after weights/residency are ready.
     _torch_compile_applied: bool = False
 
+    def forward(self, batch: Any) -> Any:
+        """Execute a complete autoregressive batch through the bound runtime services."""
+
+        from ..contracts.forward_batch import ForwardExecutionOptions
+        from ..contracts.forward_context import get_forward_context
+        from ..contracts.forward_mode import ForwardMode
+
+        if any(
+            mode not in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
+            for mode in batch.op_modes
+        ):
+            raise capability_mismatch(
+                f"{type(self).__name__} does not implement non-text batch execution"
+            )
+        ctx = get_forward_context()
+        if ctx.text_driver is None or ctx.request_states is None:
+            raise capability_mismatch("text forward requires runner-bound execution services")
+        options = ctx.execution_options
+        if not isinstance(options, ForwardExecutionOptions):
+            options = ForwardExecutionOptions()
+        return ctx.text_driver.forward_result(
+            batch,
+            ctx.request_states,
+            self,
+            options=options,
+            tensor_store=ctx.tensor_store,
+        )
+
     def _kv_store_dtype_for(self, compute_dtype: "torch.dtype") -> "torch.dtype":
         return resolve_kv_store_dtype(compute_dtype, self.kv_cache_dtype)
 
