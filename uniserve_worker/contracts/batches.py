@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 
 from ..foundation.errors import invalid_descriptor
 from ..foundation.wire import wire_int as _int
-from .forward_mode import ForwardMode, mode_for_op
+from .forward_mode import ForwardMode
 from .op_kinds import ENCODE_OP_KINDS
 
 __all__ = [
@@ -24,7 +24,6 @@ __all__ = [
     "CommitBatch",
     "EncodeBatch",
     "MixedBatch",
-    "UniForwardBatch",
     "ParsedBatch",
     "parse_batch",
 ]
@@ -242,60 +241,6 @@ class MixedBatch(BatchBase):
             kinds=tuple(op["kind"] for op in ops),
             ops=ops,
         )
-
-
-@dataclass(frozen=True)
-class UniForwardBatch:
-    """Single-mode or MIXED forward group with typed modality views."""
-
-    mode: ForwardMode
-    ops: tuple[Mapping[str, Any], ...]
-    op_modes: tuple[ForwardMode, ...] = ()
-
-    @staticmethod
-    def from_ops(ops: Sequence[Mapping[str, Any]]) -> "UniForwardBatch":
-        if not ops:
-            raise invalid_descriptor("forward batch group must contain at least one op")
-        modes = []
-        for i, op in enumerate(ops):
-            if not isinstance(op, Mapping):
-                raise invalid_descriptor(f"forward batch op {i} must be a map")
-            kind = op.get("kind")
-            if not isinstance(kind, str):
-                raise invalid_descriptor(f"forward batch op {i}.kind must be a string")
-            modes.append(mode_for_op(kind))
-        first = modes[0]
-        if any(mode != first for mode in modes):
-            return UniForwardBatch(mode=ForwardMode.MIXED, ops=tuple(ops), op_modes=tuple(modes))
-        return UniForwardBatch(mode=first, ops=tuple(ops), op_modes=tuple(modes))
-
-    def as_text(self, *, allow_mixed_text: bool = False) -> TextBatch:
-        return TextBatch.from_ops(
-            self.mode,
-            self.ops,
-            op_modes=self.op_modes,
-            allow_mixed_text=allow_mixed_text,
-        )
-
-    def as_denoise(self) -> DenoiseBatch:
-        if self.mode != ForwardMode.DENOISE:
-            raise invalid_descriptor(f"batch mode {self.mode.value} is not denoise")
-        return DenoiseBatch.from_ops(self.ops)
-
-    def as_commit(self) -> CommitBatch:
-        if self.mode != ForwardMode.COMMIT:
-            raise invalid_descriptor(f"batch mode {self.mode.value} is not commit")
-        return CommitBatch.from_ops(self.ops)
-
-    def as_encode(self) -> EncodeBatch:
-        if self.mode != ForwardMode.ENCODE:
-            raise invalid_descriptor(f"batch mode {self.mode.value} is not encode")
-        return EncodeBatch.from_ops(self.ops)
-
-    def as_mixed(self) -> MixedBatch:
-        if self.mode != ForwardMode.MIXED:
-            raise invalid_descriptor(f"batch mode {self.mode.value} is not mixed")
-        return MixedBatch.from_ops(self.ops, op_modes=self.op_modes)
 
 
 ParsedBatch = TextBatch | DenoiseBatch | CommitBatch | EncodeBatch | MixedBatch

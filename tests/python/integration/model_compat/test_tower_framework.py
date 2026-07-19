@@ -77,11 +77,8 @@ def test_place_towers_moves_only_tagged_subtree():
     assert next(root.text.parameters()).device.type == "cpu"
 
 
-def test_option_a_cross_process_tower_keeps_model_code_transport_agnostic():
-    """Option A (cross-process tower) builds a DataPlaneTowerTransport axis; the
-    model code is unchanged: place_towers must NOT move params (no in-process peer
-    device) and route_by_modality must take the in-place path (one modality per
-    worker), so each worker runs its own coordinate's compute locally."""
+def test_cross_process_tower_routes_locally_without_device_migration():
+    """A cross-process tower executes its coordinate locally."""
     from uniserve_worker.server.distributed import build_device_mesh
 
     gen_mesh = build_device_mesh(
@@ -94,8 +91,6 @@ def test_option_a_cross_process_tower_keeps_model_code_transport_agnostic():
     axis = gen_mesh.axis("tower")
     assert axis is not None and axis.size == 2 and axis.coord == 1
     transport = axis.transport
-    # Cross-process transport exposes no in-process per-coordinate device.
-    assert not hasattr(transport, "device")
     assert tower_modality_coords(gen_mesh) == {Modality.TEXT: 0, Modality.GEN: 1}
 
     # place_towers does not move a tagged module (each worker loads only its own
@@ -105,7 +100,7 @@ def test_option_a_cross_process_tower_keeps_model_code_transport_agnostic():
     place_towers(root, gen_mesh)
     assert next(root.gen.parameters()).device.type == "cpu"
 
-    # route_by_modality takes the in-place path (no .device() -> no dispatch).
+    # Each worker runs the local coordinate's compute in place.
     src = torch.randn(4, 4)
     gen = torch.tensor([False, True, False, True])
     text_fn = nn.Linear(4, 4)

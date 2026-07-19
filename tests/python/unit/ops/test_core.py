@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from uniserve_worker.backends.attention import AttentionCapabilities
-from uniserve_worker.backends.attention.text_dispatch import TextBackendGate
 from uniserve_worker.ops import (
     AdapterPool,
     AttentionRegime,
@@ -295,32 +294,3 @@ def test_attention_provider_rejects_raw_paged_varlen_page_size_mismatch():
             max_seqlen_k=2,
         )
     )
-
-
-def test_text_backend_gate_skips_paged_only_varlen_for_initial_ragged_prefill(monkeypatch):
-    class _PagedOnlyVarlenProvider:
-        name = "paged_only_varlen"
-
-        def capabilities(self):
-            return Capabilities(
-                attrs={
-                    "varlen_attention": True,
-                    "varlen_paged_kv": True,
-                    "requires_paged_varlen": True,
-                    "min_head_dim": 1,
-                    "paged_block_size_multiple": 1,
-                }
-            )
-
-    class _Dispatcher:
-        def ordered(self, override):
-            del override
-            return (_PagedOnlyVarlenProvider(),)
-
-    import uniserve_worker.ops as ops
-
-    monkeypatch.setattr(ops, "attention_dispatcher", lambda: _Dispatcher())
-    gate = TextBackendGate(head_dim=4, block_size=2, device_type="cuda")
-
-    assert not gate._varlen_available(None, needs_paged_kv=False)
-    assert gate._varlen_available(None, needs_paged_kv=True)

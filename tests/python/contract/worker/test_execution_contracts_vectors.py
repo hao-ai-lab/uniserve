@@ -1,12 +1,4 @@
-"""Cross-language canonical-fingerprint vectors (Stage 1 acceptance pin).
-
-Python half of the byte-for-byte execution-identity agreement. The batches
-here mirror, value for value, the constructors in
-``crates/foundation/core/src/execution_identity_vectors.rs``; both sides must
-reproduce the digests pinned in
-``crates/protocol/vocab/execution_fingerprint.toml``. Skips (rather than
-fails) when the vocab fixture is absent, e.g. a Python-only checkout.
-"""
+"""Cross-language canonical execution fingerprint vectors."""
 
 from __future__ import annotations
 

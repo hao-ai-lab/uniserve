@@ -6,14 +6,14 @@ from typing import Any
 import pytest
 import torch
 
-from uniserve_worker.contracts.batches import UniForwardBatch
 from uniserve_worker.contracts.forward_batch import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
+    ForwardBatch,
+    ForwardExecutionOptions,
     ForwardGraphPolicy,
     ForwardOutputKind,
     ForwardResult,
-    ForwardRuntimeHandles,
     StrictForwardGraphError,
     TextPostprocessEntry,
 )
@@ -25,8 +25,6 @@ from uniserve_worker.execution.engine import (
     EagerFallbackRecorder,
     EncodeDriver,
     ForwardExecutor,
-    ForwardModelDescriptor,
-    ForwardModelModules,
     ForwardPlanBuilder,
     ForwardPostprocessor,
     TextDriver,
@@ -146,7 +144,7 @@ def test_graph_capacity_key_excludes_operation_composition():
     assert homogeneous_key == heterogeneous_key
 
 
-def test_batch_path_runs_bound_step_executor_without_dispatch_cache():
+def test_batch_path_replays_through_the_text_graph_executor():
     graph_object = object()
     request_states = object()
 
@@ -196,11 +194,9 @@ def test_batch_path_runs_bound_step_executor_without_dispatch_cache():
 
     def build(req_id: int, token_id: int):
         op = {"req_id": req_id, "kind": "decode_und", "token_ids": [token_id], "pos_range": [0, 1]}
-        handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
         plan = builder.build(
             [op],
             graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-            runtime_handles=handles,
         )
         return plan, batch_builder.build(plan)
 
@@ -222,8 +218,8 @@ def test_dispatch_preserves_explicit_path_precedence():
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_segment_graph(self, plan, *, request_states, result_publisher):
-            del plan, request_states, result_publisher
+        def run_segment_graph(self, batch, plan, *, request_states, result_publisher, options):
+            del batch, plan, request_states, result_publisher, options
             self.calls += 1
             return ForwardResult(text_logits=torch.tensor([[3.0]]))
 
@@ -244,11 +240,9 @@ def test_dispatch_preserves_explicit_path_precedence():
         "token_ids": [7],
         "pos_range": [0, 1],
     }
-    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
     plan = ForwardPlanBuilder().build(
         [op],
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-        runtime_handles=handles,
     )
     batch = ForwardBatchBuilder().build(plan)
     dispatch = Dispatch(
@@ -271,8 +265,8 @@ def test_general_segment_path_owns_uniform_denoise_when_available():
         def __init__(self) -> None:
             self.calls = 0
 
-        def run_segment_graph(self, plan, *, request_states, result_publisher):
-            del plan, request_states, result_publisher
+        def run_segment_graph(self, batch, plan, *, request_states, result_publisher, options):
+            del batch, plan, request_states, result_publisher, options
             self.calls += 1
             return ForwardResult(
                 denoise_velocities={
@@ -361,11 +355,9 @@ def test_segment_path_runs_graph_only_forward_result(monkeypatch):
         {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]},
         {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
     ]
-    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
     plan = ForwardPlanBuilder().build(
         ops,
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-        runtime_handles=handles,
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
@@ -434,17 +426,9 @@ def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
         },
         {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
     ]
-    dispatch_batch = UniForwardBatch.from_ops(ops)
-    handles = ForwardRuntimeHandles(
-        values={
-            "dispatch_batch": dispatch_batch,
-            "defer_text_cpu_results": True,
-        }
-    )
     plan = ForwardPlanBuilder().build(
         ops,
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-        runtime_handles=handles,
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
@@ -452,7 +436,11 @@ def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
     )
 
-    result = executor.execute(batch, plan)
+    result = executor.execute(
+        batch,
+        plan,
+        options=ForwardExecutionOptions(defer_text_cpu_results=True),
+    )
 
     assert result.graph is not None and result.graph.path == "segment"
     assert result.runtime_outputs == (
@@ -461,7 +449,7 @@ def test_segment_path_runs_decode_burst_as_graph_only_runtime_result():
     )
     assert owner.calls == [
         {
-            "batch": dispatch_batch,
+            "batch": batch,
             "request_states": states,
             "defer_text_cpu_results": True,
         }
@@ -517,11 +505,9 @@ def test_segment_path_publishes_commit_outputs_without_eager(monkeypatch):
     segment_executor.run_segment_forward_result = lambda *args, **kwargs: fake_run(
         segment_executor, *args, **kwargs
     )
-    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops(ops)})
     plan = ForwardPlanBuilder().build(
         ops,
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-        runtime_handles=handles,
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
@@ -639,11 +625,9 @@ def test_owner_batch_path_uses_graph_only_driver():
         "pos_range": [0, 2],
         "decode_token_count": 4,
     }
-    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
     plan = ForwardPlanBuilder().build(
         [op],
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-        runtime_handles=handles,
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
@@ -720,11 +704,9 @@ def test_owner_batch_path_uses_runtime_result_for_multi_step_row():
         "pos_range": [4, 5],
         "decode_token_count": 2,
     }
-    handles = ForwardRuntimeHandles(values={"dispatch_batch": UniForwardBatch.from_ops([op])})
     plan = ForwardPlanBuilder().build(
         [op],
         graph_policy=ForwardGraphPolicy(prefer_graph=True, strict=True),
-        runtime_handles=handles,
     )
     batch = ForwardBatchBuilder().build(plan)
     executor = ForwardExecutor(
@@ -784,7 +766,7 @@ def test_text_driver_graph_result_runs_decode_burst_without_eager_fallback():
         "decode_token_count": 2,
     }
     driver = TextDriver()
-    fb = UniForwardBatch.from_ops([op])
+    fb = ForwardBatch.from_ops([op])
 
     with use_forward_context(ForwardContext(stats=ForwardStats())):
         result = driver.forward_graph_result(
@@ -845,7 +827,7 @@ def test_text_driver_scores_prompt_across_prefill_chunk_boundaries():
             return torch.tensor([[[0.0, 1.0, 2.0, 3.0, 6.0], [0.0, 5.0, 2.0, 3.0, 1.0]]])
 
     driver = TextDriver()
-    first = UniForwardBatch.from_ops(
+    first = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -856,7 +838,7 @@ def test_text_driver_scores_prompt_across_prefill_chunk_boundaries():
             }
         ]
     )
-    second = UniForwardBatch.from_ops(
+    second = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -999,22 +981,14 @@ def test_executor_invokes_adapter_forward_as_eager_surface():
     assert result.runtime_outputs == ({"req_id": 1, "via": "adapter"},)
 
 
-def test_postprocessor_validates_before_runtime_side_effects():
-    touched: list[Any] = []
-    handles = ForwardRuntimeHandles(
-        values={
-            "postprocess_side_effects": lambda outputs: touched.extend(outputs),
-        }
-    )
+def test_postprocessor_validates_before_projection():
     plan = ForwardPlanBuilder().build(
         [{"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}],
-        runtime_handles=handles,
     )
+    batch = ForwardBatchBuilder().build(plan)
 
     with pytest.raises(Exception, match="output count"):
-        ForwardPostprocessor().apply(plan, ForwardResult(runtime_outputs=()))
-
-    assert touched == []
+        ForwardPostprocessor().apply(batch, plan, ForwardResult(runtime_outputs=()))
 
 
 def test_worker_adapter_text_path_returns_logits_without_request_state_mutation():
@@ -1044,18 +1018,6 @@ def test_worker_adapter_text_path_returns_logits_without_request_state_mutation(
         def forward(self, *args, **kwargs):
             raise AssertionError("fake model forward is owned by the fake text driver")
 
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=1,
-        vocab_size=2,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=1,
-        supports_text=True,
-        modules=ForwardModelModules(logits=lambda: None),
-    )
     adapter = WorkerForwardAdapter(
         model=Model(),
         request_states=request_states,
@@ -1063,14 +1025,10 @@ def test_worker_adapter_text_path_returns_logits_without_request_state_mutation(
         denoise_driver=object(),
         encode_driver=object(),
         image_decode_driver=object(),
-        descriptor=descriptor,
     )
     plan = ForwardPlanBuilder().build([op], request_states=request_states)
     batch = ForwardBatchBuilder().build(plan)
-    fb = UniForwardBatch.from_ops([op])
-
-    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
-        result = adapter.forward(batch)
+    result = adapter.forward(batch, plan, ForwardExecutionOptions())
 
     assert result.runtime_outputs is None
     torch.testing.assert_close(result.text_logits, torch.tensor([[0.0, 4.0]]))
@@ -1085,13 +1043,11 @@ def test_postprocessor_text_logits_samples_batched_relays_and_advances_kv_after_
     ]
     states = {1: _FakeTextState(), 2: _FakeTextState()}
     request_states = _FakeRequestStates(states)
-    handles = ForwardRuntimeHandles(
-        request_states=request_states,
-        values={"dispatch_batch": UniForwardBatch.from_ops(ops)},
-    )
-    plan = ForwardPlanBuilder().build(ops, request_states=request_states, runtime_handles=handles)
+    plan = ForwardPlanBuilder().build(ops, request_states=request_states)
+    batch = ForwardBatchBuilder().build(plan)
 
-    outputs = ForwardPostprocessor().apply(
+    outputs = ForwardPostprocessor(request_states=request_states).apply(
+        batch,
         plan,
         ForwardResult(
             text_logits=torch.tensor(
@@ -1131,14 +1087,12 @@ def test_postprocessor_text_validation_failure_leaves_request_state_unchanged():
     op = {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [0, 1]}
     state = _FakeTextState()
     request_states = _FakeRequestStates({1: state})
-    handles = ForwardRuntimeHandles(
-        request_states=request_states,
-        values={"dispatch_batch": UniForwardBatch.from_ops([op])},
-    )
-    plan = ForwardPlanBuilder().build([op], request_states=request_states, runtime_handles=handles)
+    plan = ForwardPlanBuilder().build([op], request_states=request_states)
+    batch = ForwardBatchBuilder().build(plan)
 
     with pytest.raises(Exception, match="row count"):
-        ForwardPostprocessor().apply(
+        ForwardPostprocessor(request_states=request_states).apply(
+            batch,
             plan,
             ForwardResult(text_logits=torch.empty((0, 3), dtype=torch.float32)),
         )
@@ -1196,17 +1150,6 @@ def test_worker_adapter_denoise_result_updates_latent_only_in_postprocess():
         def predict_velocity(self, ctx, t, latent, branch):
             raise AssertionError("fake driver owns branch prediction in this test")
 
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=1,
-        vocab_size=0,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=1,
-        supports_denoise=True,
-    )
     adapter = WorkerForwardAdapter(
         model=Model(),
         request_states=request_states,
@@ -1214,19 +1157,15 @@ def test_worker_adapter_denoise_result_updates_latent_only_in_postprocess():
         denoise_driver=Driver(),
         encode_driver=object(),
         image_decode_driver=object(),
-        descriptor=descriptor,
     )
     plan = ForwardPlanBuilder().build([op], request_states=request_states)
     batch = ForwardBatchBuilder().build(plan)
-    fb = UniForwardBatch.from_ops([op])
-
-    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
-        result = adapter.forward(batch)
+    result = adapter.forward(batch, plan, ForwardExecutionOptions())
 
     assert result.runtime_outputs is None
     assert state.updated is None
 
-    outputs = ForwardPostprocessor().apply(plan, result)
+    outputs = ForwardPostprocessor(request_states=request_states).apply(batch, plan, result)
 
     assert len(outputs) == 1
     assert outputs[0].req_id == 1
@@ -1257,17 +1196,6 @@ def test_worker_adapter_encode_result_is_published_by_postprocess():
         def encode_image(self, pixels=None, grid=None, *, op=None):
             raise AssertionError("fake driver owns encode publication in this test")
 
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=1,
-        vocab_size=0,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=1,
-        supports_encode=True,
-    )
     adapter = WorkerForwardAdapter(
         model=Model(),
         request_states=_FakeRequestStates({}),
@@ -1275,17 +1203,13 @@ def test_worker_adapter_encode_result_is_published_by_postprocess():
         denoise_driver=object(),
         encode_driver=Driver(),
         image_decode_driver=object(),
-        descriptor=descriptor,
     )
     plan = ForwardPlanBuilder().build([op])
     batch = ForwardBatchBuilder().build(plan)
-    fb = UniForwardBatch.from_ops([op])
-
-    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
-        result = adapter.forward(batch)
+    result = adapter.forward(batch, plan, ForwardExecutionOptions())
 
     assert result.runtime_outputs is None
-    outputs = ForwardPostprocessor().apply(plan, result)
+    outputs = ForwardPostprocessor().apply(batch, plan, result)
 
     assert len(outputs) == 1
     assert outputs[0].req_id == 2
@@ -1320,7 +1244,7 @@ def test_encode_driver_uses_model_batch_hook_for_aligned_outputs():
 
     model = Model()
     result = EncodeDriver().forward_result(
-        UniForwardBatch.from_ops(ops),
+        ForwardBatch.from_ops(ops),
         model,
         row_indices=(4, 9),
     )
@@ -1364,17 +1288,6 @@ def test_worker_adapter_commit_result_is_sampled_by_postprocess():
         def decode_image(self, latent, *, req_id=None, state=None, op=None):
             raise AssertionError("fake driver owns commit decode in this test")
 
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=1,
-        vocab_size=3,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=1,
-        supports_commit=True,
-    )
     adapter = WorkerForwardAdapter(
         model=Model(),
         request_states=request_states,
@@ -1382,18 +1295,13 @@ def test_worker_adapter_commit_result_is_sampled_by_postprocess():
         denoise_driver=object(),
         encode_driver=object(),
         image_decode_driver=Driver(),
-        descriptor=descriptor,
     )
-    handles = ForwardRuntimeHandles(request_states=request_states)
-    plan = ForwardPlanBuilder().build([op], request_states=request_states, runtime_handles=handles)
+    plan = ForwardPlanBuilder().build([op], request_states=request_states)
     batch = ForwardBatchBuilder().build(plan)
-    fb = UniForwardBatch.from_ops([op])
-
-    with adapter.bind(dispatch_batch=fb, group=[(0, op)], defer_text_cpu_results=False):
-        result = adapter.forward(batch)
+    result = adapter.forward(batch, plan, ForwardExecutionOptions())
 
     assert result.runtime_outputs is None
-    outputs = ForwardPostprocessor().apply(plan, result)
+    outputs = ForwardPostprocessor(request_states=request_states).apply(batch, plan, result)
 
     assert len(outputs) == 1
     assert outputs[0].req_id == 3
@@ -1424,18 +1332,6 @@ def test_worker_adapter_private_mixed_hook_can_return_forward_result():
             return expected
 
     states = _FakeRequestStates({7: _FakeTextState(), 8: SimpleNamespace()})
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=1,
-        vocab_size=2,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=1,
-        supports_text=True,
-        supports_denoise=True,
-    )
     adapter = WorkerForwardAdapter(
         model=Model(),
         request_states=states,
@@ -1443,14 +1339,10 @@ def test_worker_adapter_private_mixed_hook_can_return_forward_result():
         denoise_driver=object(),
         encode_driver=object(),
         image_decode_driver=object(),
-        descriptor=descriptor,
     )
     plan = ForwardPlanBuilder().build(ops, request_states=states)
     batch = ForwardBatchBuilder().build(plan)
-    fb = UniForwardBatch.from_ops(ops)
-
-    with adapter.bind(dispatch_batch=fb, group=list(enumerate(ops)), defer_text_cpu_results=False):
-        result = adapter.forward(batch)
+    result = adapter.forward(batch, plan, ForwardExecutionOptions())
 
     assert result is expected
 
@@ -1479,18 +1371,6 @@ def test_worker_adapter_private_hook_accepts_any_segment_group(op):
             return expected
 
     states = _FakeRequestStates({7: SimpleNamespace()})
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=1,
-        vocab_size=2,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=1,
-        supports_text=True,
-        supports_denoise=True,
-    )
     adapter = WorkerForwardAdapter(
         model=Model(),
         request_states=states,
@@ -1498,18 +1378,10 @@ def test_worker_adapter_private_hook_accepts_any_segment_group(op):
         denoise_driver=object(),
         encode_driver=object(),
         image_decode_driver=object(),
-        descriptor=descriptor,
     )
     plan = ForwardPlanBuilder().build([op], request_states=states)
     batch = ForwardBatchBuilder().build(plan)
-    dispatch_batch = UniForwardBatch.from_ops([op])
-
-    with adapter.bind(
-        dispatch_batch=dispatch_batch,
-        group=[(0, op)],
-        defer_text_cpu_results=False,
-    ):
-        result = adapter.forward(batch)
+    result = adapter.forward(batch, plan, ForwardExecutionOptions())
 
     assert result is expected
 
@@ -1528,12 +1400,11 @@ def test_postprocessor_mixed_text_entry_samples_relays_and_advances_program_stat
         )
     )
     cache = SimpleNamespace(length=6)
-    handles = ForwardRuntimeHandles(request_states=request_states)
     plan = ForwardPlanBuilder().build(
         [text_op, denoise_op],
         request_states=request_states,
-        runtime_handles=handles,
     )
+    batch = ForwardBatchBuilder().build(plan)
     result = ForwardResult(
         text_logits=torch.tensor([[0.0, 2.0, 9.0]], dtype=torch.float32),
         text_postprocess=(
@@ -1567,7 +1438,7 @@ def test_postprocessor_mixed_text_entry_samples_relays_and_advances_program_stat
         },
     )
 
-    outputs = ForwardPostprocessor().apply(plan, result)
+    outputs = ForwardPostprocessor(request_states=request_states).apply(batch, plan, result)
 
     assert outputs[0].sampled_token_id == 2
     assert outputs[1].denoise_done is True
@@ -1621,21 +1492,3 @@ class _FakeRequestStates:
 
     def get(self, req_id: int) -> _FakeTextState:
         return self._states[int(req_id)]
-
-
-def test_descriptor_rejects_missing_declared_text_surfaces():
-    descriptor = ForwardModelDescriptor(
-        device=torch.device("cpu"),
-        dtype=torch.float32,
-        hidden_size=4,
-        vocab_size=16,
-        num_layers=1,
-        num_q_heads=1,
-        num_kv_heads=1,
-        head_dim=4,
-        supports_text=True,
-        modules=ForwardModelModules(),
-    )
-
-    with pytest.raises(Exception, match="text neural surfaces"):
-        descriptor.validate()

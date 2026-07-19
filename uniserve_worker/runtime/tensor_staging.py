@@ -266,7 +266,7 @@ def stage_text_forward_batch(
     Builds the device tensors (input_ids/positions plus the extend/seq-len
     offset tensors) from an already-parsed text view. The host-side staging
     buffers are owned by :class:`TextTensorStager`; this is the H2D staging seam,
-    kept separate from the model-neutral op views on :class:`UniForwardBatch`.
+    kept separate from the model-neutral views on :class:`ForwardBatch`.
     The KV-residency indices (``block_table``/``out_cache_loc``/``cache_seqlens``)
     are resolved on top of this by the ``ForwardBatchBuilder``.
     """

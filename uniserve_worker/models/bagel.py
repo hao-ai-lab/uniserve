@@ -27,7 +27,7 @@ from uniserve_worker.runtime.paged_denoise import (
     can_run_paged_denoise_attention,
 )
 
-from ..contracts.batches import UniForwardBatch
+from ..contracts.forward_batch import ForwardBatch
 from ..contracts.resource_plan import (
     AdapterResourcePolicy,
     CapsDescriptor,
@@ -1859,7 +1859,7 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     def _run_forward_adapter(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         *,
         request_states: Any,
         group: Any,
@@ -1952,7 +1952,7 @@ class BagelForUnifiedGeneration(UniModelBase):
     ) -> Any:
         loaded = self._ensure_loaded()
         with self._autocast():
-            if isinstance(input_ids, UniForwardBatch):
+            if isinstance(input_ids, ForwardBatch):
                 batch = input_ids
                 raise capability_mismatch(
                     f"BAGEL direct batch forward is unsupported for {batch.mode}"

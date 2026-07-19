@@ -1,15 +1,4 @@
-"""Drift guard: Python vocabularies vs the canonical cross-language schema.
-
-The single source of truth lives in ``crates/protocol/vocab/*.toml``. Each Rust
-crate has a ``#[test]`` asserting its own enums match those files; this is the
-Python half. Adding (or renaming/repolicy-ing) an op kind, worker kind, or error
-class now requires updating the schema AND every language, or one of these tests
-fails.
-
-The tests skip (rather than fail) when the schema files are absent — e.g. a
-Python-only checkout/wheel — so they are meaningful in the full repo and inert
-elsewhere.
-"""
+"""Python projections of the canonical cross-language vocabularies."""
 
 from __future__ import annotations
 
@@ -44,7 +33,7 @@ def _load(name: str) -> dict:
 
 
 def test_op_kinds_match_canonical_schema():
-    """Item 25: Python OP_KIND_TABLE == op_kinds.toml (wire strings + modes)."""
+    """Operation wire strings and modes match the canonical schema."""
     schema = _load("op_kinds.toml")
     schema_wire = {op["wire"] for op in schema["op"]}
     assert schema_wire == set(OP_KINDS), (
@@ -74,7 +63,7 @@ def test_worker_kinds_match_canonical_schema():
 
 
 def test_error_taxonomy_matches_canonical_schema():
-    """Item 26: Python ErrorCode + _POLICY == worker_errors.toml (codes + policy)."""
+    """Error codes and policies match the canonical schema."""
     schema = _load("worker_errors.toml")
     entries = schema["error"]
 

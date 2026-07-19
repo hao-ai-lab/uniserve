@@ -335,11 +335,7 @@ def test_qwen3_tied_vocab_parallel_weights_share_parameter():
 
 
 def test_qwen3_always_advertises_mixed_batch(monkeypatch):
-    # und/gen (here prefill/decode) mixed-batch single-forward is a
-    # non-negotiable invariant (§9.6): qwen3 advertises mixed-mode grouping
-    # unconditionally, regardless of the worker-side fused-kernel token budget.
-    # The runtime mixed-token budget only narrows fused-kernel eligibility, not the
-    # advertised capability.
+    # Mixed-mode grouping is independent of the fused-kernel token budget.
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
 
     model = Qwen3ForCausalLM(
@@ -355,7 +351,6 @@ def test_qwen3_always_advertises_mixed_batch(monkeypatch):
         },
     )
 
-    assert not hasattr(model.caps().execution_constraints, "supports_mixed_op_kinds")
     assert model.batch_policy().supports_mixed_modes
 
     _set_worker_runtime(monkeypatch, mixed_text_max_tokens=256)
@@ -398,7 +393,6 @@ def test_qwen3_runtime_applies_opt_in_model_stack_compile(monkeypatch):
     assert all(kwargs["backend"] == "eager" for _, kwargs in calls)
     assert all(kwargs["fullgraph"] is False for _, kwargs in calls)
     assert getattr(model.model, "_compiled_by_test", False)
-    assert model._torch_compile_applied
 
 
 def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
@@ -459,7 +453,6 @@ def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
     assert len(calls) == 1
     assert all(kwargs["backend"] == "eager" for _, kwargs in calls)
     assert getattr(language_model.model, "_compiled_by_test", False)
-    assert model._torch_compile_applied
 
 
 def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():

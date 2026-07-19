@@ -34,7 +34,7 @@ from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
 
-from ...contracts.batches import UniForwardBatch
+from ...contracts.forward_batch import ForwardBatch
 from ...contracts.forward_context import get_forward_context
 from ...contracts.resource_plan import (
     CapsDescriptor,
@@ -3331,7 +3331,7 @@ class SenseNovaU1ForUnifiedGeneration(
 
     def _run_forward_adapter(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         *,
         request_states: Any,
         group: Any,
@@ -3377,7 +3377,7 @@ class SenseNovaU1ForUnifiedGeneration(
     ) -> Any:
         if self.model is None:
             raise RuntimeError("SenseNova model weights are not loaded")
-        if isinstance(input_ids, UniForwardBatch):
+        if isinstance(input_ids, ForwardBatch):
             raise RuntimeError(
                 f"SenseNova direct batch forward is unsupported for {input_ids.mode}"
             )
