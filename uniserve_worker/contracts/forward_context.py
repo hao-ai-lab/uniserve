@@ -6,6 +6,7 @@ model and graph-runner entry points; this context is what attention backends,
 shared layers, and timing helpers read via :func:`get_forward_context` /
 :func:`use_forward_context` for the duration of one forward.
 """
+
 from __future__ import annotations
 
 import time
@@ -127,10 +128,7 @@ class ForwardContext:
     allow_capture: bool = True
     request_states: Any = None
     execution_options: Any = None
-    text_driver: Any = None
-    denoise_driver: Any = None
-    encode_driver: Any = None
-    image_decode_driver: Any = None
+    default_model_forward: Any = None
     tensor_store: Any = None
 
     def component_timer_start(self) -> int:

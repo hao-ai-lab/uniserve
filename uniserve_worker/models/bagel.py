@@ -18,8 +18,12 @@ import torch.nn as nn
 from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from uniserve_worker.execution.flow import FlowGraphExecution, FlowRow
-from uniserve_worker.execution.runner import PreparedFlowStep, flow_cfg_branch_count
+from uniserve_worker.execution.flow import (
+    FlowGraphExecution,
+    FlowRow,
+    PreparedFlowStep,
+    flow_cfg_branch_count,
+)
 from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.paged_denoise import (
@@ -1924,9 +1928,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         }
 
     @torch.no_grad()
-    def forward(
-        self, batch: ForwardBatch
-    ) -> Any:
+    def forward(self, batch: ForwardBatch) -> Any:
         from ..contracts.forward_context import get_forward_context
 
         self._ensure_loaded()
@@ -1935,9 +1937,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             return self.segment_executor.execute(
                 batch,
                 request_states=self.states,
-                defer_text_cpu_results=bool(
-                    getattr(options, "defer_text_cpu_results", False)
-                ),
+                defer_text_cpu_results=bool(getattr(options, "defer_text_cpu_results", False)),
             )
 
     @torch.no_grad()

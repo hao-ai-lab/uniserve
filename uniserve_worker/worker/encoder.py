@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from uniserve_worker.execution.runner import EncodeDriver
+from uniserve_worker.execution import ModelRunner
 
-from ..contracts.forward_batch import ForwardBatch
 from ..contracts.model_protocols import ModelHooks
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
@@ -35,9 +34,9 @@ class EncoderWorker(BaseWorker):
         super().__init__(block_size=block_size)
         if not isinstance(model, ModelHooks):
             raise capability_mismatch("encoder worker model must inherit ModelHooks")
-        self.model = model
-        self.encode_driver = EncodeDriver()
         self.request_states = RequestStateTable()
+        self.model = model
+        self.runner = ModelRunner(model, request_states=self.request_states)
         supported_ops = self._supported_encode_ops()
         if not supported_ops:
             raise capability_mismatch("encoder worker requires encode_image() or encode_latents()")
@@ -64,32 +63,13 @@ class EncoderWorker(BaseWorker):
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
         del defer_text_cpu_results
-        for new_request in batch.get("new_reqs") or ():
-            self._register_request(new_request)
-        operations = list(batch.get("ops") or [])
-        if not operations:
-            return {"step_id": batch.get("step_id"), "per_seq": []}
-        forward_batch = ForwardBatch.from_ops(operations)
-        outputs = self.encode_driver.step(forward_batch, self.model)
-        return {
-            "step_id": batch.get("step_id"),
-            "per_seq": [output.to_seq_result() for output in outputs],
-        }
+        return self.runner.execute(batch)
 
     def drop_request(self, request_id: int) -> None:
-        self.model.drop_request(int(request_id))
-        self.request_states.drop(int(request_id))
+        self.runner.drop_request(int(request_id))
 
     def free_encoder(self, handles: Any) -> None:
         self.model.free_encoder(handles)
-
-    def _register_request(self, new_request: Mapping[str, Any]) -> None:
-        request_id = int(new_request["req_id"])
-        state = self.request_states.create_or_update(
-            request_id,
-            dict(new_request),
-        )
-        self.model.on_new_request(request_id, state)
 
     def _supported_encode_ops(self) -> tuple[str, ...]:
         supported_ops: list[str] = []

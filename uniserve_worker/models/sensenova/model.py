@@ -22,6 +22,7 @@ import uniserve_worker.ops as ops
 from uniserve_worker.execution.flow import (
     FlowExecution,
     FlowState,
+    PreparedFlowStep,
     ProgramState,
 )
 from uniserve_worker.execution.products import (
@@ -29,7 +30,6 @@ from uniserve_worker.execution.products import (
     ImageMaterializer,
     ProductTransferSession,
 )
-from uniserve_worker.execution.runner import PreparedFlowStep
 from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
