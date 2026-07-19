@@ -7,7 +7,7 @@ from typing import Any
 
 from uniserve_worker.execution.engine import EncodeDriver
 
-from ..contracts.batches import UniForwardBatch
+from ..contracts.forward_batch import ForwardBatch
 from ..contracts.model_protocols import ModelHooks
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
@@ -69,7 +69,7 @@ class EncoderWorker(BaseWorker):
         operations = list(batch.get("ops") or [])
         if not operations:
             return {"step_id": batch.get("step_id"), "per_seq": []}
-        forward_batch = UniForwardBatch.from_ops(operations)
+        forward_batch = ForwardBatch.from_ops(operations)
         outputs = self.encode_driver.step(forward_batch, self.model)
         return {
             "step_id": batch.get("step_id"),

@@ -16,16 +16,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
 from ..foundation.errors import invalid_descriptor
-from .forward_mode import ForwardMode
+from .forward_mode import ForwardMode, mode_for_op
 
 if TYPE_CHECKING:
     from .attention_plan import AttentionPlanBase
+    from .batches import CommitBatch, DenoiseBatch, EncodeBatch, MixedBatch, TextBatch
 
 __all__ = [
     "SegmentSpec",
@@ -54,7 +54,7 @@ __all__ = [
     "ForwardSegmentPlan",
     "ForwardOutputSlot",
     "ForwardShapeSummary",
-    "ForwardRuntimeHandles",
+    "ForwardExecutionOptions",
     "ForwardPlan",
     "EagerFallbackReason",
     "ForwardGraphPolicy",
@@ -290,6 +290,72 @@ class ForwardBatch:
     def has_padding(self) -> bool:
         return int(self.padded_num_tokens) > int(self.num_token_non_padded)
 
+    @classmethod
+    def from_ops(cls, ops: Sequence[Mapping[str, Any]]) -> "ForwardBatch":
+        """Parse an op group into the canonical batch before device staging."""
+
+        from .batches import BatchBase
+
+        if not ops:
+            raise invalid_descriptor("forward batch group must contain at least one op")
+        parsed_ops: list[Mapping[str, Any]] = []
+        modes: list[ForwardMode] = []
+        for index, op in enumerate(ops):
+            if not isinstance(op, Mapping):
+                raise invalid_descriptor(f"forward batch op {index} must be a map")
+            kind = op.get("kind")
+            if not isinstance(kind, str):
+                raise invalid_descriptor(f"forward batch op {index}.kind must be a string")
+            parsed_ops.append(op)
+            modes.append(mode_for_op(kind))
+        op_tuple = tuple(parsed_ops)
+        first = modes[0]
+        mode = first if all(item is first for item in modes) else ForwardMode.MIXED
+        return cls(
+            forward_mode=mode,
+            req_ids=BatchBase.req_ids_from_ops(op_tuple),
+            op_modes=tuple(modes),
+            ops=op_tuple,
+        )
+
+    def as_text(self, *, allow_mixed_text: bool = False) -> "TextBatch":
+        from .batches import TextBatch
+
+        return TextBatch.from_ops(
+            self.mode,
+            self.ops,
+            op_modes=self.op_modes,
+            allow_mixed_text=allow_mixed_text,
+        )
+
+    def as_denoise(self) -> "DenoiseBatch":
+        from .batches import DenoiseBatch
+
+        if self.mode is not ForwardMode.DENOISE:
+            raise invalid_descriptor(f"batch mode {self.mode.value} is not denoise")
+        return DenoiseBatch.from_ops(self.ops)
+
+    def as_commit(self) -> "CommitBatch":
+        from .batches import CommitBatch
+
+        if self.mode is not ForwardMode.COMMIT:
+            raise invalid_descriptor(f"batch mode {self.mode.value} is not commit")
+        return CommitBatch.from_ops(self.ops)
+
+    def as_encode(self) -> "EncodeBatch":
+        from .batches import EncodeBatch
+
+        if self.mode is not ForwardMode.ENCODE:
+            raise invalid_descriptor(f"batch mode {self.mode.value} is not encode")
+        return EncodeBatch.from_ops(self.ops)
+
+    def as_mixed(self) -> "MixedBatch":
+        from .batches import MixedBatch
+
+        if self.mode is not ForwardMode.MIXED:
+            raise invalid_descriptor(f"batch mode {self.mode.value} is not mixed")
+        return MixedBatch.from_ops(self.ops, op_modes=self.op_modes)
+
 
 # --- Host forward-plan values (canonical row/segment/output planning) ---
 
@@ -470,19 +536,12 @@ class ForwardShapeSummary:
         )
 
 
-@dataclass(frozen=True)
-class ForwardRuntimeHandles:
-    request_states: Any = None
-    residency: Any = None
-    scratch: Any = None
-    tensor_store: Any = None
-    values: Mapping[str, Any] = field(default_factory=dict)
+@dataclass(frozen=True, slots=True)
+class ForwardExecutionOptions:
+    """Per-call execution controls that are not part of a replayable plan."""
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.values.get(key, default)
+    defer_text_cpu_results: bool = False
+    defer_sampling: bool = False
 
 
 @dataclass(frozen=True)
@@ -493,7 +552,6 @@ class ForwardPlan:
     output_slots: tuple[ForwardOutputSlot, ...]
     shape: ForwardShapeSummary
     graph_policy: "ForwardGraphPolicy | None" = None
-    runtime_handles: ForwardRuntimeHandles = field(default_factory=ForwardRuntimeHandles)
 
     @property
     def forward_mode(self) -> ForwardMode:

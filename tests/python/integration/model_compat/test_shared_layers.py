@@ -2169,13 +2169,13 @@ def test_sensenova_packed_visible_fully_visible_uses_visible_end_backend():
 
 
 def test_sensenova_admitted_forward_requires_whole_batch_graph(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.models.sensenova import model as sensenova_u1
 
     wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
         config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
     )
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 1, "kind": "decode_und", "token_ids": [11], "pos_range": [0, 1]},
             {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
@@ -2309,9 +2309,9 @@ def test_sensenova_forward_sampling_updates_decode_relay():
 
 
 def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
 
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 1,
@@ -2361,7 +2361,7 @@ def test_sensenova_forward_burst_position_staging_targets_immediate_followups():
 
 
 def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class GraphDriver:
@@ -2391,7 +2391,7 @@ def test_sensenova_packed_decode_burst_followups_use_graph_logits(monkeypatch):
     state.decode_relay.token_tensor = torch.tensor([2], dtype=torch.long)
     state.decode_relay.position_id = 4
     state.decode_relay.position_tensor = torch.tensor([4], dtype=torch.long)
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -2752,7 +2752,7 @@ def test_packed_forward_syncs_host_cache_blocks_from_runner_state():
 
 
 def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
@@ -2941,7 +2941,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "block_ids": [0, 1], "sampling": {"temperature": 0.0}})
     states.create_or_update(8, {"req_id": 8, "block_ids": [2]})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 7, "kind": "decode_und", "token_ids": [4], "pos_range": [4, 5]},
             step.op,
@@ -2959,7 +2959,7 @@ def test_packed_forward_hydrates_cached_prefix_length_from_pos_range():
 
 
 def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
@@ -3156,7 +3156,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
     states.create_or_update(8, {"req_id": 8, "block_ids": [1]})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             step.op,
             {"req_id": 8, "kind": "commit_gen"},
@@ -3181,7 +3181,7 @@ def test_sensenova_packed_forward_sorted_segments_scatter_to_original_rows(monke
 
 
 def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
@@ -3440,7 +3440,7 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
     states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
     states.create_or_update(8, {"req_id": 8, "block_ids": [1], "sampling": {"temperature": 0.0}})
     states.create_or_update(9, {"req_id": 9, "block_ids": [0]})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 7, "kind": "decode_und", "token_ids": [11], "pos_range": [2, 3]},
             {"req_id": 8, "kind": "decode_und", "token_ids": [12], "pos_range": [2, 3]},
@@ -3466,7 +3466,7 @@ def test_sensenova_packed_forward_batches_text_staging_prefix_copies(monkeypatch
 
 
 def test_sensenova_packed_forward_runs_text_only_forward_batch():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
@@ -3596,7 +3596,7 @@ def test_sensenova_packed_forward_runs_text_only_forward_batch():
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
     states.create_or_update(8, {"req_id": 8, "block_ids": [1], "sampling": {"temperature": 0.0}})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 7, "kind": "decode_und", "token_ids": [13], "pos_range": [2, 3]},
             {"req_id": 8, "kind": "prefill_und", "token_ids": [21, 22], "pos_range": [0, 2]},
@@ -3618,7 +3618,7 @@ def test_sensenova_packed_forward_runs_text_only_forward_batch():
 
 
 def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
     from uniserve_worker.runtime.kv_pool import PagedKVPool
@@ -3744,7 +3744,7 @@ def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
     monkeypatch.setattr(packed_runtime, "maybe_run_segment_graph", graph_hidden)
     states = RequestStateTable()
     states.create_or_update(9, {"req_id": 9, "block_ids": [0], "sampling": {"temperature": 0.0}})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [{"req_id": 9, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}]
     )
     owner = Owner()
@@ -3758,7 +3758,7 @@ def test_sensenova_packed_forward_uses_graph_hidden_when_available(monkeypatch):
 
 
 def test_sensenova_packed_forward_defers_text_cpu_result_when_not_burst(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
@@ -3886,7 +3886,7 @@ def test_sensenova_packed_forward_defers_text_cpu_result_when_not_burst(monkeypa
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "block_ids": [0], "sampling": {"temperature": 0.0}})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [{"req_id": 7, "kind": "decode_und", "token_ids": [13], "pos_range": [2, 3]}]
     )
     results = [None]
@@ -3911,7 +3911,7 @@ def test_sensenova_packed_forward_defers_text_cpu_result_when_not_burst(monkeypa
 
 
 def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followup():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.execution.engine import DeferredTextSeqResult
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -3953,7 +3953,7 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
             relay_token_tensor=state.decode_relay.token_tensor,
         )
     ]
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -3981,7 +3981,7 @@ def test_sensenova_packed_decode_burst_stop_allows_one_speculative_graph_followu
 
 
 def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class Owner:
@@ -3995,7 +3995,7 @@ def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -4019,7 +4019,7 @@ def test_sensenova_packed_decode_burst_rejects_missing_graph_coverage():
 
 
 def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_finalizing():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.execution.engine import DeferredTextSeqResult
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -4083,7 +4083,7 @@ def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_fina
             relay_token_tensor=state.decode_relay.token_tensor,
         )
     ]
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -4113,7 +4113,7 @@ def test_sensenova_packed_decode_burst_stop_uses_deferred_token_ids_without_fina
 
 
 def test_sensenova_packed_decode_burst_defers_final_pending_token():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.execution.engine import DeferredDecodeBurstSeqResult, DeferredTextSeqResult
     from uniserve_worker.nn.sampler import DeferredBatchedSamplingResult
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -4173,7 +4173,7 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
             relay_token_tensor=state.decode_relay.token_tensor,
         )
     ]
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -4210,7 +4210,7 @@ def test_sensenova_packed_decode_burst_defers_final_pending_token():
 
 
 def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.execution.engine import (
         DeferredTerminalDecodeBurstSeqResult,
         DeferredTextSeqResult,
@@ -4271,7 +4271,7 @@ def test_sensenova_packed_decode_burst_terminal_stop_defers_all_tokens():
             relay_token_tensor=state.decode_relay.token_tensor,
         )
     ]
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 7,
@@ -4369,7 +4369,7 @@ def test_sensenova_packed_decode_burst_graph_followup_can_defer_cpu_sampling(mon
 
 
 def test_sensenova_packed_forward_commit_samples_followup_token(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class Owner:
@@ -4393,7 +4393,7 @@ def test_sensenova_packed_forward_commit_samples_followup_token(monkeypatch):
 
     states = RequestStateTable()
     states.create_or_update(7, {"req_id": 7, "sampling": {"temperature": 0.0}})
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 7, "kind": "decode_und", "token_ids": [13], "pos_range": [2, 3]},
             {"req_id": 7, "kind": "commit_gen"},
@@ -4443,7 +4443,7 @@ def test_sensenova_flow_batch_predictor_forwards_graph_mode(monkeypatch):
 
 
 def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.runtime.forward_stream import ForwardPagedKVSegment, ForwardStreamBuilder
@@ -4565,7 +4565,7 @@ def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
             self.updated = updated
 
     owner = Owner()
-    batch = UniForwardBatch.from_ops([step.op])
+    batch = ForwardBatch.from_ops([step.op])
 
     assert SegmentExecutor(owner).run_segment_forward(batch, SimpleNamespace(), [(0, step)], [None])
     assert allocated == [1]
@@ -4578,7 +4578,7 @@ def test_sensenova_packed_forward_reserves_transient_denoise_cache_capacity():
 
 
 def test_sensenova_packed_forward_caches_denoise_cfg_plan_before_decoder(monkeypatch):
-    from uniserve_worker.contracts.batches import UniForwardBatch
+    from uniserve_worker.contracts.forward_batch import ForwardBatch
     from uniserve_worker.contracts.forward_mode import ForwardMode
     from uniserve_worker.execution.engine import PreparedFlowStep
     from uniserve_worker.nn.diffusion.cfg import Branch
@@ -4707,7 +4707,7 @@ def test_sensenova_packed_forward_caches_denoise_cfg_plan_before_decoder(monkeyp
 
     monkeypatch.setattr(packed_runtime, "flow_cfg_plan", recording_cfg_plan)
 
-    batch = UniForwardBatch.from_ops([step.op])
+    batch = ForwardBatch.from_ops([step.op])
 
     assert SegmentExecutor(owner).run_segment_forward(
         batch,
@@ -4876,23 +4876,19 @@ def test_flowmatch_schedule_matches_sensenova_shifted_sigma():
 
 
 def test_cfg_params_accepts_rust_wire_shape():
-    params = CfgParams.from_mapping(
-        {
-            "branch_count": 3,
-            "text_scale": 4.0,
-            "img_scale": 2.0,
-            "renorm_type": "global",
-            "renorm_min": 0.1,
-            "interval": [0.2, 0.8],
-        }
-    )
+    mapping = {
+        "branch_count": 3,
+        "text_scale": 4.0,
+        "img_scale": 2.0,
+        "renorm_type": "global",
+        "renorm_min": 0.1,
+    }
+    params = CfgParams.from_mapping({**mapping, "interval": [0.2, 0.8]})
     assert params.branch_count == 3
     assert params.scales == (4.0, 2.0)
     assert params.renorm is RenormKind.GLOBAL
     assert params.renorm_min == 0.1
-    # cfg-interval gating is owned by the per-step ``cfg_interval`` field, not by
-    # CfgParams; from_mapping tolerates the extra wire key but does not mirror it.
-    assert not hasattr(params, "interval")
+    assert params == CfgParams.from_mapping(mapping)
 
 
 def test_shared_cfg_matches_sensenova_text_and_mixed_formulas():

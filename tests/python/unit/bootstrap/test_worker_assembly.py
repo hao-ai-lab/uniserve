@@ -51,7 +51,7 @@ def test_worker_cli_import_does_not_load_torch():
     assert result.returncode == 0, result.stderr
 
 
-def test_worker_plan_centralizes_role_implementation_choices():
+def test_worker_plan_resolves_each_role_to_an_executable_worker_kind():
     assert resolve_worker_plan(WorkerKind.PREFILL).implementation is WorkerImplementation.MODEL
     assert resolve_worker_plan(WorkerKind.ENCODER).implementation is WorkerImplementation.ENCODER
     assert resolve_worker_plan(WorkerKind.SAMPLER).implementation is WorkerImplementation.SAMPLER
@@ -110,7 +110,7 @@ class _VisionModel(ModelHooks):
         )
 
 
-def test_encoder_assembly_loads_model_without_building_model_runner(
+def test_encoder_assembly_executes_the_loaded_model(
     monkeypatch: pytest.MonkeyPatch,
 ):
     launch = _parse_launch(
@@ -146,4 +146,13 @@ def test_encoder_assembly_loads_model_without_building_model_runner(
     worker = assembly.assemble_worker(launch)
 
     assert isinstance(worker, EncoderWorker)
-    assert not hasattr(worker, "model_runner")
+    assert worker.execute(
+        {
+            "step_id": 1,
+            "new_reqs": [{"req_id": 3}],
+            "ops": [{"req_id": 3, "kind": "vit_encode", "mm_hash": 11}],
+        }
+    ) == {
+        "step_id": 1,
+        "per_seq": [{"req_id": 3, "encoder_handle": 7, "num_tokens": 1}],
+    }

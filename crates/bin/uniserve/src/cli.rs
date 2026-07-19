@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_serve_aliases_parse_to_target_fields() {
+    fn serve_aliases_parse_to_target_fields() {
         let runtime = parse_serve(&[
             "--worker-ranks",
             "2",

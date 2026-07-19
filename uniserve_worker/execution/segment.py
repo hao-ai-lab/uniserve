@@ -20,10 +20,11 @@ import torch
 
 import uniserve_worker.ops as ops
 from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPlan
-from uniserve_worker.contracts.batches import UniForwardBatch
 from uniserve_worker.contracts.forward_batch import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
+    ForwardBatch,
+    ForwardExecutionOptions,
     ForwardPlan,
     ForwardResult,
     TextPostprocessEntry,
@@ -906,26 +907,23 @@ class SegmentRuntime:
 
     def run_segment_graph(
         self,
+        batch: ForwardBatch,
         plan: ForwardPlan,
         *,
         request_states: Any,
         result_publisher: Any | None = None,
+        options: ForwardExecutionOptions = ForwardExecutionOptions(),
     ) -> ForwardResult | None:
         """Execute any graphable segment-table composition owned by this family."""
 
-        dispatch_batch = plan.runtime_handles.get("dispatch_batch")
-        if not isinstance(dispatch_batch, UniForwardBatch):
-            dispatch_batch = UniForwardBatch.from_ops(plan.ops)
         if any(
             int(op.get("decode_token_count") or 1) > 1 or int(op.get("denoise_step_count") or 1) > 1
-            for op in dispatch_batch.ops
+            for op in batch.ops
         ):
             outputs = self.execute(
-                dispatch_batch,
+                batch,
                 request_states=request_states,
-                defer_text_cpu_results=bool(
-                    plan.runtime_handles.get("defer_text_cpu_results", False)
-                ),
+                defer_text_cpu_results=options.defer_text_cpu_results,
             )
             if isinstance(outputs, ForwardResult):
                 return outputs
@@ -944,10 +942,10 @@ class SegmentRuntime:
             denoise_steps.append((int(row.row_index), step))
 
         result = self.run_segment_forward_result(
-            dispatch_batch,
+            batch,
             request_states,
             denoise_steps,
-            defer_text_cpu_results=bool(plan.runtime_handles.get("defer_text_cpu_results", False)),
+            defer_text_cpu_results=options.defer_text_cpu_results,
             allow_graph=True,
             require_graph=True,
         )
@@ -972,7 +970,7 @@ class SegmentRuntime:
 
     def run_segment_forward_result(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         request_states: Any,
         denoise_steps: "list[tuple[int, PreparedFlowStep]]",
         *,
@@ -998,7 +996,7 @@ class SegmentRuntime:
 
     def run_segment_forward(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         request_states: Any,
         denoise_steps: list[tuple[int, PreparedFlowStep]],
         results: list[Any],
@@ -1020,7 +1018,7 @@ class SegmentRuntime:
 
     def execute(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         *,
         request_states: Any,
         defer_text_cpu_results: bool = False,
@@ -1369,7 +1367,7 @@ def _append_decode_graph_padding(
 
 @dataclass
 class SegmentPlan:
-    batch: UniForwardBatch
+    batch: ForwardBatch
     denoise_steps: list[tuple[int, PreparedFlowStep]]
     results: list[Any]
     text_result_slots: list[TextResultSlot] = field(default_factory=list)
@@ -2231,7 +2229,7 @@ class _PackedForwardTiming:
     def log(
         self,
         *,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         forward_stream: Any,
         embed_chunks: Sequence[torch.Tensor],
         text_result_slots: Sequence[tuple[Any, ...]],
@@ -2402,7 +2400,7 @@ def _validate_route_indices(
     return resolved
 
 
-def _packed_row_order(batch: UniForwardBatch) -> list[int]:
+def _packed_row_order(batch: ForwardBatch) -> list[int]:
     if not _PACKED_FORWARD_CANONICAL_ORDER:
         return list(range(len(batch.ops)))
     decode_rows: list[int] = []
@@ -2553,7 +2551,7 @@ class SegmentExecutor(SegmentRuntime):
 
     def execute(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         *,
         request_states: Any,
         defer_text_cpu_results: bool = False,
@@ -2635,7 +2633,7 @@ class SegmentExecutor(SegmentRuntime):
 
     def _complete_decode_bursts(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         request_states: Any,
         results: list[Any],
         *,
@@ -2857,7 +2855,7 @@ class SegmentExecutor(SegmentRuntime):
 
     def _complete_denoise_bursts(
         self,
-        batch: UniForwardBatch,
+        batch: ForwardBatch,
         request_states: Any,
         results: list[Any],
     ) -> None:

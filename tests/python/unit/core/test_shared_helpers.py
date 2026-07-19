@@ -1,4 +1,4 @@
-"""Unit tests for the shared worker helpers introduced for INC-113/INC-114."""
+"""Behavioral contracts for shared worker helpers."""
 from __future__ import annotations
 
 import pytest

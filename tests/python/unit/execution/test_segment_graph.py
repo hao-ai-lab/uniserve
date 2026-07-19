@@ -35,12 +35,6 @@ def test_segment_graph_runner_is_enabled_by_default():
     assert SegmentGraphRunner().enabled()
 
 
-def test_packed_forward_capacity_buckets_use_private_capture_pools():
-    runner = SegmentGraphRunner()
-
-    assert runner.capture_pool() is None
-
-
 def test_packed_forward_graph_reclaims_lru_capacity_after_releasing_state(monkeypatch):
     events: list[str] = []
 

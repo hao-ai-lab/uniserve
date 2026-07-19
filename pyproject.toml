@@ -95,7 +95,6 @@ markers = [
     "unit: pure local tests without server, GPU, or external model files",
     "contract: public schema/protocol/API compatibility tests",
     "integration: multi-component tests using fake/simulated backends",
-    "architecture: repository import/layering rules",
     "e2e: black-box server or worker tests",
     "gpu: requires real GPU model execution",
     "slow: excluded from the fast local and presubmit suites",

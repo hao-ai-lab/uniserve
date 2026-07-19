@@ -30,17 +30,14 @@ import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum, IntEnum
 from types import MappingProxyType
 from typing import (
     TYPE_CHECKING,
     Any,
-    Iterator,
     Protocol,
     TypeVar,
-    runtime_checkable,
 )
 
 import torch
@@ -51,7 +48,7 @@ from uniserve_worker.backends.attention import (
 )
 from uniserve_worker.contracts.batch_policy import BatchPolicy
 from uniserve_worker.contracts.batches import ExecuteBatch as WireExecuteBatch
-from uniserve_worker.contracts.batches import UniForwardBatch
+from uniserve_worker.contracts.batches import TextBatch
 from uniserve_worker.contracts.cache_schema import (
     CacheEffect,
     CacheRegionSpec,
@@ -103,6 +100,7 @@ from uniserve_worker.contracts.forward_batch import (
     EncodeInputs,
     EncodeRowPlan,
     ForwardBatch,
+    ForwardExecutionOptions,
     ForwardGraphPolicy,
     ForwardModality,
     ForwardOutputKind,
@@ -112,7 +110,6 @@ from uniserve_worker.contracts.forward_batch import (
     ForwardResult,
     ForwardResultProjection,
     ForwardRowPlan,
-    ForwardRuntimeHandles,
     ForwardSegmentClass,
     ForwardSegmentPlan,
     ForwardShapeSummary,
@@ -202,7 +199,6 @@ from uniserve_worker.spec import speculative_sample_target_only
 
 if TYPE_CHECKING:
     from uniserve_worker.backends.attention.text_dispatch import TextBackendGate
-    from uniserve_worker.contracts.batches import TextBatch, UniForwardBatch
     from uniserve_worker.contracts.forward_batch import ForwardBatch, ForwardGraphPolicy
     from uniserve_worker.contracts.forward_stats import ForwardStats
     from uniserve_worker.contracts.model_protocols import FlowCapable
@@ -1884,7 +1880,7 @@ class DecodeBurstExecutor:
         return self._launch_many([op], request_states, model)[0]
 
     def _launch_many(self, ops: list[dict[str, Any]], request_states: Any, model: Any) -> list[Any]:
-        text = UniForwardBatch.from_ops(ops).as_text()
+        text = ForwardBatch.from_ops(ops).as_text()
         if text.mode != ForwardMode.DECODE:
             raise invalid_descriptor("decode burst can only launch decode ops")
         return self._step_once(
@@ -2235,7 +2231,7 @@ def verify_speculative_tokens(
     builder, kv_pool = driver._system_forward_runtime()
     for length, rows in grouped.items():
         extended_ops = [op for _, op, _ in rows]
-        verify_text = UniForwardBatch.from_ops(extended_ops).as_text()
+        verify_text = ForwardBatch.from_ops(extended_ops).as_text()
         fb = builder.build_text(
             verify_text,
             device=device,
@@ -2648,7 +2644,7 @@ class TextDriver:
     @torch.inference_mode()
     def step(
         self,
-        fb: "UniForwardBatch",
+        fb: ForwardBatch,
         request_states: RequestStateTable,
         model: Any,
         *,
@@ -2713,7 +2709,7 @@ class TextDriver:
 
     def forward_logits(
         self,
-        fb: "UniForwardBatch",
+        fb: ForwardBatch,
         request_states: RequestStateTable,
         model: Any,
         *,
@@ -2752,7 +2748,7 @@ class TextDriver:
 
     def forward_logits_graph(
         self,
-        fb: "UniForwardBatch",
+        fb: ForwardBatch,
         request_states: RequestStateTable,
         model: Any,
         *,
@@ -2807,7 +2803,7 @@ class TextDriver:
 
     def forward_graph_result(
         self,
-        fb: "UniForwardBatch",
+        fb: ForwardBatch,
         request_states: RequestStateTable,
         model: Any,
         *,
@@ -4491,7 +4487,7 @@ class EncodeDriver:
     """Run model-provided image/text encoder primitives for ENCODE ops."""
 
     @torch.inference_mode()
-    def step(self, fb: UniForwardBatch, model: Any) -> list[EncodeOutput]:
+    def step(self, fb: ForwardBatch, model: Any) -> list[EncodeOutput]:
         # The encode view validates req_id/kind/mm_hash once; ``ops`` is the raw
         # op mapping retained so the model encode hooks still receive their
         # unparsed pixel/grid payloads.
@@ -4501,7 +4497,7 @@ class EncodeDriver:
     @torch.inference_mode()
     def forward_result(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         model: Any,
         *,
         row_indices: tuple[int, ...] | list[int] | None = None,
@@ -4741,7 +4737,6 @@ class ForwardPlanBuilder:
         request_states: Any = None,
         step_id: int | None = None,
         graph_policy: "ForwardGraphPolicy | None" = None,
-        runtime_handles: ForwardRuntimeHandles | None = None,
     ) -> ForwardPlan:
         if not group:
             raise invalid_descriptor("forward plan group must not be empty")
@@ -4760,7 +4755,6 @@ class ForwardPlanBuilder:
             rows=rows,
             segments=segments,
         )
-        handles = runtime_handles or ForwardRuntimeHandles(request_states=request_states)
         plan = ForwardPlan(
             step_id=step_id,
             rows=tuple(rows),
@@ -4768,7 +4762,6 @@ class ForwardPlanBuilder:
             output_slots=tuple(output_slots),
             shape=shape,
             graph_policy=graph_policy,
-            runtime_handles=handles,
         )
         plan.validate()
         return plan
@@ -5191,15 +5184,20 @@ class UnifiedForwardBatchBuilder:
             return None
         if not plan.rows or any(row.mode not in _TEXT_MODES for row in plan.rows):
             return None
-        text = UniForwardBatch.from_ops(plan.ops).as_text(
-            allow_mixed_text=plan.forward_mode is ForwardMode.MIXED
+        text = TextBatch.from_ops(
+            plan.forward_mode,
+            plan.ops,
+            op_modes=plan.op_modes,
+            allow_mixed_text=plan.forward_mode is ForwardMode.MIXED,
         )
-        return self.runtime_builder.build_text(
+        runtime_batch = self.runtime_builder.build_text(
             text,
             device=device,
             kv_pool=self.kv_pool,
             request_states=self.request_states,
         )
+        runtime_batch.op_modes = plan.op_modes
+        return runtime_batch
 
     def _build_generic(self, plan: ForwardPlan, device: torch.device) -> ForwardBatch:
         input_ids: list[int] = []
@@ -5334,186 +5332,10 @@ def _scalar_tensor(value: Any, device: torch.device) -> torch.Tensor | None:
 
 
 # ---------------------
-# Model descriptor
-# ---------------------
-
-
-@dataclass(frozen=True)
-class ForwardModelModules:
-    embed_text: Callable[..., Any] | None = None
-    embed_generation: Callable[..., Any] | None = None
-    decoder: Callable[..., Any] | None = None
-    logits: Callable[..., Any] | None = None
-    velocity: Callable[..., Any] | None = None
-    encode: Callable[..., Any] | None = None
-    commit: Callable[..., Any] | None = None
-
-
-@dataclass(frozen=True)
-class ForwardModelDescriptor:
-    device: torch.device
-    dtype: torch.dtype
-    hidden_size: int
-    vocab_size: int
-    num_layers: int
-    num_q_heads: int
-    num_kv_heads: int
-    head_dim: int
-    attention_scale: float = 1.0
-    kv_page_size: int | None = None
-    supports_text: bool = False
-    supports_denoise: bool = False
-    supports_encode: bool = False
-    supports_commit: bool = False
-    graph_capture: Mapping[str, Any] = field(default_factory=dict)
-    modules: ForwardModelModules = field(default_factory=ForwardModelModules)
-    variant: str = "default"
-
-    def validate(self) -> None:
-        positive = {
-            "hidden_size": self.hidden_size,
-            "num_layers": self.num_layers,
-            "num_q_heads": self.num_q_heads,
-            "num_kv_heads": self.num_kv_heads,
-            "head_dim": self.head_dim,
-        }
-        for name, value in positive.items():
-            if int(value) <= 0:
-                raise invalid_descriptor(f"forward model descriptor {name} must be positive")
-        if self.supports_text:
-            if int(self.vocab_size) <= 0:
-                raise invalid_descriptor("text-capable descriptor must declare vocab_size")
-            if self.modules.decoder is None and self.modules.logits is None:
-                raise invalid_descriptor("text-capable descriptor is missing text neural surfaces")
-        if self.supports_denoise and self.modules.velocity is None:
-            raise invalid_descriptor("denoise-capable descriptor is missing velocity surface")
-        if self.supports_encode and self.modules.encode is None:
-            raise invalid_descriptor("encode-capable descriptor is missing encode surface")
-        if self.supports_commit and self.modules.commit is None:
-            raise invalid_descriptor("commit-capable descriptor is missing commit surface")
-
-
-def descriptor_from_model(model: Any) -> ForwardModelDescriptor:
-    device = torch.device(str(getattr(model, "device", "cpu") or "cpu"))
-    dtype = _dtype(getattr(model, "dtype", None))
-    modules = ForwardModelModules(
-        embed_text=_first_callable(model, ("embed_tokens", "packed_text_embeddings")),
-        embed_generation=_first_callable(
-            model, ("embed_generation", "prepare_generation_embeddings")
-        ),
-        decoder=_first_callable(model, ("forward", "decoder_forward", "packed_decoder_forward")),
-        logits=_first_callable(model, ("compute_logits", "logits", "lm_head"))
-        or _first_overridden_callable(model, ("run_text_logits_batch", "run_text_logits")),
-        velocity=_first_callable(model, ("predict_velocity", "velocity", "project_velocity")),
-        encode=_first_callable(model, ("encode_image", "encode_latents")),
-        commit=_first_callable(model, ("decode_image", "commit")),
-    )
-    supports_text = (
-        callable(getattr(model, "forward", None))
-        or _overrides(model, "run_text_logits_batch")
-        or _overrides(model, "run_text_logits")
-    )
-    raw_vocab_size = int(_attr(model, ("vocab_size",), 0))
-    descriptor = ForwardModelDescriptor(
-        device=device,
-        dtype=dtype,
-        hidden_size=max(1, int(_attr(model, ("hidden_size", "d_model"), 1))),
-        vocab_size=max(1 if supports_text else 0, raw_vocab_size),
-        num_layers=max(1, int(_attr(model, ("num_layers", "n_layers"), 1))),
-        num_q_heads=max(1, int(_attr(model, ("num_q_heads", "num_attention_heads"), 1))),
-        num_kv_heads=max(1, int(_attr(model, ("num_kv_heads", "num_key_value_heads"), 1))),
-        head_dim=max(1, int(_attr(model, ("head_dim",), 1))),
-        attention_scale=float(_attr(model, ("attention_scale",), 1.0)),
-        kv_page_size=_descriptor_optional_int(_attr(model, ("block_size", "kv_page_size"), None)),
-        supports_text=supports_text,
-        supports_denoise=_overrides(model, "predict_velocity"),
-        supports_encode=_overrides(model, "encode_image") or _overrides(model, "encode_latents"),
-        supports_commit=_overrides(model, "decode_image"),
-        graph_capture={
-            "step": callable(getattr(model, "query_geometry", None)),
-        },
-        modules=modules,
-        variant=type(model).__name__,
-    )
-    descriptor.validate()
-    return descriptor
-
-
-def _dtype(value: Any) -> torch.dtype:
-    if isinstance(value, torch.dtype):
-        return value
-    if value is None:
-        return torch.float32
-    parsed = getattr(torch, str(value), None)
-    return parsed if isinstance(parsed, torch.dtype) else torch.float32
-
-
-def _attr(model: Any, names: tuple[str, ...], default: Any) -> Any:
-    config = getattr(model, "config", None)
-    for name in names:
-        if hasattr(model, name):
-            return getattr(model, name)
-        if config is not None and hasattr(config, name):
-            return getattr(config, name)
-    return default
-
-
-def _first_callable(model: Any, names: tuple[str, ...]) -> Callable[..., Any] | None:
-    for name in names:
-        value = getattr(model, name, None)
-        if callable(value):
-            return value
-    return None
-
-
-def _first_overridden_callable(model: Any, names: tuple[str, ...]) -> Callable[..., Any] | None:
-    for name in names:
-        value = getattr(model, name, None)
-        if callable(value) and _overrides(model, name):
-            return value
-    return None
-
-
-def _descriptor_optional_int(value: Any) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _overrides(model: Any, name: str) -> bool:
-    from uniserve_worker.contracts.model_protocols import ModelHooks
-
-    hook = getattr(type(model), name, None)
-    default = getattr(ModelHooks, name, None)
-    return hook is not None and hook is not default
-
-
-# ---------------------
 # Family adapter dispatch
 # ---------------------
 
 _TEXT_DRIVER_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
-
-
-@runtime_checkable
-class ForwardModelAdapter(Protocol):
-    """Small neural execution seam consumed by ``ForwardExecutor``."""
-
-    descriptor: ForwardModelDescriptor
-
-    def forward(self, batch: ForwardBatch) -> ForwardResult: ...
-
-
-@dataclass(frozen=True)
-class ForwardAdapterContext:
-    """Per-group execution context bound around one adapter forward."""
-
-    dispatch_batch: UniForwardBatch
-    group: tuple[tuple[int, Mapping[str, Any]], ...]
-    defer_text_cpu_results: bool = False
 
 
 class WorkerForwardAdapter:
@@ -5528,8 +5350,6 @@ class WorkerForwardAdapter:
         denoise_driver: Any,
         encode_driver: Any,
         image_decode_driver: Any,
-        descriptor: ForwardModelDescriptor | None = None,
-        defer_sampling: bool = False,
         tensor_store: Any | None = None,
         mixed_proof_callback: Any | None = None,
     ) -> None:
@@ -5539,11 +5359,8 @@ class WorkerForwardAdapter:
         self.denoise_driver = denoise_driver
         self.encode_driver = encode_driver
         self.image_decode_driver = image_decode_driver
-        self.descriptor = descriptor or descriptor_from_model(model)
-        self.defer_sampling = bool(defer_sampling)
         self.tensor_store = tensor_store
         self.mixed_proof_callback = mixed_proof_callback
-        self._context: ForwardAdapterContext | None = None
         self._has_text_forward = hasattr(model, "forward")
         self._has_text_logits_batch = _overrides_model_hook(model, "run_text_logits_batch")
         self._is_text_capable = self._has_text_forward or self._has_text_logits_batch
@@ -5554,39 +5371,17 @@ class WorkerForwardAdapter:
         )
         self._whole_batch_forward = bool(getattr(model, "whole_batch_forward", False))
 
-    @contextmanager
-    def bind(
+    def forward(
         self,
-        *,
-        dispatch_batch: UniForwardBatch,
-        group: Sequence[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
-    ) -> Iterator[None]:
-        previous = self._context
-        self._context = ForwardAdapterContext(
-            dispatch_batch=dispatch_batch,
-            group=tuple(group),
-            defer_text_cpu_results=bool(defer_text_cpu_results),
-        )
-        try:
-            yield
-        finally:
-            self._context = previous
-
-    def forward(self, batch: ForwardBatch) -> ForwardResult:
-        context = self._context
-        if context is None:
-            fb = UniForwardBatch.from_ops(batch.ops)
-            group = tuple(enumerate(batch.ops))
-            defer_text_cpu_results = False
-        else:
-            fb = context.dispatch_batch
-            group = context.group
-            defer_text_cpu_results = context.defer_text_cpu_results
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        options: ForwardExecutionOptions,
+    ) -> ForwardResult:
+        group = [(int(row.original_index), row.op) for row in plan.rows]
         result = self.dispatch(
-            fb,
-            list(group),
-            defer_text_cpu_results=defer_text_cpu_results,
+            batch,
+            group,
+            options=options,
         )
         if isinstance(result, ForwardResult):
             return result
@@ -5599,16 +5394,16 @@ class WorkerForwardAdapter:
 
     def dispatch(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
         *,
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any]:
         if self._whole_batch_forward and (
             fb.mode is ForwardMode.MIXED or fb.mode in _TEXT_DRIVER_MODES
         ):
             result = self._run_model_forward(fb)
-        elif _can_run_private_forward_adapter(self.model, fb):
+        elif _can_run_private_forward_adapter(self.model, fb.op_modes, fb.ops):
             if fb.mode is ForwardMode.MIXED and callable(self.mixed_proof_callback):
                 self.mixed_proof_callback(fb, group)
             with profile_range("uniserve.forward_adapter.forward"):
@@ -5617,22 +5412,22 @@ class WorkerForwardAdapter:
                     batch=fb,
                     group=group,
                     request_states=self.request_states,
-                    defer_text_cpu_results=defer_text_cpu_results,
+                    defer_text_cpu_results=options.defer_text_cpu_results,
                 )
         elif fb.mode is ForwardMode.MIXED:
-            result = self._run_mixed_mode(fb, group, defer_text_cpu_results)
+            result = self._run_mixed_mode(fb, group, options)
         elif fb.mode in _TEXT_DRIVER_MODES:
-            result = self._run_text_mode(fb, group, defer_text_cpu_results)
+            result = self._run_text_mode(fb, group, options)
         elif fb.mode is ForwardMode.DENOISE:
-            result = self._run_denoise_mode(fb, group, defer_text_cpu_results)
+            result = self._run_denoise_mode(fb, group, options)
         elif fb.mode is ForwardMode.COMMIT:
-            result = self._run_commit_mode(fb, group, defer_text_cpu_results)
+            result = self._run_commit_mode(fb, group, options)
         elif fb.mode is ForwardMode.ENCODE:
-            result = self._run_encode_mode(fb, group, defer_text_cpu_results)
+            result = self._run_encode_mode(fb, group, options)
         else:
             result = None
         if result is None:
-            result = self._run_whole_batch_forward(fb, group, defer_text_cpu_results)
+            result = self._run_whole_batch_forward(fb, group, options)
         if result is None:
             raise capability_mismatch(
                 f"model advertises ops for mode {fb.mode.value!r} but implements no "
@@ -5640,19 +5435,21 @@ class WorkerForwardAdapter:
             )
         return result
 
-    def can_run_forward(self, fb: UniForwardBatch) -> bool:
-        """Whether this adapter can execute ``fb`` as one unified forward."""
-        if fb.mode is not ForwardMode.MIXED:
+    def can_run_forward(self, ops: Sequence[Mapping[str, Any]]) -> bool:
+        """Whether this adapter can execute ``ops`` as one unified forward."""
+
+        modes = tuple(mode_for_op(str(op.get("kind"))) for op in ops)
+        if not modes or all(mode is modes[0] for mode in modes):
             return True
-        if self._whole_batch_forward or _can_run_private_forward_adapter(self.model, fb):
+        if self._whole_batch_forward or _can_run_private_forward_adapter(self.model, modes, ops):
             return True
-        return all(mode in _TEXT_DRIVER_MODES for mode in fb.op_modes)
+        return all(mode in _TEXT_DRIVER_MODES for mode in modes)
 
     def _run_mixed_mode(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any] | None:
         if self._whole_batch_forward:
             return self._run_model_forward(fb)
@@ -5660,25 +5457,25 @@ class WorkerForwardAdapter:
             return None
         if callable(self.mixed_proof_callback):
             self.mixed_proof_callback(fb, group)
-        return self._run_text_driver(fb, defer_text_cpu_results)
+        return self._run_text_driver(fb, options)
 
     def _run_text_mode(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any] | None:
         del group
         if self._whole_batch_forward:
             return self._run_model_forward(fb)
         if self._is_text_capable:
-            return self._run_text_driver(fb, defer_text_cpu_results)
+            return self._run_text_driver(fb, options)
         return None
 
     def _run_text_driver(
         self,
-        fb: UniForwardBatch,
-        defer_text_cpu_results: bool,
+        fb: ForwardBatch,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any]:
         forward_logits = getattr(self.text_driver, "forward_logits", None)
         if callable(forward_logits):
@@ -5687,8 +5484,8 @@ class WorkerForwardAdapter:
                     fb,
                     self.request_states,
                     self.model,
-                    defer_cpu_results=defer_text_cpu_results,
-                    defer_sampling=self.defer_sampling,
+                    defer_cpu_results=options.defer_text_cpu_results,
+                    defer_sampling=options.defer_sampling,
                 )
             if text_result is not None:
                 req_ids = tuple(int(req_id) for req_id in getattr(text_result, "req_ids", ()))
@@ -5710,18 +5507,18 @@ class WorkerForwardAdapter:
                 fb,
                 self.request_states,
                 self.model,
-                defer_cpu_results=defer_text_cpu_results,
-                defer_sampling=self.defer_sampling,
+                defer_cpu_results=options.defer_text_cpu_results,
+                defer_sampling=options.defer_sampling,
                 tensor_store=self.tensor_store,
             )
 
     def _run_denoise_mode(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any] | None:
-        del fb, defer_text_cpu_results
+        del fb, options
         if not self._has_predict_velocity:
             return None
         forward_result = getattr(self.denoise_driver, "forward_result", None)
@@ -5750,11 +5547,11 @@ class WorkerForwardAdapter:
 
     def _run_commit_mode(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any] | None:
-        del fb, defer_text_cpu_results
+        del fb, options
         if not self._has_decode_image:
             return None
         items = [
@@ -5779,11 +5576,11 @@ class WorkerForwardAdapter:
 
     def _run_encode_mode(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> ForwardResult | list[Any] | None:
-        del group, defer_text_cpu_results
+        del group, options
         if not self._has_encode:
             return None
         forward_result = getattr(self.encode_driver, "forward_result", None)
@@ -5797,16 +5594,16 @@ class WorkerForwardAdapter:
 
     def _run_whole_batch_forward(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> list[Any] | None:
-        del group, defer_text_cpu_results
+        del group, options
         if not self._whole_batch_forward:
             return None
         return self._run_model_forward(fb)
 
-    def _run_model_forward(self, fb: UniForwardBatch) -> list[Any]:
+    def _run_model_forward(self, fb: ForwardBatch) -> list[Any]:
         with profile_range("uniserve.forward_adapter.model_forward"):
             result = self.model.forward(fb)
         if not isinstance(result, Sequence) or isinstance(result, (str, bytes, bytearray)):
@@ -5820,11 +5617,14 @@ def _overrides_model_hook(model: Any, name: str) -> bool:
     return hook is not None and hook is not default
 
 
-def _can_run_private_forward_adapter(model: Any, fb: UniForwardBatch) -> bool:
+def _can_run_private_forward_adapter(
+    model: Any,
+    modes: Sequence[ForwardMode],
+    ops: Sequence[Mapping[str, Any]],
+) -> bool:
     hook = getattr(model, "_run_forward_adapter", None)
     if not callable(hook):
         return False
-    modes = tuple(getattr(fb, "op_modes", ()))
     if not modes:
         return False
     mode_set = set(modes)
@@ -5832,13 +5632,13 @@ def _can_run_private_forward_adapter(model: Any, fb: UniForwardBatch) -> bool:
         return False
     if not mode_set & _SEGMENT_PRODUCING_MODES:
         return False
-    return not any(_has_values(op.get("spec_token_ids")) for op in fb.ops)
+    return not any(_has_values(op.get("spec_token_ids")) for op in ops)
 
 
 def _run_private_forward_adapter(
     *,
     model: Any,
-    batch: UniForwardBatch,
+    batch: ForwardBatch,
     group: Sequence[tuple[int, Mapping[str, Any]]],
     request_states: Any,
     defer_text_cpu_results: bool,
@@ -5942,6 +5742,7 @@ class ForwardExecutor:
         batch: ForwardBatch,
         plan: ForwardPlan,
         *,
+        options: ForwardExecutionOptions = ForwardExecutionOptions(),
         forward_fn: Callable[[ForwardBatch], Any] | None = None,
     ) -> ForwardResult:
         policy = plan.graph_policy or self.graph_policy
@@ -5954,6 +5755,7 @@ class ForwardExecutor:
                     batch,
                     plan,
                     allow_capture=policy.allow_capture,
+                    options=options,
                 )
             except Exception as exc:
                 warning = self._warning(EagerFallbackReason.REPLAY_FAILURE, plan)
@@ -5993,21 +5795,27 @@ class ForwardExecutor:
 
 
 class ForwardPostprocessor:
-    def apply(self, plan: ForwardPlan, result: ForwardResult) -> list[Any]:
+    """Project neural results using explicitly bound runtime services."""
+
+    def __init__(self, *, request_states: Any = None, tensor_store: Any = None) -> None:
+        self.request_states = request_states
+        self.tensor_store = tensor_store
+
+    def apply(
+        self,
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        result: ForwardResult,
+        options: ForwardExecutionOptions = ForwardExecutionOptions(),
+    ) -> list[Any]:
         result.validate_for_plan(plan)
         if result.runtime_outputs is not None:
-            runtime_outputs = self._normalize_outputs(plan, result.runtime_outputs)
-            side_effects = plan.runtime_handles.get("postprocess_side_effects")
-            if callable(side_effects):
-                side_effects(runtime_outputs)
-            return runtime_outputs
+            return self._normalize_outputs(result.runtime_outputs)
         if self._can_apply_text_batch(plan, result):
-            batch_outputs = self._normalize_outputs(plan, self._apply_text_batch(plan, result))
-            side_effects = plan.runtime_handles.get("postprocess_side_effects")
-            if callable(side_effects):
-                side_effects(batch_outputs)
-            return batch_outputs
-        text_outputs = self._apply_text_entries(plan, result) if result.text_postprocess else {}
+            return self._normalize_outputs(self._apply_text_batch(batch, plan, result, options))
+        text_outputs = (
+            self._apply_text_entries(plan, result, options) if result.text_postprocess else {}
+        )
         outputs: list[Any] = []
         text_row = 0
         for slot in plan.output_slots:
@@ -6019,7 +5827,7 @@ class ForwardPostprocessor:
                 if result.text_logits is None:
                     raise invalid_descriptor("text output slot requires logits")
                 logits_rows = result.text_logits.reshape(-1, result.text_logits.shape[-1])
-                outputs.append(self._sample_text(plan, row.req_id, row.op, logits_rows[text_row]))
+                outputs.append(self._sample_text(row.req_id, row.op, logits_rows[text_row]))
                 text_row += 1
             elif slot.kind is ForwardOutputKind.DENOISE_STEP:
                 outputs.append(self._apply_denoise(plan, slot.row_index, result))
@@ -6029,20 +5837,10 @@ class ForwardPostprocessor:
                 outputs.append(self._apply_encode(plan, slot.row_index, result))
             else:
                 outputs.append({"req_id": row.req_id})
-        outputs = self._normalize_outputs(plan, outputs)
-        side_effects = plan.runtime_handles.get("postprocess_side_effects")
-        if callable(side_effects):
-            side_effects(outputs)
-        return outputs
+        return self._normalize_outputs(outputs)
 
-    def _normalize_outputs(
-        self,
-        plan: ForwardPlan,
-        outputs: tuple[Any, ...] | list[Any],
-    ) -> list[Any]:
-        normalizer = plan.runtime_handles.get("output_normalizer")
-        if callable(normalizer):
-            return [normalizer(output) for output in outputs]
+    @staticmethod
+    def _normalize_outputs(outputs: tuple[Any, ...] | list[Any]) -> list[Any]:
         return list(outputs)
 
     @staticmethod
@@ -6051,40 +5849,42 @@ class ForwardPostprocessor:
             isinstance(result.text_logits, torch.Tensor)
             and bool(plan.output_slots)
             and all(slot.kind is ForwardOutputKind.TEXT_TOKEN for slot in plan.output_slots)
-            and plan.runtime_handles.get("dispatch_batch") is not None
         )
 
-    def _apply_text_batch(self, plan: ForwardPlan, result: ForwardResult) -> list[Any]:
-        text = plan.runtime_handles.get("dispatch_batch").as_text(
+    def _apply_text_batch(
+        self,
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        result: ForwardResult,
+        options: ForwardExecutionOptions,
+    ) -> list[Any]:
+        text = batch.as_text(
             allow_mixed_text=plan.forward_mode is ForwardMode.MIXED
         )
         req_ids = [int(row.req_id) for row in plan.rows]
         if result.text_logits is None:
             raise invalid_descriptor("text batch postprocess requires logits")
         logits_batch = self._text_logits_rows(result.text_logits, len(req_ids))
-        if (
-            plan.runtime_handles.get("defer_sampling")
-            and plan.runtime_handles.tensor_store is not None
-        ):
+        if options.defer_sampling and self.tensor_store is not None:
             published_outputs = self._publish_logits(
                 list(text.ops),
                 req_ids,
                 logits_batch,
-                plan.runtime_handles.tensor_store,
+                self.tensor_store,
             )
-            self._publish_decode_position_relays(text, logits_batch.device, plan)
-            self._advance_text_kv_lengths(text, plan)
+            self._publish_decode_position_relays(text, logits_batch.device)
+            self._advance_text_kv_lengths(text)
             return published_outputs
         sampled_outputs = self._sample_text_logits_batch(
             plan,
             list(text.ops),
             req_ids,
             logits_batch,
-            defer_cpu_results=bool(plan.runtime_handles.get("defer_text_cpu_results")),
+            defer_cpu_results=options.defer_text_cpu_results,
             cuda_ready_start_event=result.text_cuda_ready_start_event,
         )
-        self._publish_decode_position_relays(text, logits_batch.device, plan)
-        self._advance_text_kv_lengths(text, plan)
+        self._publish_decode_position_relays(text, logits_batch.device)
+        self._advance_text_kv_lengths(text)
         return sampled_outputs
 
     @staticmethod
@@ -6109,7 +5909,7 @@ class ForwardPostprocessor:
             raise invalid_descriptor("batched text logits rows must form a [batch, vocab] tensor")
         if int(logits_batch.shape[0]) != len(req_ids):
             raise invalid_descriptor("batched text logits row count must match req_ids")
-        request_states = plan.runtime_handles.request_states
+        request_states = self.request_states
         if request_states is None:
             return [
                 TextTokenOutput(
@@ -6211,11 +6011,10 @@ class ForwardPostprocessor:
             results.append(result)
         return results
 
-    @staticmethod
-    def _publish_decode_position_relays(text: Any, device: torch.device, plan: ForwardPlan) -> None:
+    def _publish_decode_position_relays(self, text: Any, device: torch.device) -> None:
         if text.mode is not ForwardMode.DECODE:
             return
-        request_states = plan.runtime_handles.request_states
+        request_states = self.request_states
         if request_states is None:
             return
         if any(len(tokens) != 1 for tokens in text.token_ids):
@@ -6227,28 +6026,31 @@ class ForwardPostprocessor:
         _DECODE_RELAY.publish_positions(states, position_ids=positions, device=device)
         record_component_elapsed(stats, "text_decode_position_store", start)
 
-    @staticmethod
-    def _advance_text_kv_lengths(text: Any, plan: ForwardPlan) -> None:
+    def _advance_text_kv_lengths(self, text: Any) -> None:
         if text.mode not in _TEXT_MODES:
             return
-        request_states = plan.runtime_handles.request_states
+        request_states = self.request_states
         if request_states is None:
             return
         for req_id, pos_range in zip(text.req_ids, text.pos_ranges, strict=True):
             request_states.get(int(req_id)).set_kv_length(int(pos_range[1]), lane="text")
 
-    @staticmethod
     def _sample_text(
-        plan: ForwardPlan, req_id: int, op: Any, logits: torch.Tensor
+        self, req_id: int, op: Any, logits: torch.Tensor
     ) -> dict[str, Any]:
-        request_states = plan.runtime_handles.request_states
+        request_states = self.request_states
         if request_states is not None:
             state = request_states.get(int(req_id))
             return sample_logits_result(req_id=int(req_id), state=state, logits=logits, op=op)
         token = int(torch.argmax(logits.float()).item())
         return {"req_id": int(req_id), "sampled_token_id": token}
 
-    def _apply_text_entries(self, plan: ForwardPlan, result: ForwardResult) -> dict[int, Any]:
+    def _apply_text_entries(
+        self,
+        plan: ForwardPlan,
+        result: ForwardResult,
+        options: ForwardExecutionOptions,
+    ) -> dict[int, Any]:
         entries = tuple(result.text_postprocess or ())
         if not entries:
             return {}
@@ -6260,7 +6062,7 @@ class ForwardPostprocessor:
             range(len(entries_by_index))
         ):
             raise invalid_descriptor("text postprocess logits indices must be contiguous")
-        request_states = plan.runtime_handles.request_states
+        request_states = self.request_states
         params: list[dict[str, Any]] = []
         recent: list[list[int] | tuple[int, ...]] = []
         allowed: list[list[int] | tuple[int, ...] | None] = []
@@ -6285,7 +6087,7 @@ class ForwardPostprocessor:
             allowed,
             suppress,
             generators=generators,
-            defer_cpu=bool(plan.runtime_handles.get("defer_text_cpu_results")),
+            defer_cpu=options.defer_text_cpu_results,
         )
         deferred: Any | None
         if is_deferred_sampling_result(sampling_result):
@@ -6418,8 +6220,12 @@ class ForwardPostprocessor:
             num_steps_done=denoise.step_index + 1,
         )
 
-    @staticmethod
-    def _apply_commit(plan: ForwardPlan, row_index: int, result: ForwardResult) -> CommitOutput:
+    def _apply_commit(
+        self,
+        plan: ForwardPlan,
+        row_index: int,
+        result: ForwardResult,
+    ) -> CommitOutput:
         row = plan.rows[row_index]
         if row.commit is None:
             raise invalid_descriptor("commit output slot references a non-commit row")
@@ -6427,9 +6233,7 @@ class ForwardPostprocessor:
             return CommitOutput(req_id=row.req_id)
         return _commit_output_from_value(
             int(row.req_id),
-            plan.runtime_handles.request_states.get(int(row.req_id))
-            if plan.runtime_handles.request_states is not None
-            else None,
+            self.request_states.get(int(row.req_id)) if self.request_states is not None else None,
             row.op,
             result.commit_outputs[int(row_index)],
         )
@@ -6482,11 +6286,6 @@ def _overlap_eligible(group: list[tuple[int, Mapping[str, Any]]]) -> bool:
     return all(mode_for_op(op["kind"]) in _STREAM_OVERLAP_MODES for _, op in group)
 
 
-@dataclass(frozen=True)
-class ForwardStepOptions:
-    defer_text_cpu_results: bool = False
-
-
 class ForwardGroupPlanner:
     """Plans one parsed worker step into executable op groups."""
 
@@ -6495,7 +6294,7 @@ class ForwardGroupPlanner:
         batch_policy: BatchPolicy,
         *,
         log_text_mixed_split: Callable[[list[Mapping[str, Any]], Any], None],
-        can_run_forward: Callable[[UniForwardBatch], bool] | None = None,
+        can_run_forward: Callable[[Sequence[Mapping[str, Any]]], bool] | None = None,
     ) -> None:
         self.batch_policy = batch_policy
         self._log_text_mixed_split = log_text_mixed_split
@@ -6508,8 +6307,7 @@ class ForwardGroupPlanner:
             forward_ops = [op for _index, op in forward_rows]
             decision = router.decide(forward_ops)
             if decision.use_forward:
-                batch = UniForwardBatch.from_ops(forward_ops)
-                if self._can_run_forward is None or self._can_run_forward(batch):
+                if self._can_run_forward is None or self._can_run_forward(forward_ops):
                     delegated_groups = self._mode_ordered_indexed_groups(delegated_rows)
                     return self._order_groups([*delegated_groups, forward_rows])
                 raise capability_mismatch(
@@ -6606,7 +6404,7 @@ class ForwardStepExecutor:
         self.runner = runner
         self.group_planner = group_planner
 
-    def execute(self, parsed: WireExecuteBatch, options: ForwardStepOptions) -> dict[str, Any]:
+    def execute(self, parsed: WireExecuteBatch, options: ForwardExecutionOptions) -> dict[str, Any]:
         forward_stats = ForwardStats() if env_flag("UNISERVE_FORWARD_METRICS") else None
         self.runner._register_new_reqs(parsed.new_reqs)
         ops = parsed.ops
@@ -6618,7 +6416,7 @@ class ForwardStepExecutor:
                 group,
                 results,
                 forward_stats=forward_stats,
-                defer_text_cpu_results=options.defer_text_cpu_results,
+                options=options,
             )
         if any(result is None for result in results):
             raise invalid_descriptor("runner missed at least one op result")
@@ -6633,32 +6431,36 @@ class ForwardStepExecutor:
         results: list[dict[str, Any] | None],
         *,
         forward_stats: ForwardStats | None,
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> None:
         indices = [idx for idx, _ in group]
-        fb = UniForwardBatch.from_ops([op for _, op in group])
-        with profile_range(f"uniserve.runner.group.{fb.mode.value}"):
+        mode = _summary_mode(tuple(mode_for_op(str(op["kind"])) for _, op in group))
+        with profile_range(f"uniserve.runner.group.{mode.value}"):
             self.runner._accountant.account_group(group)
+            plan = self.runner.forward_plan_builder.build(
+                group,
+                request_states=self.runner.request_states,
+                graph_policy=_graph_policy_for_mode(self.runner.forward_graph_policy, mode),
+            )
             if forward_stats is not None:
-                self.runner._record_group_shape(forward_stats, fb)
+                self.runner._record_group_shape(forward_stats, plan)
             ctx = ForwardContext(
                 attention_backend=self.runner.attention_backend,
                 attention_preference=self.runner.attention_preference,
                 stats=forward_stats,
             )
             group_start = time.perf_counter_ns() if forward_stats is not None else 0
-            stream_ctx = self.runner._forward_stream_context(fb)
+            stream_ctx = self.runner._forward_stream_context(plan)
             with torch.inference_mode(), use_forward_context(ctx), stream_ctx:
                 outputs = self._execute_unified_group(
-                    fb,
+                    plan,
                     group,
                     results,
-                    forward_stats=forward_stats,
-                    defer_text_cpu_results=defer_text_cpu_results,
+                    options=options,
                 )
             if forward_stats is not None:
                 forward_stats.record_mode_wall_time(
-                    fb.mode.value,
+                    mode.value,
                     time.perf_counter_ns() - group_start,
                 )
             if len(outputs) != len(group):
@@ -6670,70 +6472,50 @@ class ForwardStepExecutor:
 
     def _execute_unified_group(
         self,
-        fb: UniForwardBatch,
+        plan: ForwardPlan,
         group: list[tuple[int, Mapping[str, Any]]],
         results: list[dict[str, Any] | None],
         *,
-        forward_stats: ForwardStats | None,
-        defer_text_cpu_results: bool,
+        options: ForwardExecutionOptions,
     ) -> list[Any]:
         indices = [idx for idx, _ in group]
-
-        def normalize_output(output: Any) -> Any:
-            return _to_seq_result(output)
-
-        def postprocess_side_effects(group_results: list[Any]) -> None:
-            staged_results = list(results)
-            for idx, result in zip(indices, group_results):
-                staged_results[idx] = result
-            self.runner._advance_state(fb, group_results)
-            self.runner._stamp_conditioning_locators(fb, group, staged_results)
-            for row, idx in enumerate(indices):
-                group_results[row] = staged_results[idx]
-
-        runtime_handles = ForwardRuntimeHandles(
-            request_states=self.runner.request_states,
-            residency=self.runner.residency,
-            tensor_store=self.runner.tensor_store,
-            values={
-                "dispatch_batch": fb,
-                "defer_text_cpu_results": defer_text_cpu_results,
-                "defer_sampling": self.runner.defer_sampling,
-                "output_normalizer": normalize_output,
-                "postprocess_side_effects": postprocess_side_effects,
-            },
-        )
         device = torch.device(str(getattr(self.runner.model, "device", "cpu") or "cpu"))
 
-        def prepare() -> tuple[Any, Any]:
-            plan = self.runner.forward_plan_builder.build(
-                group,
-                request_states=self.runner.request_states,
-                graph_policy=_graph_policy_for_group(self.runner.forward_graph_policy, fb),
-                runtime_handles=runtime_handles,
-            )
-            return plan, self.runner.unified_forward_batch_builder.build(plan, device=device)
+        def prepare() -> ForwardBatch:
+            return self.runner.unified_forward_batch_builder.build(plan, device=device)
 
         overlap = getattr(self.runner, "plan_stream_overlap", None)
         if overlap is None or device.type != "cuda" or not _overlap_eligible(group):
             overlap = None
         prepared = overlap.prepare(prepare) if overlap is not None else None
-        plan, batch = prepared.value if prepared is not None else prepare()
+        batch = prepared.value if prepared is not None else prepare()
 
-        with self.runner.forward_adapter.bind(
-            dispatch_batch=fb,
-            group=group,
-            defer_text_cpu_results=defer_text_cpu_results,
-        ):
-            if overlap is not None and prepared is not None:
-                result = overlap.launch(
-                    prepared,
-                    lambda: self.runner.forward_executor.execute(batch, plan),
-                    retain=batch,
-                )
-            else:
-                result = self.runner.forward_executor.execute(batch, plan)
-        return self.runner.forward_postprocessor.apply(plan, result)
+        def execute_forward() -> ForwardResult:
+            return self.runner.forward_executor.execute(
+                batch,
+                plan,
+                options=options,
+                forward_fn=lambda current: self.runner.forward_adapter.forward(
+                    current,
+                    plan,
+                    options,
+                ),
+            )
+
+        if overlap is not None and prepared is not None:
+            result = overlap.launch(prepared, execute_forward, retain=batch)
+        else:
+            result = execute_forward()
+        group_results = [
+            _to_seq_result(output)
+            for output in self.runner.forward_postprocessor.apply(batch, plan, result, options)
+        ]
+        staged_results = list(results)
+        for index, item in zip(indices, group_results, strict=True):
+            staged_results[index] = item
+        self.runner._advance_state(plan, group_results)
+        self.runner._stamp_conditioning_locators(plan, staged_results)
+        return [staged_results[index] for index in indices]
 
 
 def _to_seq_result(output: ForwardOutput | Mapping[str, Any]) -> Any:
@@ -6746,8 +6528,8 @@ def _to_seq_result(output: ForwardOutput | Mapping[str, Any]) -> Any:
     raise invalid_descriptor(f"unsupported forward output type {type(output).__name__}")
 
 
-def _graph_policy_for_group(policy: Any, fb: UniForwardBatch) -> Any:
-    if getattr(fb, "mode", None) not in _GRAPH_SELECTION_DELEGATED_MODES:
+def _graph_policy_for_mode(policy: Any, mode: ForwardMode) -> Any:
+    if mode not in _GRAPH_SELECTION_DELEGATED_MODES:
         return policy
     if policy is None:
         return None
@@ -7027,17 +6809,18 @@ class ModelRunner:
             denoise_driver=self.denoise_driver,
             encode_driver=self.encode_driver,
             image_decode_driver=self.image_decode_driver,
-            defer_sampling=self.defer_sampling,
             tensor_store=self.tensor_store,
             mixed_proof_callback=self._log_mixed_proof if _MIXED_PROOF_ENABLED else None,
         )
         self.forward_executor = ForwardExecutor(
-            model=self.forward_adapter,
             graph_runner=self.forward_graph_runner,
             graph_policy=self.forward_graph_policy,
             fallback_recorder=self.forward_fallback_recorder,
         )
-        self.forward_postprocessor = ForwardPostprocessor()
+        self.forward_postprocessor = ForwardPostprocessor(
+            request_states=self.request_states,
+            tensor_store=self.tensor_store,
+        )
         self.plan_stream_overlap = self._maybe_build_plan_stream_overlap(device)
 
     def _maybe_build_plan_stream_overlap(self, device: torch.device):
@@ -7279,7 +7062,7 @@ class ModelRunner:
             logger.warning("StreamManager init failed; green contexts disabled", exc_info=True)
             return None
 
-    def _forward_stream_context(self, fb: UniForwardBatch):
+    def _forward_stream_context(self, plan: ForwardPlan):
         """Context manager that runs a single-mode group on its SM partition.
 
         Prefill/verify groups run on the prefill (large-SM) partition; decode
@@ -7291,11 +7074,11 @@ class ModelRunner:
 
         if self.stream_manager is None:
             return nullcontext()
-        mode = fb.mode
+        mode = plan.forward_mode
         if mode == ForwardMode.EXTEND or mode == ForwardMode.VERIFY_DRAFT:
             stream = self.stream_manager.select_streams(0)[0]
         elif mode == ForwardMode.DECODE:
-            stream = self.stream_manager.select_streams(len(fb.ops))[1]
+            stream = self.stream_manager.select_streams(plan.shape.row_count)[1]
         else:
             stream = self.stream_manager.default_stream()
         import torch
@@ -7316,7 +7099,10 @@ class ModelRunner:
         parsed = WireExecuteBatch.from_wire(batch)
         return self._step_executor.execute(
             parsed,
-            ForwardStepOptions(defer_text_cpu_results=defer_text_cpu_results),
+            ForwardExecutionOptions(
+                defer_text_cpu_results=defer_text_cpu_results,
+                defer_sampling=self.defer_sampling,
+            ),
         )
 
     def _register_new_reqs(self, new_reqs: tuple[Mapping[str, Any], ...]) -> None:
@@ -7340,8 +7126,7 @@ class ModelRunner:
 
     def _stamp_conditioning_locators(
         self,
-        fb: UniForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
+        plan: ForwardPlan,
         results: list[Any],
     ) -> None:
         """Mode A: stamp the und->gen conditioning locator on a text result that
@@ -7350,22 +7135,22 @@ class ModelRunner:
         Delegates the decision to the model's ``maybe_publish_conditioning`` hook
         (a no-op unless a data-plane handoff is bound). Only fires for text-decode
         results carrying an inline sampled token (the image-start trigger)."""
-        if fb.mode not in _TEXT_DRIVER_MODES:
+        if plan.forward_mode not in _TEXT_DRIVER_MODES:
             return
-        for idx, op in group:
-            result = results[idx]
+        for row in plan.rows:
+            result = results[row.original_index]
             if not isinstance(result, dict):
                 continue
             sampled = result.get("sampled_token_id")
             if sampled is None:
                 continue
-            locator = self.model.maybe_publish_conditioning(int(op["req_id"]), int(sampled))
+            locator = self.model.maybe_publish_conditioning(int(row.req_id), int(sampled))
             if locator:
                 result["locator"] = locator
 
     def _log_mixed_proof(
         self,
-        fb: UniForwardBatch,
+        fb: ForwardBatch,
         group: list[tuple[int, Mapping[str, Any]]],
     ) -> None:
         # Per-step "mixed forward executed" trace (opt-in via the proof flag).
@@ -7424,14 +7209,13 @@ class ModelRunner:
     def _model_caps(self) -> Caps | None:
         return self.model.caps() if isinstance(self.model, ModelHooks) else None
 
-    def _advance_state(self, fb: UniForwardBatch, results: list[Any]) -> None:
-        if fb.mode == ForwardMode.MIXED:
-            # Advance each op by its own mode; results align with ``fb.op_modes``.
-            for mode, result in zip(fb.op_modes, results):
+    def _advance_state(self, plan: ForwardPlan, results: list[Any]) -> None:
+        if plan.forward_mode == ForwardMode.MIXED:
+            for mode, result in zip(plan.op_modes, results, strict=True):
                 self._advance_op_state(mode, result)
             return
         for result in results:
-            self._advance_op_state(fb.mode, result)
+            self._advance_op_state(plan.forward_mode, result)
 
     def _advance_op_state(self, mode: ForwardMode, result: Any) -> None:
         if mode == ForwardMode.DENOISE:
@@ -7443,9 +7227,9 @@ class ModelRunner:
             req_id = int(result["req_id"])
             self._accountant.release_generation(req_id, committed=True)
 
-    def _record_group_shape(self, stats: ForwardStats, fb: UniForwardBatch) -> None:
-        if fb.mode is ForwardMode.MIXED:
-            for mode, op in zip(fb.op_modes, fb.ops):
+    def _record_group_shape(self, stats: ForwardStats, plan: ForwardPlan) -> None:
+        if plan.forward_mode is ForwardMode.MIXED:
+            for mode, op in zip(plan.op_modes, plan.ops, strict=True):
                 stats.record_mode_shape(
                     mode.value,
                     ops=1,
@@ -7453,9 +7237,9 @@ class ModelRunner:
                 )
             return
         stats.record_mode_shape(
-            fb.mode.value,
-            ops=len(fb.ops),
-            tokens=sum(self._op_token_count(op) for op in fb.ops),
+            plan.forward_mode.value,
+            ops=plan.shape.row_count,
+            tokens=sum(self._op_token_count(op) for op in plan.ops),
         )
 
     def _op_token_count(self, op: Mapping[str, Any]) -> int:

@@ -157,8 +157,7 @@ def test_core_kinds_roundtrip():
             }
         ],
     }
-    # execute is owned by handle() (the single instrumented path the host uses);
-    # dispatch() no longer carries a weaker shadow execute.
+    # Host execution enters through the instrumented server handle.
     runtime = WorkerServer(worker, ipc_endpoint=None)
     resp = runtime.handle({"kind": "execute", "batch": batch})
     assert resp["kind"] == "result"
@@ -274,8 +273,7 @@ def test_worker_error_wire_shape():
     assert wire["kind"] == "error"
     assert wire["code"] == "ModelExecutionError"
     assert wire["fatal"] is False
-    # Rich context stays local (logging/metrics); only the Invariant-A-audited
-    # fields modeled on the Rust WorkerResponse cross the wire.
+    # Rich context stays local; only fields modeled on WorkerResponse cross the wire.
     assert err.req_id == 3 and err.op_kind == "decode_und"
     assert set(wire) == {"kind", "code", "message", "retryable", "fatal"}
 

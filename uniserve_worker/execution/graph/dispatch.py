@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 
 from uniserve_worker.contracts.forward_batch import (
     ForwardBatch,
+    ForwardExecutionOptions,
     ForwardPlan,
     ForwardResult,
     GraphInfo,
@@ -46,7 +47,12 @@ class Path(ABC):
         return key(path=self.name(plan), batch=batch, plan=plan)
 
     @abstractmethod
-    def run(self, batch: ForwardBatch, plan: ForwardPlan) -> ForwardResult | None: ...
+    def run(
+        self,
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        options: ForwardExecutionOptions,
+    ) -> ForwardResult | None: ...
 
 
 class Dispatch:
@@ -64,6 +70,7 @@ class Dispatch:
         plan: ForwardPlan,
         *,
         allow_capture: bool = True,
+        options: ForwardExecutionOptions = ForwardExecutionOptions(),
     ) -> ForwardResult | None:
         ctx = get_forward_context()
         strict = bool(getattr(getattr(plan, "graph_policy", None), "strict", False))
@@ -76,7 +83,7 @@ class Dispatch:
                 continue
             capacity = path.capacity(batch, plan)
             with use_forward_context(replace(ctx, allow_capture=bool(allow_capture))):
-                result = path.run(batch, plan)
+                result = path.run(batch, plan, options)
             if result is None:
                 if strict:
                     logger.warning(

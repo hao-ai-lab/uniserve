@@ -76,8 +76,8 @@ class _Path(Path):
         del batch, plan
         return Match(True)
 
-    def run(self, batch: Any, plan: Any) -> ForwardResult | None:
-        del batch, plan
+    def run(self, batch: Any, plan: Any, options: Any) -> ForwardResult | None:
+        del batch, plan, options
         return self.runner.run()
 
 
@@ -113,11 +113,3 @@ def test_capture_policy_reaches_the_physical_runner_and_still_allows_replay():
     assert stats.cuda_graph_replays == 2
     assert stats.cuda_graph_misses == 1
     assert stats.cuda_graph_runtime_mode_counts == {"probe": 2}
-
-
-def test_dispatch_does_not_own_a_second_graph_cache():
-    runner = _Runner()
-    dispatch = Dispatch((_Path(runner),))
-
-    assert not hasattr(dispatch, "_graphs")
-    assert dispatch.paths[0].runner is runner

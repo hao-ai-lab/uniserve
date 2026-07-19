@@ -5,8 +5,12 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from uniserve_worker.contracts.batches import UniForwardBatch
-from uniserve_worker.contracts.forward_batch import ForwardBatch, ForwardPlan, ForwardResult
+from uniserve_worker.contracts.forward_batch import (
+    ForwardBatch,
+    ForwardExecutionOptions,
+    ForwardPlan,
+    ForwardResult,
+)
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.foundation.errors import invalid_descriptor
 
@@ -39,14 +43,20 @@ class Segment(Path):
             return Match(False, "segment executor is unavailable")
         return Match(True)
 
-    def run(self, batch: ForwardBatch, plan: ForwardPlan) -> ForwardResult | None:
-        del batch
+    def run(
+        self,
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        options: ForwardExecutionOptions,
+    ) -> ForwardResult | None:
         if self.executor is None or self.states is None:
             return None
         result = self.executor.run_segment_graph(
+            batch,
             plan,
             request_states=self.states,
             result_publisher=self.publisher,
+            options=options,
         )
         if result is not None and not isinstance(result, ForwardResult):
             raise invalid_descriptor("segment path must return a ForwardResult")
@@ -103,22 +113,23 @@ class Batch(Path):
             getattr(self.model, "try_run_graph_logits_batch", None)
         )
 
-    def run(self, batch: ForwardBatch, plan: ForwardPlan) -> ForwardResult | None:
-        del batch
+    def run(
+        self,
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        options: ForwardExecutionOptions,
+    ) -> ForwardResult | None:
         if not self._bound:
             return None
-        dispatch = plan.runtime_handles.get("dispatch_batch")
-        if not isinstance(dispatch, UniForwardBatch):
-            dispatch = UniForwardBatch.from_ops(plan.ops)
         forward = getattr(self.driver, "forward_graph_result", None)
         if callable(forward):
             result = forward(
-                dispatch,
+                batch,
                 self.states,
                 self.model,
                 graph_runner=self.executor,
-                defer_cpu_results=bool(plan.runtime_handles.get("defer_text_cpu_results", False)),
-                defer_sampling=bool(plan.runtime_handles.get("defer_sampling", False)),
+                defer_cpu_results=options.defer_text_cpu_results,
+                defer_sampling=options.defer_sampling,
             )
             if result is not None and not isinstance(result, ForwardResult):
                 raise invalid_descriptor("batch path must return a ForwardResult")
@@ -127,12 +138,12 @@ class Batch(Path):
         if not callable(forward):
             return None
         result = forward(
-            dispatch,
+            batch,
             self.states,
             self.model,
             graph_runner=self.executor,
-            defer_cpu_results=bool(plan.runtime_handles.get("defer_text_cpu_results", False)),
-            defer_sampling=bool(plan.runtime_handles.get("defer_sampling", False)),
+            defer_cpu_results=options.defer_text_cpu_results,
+            defer_sampling=options.defer_sampling,
         )
         if result is None:
             return None
@@ -182,8 +193,13 @@ class Flow(Path):
             and callable(getattr(self.driver, "forward_result", None))
         )
 
-    def run(self, batch: ForwardBatch, plan: ForwardPlan) -> ForwardResult | None:
-        del batch
+    def run(
+        self,
+        batch: ForwardBatch,
+        plan: ForwardPlan,
+        options: ForwardExecutionOptions,
+    ) -> ForwardResult | None:
+        del batch, options
         if not self._bound:
             return None
         forward = self.driver.forward_result

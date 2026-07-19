@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
 from uniserve_worker.contracts.batch_policy import BatchPolicy
-from uniserve_worker.contracts.batches import CfgBatch, UniForwardBatch
-from uniserve_worker.contracts.forward_mode import ForwardMode
+from uniserve_worker.contracts.batches import CfgBatch
+from uniserve_worker.contracts.forward_batch import ForwardBatch
+from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution.engine import (
@@ -18,7 +18,6 @@ from uniserve_worker.execution.engine import (
     RunnerConfig,
     text_input_id_replacements_from_relays,
 )
-from uniserve_worker.execution.graph.path import Batch, Flow, Segment
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.runtime.request_state import RequestStateTable
@@ -39,7 +38,7 @@ class RecordingModel(ModelHooks):
     def batch_policy(self) -> BatchPolicy:
         return self._policy
 
-    def forward(self, batch: UniForwardBatch) -> list[dict[str, Any]]:
+    def forward(self, batch: ForwardBatch) -> list[dict[str, Any]]:
         self.inference_modes.append(torch.is_inference_mode_enabled())
         kinds = [str(op["kind"]) for op in batch.ops]
         req_ids = [int(op["req_id"]) for op in batch.ops]
@@ -177,7 +176,7 @@ def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch()
     planner = ForwardGroupPlanner(
         BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),
         log_text_mixed_split=lambda _ops, _decision: None,
-        can_run_forward=lambda batch: batch.mode is not ForwardMode.MIXED,
+        can_run_forward=lambda ops: len({mode_for_op(op["kind"]) for op in ops}) == 1,
     )
     submitted = [
         {"req_id": 1, "kind": "prefill_und", "token_ids": [1]},
@@ -219,7 +218,7 @@ def test_runner_executes_whole_batch_forward_under_inference_mode():
 
 
 def test_model_execution_and_publication_groups_preserve_result_alignment():
-    model = ForwardHookModel(max_batch_ops=2)
+    model = RecordingModel(BatchPolicy(max_batch_ops=2, supports_mixed_modes=True))
     submitted = ops("decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und")
 
     result = execute(model, submitted)
@@ -234,7 +233,6 @@ def test_model_execution_and_publication_groups_preserve_result_alignment():
         ),
         (ForwardMode.COMMIT, [2], ["commit_gen"]),
     ]
-    assert model.forward_calls == []
 
 
 def test_non_thin_text_extend_decode_runs_as_unified_mixed_batch():
@@ -250,63 +248,11 @@ def test_non_thin_text_extend_decode_runs_as_unified_mixed_batch():
     ]
 
 
-def test_text_extend_decode_route_prefers_whole_batch_forward_over_legacy_hook():
-    model = ForwardHookModel(max_batch_ops=8)
-    submitted = [
-        {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [4, 5]},
-        {"req_id": 2, "kind": "prefill_und", "token_ids": [11, 12], "pos_range": [0, 2]},
-    ]
-
-    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 1, "block_ids": []}, {"req_id": 2, "block_ids": []}],
-            "ops": submitted,
-        }
-    )
-
-    assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
-    assert model.calls == [
-        (ForwardMode.MIXED, [1, 2], ["decode_und", "prefill_und"]),
-    ]
-    assert model.forward_calls == []
-
-
-def test_runner_dispatches_sequence_specialization_before_general_segment(monkeypatch):
-    class Model(ModelHooks):
-        device = "cpu"
-
-    graph_runner = object()
-
-    def fake_text_stack(self, model, residency):
-        del self, model, residency
-        return SimpleNamespace(builder=object(), gate=object(), graph_runner=graph_runner)
-
-    monkeypatch.setattr(ModelRunner, "_build_text_execution", fake_text_stack)
-
-    runner = ModelRunner(Model())
-
-    assert runner.forward_graph_policy.graph_selection_delegated is False
-    assert runner.forward_graph_policy.strict is True
-    assert runner.text_graph_runner is graph_runner
-    assert runner.text_driver.graph_runner is None
-    assert runner.forward_executor.graph_runner is runner.forward_graph_runner
-    assert runner.forward_graph_runner is not None
-    assert [type(path) for path in runner.forward_graph_runner.paths] == [
-        Batch,
-        Segment,
-        Flow,
-    ]
-    batch_path = runner.forward_graph_runner.paths[0]
-    assert batch_path.driver is runner.text_driver
-    assert batch_path.executor is graph_runner
-
-
 def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
     states = RequestStateTable()
     state = states.get(1)
     state.decode_relay.token_tensor = torch.tensor([7], dtype=torch.long)
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 1,
@@ -333,7 +279,7 @@ def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
 
 
 def test_forward_admission_separates_publication_rows_from_segment_batch():
-    model = ForwardHookModel(max_batch_ops=8)
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
     submitted = ops("decode_und", "denoise_gen", "commit_gen")
 
     result = execute(model, submitted)
@@ -343,7 +289,6 @@ def test_forward_admission_separates_publication_rows_from_segment_batch():
         (ForwardMode.MIXED, [1, 2], ["decode_und", "denoise_gen"]),
         (ForwardMode.COMMIT, [3], ["commit_gen"]),
     ]
-    assert model.forward_calls == []
 
 
 def test_system_speculative_verify_runs_over_thin_model_forward():
@@ -460,7 +405,7 @@ def test_per_op_last_sampled_token_source_requires_relay():
 
 
 def test_denoise_batch_constructs_cfg_batch_view():
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 3,
@@ -508,7 +453,7 @@ def test_text_tensor_stager_reuses_ring_slots_and_preserves_build_text_contract(
     assert grown.data_ptr() != a_ptr
 
     batch = stage_text_forward_batch(
-        UniForwardBatch.from_ops(
+        ForwardBatch.from_ops(
             [
                 {"req_id": 1, "kind": "prefill_und", "token_ids": [10, 11], "pos_range": [4, 6]},
                 {"req_id": 2, "kind": "prefill_und", "token_ids": [12], "pos_range": [9, 10]},
@@ -526,7 +471,7 @@ def test_text_tensor_stager_reuses_ring_slots_and_preserves_build_text_contract(
 
 
 def test_text_forward_batch_tracks_padded_token_bucket_contract():
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 1, "kind": "prefill_und", "token_ids": [10, 11], "pos_range": [4, 6]},
             {"req_id": 2, "kind": "prefill_und", "token_ids": [12], "pos_range": [9, 10]},
@@ -567,7 +512,7 @@ def test_attention_varlen_padding_helpers_keep_raw_tokens_only():
 
 
 def test_forward_batch_accepts_explicit_mixed_mode_view():
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [3, 4]},
             {"req_id": 2, "kind": "denoise_gen", "timestep_idx": 7},
@@ -584,7 +529,7 @@ def test_forward_batch_accepts_explicit_mixed_mode_view():
 
 
 def test_forward_batch_builds_explicit_mixed_text_view():
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {"req_id": 1, "kind": "decode_und", "token_ids": [10], "pos_range": [3, 4]},
             {"req_id": 2, "kind": "prefill_und", "token_ids": [11, 12], "pos_range": [0, 2]},
@@ -605,7 +550,7 @@ def test_forward_batch_builds_explicit_mixed_text_view():
 
 
 def test_target_verify_is_a_text_forward_mode():
-    batch = UniForwardBatch.from_ops(
+    batch = ForwardBatch.from_ops(
         [
             {
                 "req_id": 1,
@@ -642,7 +587,7 @@ def test_batch_policy_rejects_invalid_max_batch():
 
 def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
-    model = ForwardHookModel(max_batch_ops=4)
+    model = RecordingModel(BatchPolicy(max_batch_ops=4, supports_mixed_modes=True))
     runner = ModelRunner(model, config=RunnerConfig(simulation=True))
     result = runner.execute(
         {
@@ -672,75 +617,9 @@ def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     assert stats["attention_launches"] == 0
 
 
-class ForwardHookModel(RecordingModel):
-    def __init__(self, *, max_batch_ops: int = 8) -> None:
-        super().__init__(BatchPolicy(max_batch_ops=max_batch_ops, supports_mixed_modes=True))
-        self.forward_calls: list[list[str]] = []
-
-    def run_forward(self, batch, *, request_states, group):
-        del request_states, group
-        self.forward_calls.append([str(op["kind"]) for op in batch.ops])
-        return [
-            {"req_id": int(op["req_id"]), "kind": str(op["kind"]), "mode": batch.mode.value}
-            for op in batch.ops
-        ]
-
-
 @pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
 def test_text_denoise_route_uses_whole_batch_forward_unconditionally(text_kind):
-    model = ForwardHookModel(max_batch_ops=1)
-    submitted = ops(text_kind, "denoise_gen")
-
-    req_ids = sorted({int(op["req_id"]) for op in submitted})
-    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
-            "ops": submitted,
-        }
-    )
-
-    assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
-    assert model.calls == [
-        (ForwardMode.MIXED, [1, 2], [text_kind, "denoise_gen"]),
-    ]
-    assert model.forward_calls == []
-
-
-def test_mixed_adapter_whole_batch_forward_bypasses_legacy_deferred_hook():
-    class DeferredForwardHookModel(ForwardHookModel):
-        def __init__(self) -> None:
-            super().__init__()
-            self.defer_flags: list[bool] = []
-
-        def run_forward(self, batch, *, request_states, group, defer_text_cpu_results=False):
-            self.defer_flags.append(bool(defer_text_cpu_results))
-            return super().run_forward(batch, request_states=request_states, group=group)
-
-    model = DeferredForwardHookModel()
-    submitted = ops("decode_und", "denoise_gen")
-    req_ids = sorted({int(op["req_id"]) for op in submitted})
-
-    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
-            "ops": submitted,
-        },
-        defer_text_cpu_results=True,
-    )
-
-    assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]
-    assert model.calls == [
-        (ForwardMode.MIXED, [1, 2], ["decode_und", "denoise_gen"]),
-    ]
-    assert model.forward_calls == []
-    assert model.defer_flags == []
-
-
-@pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
-def test_text_denoise_forward_route_uses_unified_whole_batch_without_hook(text_kind):
-    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
+    model = RecordingModel(BatchPolicy(max_batch_ops=1, supports_mixed_modes=True))
     submitted = ops(text_kind, "denoise_gen")
 
     req_ids = sorted({int(op["req_id"]) for op in submitted})

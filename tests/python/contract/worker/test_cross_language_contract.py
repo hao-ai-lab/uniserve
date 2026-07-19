@@ -1,14 +1,4 @@
-"""Cross-language contract tests (Cluster J).
-
-Several Python constants must equal a Rust / FlatBuffers counterpart that today
-is held in sync only by prose comments ("MUST mirror", "INC-38"). These tests
-parse the canonical Rust/FlatBuffers sources and assert equality so drift fails
-the build instead of surfacing as a runtime mismatch.
-
-The tests skip (rather than fail) when the Rust sources are absent — e.g. a
-Python-only checkout/wheel — so they are meaningful in the full repo and inert
-elsewhere.
-"""
+"""Cross-language operation vocabulary contract."""
 from __future__ import annotations
 
 import re
@@ -33,7 +23,7 @@ def _camel_to_snake(name: str) -> str:
 
 
 def test_op_kind_vocabulary_matches_flatbuffers_schema():
-    """Python OP_KINDS == the worker.fbs OpKind enum (snake_cased) (C1/INC-38)."""
+    """Python operation kinds match the FlatBuffers wire vocabulary."""
     root = _repo_root()
     if root is None:
         pytest.skip("Rust crates not present in this checkout")

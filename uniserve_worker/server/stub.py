@@ -8,7 +8,7 @@ import numpy as np
 from PIL import Image
 
 from ..contracts.batch_policy import BatchPolicy
-from ..contracts.batches import UniForwardBatch
+from ..contracts.forward_batch import ForwardBatch
 from ..contracts.forward_mode import ForwardMode
 from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (
@@ -146,7 +146,7 @@ class StubUniModel(UniModelBase):
             max_batch_ops=self.max_batch_ops,
         )
 
-    def forward(self, batch: UniForwardBatch) -> list[ForwardOutput]:
+    def forward(self, batch: ForwardBatch) -> list[ForwardOutput]:
         self._executes += 1
         if self._die_after and self._executes > self._die_after:
             print("[worker] fault injection: dying abruptly", flush=True)
@@ -156,7 +156,7 @@ class StubUniModel(UniModelBase):
             raise RuntimeError(f"unsupported stub forward mode {batch.mode}")
         return handler(self, batch)
 
-    def _text(self, batch: UniForwardBatch) -> list[TextTokenOutput]:
+    def _text(self, batch: ForwardBatch) -> list[TextTokenOutput]:
         out = []
         for req_id in batch.as_text().req_ids:
             n = self.emitted.get(req_id, 0)
@@ -170,7 +170,7 @@ class StubUniModel(UniModelBase):
             out.append(TextTokenOutput(req_id=req_id, sampled_token_id=tok))
         return out
 
-    def _denoise(self, batch: UniForwardBatch) -> list[FlowOutput]:
+    def _denoise(self, batch: ForwardBatch) -> list[FlowOutput]:
         view = batch.as_denoise()
         out = []
         for req_id in view.req_ids:
@@ -180,7 +180,7 @@ class StubUniModel(UniModelBase):
             out.append(FlowOutput(req_id=req_id, denoise_done=step >= total, num_steps_done=step))
         return out
 
-    def _commit(self, batch: UniForwardBatch) -> list[CommitOutput]:
+    def _commit(self, batch: ForwardBatch) -> list[CommitOutput]:
         out = []
         for req_id in batch.as_commit().req_ids:
             self.steps.pop(req_id, None)
@@ -190,7 +190,7 @@ class StubUniModel(UniModelBase):
             out.append(CommitOutput(req_id=req_id, image_png_b64=png, image_hw=hw))
         return out
 
-    def _encode(self, batch: UniForwardBatch) -> list[EncodeOutput]:
+    def _encode(self, batch: ForwardBatch) -> list[EncodeOutput]:
         view = batch.as_encode()
         out = []
         for req_id, mm_hash in zip(view.req_ids, view.mm_hashes):

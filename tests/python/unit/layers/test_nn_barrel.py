@@ -1,10 +1,4 @@
-"""The lazy ``uniserve_worker.nn`` barrel must still resolve every public name.
-
-De-barreling the layer package (audit finding #20) replaced the eager submodule
-imports with a PEP 562 ``__getattr__``; this pins that every name advertised in
-``nn.__all__`` is still importable, so the lazy form cannot silently drop an
-export until some downstream model fails at runtime.
-"""
+"""Public ``uniserve_worker.nn`` exports resolve through the package API."""
 from __future__ import annotations
 
 import pytest
@@ -16,4 +10,4 @@ def test_every_nn_public_name_resolves():
     import uniserve_worker.nn as nn
 
     unresolved = [name for name in nn.__all__ if not hasattr(nn, name)]
-    assert unresolved == [], f"nn barrel exports that no longer resolve: {unresolved}"
+    assert unresolved == [], f"unresolvable nn exports: {unresolved}"

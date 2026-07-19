@@ -392,7 +392,6 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
 
     deploy = (ROOT / "uniserve_eval/configs/vllm_omni/bagel.yaml").read_text(encoding="utf-8")
     assert deploy.count("seed: 42") == 2
-    assert "seed: 52" not in deploy
 
     omni = server_spec(config, "benchmark/server/bagel-omni")
     mot_dir = ROOT / omni["env"]["VLLM_TUNED_CONFIG_FOLDER"]

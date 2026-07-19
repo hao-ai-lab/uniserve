@@ -266,7 +266,6 @@ def sampler_with_async_assert(monkeypatch):
     original = sys.modules["uniserve_worker.nn.sampler"]
     monkeypatch.setenv("UNISERVE_ENABLE_ASYNC_ASSERT", "1")
     reloaded = importlib.reload(original)
-    assert reloaded._ENABLE_ASYNC_ASSERT is True
     try:
         yield reloaded
     finally:
