@@ -2168,48 +2168,6 @@ def test_sensenova_packed_visible_fully_visible_uses_visible_end_backend():
     torch.testing.assert_close(pool.k[0, 1, :3], k[1:])
 
 
-def test_sensenova_admitted_forward_requires_whole_batch_graph(monkeypatch):
-    from uniserve_worker.contracts.forward_batch import ForwardBatch
-    from uniserve_worker.models.sensenova import model as sensenova_u1
-
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
-        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
-    )
-    batch = ForwardBatch.from_ops(
-        [
-            {"req_id": 1, "kind": "decode_und", "token_ids": [11], "pos_range": [0, 1]},
-            {"req_id": 2, "kind": "denoise_gen", "cfg": {"branch_count": 1}},
-        ]
-    )
-
-    class RequestStates:
-        def get(self, req_id):
-            return {"req_id": req_id}
-
-    monkeypatch.setattr(wrapper, "prepare_flow", lambda _state, _op: object())
-    monkeypatch.setattr(
-        wrapper.segment_executor,
-        "run_segment_forward_result",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        wrapper.segment_executor,
-        "run_segment_forward",
-        lambda *_args, **_kwargs: False,
-    )
-
-    def scalar_text_called(_op):
-        raise AssertionError("admitted mixed batch must stay whole")
-
-    monkeypatch.setattr(wrapper, "run_text_logits", scalar_text_called)
-    with pytest.raises(WorkerError, match="did not execute as one packed graph"):
-        wrapper._run_forward_adapter(
-            batch,
-            request_states=RequestStates(),
-            group=list(enumerate(batch.ops)),
-        )
-
-
 def test_sensenova_forward_text_input_ids_consumes_last_sampled_relay():
     relay_tensor = torch.tensor([7], dtype=torch.long)
     state = SimpleNamespace(decode_relay=SimpleNamespace(token_tensor=relay_tensor))

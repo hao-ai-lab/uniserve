@@ -74,18 +74,10 @@ class ModelOperationSet:
     def validate(self, model_cls: type) -> None:
         if not self.operations:
             return
-        if bool(getattr(model_cls, "whole_batch_forward", False)):
-            if not callable(getattr(model_cls, "forward", None)):
-                raise capability_mismatch(
-                    f"{model_cls.__name__} declares a whole-batch forward but has no forward()"
-                )
-            return
-        for operation in self.operations:
-            if not callable(getattr(model_cls, operation.adapter_method, None)):
-                raise capability_mismatch(
-                    f"{model_cls.__name__} declares op {operation.kind!r} but does not implement "
-                    f"{operation.adapter_method}()"
-                )
+        if not callable(getattr(model_cls, "forward", None)):
+            raise capability_mismatch(
+                f"{model_cls.__name__} declares model operations but has no forward()"
+            )
 
 
 @dataclass(frozen=True)

@@ -10,7 +10,7 @@ import torch
 from uniserve_worker.contracts.batch_policy import BatchPolicy
 from uniserve_worker.contracts.batches import CfgBatch
 from uniserve_worker.contracts.forward_batch import ForwardBatch
-from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
+from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution import ModelRunner, RunnerConfig
@@ -25,7 +25,6 @@ pytestmark = pytest.mark.unit
 
 class RecordingModel(ModelHooks):
     resource_classes: tuple[str, ...] = ()
-    whole_batch_forward = True
 
     def __init__(self, policy: BatchPolicy) -> None:
         self._policy = policy
@@ -44,24 +43,6 @@ class RecordingModel(ModelHooks):
             {"req_id": int(op["req_id"]), "kind": str(op["kind"]), "mode": batch.mode.value}
             for op in batch.ops
         ]
-
-
-class RecordingEncodeCapabilityModel(RecordingModel):
-    def __init__(self) -> None:
-        super().__init__(BatchPolicy(max_batch_ops=4, supports_mixed_modes=False))
-        self.encode_ops: list[str] = []
-
-    def encode_image(self, pixels=None, grid=None, *, op: dict[str, Any]) -> dict[str, Any]:
-        del pixels, grid
-        self.encode_ops.append(str(op["kind"]))
-        return {
-            "req_id": int(op["req_id"]),
-            "encoder_handle": 1000 + int(op["req_id"]),
-            "num_tokens": 3,
-        }
-
-    def encode_latents(self, pixels=None, grid=None, *, op: dict[str, Any]) -> dict[str, Any]:
-        return self.encode_image(pixels, grid, op=op)
 
 
 class ThinCPUTextModel(ModelHooks):
@@ -97,14 +78,16 @@ class ThinCPUTextModel(ModelHooks):
     def batch_policy(self) -> BatchPolicy:
         return BatchPolicy(max_batch_ops=8, supports_mixed_modes=True)
 
-    def forward(self, input_ids, positions, forward_batch):
-        del positions
-        flat = input_ids.reshape(-1)
+    def forward_text(self, forward_batch):
+        flat = forward_batch.input_ids.reshape(-1)
         self.input_values.append([int(token) for token in flat.tolist()])
         self.input_ptrs.append(int(flat.data_ptr()))
         if forward_batch.forward_mode == ForwardMode.VERIFY_DRAFT:
             # Per-position logits [batch, length, vocab] with a fixed argmax (7).
-            batch, length = int(input_ids.shape[0]), int(input_ids.shape[1])
+            batch, length = (
+                int(forward_batch.input_ids.shape[0]),
+                int(forward_batch.input_ids.shape[1]),
+            )
             logits = torch.full((batch, length, 16), -1000.0)
             logits[:, :, 7] = 1000.0
             return logits
@@ -152,61 +135,17 @@ def execute(model: RecordingModel, submitted_ops: list[dict[str, Any]]) -> dict[
     )
 
 
-def test_strict_policy_preserves_contiguous_order_and_splits_by_max_batch():
+def test_runner_rejects_an_oversized_batch_without_partial_model_execution():
     model = RecordingModel(BatchPolicy(max_batch_ops=2, supports_mixed_modes=False))
     submitted = ops("prefill_und", "prefill_und", "prefill_und", "decode_und", "prefill_und")
 
-    result = execute(model, submitted)
+    with pytest.raises(WorkerError, match="maximum operation count"):
+        execute(model, submitted)
 
-    assert [r["kind"] for r in result["per_seq"]] == [op["kind"] for op in submitted]
-    assert model.calls == [
-        (ForwardMode.EXTEND, [1, 2], ["prefill_und", "prefill_und"]),
-        (ForwardMode.EXTEND, [3], ["prefill_und"]),
-        (ForwardMode.DECODE, [4], ["decode_und"]),
-        (ForwardMode.EXTEND, [5], ["prefill_und"]),
-    ]
+    assert model.calls == []
 
 
-def test_mixed_admission_fails_when_the_model_adapter_cannot_execute_the_batch():
-    from uniserve_worker.execution.runner import ForwardGroupPlanner
-
-    planner = ForwardGroupPlanner(
-        BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),
-        log_text_mixed_split=lambda _ops, _decision: None,
-        can_run_forward=lambda ops: len({mode_for_op(op["kind"]) for op in ops}) == 1,
-    )
-    submitted = [
-        {"req_id": 1, "kind": "prefill_und", "token_ids": [1]},
-        {"req_id": 2, "kind": "denoise_gen", "latent_shape": [2, 2]},
-        {"req_id": 3, "kind": "prefill_und", "token_ids": [2]},
-        {"req_id": 4, "kind": "denoise_gen", "latent_shape": [2, 2]},
-    ]
-
-    with pytest.raises(WorkerError, match="admitted segment group has no whole-batch executor"):
-        planner.groups(submitted)
-
-
-def test_mixed_planner_peels_encode_rows_and_keeps_text_denoise_packed():
-    from uniserve_worker.execution.runner import ForwardGroupPlanner
-
-    planner = ForwardGroupPlanner(
-        BatchPolicy(max_batch_ops=8, supports_mixed_modes=True),
-        log_text_mixed_split=lambda _ops, _decision: None,
-        can_run_forward=lambda _batch: True,
-    )
-    submitted = [
-        {"req_id": 1, "kind": "decode_und", "token_ids": [1]},
-        {"req_id": 2, "kind": "vit_encode"},
-        {"req_id": 3, "kind": "denoise_gen", "latent_shape": [2, 2]},
-        {"req_id": 4, "kind": "prefill_und", "token_ids": [2]},
-    ]
-
-    groups = planner.groups(submitted)
-
-    assert [[index for index, _op in group] for group in groups] == [[1], [0, 2, 3]]
-
-
-def test_runner_executes_whole_batch_forward_under_inference_mode():
+def test_runner_executes_model_forward_under_inference_mode():
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
 
     execute(model, ops("prefill_und"))
@@ -214,8 +153,8 @@ def test_runner_executes_whole_batch_forward_under_inference_mode():
     assert model.inference_modes == [True]
 
 
-def test_model_execution_and_publication_groups_preserve_result_alignment():
-    model = RecordingModel(BatchPolicy(max_batch_ops=2, supports_mixed_modes=True))
+def test_complete_mixed_batch_preserves_result_alignment_in_one_model_call():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
     submitted = ops("decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und")
 
     result = execute(model, submitted)
@@ -225,10 +164,9 @@ def test_model_execution_and_publication_groups_preserve_result_alignment():
     assert model.calls == [
         (
             ForwardMode.MIXED,
-            [1, 3, 4, 5],
-            ["decode_und", "denoise_gen", "prefill_und", "decode_und"],
+            [1, 2, 3, 4, 5],
+            ["decode_und", "commit_gen", "denoise_gen", "prefill_und", "decode_und"],
         ),
-        (ForwardMode.COMMIT, [2], ["commit_gen"]),
     ]
 
 
@@ -275,16 +213,15 @@ def test_mixed_text_build_replaces_last_sampled_placeholder_from_relay():
     assert flat.positions.tolist() == [3, 0, 1]
 
 
-def test_forward_admission_separates_publication_rows_from_segment_batch():
+def test_publication_and_neural_rows_share_one_complete_model_batch():
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
     submitted = ops("decode_und", "denoise_gen", "commit_gen")
 
     result = execute(model, submitted)
 
-    assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed", "commit"]
+    assert [r["mode"] for r in result["per_seq"]] == ["mixed", "mixed", "mixed"]
     assert model.calls == [
-        (ForwardMode.MIXED, [1, 2], ["decode_und", "denoise_gen"]),
-        (ForwardMode.COMMIT, [3], ["commit_gen"]),
+        (ForwardMode.MIXED, [1, 2, 3], ["decode_und", "denoise_gen", "commit_gen"]),
     ]
 
 
@@ -566,17 +503,6 @@ def test_target_verify_is_a_text_forward_mode():
     torch.testing.assert_close(built.positions, torch.tensor([4, 5, 6], dtype=torch.long))
 
 
-def test_encode_driver_handles_encode_mode_before_model_forward():
-    model = RecordingEncodeCapabilityModel()
-    submitted = [{"req_id": 7, "kind": "vit_encode", "mm_hash": 9}]
-
-    result = execute(model, submitted)
-
-    assert result["per_seq"] == [{"req_id": 7, "encoder_handle": 1007, "num_tokens": 3}]
-    assert model.encode_ops == ["vit_encode"]
-    assert model.calls == []
-
-
 def test_batch_policy_rejects_invalid_max_batch():
     with pytest.raises(Exception, match="max_batch_ops"):
         BatchPolicy(max_batch_ops=0)
@@ -615,8 +541,8 @@ def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
 
 
 @pytest.mark.parametrize("text_kind", ["decode_und", "prefill_und"])
-def test_text_denoise_route_uses_whole_batch_forward_unconditionally(text_kind):
-    model = RecordingModel(BatchPolicy(max_batch_ops=1, supports_mixed_modes=True))
+def test_text_denoise_route_uses_one_complete_batch_forward(text_kind):
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=True))
     submitted = ops(text_kind, "denoise_gen")
 
     req_ids = sorted({int(op["req_id"]) for op in submitted})

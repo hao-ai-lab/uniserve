@@ -4,37 +4,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.graph.path import Segment
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig
 from uniserve_worker.nn.decoder import Modality, MoTModel
 
 pytestmark = pytest.mark.unit
-
-
-@pytest.mark.parametrize(
-    "ops",
-    [
-        [{"req_id": 1, "kind": "prefill_und"}],
-        [{"req_id": 1, "kind": "decode_und"}],
-        [{"req_id": 1, "kind": "denoise_gen"}],
-        [
-            {"req_id": 1, "kind": "decode_und"},
-            {"req_id": 2, "kind": "denoise_gen"},
-        ],
-    ],
-)
-def test_bagel_binds_segment_graph_program_for_any_active_composition(ops):
-    owner = BagelForUnifiedGeneration(device="cpu")
-    program = Segment(executor=owner.segment_executor, states=object())
-    plan = SimpleNamespace(
-        shape=SimpleNamespace(segment_count=len(ops)),
-        ops=ops,
-    )
-
-    match = program.match(SimpleNamespace(), plan)
-
-    assert match.accepted is True
 
 
 def test_bagel_denoise_rejects_eager_execution(monkeypatch):

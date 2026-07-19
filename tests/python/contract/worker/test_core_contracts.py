@@ -230,10 +230,6 @@ class CommitCapabilityModel(ModelHooks):
         state.schedule_cursor = 7
         return {"req_id": req_id, "image_hw": [8, 8]}
 
-    def forward(self, batch):  # pragma: no cover - commit must not route here
-        raise AssertionError("commit should be owned by ImageDecodeDriver")
-
-
 def test_runner_commit_uses_decode_image_capability_and_resets_state():
     model = CommitCapabilityModel()
     runner = ModelRunner(model, config=RunnerConfig(simulation=True))
@@ -265,11 +261,7 @@ class CommitLogitsCapabilityModel(ModelHooks):
             "logits": torch.tensor([0.0, 2.0, 1.0], dtype=torch.float32),
         }
 
-    def forward(self, batch):  # pragma: no cover - commit must not route here
-        raise AssertionError("commit should be owned by ImageDecodeDriver")
-
-
-def test_runner_commit_samples_logits_in_image_decode_driver():
+def test_runner_commit_samples_model_logits():
     runner = ModelRunner(
         CommitLogitsCapabilityModel(),
         config=RunnerConfig(simulation=True),
@@ -343,10 +335,9 @@ class ThinTextModel(ModelHooks):
 
         return KvCacheSpec(num_layers=1, num_kv_heads=1, head_dim=4, dtype=torch.float32)
 
-    def forward(self, input_ids, positions, forward_batch):
+    def forward_text(self, forward_batch):
         from uniserve_worker.contracts.forward_context import get_forward_context
 
-        del input_ids, positions
         self.context_plan = get_forward_context().attention_plan
         self.seen_req_ids = forward_batch.req_ids
         batch = forward_batch.batch_size

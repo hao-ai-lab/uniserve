@@ -88,9 +88,6 @@ class StubUniModel(UniModelBase):
         image_latent=LatentTokens(downsample=16),
         scratch=PerBranch(),
     )
-    # GPU-free output-level fake: dispatch the whole batch through one forward(fb)
-    # (no system pools/compute to drive per-mode). See ModelRunner._whole_batch_forward.
-    whole_batch_forward = True
     num_layers = STUB_NUM_LAYERS
     max_latent_size = STUB_MAX_LATENT_SIZE
     latent_downsample = STUB_LATENT_DOWNSAMPLE
@@ -153,8 +150,18 @@ class StubUniModel(UniModelBase):
             os._exit(1)
         handler = self._FORWARD_BY_MODE.get(batch.mode)
         if handler is None:
-            raise RuntimeError(f"unsupported stub forward mode {batch.mode}")
+            return self._mixed(batch)
         return handler(self, batch)
+
+    def _mixed(self, batch: ForwardBatch) -> list[ForwardOutput]:
+        outputs: list[ForwardOutput] = []
+        for op in batch.ops:
+            row = ForwardBatch.from_ops([op])
+            handler = self._FORWARD_BY_MODE.get(row.mode)
+            if handler is None:
+                raise RuntimeError(f"unsupported stub forward mode {row.mode}")
+            outputs.extend(handler(self, row))
+        return outputs
 
     def _text(self, batch: ForwardBatch) -> list[TextTokenOutput]:
         out = []

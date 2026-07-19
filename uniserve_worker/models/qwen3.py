@@ -376,7 +376,7 @@ class Qwen3Model(nn.Module):
 
 
 class Qwen3ForCausalLM(UniModelBase, nn.Module):
-    """Qwen3 serving model — thin: forward(input_ids, positions, forward_batch)."""
+    """Qwen3 serving model with a thin tensor-level text core."""
 
     family = "qwen3"
     architectures = ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM")
@@ -499,14 +499,7 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         return self.model.embed_tokens(input_ids)
 
     @torch.inference_mode()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: "ForwardBatch",
-        *,
-        input_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward_text(self, forward_batch: "ForwardBatch") -> torch.Tensor:
         """Run the decoder and return sampling logits for ``forward_batch``.
 
         The attention plan + paged residency are resolved from the published
@@ -515,7 +508,11 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         token per row for extend/decode, or per-position logits for verify.
         """
 
-        hidden = self.model(input_ids, positions, forward_batch, input_embeds=input_embeds)
+        input_ids = forward_batch.input_ids
+        positions = forward_batch.positions
+        if input_ids is None or positions is None:
+            raise RuntimeError("Qwen3 text forward requires input ids and positions")
+        hidden = self.model(input_ids, positions, forward_batch)
         return self.compute_logits(hidden, forward_batch)
 
     def compute_logits(self, hidden: torch.Tensor, forward_batch: "ForwardBatch") -> torch.Tensor:

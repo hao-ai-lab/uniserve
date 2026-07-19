@@ -206,7 +206,7 @@ class Executor:
             positions=state.positions,
             attn_plan=state.plan,
         )
-        return model.forward(state.input_ids, state.positions, fb)
+        return model.forward_text(fb)
 
     def _span_forward(self, model: Any, state: SpanState) -> "torch.Tensor":
         fb = ForwardBatch(
@@ -217,7 +217,7 @@ class Executor:
             last_token_indices=state.last_token_indices,
             attn_plan=state.plan,
         )
-        return model.forward(state.input_ids, state.positions, fb)
+        return model.forward_text(fb)
 
     # ---- prefill bucket padding + warmup ------------------------------------
 

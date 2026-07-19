@@ -214,9 +214,8 @@ class _LinearLogitsModel:
         x = self.emb[input_ids.reshape(-1)] + positions.reshape(-1, 1).float()
         return x @ self.proj.t()
 
-    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor, fb) -> torch.Tensor:
-        del fb
-        return self.logits(input_ids, positions)
+    def forward_text(self, fb: ForwardBatch) -> torch.Tensor:
+        return self.logits(fb.input_ids, fb.positions)
 
     def query_geometry(self) -> tuple[int, float, torch.dtype]:
         # Plausible query geometry matching the test pool; the fake forward
@@ -1520,7 +1519,7 @@ def test_text_graph_runner_decode_replay_matches_eager_forward():
         positions=positions,
         attn_plan=plan,
     )
-    reference = model.forward(input_ids, positions, fb)
+    reference = model.forward_text(fb)
 
     stats = ForwardStats()
     out = runner.maybe_run(model, input_ids, positions, fb, ForwardContext(stats=stats))

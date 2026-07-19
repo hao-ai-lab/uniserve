@@ -97,7 +97,7 @@ def test_model_worker_rejects_declared_missing_control():
         raise AssertionError("missing control declaration should fail at startup")
 
 
-def test_registry_rejects_declared_op_without_runner_capability():
+def test_registry_rejects_declared_operations_without_forward():
     from uniserve_worker.models.registry import ModelRegistry
 
     class BadDenoiseModel:
@@ -106,7 +106,7 @@ def test_registry_rejects_declared_op_without_runner_capability():
     with pytest.raises(WorkerError) as exc:
         ModelRegistry().register(BadDenoiseModel, names=("bad",))
     assert exc.value.code == ErrorCode.CAPABILITY_MISMATCH
-    assert "predict_velocity" in exc.value.message
+    assert "forward" in exc.value.message
 
 
 def test_model_import_isolation_warns_and_continues(monkeypatch, caplog):
