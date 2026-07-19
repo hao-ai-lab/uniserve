@@ -1,4 +1,5 @@
 """Provider packs backed by existing in-tree kernels."""
+
 from __future__ import annotations
 
 import logging
@@ -226,6 +227,40 @@ def rms_norm_dispatcher():
     )
 
 
+def select_rms_norm_kernel(
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    override: str | None = None,
+):
+    """Bind the best RMSNorm kernel for a placed module parameter."""
+
+    providers = rms_norm_dispatcher().ordered(override)
+    eager = next(provider for provider in providers if provider.name == "eager")
+    prototype = torch.empty(
+        (1, int(weight.numel())),
+        dtype=weight.dtype,
+        device=weight.device,
+    )
+    with torch.inference_mode():
+        selected = next(
+            provider
+            for provider in providers
+            if provider.can_run(RmsNormReq(prototype, weight, float(eps)))
+        )
+    selected_kernel = selected._kernel
+    eager_kernel = eager._kernel
+    if selected is eager:
+        return eager_kernel.run
+
+    def run(hidden_states: torch.Tensor, current_weight: torch.Tensor, current_eps: float):
+        if selected_kernel.is_eligible(hidden_states, current_weight, current_eps):
+            return selected_kernel.run(hidden_states, current_weight, current_eps)
+        return eager_kernel.run(hidden_states, current_weight, current_eps)
+
+    return run
+
+
 @lru_cache(maxsize=1)
 def add_rms_norm_dispatcher():
     n = import_module("uniserve_worker.nn.norm")
@@ -282,9 +317,13 @@ class _TritonQKNormProvider:
             return False
         if isinstance(req.q_weight, tuple) or isinstance(req.k_weight, tuple):
             return False
-        can_run_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").can_run_triton_qk_rms_norm
+        can_run_triton_qk_rms_norm = import_module(
+            "uniserve_worker.nn.norm"
+        ).can_run_triton_qk_rms_norm
 
-        return bool(can_run_triton_qk_rms_norm(req.q, req.k, req.q_weight, req.k_weight, req.eps, req.eps))
+        return bool(
+            can_run_triton_qk_rms_norm(req.q, req.k, req.q_weight, req.k_weight, req.eps, req.eps)
+        )
 
     def run(self, req: QKNormReq):
         if req.axis_dims is not None:
@@ -373,7 +412,9 @@ class _TritonQKNormRopeProvider:
             return False
         if req.position_ids is not None or req.unsqueeze_dim != 1:
             return False
-        can_run_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").can_run_triton_qk_rms_norm_rope
+        can_run_triton_qk_rms_norm_rope = import_module(
+            "uniserve_worker.nn.rope"
+        ).can_run_triton_qk_rms_norm_rope
 
         return bool(
             can_run_triton_qk_rms_norm_rope(
@@ -392,10 +433,16 @@ class _TritonQKNormRopeProvider:
         if req.axis_dims is not None:
             return self._run_multi_axis(req)
         if isinstance(req.q_weight, tuple) or isinstance(req.cos, tuple):
-            raise RuntimeError("triton qk_norm_rope only handles single-axis requests without axis_dims")
-        try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
+            raise RuntimeError(
+                "triton qk_norm_rope only handles single-axis requests without axis_dims"
+            )
+        try_triton_qk_rms_norm_rope = import_module(
+            "uniserve_worker.nn.rope"
+        ).try_triton_qk_rms_norm_rope
 
-        out = try_triton_qk_rms_norm_rope(req.q, req.k, req.q_weight, req.k_weight, req.cos, req.sin, req.eps, req.eps)
+        out = try_triton_qk_rms_norm_rope(
+            req.q, req.k, req.q_weight, req.k_weight, req.cos, req.sin, req.eps, req.eps
+        )
         if out is None:
             raise RuntimeError("triton qk_norm_rope became ineligible")
         return out
@@ -416,8 +463,7 @@ class _TritonQKNormRopeProvider:
         if req.identity_axes is None or axis_dims is None or len(axis_dims) < 2:
             return None
         if not all(
-            isinstance(value, tuple)
-            for value in (req.q_weight, req.k_weight, req.cos, req.sin)
+            isinstance(value, tuple) for value in (req.q_weight, req.k_weight, req.cos, req.sin)
         ):
             return None
         if tuple(req.identity_axes) != tuple(range(1, len(axis_dims))):
@@ -467,8 +513,7 @@ class _TritonQKNormRopeProvider:
         if axis_dims is None or len(axis_dims) != 3:
             return None
         if not all(
-            isinstance(value, tuple)
-            for value in (req.q_weight, req.k_weight, req.cos, req.sin)
+            isinstance(value, tuple) for value in (req.q_weight, req.k_weight, req.cos, req.sin)
         ):
             return None
         if req.q.ndim != 3 or req.k.ndim != 3:
@@ -510,7 +555,11 @@ class _TritonQKNormRopeProvider:
         # Multi-axis callers may pass [batch, heads, seq, dim]. Existing Triton
         # norm/RoPE kernels operate on [tokens, heads, dim], so flatten
         # batch*seq tokens.
-        flat = x.permute(0, 2, 1, 3).contiguous().reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3])
+        flat = (
+            x.permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(x.shape[0] * x.shape[2], x.shape[1], x.shape[3])
+        )
         return flat, tuple(x.shape), True
 
     @staticmethod
@@ -534,7 +583,9 @@ class _TritonQKNormRopeProvider:
         return self._flatten_heads(self._axis_group(x, axis_dims, start_axis, end_axis))
 
     @staticmethod
-    def _unflatten_heads(x: torch.Tensor, shape: tuple[int, ...], was_flattened: bool) -> torch.Tensor:
+    def _unflatten_heads(
+        x: torch.Tensor, shape: tuple[int, ...], was_flattened: bool
+    ) -> torch.Tensor:
         if not was_flattened:
             return x
         batch, heads, seq_len, dim = shape
@@ -542,7 +593,11 @@ class _TritonQKNormRopeProvider:
 
     @staticmethod
     def _can_repeat_rope(cos: torch.Tensor, tokens: int) -> bool:
-        return cos.ndim == 2 and int(cos.shape[0]) > 0 and (tokens % int(cos.shape[0]) == 0 or int(cos.shape[0]) % tokens == 0)
+        return (
+            cos.ndim == 2
+            and int(cos.shape[0]) > 0
+            and (tokens % int(cos.shape[0]) == 0 or int(cos.shape[0]) % tokens == 0)
+        )
 
     @staticmethod
     def _align_rope_table(table: torch.Tensor, tokens: int) -> torch.Tensor:
@@ -559,7 +614,9 @@ class _TritonQKNormRopeProvider:
         if req.position_ids is not None or req.unsqueeze_dim != 1:
             return False
         try:
-            plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(req)
+            plan = import_module(
+                "uniserve_worker.ops.qk_norm_rope_plan"
+            ).QKNormRopePlan.from_request(req)
         except RuntimeError:
             return False
         if req.q.ndim not in (3, 4) or req.k.ndim not in (3, 4):
@@ -623,7 +680,9 @@ class _TritonQKNormRopeProvider:
         return 0
 
     @staticmethod
-    def _rope_table_shape_matches(cos: torch.Tensor, sin: torch.Tensor, tokens: int, axis_dim: int) -> bool:
+    def _rope_table_shape_matches(
+        cos: torch.Tensor, sin: torch.Tensor, tokens: int, axis_dim: int
+    ) -> bool:
         return (
             cos.ndim == 2
             and sin.shape == cos.shape
@@ -725,9 +784,13 @@ class _TritonQKNormRopeProvider:
             return fused
         out_q = []
         out_k = []
-        plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(req)
+        plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(
+            req
+        )
         try_triton_qk_rms_norm = import_module("uniserve_worker.nn.norm").try_triton_qk_rms_norm
-        try_triton_qk_rms_norm_rope = import_module("uniserve_worker.nn.rope").try_triton_qk_rms_norm_rope
+        try_triton_qk_rms_norm_rope = import_module(
+            "uniserve_worker.nn.rope"
+        ).try_triton_qk_rms_norm_rope
         packed_rope = import_module("uniserve_worker.nn.rope")._TritonPackedRope()
         for group in plan.groups:
             q_group, q_shape, q_was_flattened = self._flatten_axis_group(
@@ -768,9 +831,11 @@ class _TritonQKNormRopeProvider:
                 if out is None:
                     raise RuntimeError("triton multi-axis qk_norm became ineligible")
                 q_normed, k_normed = out
-                q_normed_parts = q_normed.split(plan.axis_dims[group.start:group.end], dim=-1)
-                k_normed_parts = k_normed.split(plan.axis_dims[group.start:group.end], dim=-1)
-                for local, (q_normed_part, k_normed_part) in enumerate(zip(q_normed_parts, k_normed_parts, strict=True)):
+                q_normed_parts = q_normed.split(plan.axis_dims[group.start : group.end], dim=-1)
+                k_normed_parts = k_normed.split(plan.axis_dims[group.start : group.end], dim=-1)
+                for local, (q_normed_part, k_normed_part) in enumerate(
+                    zip(q_normed_parts, k_normed_parts, strict=True)
+                ):
                     axis = group.start + local
                     cos = plan.cos_tables[axis]
                     sin = plan.sin_tables[axis]
@@ -800,14 +865,20 @@ class _EagerQKNormRopeProvider:
 
     @staticmethod
     def _validate_multi_axis(req: QKNormRopeReq) -> None:
-        import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.validate_multi_axis(req)
+        import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.validate_multi_axis(
+            req
+        )
 
     @staticmethod
     def _shared_norm_group_end(req: QKNormReq | QKNormRopeReq, start: int) -> int:
-        return import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.shared_norm_group_end(req, start)
+        return import_module(
+            "uniserve_worker.ops.qk_norm_rope_plan"
+        ).QKNormRopePlan.shared_norm_group_end(req, start)
 
     @staticmethod
-    def _apply_rope_axis(q_normed, k_normed, cos, sin, *, apply_rotary_pos_emb, apply_rotary_emb, unsqueeze_dim):
+    def _apply_rope_axis(
+        q_normed, k_normed, cos, sin, *, apply_rotary_pos_emb, apply_rotary_emb, unsqueeze_dim
+    ):
         if q_normed.ndim == 4 and cos.ndim == 2:
             dim = int(q_normed.shape[-1])
             if dim % 2:
@@ -830,8 +901,14 @@ class _EagerQKNormRopeProvider:
 
                 def rotate_full(x):
                     out = torch.empty_like(x)
-                    out[..., :half] = x[..., :half] * cos_view[..., :half] - x[..., half:dim] * sin_view[..., :half]
-                    out[..., half:dim] = x[..., half:dim] * cos_view[..., half:dim] + x[..., :half] * sin_view[..., half:dim]
+                    out[..., :half] = (
+                        x[..., :half] * cos_view[..., :half]
+                        - x[..., half:dim] * sin_view[..., :half]
+                    )
+                    out[..., half:dim] = (
+                        x[..., half:dim] * cos_view[..., half:dim]
+                        + x[..., :half] * sin_view[..., half:dim]
+                    )
                     if dim % 2:
                         out[..., -1:] = x[..., -1:]
                     return out
@@ -853,15 +930,17 @@ class _EagerQKNormRopeProvider:
         return apply_rotary_emb(q_normed, cos, sin), apply_rotary_emb(k_normed, cos, sin)
 
     def _run_multi_axis(self, req: QKNormRopeReq, *, apply_rotary_pos_emb, apply_rotary_emb):
-        plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(req)
+        plan = import_module("uniserve_worker.ops.qk_norm_rope_plan").QKNormRopePlan.from_request(
+            req
+        )
         q_parts = req.q.split(plan.axis_dims, dim=-1)
         k_parts = req.k.split(plan.axis_dims, dim=-1)
         out_q = []
         out_k = []
         eager_norm = _EagerQKNormProvider()
         for group in plan.groups:
-            q_group = torch.cat(q_parts[group.start:group.end], dim=-1)
-            k_group = torch.cat(k_parts[group.start:group.end], dim=-1)
+            q_group = torch.cat(q_parts[group.start : group.end], dim=-1)
+            k_group = torch.cat(k_parts[group.start : group.end], dim=-1)
             q_normed_group, k_normed_group = eager_norm.run(
                 QKNormReq(
                     q_group,
@@ -871,9 +950,11 @@ class _EagerQKNormRopeProvider:
                     req.eps,
                 )
             )
-            q_normed_parts = q_normed_group.split(plan.axis_dims[group.start:group.end], dim=-1)
-            k_normed_parts = k_normed_group.split(plan.axis_dims[group.start:group.end], dim=-1)
-            for local, (q_normed, k_normed) in enumerate(zip(q_normed_parts, k_normed_parts, strict=True)):
+            q_normed_parts = q_normed_group.split(plan.axis_dims[group.start : group.end], dim=-1)
+            k_normed_parts = k_normed_group.split(plan.axis_dims[group.start : group.end], dim=-1)
+            for local, (q_normed, k_normed) in enumerate(
+                zip(q_normed_parts, k_normed_parts, strict=True)
+            ):
                 axis = group.start + local
                 q_rot, k_rot = self._apply_rope_axis(
                     q_normed,
@@ -894,9 +975,13 @@ class _EagerQKNormRopeProvider:
         apply_rotary_emb = rope_mod.apply_rotary_emb
 
         if req.axis_dims is not None:
-            return self._run_multi_axis(req, apply_rotary_pos_emb=apply_rotary_pos_emb, apply_rotary_emb=apply_rotary_emb)
+            return self._run_multi_axis(
+                req, apply_rotary_pos_emb=apply_rotary_pos_emb, apply_rotary_emb=apply_rotary_emb
+            )
 
-        q, k = _EagerQKNormProvider().run(QKNormReq(req.q, req.k, req.q_weight, req.k_weight, req.eps))
+        q, k = _EagerQKNormProvider().run(
+            QKNormReq(req.q, req.k, req.q_weight, req.k_weight, req.eps)
+        )
         return self._apply_rope_axis(
             q,
             k,
@@ -935,7 +1020,9 @@ class _AttentionBackendProvider:
                 "requires_paged_varlen": bool(getattr(caps, "requires_paged_varlen", False)),
                 "visible_end": bool(getattr(caps, "visible_end", False)),
                 "trunk_geometries": getattr(caps, "trunk_geometries", frozenset()),
-                "paged_block_size_multiple": int(getattr(caps, "paged_block_size_multiple", 1) or 1),
+                "paged_block_size_multiple": int(
+                    getattr(caps, "paged_block_size_multiple", 1) or 1
+                ),
                 "min_head_dim": int(getattr(caps, "min_head_dim", 1) or 1),
                 "paged_decode_only": bool(getattr(caps, "paged_decode_only", False)),
                 "paged_varlen_cuda_graph": bool(getattr(caps, "paged_varlen_cuda_graph", False)),
@@ -944,7 +1031,11 @@ class _AttentionBackendProvider:
         )
 
     def display_name(self, req: AttentionReq) -> str:
-        if req.block_table is not None and req.cu_seqlens_q is not None and req.cu_seqlens_k is not None:
+        if (
+            req.block_table is not None
+            and req.cu_seqlens_q is not None
+            and req.cu_seqlens_k is not None
+        ):
             return f"{self.name}_paged_varlen"
         return self.name
 
@@ -953,7 +1044,9 @@ class _AttentionBackendProvider:
         return int(head_dim) >= int(getattr(caps, "min_head_dim", 1) or 1)
 
     @staticmethod
-    def _trunk_geometry_supported(caps, req: AttentionReq, *, backend_name: str | None = None) -> bool:
+    def _trunk_geometry_supported(
+        caps, req: AttentionReq, *, backend_name: str | None = None
+    ) -> bool:
         supports = getattr(caps, "supports_trunk_geometry", None)
         if backend_name == "fa4_cute" and not getattr(caps, "trunk_geometries", frozenset()):
             return False
@@ -1011,7 +1104,10 @@ class _AttentionBackendProvider:
         caps = self.backend.capabilities()
         if not bool(getattr(caps, "available", True)):
             return False
-        if self.name in {"sgl_kernel", "flashinfer", "flash_attn", "fa4_cute"} and req.q.device.type != "cuda":
+        if (
+            self.name in {"sgl_kernel", "flashinfer", "flash_attn", "fa4_cute"}
+            and req.q.device.type != "cuda"
+        ):
             return False
         if self.name == "trtllm_mha":
             if req.q.device.type != "cuda":
@@ -1021,11 +1117,16 @@ class _AttentionBackendProvider:
                 return False
         if not self._head_dim_supported(caps, req.q.shape[-1]):
             return False
-        if not self._trunk_geometry_supported(caps, req, backend_name=getattr(self.backend, "name", self.name)):
+        if not self._trunk_geometry_supported(
+            caps, req, backend_name=getattr(self.backend, "name", self.name)
+        ):
             return False
         if req.regime is AttentionRegime.VISIBLE_END:
             return bool(getattr(caps, "visible_end", False)) and req.visible_end is not None
-        if req.regime in {AttentionRegime.EXTEND, AttentionRegime.MIXED} and req.cu_seqlens_q is not None:
+        if (
+            req.regime in {AttentionRegime.EXTEND, AttentionRegime.MIXED}
+            and req.cu_seqlens_q is not None
+        ):
             if req.block_table is not None:
                 return (
                     bool(getattr(caps, "varlen_attention", False))
@@ -1035,8 +1136,14 @@ class _AttentionBackendProvider:
             if bool(getattr(caps, "requires_paged_varlen", False)):
                 return False
             return bool(getattr(caps, "varlen_attention", False))
-        if req.regime is AttentionRegime.DECODE or req.block_table is not None or req.kv_cache is not None:
-            if bool(getattr(caps, "paged_decode_only", False)) and not self._is_one_token_decode(req):
+        if (
+            req.regime is AttentionRegime.DECODE
+            or req.block_table is not None
+            or req.kv_cache is not None
+        ):
+            if bool(getattr(caps, "paged_decode_only", False)) and not self._is_one_token_decode(
+                req
+            ):
                 return False
             return (
                 bool(getattr(caps, "paged_kv", False))
@@ -1067,7 +1174,11 @@ class _AttentionBackendProvider:
                 use_prefix_bounds=req.use_prefix_bounds,
                 fully_visible=req.fully_visible,
             )
-        if req.cu_seqlens_q is not None and req.cu_seqlens_k is not None and hasattr(self.backend, "forward_varlen"):
+        if (
+            req.cu_seqlens_q is not None
+            and req.cu_seqlens_k is not None
+            and hasattr(self.backend, "forward_varlen")
+        ):
             return self.backend.forward_varlen(
                 req.q,
                 req.k,
@@ -1080,7 +1191,11 @@ class _AttentionBackendProvider:
                 scale=req.scale,
                 block_table=req.block_table,
             )
-        if req.block_table is not None and req.cache_seqlens is not None and hasattr(self.backend, "forward_paged"):
+        if (
+            req.block_table is not None
+            and req.cache_seqlens is not None
+            and hasattr(self.backend, "forward_paged")
+        ):
             return self.backend.forward_paged(
                 req.q,
                 req.k,
@@ -1092,7 +1207,9 @@ class _AttentionBackendProvider:
                 causal=req.causal,
                 scale=req.scale,
             )
-        return self.backend.forward(req.q, req.k, req.v, causal=req.causal, scale=req.scale, attn_mask=req.attn_mask)
+        return self.backend.forward(
+            req.q, req.k, req.v, causal=req.causal, scale=req.scale, attn_mask=req.attn_mask
+        )
 
 
 class _ContextAttentionProvider(_AttentionBackendProvider):
@@ -1109,7 +1226,11 @@ class _ContextAttentionProvider(_AttentionBackendProvider):
     def display_name(self, req: AttentionReq) -> str:
         backend = self._backend(req)
         name = str(getattr(backend, "name", self.name))
-        if req.block_table is not None and req.cu_seqlens_q is not None and req.cu_seqlens_k is not None:
+        if (
+            req.block_table is not None
+            and req.cu_seqlens_q is not None
+            and req.cu_seqlens_k is not None
+        ):
             return f"{name}_paged_varlen"
         return name
 
@@ -1257,7 +1378,9 @@ class _SymmMemTpAllReduceProvider:
             # every later call, including non-inference setup paths, so allocate
             # them as normal tensors regardless of the caller's current mode.
             with torch.inference_mode(False):
-                buffer = symm_mem.empty(int(tensor.numel()), dtype=tensor.dtype, device=tensor.device)
+                buffer = symm_mem.empty(
+                    int(tensor.numel()), dtype=tensor.dtype, device=tensor.device
+                )
             handle = symm_mem.rendezvous(buffer, group=group_name)
             if handle is None:
                 # Rendezvous declined (unsupported topology). Downgrade loudly,
