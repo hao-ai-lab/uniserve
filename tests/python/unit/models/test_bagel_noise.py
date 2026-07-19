@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.engine import FlowSession, PreparedFlowStep
+from uniserve_worker.execution.runner import FlowSession, PreparedFlowStep
 from uniserve_worker.models.bagel import (
     BagelConfig,
     BagelForUnifiedGeneration,

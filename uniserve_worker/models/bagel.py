@@ -18,8 +18,8 @@ import torch.nn as nn
 from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from uniserve_worker.execution.engine import PreparedFlowStep, flow_cfg_branch_count
 from uniserve_worker.execution.flow import FlowGraphExecution, FlowRow
+from uniserve_worker.execution.runner import PreparedFlowStep, flow_cfg_branch_count
 from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.paged_denoise import (

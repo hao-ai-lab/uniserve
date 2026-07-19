@@ -12,12 +12,12 @@ from uniserve_worker.contracts.forward_context import (
     use_forward_context,
 )
 from uniserve_worker.contracts.forward_stats import ForwardStats
-from uniserve_worker.execution.engine import (
+from uniserve_worker.execution.graph.capture import Runner, record
+from uniserve_worker.execution.graph.dispatch import Dispatch, Match, Path
+from uniserve_worker.execution.runner import (
     ForwardPlanBuilder,
     UnifiedForwardBatchBuilder,
 )
-from uniserve_worker.execution.graph.capture import Runner, record
-from uniserve_worker.execution.graph.dispatch import Dispatch, Match, Path
 
 pytestmark = pytest.mark.unit
 

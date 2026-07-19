@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 
 from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.engine import ModelRunner, RunnerConfig
+from uniserve_worker.execution import ModelRunner, RunnerConfig
 from uniserve_worker.execution.sequence import resolve_op_token_ids
 
 

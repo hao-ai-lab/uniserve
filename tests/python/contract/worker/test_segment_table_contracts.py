@@ -9,7 +9,7 @@ import pytest
 from uniserve_worker.contracts.cache_schema import AttentionPattern, CacheEffect
 from uniserve_worker.contracts.execution import OperationTag
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
-from uniserve_worker.contracts.segment_table import (
+from uniserve_worker.execution import (
     GraphCapacity,
     SegmentTableArrays,
     SegmentTableError,

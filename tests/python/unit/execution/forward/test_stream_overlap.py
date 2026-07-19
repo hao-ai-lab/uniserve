@@ -9,7 +9,7 @@ pytestmark = pytest.mark.unit
 
 
 def test_coordinator_requires_cuda_device():
-    from uniserve_worker.execution.engine import PlanStreamOverlap
+    from uniserve_worker.execution.runner import PlanStreamOverlap
 
     with pytest.raises(ValueError):
         PlanStreamOverlap(torch.device("cpu"), max_inflight=3)
@@ -18,7 +18,7 @@ def test_coordinator_requires_cuda_device():
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 def test_prepare_launch_orders_consumption_after_plan_stream():
-    from uniserve_worker.execution.engine import PlanStreamOverlap
+    from uniserve_worker.execution.runner import PlanStreamOverlap
 
     device = torch.device("cuda", torch.cuda.current_device())
     overlap = PlanStreamOverlap(device, max_inflight=3)

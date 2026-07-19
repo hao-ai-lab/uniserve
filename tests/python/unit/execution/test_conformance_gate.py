@@ -27,10 +27,10 @@ from uniserve_worker.contracts.execution import (
 )
 from uniserve_worker.contracts.model_family import ModelFamilyDescriptor
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
-from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.engine import (
+from uniserve_worker.execution import (
     AdapterRowOutcome,
     ExecutionEngine,
+    GraphCapacity,
     ManifestError,
     StandardTransactionExecutor,
     build_manifest,

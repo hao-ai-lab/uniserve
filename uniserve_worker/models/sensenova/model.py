@@ -19,7 +19,6 @@ import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 import uniserve_worker.ops as ops
-from uniserve_worker.execution.engine import PreparedFlowStep
 from uniserve_worker.execution.flow import (
     FlowExecution,
     FlowState,
@@ -30,6 +29,7 @@ from uniserve_worker.execution.products import (
     ImageMaterializer,
     ProductTransferSession,
 )
+from uniserve_worker.execution.runner import PreparedFlowStep
 from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
