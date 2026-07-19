@@ -21,14 +21,14 @@ from uniserve_worker.contracts.execution import (
     SessionRef,
 )
 from uniserve_worker.contracts.residency_batch import ResidencyBatchCapacity
-from uniserve_worker.contracts.segment_table import GraphCapacity
-from uniserve_worker.execution.engine import (
+from uniserve_worker.execution import (
     AdapterRowOutcome,
     DistributedConfigurationError,
     EngineBackpressure,
     EnginePoisoned,
     EngineState,
     ExecutionEngine,
+    GraphCapacity,
     RankFanOutExecutor,
     RankMember,
     StandardTransactionExecutor,

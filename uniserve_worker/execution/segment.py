@@ -32,7 +32,10 @@ from uniserve_worker.contracts.forward_batch import (
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.outputs import TextTokenOutput
-from uniserve_worker.execution.engine import (
+from uniserve_worker.execution.graph.bucket import padding_blocks
+from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
+from uniserve_worker.execution.graph.executor import backend_name
+from uniserve_worker.execution.runner import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
     DeferredTextSeqResult,
@@ -43,9 +46,6 @@ from uniserve_worker.execution.engine import (
     flow_cfg_plan,
     sample_logits_result,
 )
-from uniserve_worker.execution.graph.bucket import padding_blocks
-from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
-from uniserve_worker.execution.graph.executor import backend_name
 from uniserve_worker.execution.sequence import hydrate_cached_prefix_from_op
 from uniserve_worker.foundation.env import env_flag
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor

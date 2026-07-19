@@ -21,7 +21,9 @@ from uniserve_worker.contracts.forward_context import ForwardContext, use_forwar
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.contracts.model_protocols import ModelHooks
-from uniserve_worker.execution.engine import (
+from uniserve_worker.execution.graph import Dispatch, key
+from uniserve_worker.execution.graph.path import Batch, Flow, Segment
+from uniserve_worker.execution.runner import (
     EagerFallbackRecorder,
     EncodeDriver,
     ForwardExecutor,
@@ -30,9 +32,7 @@ from uniserve_worker.execution.engine import (
     TextDriver,
     WorkerForwardAdapter,
 )
-from uniserve_worker.execution.engine import UnifiedForwardBatchBuilder as ForwardBatchBuilder
-from uniserve_worker.execution.graph import Dispatch, key
-from uniserve_worker.execution.graph.path import Batch, Flow, Segment
+from uniserve_worker.execution.runner import UnifiedForwardBatchBuilder as ForwardBatchBuilder
 from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.runtime.request_state import RequestStateTable
 

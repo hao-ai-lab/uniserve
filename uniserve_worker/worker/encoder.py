@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from uniserve_worker.execution.engine import EncodeDriver
+from uniserve_worker.execution.runner import EncodeDriver
 
 from ..contracts.forward_batch import ForwardBatch
 from ..contracts.model_protocols import ModelHooks

@@ -20,7 +20,7 @@ from .resource_plan import ResourcePlan
 if TYPE_CHECKING:
     import torch
 
-    from uniserve_worker.execution.engine import PreparedFlowStep
+    from uniserve_worker.execution.runner import PreparedFlowStep
     from uniserve_worker.execution.segment import SegmentExecutor
 
     from ..runtime.compile import CompileTarget

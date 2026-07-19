@@ -12,7 +12,7 @@ from uniserve_worker.contracts.op_kinds import (
     OP_KIND_TABLE,
     PREFILL_UND,
 )
-from uniserve_worker.execution.engine import (
+from uniserve_worker.execution.runner import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
     DeferredTextSeqResult,
@@ -238,7 +238,7 @@ def _store_relay(state: RequestState, token_id: int | None, tensor: torch.Tensor
 
 
 def test_decode_relay_accepts_canonical_device_alias(monkeypatch):
-    from uniserve_worker.execution import engine as text_decode_relay
+    from uniserve_worker.execution import runner as text_decode_relay
 
     state = RequestState()
     relay_tensor = torch.tensor([7], dtype=torch.long)

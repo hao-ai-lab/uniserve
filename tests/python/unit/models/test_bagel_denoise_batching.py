@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.execution.engine import PreparedFlowStep
+from uniserve_worker.execution.runner import PreparedFlowStep
 from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
 from uniserve_worker.nn.diffusion.cfg import Branch
 from uniserve_worker.runtime.paged_denoise import PagedDenoiseBranchSet

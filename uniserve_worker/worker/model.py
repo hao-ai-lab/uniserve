@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
-from uniserve_worker.execution.engine import ModelRunner, RunnerConfig
+from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
 
 from ..backends.attention import (
     get_attention_backend,

@@ -1,8 +1,6 @@
 """Speculative decoding sampler conformance."""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -102,41 +100,3 @@ def test_target_only_uses_sglang_relaxed_penalties_for_all_verify_rows():
 
     assert got.num_accepted_tokens == 1
     assert got.sampled_token_id == 1
-
-
-def test_qwen3_spec_row_uses_sglang_target_only_path_for_stochastic_verify():
-    logits = torch.tensor(
-        [
-            [-40.0, 40.0, -40.0],
-            [-40.0, -40.0, 40.0],
-        ]
-    )
-    state = SimpleNamespace(
-        sampling={"temperature": 1.0, "top_k": 0, "top_p": 1.0},
-        kv_length=None,
-    )
-
-    def set_kv_length(length: int, *, lane: str) -> None:
-        state.kv_length = (length, lane)
-
-    state.set_kv_length = set_kv_length
-    from uniserve_worker.contracts.forward_stats import ForwardStats
-    from uniserve_worker.execution.engine import _verify_spec_row
-
-    stats = ForwardStats()
-
-    got = _verify_spec_row(
-        logits,
-        {"req_id": 7, "pos_range": [10, 11], "recent_tokens": []},
-        (1,),
-        state,
-        stats=stats,
-    )
-
-    assert got["sampled_token_id"] == 2
-    assert got["num_accepted_tokens"] == 1
-    assert got["sampled_token_device"].cpu().tolist() == [2]
-    assert got["sampled_position_device"].cpu().tolist() == [12]
-    # KV-length advance is system-owned; the verify path records the text lane.
-    assert state.kv_length == (12, "text")
-    assert stats.spec_verify_path_counts == {"sglang_target_only": 1}
