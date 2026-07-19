@@ -14,10 +14,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Type
 
-from ..contracts.batch_policy import BatchPolicy
 from ..contracts.caps import Caps, ExecutionConstraints
+from ..contracts.forward_batch import BatchPolicy
 from ..contracts.model_family import ModelFamilyDescriptor, ModelOperationSet
-from ..contracts.model_protocols import ModelHooks, UniModel
+from ..contracts.model_protocols import UniModel
 from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
 from ..foundation.plugins import discover_package_plugins
 from ..foundation.runtime_config import get_execution_config
@@ -43,13 +43,12 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-class UniModelBase(ModelHooks):
+class UniModelBase(UniModel):
     """Concrete glue shared by the registered model entries.
 
     The base carries no ``__init__`` and keeps model entries free to compose
     system execution objects around their family-specific neural adapters. It complements the
-    :class:`~uniserve_worker.contracts.model_protocols.UniModel` structural
-    Protocol rather than duplicating it.
+    :class:`~uniserve_worker.contracts.model_protocols.UniModel` contract rather than duplicating it.
 
     It owns the duplicated contract glue:
 
@@ -275,4 +274,6 @@ def detect_model_architectures(model_path: str | Path) -> list[str]:
 
 
 def _validate_model_contract(model_cls: Type[UniModel]) -> None:
+    if not issubclass(model_cls, UniModel):
+        raise capability_mismatch(f"{model_cls.__name__} must inherit UniModel")
     ModelOperationSet.from_model_class(model_cls).validate(model_cls)

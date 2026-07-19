@@ -13,7 +13,7 @@ from uniserve_worker.bootstrap.plan import (
     WorkerImplementation,
     resolve_worker_plan,
 )
-from uniserve_worker.contracts.model_protocols import ModelHooks
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.contracts.outputs import EncodeOutput
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.server.worker_kind import WorkerKind
@@ -98,7 +98,7 @@ def test_pipeline_depth_is_part_of_worker_contract():
     assert worker.caps().to_wire()["pipeline_depth"] == 3
 
 
-class _VisionModel(ModelHooks):
+class _VisionModel(UniModel):
     num_layers = 1
     encoder_cache_budget = 4
 

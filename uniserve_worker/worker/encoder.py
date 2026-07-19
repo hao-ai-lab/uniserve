@@ -7,7 +7,7 @@ from typing import Any
 
 from uniserve_worker.execution import ModelRunner
 
-from ..contracts.model_protocols import ModelHooks
+from ..contracts.model_protocols import UniModel
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
@@ -32,8 +32,8 @@ class EncoderWorker(BaseWorker):
         block_size: int = DEFAULT_BLOCK_SIZE,
     ) -> None:
         super().__init__(block_size=block_size)
-        if not isinstance(model, ModelHooks):
-            raise capability_mismatch("encoder worker model must inherit ModelHooks")
+        if not isinstance(model, UniModel):
+            raise capability_mismatch("encoder worker model must inherit UniModel")
         self.request_states = RequestStateTable()
         self.model = model
         self.runner = ModelRunner(model, request_states=self.request_states)
@@ -74,9 +74,9 @@ class EncoderWorker(BaseWorker):
     def _supported_encode_ops(self) -> tuple[str, ...]:
         supported_ops: list[str] = []
         encode_image = getattr(type(self.model), "encode_image", None)
-        if encode_image is not None and encode_image is not ModelHooks.encode_image:
+        if encode_image is not None and encode_image is not UniModel.encode_image:
             supported_ops.append(VIT_ENCODE)
         encode_latents = getattr(type(self.model), "encode_latents", None)
-        if encode_latents is not None and encode_latents is not ModelHooks.encode_latents:
+        if encode_latents is not None and encode_latents is not UniModel.encode_latents:
             supported_ops.append(VAE_ENCODE)
         return tuple(supported_ops)

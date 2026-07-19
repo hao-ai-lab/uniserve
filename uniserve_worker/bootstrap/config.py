@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
-from ..contracts.model_load import ModelLoadScope
+from ..contracts.model_family import ModelLoadScope
 from ..foundation.runtime_config import (
     ExecutionConfig,
     execution_config_from_namespace,

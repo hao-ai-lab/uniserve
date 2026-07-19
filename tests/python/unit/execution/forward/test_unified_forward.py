@@ -5,21 +5,21 @@ from typing import Any
 import pytest
 import torch
 
-from uniserve_worker.contracts.batch_policy import BatchPolicy
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.contracts.forward_batch import (
+    BatchPolicy,
     DenoiseBranchKey,
     DenoisePostprocessEntry,
     ForwardBatch,
     ForwardResult,
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.execution import ModelRunner, RunnerConfig
 
 pytestmark = pytest.mark.unit
 
 
-class _Model(ModelHooks):
+class _Model(UniModel):
     resource_classes: tuple[str, ...] = ()
 
     def __init__(self, result: Any) -> None:
@@ -34,7 +34,7 @@ class _Model(ModelHooks):
         return self.result
 
 
-def _execute(model: ModelHooks, ops: list[dict[str, Any]]) -> dict[str, Any]:
+def _execute(model: UniModel, ops: list[dict[str, Any]]) -> dict[str, Any]:
     req_ids = [int(op["req_id"]) for op in ops]
     return ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
         {

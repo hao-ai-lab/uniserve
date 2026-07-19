@@ -16,7 +16,7 @@ from uniserve_worker.backends.attention import (
     get_attention_backend,
     has_attention_backend,
 )
-from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.contracts import ForwardStats
 from uniserve_worker.execution import segment as packed_batch
 from uniserve_worker.execution import segment as packed_runtime
 from uniserve_worker.execution.segment import SegmentExecutor

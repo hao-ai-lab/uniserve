@@ -26,8 +26,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
-from uniserve_worker.contracts.forward_stats import ForwardStats
+from uniserve_worker.contracts.forward_context import (
+    ForwardContext,
+    ForwardStats,
+    use_forward_context,
+)
 from uniserve_worker.execution.flow import (
     FlowGraphExecution,
     FlowGraphRunner,

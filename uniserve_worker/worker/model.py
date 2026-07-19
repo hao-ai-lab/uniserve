@@ -16,8 +16,7 @@ from ..backends.attention import (
     normalize_attention_backend_name,
 )
 from ..contracts.caps import Caps, validate_caps
-from ..contracts.model_family import ModelFamilyDescriptor
-from ..contracts.model_load import ModelLoadScope
+from ..contracts.model_family import ModelFamilyDescriptor, ModelLoadScope
 from ..contracts.model_protocols import UniModel
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.errors import capability_mismatch

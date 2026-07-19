@@ -7,11 +7,10 @@ from typing import Any
 import pytest
 import torch
 
-from uniserve_worker.contracts.batch_policy import BatchPolicy
+from uniserve_worker.contracts import BatchPolicy, UniModel
 from uniserve_worker.contracts.batches import CfgBatch
 from uniserve_worker.contracts.forward_batch import ForwardBatch
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution import ModelRunner, RunnerConfig
 from uniserve_worker.execution.runner import text_input_id_replacements_from_relays
@@ -23,7 +22,7 @@ from uniserve_worker.runtime.tensor_staging import TextTensorStager, stage_text_
 pytestmark = pytest.mark.unit
 
 
-class RecordingModel(ModelHooks):
+class RecordingModel(UniModel):
     resource_classes: tuple[str, ...] = ()
 
     def __init__(self, policy: BatchPolicy) -> None:
@@ -45,7 +44,7 @@ class RecordingModel(ModelHooks):
         ]
 
 
-class ThinCPUTextModel(ModelHooks):
+class ThinCPUTextModel(UniModel):
     """Thin system-managed text model on CPU (single-token-per-op echo logits).
 
     Declares its KV geometry so the runtime owns the pool; the system text path

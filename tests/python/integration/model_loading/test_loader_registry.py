@@ -17,9 +17,8 @@ from uniserve_worker.bootstrap.model_loader import (
     load_worker_model,
     model_architecture_candidates,
 )
+from uniserve_worker.contracts import ModelLoadScope, UniModel
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints
-from uniserve_worker.contracts.model_load import ModelLoadScope
-from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.foundation.runtime_config import TorchCompileRuntimeConfig
@@ -77,7 +76,7 @@ def test_bagel_detection_hook_supplies_architecture_for_stub_config(tmp_path):
 
 
 def test_model_worker_rejects_declared_missing_control():
-    class BadControlModel(ModelHooks):
+    class BadControlModel(UniModel):
         # Minimal valid caps so the worker reaches control validation (which is
         # what this test exercises), rather than tripping the caps check first.
         supported_ops = ("prefill_und", "decode_und")
@@ -97,7 +96,7 @@ def test_model_worker_rejects_declared_missing_control():
         raise AssertionError("missing control declaration should fail at startup")
 
 
-def test_registry_rejects_declared_operations_without_forward():
+def test_registry_rejects_classes_outside_the_model_contract():
     from uniserve_worker.models.registry import ModelRegistry
 
     class BadDenoiseModel:
@@ -106,7 +105,7 @@ def test_registry_rejects_declared_operations_without_forward():
     with pytest.raises(WorkerError) as exc:
         ModelRegistry().register(BadDenoiseModel, names=("bad",))
     assert exc.value.code == ErrorCode.CAPABILITY_MISMATCH
-    assert "forward" in exc.value.message
+    assert "inherit UniModel" in exc.value.message
 
 
 def test_model_import_isolation_warns_and_continues(monkeypatch, caplog):
@@ -202,7 +201,7 @@ def test_transformers_dtype_typos_fail_loudly():
 
 
 def test_model_worker_computes_caps_once_and_serves_cached_copy():
-    class CountingCapsModel(ModelHooks):
+    class CountingCapsModel(UniModel):
         supported_ops = ("prefill_und", "decode_und")
         supported_controls: tuple[str, ...] = ()
         adapter_mode = "none"

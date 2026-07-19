@@ -35,8 +35,13 @@ from uniserve_worker.runtime.request_state import RequestState
 
 from .flow import PreparedFlowStep, combine_flow_velocity, flow_branches
 
+
+def _execute_required_denoise(items: Any, model: Any) -> list[FlowOutput]:
+    return _DiffusionRuntime().step_many(items, model, graph_mode="require")
+
+
 if TYPE_CHECKING:
-    from uniserve_worker.contracts.model_protocols import FlowCapable
+    from uniserve_worker.contracts.model_protocols import UniModel
 
 
 # Decode token/position relays (device-resident sequence feedback)
@@ -122,7 +127,7 @@ class _DiffusionRuntime:
 
     @torch.inference_mode()
     def step(
-        self, req_id: int, state: RequestState, model: "FlowCapable", op: Mapping[str, Any]
+        self, req_id: int, state: RequestState, model: "UniModel", op: Mapping[str, Any]
     ) -> FlowOutput:
         return self.step_many([(req_id, state, op)], model)[0]
 
@@ -130,7 +135,7 @@ class _DiffusionRuntime:
     def step_many(
         self,
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
-        model: "FlowCapable",
+        model: "UniModel",
         *,
         graph_mode: str = "auto",
     ) -> list[FlowOutput]:
@@ -156,7 +161,7 @@ class _DiffusionRuntime:
     def forward_result(
         self,
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
-        model: "FlowCapable",
+        model: "UniModel",
         *,
         row_indices: Sequence[int] | None = None,
         graph_mode: str = "auto",
@@ -213,7 +218,7 @@ class _DiffusionRuntime:
     def _step_many_burst(
         self,
         items: Sequence[tuple[int, RequestState, Mapping[str, Any]]],
-        model: "FlowCapable",
+        model: "UniModel",
         step_counts: Sequence[int],
         *,
         graph_mode: str,
@@ -286,7 +291,7 @@ class _DiffusionRuntime:
         self,
         req_id: int,
         state: RequestState,
-        model: "FlowCapable",
+        model: "UniModel",
         op: Mapping[str, Any],
     ) -> FlowContext | PreparedFlowStep:
         del req_id
@@ -301,7 +306,7 @@ class _DiffusionRuntime:
         self,
         req_id: int,
         state: RequestState,
-        model: "FlowCapable",
+        model: "UniModel",
         op: Mapping[str, Any],
         prepared: FlowContext | PreparedFlowStep,
     ) -> FlowOutput:
@@ -351,7 +356,7 @@ class _DiffusionRuntime:
 
     def _flow_steps(
         self,
-        model: "FlowCapable",
+        model: "UniModel",
         steps: Sequence[PreparedFlowStep],
         *,
         graph_mode: str = "auto",
@@ -402,7 +407,7 @@ class _DiffusionRuntime:
 
     def _flow_forward_entries(
         self,
-        model: "FlowCapable",
+        model: "UniModel",
         items: Sequence[tuple[int, PreparedFlowStep]],
         *,
         graph_mode: str = "auto",
@@ -475,7 +480,7 @@ class _DiffusionRuntime:
         row_index: int,
         req_id: int,
         state: RequestState,
-        model: "FlowCapable",
+        model: "UniModel",
         op: Mapping[str, Any],
         prepared: FlowContext,
     ) -> tuple[DenoisePostprocessEntry, dict[DenoiseBranchKey, torch.Tensor]]:

@@ -3,21 +3,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Callable
 
 from ..foundation.errors import WorkerError, capability_mismatch
+from .execution import OperationTag
 from .forward_mode import ForwardMode, mode_for_op
-from .operations import OperationTag
 
 if TYPE_CHECKING:
     from .cache_schema import FamilyCacheRegistration
 
 __all__ = [
     "FamilyExecutionContract",
+    "ModelLoadScope",
     "ModelFamilyDescriptor",
     "ModelOperation",
     "ModelOperationSet",
 ]
+
+
+class ModelLoadScope(StrEnum):
+    """Semantic scope of model parameters materialized for a worker."""
+
+    WHOLE = "whole"
+    UNDERSTANDING = "understanding"
+    GENERATION = "generation"
+
+    @property
+    def tower_role(self) -> str | None:
+        if self is ModelLoadScope.UNDERSTANDING:
+            return "und"
+        if self is ModelLoadScope.GENERATION:
+            return "gen"
+        return None
 
 
 @dataclass(frozen=True, slots=True)

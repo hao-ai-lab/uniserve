@@ -36,8 +36,6 @@ from dataclasses import dataclass, fields
 from enum import IntEnum
 from typing import Protocol, Union
 
-from .operations import OperationTag
-
 __all__ = [
     "CacheLease",
     "CandidateVerification",
@@ -80,6 +78,15 @@ __all__ = [
 
 class ExecutionContractError(ValueError):
     """An execute payload violates the closed host contract (pre-launch)."""
+
+
+class OperationTag(IntEnum):
+    """Stable tags for the general model-backed operation algebra."""
+
+    SEQUENCE_STEP = 1
+    FLOW_STEP = 2
+    ENCODE_STEP = 3
+    MATERIALIZE_STEP = 4
 
 
 # --------------------------------------------------------------------------- #

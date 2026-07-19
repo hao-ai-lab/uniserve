@@ -21,6 +21,7 @@ from dataclasses import replace
 import pytest
 import torch.nn as nn
 
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.foundation import runtime_config as runtime_config_module
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.models.registry import ModelRegistry
@@ -33,25 +34,22 @@ PIL_Image = pytest.importorskip("PIL.Image")
 # --------------------------------------------------------------------------- #
 # Minimal model stubs.
 #
-# ``ModelRegistry.register`` reads attributes off the class via ``getattr`` and
-# only runs contract validation when ``supported_ops`` is non-empty, so a plain
-# class with an empty ``supported_ops`` is a valid registrable model. These are
-# defined fresh per use; the registry instances under test are never the global
-# ``MODEL_REGISTRY`` so there is no shared mutable state across tests.
+# These models satisfy the public nominal model contract while advertising no
+# operations, keeping the tests focused on registry naming and resolution.
 # --------------------------------------------------------------------------- #
 
 
-class _ModelArch1:
+class _ModelArch1(UniModel):
     architectures = ("Arch1",)
     supported_ops = ()
 
 
-class _ModelArch2:
+class _ModelArch2(UniModel):
     architectures = ("Arch2",)
     supported_ops = ()
 
 
-class _FallbackA:
+class _FallbackA(UniModel):
     architectures = ("FallbackA",)
     supported_ops = ()
 
@@ -80,9 +78,6 @@ def test_register_same_class_under_same_arch_is_idempotent():
     registry.register(_ModelArch1, names=_ModelArch1.architectures)
 
     assert registry.resolve(("Arch1",)) is _ModelArch1
-
-
-
 
 # --------------------------------------------------------------------------- #
 # ModelRegistry.resolve -- disabled_model_archs filtering
