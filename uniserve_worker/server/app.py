@@ -8,6 +8,7 @@ materialization and execution choices are resolved before this module starts.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
 
 from ..contracts.caps import CONTROL_KINDS, validate_caps, validate_forward_result
@@ -15,12 +16,12 @@ from ..contracts.outputs import FinalizableSeqResult
 from ..foundation.errors import (
     WorkerError,
     classify,
+    invalid_descriptor,
     scheduler_bug,
     should_capture_trace,
+    unsupported_control,
 )
 from ..worker.protocol import ResultPolicy, Worker
-from .control_plane import ControlPlane
-from .execution_pipeline import ExecutionPipeline, PendingResult
 from .metrics import MetricsService
 from .profiler import WorkerProfiler
 
@@ -30,6 +31,29 @@ if TYPE_CHECKING:
 __all__ = ["WorkerServer", "dispatch"]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingResult:
+    """Execute response state that may require deferred CPU finalization."""
+
+    response: dict[str, Any]
+    batch: dict[str, Any] | None = None
+    wait_start_ns: int | None = None
+
+    @property
+    def result(self) -> dict[str, Any] | None:
+        result = self.response.get("result")
+        return result if isinstance(result, dict) else None
+
+    def ready(self) -> bool:
+        per_seq = (self.result or {}).get("per_seq")
+        if not isinstance(per_seq, list):
+            return True
+        return all(
+            not callable(ready := getattr(item, "ready", None)) or bool(ready()) for item in per_seq
+        )
+
 
 # Control op kinds (vs get_caps/execute/drop_request/shutdown). Controls absent
 # from the worker's declared ``supported_controls`` raise UnsupportedControl.
@@ -217,7 +241,57 @@ def _dispatch_control(
     kind: str,
     request: Mapping[str, Any],
 ) -> dict:
-    return ControlPlane(worker, supported_controls).handle(kind, request)
+    if kind not in CONTROL_KINDS:
+        raise scheduler_bug(f"unknown control kind: {kind!r}")
+    if kind not in supported_controls:
+        raise unsupported_control(kind)
+    method, scalar_fields, list_fields = {
+        "copy_blocks": ("copy_blocks", (), (("copies", "copies"),)),
+        "load_lora": (
+            "load_lora",
+            (("lora_id", "lora_id"), ("lora_path", "lora_path")),
+            (),
+        ),
+        "unload_lora": ("unload_lora", (("lora_id", "lora_id"),), ()),
+        "free_encoder": ("free_encoder", (), (("free_handles", "handles"),)),
+        "reset_prefix_cache": ("reset_prefix_cache", (), ()),
+        "sleep": ("sleep", (), ()),
+        "wake_up": ("wake_up", (), ()),
+    }[kind]
+    kwargs = {
+        parameter: _required_control_field(request, wire_field, kind)
+        for wire_field, parameter in scalar_fields
+    }
+    kwargs.update(
+        {
+            parameter: _control_list(request, wire_field, kind)
+            for wire_field, parameter in list_fields
+        }
+    )
+    getattr(worker, method)(**kwargs)
+    return {"kind": "ok"}
+
+
+def _required_control_field(request: Mapping[str, Any], field: str, kind: str) -> Any:
+    value = request.get(field)
+    if value is None:
+        raise invalid_descriptor(
+            f"control {kind!r} is missing required field {field!r}",
+            op_kind=kind,
+        )
+    return value
+
+
+def _control_list(request: Mapping[str, Any], field: str, kind: str) -> list[Any]:
+    value = request.get(field)
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise invalid_descriptor(
+            f"control {kind!r} field {field!r} must be a list, got {type(value).__name__}",
+            op_kind=kind,
+        )
+    return list(value)
 
 
 def dispatch(
@@ -342,13 +416,8 @@ class WorkerServer:
         self.pipeline_depth = max(1, int(self.caps["pipeline_depth"]))
         self.allowed_ops = frozenset(self.caps["supported_ops"])
         self.supported_controls = set(self.caps.get("supported_controls") or [])
-        self.control_plane = ControlPlane(
-            self.worker,
-            self.supported_controls,
-        )
         self.allow_deferred_results = contract.result_policy is ResultPolicy.DEFER_WHEN_AVAILABLE
         self.profiler = WorkerProfiler.from_env()
-        self.execution_pipeline = ExecutionPipeline()
 
     def handle(self, request, *, allow_deferred: bool = False) -> dict:
         """Dispatch one decoded request, classifying failures and recording
@@ -369,7 +438,12 @@ class WorkerServer:
             if request_kind == "get_caps":
                 response = {"kind": "caps", "caps": dict(self.caps)}
             elif request_kind in CONTROL_KINDS:
-                response = self.control_plane.handle(request_kind, request)
+                response = _dispatch_control(
+                    self.worker,
+                    self.supported_controls,
+                    request_kind,
+                    request,
+                )
             else:
                 response = dispatch(
                     self.worker,
@@ -379,7 +453,7 @@ class WorkerServer:
                 )
             if request_kind in CONTROL_KINDS:
                 self.metrics.record_control(request_kind, True)
-            return self.execution_pipeline.immediate(response)
+            return PendingResult(response=response)
         except WorkerError as error:
             if request_kind in CONTROL_KINDS:
                 self.metrics.record_control(request_kind, False)
@@ -396,7 +470,7 @@ class WorkerServer:
                 error.op_kind,
                 error.details,
             )
-            return self.execution_pipeline.immediate(error.to_wire())
+            return PendingResult(response=error.to_wire())
         except Exception as error:  # noqa: BLE001 — classify everything else
             logger.exception(
                 "worker request %r raised an unclassified error",
@@ -404,7 +478,7 @@ class WorkerServer:
             )
             worker_error = classify(error, context=request_kind)
             self.metrics.record_error(worker_error.code)
-            return self.execution_pipeline.immediate(worker_error.to_wire())
+            return PendingResult(response=worker_error.to_wire())
 
     def _execute_pipeline(
         self,
@@ -434,12 +508,11 @@ class WorkerServer:
             allow_deferred=allow_deferred,
         )
         wait_started_ns = self.metrics.now_ns()
-        pending = self.execution_pipeline.pending(
-            result=result,
-            batch=batch,
-            wait_start_ns=wait_started_ns,
-        )
+        pending = PendingResult(response={"kind": "result", "result": result})
         has_deferred = _result_has_deferred(result)
+        if has_deferred:
+            pending.batch = batch
+            pending.wait_start_ns = wait_started_ns
         if isinstance(result, dict) and not has_deferred:
             validate_forward_result(
                 result,

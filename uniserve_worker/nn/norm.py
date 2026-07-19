@@ -138,13 +138,27 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self._select_forward_kernel()
+
+    def _select_forward_kernel(self) -> None:
+        from uniserve_worker.ops.providers import select_rms_norm_kernel
+
+        self._forward_kernel = select_rms_norm_kernel(
+            self.weight,
+            self.variance_epsilon,
+        )
+
+    def _apply(self, fn, recurse: bool = True):
+        module = super()._apply(fn, recurse=recurse)
+        self._select_forward_kernel()
+        return module
 
     @property
     def eps(self) -> float:
         return self.variance_epsilon
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return _rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        return self._forward_kernel(hidden_states, self.weight, self.variance_epsilon)
 
     def forward_with_residual(
         self,

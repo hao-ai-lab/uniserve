@@ -6,7 +6,7 @@ import time
 from collections import deque
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from .execution_pipeline import PendingResult
+from .app import PendingResult
 
 if TYPE_CHECKING:
     from .app import WorkerServer

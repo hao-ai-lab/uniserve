@@ -179,11 +179,15 @@ class TextBackendGate:
     def _attention_provider_caps(self, preferred: str | None):
         import uniserve_worker.ops as ops
 
-        from .selector import AttentionBackendSelector
-
-        yield from AttentionBackendSelector(ops.attention_dispatcher()).capability_rows(
-            preferred or "auto"
-        )
+        for provider in ops.attention_dispatcher().ordered(preferred or "auto"):
+            name = str(getattr(provider, "name", type(provider).__name__))
+            if name == "context":
+                continue
+            try:
+                capabilities = provider.capabilities()
+            except Exception:
+                continue
+            yield name, dict(getattr(capabilities, "attrs", {}) or {})
 
     def _head_dim_ok(self, caps) -> bool:
         return self.head_dim >= int(caps.get("min_head_dim", 1) or 1)
