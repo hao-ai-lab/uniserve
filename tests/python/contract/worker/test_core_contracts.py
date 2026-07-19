@@ -230,6 +230,7 @@ class CommitCapabilityModel(ModelHooks):
         state.schedule_cursor = 7
         return {"req_id": req_id, "image_hw": [8, 8]}
 
+
 def test_runner_commit_uses_decode_image_capability_and_resets_state():
     model = CommitCapabilityModel()
     runner = ModelRunner(model, config=RunnerConfig(simulation=True))
@@ -261,6 +262,7 @@ class CommitLogitsCapabilityModel(ModelHooks):
             "logits": torch.tensor([0.0, 2.0, 1.0], dtype=torch.float32),
         }
 
+
 def test_runner_commit_samples_model_logits():
     runner = ModelRunner(
         CommitLogitsCapabilityModel(),
@@ -283,13 +285,7 @@ def test_runner_commit_samples_model_logits():
 
 
 class TextCapabilityModel(ModelHooks):
-    """HF day-zero fallback shape: no system pool, per-op ``run_text_logits_batch``.
-
-    The system :class:`TextDriver` routes a model without a ``kv_cache_spec`` /
-    KV pool through its HF fallback branch and owns the post-model sampler, so
-    this fixture exercises the driver's sampling (masks/logprobs) over raw
-    model logits.
-    """
+    """HF day-zero fallback shape: no system pool, per-op ``run_text_logits_batch``."""
 
     resource_classes: tuple[str, ...] = ()
     device = "cpu"
@@ -366,7 +362,7 @@ def _thin_text_runner(model):
     )
 
 
-def test_runner_text_uses_text_driver_for_sampling_masks_and_logprobs():
+def test_runner_text_applies_sampling_masks_and_logprobs():
     model = TextCapabilityModel()
     runner = ModelRunner(model, config=RunnerConfig(simulation=True))
 

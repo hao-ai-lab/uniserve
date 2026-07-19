@@ -8,6 +8,7 @@ the operation lifecycle.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, Sequence
 
@@ -17,7 +18,6 @@ import uniserve_worker.ops as ops
 from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPlan
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
 from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
-from uniserve_worker.execution.runner import PreparedFlowStep, flow_cfg_branch_count
 from uniserve_worker.execution.sequence import SequenceCache
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
 from uniserve_worker.nn.attention import RadixAttention
@@ -28,6 +28,7 @@ from uniserve_worker.nn.diffusion import (
     init_latent,
 )
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
+from uniserve_worker.nn.diffusion.cfg import CfgPlan as DiffusionCfgPlan
 from uniserve_worker.nn.vision import patchify_batch, unpatchify_batch
 from uniserve_worker.runtime.image_params import (
     TextImageGenerationParams as _ImageParams,
@@ -48,6 +49,79 @@ logger = logging.getLogger(__name__)
 # Keep graph-resident activation pools bounded while retaining useful GEMM
 # batching: one graph microbatch covers two full three-branch CFG requests.
 _MAX_GRAPH_ROWS = 6
+
+
+@dataclass(frozen=True)
+class PreparedFlowStep:
+    """Model/runtime boundary for one scheduled denoise update."""
+
+    req_id: int
+    state: Any
+    op: Mapping[str, Any]
+    latent: torch.Tensor
+    t: torch.Tensor
+    t_next: torch.Tensor
+    step_index: int
+    total_steps: int
+    cfg_text_scale: float
+    cfg_img_scale: float
+    cfg_interval: tuple[float, float]
+    cfg_renorm_type: str
+    cfg_renorm_min: float
+    cfg_branch_count: int | None = None
+    image_scale_applies_to_text: CfgRecipe = CfgRecipe.ADDITIVE_DELTAS
+    extra: Any = None
+
+    def __post_init__(self) -> None:
+        recipe = CfgRecipe.coerce(self.image_scale_applies_to_text)
+        if recipe is not self.image_scale_applies_to_text:
+            object.__setattr__(self, "image_scale_applies_to_text", recipe)
+        if self.cfg_branch_count is not None:
+            branch_count = int(self.cfg_branch_count)
+            if branch_count < 1:
+                raise ValueError("cfg_branch_count must be >= 1")
+            object.__setattr__(self, "cfg_branch_count", branch_count)
+
+
+def flow_cfg_plan(step: PreparedFlowStep) -> DiffusionCfgPlan:
+    """Resolve the branches and weights for one prepared denoise step."""
+
+    if step.cfg_branch_count == 1:
+        return DiffusionCfgPlan(branches=(Branch.COND,))
+    t_value = float(step.t.detach().float().item())
+    lo, hi = step.cfg_interval
+    return build_flow_cfg_plan(
+        cfg_text_scale=step.cfg_text_scale,
+        cfg_img_scale=step.cfg_img_scale,
+        recipe=step.image_scale_applies_to_text,
+        renorm=step.cfg_renorm_type,
+        renorm_min=step.cfg_renorm_min,
+        use_cfg=lo <= t_value <= hi,
+    )
+
+
+def flow_branches(step: PreparedFlowStep) -> tuple[str, ...]:
+    return flow_cfg_plan(step).branches
+
+
+def flow_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
+    cfg = op.get("cfg")
+    if not isinstance(cfg, Mapping) or cfg.get("branch_count") is None:
+        return None
+    try:
+        branch_count = int(cfg["branch_count"])
+    except (TypeError, ValueError) as exc:
+        raise invalid_descriptor("cfg.branch_count must be a positive integer") from exc
+    if branch_count < 1:
+        raise invalid_descriptor("cfg.branch_count must be a positive integer")
+    return branch_count
+
+
+def combine_flow_velocity(
+    step: PreparedFlowStep,
+    outputs: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    return flow_cfg_plan(step).combine(outputs)
 
 
 class _GraphBackendUnplanned(RuntimeError):

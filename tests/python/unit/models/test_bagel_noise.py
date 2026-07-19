@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.runner import FlowSession, PreparedFlowStep
+from uniserve_worker.execution.flow import PreparedFlowStep
 from uniserve_worker.models.bagel import (
     BagelConfig,
     BagelForUnifiedGeneration,
@@ -105,7 +105,7 @@ def test_bagel_initial_noise_keeps_exact_cpu_float32_values():
         ),
     ],
 )
-def test_bagel_euler_update_keeps_fp32_state_and_matches_reference_arithmetic(device):
+def test_bagel_flow_update_keeps_fp32_state_and_matches_reference_arithmetic(device):
     owner = BagelForUnifiedGeneration(config=BagelConfig(), device=device)
     latent = owner._init_generation_noise((2, 3), seed=7)
     velocity = torch.tensor(
@@ -134,15 +134,7 @@ def test_bagel_euler_update_keeps_fp32_state_and_matches_reference_arithmetic(de
         extra={"gs": generation_state},
     )
 
-    session = FlowSession(
-        owner,
-        step,
-        combine_velocity=lambda _step, values: values["cond"],
-        accept_update=lambda model, current_step, updated: model.apply_flow_update(
-            current_step, updated
-        ),
-    )
-    session.apply_update({"cond": velocity})
+    owner.apply_flow_update(step, euler_step(latent, velocity, t, t_next))
 
     assert generation_state.x_t.dtype == torch.float32
     assert torch.equal(generation_state.x_t, expected)

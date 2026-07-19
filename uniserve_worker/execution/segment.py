@@ -32,6 +32,7 @@ from uniserve_worker.contracts.forward_batch import (
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.outputs import TextTokenOutput
+from uniserve_worker.execution.flow import PreparedFlowStep, flow_branches, flow_cfg_plan
 from uniserve_worker.execution.graph.bucket import padding_blocks
 from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
 from uniserve_worker.execution.graph.executor import backend_name
@@ -39,11 +40,8 @@ from uniserve_worker.execution.runner import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
     DeferredTextSeqResult,
-    FlowExecutor,
-    PreparedFlowStep,
     TextDecodeRelay,
-    flow_branches,
-    flow_cfg_plan,
+    _execute_required_denoise,
     sample_logits_result,
 )
 from uniserve_worker.execution.sequence import hydrate_cached_prefix_from_op
@@ -2925,7 +2923,7 @@ class SegmentExecutor(SegmentRuntime):
             items.append((req_id, request_states.get(req_id), followup))
         if not items:
             return
-        outputs = FlowExecutor().step_many(items, self.adapter, graph_mode="require")
+        outputs = _execute_required_denoise(items, self.adapter)
         for row_index, output in zip(row_indexes, outputs, strict=True):
             results[row_index] = output
 
