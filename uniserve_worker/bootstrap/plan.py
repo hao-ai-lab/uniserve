@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..contracts.model_load import ModelLoadScope
+from ..contracts.model_family import ModelLoadScope
 from ..server.worker_kind import WorkerKind
 from ..worker.protocol import ResultPolicy
 

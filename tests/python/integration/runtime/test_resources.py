@@ -48,11 +48,11 @@ def test_drop_request_leaves_no_resident_state():
 
 
 def test_model_runner_default_resource_runtime_enforces_model_totals():
-    from uniserve_worker.contracts.model_protocols import ModelHooks
+    from uniserve_worker.contracts.model_protocols import UniModel
     from uniserve_worker.contracts.resource_plan import ResourcePlan
     from uniserve_worker.execution import ModelRunner, RunnerConfig
 
-    class TinyBlockModel(ModelHooks):
+    class TinyBlockModel(UniModel):
         resource_plan = ResourcePlan(kv_block="per_block")
         num_blocks = 1
 

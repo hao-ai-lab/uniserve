@@ -12,7 +12,7 @@ import torch
 from ...foundation.sizing import ceil_div
 
 if TYPE_CHECKING:
-    from ...contracts.forward_stats import ForwardStats
+    from ...contracts.forward_context import ForwardStats
     from .flashinfer_pool import WrapperKey
 
 

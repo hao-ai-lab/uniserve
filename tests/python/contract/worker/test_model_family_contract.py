@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve_worker.contracts import OperationTag
 from uniserve_worker.contracts.model_family import (
     FamilyExecutionContract,
     ModelFamilyDescriptor,
     ModelOperationSet,
 )
-from uniserve_worker.contracts.operations import OperationTag
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration
 from uniserve_worker.models.cache_registrations import qwen3_cache_registration

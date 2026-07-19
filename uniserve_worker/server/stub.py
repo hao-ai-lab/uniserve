@@ -7,8 +7,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from ..contracts.batch_policy import BatchPolicy
-from ..contracts.forward_batch import ForwardBatch
+from ..contracts.forward_batch import BatchPolicy, ForwardBatch
 from ..contracts.forward_mode import ForwardMode
 from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (

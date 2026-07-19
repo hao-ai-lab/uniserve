@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import torch
 
-from uniserve_worker.contracts.model_protocols import ModelHooks
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.execution import ModelRunner, RunnerConfig
 from uniserve_worker.execution.sequence import resolve_op_token_ids
 
 
-class _ScriptedTextModel(ModelHooks):
+class _ScriptedTextModel(UniModel):
     """Self-managed text model whose argmax follows a scripted token sequence."""
 
     resource_classes: tuple[str, ...] = ()

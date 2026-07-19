@@ -26,8 +26,7 @@ import hashlib
 from dataclasses import dataclass, fields
 from enum import IntEnum
 
-from .execution import EngineRef, SessionRef
-from .operations import OperationTag
+from .execution import EngineRef, OperationTag, SessionRef
 
 __all__ = [
     "NO_CACHE_DOMAIN",

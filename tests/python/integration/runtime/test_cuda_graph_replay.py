@@ -31,10 +31,10 @@ from uniserve_worker.contracts.attention_plan import (
 from uniserve_worker.contracts.forward_batch import ForwardBatch
 from uniserve_worker.contracts.forward_context import (
     ForwardContext,
+    ForwardStats,
     use_forward_context,
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.contracts.forward_stats import ForwardStats
 from uniserve_worker.execution.graph import Executor, span, step
 from uniserve_worker.execution.graph.capture import (
     _reset_for_testing,

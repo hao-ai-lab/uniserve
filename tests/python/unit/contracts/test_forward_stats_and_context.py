@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve_worker.contracts import ForwardStats
 from uniserve_worker.contracts.forward_context import (
     ForwardContext,
     component_timer_start,
@@ -24,7 +25,6 @@ from uniserve_worker.contracts.forward_context import (
     record_component_elapsed,
     use_forward_context,
 )
-from uniserve_worker.contracts.forward_stats import ForwardStats
 
 pytestmark = [pytest.mark.unit]
 

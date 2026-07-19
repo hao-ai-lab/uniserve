@@ -11,13 +11,12 @@ from typing import Any
 
 import torch
 
-from uniserve_worker.contracts.batch_policy import BatchPolicy
+from uniserve_worker.contracts import BatchPolicy, UniModel
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints
-from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.resource_plan import LatentTokens, PerBranch, ResourcePlan
 
 
-class UniServeZeroDayCfgZeroStarModel(ModelHooks):
+class UniServeZeroDayCfgZeroStarModel(UniModel):
     architectures = ("UniServeZeroDayCfgZeroStarModel",)
     supported_ops = ("denoise_gen",)
     supported_controls: tuple[str, ...] = ()

@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from uniserve_worker.contracts.model_protocols import ModelHooks
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.execution import ModelRunner, RunnerConfig
 
 pytestmark = pytest.mark.unit
 
 
-class RecordingVelocityModel(ModelHooks):
+class RecordingVelocityModel(UniModel):
     supported_ops = ("denoise_gen",)
     device = "cpu"
 
@@ -26,7 +26,7 @@ class RecordingVelocityModel(ModelHooks):
         return torch.full_like(latent, float(branch.rsplit("_", 1)[-1]))
 
 
-def _runner(model: ModelHooks) -> ModelRunner:
+def _runner(model: UniModel) -> ModelRunner:
     return ModelRunner(model, config=RunnerConfig(simulation=True))
 
 

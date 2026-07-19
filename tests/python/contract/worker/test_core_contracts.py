@@ -5,9 +5,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.contracts.caps import validate_caps, validate_forward_result
 from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
-from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.op_kinds import OP_KIND_TABLE, OP_KINDS
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution import ModelRunner, RunnerConfig
@@ -215,7 +215,7 @@ def test_paged_kv_pool_fp8_storage_dequantizes_dense_reads():
     assert exc.value.code == ErrorCode.CAPABILITY_MISMATCH
 
 
-class CommitCapabilityModel(ModelHooks):
+class CommitCapabilityModel(UniModel):
     resource_classes: tuple[str, ...] = ()
 
     def __init__(self) -> None:
@@ -251,7 +251,7 @@ def test_runner_commit_uses_decode_image_capability_and_resets_state():
     assert state.schedule_cursor == 0
 
 
-class CommitLogitsCapabilityModel(ModelHooks):
+class CommitLogitsCapabilityModel(UniModel):
     resource_classes: tuple[str, ...] = ()
 
     def decode_image(self, latent, *, req_id, state, op):
@@ -284,7 +284,7 @@ def test_runner_commit_samples_model_logits():
     assert "logits" not in seq
 
 
-class TextCapabilityModel(ModelHooks):
+class TextCapabilityModel(UniModel):
     """HF day-zero fallback shape: no system pool, per-op ``run_text_logits_batch``."""
 
     resource_classes: tuple[str, ...] = ()
@@ -303,7 +303,7 @@ class TextCapabilityModel(ModelHooks):
         return out
 
 
-class ThinTextModel(ModelHooks):
+class ThinTextModel(UniModel):
     """Thin system-managed text model: declares KV geometry, takes a ForwardBatch.
 
     The system (``ForwardBatchBuilder`` + ``ResidencyManager``) owns the pool and

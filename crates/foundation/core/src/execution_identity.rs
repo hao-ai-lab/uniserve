@@ -27,44 +27,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Exact new-major wire schema for the target worker protocol (dormant).
-///
-/// Values and version semantics are pinned here and mirrored by
-/// `uniserve_worker/contracts/execution_wire.py`; the canonical JSON
-/// encoding (struct declaration order, `deny_unknown_fields`) is the
-/// cross-language envelope until the FlatBuffers transport lands with the
-/// Stage 10 cutover. Unknown schema majors and unknown fields fail closed.
-pub const EXECUTION_WIRE_SCHEMA_MAJOR: u32 = 1;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutionWireEnvelope {
-    pub schema_major: u32,
-    pub batch: ExecExecuteBatch,
-}
-
-/// Encode one batch into the canonical wire envelope.
-pub fn encode_execute_batch(batch: &ExecExecuteBatch) -> String {
-    serde_json::to_string(&ExecutionWireEnvelope {
-        schema_major: EXECUTION_WIRE_SCHEMA_MAJOR,
-        batch: batch.clone(),
-    })
-    .expect("wire values always serialize")
-}
-
-/// Decode one envelope, failing closed on unknown majors or fields.
-pub fn decode_execute_batch(wire: &str) -> Result<ExecExecuteBatch, String> {
-    let envelope: ExecutionWireEnvelope =
-        serde_json::from_str(wire).map_err(|error| error.to_string())?;
-    if envelope.schema_major != EXECUTION_WIRE_SCHEMA_MAJOR {
-        return Err(format!(
-            "unsupported execution wire schema {}; this build supports {}",
-            envelope.schema_major, EXECUTION_WIRE_SCHEMA_MAJOR
-        ));
-    }
-    Ok(envelope.batch)
-}
-
 /// Sealed operation tags shared with the Python contract and the program
 /// algebra; adding a variant is a cross-language protocol change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,46 +425,6 @@ mod tests {
                 "fingerprint drift for shared vector {name}"
             );
         }
-    }
-
-    #[test]
-    fn wire_envelope_round_trips_and_matches_the_pinned_encoding() {
-        const FIXTURE: &str = include_str!("../../../protocol/vocab/execution_wire.json");
-        let pinned: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(FIXTURE).expect("valid fixture");
-        assert!(!pinned.is_empty());
-        for (name, wire) in &pinned {
-            let batch = shared_vector(name);
-            assert_eq!(
-                &encode_execute_batch(&batch),
-                wire,
-                "wire encoding drift for shared vector {name}"
-            );
-            assert_eq!(
-                decode_execute_batch(wire).expect("decodes"),
-                batch,
-                "wire decode drift for shared vector {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn wire_decoding_fails_closed() {
-        let batch = shared_vector("single_sequence_row");
-        let wire = encode_execute_batch(&batch);
-        // Unknown schema major.
-        let future = wire.replace("\"schema_major\":1", "\"schema_major\":9");
-        assert!(
-            decode_execute_batch(&future)
-                .unwrap_err()
-                .contains("unsupported execution wire schema")
-        );
-        // Unknown field.
-        let extended = wire.replace(
-            "\"engine_epoch\":7,\"step_id\"",
-            "\"engine_epoch\":7,\"surprise\":1,\"step_id\"",
-        );
-        assert!(decode_execute_batch(&extended).is_err());
     }
 
     #[test]

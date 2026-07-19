@@ -9,9 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from ..contracts.model_family import ModelFamilyDescriptor
-from ..contracts.model_load import ModelLoadScope
-from ..contracts.model_protocols import UniModel, verify_model_conformance
+from ..contracts.model_family import ModelFamilyDescriptor, ModelLoadScope
+from ..contracts.model_protocols import UniModel
 from ..foundation.errors import capability_mismatch
 from ..loader import ModelBringUp, get_loader_for_descriptor
 from ..loader.paths import read_config, resolve_model_path
@@ -127,10 +126,8 @@ def _load_via_model(
 
 
 def _check_model_conformance(model: UniModel) -> None:
-    violations = verify_model_conformance(model)
-    if violations:
-        details = "\n  - ".join(violations)
-        raise capability_mismatch(f"{type(model).__name__} fails model conformance:\n  - {details}")
+    if not isinstance(model, UniModel):
+        raise capability_mismatch(f"{type(model).__name__} must inherit UniModel")
 
 
 def _configure_model_tokenizer(model: UniModel, model_path: str) -> None:

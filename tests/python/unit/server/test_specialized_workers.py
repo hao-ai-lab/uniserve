@@ -12,8 +12,8 @@ import base64
 import pytest
 import torch
 
+from uniserve_worker.contracts import UniModel
 from uniserve_worker.contracts.caps import validate_caps
-from uniserve_worker.contracts.model_protocols import ModelHooks
 from uniserve_worker.contracts.outputs import EncodeOutput
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.tensor_store import TensorStore
@@ -91,7 +91,7 @@ def test_frame_accumulator_worker_counts_and_releases_frames():
     assert status["frames"] == 2
 
 
-class _FakeVisionModel(ModelHooks):
+class _FakeVisionModel(UniModel):
     num_layers = 2
     max_latent_size = 0
     latent_downsample = 1
