@@ -30,10 +30,12 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyModule};
+use pyo3::types::{PyAny, PyDict, PyModule};
 use pythonize::{depythonize, pythonize};
 use uniserve_worker_ipc_core::ServerEndpoint;
-use uniserve_worker_wire::WorkerResponse;
+use uniserve_worker_wire::{WorkerRequest, WorkerResponse};
+
+const VALIDATED_ENVELOPE_KEY: &str = "_native_envelope_validated";
 
 #[pyclass(name = "Server")]
 struct PyServer {
@@ -65,9 +67,7 @@ impl PyServer {
         let req = result.map_err(|err: anyhow::Error| {
             py_runtime(format!("failed to receive IPC request: {err:#}"))
         })?;
-        let obj = pythonize(py, &req)
-            .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
-        Ok(obj.unbind())
+        pythonize_request(py, &req)
     }
 
     fn try_recv(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
@@ -88,9 +88,7 @@ impl PyServer {
         else {
             return Ok(None);
         };
-        let obj = pythonize(py, &req)
-            .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
-        Ok(Some(obj.unbind()))
+        Ok(Some(pythonize_request(py, &req)?))
     }
 
     fn respond(&self, py: Python<'_>, response: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -105,6 +103,19 @@ impl PyServer {
         result.map_err(|err| py_runtime(format!("failed to send IPC response: {err:#}")))?;
         Ok(())
     }
+}
+
+fn pythonize_request(py: Python<'_>, request: &WorkerRequest) -> PyResult<Py<PyAny>> {
+    let object = pythonize(py, request)
+        .map_err(|err| py_runtime(format!("failed to pythonize IPC request: {err}")))?;
+    if request.batch.is_some()
+        && let Ok(request_dict) = object.cast::<PyDict>()
+        && let Some(batch) = request_dict.get_item("batch")?
+        && let Ok(batch_dict) = batch.cast::<PyDict>()
+    {
+        batch_dict.set_item(VALIDATED_ENVELOPE_KEY, true)?;
+    }
+    Ok(object.unbind())
 }
 
 impl PyServer {

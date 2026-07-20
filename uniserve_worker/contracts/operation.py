@@ -306,6 +306,19 @@ class OperationEnvelope(Mapping[str, Any]):
             payload=MappingProxyType(dict(operation)),
         )
 
+    @classmethod
+    def from_validated_wire(cls, operation: Mapping[str, Any]) -> OperationEnvelope:
+        """Wrap an envelope already validated by the native IPC decoder."""
+        return cls(
+            session_id=int(operation["req_id"]),
+            epoch=int(operation["epoch"]),
+            op_id=int(operation["op_id"]),
+            base_version=int(operation["base_version"]),
+            digest=str(operation["digest"]),
+            operation=_OPERATION_CLASSES[operation["kind"]],
+            payload=MappingProxyType(dict(operation)),
+        )
+
     def __getitem__(self, key: str) -> Any:
         return self.payload[key]
 

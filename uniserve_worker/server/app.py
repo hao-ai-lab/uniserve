@@ -87,6 +87,9 @@ SEQ_RESULT_FIELDS = (
     "num_tokens",
     "num_accepted_tokens",
     "op_id",
+    "epoch",
+    "base_version",
+    "result_version",
     "logits_handle",
     "locator",
 )

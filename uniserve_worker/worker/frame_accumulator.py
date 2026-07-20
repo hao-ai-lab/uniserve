@@ -5,26 +5,20 @@ from __future__ import annotations
 import base64
 import binascii
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 from typing import Any
 
+from ..contracts.batches import Batch
 from ..contracts.outputs import FrameOutput
+from ..execution.operation_executor import OperationExecutor
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
+from ..runtime.product_store import ProductStore
+from ..runtime.request_session import SessionStore
 from .protocol import (
     BaseWorker,
     ResultPolicy,
     model_free_capabilities,
 )
-
-
-@dataclass
-class _RequestFrameBuffer:
-    frames: list[bytes] = field(default_factory=list)
-
-    def append(self, frame: bytes) -> int:
-        self.frames.append(frame)
-        return len(self.frames)
 
 
 class FrameAccumulatorWorker(BaseWorker):
@@ -39,7 +33,14 @@ class FrameAccumulatorWorker(BaseWorker):
         block_size: int = DEFAULT_BLOCK_SIZE,
     ) -> None:
         super().__init__(block_size=block_size)
-        self._frame_buffers: dict[int, _RequestFrameBuffer] = {}
+        self.sessions = SessionStore()
+        self.products = ProductStore()
+        self.executor = OperationExecutor(
+            self.sessions,
+            self._execute_once,
+            admit=self._admit,
+            stores=(self.products,),
+        )
         self._compile_contract(
             model_free_capabilities(
                 block_size=self.block_size,
@@ -56,33 +57,51 @@ class FrameAccumulatorWorker(BaseWorker):
         *,
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
+        return self.executor.execute(
+            batch,
+            defer_text_cpu_results=defer_text_cpu_results,
+        )
+
+    def _execute_once(
+        self,
+        batch: Batch,
+        *,
+        defer_text_cpu_results: bool = False,
+    ) -> dict[str, Any]:
         del defer_text_cpu_results
-        operations = batch.get("ops") or []
         return {
-            "step_id": batch.get("step_id"),
-            "per_seq": [self._append_frame(operation) for operation in operations],
+            "step_id": batch.step_id,
+            "per_seq": [self._append_frame(operation) for operation in batch.ops],
         }
 
     def drop_request(self, request_id: int) -> None:
         self.release_request_frames(int(request_id))
+        self.sessions.drop(int(request_id))
 
     def release_request_frames(self, request_id: int) -> dict[str, Any]:
-        frame_buffer = self._frame_buffers.pop(int(request_id), None)
         return {
             "req_id": int(request_id),
-            "frames": (0 if frame_buffer is None else len(frame_buffer.frames)),
+            "frames": self.products.release_frames(int(request_id)),
         }
+
+    def _admit(self, batch: Batch) -> None:
+        operations = {operation.session_id: operation for operation in batch.ops}
+        for new_request in batch.new_reqs:
+            request_id = int(new_request["req_id"])
+            operation = operations[request_id]
+            self.sessions.admit(
+                request_id,
+                new_request,
+                epoch=operation.epoch,
+                base_version=operation.base_version,
+            )
 
     def _append_frame(
         self,
         operation: Mapping[str, Any],
     ) -> dict[str, Any]:
         request_id = int(operation["req_id"])
-        frame_buffer = self._frame_buffers.setdefault(
-            request_id,
-            _RequestFrameBuffer(),
-        )
-        frame_count = frame_buffer.append(self._decode_frame(operation))
+        frame_count = self.products.append_frame(request_id, self._decode_frame(operation))
         return FrameOutput(
             req_id=request_id,
             num_tokens=frame_count,

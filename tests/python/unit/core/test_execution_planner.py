@@ -13,9 +13,11 @@ from uniserve_worker.contracts.forward_batch import ForwardBatch
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution import ExecutorConfig, ModelExecutor
+from uniserve_worker.execution.operation_executor import OperationExecutor
 from uniserve_worker.execution.runner import text_input_id_replacements_from_relays
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
+from uniserve_worker.runtime.request_session import SessionStore
 from uniserve_worker.runtime.request_state import RequestStateTable
 from uniserve_worker.runtime.tensor_staging import TextTensorStager, stage_text_forward_batch
 
@@ -407,6 +409,51 @@ def test_thin_text_runs_per_op_through_system_forward_and_samples():
     assert model.input_values == [[5], [6]]
     # KV-length advance is system-owned (lane "text").
     assert runner.sessions.get(1).kv_lengths["text"] == 1
+
+
+def test_deferred_result_preserves_operation_version_through_finalization_and_replay():
+    sessions = SessionStore()
+    effects: list[int] = []
+
+    class DeferredResult:
+        req_id = 1
+
+        def finalize(self):
+            return {"req_id": 1, "sampled_token_id": 7}
+
+    def admit(parsed):
+        operation = parsed.ops[0]
+        sessions.admit(
+            1,
+            parsed.new_reqs[0],
+            epoch=operation.epoch,
+            base_version=operation.base_version,
+        )
+
+    def effect(parsed, *, defer_text_cpu_results=False):
+        effects.append(parsed.step_id)
+        assert defer_text_cpu_results
+        return {"step_id": parsed.step_id, "per_seq": [DeferredResult()]}
+
+    executor = OperationExecutor(sessions, effect, admit=admit)
+    batch = seal_batch(
+        11,
+        [{"req_id": 1, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}],
+        new_reqs=[{"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}}],
+    )
+
+    first = executor.execute(batch, defer_text_cpu_results=True)
+    replay = executor.execute(batch, defer_text_cpu_results=True)
+    first_result = first["per_seq"][0].finalize()
+    replay_result = replay["per_seq"][0].finalize()
+
+    assert replay_result == first_result
+    assert first_result["sampled_token_id"] == 7
+    assert first_result["op_id"] == batch["ops"][0]["op_id"]
+    assert first_result["epoch"] == 1
+    assert first_result["base_version"] == 0
+    assert first_result["result_version"] == 1
+    assert effects == [11]
 
 
 def test_per_op_decode_consumes_last_sampled_relay_token(monkeypatch):
