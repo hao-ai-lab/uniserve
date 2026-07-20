@@ -44,6 +44,31 @@ def png_size(data: bytes) -> tuple[int, int]:
     return int(width), int(height)
 
 
+def verify_image_channel_dominance(
+    images: list[dict[str, Any]],
+    expectation: Any,
+) -> None:
+    if not isinstance(expectation, list) or len(expectation) != 2:
+        raise SystemExit("expect_image_channel_dominance must name two RGB channels")
+    channels = {"red": 0, "green": 1, "blue": 2}
+    higher, lower = (str(value).lower() for value in expectation)
+    if higher not in channels or lower not in channels or higher == lower:
+        raise SystemExit("expect_image_channel_dominance must name two distinct RGB channels")
+
+    from PIL import Image, ImageStat
+
+    for image in images:
+        path = image.get("path")
+        if not isinstance(path, str):
+            raise SystemExit("generated image metadata is missing its artifact path")
+        with Image.open(path) as loaded:
+            means = ImageStat.Stat(loaded.convert("RGB")).mean
+        if means[channels[higher]] <= means[channels[lower]]:
+            raise SystemExit(
+                f"expected image mean {higher} channel to exceed {lower}: {path}"
+            )
+
+
 def synthetic_png_b64(seed: int, width: int, height: int) -> str:
     """Deterministic geometric test scene (mirrors the benchmark harness's)."""
     import io
@@ -356,3 +381,6 @@ def verify(args: argparse.Namespace) -> None:
         for image in images:
             if tuple(image["size"]) != (int(expected_w), int(expected_h)):
                 raise SystemExit(f"unexpected image size: {image}")
+    expected_channel_dominance = workload.get("expect_image_channel_dominance")
+    if expected_channel_dominance is not None:
+        verify_image_channel_dominance(images, expected_channel_dominance)

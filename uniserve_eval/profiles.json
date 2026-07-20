@@ -300,6 +300,10 @@
       "expect_images": 1,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
+      "expect_image_channel_dominance": [
+        "red",
+        "blue"
+      ],
       "description": "SenseNova chat image correctness gate."
     },
     "gate/sensenova/i2t-house": {

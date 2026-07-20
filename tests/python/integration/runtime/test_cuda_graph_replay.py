@@ -948,7 +948,7 @@ def test_padded_max_tokens_isolates_padding_from_cached_prefix():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_prefill_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
+def test_prefill_graph_avoids_recapture_for_a_smaller_followup():
     device = torch.device("cuda")
     torch.manual_seed(7)
     model = _LinearLogitsModel(device, seed=7)
@@ -992,11 +992,51 @@ def test_prefill_graph_pads_short_batch_to_bucket_and_returns_unpadded_rows():
     assert out is not None
     assert tuple(out.shape) == (3, _VOCAB)
     torch.testing.assert_close(out, reference)
-    assert (8, 4, 32) in runner.states
     assert stats.cuda_graph_captures == 1
     assert stats.cuda_graph_replays == 1
     assert stats.cuda_graph_unpadded_tokens == 6
     assert stats.cuda_graph_padded_tokens == 2
+
+    followup_ids = torch.tensor([17, 19], dtype=torch.long, device=device)
+    followup_positions = torch.arange(5, 7, dtype=torch.long, device=device)
+    followup_plan = _prefill_plan(
+        pool,
+        block_ids_by_row=[[6, 7, 8, 9]],
+        cache_seqlens_cpu=(5,),
+        query_lens_cpu=(2,),
+        device=device,
+        max_context_len=32,
+    )
+    followup_last_token = torch.tensor([1], dtype=torch.long, device=device)
+    followup_reference = model.logits(followup_ids, followup_positions).index_select(
+        0, followup_last_token
+    )
+
+    followup = runner.maybe_run(
+        kv_pool=pool,
+        num_blocks=32,
+        num_tokens=2,
+        max_kv_tokens=32,
+        batch_size=1,
+        input_ids=followup_ids,
+        positions=followup_positions,
+        attention_plan=followup_plan,
+        last_token_indices=followup_last_token,
+        raw_num_tokens=2,
+        ctx=ForwardContext(stats=stats),
+        forward_fn=lambda state: model.logits(
+            state.input_ids, state.positions
+        ).index_select(0, state.last_token_indices),
+    )
+    torch.cuda.synchronize()
+
+    assert followup is not None
+    assert tuple(followup.shape) == (1, _VOCAB)
+    torch.testing.assert_close(followup, followup_reference)
+    assert stats.cuda_graph_captures == 1
+    assert stats.cuda_graph_replays == 2
+    assert stats.cuda_graph_unpadded_tokens == 8
+    assert stats.cuda_graph_padded_tokens == 8
 
 
 # --------------------------------------------------------------------------- #

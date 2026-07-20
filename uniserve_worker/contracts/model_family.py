@@ -4,14 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 from ..foundation.errors import WorkerError, capability_mismatch
-from .execution import OperationTag
 from .forward_mode import ForwardMode, mode_for_op
-
-if TYPE_CHECKING:
-    from .cache_schema import FamilyCacheRegistration
 
 __all__ = [
     "FamilyExecutionContract",
@@ -43,7 +39,6 @@ class ModelOperation:
     """One declared operation and its canonical family-adapter method."""
 
     kind: str
-    tag: OperationTag
     adapter_method: str
 
     @classmethod
@@ -53,15 +48,15 @@ class ModelOperation:
         except WorkerError as exc:
             raise capability_mismatch(f"model declares unknown op {kind!r}") from exc
         if mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}:
-            return cls(str(kind), OperationTag.SEQUENCE_STEP, "forward")
+            return cls(str(kind), "forward")
         if mode is ForwardMode.DENOISE:
-            return cls(str(kind), OperationTag.FLOW_STEP, "predict_velocity")
+            return cls(str(kind), "predict_velocity")
         if mode is ForwardMode.COMMIT:
-            return cls(str(kind), OperationTag.MATERIALIZE_STEP, "decode_image")
+            return cls(str(kind), "decode_image")
         if mode is ForwardMode.ENCODE and kind == "vit_encode":
-            return cls(str(kind), OperationTag.ENCODE_STEP, "encode_image")
+            return cls(str(kind), "encode_image")
         if mode is ForwardMode.ENCODE and kind == "vae_encode":
-            return cls(str(kind), OperationTag.ENCODE_STEP, "encode_latents")
+            return cls(str(kind), "encode_latents")
         raise capability_mismatch(f"model operation {kind!r} has no family-adapter method")
 
 
@@ -84,11 +79,6 @@ class ModelOperationSet:
     def supported_ops(self) -> tuple[str, ...]:
         return tuple(operation.kind for operation in self.operations)
 
-    def operation_tags(self) -> frozenset[OperationTag]:
-        """Return the general operation algebra advertised by this family."""
-
-        return frozenset(operation.tag for operation in self.operations)
-
     def validate(self, model_cls: type) -> None:
         if not self.operations:
             return
@@ -100,47 +90,13 @@ class ModelOperationSet:
 
 @dataclass(frozen=True)
 class FamilyExecutionContract:
-    """Closed operation vocabulary and cache lowering for one model family."""
+    """Closed operation vocabulary for one model family."""
 
     operations: ModelOperationSet
-    cache_registration_factory: Callable[..., FamilyCacheRegistration] | None
 
     @classmethod
     def from_model_class(cls, model_cls: type) -> "FamilyExecutionContract":
-        factory = getattr(model_cls, "cache_registration_factory", None)
-        if factory is not None and not callable(factory):
-            raise capability_mismatch(
-                f"{model_cls.__name__}.cache_registration_factory must be callable"
-            )
-        return cls(
-            operations=ModelOperationSet.from_model_class(model_cls),
-            cache_registration_factory=factory,
-        )
-
-    @property
-    def operation_tags(self) -> frozenset[OperationTag]:
-        return self.operations.operation_tags()
-
-    def build_cache_registration(
-        self,
-        *,
-        family: str,
-        **geometry: int,
-    ) -> FamilyCacheRegistration:
-        """Build and prove the family's cache schema covers exactly its operations."""
-
-        factory = self.cache_registration_factory
-        if factory is None:
-            raise capability_mismatch(f"model family {family!r} has no cache registration factory")
-        registration = factory(**geometry)
-        lowerable = frozenset(region.operation_tag for region in registration.schema.regions)
-        if lowerable != self.operation_tags:
-            raise capability_mismatch(
-                f"model family {family!r} advertises "
-                f"{sorted(tag.name for tag in self.operation_tags)} but its cache schema "
-                f"lowers {sorted(tag.name for tag in lowerable)}"
-            )
-        return registration
+        return cls(operations=ModelOperationSet.from_model_class(model_cls))
 
 
 @dataclass(frozen=True)
@@ -178,13 +134,6 @@ class ModelFamilyDescriptor:
     @property
     def operation_set(self) -> ModelOperationSet:
         return self.execution.operations
-
-    @property
-    def operation_tags(self) -> frozenset[OperationTag]:
-        return self.execution.operation_tags
-
-    def build_cache_registration(self, **geometry: int) -> FamilyCacheRegistration:
-        return self.execution.build_cache_registration(family=self.family, **geometry)
 
     def matches_model(self, model_cls: type) -> bool:
         names = {model_cls.__name__, *[str(v) for v in getattr(model_cls, "architectures", ())]}

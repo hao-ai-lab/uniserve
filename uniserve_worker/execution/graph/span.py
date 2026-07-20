@@ -325,7 +325,17 @@ class Runner(Capture):
     ) -> torch.Tensor | None:
         """Capture-or-replay an initial-prefill bucket; ``None`` on miss/fallback."""
 
-        graph_batch_size = self.resolve_batch_size(num_tokens, int(batch_size), max_kv_tokens)
+        resident = self._resident_capacity(
+            raw_num_tokens=int(raw_num_tokens),
+            batch_size=int(batch_size),
+            attention_plan=attention_plan,
+        )
+        if resident is not None:
+            num_tokens, graph_batch_size, max_kv_tokens = resident
+        else:
+            graph_batch_size = self.resolve_batch_size(
+                num_tokens, int(batch_size), max_kv_tokens
+            )
         graph_key = self.state_key(num_tokens, graph_batch_size, max_kv_tokens)
         if graph_key not in self.states and self.warmup_enabled():
             self.record_stats(
@@ -398,6 +408,32 @@ class Runner(Capture):
             after_copy=lambda state: self._prepare(state, ctx, prepare_backend),
             after_copy_metric=f"{self.metric_prefix}span_attention_prepare",
         )
+
+    def _resident_capacity(
+        self,
+        *,
+        raw_num_tokens: int,
+        batch_size: int,
+        attention_plan: PagedVarlenPlan,
+    ) -> tuple[int, int, int] | None:
+        candidates = []
+        for key in self.states:
+            state_tokens, state_batch_size, state_kv_tokens = (int(value) for value in key)
+            if key in self.disabled:
+                continue
+            if state_tokens < int(raw_num_tokens) or state_batch_size < int(batch_size):
+                continue
+            required_kv_tokens = _padded_kv_capacity(
+                attention_plan,
+                raw_num_tokens=int(raw_num_tokens),
+                padded_num_tokens=state_tokens,
+            )
+            if state_kv_tokens < required_kv_tokens:
+                continue
+            candidates.append((state_tokens, state_batch_size, state_kv_tokens))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda capacity: (capacity[0], capacity[1], capacity[2]))
 
     def warmup(
         self,
@@ -530,6 +566,30 @@ class _SyntheticInputs:
     positions: torch.Tensor
     plan: PagedVarlenPlan
     last_token_indices: torch.Tensor
+
+
+def _padded_kv_capacity(
+    attention_plan: PagedVarlenPlan,
+    *,
+    raw_num_tokens: int,
+    padded_num_tokens: int,
+) -> int:
+    padding = max(0, int(padded_num_tokens) - int(raw_num_tokens))
+    cache_lens = tuple(int(value) for value in attention_plan.cache_seqlens_cpu)
+    query_lens = tuple(int(value) for value in attention_plan.query_lens_cpu)
+    if not query_lens or len(cache_lens) != len(query_lens):
+        return max(0, int(attention_plan.max_seqlen_k)) + padding
+    if sum(query_lens) != int(raw_num_tokens):
+        raise invalid_descriptor("prefill graph raw token count does not match query lengths")
+    return max(
+        (
+            base + query + (padding if row == len(query_lens) - 1 else 0)
+            for row, (base, query) in enumerate(
+                zip(cache_lens, query_lens, strict=True)
+            )
+        ),
+        default=padding,
+    )
 
 
 def _synthetic_inputs(

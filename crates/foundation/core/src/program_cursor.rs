@@ -1,15 +1,13 @@
 //! Dormant program-cursor semantics for the bounded inference program.
 //!
-//! Value-level foundation for the scheduler's future `ProgramRuntime`
-//! (`specs/unified_inference_runtime.md`, Slice 2). This module owns the pure
-//! state-machine semantics — admission, side-effect-free transition planning,
+//! Value-level foundation for the scheduler's future `ProgramRuntime`. This module owns the pure state-machine semantics — admission, side-effect-free transition planning,
 //! result-validated resolution, deterministic invocation identity, and
 //! duplicate-resolution rejection — over a validated
 //! [`InferenceProgram`](crate::program::InferenceProgram). Placement binding,
 //! resource ledgers, batching, and worker submission stay in the scheduler
 //! crate when the target stack activates; nothing here touches production.
 //!
-//! The laws enforced here come straight from the migration plan:
+//! The laws enforced here are:
 //!
 //! * Planning is side-effect-free — [`ProgramInstance::plan_next`] borrows
 //!   immutably and returns a value; cursor state changes only in

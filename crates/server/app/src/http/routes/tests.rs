@@ -43,6 +43,9 @@ use uniserve_serving::text::{Prompt, TextBackend};
 use super::{build_router, build_router_with_dev_mode, build_router_with_dev_mode_and_lora};
 use crate::AppState;
 
+const TEST_PNG_B64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlMZrAAAAAASUVORK5CYII=";
+
 fn request_output(
     request_id: &str,
     new_token_ids: Vec<u32>,
@@ -2422,7 +2425,7 @@ async fn chat_completions_routes_image_input_to_native_und_only() {
                 })
                 .collect();
             assert_eq!(images.len(), 1);
-            assert_eq!(images[0].b64, "QUJD");
+            assert_eq!(images[0].b64, TEST_PNG_B64);
 
             send_canonical_outputs(
                 &mock,
@@ -2461,7 +2464,7 @@ async fn chat_completions_routes_image_input_to_native_und_only() {
                                 "role": "user",
                                 "content": [
                                     {"type": "text", "text": "Inspect this image."},
-                                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+                                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{TEST_PNG_B64}")}}
                                 ]
                             },
                             {"role":"assistant","content":"Checking metadata.","tool_calls":[{
@@ -2545,7 +2548,7 @@ async fn native_generate_routes_ordered_multimodal_context_to_runtime_events() {
                         "constraint": "und_only",
                         "context": [
                             {"type": "text", "role": "user", "text": "Describe this image."},
-                            {"type": "image", "b64": "QUJD"}
+                            {"type": "image", "b64": TEST_PNG_B64}
                         ],
                         "max_tokens": 16
                     })
