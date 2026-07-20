@@ -20,7 +20,7 @@ from .request_state import (
 __all__ = [
     "PreparedTextRow",
     "RequestSession",
-    "RequestSessionTable",
+    "SessionStore",
     "StepTxn",
 ]
 
@@ -42,9 +42,8 @@ class PreparedTextRow:
 class RequestSession:
     """Owns state transitions for one request.
 
-    The backing ``RequestState`` remains available during migration so existing
-    drivers and tests can inspect the same object, but state mutations that have
-    lifecycle or ordering invariants live here.
+    The backing ``RequestState`` stores the session data, while every mutation
+    with lifecycle or ordering invariants is defined here.
     """
 
     def __init__(self, req_id: int, state: RequestState) -> None:
@@ -122,8 +121,8 @@ class RequestSession:
         self.state.lifecycle = RequestLifecycle.ACTIVE
 
 
-class RequestSessionTable(_RequestStateTable):
-    """Request-state table with session-level mutation APIs."""
+class SessionStore(_RequestStateTable):
+    """System authority for request sessions and their mutation scopes."""
 
     def session(self, req_id: int) -> RequestSession:
         return RequestSession(int(req_id), self.get(int(req_id)))
@@ -167,7 +166,7 @@ class StepTxn:
 
     def __init__(
         self,
-        sessions: RequestSessionTable,
+        sessions: SessionStore,
         resources: "ResourceRuntime",
         *,
         step_id: int,

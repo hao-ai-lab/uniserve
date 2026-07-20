@@ -178,7 +178,7 @@ def test_executor_replays_one_committed_step_without_a_second_model_effect():
 
     assert replay == first
     assert len(model.calls) == 1
-    assert executor.request_states.get(1).version == 1
+    assert executor.sessions.get(1).version == 1
 
 
 def test_executor_rejects_a_digest_conflict_for_a_committed_step():
@@ -207,11 +207,11 @@ def test_executor_forward_failure_rolls_back_admission_and_allows_repair_retry()
 
     with pytest.raises(RuntimeError, match="injected forward failure"):
         executor.execute(batch)
-    assert 1 not in executor.request_states
+    assert 1 not in executor.sessions
 
     result = executor.execute(batch)
     assert result["per_seq"][0]["req_id"] == 1
-    assert executor.request_states.get(1).version == 1
+    assert executor.sessions.get(1).version == 1
 
 
 def test_complete_mixed_batch_preserves_result_alignment_in_one_model_call():
@@ -312,7 +312,7 @@ def test_system_speculative_verify_runs_over_thin_model_forward():
     # The model's verify logits fix the argmax at 7 for every position, so both
     # draft 7s are accepted and the sampled continuation is 7.
     assert result["per_seq"] == [{"req_id": 1, "sampled_token_id": 7, "num_accepted_tokens": 2}]
-    assert runner.request_states.get(1).decode_relay.token_id == 7
+    assert runner.sessions.get(1).decode_relay.token_id == 7
 
 
 def test_thin_text_runs_per_op_through_system_forward_and_samples():
@@ -338,7 +338,7 @@ def test_thin_text_runs_per_op_through_system_forward_and_samples():
     assert [r["sampled_token_id"] for r in result["per_seq"]] == [7, 7]
     assert model.input_values == [[5], [6]]
     # KV-length advance is system-owned (lane "text").
-    assert runner.request_states.get(1).kv_lengths["text"] == 1
+    assert runner.sessions.get(1).kv_lengths["text"] == 1
 
 
 def test_per_op_decode_consumes_last_sampled_relay_token(monkeypatch):

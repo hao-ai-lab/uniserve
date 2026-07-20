@@ -72,7 +72,7 @@ def test_model_executor_default_resource_runtime_enforces_model_totals():
         )
     assert exc.value.code == ErrorCode.RESOURCE_LEASE_VIOLATION
     assert runner.resource_runtime.used("kv_block") == 0
-    assert 1 not in runner.request_states
+    assert 1 not in runner.sessions
 
 
 def test_model_executor_resource_runtime_tracks_blocks_latents_and_drop():
@@ -215,7 +215,7 @@ def test_model_executor_rejects_kv_blocks_beyond_declared_capacity():
         )
     assert exc.value.code == ErrorCode.RESOURCE_LEASE_VIOLATION
     assert worker.model_executor.resource_runtime.used("kv_block") == 0
-    assert 9 not in worker.model_executor.request_states
+    assert 9 not in worker.model_executor.sessions
 
 
 def test_model_executor_rolls_back_denoise_latent_if_scratch_admission_fails():
@@ -258,7 +258,7 @@ def test_model_executor_rolls_back_denoise_latent_if_scratch_admission_fails():
         )
     assert exc.value.code == ErrorCode.RESOURCE_LEASE_VIOLATION
     assert worker.model_executor.resource_runtime.used("image_latent") == 0
-    assert worker.model_executor.request_states.get(11).residency.image_latent_active is False
+    assert worker.model_executor.sessions.get(11).residency.image_latent_active is False
 
 
 def test_model_executor_uses_resource_plan_latent_downsample_for_image_accounting():

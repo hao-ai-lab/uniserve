@@ -102,7 +102,7 @@ class DecodeRelay:
 
 @dataclass
 class RequestState:
-    """Per-request mutable state owned by the runner (blocks, sampling, relays)."""
+    """Per-request mutable data owned by the session store."""
 
     sampling: dict[str, Any] = field(default_factory=dict)
     image: dict[str, Any] = field(default_factory=dict)

@@ -246,7 +246,7 @@ def test_runner_commit_uses_decode_image_capability_and_resets_state():
     assert result["per_seq"] == [{"req_id": 5, "image_hw": [8, 8]}]
     assert model.calls == [5]
     assert model.inference_modes == [True]
-    state = runner.request_states.get(5)
+    state = runner.sessions.get(5)
     assert state.latent is None
     assert state.schedule_cursor == 0
 
@@ -455,6 +455,6 @@ def test_runner_request_state_keeps_op_block_deltas_authoritative():
         }
     )
 
-    state = runner.request_states.get(12)
+    state = runner.sessions.get(12)
     assert state.block_ids == [1, 2, 3]
     assert state.resident_block_ids == {1, 2, 3}
