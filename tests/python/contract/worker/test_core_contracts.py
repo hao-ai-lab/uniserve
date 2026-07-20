@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.contracts.caps import validate_caps, validate_forward_result
 from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
 from uniserve_worker.contracts.op_kinds import OP_KIND_TABLE, OP_KINDS
@@ -236,14 +237,15 @@ def test_runner_commit_uses_decode_image_capability_and_resets_state():
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
 
     result = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 5, "block_ids": []}],
-            "ops": [{"req_id": 5, "kind": "commit_gen"}],
-        }
+        seal_batch(
+            1,
+            [{"req_id": 5, "kind": "commit_gen"}],
+            new_reqs=[{"req_id": 5, "block_ids": []}],
+        )
     )
 
-    assert result["per_seq"] == [{"req_id": 5, "image_hw": [8, 8]}]
+    assert result["per_seq"][0]["req_id"] == 5
+    assert result["per_seq"][0]["image_hw"] == [8, 8]
     assert model.calls == [5]
     assert model.inference_modes == [True]
     state = runner.sessions.get(5)
@@ -269,11 +271,11 @@ def test_runner_commit_samples_model_logits():
         config=ExecutorConfig(simulation=True),
     )
     result = runner.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [{"req_id": 6, "sampling": {"temperature": 0.0, "n_logprobs": 1}}],
-            "ops": [{"req_id": 6, "kind": "commit_gen", "suppress_tokens": [1]}],
-        }
+        seal_batch(
+            2,
+            [{"req_id": 6, "kind": "commit_gen", "suppress_tokens": [1]}],
+            new_reqs=[{"req_id": 6, "sampling": {"temperature": 0.0, "n_logprobs": 1}}],
+        )
     )
 
     seq = result["per_seq"][0]
@@ -367,9 +369,18 @@ def test_runner_text_applies_sampling_masks_and_logprobs():
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
 
     result = runner.execute(
-        {
-            "step_id": 3,
-            "new_reqs": [
+        seal_batch(
+            3,
+            [
+                {
+                    "req_id": 8,
+                    "kind": "decode_und",
+                    "token_ids": [11],
+                    "pos_range": [0, 1],
+                    "suppress_tokens": [1],
+                }
+            ],
+            new_reqs=[
                 {
                     "req_id": 8,
                     "sampling": {
@@ -381,16 +392,7 @@ def test_runner_text_applies_sampling_masks_and_logprobs():
                     },
                 }
             ],
-            "ops": [
-                {
-                    "req_id": 8,
-                    "kind": "decode_und",
-                    "token_ids": [11],
-                    "pos_range": [0, 1],
-                    "suppress_tokens": [1],
-                }
-            ],
-        }
+        )
     )
 
     seq = result["per_seq"][0]
@@ -407,10 +409,9 @@ def test_system_builds_and_publishes_attention_plan_to_thin_model():
     runner = _thin_text_runner(model)
 
     result = runner.execute(
-        {
-            "step_id": 33,
-            "new_reqs": [{"req_id": 8, "sampling": {"temperature": 0.0}, "block_ids": [0]}],
-            "ops": [
+        seal_batch(
+            33,
+            [
                 {
                     "req_id": 8,
                     "kind": "decode_und",
@@ -418,7 +419,8 @@ def test_system_builds_and_publishes_attention_plan_to_thin_model():
                     "pos_range": [0, 1],
                 }
             ],
-        }
+            new_reqs=[{"req_id": 8, "sampling": {"temperature": 0.0}, "block_ids": [0]}],
+        )
     )
 
     assert result["per_seq"][0]["sampled_token_id"] == 1
@@ -440,10 +442,9 @@ def test_runner_request_state_keeps_op_block_deltas_authoritative():
     )
 
     runner.execute(
-        {
-            "step_id": 4,
-            "new_reqs": [{"req_id": 12, "block_ids": [1]}],
-            "ops": [
+        seal_batch(
+            4,
+            [
                 {
                     "req_id": 12,
                     "kind": "decode_und",
@@ -452,7 +453,8 @@ def test_runner_request_state_keeps_op_block_deltas_authoritative():
                     "new_block_ids": [2, 3],
                 }
             ],
-        }
+            new_reqs=[{"req_id": 12, "block_ids": [1]}],
+        )
     )
 
     state = runner.sessions.get(12)

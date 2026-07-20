@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.contracts.forward_batch import (
     BatchPolicy,
     DenoiseBranchKey,
@@ -39,11 +40,11 @@ class _Model(UniModel):
 def _execute(model: UniModel, ops: list[dict[str, Any]]) -> dict[str, Any]:
     req_ids = [int(op["req_id"]) for op in ops]
     return ModelExecutor(model, config=ExecutorConfig(simulation=True)).execute(
-        {
-            "step_id": 9,
-            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
-            "ops": ops,
-        }
+        seal_batch(
+            9,
+            ops,
+            new_reqs=[{"req_id": req_id, "block_ids": []} for req_id in req_ids],
+        )
     )
 
 
@@ -62,10 +63,14 @@ def test_model_receives_the_complete_mixed_batch_once_and_results_keep_wire_orde
 
     result = _execute(model, ops)
 
-    assert result == {"step_id": 9, "per_seq": expected}
+    assert result["step_id"] == 9
+    assert [
+        {key: row[key] for key in expected_row}
+        for row, expected_row in zip(result["per_seq"], expected, strict=True)
+    ] == expected
     assert len(model.batches) == 1
     assert model.batches[0].mode is ForwardMode.MIXED
-    assert model.batches[0].ops == tuple(ops)
+    assert [dict(operation) for operation in model.batches[0].ops] == seal_batch(9, ops)["ops"]
 
 
 def test_typed_mixed_result_is_postprocessed_once_at_the_runner_boundary():
@@ -75,7 +80,14 @@ def test_typed_mixed_result_is_postprocessed_once_at_the_runner_boundary():
             "req_id": 2,
             "kind": "denoise_gen",
             "latent_shape": [1],
-            "cfg": {"branch_count": 1},
+            "cfg": {
+                "branch_count": 1,
+                "text_scale": 1.0,
+                "img_scale": 1.0,
+                "renorm_type": "none",
+                "renorm_min": 0.0,
+                "interval": [0.0, 0.0],
+            },
         },
     ]
     accepted: list[torch.Tensor] = []
@@ -103,7 +115,9 @@ def test_typed_mixed_result_is_postprocessed_once_at_the_runner_boundary():
     result = _execute(model, ops)
 
     assert result["per_seq"][0]["sampled_token_id"] == 1
-    assert result["per_seq"][1] == {"req_id": 2, "denoise_done": True, "num_steps_done": 1}
+    assert result["per_seq"][1]["req_id"] == 2
+    assert result["per_seq"][1]["denoise_done"] is True
+    assert result["per_seq"][1]["num_steps_done"] == 1
     assert len(accepted) == 1
     torch.testing.assert_close(accepted[0], torch.tensor([3.0]))
 

@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.contracts.caps import validate_caps
 from uniserve_worker.contracts.outputs import EncodeOutput
 from uniserve_worker.foundation.errors import WorkerError
@@ -58,11 +59,11 @@ def test_sampler_worker_greedy_samples_argmax_from_handle():
     logits[42] = 5.0
     handle = store.publish(logits, "logits")
     out = worker.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 7, "sampling": {"temperature": 0.0, "n_logprobs": 0}}],
-            "ops": [{"req_id": 7, "kind": "sample", "logits_handle": handle}],
-        }
+        seal_batch(
+            1,
+            [{"req_id": 7, "kind": "sample", "logits_handle": handle}],
+            new_reqs=[{"req_id": 7, "sampling": {"temperature": 0.0, "n_logprobs": 0}}],
+        )
     )
     assert out["per_seq"][0]["sampled_token_id"] == 42
 
@@ -77,16 +78,23 @@ def test_frame_accumulator_worker_counts_and_releases_frames():
     assert worker.caps().supported_ops == ("encode_frame",)
     frame = base64.b64encode(b"\x00\x01\x02").decode()
     out = worker.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [],
-            "ops": [
+        seal_batch(
+            2,
+            [
                 {"req_id": 5, "kind": "encode_frame", "image_b64": frame},
-                {"req_id": 5, "kind": "encode_frame", "image_b64": frame},
+                {"req_id": 6, "kind": "encode_frame", "image_b64": frame},
             ],
-        }
+            new_reqs=[{"req_id": 5}, {"req_id": 6}],
+        )
     )
-    assert [s["num_tokens"] for s in out["per_seq"]] == [1, 2]
+    assert [s["num_tokens"] for s in out["per_seq"]] == [1, 1]
+    worker.execute(
+        seal_batch(
+            3,
+            [{"req_id": 5, "kind": "encode_frame", "image_b64": frame}],
+            base_version=1,
+        )
+    )
     status = worker.release_request_frames(5)
     assert status["frames"] == 2
 
@@ -110,11 +118,11 @@ def test_encoder_worker_dispatches_vision_encode():
     assert worker.caps().supported_ops == ("vit_encode",)
     assert "free_encoder" in worker.caps().supported_controls
     out = worker.execute(
-        {
-            "step_id": 3,
-            "new_reqs": [{"req_id": 1}],
-            "ops": [{"req_id": 1, "kind": "vit_encode", "mm_hash": 123}],
-        }
+        seal_batch(
+            3,
+            [{"req_id": 1, "kind": "vit_encode", "mm_hash": 123}],
+            new_reqs=[{"req_id": 1}],
+        )
     )
     assert out["per_seq"][0]["encoder_handle"] == 999
     assert out["per_seq"][0]["num_tokens"] == 16
@@ -134,11 +142,11 @@ def test_worker_server_rejects_op_outside_worker_contract():
     resp = runtime.handle(
         {
             "kind": "execute",
-            "batch": {
-                "step_id": 1,
-                "new_reqs": [],
-                "ops": [{"req_id": 1, "kind": "decode_und", "token_ids": [1]}],
-            },
+            "batch": seal_batch(
+                1,
+                [{"req_id": 1, "kind": "decode_und", "token_ids": [1]}],
+                new_reqs=[{"req_id": 1}],
+            ),
         }
     )
     assert resp["kind"] == "error"

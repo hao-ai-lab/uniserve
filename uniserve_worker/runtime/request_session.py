@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
+from ..foundation.errors import invalid_descriptor
 from .request_state import (
     RequestLifecycle,
     RequestState,
@@ -25,6 +26,7 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    from ..contracts.batches import OperationEnvelope
     from .resources import ResourceRuntime
 
 
@@ -127,9 +129,48 @@ class SessionStore(_RequestStateTable):
     def session(self, req_id: int) -> RequestSession:
         return RequestSession(int(req_id), self.get(int(req_id)))
 
-    def admit(self, req_id: int, new_req: Mapping[str, Any]) -> RequestSession:
+    def admit(
+        self,
+        req_id: int,
+        new_req: Mapping[str, Any],
+        *,
+        epoch: int,
+        base_version: int,
+    ) -> RequestSession:
+        existed = int(req_id) in self._states
         state = self.create_or_update(int(req_id), dict(new_req))
+        if not existed:
+            state.epoch = int(epoch)
+            state.version = int(base_version)
         return RequestSession(int(req_id), state)
+
+    def validate_operations(
+        self,
+        operations: tuple["OperationEnvelope", ...],
+        new_request_ids: set[int],
+    ) -> None:
+        for operation in operations:
+            state = self._states.get(operation.session_id)
+            if state is None:
+                if operation.session_id not in new_request_ids:
+                    raise invalid_descriptor(
+                        f"operation {operation.op_id} references an unknown session"
+                    )
+                if operation.base_version != 0:
+                    raise invalid_descriptor(
+                        f"new session {operation.session_id} must start at version zero"
+                    )
+                continue
+            if state.epoch != operation.epoch:
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} has stale epoch {operation.epoch}; "
+                    f"session epoch is {state.epoch}"
+                )
+            if state.version != operation.base_version:
+                raise invalid_descriptor(
+                    f"operation {operation.op_id} expects version {operation.base_version}; "
+                    f"session version is {state.version}"
+                )
 
     def resolve_text_row(self, req_id: int, op: Mapping[str, Any]) -> PreparedTextRow:
         return self.session(int(req_id)).resolve_text_row(op)
@@ -147,10 +188,10 @@ class SessionStore(_RequestStateTable):
     def begin_step(
         self,
         step_id: int,
-        request_ids: set[int],
+        operations: tuple["OperationEnvelope", ...],
         resources: "ResourceRuntime",
     ) -> "StepTxn":
-        return StepTxn(self, resources, step_id=int(step_id), request_ids=request_ids)
+        return StepTxn(self, resources, step_id=int(step_id), operations=operations)
 
 
 @dataclass(frozen=True)
@@ -170,12 +211,13 @@ class StepTxn:
         resources: "ResourceRuntime",
         *,
         step_id: int,
-        request_ids: set[int],
+        operations: tuple["OperationEnvelope", ...],
     ) -> None:
         self.sessions = sessions
         self.resources = resources
         self.step_id = int(step_id)
-        self.request_ids = {int(request_id) for request_id in request_ids}
+        self.operations = operations
+        self.request_ids = {operation.session_id for operation in operations}
         self._snapshots = {
             request_id: self._snapshot(request_id) for request_id in self.request_ids
         }
@@ -184,11 +226,17 @@ class StepTxn:
 
     def commit(self) -> None:
         self._require_open()
-        for request_id in self.request_ids:
-            state = self.sessions._states.get(request_id)
-            if state is not None:
-                state.version += 1
-                state.last_step_id = self.step_id
+        for operation in self.operations:
+            state = self.sessions._states.get(operation.session_id)
+            if state is None:
+                raise RuntimeError(f"session {operation.session_id} disappeared before commit")
+            if state.epoch != operation.epoch or state.version != operation.base_version:
+                raise RuntimeError(
+                    f"session {operation.session_id} changed outside its transaction"
+                )
+            state.version = operation.base_version + 1
+            state.last_op_id = operation.op_id
+            state.last_step_id = self.step_id
         self._closed = True
 
     def rollback(self) -> None:

@@ -157,6 +157,7 @@ pub struct StageRouter {
     /// Synthesized-sample op_id → (step_id, output slot) for backfill correlation.
     pending_samples: HashMap<u64, (u64, usize)>,
     next_sample_op_id: u64,
+    sample_sessions: HashMap<RequestId, (u64, u64)>,
 }
 
 /// Append items from `incoming` not already in `target`, preserving order, with
@@ -235,6 +236,7 @@ impl StageRouter {
             // Synthesized sample op_ids live in a high range so they never
             // collide with scheduler-assigned op_ids on the wire echo.
             next_sample_op_id: 1 << 56,
+            sample_sessions: HashMap::new(),
         })
     }
 
@@ -363,17 +365,15 @@ impl StageRouter {
     fn submit_partition(
         exec: &mut dyn Executor,
         step_id: u64,
-        new_reqs: Vec<NewRequestData>,
+        mut new_reqs: Vec<NewRequestData>,
         ops: Vec<ForwardOp>,
     ) -> anyhow::Result<bool> {
         if ops.is_empty() {
             return Ok(false);
         }
-        exec.submit(ForwardBatch {
-            step_id,
-            new_reqs,
-            ops,
-        })?;
+        let sessions: HashSet<RequestId> = ops.iter().map(|operation| operation.req_id).collect();
+        new_reqs.retain(|request| sessions.contains(&request.req_id));
+        exec.submit(ForwardBatch::new(step_id, new_reqs, ops))?;
         Ok(true)
     }
 
@@ -488,19 +488,21 @@ impl StageRouter {
             .cloned()
             .into_iter()
             .collect();
-        let op = ForwardOp {
+        let (epoch, base_version) =
+            self.sample_sessions.get(&req_id).copied().ok_or_else(|| {
+                anyhow::anyhow!("sample operation has no lifecycle for request {}", req_id.0)
+            })?;
+        let mut op = ForwardOp {
             req_id,
             kind: OpKind::Sample,
             logits_handle,
             locator,
-            op_id: Some(op_id),
             ..Default::default()
         };
-        self.pools[sampler].exec.submit(ForwardBatch {
-            step_id,
-            new_reqs,
-            ops: vec![op],
-        })?;
+        op.seal(epoch, op_id, base_version);
+        self.pools[sampler]
+            .exec
+            .submit(ForwardBatch::new(step_id, new_reqs, vec![op]))?;
         self.pending_samples.insert(op_id, (step_id, slot));
         Ok(())
     }
@@ -516,6 +518,11 @@ impl StageRouter {
             let Some((step_id, slot)) = self.pending_samples.remove(&op_id) else {
                 anyhow::bail!("sampler result op_id {op_id} matches no pending sample");
             };
+            if let Some(session) = self.sample_sessions.get_mut(&seq.req_id) {
+                session.1 = seq
+                    .result_version
+                    .unwrap_or_else(|| session.1.saturating_add(1));
+            }
             if let Some(step) = self.pending.get_mut(&step_id) {
                 if let Some(Some(out)) = step.outputs.get_mut(slot) {
                     out.sampled_token_id = seq.sampled_token_id;
@@ -597,6 +604,7 @@ impl Executor for StageRouter {
     }
 
     fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
+        batch.validate()?;
         self.pump()?;
         if batch.ops.is_empty() {
             return Ok(());
@@ -608,6 +616,16 @@ impl Executor for StageRouter {
         if self.sampler_pool.is_some() || self.tower_edge.is_some() {
             for nr in &batch.new_reqs {
                 self.req_sampling.insert(nr.req_id, nr.clone());
+                if let Some(op) = batch.ops.iter().find(|op| op.req_id == nr.req_id) {
+                    self.sample_sessions
+                        .entry(nr.req_id)
+                        .and_modify(|session| {
+                            if session.0 != op.epoch {
+                                *session = (op.epoch, 0);
+                            }
+                        })
+                        .or_insert((op.epoch, 0));
+                }
             }
         }
         let gen_pool = self.tower_edge.map(|(_, g)| g);
@@ -646,6 +664,7 @@ impl Executor for StageRouter {
             {
                 op.locator = Some(locator);
             }
+            op.refresh_digest(batch.protocol_version);
             partitions[idx].push(op);
         }
         let mut expected = 0u64;
@@ -811,6 +830,7 @@ impl StageRouter {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use uniserve_core::{Modality, RequestId};
     use uniserve_worker_wire::{EngineCaps, ForwardOp, OpKind};
 
@@ -1014,12 +1034,15 @@ mod tests {
     }
 
     fn op(req_id: u64, kind: OpKind, modality: Modality) -> ForwardOp {
-        ForwardOp {
+        static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+        let mut operation = ForwardOp {
             req_id: RequestId(req_id),
             kind,
             modality,
             ..Default::default()
-        }
+        };
+        operation.seal(1, NEXT_OPERATION.fetch_add(1, Ordering::Relaxed), 0);
+        operation
     }
 
     /// Role-specific mock for the decode→sampler edge: a `decode` pool defers
@@ -1231,6 +1254,7 @@ mod tests {
         ]);
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 9,
                 new_reqs: vec![NewRequestData::new(RequestId(7))],
                 ops: vec![op(7, OpKind::DecodeUnd, Modality::Und)],
@@ -1263,6 +1287,7 @@ mod tests {
         )]);
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 3,
                 new_reqs: Vec::new(),
                 ops: vec![op(7, OpKind::DecodeUnd, Modality::Und)],
@@ -1281,6 +1306,7 @@ mod tests {
         )]);
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 5,
                 new_reqs: Vec::new(),
                 ops: vec![
@@ -1304,6 +1330,7 @@ mod tests {
         ]);
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 7,
                 new_reqs: Vec::new(),
                 ops: vec![
@@ -1339,6 +1366,7 @@ mod tests {
         ]);
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 3,
                 new_reqs: Vec::new(),
                 ops: vec![
@@ -1378,6 +1406,7 @@ mod tests {
         );
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 11,
                 new_reqs: Vec::new(),
                 ops: vec![
@@ -1402,6 +1431,7 @@ mod tests {
         ]);
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 21,
                 new_reqs: Vec::new(),
                 ops: vec![op(9, OpKind::CommitGen, Modality::Gen)],
@@ -1412,6 +1442,7 @@ mod tests {
 
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 22,
                 new_reqs: Vec::new(),
                 ops: vec![op(9, OpKind::CommitWriteback, Modality::Und)],
@@ -1566,6 +1597,7 @@ mod tests {
         // Step 1: und decode for req 7 → its result carries the conditioning locator.
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 1,
                 new_reqs: vec![],
                 ops: vec![op(7, OpKind::DecodeUnd, Modality::Und)],
@@ -1576,6 +1608,7 @@ mod tests {
         // Step 2: denoise_gen for req 7 → routed to the gen pool, threaded.
         router
             .submit(ForwardBatch {
+                protocol_version: uniserve_worker_wire::EXECUTION_PROTOCOL_VERSION,
                 step_id: 2,
                 new_reqs: vec![],
                 ops: vec![op(7, OpKind::DenoiseGen, Modality::Gen)],

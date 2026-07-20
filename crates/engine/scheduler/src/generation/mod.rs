@@ -1336,6 +1336,12 @@ pub(crate) struct PlannedTransition {
 }
 
 impl PlannedTransition {
+    pub(crate) fn assign_envelope(&mut self, epoch: u64, op_id: u64, base_version: u64) {
+        self.op_id = Some(op_id);
+        self.op.seal(epoch, op_id, base_version);
+    }
+
+    #[cfg(test)]
     pub(crate) fn assign_op_id(&mut self, op_id: u64) {
         self.op_id = Some(op_id);
         self.op.op_id = Some(op_id);
@@ -1352,6 +1358,23 @@ impl PlannedTransition {
                 expected,
                 actual: result.op_id,
             });
+        }
+        if self.op.digest.is_some() {
+            if result.epoch != Some(self.op.epoch) {
+                return Err(TransitionValidationError::EpochMismatch {
+                    expected: self.op.epoch,
+                    actual: result.epoch,
+                });
+            }
+            if result.base_version != Some(self.op.base_version)
+                || result.result_version != Some(self.op.base_version.saturating_add(1))
+            {
+                return Err(TransitionValidationError::VersionMismatch {
+                    expected_base: self.op.base_version,
+                    actual_base: result.base_version,
+                    actual_result: result.result_version,
+                });
+            }
         }
         self.validation.validate(self.kind, result)
     }
@@ -1742,6 +1765,15 @@ pub(crate) enum TransitionValidationError {
     OpIdMismatch {
         expected: u64,
         actual: Option<u64>,
+    },
+    EpochMismatch {
+        expected: u64,
+        actual: Option<u64>,
+    },
+    VersionMismatch {
+        expected_base: u64,
+        actual_base: Option<u64>,
+        actual_result: Option<u64>,
     },
     OpKindMismatch {
         expected: OpKind,

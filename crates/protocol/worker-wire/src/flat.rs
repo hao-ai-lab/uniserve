@@ -133,7 +133,9 @@ fn response_from_fb(resp: fbs::WorkerResponseT) -> anyhow::Result<WorkerResponse
 }
 
 fn batch_to_fb(batch: &ForwardBatch) -> anyhow::Result<fbs::ForwardBatchT> {
+    batch.validate()?;
     Ok(fbs::ForwardBatchT {
+        protocol_version: batch.protocol_version,
         step_id: batch.step_id,
         new_reqs: Some(
             batch
@@ -153,7 +155,8 @@ fn batch_to_fb(batch: &ForwardBatch) -> anyhow::Result<fbs::ForwardBatchT> {
 }
 
 fn batch_from_fb(batch: fbs::ForwardBatchT) -> anyhow::Result<ForwardBatch> {
-    Ok(ForwardBatch {
+    let batch = ForwardBatch {
+        protocol_version: batch.protocol_version,
         step_id: batch.step_id,
         new_reqs: batch
             .new_reqs
@@ -167,7 +170,9 @@ fn batch_from_fb(batch: fbs::ForwardBatchT) -> anyhow::Result<ForwardBatch> {
             .into_iter()
             .map(op_from_fb)
             .collect::<anyhow::Result<_>>()?,
-    })
+    };
+    batch.validate()?;
+    Ok(batch)
 }
 
 fn new_request_to_fb(req: &NewRequestData) -> anyhow::Result<fbs::NewRequestDataT> {
@@ -207,6 +212,9 @@ fn new_request_from_fb(req: fbs::NewRequestDataT) -> anyhow::Result<NewRequestDa
 fn op_to_fb(op: &ForwardOp) -> anyhow::Result<fbs::ForwardOpT> {
     Ok(fbs::ForwardOpT {
         req_id: op.req_id.0,
+        epoch: op.epoch,
+        base_version: op.base_version,
+        digest: op.digest.clone(),
         kind: op_kind_to_fb(op.kind),
         modality: modality_to_fb(op.modality),
         new_block_ids: Some(op.new_block_ids.iter().map(|id| id.0).collect()),
@@ -240,6 +248,9 @@ fn op_to_fb(op: &ForwardOp) -> anyhow::Result<fbs::ForwardOpT> {
 fn op_from_fb(op: fbs::ForwardOpT) -> anyhow::Result<ForwardOp> {
     Ok(ForwardOp {
         req_id: RequestId(op.req_id),
+        epoch: op.epoch,
+        base_version: op.base_version,
+        digest: op.digest,
         kind: op_kind_from_fb(op.kind)?,
         modality: modality_from_fb(op.modality)?,
         new_block_ids: op
@@ -424,6 +435,9 @@ fn seq_result_to_fb(sr: &SeqResult) -> anyhow::Result<fbs::SeqResultT> {
         num_tokens: sr.num_tokens,
         num_accepted_tokens: sr.num_accepted_tokens,
         op_id: sr.op_id,
+        epoch: sr.epoch,
+        base_version: sr.base_version,
+        result_version: sr.result_version,
         logits_handle: sr.logits_handle,
         locator: sr.locator.clone(),
         op_kind: sr
@@ -475,6 +489,9 @@ fn seq_result_from_fb(sr: fbs::SeqResultT) -> anyhow::Result<SeqResult> {
         num_tokens: sr.num_tokens,
         num_accepted_tokens: sr.num_accepted_tokens,
         op_id: sr.op_id,
+        epoch: sr.epoch,
+        base_version: sr.base_version,
+        result_version: sr.result_version,
         logits_handle: sr.logits_handle,
         locator: sr.locator,
     };

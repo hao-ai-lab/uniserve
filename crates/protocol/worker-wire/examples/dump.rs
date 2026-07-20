@@ -7,34 +7,37 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or("/tmp/wire_test.bin".into());
-    let batch = ForwardBatch {
-        step_id: 7,
-        new_reqs: vec![NewRequestData {
+    let mut operations = vec![
+        ForwardOp {
+            req_id: RequestId(42),
+            kind: OpKind::PrefillUnd,
+            modality: Modality::Und,
+            pos_range: (0, 5),
+            token_ids: Some(vec![151644, 100, 200, 300, 151645]),
+            ..Default::default()
+        },
+        ForwardOp {
+            req_id: RequestId(43),
+            kind: OpKind::DenoiseGen,
+            modality: Modality::Gen,
+            new_block_ids: vec![BlockId(2)],
+            pos_range: (5, 6),
+            timestep_idx: Some(3),
+            cond_pos: Some(5),
+            ..Default::default()
+        },
+    ];
+    operations[0].seal(1, 1, 0);
+    operations[1].seal(1, 2, 0);
+    let batch = ForwardBatch::new(
+        7,
+        vec![NewRequestData {
             sampling: Some(SamplingParams::default()),
             block_ids: vec![BlockId(0), BlockId(1)],
             ..NewRequestData::new(RequestId(42))
         }],
-        ops: vec![
-            ForwardOp {
-                req_id: RequestId(42),
-                kind: OpKind::PrefillUnd,
-                modality: Modality::Und,
-                pos_range: (0, 5),
-                token_ids: Some(vec![151644, 100, 200, 300, 151645]),
-                ..Default::default()
-            },
-            ForwardOp {
-                req_id: RequestId(43),
-                kind: OpKind::DenoiseGen,
-                modality: Modality::Gen,
-                new_block_ids: vec![BlockId(2)],
-                pos_range: (5, 6),
-                timestep_idx: Some(3),
-                cond_pos: Some(5),
-                ..Default::default()
-            },
-        ],
-    };
+        operations,
+    );
     let req = WorkerRequest::execute(batch);
     let bytes = flat::encode_request(&req).unwrap();
     std::fs::write(&path, &bytes).unwrap();

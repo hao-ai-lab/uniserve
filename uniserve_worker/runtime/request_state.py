@@ -126,6 +126,7 @@ class RequestState:
     lifecycle: RequestLifecycle = RequestLifecycle.CREATED
     epoch: int = 0
     version: int = 0
+    last_op_id: int | None = None
     last_step_id: int | None = None
 
     def extend_block_ids(self, block_ids: list[int] | tuple[int, ...]) -> None:

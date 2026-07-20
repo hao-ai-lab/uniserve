@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.server.app import WorkerServer
 from uniserve_worker.server.profiler import WorkerProfiler
 from uniserve_worker.server.stub import StubWorker
@@ -32,10 +33,9 @@ def _clear_profiler_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _execute_req() -> dict:
     return {
         "kind": "execute",
-        "batch": {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 1}],
-            "ops": [
+        "batch": seal_batch(
+            1,
+            [
                 {
                     "req_id": 1,
                     "kind": "prefill_und",
@@ -44,7 +44,8 @@ def _execute_req() -> dict:
                     "token_ids": [11, 12],
                 }
             ],
-        },
+            new_reqs=[{"req_id": 1}],
+        ),
     }
 
 

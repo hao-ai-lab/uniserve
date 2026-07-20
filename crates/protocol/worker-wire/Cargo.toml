@@ -9,6 +9,7 @@ uniserve-core.workspace = true
 serde.workspace = true
 anyhow.workspace = true
 flatbuffers.workspace = true
+sha2.workspace = true
 
 [build-dependencies]
 flatbuffers-build.workspace = true
