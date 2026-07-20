@@ -7,8 +7,9 @@ the operation lifecycle.
 
 from __future__ import annotations
 
+import copy
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, Sequence
 
@@ -639,13 +640,13 @@ class FlowState:
     """Mutable denoise state for one in-flight image generation request.
 
     The latent trajectory ``x_t`` is not stored on the model state — it lives in
-    the system-owned :class:`~uniserve_worker.runtime.residency.LatentPool`
+    the system-owned :class:`~uniserve_worker.runtime.residency.LatentStore`
     as a leased buffer addressed by ``latent_handle``. ``x_t`` here is a property
     reading/writing that system buffer.
     """
 
-    latent_pool: Any  # system LatentPool (residency.latent)
-    latent_handle: int  # request-scoped handle into the LatentPool
+    latent_pool: Any  # system LatentStore (residency.latent)
+    latent_handle: int  # request-scoped handle into the LatentStore
     schedule: FlowMatchSchedule
     timesteps: torch.Tensor
     token_h: int
@@ -700,8 +701,200 @@ class ProgramState:
     cond: SequenceCache = field(default_factory=SequenceCache)
     tu: SequenceCache = field(default_factory=SequenceCache)
     iu: SequenceCache = field(default_factory=SequenceCache)
-    image_state: FlowState | None = None
     rng: torch.Generator | None = None
+    _image_state: FlowState | None = field(default=None, repr=False)
+    _latent_store: Any = field(default=None, init=False, repr=False)
+    _request_id: int | None = field(default=None, init=False, repr=False)
+
+    def bind_latent(self, store: Any, request_id: int) -> None:
+        self._latent_store = store
+        self._request_id = int(request_id)
+
+    @property
+    def image_state(self) -> FlowState | None:
+        if self._latent_store is None or self._request_id is None:
+            return self._image_state
+        return self._latent_store.state(self._request_id)
+
+    @image_state.setter
+    def image_state(self, value: FlowState | None) -> None:
+        if self._latent_store is None or self._request_id is None:
+            self._image_state = value
+            return
+        if value is None:
+            self._latent_store.pop_state(self._request_id)
+        else:
+            self._latent_store.set_state(self._request_id, value)
+
+
+class KvStore:
+    """Own per-request conditional and CFG sequence branches."""
+
+    def __init__(self, sessions: Any, latents: Any, *, rng_device: Any) -> None:
+        self.sessions = sessions
+        self.latents = latents
+        self.rng_device = rng_device
+        self._programs: dict[int, ProgramState] = {}
+
+    def program(self, request_id: int) -> ProgramState:
+        request_id = int(request_id)
+        session = self.sessions.get(request_id)
+        program = self._programs.get(request_id)
+        if program is None:
+            program = ProgramState(
+                sampling=dict(session.sampling or {}),
+                image=dict(session.image or {}),
+                neg_token_ids=list(session.neg_token_ids or []),
+                rng=session.device_rng(self.rng_device),
+            )
+            program.cond.block_ids = session.block_ids
+            program.bind_latent(self.latents, request_id)
+            self._programs[request_id] = program
+            return program
+        if session.sampling:
+            program.sampling = dict(session.sampling)
+        if session.image:
+            program.image = dict(session.image)
+        if session.neg_token_ids:
+            program.neg_token_ids = list(session.neg_token_ids)
+        if not program.cond.block_ids and session.block_ids:
+            program.cond.block_ids = session.block_ids
+            set_blocks = getattr(program.cond.past, "set_blocks", None)
+            if callable(set_blocks):
+                set_blocks(program.cond.block_ids)
+        return program
+
+    def view(self, request_ids: Iterable[int]) -> "KvView":
+        return KvView(self, frozenset(int(value) for value in request_ids))
+
+    def live_cache_ids(self) -> set[int]:
+        return {
+            id(cache)
+            for program in self._programs.values()
+            for cache in (program.cond.past, program.tu.past, program.iu.past)
+            if cache is not None
+        }
+
+    def drop(self, request_id: int, *, residency: Any, segment_executor: Any) -> None:
+        program = self._programs.pop(int(request_id), None)
+        if program is None:
+            return
+        seen: set[int] = set()
+        for branch in (program.cond, program.tu, program.iu):
+            cache = branch.past
+            if cache is None or id(cache) in seen:
+                continue
+            seen.add(id(cache))
+            if segment_executor is not None:
+                segment_executor.release_staging(cache)
+            residency.release_scratch_cache(cache)
+
+    def snapshot_requests(self, request_ids: set[int]) -> dict[int, ProgramState]:
+        return {
+            request_id: self._snapshot(program)
+            for request_id in {int(value) for value in request_ids}
+            if (program := self._programs.get(request_id)) is not None
+        }
+
+    def restore_requests(
+        self,
+        request_ids: set[int],
+        snapshot: dict[int, ProgramState],
+    ) -> None:
+        for request_id in {int(value) for value in request_ids}:
+            self._programs.pop(request_id, None)
+        self._programs.update(snapshot)
+
+    @staticmethod
+    def _snapshot(program: ProgramState) -> ProgramState:
+        cloned = copy.copy(program)
+        cloned.sampling = dict(program.sampling)
+        cloned.image = dict(program.image)
+        cloned.neg_token_ids = list(program.neg_token_ids)
+        for name in ("cond", "tu", "iu"):
+            branch = copy.copy(getattr(program, name))
+            branch.block_ids = list(branch.block_ids)
+            setattr(cloned, name, branch)
+        return cloned
+
+
+class KvView:
+    """Batch-bounded access to request KV branch state."""
+
+    def __init__(self, store: KvStore, request_ids: frozenset[int]) -> None:
+        self._store = store
+        self._request_ids = request_ids
+
+    def program(self, request_id: int) -> ProgramState:
+        request_id = int(request_id)
+        if request_id not in self._request_ids:
+            raise invalid_descriptor(f"request {request_id} is outside the KV view")
+        return self._store.program(request_id)
+
+
+class LatentView:
+    """Batch-bounded access to active flow or generation state."""
+
+    def __init__(
+        self,
+        store: Any,
+        request_ids: Iterable[int],
+        *,
+        kv_store: KvStore,
+        residency: Any,
+        segment_executor: Any,
+    ) -> None:
+        self._store = store
+        self._request_ids = frozenset(int(value) for value in request_ids)
+        self._kv_store = kv_store
+        self._residency = residency
+        self._segment_executor = segment_executor
+
+    def state(self, request_id: int) -> Any | None:
+        self._require(request_id)
+        return self._store.state(int(request_id))
+
+    def set_state(self, request_id: int, state: Any) -> None:
+        self._require(request_id)
+        self._store.set_state(int(request_id), state)
+
+    def pop_state(self, request_id: int) -> Any | None:
+        self._require(request_id)
+        state = self._store.pop_state(int(request_id))
+        self.release_state(state)
+        return state
+
+    def release_state(self, state: Any | None) -> None:
+        if state is None:
+            return
+        latent_handle = getattr(state, "latent_handle", None)
+        if latent_handle is not None:
+            self._store.free(int(latent_handle))
+        branches = getattr(state, "paged_branches", None)
+        if branches is not None:
+            branches.release(self._residency)
+            state.paged_branches = None
+        if hasattr(state, "graph_image"):
+            state.graph_image = None
+        live_cache_ids = self._kv_store.live_cache_ids()
+        seen: set[int] = set()
+        for cache in (
+            getattr(state, "cond_cache", None),
+            getattr(state, "tu_cache", None),
+            getattr(state, "iu_cache", None),
+        ):
+            cache_id = id(cache)
+            if cache is None or cache_id in seen or cache_id in live_cache_ids:
+                continue
+            seen.add(cache_id)
+            if self._segment_executor is not None:
+                self._segment_executor.release_staging(cache)
+            self._residency.release_scratch_cache(cache)
+
+    def _require(self, request_id: int) -> None:
+        request_id = int(request_id)
+        if request_id not in self._request_ids:
+            raise invalid_descriptor(f"request {request_id} is outside the latent view")
 
 
 class ProductTransferState(Protocol):
@@ -849,7 +1042,7 @@ class FlowExecution(FlowGraphExecution):
         cond_cache = adapter._denoise_cache(cond.past)
         tu_cache = adapter._denoise_cache(st.tu.past)
         iu_cache = adapter._denoise_cache(st.iu.past)
-        # The latent lives in the system-owned LatentPool, keyed by the request
+        # The latent lives in the system-owned LatentStore, keyed by the request
         # handle; ``FlowState.x_t`` reads/writes that buffer.
         latent_handle = int(op["req_id"]) if op and "req_id" in op else id(st)
         image_state = FlowState(
@@ -878,7 +1071,7 @@ class FlowExecution(FlowGraphExecution):
             width=params.width,
             noise_scale_embedding=noise_scale_embedding,
         )
-        image_state.x_t = x_t  # store the initial noise into the system LatentPool
+        image_state.x_t = x_t  # store the initial noise into the system LatentStore
         return image_state
 
     def _parse_image_params(self, ip: dict) -> _ImageParams:

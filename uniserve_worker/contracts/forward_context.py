@@ -720,6 +720,9 @@ class ForwardContext:
     execution_options: Any = None
     default_model_forward: Any = None
     tensor_store: Any = None
+    kv_view: Any = None
+    latent_view: Any = None
+    product_view: Any = None
 
     def component_timer_start(self) -> int:
         """Start a per-component timer against this context's ``stats``."""

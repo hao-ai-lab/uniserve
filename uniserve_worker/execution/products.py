@@ -6,6 +6,7 @@ from typing import Any, Protocol
 
 import torch
 
+from uniserve_worker.contracts.forward_context import get_forward_context
 from uniserve_worker.execution.flow import FlowState
 from uniserve_worker.execution.sequence import SequenceAdapter, SequenceCache
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
@@ -37,7 +38,6 @@ class ImageMaterializeAdapter(SequenceAdapter, Protocol):
     def _state(self, op: dict[str, Any]) -> Any: ...
     def _extend_cache_blocks(self, cache: SequenceCache, op: dict[str, Any]) -> None: ...
     def _ensure_host_cache(self, cache: SequenceCache) -> None: ...
-    def _release_image_state_caches(self, image_state: Any) -> None: ...
     def normalize_materialized_image(self, image: torch.Tensor) -> torch.Tensor: ...
     def sequence_position_indexes(
         self,
@@ -133,7 +133,10 @@ class ImageMaterializer:
         if self.transfer.distributed:
             locator = self.transfer.publish_commit_latent(image_state)
             st.image_state = None
-            self.owner._release_image_state_caches(image_state)
+            latent_view = get_forward_context().latent_view
+            if latent_view is None:
+                raise invalid_descriptor("image commit requires an executor latent view")
+            latent_view.release_state(image_state)
             self.owner.residency.release_scratch_cache(st.cond.past)
             self.owner.residency.release_scratch_cache(st.tu.past)
             self.owner.residency.release_scratch_cache(st.iu.past)
@@ -271,7 +274,10 @@ class ImageMaterializer:
     ) -> dict[str, Any]:
         logits = st.cond.last_logits[:, -1, :].float()
         st.image_state = None
-        self.owner._release_image_state_caches(image_state)
+        latent_view = get_forward_context().latent_view
+        if latent_view is None:
+            raise invalid_descriptor("image commit requires an executor latent view")
+        latent_view.release_state(image_state)
         self.owner.residency.release_scratch_cache(st.iu.past)
         st.iu = SequenceCache()
         out = {
@@ -431,11 +437,8 @@ class ProductTransferSession:
     def __init__(
         self,
         owner: ProductTransferAdapter,
-        *,
-        states: dict[int, Any],
     ) -> None:
         self.owner = owner
-        self.states = states
         self._data_plane_handoff: DataPlaneTowerHandoff | None = None
 
     @property
@@ -451,14 +454,13 @@ class ProductTransferSession:
     def wait_gen_cache_ready(self, cache: Any) -> None:
         self.owner._tower_handoff.await_ready(cache)
 
-    def publish_conditioning(self, req_id: int, sampled_token_id: int) -> Any:
+    def publish_conditioning(self, state: Any, sampled_token_id: int) -> Any:
         handoff = self._data_plane_handoff
         if handoff is None:
             return None
         if int(sampled_token_id) != int(self.owner.img_start_id):
             return None
-        state = self.states.get(int(req_id))
-        if state is None or state.cond.past is None:
+        if state.cond.past is None:
             return None
         self.owner._ensure_img_start(state.cond)
         params = parse_text_image_generation_params(state.image or {})

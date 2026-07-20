@@ -2398,9 +2398,6 @@ class SenseNovaU1ForUnifiedGeneration(
         self.block_size = int(block_size)
         self.kv_token_capacity = kv_token_capacity
         self.attention_backend = attention_backend or "auto"
-        # Per-request program state, keyed by req_id and
-        # cleared in drop_request (the authoritative owner).
-        self.reqs: dict[int, ProgramState] = {}
 
         llm_cfg = self._init_token_geometry(config)
         self.resource_plan = ResourcePlan(
@@ -2419,7 +2416,7 @@ class SenseNovaU1ForUnifiedGeneration(
         # and degrades to a same-device scratch copy. The binding resolves live
         # so destination residency tracks the tower-vs-trivial choice.
         self._tower_handoff: TowerHandoff = LocalP2PTowerHandoff(self._resolve_tower_binding)
-        self.tower_session = ProductTransferSession(self, states=self.reqs)
+        self.tower_session = ProductTransferSession(self)
         self.flow_execution = FlowExecution(self, transfer=self.tower_session)
         self.segment_executor: SegmentExecutor = SegmentExecutor(self)
         self._img_start_token = IMG_START_TOKEN
@@ -2807,7 +2804,10 @@ class SenseNovaU1ForUnifiedGeneration(
         Returns the wire locator (for ``SeqResult.locator``) the gen pool will fetch
         and rebuild ``st.cond`` from, or ``None`` outside Mode A / a non-image token.
         A no-op unless a data-plane handoff is bound (Mode A)."""
-        return self.tower_session.publish_conditioning(req_id, sampled_token_id)
+        return self.tower_session.publish_conditioning(
+            self.program_state(int(req_id)),
+            sampled_token_id,
+        )
 
     def _stage_text_cache_from_snapshot(
         self,
@@ -2836,27 +2836,6 @@ class SenseNovaU1ForUnifiedGeneration(
         fetch the published KV into the gen replica and populate the decode-state
         scalars the denoise setup reads. A no-op in Mode C / single-device."""
         self.tower_session.stage_conditioning_from_op(st, op)
-
-    def _release_image_state_caches(self, image_state: FlowState | None) -> None:
-        if image_state is None:
-            return
-        # The latent trajectory lives in the system LatentPool; free its handle
-        # so the buffer is reclaimed at commit/drop.
-        self.residency.latent.free(image_state.latent_handle)
-        live_cache_ids: set[int] = set()
-        for state in self.reqs.values():
-            for text_cache in (state.cond, state.tu, state.iu):
-                cache = getattr(text_cache, "past", None)
-                if cache is not None:
-                    live_cache_ids.add(id(cache))
-        seen: set[int] = set()
-        for cache in (image_state.cond_cache, image_state.tu_cache, image_state.iu_cache):
-            cache_id = id(cache)
-            if cache is None or cache_id in seen or cache_id in live_cache_ids:
-                continue
-            seen.add(cache_id)
-            self.segment_executor.release_staging(cache)
-            self.residency.release_scratch_cache(cache)
 
     def _text_driver(self) -> SequenceExecutor:
         driver = getattr(self, "_shared_text_driver", None)
@@ -3246,57 +3225,13 @@ class SenseNovaU1ForUnifiedGeneration(
         for handle in handles or []:
             self.residency.encoder.pop(int(handle))
 
-    def on_new_request(self, req_id: int, state: RunnerRequestState) -> None:
-        req_id = int(req_id)
-        existing = self.reqs.get(req_id)
-        if isinstance(existing, ProgramState):
-            existing.sampling = dict(state.sampling or existing.sampling or {})
-            existing.image = dict(state.image or existing.image or {})
-            existing.neg_token_ids = list(state.neg_token_ids or existing.neg_token_ids or [])
-            if not existing.cond.block_ids and state.block_ids:
-                existing.cond.block_ids = list(state.block_ids)
-                set_blocks = getattr(existing.cond.past, "set_blocks", None)
-                if callable(set_blocks):
-                    set_blocks(existing.cond.block_ids)
-            return
-        image_state = self._new_program_state(state)
-        self.reqs[req_id] = image_state
-
-    def _new_program_state(self, state: RunnerRequestState) -> ProgramState:
-        image_state = ProgramState(
-            sampling=dict(state.sampling or {}),
-            image=dict(state.image or {}),
-            neg_token_ids=list(state.neg_token_ids or []),
-        )
-        image_state.cond.block_ids = list(state.block_ids or [])
-        image_state.rng = state.device_rng(self.gen_device)
-        return image_state
-
     def program_state(self, req_id: int) -> ProgramState:
-        req_id = int(req_id)
-        existing = self.reqs.get(req_id)
-        if isinstance(existing, ProgramState):
-            return existing
-        request_states = get_forward_context().request_states
-        if request_states is None:
-            return self.reqs.setdefault(req_id, ProgramState())
-        state = request_states.get(req_id)
-        created = self._new_program_state(state)
-        self.reqs[req_id] = created
-        return created
+        kv_view = get_forward_context().kv_view
+        if kv_view is None:
+            raise invalid_descriptor("SenseNova sequence state requires an executor KV view")
+        return kv_view.program(int(req_id))
 
     transformers_image_state = program_state
-
-    def drop_request(self, req_id: int) -> None:
-        req_id = int(req_id)
-        st = self.reqs.pop(req_id, None)
-        if st is not None:
-            self._release_image_state_caches(st.image_state)
-            self.segment_executor.release_staging(st.cond.past)
-            self.segment_executor.release_staging(st.tu.past)
-            self.segment_executor.release_staging(st.iu.past)
-            self.residency.release_scratch_cache(st.tu.past)
-            self.residency.release_scratch_cache(st.iu.past)
 
     def prepare_flow(self, state: RunnerRequestState, op: dict[str, Any] | Any) -> PreparedFlowStep:
         req_id = int(op["req_id"])

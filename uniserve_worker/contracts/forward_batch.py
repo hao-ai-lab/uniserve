@@ -204,7 +204,7 @@ class DenoiseInputs:
     """Generation sub-block for a ``DENOISE`` forward.
 
     The latent trajectory ``x_t`` is named by ``latent_handle`` (a
-    ``LatentPool`` buffer the system owns); the schedule cursor is the
+    ``LatentStore`` buffer the system owns); the schedule cursor is the
     ``step_index``/``total_steps`` pair; the per-step ODE endpoints are ``t`` /
     ``t_next``. The model never holds ``x_t`` or the schedule.
     """

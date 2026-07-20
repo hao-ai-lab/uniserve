@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image
 
 from ..contracts.forward_batch import BatchPolicy, ForwardBatch
+from ..contracts.forward_context import get_forward_context
 from ..contracts.forward_mode import ForwardMode
 from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (
@@ -29,7 +30,6 @@ from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
 from ..models.registry import UniModelBase
 from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.image_utils import pil_image_to_png_b64
-from ..runtime.request_state import RequestState
 from ..worker.model import ModelWorker
 
 STUB_EOS_TOKEN_ID = 151645
@@ -95,22 +95,11 @@ class StubUniModel(UniModelBase):
 
     def __init__(self, config=None) -> None:
         self.config = config
-        self.emitted: dict[int, int] = {}
-        self.steps: dict[int, int] = {}
-        self.images: dict[int, dict] = {}
         self._die_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
         self._executes = 0
 
-    def on_new_request(self, req_id: int, state: RequestState) -> None:
-        self.images[req_id] = dict(state.image or {})
-
     def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
         return {str(name) for name, _tensor in weights}
-
-    def drop_request(self, req_id: int) -> None:
-        self.emitted.pop(req_id, None)
-        self.steps.pop(req_id, None)
-        self.images.pop(req_id, None)
 
     def batch_policy(self) -> BatchPolicy:
         return BatchPolicy(max_batch_ops=self.max_batch_ops, supports_mixed_modes=True)
@@ -165,14 +154,15 @@ class StubUniModel(UniModelBase):
     def _text(self, batch: ForwardBatch) -> list[TextTokenOutput]:
         out = []
         for req_id in batch.as_text().req_ids:
-            n = self.emitted.get(req_id, 0)
-            if self.images.get(req_id) and n == STUB_IMAGE_TRIGGER_STEP:
+            state = get_forward_context().request_states.get(int(req_id))
+            n = state.kv_length("stub_emitted")
+            if state.image and n == STUB_IMAGE_TRIGGER_STEP:
                 tok = STUB_IMG_START_TOKEN_ID
             elif n >= STUB_TEXT_EOS_STEP:
                 tok = STUB_EOS_TOKEN_ID
             else:
                 tok = 1000 + (req_id * 7 + n) % 5000
-            self.emitted[req_id] = n + 1
+            state.set_kv_length(n + 1, "stub_emitted")
             out.append(TextTokenOutput(req_id=req_id, sampled_token_id=tok))
         return out
 
@@ -180,17 +170,19 @@ class StubUniModel(UniModelBase):
         view = batch.as_denoise()
         out = []
         for req_id in view.req_ids:
-            step = self.steps.get(req_id, 0) + 1
-            self.steps[req_id] = step
-            total = int((self.images.get(req_id) or {}).get("steps", 50) or 50)
+            state = get_forward_context().request_states.get(int(req_id))
+            step = int(state.schedule_cursor) + 1
+            state.schedule_cursor = step
+            total = int((state.image or {}).get("steps", 50) or 50)
             out.append(FlowOutput(req_id=req_id, denoise_done=step >= total, num_steps_done=step))
         return out
 
     def _commit(self, batch: ForwardBatch) -> list[CommitOutput]:
         out = []
         for req_id in batch.as_commit().req_ids:
-            self.steps.pop(req_id, None)
-            image = self.images.get(req_id) or {}
+            state = get_forward_context().request_states.get(int(req_id))
+            state.schedule_cursor = 0
+            image = state.image or {}
             hw = (required_image_height(image), required_image_width(image))
             png = _synthetic_png_b64(hw[1], hw[0])
             out.append(CommitOutput(req_id=req_id, image_png_b64=png, image_hw=hw))
@@ -237,6 +229,3 @@ class StubWorker(ModelWorker):
             block_size=block_size,
             simulation=True,
         )
-        self.emitted = model.emitted
-        self.steps = model.steps
-        self.reqs = model.images
