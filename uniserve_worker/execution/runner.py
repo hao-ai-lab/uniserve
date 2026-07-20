@@ -23,7 +23,7 @@ from uniserve_worker.backends.attention import (
     get_attention_backend,
     normalize_attention_backend_name,
 )
-from uniserve_worker.contracts.batches import ExecuteBatch as WireExecuteBatch
+from uniserve_worker.contracts.batches import Batch as WireBatch
 from uniserve_worker.contracts.caps import Caps
 from uniserve_worker.contracts.forward_batch import (
     BatchPolicy,
@@ -70,7 +70,7 @@ from uniserve_worker.nn.sampler import (
 )
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
-from uniserve_worker.runtime.replay import ReplayStore, batch_digest
+from uniserve_worker.runtime.replay import ReplayStore
 from uniserve_worker.runtime.request_session import SessionStore
 from uniserve_worker.runtime.residency_manager import ResidencyLeaseManager
 from uniserve_worker.runtime.resources import ResourceRuntime
@@ -1093,15 +1093,15 @@ class ModelExecutor:
         *,
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
-        parsed = WireExecuteBatch.from_wire(batch)
-        digest = batch_digest(batch)
-        replay = self.replay_store.lookup(parsed.step_id, digest)
+        parsed = WireBatch.from_wire(batch)
+        replay = self.replay_store.lookup(parsed.ops)
         if replay is not None:
             return replay
-        request_ids = {int(item["req_id"]) for item in (*parsed.new_reqs, *parsed.ops)}
+        new_request_ids = {int(item["req_id"]) for item in parsed.new_reqs}
+        self.sessions.validate_operations(parsed.ops, new_request_ids)
         txn = self.sessions.begin_step(
             parsed.step_id,
-            request_ids,
+            parsed.ops,
             self.resource_runtime,
         )
         try:
@@ -1113,12 +1113,12 @@ class ModelExecutor:
         except BaseException:
             txn.rollback()
             raise
-        self.replay_store.commit(parsed.step_id, digest, response)
+        self.replay_store.commit(parsed.ops, response)
         return response
 
     def _execute_once(
         self,
-        parsed: WireExecuteBatch,
+        parsed: WireBatch,
         *,
         defer_text_cpu_results: bool,
     ) -> dict[str, Any]:
@@ -1126,7 +1126,7 @@ class ModelExecutor:
             defer_text_cpu_results=defer_text_cpu_results,
             defer_sampling=self.defer_sampling,
         )
-        self._register_new_reqs(parsed.new_reqs)
+        self._register_new_reqs(parsed)
         if len(parsed.ops) > int(self.batch_policy.max_batch_ops):
             raise invalid_descriptor("execute batch exceeds the model's maximum operation count")
         group = list(enumerate(parsed.ops))
@@ -1202,6 +1202,11 @@ class ModelExecutor:
             ]
         self._advance_state(plan, outputs)
         self._stamp_conditioning_locators(plan, outputs)
+        for operation, output in zip(parsed.ops, outputs, strict=True):
+            output["op_id"] = operation.op_id
+            output["epoch"] = operation.epoch
+            output["base_version"] = operation.base_version
+            output["result_version"] = operation.base_version + 1
         response: dict[str, Any] = {"step_id": parsed.step_id, "per_seq": outputs}
         if forward_stats is not None:
             response["forward_stats"] = forward_stats.to_wire()
@@ -1240,16 +1245,23 @@ class ModelExecutor:
             return encode_result(batch, model, row_indices=rows)
         raise invalid_descriptor("mixed-mode models must implement forward(batch)")
 
-    def _register_new_reqs(self, new_reqs: tuple[Mapping[str, Any], ...]) -> None:
+    def _register_new_reqs(self, batch: WireBatch) -> None:
         """Create/refresh request state and account resident blocks for new reqs.
 
         A block-accounting failure rolls back any request *this* call freshly
         created (existing requests are left untouched) before re-raising.
         """
-        for nr in new_reqs:
+        operations = {operation.session_id: operation for operation in batch.ops}
+        for nr in batch.new_reqs:
             req_id = nr["req_id"]
+            operation = operations[int(req_id)]
             existed = req_id in self.sessions
-            state = self.sessions.create_or_update(req_id, dict(nr))
+            state = self.sessions.admit(
+                req_id,
+                nr,
+                epoch=operation.epoch,
+                base_version=operation.base_version,
+            ).state
             try:
                 self._accountant.account_blocks(req_id, state.block_ids, append_to_state=False)
             except Exception:

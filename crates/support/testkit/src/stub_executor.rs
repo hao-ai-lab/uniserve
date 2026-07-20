@@ -89,6 +89,9 @@ impl StubExecutor {
                 op_kind: Some(op.kind),
                 sampled_token_id: Some(op.req_id.0 as u32),
                 op_id: op.op_id,
+                epoch: Some(op.epoch),
+                base_version: Some(op.base_version),
+                result_version: Some(op.base_version.saturating_add(1)),
                 ..Default::default()
             })
             .collect();
@@ -168,16 +171,14 @@ mod tests {
     use uniserve_worker_wire::{ForwardOp, OpKind};
 
     fn batch(step_id: u64, req_id: u64) -> ForwardBatch {
-        ForwardBatch {
-            step_id,
-            new_reqs: Vec::new(),
-            ops: vec![ForwardOp {
-                req_id: RequestId(req_id),
-                kind: OpKind::DecodeUnd,
-                modality: Modality::Und,
-                ..Default::default()
-            }],
-        }
+        let mut operation = ForwardOp {
+            req_id: RequestId(req_id),
+            kind: OpKind::DecodeUnd,
+            modality: Modality::Und,
+            ..Default::default()
+        };
+        operation.seal(1, step_id, step_id.saturating_sub(1));
+        ForwardBatch::new(step_id, Vec::new(), vec![operation])
     }
 
     #[test]

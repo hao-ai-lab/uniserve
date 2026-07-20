@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 pub use uniserve_core::OpKind;
 use uniserve_core::{
     BlockId, CfgParams, ImageParams, KvCacheGroupSpec, Modality, RankInfo, RequestId,
@@ -24,6 +25,8 @@ pub use resources::{
     LeasePolicy, ResourceClass, ResourceEvent, ResourceEventKind, ResourceHandle, ResourceLease,
     ResourcePressure,
 };
+
+pub const EXECUTION_PROTOCOL_VERSION: u16 = 1;
 
 /// Source for text input token ids on a [`ForwardOp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +82,12 @@ impl NewRequestData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardOp {
     pub req_id: RequestId,
+    /// Lifecycle generation assigned by the scheduler.
+    pub epoch: u64,
+    /// Session version this operation is allowed to advance.
+    pub base_version: u64,
+    /// Digest of the complete typed operation payload and envelope.
+    pub digest: Option<String>,
     pub kind: OpKind,
     pub modality: Modality,
     /// Logical KV blocks allocated since the last op for this request (the
@@ -159,6 +168,9 @@ impl Default for ForwardOp {
     fn default() -> Self {
         Self {
             req_id: RequestId(0),
+            epoch: 0,
+            base_version: 0,
+            digest: None,
             kind: OpKind::PrefillUnd,
             modality: Modality::Und,
             new_block_ids: Vec::new(),
@@ -189,17 +201,254 @@ impl Default for ForwardOp {
     }
 }
 
+impl ForwardOp {
+    /// Bind one logical operation to its lifecycle and expected session version.
+    pub fn seal(&mut self, epoch: u64, op_id: u64, base_version: u64) {
+        self.epoch = epoch;
+        self.op_id = Some(op_id);
+        self.base_version = base_version;
+        self.refresh_digest(EXECUTION_PROTOCOL_VERSION);
+    }
+
+    /// Refresh the payload digest after a protocol-owned descriptor is changed.
+    pub fn refresh_digest(&mut self, protocol_version: u16) {
+        self.digest = Some(self.payload_digest(protocol_version));
+    }
+
+    /// Validate the complete operation envelope without mutating runtime state.
+    pub fn validate_envelope(&self, protocol_version: u16) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            protocol_version == EXECUTION_PROTOCOL_VERSION,
+            "unsupported execution protocol version {protocol_version}"
+        );
+        anyhow::ensure!(self.epoch > 0, "operation epoch must be positive");
+        anyhow::ensure!(
+            self.op_id.is_some_and(|op_id| op_id > 0),
+            "operation id must be positive"
+        );
+        let expected = self.payload_digest(protocol_version);
+        anyhow::ensure!(
+            self.digest.as_deref() == Some(expected.as_str()),
+            "operation digest mismatch for request {}",
+            self.req_id.0
+        );
+        Ok(())
+    }
+
+    /// Cross-language canonical digest for one operation payload.
+    pub fn payload_digest(&self, protocol_version: u16) -> String {
+        let mut digest = OperationDigest::new(protocol_version);
+        digest.u64(self.req_id.0);
+        digest.u64(self.epoch);
+        digest.option_u64(self.op_id);
+        digest.u64(self.base_version);
+        digest.u8(op_kind_code(self.kind));
+        digest.u8(modality_code(self.modality));
+        digest.u32s(self.new_block_ids.iter().map(|block| block.0));
+        digest.u32(self.pos_range.0);
+        digest.u32(self.pos_range.1);
+        digest.option_u32s(self.token_ids.as_deref());
+        digest.u8(token_source_code(self.token_source));
+        digest.option_u16(self.timestep_idx);
+        digest.option_u32(self.cond_pos);
+        digest.option_cfg(self.cfg.as_ref());
+        digest.option_u64(self.image_in);
+        digest.option_str(self.image_prompt.as_deref());
+        digest.option_str(self.image_b64.as_deref());
+        digest.u32(self.group_id);
+        digest.option_u32s(self.allowed_tokens.as_deref());
+        digest.option_u32s(self.suppress_tokens.as_deref());
+        digest.option_u32s(self.recent_tokens.as_deref());
+        digest.option_u64(self.mm_hash);
+        digest.option_u32s(self.spec_token_ids.as_deref());
+        digest.option_u16(self.denoise_step_count);
+        digest.option_u16(self.decode_token_count);
+        digest.option_u32s(self.decode_stop_token_ids.as_deref());
+        digest.bool(self.decode_stop_terminal);
+        digest.bool(self.return_all_logits);
+        digest.option_u64(self.logits_handle);
+        digest.option_str(self.locator.as_deref());
+        digest.finish()
+    }
+}
+
+struct OperationDigest(Sha256);
+
+impl OperationDigest {
+    fn new(protocol_version: u16) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"uniserve-operation\0");
+        hasher.update(protocol_version.to_le_bytes());
+        Self(hasher)
+    }
+
+    fn finish(self) -> String {
+        format!("{:x}", self.0.finalize())
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.0.update([value]);
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.0.update(value.to_le_bytes());
+    }
+
+    fn str(&mut self, value: &str) {
+        self.u64(value.len() as u64);
+        self.0.update(value.as_bytes());
+    }
+
+    fn u32s(&mut self, values: impl IntoIterator<Item = u32>) {
+        let values: Vec<u32> = values.into_iter().collect();
+        self.u64(values.len() as u64);
+        for value in values {
+            self.u32(value);
+        }
+    }
+
+    fn option_u16(&mut self, value: Option<u16>) {
+        self.option(value, Self::u16);
+    }
+
+    fn option_u32(&mut self, value: Option<u32>) {
+        self.option(value, Self::u32);
+    }
+
+    fn option_u64(&mut self, value: Option<u64>) {
+        self.option(value, Self::u64);
+    }
+
+    fn option_str(&mut self, value: Option<&str>) {
+        self.option(value, Self::str);
+    }
+
+    fn option_u32s(&mut self, value: Option<&[u32]>) {
+        self.option(value, |digest, values| digest.u32s(values.iter().copied()));
+    }
+
+    fn option_cfg(&mut self, value: Option<&CfgParams>) {
+        self.option(value, |digest, cfg| {
+            digest.u8(cfg.branch_count);
+            digest.u32(cfg.text_scale.to_bits());
+            digest.u32(cfg.img_scale.to_bits());
+            digest.str(&cfg.renorm_type);
+            digest.u32(cfg.renorm_min.to_bits());
+            digest.u32(cfg.interval.0.to_bits());
+            digest.u32(cfg.interval.1.to_bits());
+        });
+    }
+
+    fn option<T>(&mut self, value: Option<T>, encode: impl FnOnce(&mut Self, T)) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                encode(self, value);
+            }
+            None => self.u8(0),
+        }
+    }
+}
+
+const fn op_kind_code(kind: OpKind) -> u8 {
+    match kind {
+        OpKind::PrefillUnd => 0,
+        OpKind::DecodeUnd => 1,
+        OpKind::TargetVerifyUnd => 2,
+        OpKind::DenoiseGen => 3,
+        OpKind::CommitGen => 4,
+        OpKind::CommitWriteback => 5,
+        OpKind::VaeEncode => 6,
+        OpKind::VitEncode => 7,
+        OpKind::Sample => 8,
+        OpKind::EncodeFrame => 9,
+    }
+}
+
+const fn modality_code(modality: Modality) -> u8 {
+    match modality {
+        Modality::Und => 0,
+        Modality::Gen => 1,
+    }
+}
+
+const fn token_source_code(source: TokenSource) -> u8 {
+    match source {
+        TokenSource::Wire => 0,
+        TokenSource::LastSampled => 1,
+    }
+}
+
 /// One ranked vocabulary candidate at a generated or prompt token position.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TokenLogprob(pub u32, pub f32, pub u32);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardBatch {
+    pub protocol_version: u16,
     pub step_id: u64,
     /// Requests first dispatched in this batch: their static state crosses
     /// here, once; the worker seeds a per-request record before running `ops`.
     pub new_reqs: Vec<NewRequestData>,
     pub ops: Vec<ForwardOp>,
+}
+
+impl ForwardBatch {
+    pub fn new(step_id: u64, new_reqs: Vec<NewRequestData>, ops: Vec<ForwardOp>) -> Self {
+        Self {
+            protocol_version: EXECUTION_PROTOCOL_VERSION,
+            step_id,
+            new_reqs,
+            ops,
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.protocol_version == EXECUTION_PROTOCOL_VERSION,
+            "unsupported execution protocol version {}",
+            self.protocol_version
+        );
+        anyhow::ensure!(
+            !self.ops.is_empty(),
+            "execution batch must contain an operation"
+        );
+        let mut sessions = std::collections::HashSet::with_capacity(self.ops.len());
+        for op in &self.ops {
+            op.validate_envelope(self.protocol_version)?;
+            anyhow::ensure!(
+                sessions.insert(op.req_id),
+                "batch contains multiple operations for request {}",
+                op.req_id.0
+            );
+        }
+        let mut admissions = std::collections::HashSet::with_capacity(self.new_reqs.len());
+        for request in &self.new_reqs {
+            anyhow::ensure!(
+                admissions.insert(request.req_id),
+                "batch contains duplicate admission for request {}",
+                request.req_id.0
+            );
+            anyhow::ensure!(
+                sessions.contains(&request.req_id),
+                "batch admits request {} without an operation",
+                request.req_id.0
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Small per-sequence result. `image_png_b64` is the
@@ -236,6 +485,10 @@ pub struct SeqResult {
     /// echo of the op's `op_id` for result↔op
     /// correlation in the lifecycle trace.
     pub op_id: Option<u64>,
+    /// Lifecycle and version coordinates of the committed operation.
+    pub epoch: Option<u64>,
+    pub base_version: Option<u64>,
+    pub result_version: Option<u64>,
     /// Sampler stage: handle to the logits this op produced, when sampling is
     /// peeled into a separate Sampler pool. Scalar id; routing key.
     pub logits_handle: Option<u64>,
@@ -688,6 +941,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn operation_digest_is_language_independent() {
+        let mut operation = ForwardOp {
+            req_id: RequestId(7),
+            kind: OpKind::DecodeUnd,
+            ..Default::default()
+        };
+        operation.seal(3, 11, 5);
+        assert_eq!(
+            operation.digest.as_deref(),
+            Some("19b160387b195dc140a2bf3f552325287bcf50eab50932cbbb2ae3b205e3e605")
+        );
+    }
+
+    #[test]
     fn control_op_envelopes() {
         let cb = WorkerRequest::copy_blocks(vec![(BlockId(1), BlockId(2))]);
         assert_eq!(cb.kind, RequestKind::CopyBlocks);
@@ -729,20 +996,53 @@ mod tests {
         }
         // The whole envelope still serializes with a flat top-level `kind` string,
         // exactly as the Python worker dispatches on (`req.get("kind")`).
-        let req = WorkerRequest::execute(ForwardBatch {
-            step_id: 1,
-            new_reqs: Vec::new(),
-            ops: Vec::new(),
-        });
+        let req = WorkerRequest::execute(ForwardBatch::new(1, Vec::new(), Vec::new()));
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(value["kind"], serde_json::json!("execute"));
     }
 
     #[test]
     fn flatbuffer_request_response_roundtrip() {
-        let mut req = WorkerRequest::execute(ForwardBatch {
-            step_id: 11,
-            new_reqs: vec![NewRequestData {
+        let mut operation = ForwardOp {
+            req_id: RequestId(5),
+            kind: OpKind::DenoiseGen,
+            modality: Modality::Gen,
+            new_block_ids: vec![BlockId(11)],
+            pos_range: (128, 256),
+            token_ids: Some(vec![101, 102]),
+            token_source: TokenSource::LastSampled,
+            timestep_idx: Some(7),
+            cond_pos: Some(9),
+            cfg: Some(CfgParams {
+                branch_count: 3,
+                text_scale: 4.0,
+                img_scale: 1.0,
+                renorm_type: "global".into(),
+                renorm_min: 0.0,
+                interval: (0.0, 1.0),
+            }),
+            image_in: Some(99),
+            image_prompt: Some("clean scenic destination photograph".into()),
+            image_b64: Some("AAAA".into()),
+            group_id: 2,
+            allowed_tokens: Some(vec![1]),
+            suppress_tokens: Some(vec![2]),
+            recent_tokens: Some(vec![3]),
+            mm_hash: Some(0xABCD),
+            spec_token_ids: Some(vec![5]),
+            denoise_step_count: Some(2),
+            decode_token_count: Some(4),
+            decode_stop_token_ids: Some(vec![9, 10]),
+            decode_stop_terminal: true,
+            return_all_logits: true,
+            logits_handle: Some(0xBEEF),
+            locator: Some("bG9jYXRvcg==".into()),
+            ..Default::default()
+        };
+        operation.seal(2, 44, 6);
+        let mut req = WorkerRequest::execute(ForwardBatch::new(
+            11,
+            vec![NewRequestData {
                 sampling: Some(SamplingParams {
                     temperature: 0.7,
                     n_logprobs: 3,
@@ -759,43 +1059,8 @@ mod tests {
                 group_id: 2,
                 ..NewRequestData::new(RequestId(5))
             }],
-            ops: vec![ForwardOp {
-                req_id: RequestId(5),
-                kind: OpKind::DenoiseGen,
-                modality: Modality::Gen,
-                new_block_ids: vec![BlockId(11)],
-                pos_range: (128, 256),
-                token_ids: Some(vec![101, 102]),
-                token_source: TokenSource::LastSampled,
-                timestep_idx: Some(7),
-                cond_pos: Some(9),
-                cfg: Some(CfgParams {
-                    branch_count: 3,
-                    text_scale: 4.0,
-                    img_scale: 1.0,
-                    renorm_type: "global".into(),
-                    renorm_min: 0.0,
-                    interval: (0.0, 1.0),
-                }),
-                image_in: Some(99),
-                image_prompt: Some("clean scenic destination photograph".into()),
-                image_b64: Some("AAAA".into()),
-                group_id: 2,
-                allowed_tokens: Some(vec![1]),
-                suppress_tokens: Some(vec![2]),
-                recent_tokens: Some(vec![3]),
-                mm_hash: Some(0xABCD),
-                spec_token_ids: Some(vec![5]),
-                denoise_step_count: Some(2),
-                decode_token_count: Some(4),
-                decode_stop_token_ids: Some(vec![9, 10]),
-                decode_stop_terminal: true,
-                return_all_logits: true,
-                op_id: Some(44),
-                logits_handle: Some(0xBEEF),
-                locator: Some("bG9jYXRvcg==".into()),
-            }],
-        });
+            vec![operation],
+        ));
         req.call_id = Some(77);
         let back = flat::decode_request(&flat::encode_request(&req).unwrap()).unwrap();
         assert_eq!(back.call_id, Some(77));
@@ -949,9 +1214,23 @@ mod tests {
     #[test]
     fn flatbuffer_scalar_pair_ordering_is_preserved() {
         // Asymmetric values so a `.0`/`.1` swap cannot round-trip equal.
-        let req = WorkerRequest::execute(ForwardBatch {
-            step_id: 1,
-            new_reqs: vec![NewRequestData {
+        let mut operation = ForwardOp {
+            req_id: RequestId(1),
+            pos_range: (3, 7),
+            cfg: Some(CfgParams {
+                branch_count: 1,
+                text_scale: 1.0,
+                img_scale: 1.0,
+                renorm_type: "global".into(),
+                renorm_min: 0.0,
+                interval: (0.25, 0.75),
+            }),
+            ..ForwardOp::default()
+        };
+        operation.seal(1, 1, 0);
+        let req = WorkerRequest::execute(ForwardBatch::new(
+            1,
+            vec![NewRequestData {
                 image: Some(ImageParams {
                     // `cfg_interval` splits into cfg_interval_lo/cfg_interval_hi.
                     cfg_interval: (0.125, 0.875),
@@ -961,22 +1240,8 @@ mod tests {
                 }),
                 ..NewRequestData::new(RequestId(1))
             }],
-            ops: vec![ForwardOp {
-                req_id: RequestId(1),
-                // `pos_range` splits into pos_lo/pos_hi.
-                pos_range: (3, 7),
-                cfg: Some(CfgParams {
-                    branch_count: 1,
-                    text_scale: 1.0,
-                    img_scale: 1.0,
-                    renorm_type: "global".into(),
-                    renorm_min: 0.0,
-                    // `interval` splits into interval_lo/interval_hi.
-                    interval: (0.25, 0.75),
-                }),
-                ..ForwardOp::default()
-            }],
-        });
+            vec![operation],
+        ));
         let back = flat::decode_request(&flat::encode_request(&req).unwrap()).unwrap();
         let batch = back.batch.unwrap();
         assert_eq!(batch.ops[0].pos_range, (3, 7), "pos_lo/pos_hi transposed");
@@ -1173,6 +1438,9 @@ mod tests {
         // assertion (it must enumerate every field — no `..`).
         let ForwardOp {
             req_id: _,
+            epoch: _,
+            base_version: _,
+            digest: _,
             kind: _,
             modality: _,
             new_block_ids: _,         // logical block ids (scalars), never KV bytes
@@ -1217,6 +1485,9 @@ mod tests {
             num_tokens: _,          // scalar
             num_accepted_tokens: _, // scalar
             op_id: _,               // lifecycle id (scalar)
+            epoch: _,               // lifecycle generation (scalar)
+            base_version: _,        // expected session version (scalar)
+            result_version: _,      // committed session version (scalar)
             logits_handle: _,       // opaque logits handle (scalar); logits stay off-wire
             locator: _, // base64 data-plane locator (small descriptor); tensor stays off-wire
         } = SeqResult::default();

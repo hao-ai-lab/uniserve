@@ -6449,6 +6449,7 @@ dependencies = [
  "flatc-fork",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
  "uniserve-core",
 ]

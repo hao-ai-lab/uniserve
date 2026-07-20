@@ -191,6 +191,9 @@ table NewRequestData {
 
 table ForwardOp {
   req_id:ulong;
+  epoch:ulong;
+  base_version:ulong;
+  digest:string;
   kind:OpKind;
   modality:Modality;
   new_block_ids:[uint];
@@ -236,6 +239,7 @@ table ForwardOp {
 }
 
 table ForwardBatch {
+  protocol_version:ushort;
   step_id:ulong;
   new_reqs:[NewRequestData];
   ops:[ForwardOp];
@@ -255,6 +259,9 @@ table SeqResult {
   num_tokens:uint = null;
   num_accepted_tokens:uint = null;
   op_id:ulong = null;
+  epoch:ulong = null;
+  base_version:ulong = null;
+  result_version:ulong = null;
   // Sampler stage: handle to the logits this op produced, when sampling is
   // peeled into a separate Sampler pool. Scalar id; routing key.
   logits_handle:ulong = null;

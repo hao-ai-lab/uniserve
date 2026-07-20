@@ -5,6 +5,7 @@ views once; models consume only those views. Device-tensor staging into the
 unified :class:`~uniserve_worker.contracts.forward_batch.ForwardBatch` lives in
 ``runtime.forward_batch_builder``.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,9 +15,19 @@ from ..foundation.errors import invalid_descriptor
 from ..foundation.wire import wire_int as _int
 from .forward_mode import ForwardMode
 from .op_kinds import ENCODE_OP_KINDS
+from .operation import (
+    EXECUTION_PROTOCOL_VERSION,
+    OperationClass,
+    OperationEnvelope,
+    seal_operation,
+)
 
 __all__ = [
-    "ExecuteBatch",
+    "Batch",
+    "OperationClass",
+    "OperationEnvelope",
+    "seal_operation",
+    "seal_batch",
     "BatchBase",
     "CfgBatch",
     "TextBatch",
@@ -29,8 +40,40 @@ __all__ = [
 ]
 
 
+def seal_batch(
+    step_id: int,
+    operations: Sequence[Mapping[str, Any]],
+    *,
+    new_reqs: Sequence[Mapping[str, Any]] = (),
+    epoch: int = 1,
+    base_version: int = 0,
+) -> dict[str, Any]:
+    """Construct a versioned batch for an in-memory scheduler boundary."""
+    sealed = []
+    for index, operation in enumerate(operations):
+        payload = dict(operation)
+        operation_epoch = int(payload.pop("epoch", epoch))
+        operation_id = int(payload.pop("op_id", (int(step_id) << 32) + index + 1))
+        operation_base = int(payload.pop("base_version", base_version))
+        payload.pop("digest", None)
+        sealed.append(
+            seal_operation(
+                payload,
+                epoch=operation_epoch,
+                op_id=operation_id,
+                base_version=operation_base,
+            )
+        )
+    return {
+        "protocol_version": EXECUTION_PROTOCOL_VERSION,
+        "step_id": int(step_id),
+        "new_reqs": [dict(request) for request in new_reqs],
+        "ops": sealed,
+    }
+
+
 @dataclass(frozen=True)
-class ExecuteBatch:
+class Batch:
     """One execute() wire payload, parsed and validated once at the boundary.
 
     The scheduler control plane decodes to a ``Mapping``; this parses it into
@@ -43,12 +86,20 @@ class ExecuteBatch:
 
     step_id: int
     new_reqs: tuple[Mapping[str, Any], ...]
-    ops: tuple[Mapping[str, Any], ...]
+    protocol_version: int
+    ops: tuple[OperationEnvelope, ...]
 
     @classmethod
-    def from_wire(cls, batch: Mapping[str, Any]) -> "ExecuteBatch":
+    def from_wire(cls, batch: Mapping[str, Any]) -> "Batch":
         if not isinstance(batch, Mapping):
             raise invalid_descriptor("execute batch must be a map")
+        protocol_version = _int(
+            batch.get("protocol_version"),
+            "execute batch.protocol_version",
+            minimum=1,
+        )
+        if protocol_version != EXECUTION_PROTOCOL_VERSION:
+            raise invalid_descriptor(f"unsupported execution protocol version {protocol_version}")
         step_id = _int(batch.get("step_id"), "execute batch.step_id")
         raw_new = batch.get("new_reqs") or []
         if not isinstance(raw_new, (list, tuple)):
@@ -59,10 +110,33 @@ class ExecuteBatch:
                 raise invalid_descriptor("execute batch.new_reqs entries must be maps")
             _int(nr.get("req_id"), "execute batch.new_reqs[].req_id")
             new_reqs.append(nr)
-        ops = batch.get("ops")
-        if not isinstance(ops, list):
+        raw_ops = batch.get("ops")
+        if not isinstance(raw_ops, list):
             raise invalid_descriptor("execute batch.ops must be a list")
-        return cls(step_id=step_id, new_reqs=tuple(new_reqs), ops=tuple(ops))
+        ops = tuple(
+            OperationEnvelope.from_wire(
+                operation,
+                protocol_version=protocol_version,
+                index=index,
+            )
+            for index, operation in enumerate(raw_ops)
+        )
+        if not ops:
+            raise invalid_descriptor("execute batch must contain an operation")
+        sessions = {operation.session_id for operation in ops}
+        if len(sessions) != len(ops):
+            raise invalid_descriptor("execute batch contains multiple operations for one session")
+        new_sessions = {int(request["req_id"]) for request in new_reqs}
+        if len(new_sessions) != len(new_reqs):
+            raise invalid_descriptor("execute batch contains duplicate admission descriptors")
+        if not new_sessions.issubset(sessions):
+            raise invalid_descriptor("execute batch admits a session without an operation")
+        return cls(
+            protocol_version=protocol_version,
+            step_id=step_id,
+            new_reqs=tuple(new_reqs),
+            ops=ops,
+        )
 
 
 @dataclass(frozen=True)
@@ -82,9 +156,7 @@ class CfgBatch:
     branch_kv_lens: Any
 
 
-_TEXT_MODES = frozenset(
-    {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
-)
+_TEXT_MODES = frozenset({ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT})
 
 
 @dataclass(frozen=True)
@@ -143,7 +215,9 @@ class TextBatch(BatchBase):
             pos = op.get("pos_range") or (0, 0)
             if not isinstance(pos, Sequence) or len(pos) != 2:
                 raise invalid_descriptor(f"ops[{i}].pos_range must be [start, end]")
-            pos_ranges.append((_int(pos[0], f"ops[{i}].pos_range[0]"), _int(pos[1], f"ops[{i}].pos_range[1]")))
+            pos_ranges.append(
+                (_int(pos[0], f"ops[{i}].pos_range[0]"), _int(pos[1], f"ops[{i}].pos_range[1]"))
+            )
         return cls(
             mode=mode,
             req_ids=tuple(req_ids),
@@ -261,7 +335,9 @@ def parse_batch(
     """
     match mode:
         case ForwardMode.EXTEND | ForwardMode.DECODE | ForwardMode.VERIFY_DRAFT:
-            return TextBatch.from_ops(mode, ops, op_modes=op_modes, allow_mixed_text=allow_mixed_text)
+            return TextBatch.from_ops(
+                mode, ops, op_modes=op_modes, allow_mixed_text=allow_mixed_text
+            )
         case ForwardMode.DENOISE:
             return DenoiseBatch.from_ops(ops)
         case ForwardMode.COMMIT:

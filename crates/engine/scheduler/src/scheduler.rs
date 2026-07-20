@@ -208,7 +208,6 @@ const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// be the first to notice). Small enough for prompt death detection, large
 /// enough that the idle engine is effectively asleep.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
-const DECODE_LOOKAHEAD_ENV: &str = "UNISERVE_DECODE_LOOKAHEAD";
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 const DECODE_TOKEN_BURST_ENV: &str = "UNISERVE_DECODE_TOKEN_BURST";
 
@@ -302,6 +301,9 @@ impl Default for SchedulerConfig {
 
 pub struct ReqState {
     pub req: GenerationRequest,
+    /// Scheduler-owned lifecycle generation and committed worker-session version.
+    pub(crate) epoch: u64,
+    pub(crate) version: u64,
     pub(crate) context: SchedulerContext,
     pub(crate) event_tx: EventTx,
     pub(crate) cursor: GenerationCursor,
@@ -404,21 +406,14 @@ pub struct Scheduler {
     reserved_blocks: usize,
     step_id: u64,
     /// Per-request ops currently in flight (submitted, not yet resolved). A
-    /// request may have multiple queued decode ops when FutureMap-style
-    /// lookahead is safe. Each [`InflightOp`] carries the op's `op_id`, so a
-    /// resolving result is matched to its exact op by `op_id` rather than the
-    /// FIFO submission order; the FIFO
-    /// front is only a fallback when the worker did not echo an op_id.
+    /// Each request has at most one operation lease. The operation identity
+    /// still binds a resolving result to the exact submitted transition.
     inflight_ops: HashMap<RequestId, VecDeque<InflightOp>>,
     /// Finite resident-request cohort whose prompt and image-ingest work is
     /// drained before its first decode service. Membership is frozen when a
     /// ready decode would otherwise overlap another resident prompt, so later
     /// arrivals cannot extend the cohort indefinitely.
     prompt_cohort: Option<HashSet<RequestId>>,
-    /// Decode lookahead toggle. The fast path is additionally gated per request
-    /// to plain text generation whose next logits processors do not depend on
-    /// an unknown sampled token.
-    decode_lookahead: bool,
     /// Sequential denoise timesteps to execute per denoise op. The worker runs
     /// the exact same Euler steps and reports the cumulative step cursor.
     denoise_step_burst: u16,
@@ -442,6 +437,7 @@ pub struct Scheduler {
     batch_started: HashMap<u64, Instant>,
     /// Monotonic op ids and archived lifecycle traces.
     next_op_id: u64,
+    next_epoch: u64,
     completed_traces: VecDeque<crate::trace::RequestTrace>,
     trace_sink: Option<crate::bench_trace::SchedulerTraceSink>,
     pub peak_ops_in_batch: usize,
@@ -546,6 +542,8 @@ fn ranked_logprobs(
 fn transition_validation_error_str(error: &TransitionValidationError) -> &'static str {
     match error {
         TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
+        TransitionValidationError::EpochMismatch { .. } => "epoch_mismatch",
+        TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
         TransitionValidationError::OpKindMismatch { .. } => "op_kind_mismatch",
         TransitionValidationError::MissingDenoiseStep => "missing_denoise_step",
         TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
@@ -654,9 +652,6 @@ struct InflightOp {
     op_id: Option<u64>,
     /// Speculative draft token ids attached to this op (empty when none).
     spec_tokens: Vec<u32>,
-    /// Sequential text decode tokens requested by this op. Projected cursors
-    /// account for the full count while the device relay chains the next op.
-    decode_token_count: u16,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
 }
@@ -742,7 +737,6 @@ impl Scheduler {
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
         let spec_decode = crate::spec_decode::SpecDecodeAccounting::new(Arc::clone(&stats));
         let spec_ngram_max_tokens = spec_decode.max_ngram_tokens();
-        let decode_lookahead = decode_lookahead_from_env();
         let denoise_step_burst = denoise_step_burst_from_env();
         let decode_token_burst = decode_token_burst_from_env();
         let mut trace_sink = crate::bench_trace::SchedulerTraceSink::from_env();
@@ -759,7 +753,6 @@ impl Scheduler {
                     "long_prefill_threshold": config.long_prefill_threshold,
                     "mixed_prefill_tokens": config.mixed_prefill_tokens,
                     "spec_ngram_max_tokens": spec_ngram_max_tokens,
-                    "decode_lookahead": decode_lookahead,
                     "denoise_step_burst": denoise_step_burst,
                     "decode_token_burst": decode_token_burst,
                 },
@@ -803,7 +796,6 @@ impl Scheduler {
             step_id: 0,
             inflight_ops: HashMap::new(),
             prompt_cohort: None,
-            decode_lookahead,
             denoise_step_burst,
             decode_token_burst,
             spec_decode,
@@ -814,6 +806,7 @@ impl Scheduler {
             planner: GenerationPlanner::new(),
             batch_started: HashMap::new(),
             next_op_id: 1,
+            next_epoch: 1,
             completed_traces: VecDeque::new(),
             trace_sink,
             peak_ops_in_batch: 0,
@@ -1497,6 +1490,8 @@ impl Scheduler {
             uniserve_core::TraceId(req.request_id.0),
         );
         let st = ReqState {
+            epoch: self.next_epoch,
+            version: 0,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
             event_tx,
@@ -1507,6 +1502,7 @@ impl Scheduler {
             trace,
             req,
         };
+        self.next_epoch = self.next_epoch.saturating_add(1);
         // Structured-output gate: a request with a grammar
         // waits in skipped_waiting until its compilation finishes; admission
         // collects ready grammars each pass.
@@ -1932,37 +1928,6 @@ impl Scheduler {
             .is_some_and(|items| !items.is_empty())
     }
 
-    fn inflight_decode_count(&self, id: RequestId) -> usize {
-        self.inflight_ops
-            .get(&id)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|op| op.transition.kind == OpKind::DecodeUnd)
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
-    fn inflight_has_spec_tokens(&self, id: RequestId) -> bool {
-        self.inflight_ops
-            .get(&id)
-            .is_some_and(|items| items.iter().any(|op| !op.spec_tokens.is_empty()))
-    }
-
-    fn inflight_generated_token_count(&self, id: RequestId) -> usize {
-        self.inflight_ops.get(&id).map_or(0, |items| {
-            items
-                .iter()
-                .map(|op| match op.transition.kind {
-                    OpKind::DecodeUnd => usize::from(op.decode_token_count.max(1)),
-                    OpKind::PrefillUnd => 1,
-                    _ => 0,
-                })
-                .sum()
-        })
-    }
-
     fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
         let st = self.running.get(&id)?;
         let transitions = self
@@ -1973,21 +1938,10 @@ impl Scheduler {
         Some(st.cursor.project(transitions))
     }
 
-    /// Whether any in-flight op for `id` is something other than a plain decode
-    /// (a prefill chunk, an image op, …). Used to gate decode-lookahead.
-    fn inflight_has_non_decode(&self, id: RequestId) -> bool {
-        self.inflight_ops.get(&id).is_some_and(|items| {
-            items
-                .iter()
-                .any(|op| op.transition.kind != OpKind::DecodeUnd)
-        })
-    }
-
     fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
         let request_id = transition.op.req_id;
         let op_id = transition.op.op_id;
         let spec_tokens = transition.op.spec_token_ids.clone().unwrap_or_default();
-        let decode_token_count = transition.op.decode_token_count.unwrap_or(1).max(1);
         self.inflight_ops
             .entry(request_id)
             .or_default()
@@ -1995,7 +1949,6 @@ impl Scheduler {
                 transition,
                 op_id,
                 spec_tokens,
-                decode_token_count,
                 started,
             });
     }
@@ -2226,6 +2179,11 @@ impl Scheduler {
                         self.finish(id, FinishReason::Error);
                     }
                     continue;
+                }
+                if let Some(state) = self.running.get_mut(&id) {
+                    state.version = sr
+                        .result_version
+                        .expect("validated operation result has a resulting version");
                 }
                 self.release_transition_resources(id, &transition);
                 let kind = transition.kind;
@@ -2712,8 +2670,6 @@ impl Scheduler {
             return false;
         }
         !self.has_inflight(id)
-            || self.can_decode_lookahead(id)
-            || self.can_prefill_decode_lookahead(id)
     }
 
     fn refresh_prompt_cohort(&mut self, ids: &[RequestId]) {
@@ -2781,10 +2737,7 @@ impl Scheduler {
             if budget == 0 {
                 break;
             }
-            if self.has_inflight(id)
-                && !self.can_decode_lookahead(id)
-                && !self.can_prefill_decode_lookahead(id)
-            {
+            if self.has_inflight(id) {
                 continue;
             }
             let cancelled = self.running.get(&id).map(|s| s.cancelled).unwrap_or(true);
@@ -2899,7 +2852,6 @@ impl Scheduler {
 
     fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
         let mut decode_ready = false;
-        let mut decode_ready_without_lookahead = false;
         let mut prefill_ready = false;
         for id in ids.iter().copied() {
             if self.running.get(&id).map(|s| s.cancelled).unwrap_or(true) {
@@ -2910,13 +2862,8 @@ impl Scheduler {
             };
             match assembly_lane_for_kind(kind) {
                 AssemblyLane::Decode => {
-                    if self.has_inflight(id) {
-                        if self.can_decode_lookahead(id) || self.can_prefill_decode_lookahead(id) {
-                            decode_ready = true;
-                        }
-                    } else {
+                    if !self.has_inflight(id) {
                         decode_ready = true;
-                        decode_ready_without_lookahead = true;
                     }
                 }
                 AssemblyLane::Prefill => {
@@ -2927,13 +2874,9 @@ impl Scheduler {
                 AssemblyLane::Other => {}
             }
         }
-        if decode_ready_without_lookahead {
-            Some(AssemblyLane::Decode)
-        } else if decode_ready && self.config.mixed_prefill_tokens > 0 {
+        if decode_ready && self.config.mixed_prefill_tokens > 0 {
             // With mixed batching, prompt work rides inside the decode batch
-            // (sharing its weight sweep) instead of claiming a sweep of its
-            // own; the decode lane wins even when decodes are only
-            // lookahead-ready.
+            // (sharing its weight sweep) instead of claiming a sweep of its own.
             Some(AssemblyLane::Decode)
         } else if prefill_ready && !self.any_prefill_inflight() {
             Some(AssemblyLane::Prefill)
@@ -2970,103 +2913,6 @@ impl Scheduler {
         }
     }
 
-    fn can_decode_lookahead(&self, id: RequestId) -> bool {
-        if !self.decode_lookahead || !self.has_inflight(id) {
-            return false;
-        }
-        let Some(st) = self.running.get(&id) else {
-            return false;
-        };
-        if st.cancelled
-            || !st.is_replayable_text()
-            || st.req.behavior.gen_output
-            || st.lifecycle.phase != Phase::DecodeUnd
-            || st.grammar.is_some()
-        {
-            return false;
-        }
-        let depth = self.inflight_decode_count(id);
-        if depth == 0 || self.inflight_has_non_decode(id) || self.inflight_has_spec_tokens(id) {
-            return false;
-        }
-        let sp = &st.req.sampling;
-        let greedy = sp.temperature <= 0.0;
-        let penalties = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        greedy
-            && sp.ignore_eos
-            && st.req.stop_token_ids.is_empty()
-            && st.und.tokens_emitted >= sp.min_tokens
-            && st
-                .und
-                .tokens_emitted
-                .saturating_add(self.inflight_generated_token_count(id))
-                < st.req.max_und_tokens
-            && !sp.generated_logprobs_requested()
-            && sp.bad_words_ids.is_empty()
-            && !penalties
-    }
-
-    /// Cross-boundary async submission (the analog of SGLang's overlap
-    /// scheduler's future-token map): once a request's FINAL prefill chunk is
-    /// in flight, its first decode op may be submitted immediately with
-    /// `token_source = last_sampled`, reading the prefill's sampled token from
-    /// the worker's device-side relay. The first decode step then starts right
-    /// after the prefill step instead of waiting one extra pipeline slot for
-    /// the prefill result's host round-trip.
-    fn can_prefill_decode_lookahead(&self, id: RequestId) -> bool {
-        if !self.decode_lookahead {
-            return false;
-        }
-        let Some(st) = self.running.get(&id) else {
-            return false;
-        };
-        if st.cancelled
-            || !st.is_replayable_text()
-            || st.req.behavior.gen_output
-            || st.lifecycle.phase != Phase::Prefill
-            || st.grammar.is_some()
-        {
-            return false;
-        }
-        // The whole prompt must already be covered by the in-flight prefill
-        // transition, i.e. the final prefill is running.
-        if self
-            .projected_cursor(id)
-            .is_none_or(|cursor| (cursor.prompt_cursor as usize) < st.effective_prompt().len())
-        {
-            return false;
-        }
-        let Some(items) = self.inflight_ops.get(&id) else {
-            return false;
-        };
-        if items.len() != 1
-            || items
-                .iter()
-                .any(|op| op.transition.kind != OpKind::PrefillUnd)
-        {
-            return false;
-        }
-        let sp = &st.req.sampling;
-        let greedy = sp.temperature <= 0.0;
-        let penalties = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        greedy
-            && sp.ignore_eos
-            && st.req.stop_token_ids.is_empty()
-            && st.und.tokens_emitted >= sp.min_tokens
-            && st
-                .und
-                .tokens_emitted
-                .saturating_add(self.inflight_generated_token_count(id))
-                < st.req.max_und_tokens
-            && !sp.generated_logprobs_requested()
-            && sp.bad_words_ids.is_empty()
-            && !penalties
-    }
-
     fn supports_spec_decode(&self) -> bool {
         self.caps.supported_ops.contains(&OpKind::TargetVerifyUnd)
     }
@@ -3098,11 +2944,7 @@ impl Scheduler {
             return (1, None, false);
         }
 
-        let remaining = st
-            .req
-            .max_und_tokens
-            .saturating_sub(st.und.tokens_emitted)
-            .saturating_sub(self.inflight_generated_token_count(id));
+        let remaining = st.req.max_und_tokens.saturating_sub(st.und.tokens_emitted);
         let count = self
             .decode_token_burst
             .min(remaining.min(u16::MAX as usize).max(1) as u16)
@@ -3192,7 +3034,6 @@ impl Scheduler {
                 ImageIngestStep::VaeEncode => OpKind::VaeEncode,
                 ImageIngestStep::VitEncode => OpKind::VitEncode,
             },
-            Phase::Prefill if self.can_prefill_decode_lookahead(id) => OpKind::DecodeUnd,
             Phase::Prefill => OpKind::PrefillUnd,
             Phase::DecodeUnd => OpKind::DecodeUnd,
             Phase::DenoiseGen => OpKind::DenoiseGen,
@@ -3340,6 +3181,9 @@ impl Scheduler {
         let worstcase_blocks = st.resources.worstcase_blocks;
         let reserve_worstcase = st.resources.reserve_worstcase;
         st.cursor = GenerationCursor::new(Phase::Prefill, worstcase_blocks, reserve_worstcase);
+        st.epoch = self.next_epoch;
+        st.version = 0;
+        self.next_epoch = self.next_epoch.saturating_add(1);
         st.replay.generated_ids = generated_ids;
         st.replay.recompute_ids = Some(recompute);
         st.replay.preempted = true;
@@ -3383,8 +3227,16 @@ impl Scheduler {
         for transition in &mut transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
-            transition.assign_op_id(oid);
             let request_id = transition.op.req_id;
+            let Some(state) = self.running.get(&request_id) else {
+                tracing::error!(
+                    request_id = request_id.0,
+                    "planned operation lost its session"
+                );
+                self.fatal = true;
+                return;
+            };
+            transition.assign_envelope(state.epoch, oid, state.version);
             let opk = opkind_str(transition.op.kind);
             self.register_inflight(transition.clone(), submit_at);
             if let Some(st) = self.running.get_mut(&request_id) {
@@ -3502,11 +3354,7 @@ impl Scheduler {
             .iter()
             .map(|transition| transition.op.clone())
             .collect();
-        let batch = ForwardBatch {
-            step_id: self.step_id,
-            new_reqs,
-            ops: wire_ops,
-        };
+        let batch = ForwardBatch::new(self.step_id, new_reqs, wire_ops);
         let spec_draft_counts: Vec<usize> = batch
             .ops
             .iter()
@@ -3667,13 +3515,6 @@ impl Scheduler {
             return None;
         }
         let phase = self.running.get(&id)?.lifecycle.phase;
-        // Final-prefill-in-flight requests build their first decode op early
-        // (cross-boundary lookahead); the committed phase advances at resolve.
-        let phase = if phase == Phase::Prefill && self.can_prefill_decode_lookahead(id) {
-            Phase::DecodeUnd
-        } else {
-            phase
-        };
         match phase {
             Phase::Encode => None,
             Phase::Prefill => {
@@ -3715,39 +3556,25 @@ impl Scheduler {
             }
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
-                let prefill_lookahead = st.lifecycle.phase == Phase::Prefill;
-                let lookahead_depth = self.inflight_decode_count(id);
-                let use_last_sampled = lookahead_depth > 0 || prefill_lookahead;
-                if use_last_sampled
-                    && !self.can_decode_lookahead(id)
-                    && !self.can_prefill_decode_lookahead(id)
-                {
-                    return None;
-                }
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
-                let tok = if use_last_sampled {
-                    0
-                } else {
-                    st.und.next_token
-                };
+                let tok = st.und.next_token;
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
                 let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) =
                     self.decode_burst_plan(id, pos as usize, budget, allowed.as_deref());
-                let spec_token_ids =
-                    if !use_last_sampled && budget > 1 && self.supports_spec_decode() {
-                        self.running.get(&id).and_then(|st| {
-                            self.spec_decode.draft_tokens(
-                                st,
-                                tok,
-                                allowed.as_deref(),
-                                suppress.as_deref(),
-                            )
-                        })
-                    } else {
-                        None
-                    };
+                let spec_token_ids = if budget > 1 && self.supports_spec_decode() {
+                    self.running.get(&id).and_then(|st| {
+                        self.spec_decode.draft_tokens(
+                            st,
+                            tok,
+                            allowed.as_deref(),
+                            suppress.as_deref(),
+                        )
+                    })
+                } else {
+                    None
+                };
                 let spec_len = spec_token_ids.as_ref().map_or(0, Vec::len);
                 let decode_len = if spec_len == 0 {
                     decode_token_count.max(1) as usize
@@ -3766,11 +3593,7 @@ impl Scheduler {
                     TransitionIntent::DecodeUnd {
                         position: pos,
                         token_id: tok,
-                        token_source: if use_last_sampled {
-                            TokenSource::LastSampled
-                        } else {
-                            TokenSource::Wire
-                        },
+                        token_source: TokenSource::Wire,
                         new_blocks,
                         spec_token_ids,
                         token_count: decode_len as u16,
@@ -5074,17 +4897,6 @@ fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
         .saturating_mul(timesteps)
 }
 
-fn decode_lookahead_from_env() -> bool {
-    env::var(DECODE_LOOKAHEAD_ENV)
-        .map(|raw| {
-            !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
-}
-
 fn denoise_step_burst_from_env() -> u16 {
     env::var(DENOISE_STEP_BURST_ENV)
         .ok()
@@ -5210,7 +5022,6 @@ mod tests {
             transition,
             op_id,
             spec_tokens: Vec::new(),
-            decode_token_count: 1,
             started: Instant::now(),
         }
     }
@@ -5820,19 +5631,26 @@ mod tests {
             scheduler.next_op_id = scheduler.next_op_id.saturating_add(1);
             op_id
         });
-        transition.assign_op_id(op_id);
+        let (epoch, base_version) = scheduler
+            .running
+            .get(&id)
+            .map(|state| (state.epoch, state.version))
+            .expect("request running");
+        transition.assign_envelope(epoch, op_id, base_version);
         result.op_id = Some(op_id);
+        result.epoch = Some(epoch);
+        result.base_version = Some(base_version);
+        result.result_version = Some(base_version.saturating_add(1));
         result.op_kind = Some(transition.kind);
         transition
             .validate_result(&result)
             .expect("test result validates against transition");
-        scheduler
-            .running
-            .get_mut(&id)
-            .expect("request running")
+        let state = scheduler.running.get_mut(&id).expect("request running");
+        state
             .cursor
             .apply_transition(&transition, &result)
             .expect("apply test transition");
+        state.version = base_version.saturating_add(1);
         scheduler.resolve(id, transition, result, draft_token_ids);
     }
 
@@ -6215,7 +6033,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_keeps_ready_text_decode_separate_from_prefill() {
+    fn assemble_keeps_prefill_and_ready_decode_in_separate_batches() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -6272,18 +6090,16 @@ mod tests {
         req.sampling.ignore_eos = true;
         receivers.push(sched.submit_for_test(req));
         sched.admit();
-        let ids = sched.assembly_order();
-        assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
 
         let (_new_reqs, ops) = sched.assemble();
 
         assert_eq!(
             ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OpKind::DecodeUnd, OpKind::DecodeUnd]
+            vec![OpKind::PrefillUnd]
         );
         assert!(
-            ops.iter().all(|op| op.req_id != RequestId(3)),
-            "ready decode lane must not mix in a text prefill op: {ops:?}"
+            ops.iter().all(|op| op.req_id == RequestId(3)),
+            "prefill and decode work must remain in separate batches: {ops:?}"
         );
     }
 
@@ -6329,17 +6145,20 @@ mod tests {
         );
         sched.register_inflight(ops2[0].clone(), Instant::now());
 
-        // A later arrival cannot extend the frozen cohort. While both cohort
-        // prefills are in flight, no first token is emitted and request 3 waits.
+        // A later independent session may make progress while both existing
+        // session leases are in flight.
         let mut req = test_request(3, 4);
         req.sampling.ignore_eos = true;
         let _rx3 = sched.submit_for_test(req);
         sched.admit();
         let (_new_reqs, ops3) = sched.assemble();
-        assert!(
-            ops3.is_empty(),
-            "unexpected ops while cohort drains: {ops3:?}"
+        assert_eq!(
+            ops3.iter()
+                .map(|op| (op.kind, op.req_id))
+                .collect::<Vec<_>>(),
+            vec![(OpKind::PrefillUnd, RequestId(3))]
         );
+        sched.register_inflight(ops3[0].clone(), Instant::now());
 
         for (id, op) in [
             (RequestId(1), ops[0].clone()),
@@ -6374,7 +6193,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_submits_first_decode_while_final_prefill_inflight() {
+    fn assemble_waits_for_terminal_result_before_issuing_a_successor() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -6405,24 +6224,34 @@ mod tests {
         );
         sched.register_inflight(ops[0].clone(), Instant::now());
 
-        // step 2: with the final prefill still in flight, the first decode op
-        // is submitted early, reading its token from the device relay.
+        // The next session operation is not issued until this lease resolves.
         let (_new_reqs, ops2) = sched.assemble();
+        assert!(ops2.is_empty());
+
+        sched.inflight_ops.remove(&RequestId(1));
+        apply_and_resolve(
+            &mut sched,
+            RequestId(1),
+            ops[0].clone(),
+            uniserve_worker_wire::SeqResult {
+                req_id: RequestId(1),
+                sampled_token_id: Some(9),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let (_new_reqs, ops3) = sched.assemble();
         assert_eq!(
-            ops2.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            ops3.iter()
+                .map(|operation| operation.kind)
+                .collect::<Vec<_>>(),
             vec![OpKind::DecodeUnd]
         );
-        assert_eq!(ops2[0].pos_range, (4, 5));
-        assert_eq!(ops2[0].token_source, TokenSource::LastSampled);
-
-        // both in flight: nothing further until a result resolves.
-        sched.register_inflight(ops2[0].clone(), Instant::now());
-        let (_new_reqs, ops3) = sched.assemble();
-        assert!(ops3.is_empty(), "unexpected extra ops: {ops3:?}");
+        assert_eq!(ops3[0].pos_range, (4, 5));
     }
 
     #[test]
-    fn assemble_preserves_decode_bursts_across_the_device_relay() {
+    fn assemble_keeps_decode_bursts_inside_one_operation_lease() {
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 64,
@@ -6440,7 +6269,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        sched.decode_lookahead = true;
         sched.decode_token_burst = 8;
         let mut req = test_request(1, 4);
         req.max_und_tokens = 32;
@@ -6465,14 +6293,7 @@ mod tests {
         sched.register_inflight(first[0].clone(), Instant::now());
 
         let (_new_reqs, relayed) = sched.assemble();
-        assert_eq!(
-            relayed.len(),
-            1,
-            "an in-flight burst must keep the relay pipeline full"
-        );
-        assert_eq!(relayed[0].token_source, TokenSource::LastSampled);
-        assert_eq!(relayed[0].decode_token_count, Some(8));
-        assert_eq!(relayed[0].pos_range, (12, 13));
+        assert!(relayed.is_empty());
     }
 
     #[test]
@@ -6913,10 +6734,8 @@ mod tests {
     }
 
     #[test]
-    fn assemble_interleaves_packed_mixed_and_decode_service() {
+    fn assemble_interleaves_packed_mixed_work_under_single_session_leases() {
         // A ready text-decode op and image-denoise op share one packed forward.
-        // While that denoise op is in flight, the next pipeline slot services
-        // decode lookahead without admitting another denoise request.
         let caps = EngineCaps {
             block_size: 4,
             num_blocks: 256,
@@ -6975,7 +6794,6 @@ mod tests {
         compile_resources(&sched, &mut second_gen_req);
         let _rx3 = sched.submit_for_test(second_gen_req);
         sched.admit();
-        sched.decode_lookahead = true;
         sched.decode_token_burst = 8;
 
         if let Some(st) = sched.running.get_mut(&RequestId(1)) {
@@ -7026,19 +6844,17 @@ mod tests {
             1,
             "the token budget should admit one denoise operation"
         );
+        let leased_sessions: HashSet<RequestId> =
+            ops.iter().map(|operation| operation.req_id).collect();
         for op in ops {
             sched.register_inflight(op, Instant::now());
         }
 
-        let (_new, lookahead) = sched.assemble();
+        let (_new, successors) = sched.assemble();
         assert!(
-            lookahead.iter().any(|op| op.kind == OpKind::DecodeUnd),
-            "decode lookahead must keep the pipeline full"
-        );
-        assert!(
-            lookahead.iter().all(|op| op.kind != OpKind::DenoiseGen),
-            "a second denoise operation must not occupy the decode service slot: {:?}",
-            lookahead.iter().map(|op| op.kind).collect::<Vec<_>>()
+            successors
+                .iter()
+                .all(|operation| !leased_sessions.contains(&operation.req_id))
         );
     }
 

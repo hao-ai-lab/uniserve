@@ -14,6 +14,7 @@ from uniserve_worker.bootstrap.plan import (
     resolve_worker_plan,
 )
 from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.contracts.outputs import EncodeOutput
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.server.worker_kind import WorkerKind
@@ -146,13 +147,14 @@ def test_encoder_assembly_executes_the_loaded_model(
     worker = assembly.assemble_worker(launch)
 
     assert isinstance(worker, EncoderWorker)
-    assert worker.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 3}],
-            "ops": [{"req_id": 3, "kind": "vit_encode", "mm_hash": 11}],
-        }
-    ) == {
-        "step_id": 1,
-        "per_seq": [{"req_id": 3, "encoder_handle": 7, "num_tokens": 1}],
-    }
+    result = worker.execute(
+        seal_batch(
+            1,
+            [{"req_id": 3, "kind": "vit_encode", "mm_hash": 11}],
+            new_reqs=[{"req_id": 3}],
+        )
+    )
+    assert result["step_id"] == 1
+    assert result["per_seq"][0]["req_id"] == 3
+    assert result["per_seq"][0]["encoder_handle"] == 7
+    assert result["per_seq"][0]["num_tokens"] == 1

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts import BatchPolicy, UniModel
-from uniserve_worker.contracts.batches import CfgBatch
+from uniserve_worker.contracts.batches import CfgBatch, seal_batch
 from uniserve_worker.contracts.forward_batch import ForwardBatch
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.resource_plan import ResourcePlan
@@ -138,11 +138,11 @@ def ops(*kinds: str) -> list[dict[str, Any]]:
 def execute(model: RecordingModel, submitted_ops: list[dict[str, Any]]) -> dict[str, Any]:
     req_ids = sorted({int(op["req_id"]) for op in submitted_ops})
     return ModelExecutor(model, config=ExecutorConfig(simulation=True)).execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
-            "ops": submitted_ops,
-        }
+        seal_batch(
+            1,
+            submitted_ops,
+            new_reqs=[{"req_id": req_id, "block_ids": []} for req_id in req_ids],
+        )
     )
 
 
@@ -167,11 +167,11 @@ def test_runner_executes_model_forward_under_inference_mode():
 def test_executor_replays_one_committed_step_without_a_second_model_effect():
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
     executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
-    batch = {
-        "step_id": 7,
-        "new_reqs": [{"req_id": 1, "block_ids": []}],
-        "ops": ops("prefill_und"),
-    }
+    batch = seal_batch(
+        7,
+        ops("prefill_und"),
+        new_reqs=[{"req_id": 1, "block_ids": []}],
+    )
 
     first = executor.execute(batch)
     replay = executor.execute(batch)
@@ -181,29 +181,96 @@ def test_executor_replays_one_committed_step_without_a_second_model_effect():
     assert executor.sessions.get(1).version == 1
 
 
+def test_executor_replay_identity_is_independent_of_transport_step():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+    executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
+    batch = seal_batch(
+        7,
+        ops("prefill_und"),
+        new_reqs=[{"req_id": 1, "block_ids": []}],
+    )
+    first = executor.execute(batch)
+    replay = executor.execute({**batch, "step_id": 70})
+
+    assert replay == first
+    assert len(model.calls) == 1
+
+
+def test_executor_rejects_payload_tampering_before_session_mutation():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+    executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
+    batch = seal_batch(
+        7,
+        ops("prefill_und"),
+        new_reqs=[{"req_id": 1, "block_ids": []}],
+    )
+    batch["ops"][0]["token_ids"] = [999]
+
+    with pytest.raises(WorkerError, match="digest does not match"):
+        executor.execute(batch)
+
+    assert model.calls == []
+    assert 1 not in executor.sessions
+
+
+def test_executor_rejects_stale_epoch_and_version_without_model_effect():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+    executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
+    executor.execute(
+        seal_batch(
+            1,
+            ops("prefill_und"),
+            new_reqs=[{"req_id": 1, "block_ids": []}],
+        )
+    )
+    calls = len(model.calls)
+
+    with pytest.raises(WorkerError, match="stale epoch"):
+        executor.execute(
+            seal_batch(
+                2,
+                [{"req_id": 1, "kind": "decode_und", "token_ids": [7]}],
+                epoch=2,
+                base_version=1,
+            )
+        )
+    with pytest.raises(WorkerError, match="session version is 1"):
+        executor.execute(
+            seal_batch(
+                3,
+                [{"req_id": 1, "kind": "decode_und", "token_ids": [7]}],
+                base_version=0,
+            )
+        )
+
+    assert len(model.calls) == calls
+    assert executor.sessions.get(1).version == 1
+
+
 def test_executor_rejects_a_digest_conflict_for_a_committed_step():
     model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
     executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
-    batch = {
-        "step_id": 8,
-        "new_reqs": [{"req_id": 1, "block_ids": []}],
-        "ops": ops("prefill_und"),
-    }
+    batch = seal_batch(
+        8,
+        ops("prefill_und"),
+        new_reqs=[{"req_id": 1, "block_ids": []}],
+    )
     executor.execute(batch)
-    conflicting = {**batch, "ops": [{**batch["ops"][0], "token_ids": [999]}]}
+    conflicting_op = {**batch["ops"][0], "token_ids": [999]}
+    conflicting = seal_batch(8, [conflicting_op], new_reqs=batch["new_reqs"])
 
-    with pytest.raises(WorkerError, match="conflicts with its committed batch digest"):
+    with pytest.raises(WorkerError, match="conflicts with its committed digest"):
         executor.execute(conflicting)
 
 
 def test_executor_forward_failure_rolls_back_admission_and_allows_repair_retry():
     model = FailOnceRecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
     executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
-    batch = {
-        "step_id": 9,
-        "new_reqs": [{"req_id": 1, "block_ids": [3]}],
-        "ops": ops("prefill_und"),
-    }
+    batch = seal_batch(
+        9,
+        ops("prefill_und"),
+        new_reqs=[{"req_id": 1, "block_ids": [3]}],
+    )
 
     with pytest.raises(RuntimeError, match="injected forward failure"):
         executor.execute(batch)
@@ -294,10 +361,9 @@ def test_system_speculative_verify_runs_over_thin_model_forward():
     runner = _cpu_pool_runner(model)
 
     result = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}}],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {
                     "req_id": 1,
                     "kind": "decode_und",
@@ -306,12 +372,14 @@ def test_system_speculative_verify_runs_over_thin_model_forward():
                     "pos_range": [5, 6],
                 }
             ],
-        }
+            new_reqs=[{"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}}],
+        )
     )
 
     # The model's verify logits fix the argmax at 7 for every position, so both
     # draft 7s are accepted and the sampled continuation is 7.
-    assert result["per_seq"] == [{"req_id": 1, "sampled_token_id": 7, "num_accepted_tokens": 2}]
+    assert result["per_seq"][0]["sampled_token_id"] == 7
+    assert result["per_seq"][0]["num_accepted_tokens"] == 2
     assert runner.sessions.get(1).decode_relay.token_id == 7
 
 
@@ -322,17 +390,17 @@ def test_thin_text_runs_per_op_through_system_forward_and_samples():
     runner = _cpu_pool_runner(model)
 
     result = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [
-                {"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}},
-                {"req_id": 2, "block_ids": [1], "sampling": {"temperature": 0.0}},
-            ],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {"req_id": 1, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]},
                 {"req_id": 2, "kind": "decode_und", "token_ids": [6], "pos_range": [0, 1]},
             ],
-        }
+            new_reqs=[
+                {"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}},
+                {"req_id": 2, "block_ids": [1], "sampling": {"temperature": 0.0}},
+            ],
+        )
     )
 
     assert [r["sampled_token_id"] for r in result["per_seq"]] == [7, 7]
@@ -347,28 +415,28 @@ def test_per_op_decode_consumes_last_sampled_relay_token(monkeypatch):
     runner = _cpu_pool_runner(model)
 
     runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}}],
-            "ops": [{"req_id": 1, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}],
-        }
+        seal_batch(
+            1,
+            [{"req_id": 1, "kind": "decode_und", "token_ids": [5], "pos_range": [0, 1]}],
+            new_reqs=[{"req_id": 1, "block_ids": [0], "sampling": {"temperature": 0.0}}],
+        )
     )
     # The sampled token (7) was kept on device; the next step reads it via the
     # relay rather than the wire placeholder (0).
     runner.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [],
-            "ops": [
+        seal_batch(
+            2,
+            [
                 {
                     "req_id": 1,
                     "kind": "decode_und",
                     "token_ids": [0],
                     "token_source": "last_sampled",
                     "pos_range": [1, 2],
+                    "base_version": 1,
                 }
             ],
-        }
+        )
     )
 
     assert model.input_values == [[5], [7]]
@@ -380,10 +448,9 @@ def test_per_op_last_sampled_token_source_requires_relay():
 
     with pytest.raises(WorkerError) as exc:
         runner.execute(
-            {
-                "step_id": 1,
-                "new_reqs": [{"req_id": 1, "block_ids": [0]}],
-                "ops": [
+            seal_batch(
+                1,
+                [
                     {
                         "req_id": 1,
                         "kind": "decode_und",
@@ -392,7 +459,8 @@ def test_per_op_last_sampled_token_source_requires_relay():
                         "pos_range": [1, 2],
                     }
                 ],
-            }
+                new_reqs=[{"req_id": 1, "block_ids": [0]}],
+            )
         )
 
     assert exc.value.code == ErrorCode.INVALID_DESCRIPTOR
@@ -574,10 +642,9 @@ def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     model = RecordingModel(BatchPolicy(max_batch_ops=4, supports_mixed_modes=True))
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     result = runner.execute(
-        {
-            "step_id": 7,
-            "new_reqs": [{"req_id": 1, "block_ids": []}, {"req_id": 2, "block_ids": []}],
-            "ops": [
+        seal_batch(
+            7,
+            [
                 {
                     "req_id": 1,
                     "kind": "prefill_und",
@@ -588,10 +655,18 @@ def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
                     "req_id": 2,
                     "kind": "denoise_gen",
                     "latent_shape": [2, 2],
-                    "cfg": {"branch_count": 3},
+                    "cfg": {
+                        "branch_count": 3,
+                        "text_scale": 1.0,
+                        "img_scale": 1.0,
+                        "renorm_type": "none",
+                        "renorm_min": 0.0,
+                        "interval": [0.0, 0.0],
+                    },
                 },
             ],
-        }
+            new_reqs=[{"req_id": 1, "block_ids": []}, {"req_id": 2, "block_ids": []}],
+        )
     )
 
     stats = result["forward_stats"]
@@ -608,11 +683,11 @@ def test_text_denoise_route_uses_one_complete_batch_forward(text_kind):
 
     req_ids = sorted({int(op["req_id"]) for op in submitted})
     result = ModelExecutor(model, config=ExecutorConfig(simulation=True)).execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
-            "ops": submitted,
-        }
+        seal_batch(
+            1,
+            submitted,
+            new_reqs=[{"req_id": req_id, "block_ids": []} for req_id in req_ids],
+        )
     )
 
     assert [row["mode"] for row in result["per_seq"]] == ["mixed", "mixed"]

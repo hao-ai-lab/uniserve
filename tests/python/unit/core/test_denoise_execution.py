@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 
 pytestmark = pytest.mark.unit
@@ -48,16 +49,24 @@ def test_denoise_request_advances_its_schedule_across_runner_steps():
     runner = _runner(model)
 
     first = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [_new_request(11, seed=123, steps=2)],
-            "ops": [{"req_id": 11, "kind": "denoise_gen"}],
-        }
+        seal_batch(
+            1,
+            [{"req_id": 11, "kind": "denoise_gen"}],
+            new_reqs=[_new_request(11, seed=123, steps=2)],
+        )
     )
-    second = runner.execute({"step_id": 2, "ops": [{"req_id": 11, "kind": "denoise_gen"}]})
+    second = runner.execute(
+        seal_batch(
+            2,
+            [{"req_id": 11, "kind": "denoise_gen"}],
+            base_version=1,
+        )
+    )
 
-    assert first["per_seq"] == [{"req_id": 11, "denoise_done": False, "num_steps_done": 1}]
-    assert second["per_seq"] == [{"req_id": 11, "denoise_done": True, "num_steps_done": 2}]
+    assert first["per_seq"][0]["denoise_done"] is False
+    assert first["per_seq"][0]["num_steps_done"] == 1
+    assert second["per_seq"][0]["denoise_done"] is True
+    assert second["per_seq"][0]["num_steps_done"] == 2
     assert model.branches == ["branch_0", "branch_1", "branch_0", "branch_1"]
     assert not torch.equal(model.latents[0], model.latents[2])
 
@@ -68,11 +77,11 @@ def test_seeded_denoise_requests_expose_reproducible_initial_latents_to_the_mode
 
     for index, (model, seed) in enumerate(zip(models, seeds, strict=True), start=1):
         _runner(model).execute(
-            {
-                "step_id": 1,
-                "new_reqs": [_new_request(index, seed=seed)],
-                "ops": [{"req_id": index, "kind": "denoise_gen"}],
-            }
+            seal_batch(
+                1,
+                [{"req_id": index, "kind": "denoise_gen"}],
+                new_reqs=[_new_request(index, seed=seed)],
+            )
         )
 
     torch.testing.assert_close(models[0].latents[0], models[1].latents[0])
@@ -84,21 +93,20 @@ def test_denoise_batch_preserves_wire_order_and_per_request_completion():
     model = RecordingVelocityModel()
 
     result = _runner(model).execute(
-        {
-            "step_id": 1,
-            "new_reqs": [
-                _new_request(42, seed=1),
-                _new_request(7, seed=2),
-            ],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {"req_id": 42, "kind": "denoise_gen"},
                 {"req_id": 7, "kind": "denoise_gen"},
             ],
-        }
+            new_reqs=[
+                _new_request(42, seed=1),
+                _new_request(7, seed=2),
+            ],
+        )
     )
 
-    assert result["per_seq"] == [
-        {"req_id": 42, "denoise_done": True, "num_steps_done": 1},
-        {"req_id": 7, "denoise_done": True, "num_steps_done": 1},
-    ]
+    assert [row["req_id"] for row in result["per_seq"]] == [42, 7]
+    assert [row["denoise_done"] for row in result["per_seq"]] == [True, True]
+    assert [row["num_steps_done"] for row in result["per_seq"]] == [1, 1]
     assert model.branches == ["branch_0", "branch_1", "branch_0", "branch_1"]

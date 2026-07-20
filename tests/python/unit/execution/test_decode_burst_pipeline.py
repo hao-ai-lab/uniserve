@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 
 from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 from uniserve_worker.execution.sequence import resolve_op_token_ids
 
@@ -55,11 +56,11 @@ def _burst_op(count: int, stop_ids: list[int]) -> dict:
 def _run_burst(model: _ScriptedTextModel, op: dict) -> dict:
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     result = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 4, "sampling": {"temperature": 0.0}}],
-            "ops": [op],
-        }
+        seal_batch(
+            1,
+            [op],
+            new_reqs=[{"req_id": 4, "sampling": {"temperature": 0.0}}],
+        )
     )
     return result["per_seq"][0]
 
@@ -125,23 +126,17 @@ def test_relay_started_burst_continues_from_the_previous_burst_tail():
     model = _ScriptedTextModel([5, 6, 8, 9, 10])
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     first = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 4, "sampling": {"temperature": 0.0}}],
-            "ops": [_burst_op(3, stop_ids=[])],
-        }
+        seal_batch(
+            1,
+            [_burst_op(3, stop_ids=[])],
+            new_reqs=[{"req_id": 4, "sampling": {"temperature": 0.0}}],
+        )
     )["per_seq"][0]
     second_op = _burst_op(2, stop_ids=[])
     second_op["token_source"] = "last_sampled"
-    second_op["token_ids"] = [-1]
+    second_op["token_ids"] = [0]
     second_op["pos_range"] = [10, 11]
-    second = runner.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [],
-            "ops": [second_op],
-        }
-    )["per_seq"][0]
+    second = runner.execute(seal_batch(2, [second_op], base_version=1))["per_seq"][0]
 
     assert first["sampled_token_ids"] == [5, 6, 8]
     assert second["sampled_token_ids"] == [9, 10]
@@ -159,13 +154,9 @@ def test_multi_row_burst_returns_token_lists_for_each_row():
     model = _ScriptedTextModel([5, 6, 7, 8])
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     result = runner.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [
-                {"req_id": 4, "sampling": {"temperature": 0.0}},
-                {"req_id": 5, "sampling": {"temperature": 0.0}},
-            ],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 _burst_op(2, stop_ids=[]),
                 {
                     "req_id": 5,
@@ -176,7 +167,11 @@ def test_multi_row_burst_returns_token_lists_for_each_row():
                     "decode_stop_token_ids": [],
                 },
             ],
-        }
+            new_reqs=[
+                {"req_id": 4, "sampling": {"temperature": 0.0}},
+                {"req_id": 5, "sampling": {"temperature": 0.0}},
+            ],
+        )
     )
 
     assert result["per_seq"][0]["sampled_token_ids"] == [5, 7]

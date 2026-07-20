@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError, classify
 from uniserve_worker.server.app import CONTROL_KINDS, WorkerServer, dispatch
 from uniserve_worker.server.metrics import MetricsService
@@ -144,10 +145,9 @@ def test_core_kinds_roundtrip():
     supported = _supported(worker)
     assert dispatch(worker, supported, {"kind": "get_caps"})["kind"] == "caps"
     assert dispatch(worker, supported, {"kind": "drop_request", "req_id": 1}) == {"kind": "ok"}
-    batch = {
-        "step_id": 1,
-        "new_reqs": [{"req_id": 1}],
-        "ops": [
+    batch = seal_batch(
+        1,
+        [
             {
                 "req_id": 1,
                 "kind": "prefill_und",
@@ -156,7 +156,8 @@ def test_core_kinds_roundtrip():
                 "token_ids": [1, 2, 3],
             }
         ],
-    }
+        new_reqs=[{"req_id": 1}],
+    )
     # Host execution enters through the instrumented server handle.
     runtime = WorkerServer(worker, ipc_endpoint=None)
     resp = runtime.handle({"kind": "execute", "batch": batch})
@@ -307,10 +308,9 @@ def _execute_req(
     return {
         "kind": "execute",
         "call_id": call_id,
-        "batch": {
-            "step_id": step_id,
-            "new_reqs": [{"req_id": req_id}],
-            "ops": [
+        "batch": seal_batch(
+            step_id,
+            [
                 {
                     "req_id": req_id,
                     "kind": kind,
@@ -320,7 +320,8 @@ def _execute_req(
                     **op,
                 }
             ],
-        },
+            new_reqs=[{"req_id": req_id}],
+        ),
     }
 
 
@@ -406,7 +407,7 @@ def test_worker_server_depth1_finalizes_each_before_next_dispatch():
     server = _FifoServer(
         [
             _execute_req(1, 1, 1),
-            _execute_req(2, 2, 1, pos_range=(1, 2), token_ids=(0,), token_source="last_sampled"),
+            _execute_req(2, 2, 2),
             {"kind": "shutdown", "call_id": 3},
         ]
     )
