@@ -1,4 +1,4 @@
-"""Diffusion preparation and projection internals for ``ModelRunner``."""
+"""Diffusion preparation and projection internals for ``ModelExecutor``."""
 
 from __future__ import annotations
 

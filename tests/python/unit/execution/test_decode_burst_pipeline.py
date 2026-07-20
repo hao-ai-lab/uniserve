@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 
 from uniserve_worker.contracts import UniModel
-from uniserve_worker.execution import ModelRunner, RunnerConfig
+from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 from uniserve_worker.execution.sequence import resolve_op_token_ids
 
 
@@ -53,7 +53,7 @@ def _burst_op(count: int, stop_ids: list[int]) -> dict:
 
 
 def _run_burst(model: _ScriptedTextModel, op: dict) -> dict:
-    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     result = runner.execute(
         {
             "step_id": 1,
@@ -123,7 +123,7 @@ def test_burst_relay_ops_carry_device_relay_tensor():
 
 def test_relay_started_burst_continues_from_the_previous_burst_tail():
     model = _ScriptedTextModel([5, 6, 8, 9, 10])
-    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     first = runner.execute(
         {
             "step_id": 1,
@@ -157,7 +157,7 @@ def test_relay_started_burst_continues_from_the_previous_burst_tail():
 
 def test_multi_row_burst_returns_token_lists_for_each_row():
     model = _ScriptedTextModel([5, 6, 7, 8])
-    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     result = runner.execute(
         {
             "step_id": 1,

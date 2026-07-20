@@ -1,7 +1,7 @@
 """SenseNova-U1 UniModel entry.
 
 This is the registry/runner-facing model port. Execution is driven by
-``ModelRunner`` and selected by ``models.registry``; text and denoise attention
+``ModelExecutor`` through ``ModelRunner`` and selected by ``models.registry``; text and denoise attention
 use the worker-owned paged KV pool through the shared ``RadixAttention`` seam.
 """
 

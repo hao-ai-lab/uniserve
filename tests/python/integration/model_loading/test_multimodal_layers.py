@@ -19,6 +19,6 @@ def test_processor_registry_auto_discovers_bagel_processor():
 def test_model_worker_attaches_discovered_multimodal_processor():
     worker = ModelWorker(BagelForUnifiedGeneration(config={}))
     assert isinstance(
-        worker.model_runner.multimodal_processor,
+        worker.model_executor.multimodal_processor,
         BagelImageProcessor,
     )

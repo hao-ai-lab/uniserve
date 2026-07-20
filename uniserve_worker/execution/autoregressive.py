@@ -1,4 +1,4 @@
-"""Autoregressive preparation and projection internals for ``ModelRunner``."""
+"""Autoregressive preparation and projection internals for ``ModelExecutor``."""
 
 from __future__ import annotations
 

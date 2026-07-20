@@ -1,4 +1,4 @@
-"""Image encode and decode internals for ``ModelRunner``."""
+"""Image encode and decode internals for ``ModelExecutor``."""
 
 from __future__ import annotations
 

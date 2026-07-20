@@ -16,7 +16,7 @@ from uniserve_worker.contracts.forward_batch import (
     TextPostprocessEntry,
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
-from uniserve_worker.execution import ModelRunner, RunnerConfig
+from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 
 pytestmark = pytest.mark.unit
 
@@ -38,7 +38,7 @@ class _Model(UniModel):
 
 def _execute(model: UniModel, ops: list[dict[str, Any]]) -> dict[str, Any]:
     req_ids = [int(op["req_id"]) for op in ops]
-    return ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
+    return ModelExecutor(model, config=ExecutorConfig(simulation=True)).execute(
         {
             "step_id": 9,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],

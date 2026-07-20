@@ -12,7 +12,7 @@ from uniserve_worker.contracts.batches import CfgBatch
 from uniserve_worker.contracts.forward_batch import ForwardBatch
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.resource_plan import ResourcePlan
-from uniserve_worker.execution import ModelRunner, RunnerConfig
+from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 from uniserve_worker.execution.runner import text_input_id_replacements_from_relays
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.nn.attention import RadixAttention
@@ -42,6 +42,18 @@ class RecordingModel(UniModel):
             {"req_id": int(op["req_id"]), "kind": str(op["kind"]), "mode": batch.mode.value}
             for op in batch.ops
         ]
+
+
+class FailOnceRecordingModel(RecordingModel):
+    def __init__(self, policy: BatchPolicy) -> None:
+        super().__init__(policy)
+        self.fail_next = True
+
+    def forward(self, batch: ForwardBatch) -> list[dict[str, Any]]:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("injected forward failure")
+        return super().forward(batch)
 
 
 class ThinCPUTextModel(UniModel):
@@ -108,9 +120,9 @@ def _cpu_pool_runner(model):
         device="cpu",
         ledger=ledger,
     )
-    return ModelRunner(
+    return ModelExecutor(
         model,
-        config=RunnerConfig(simulation=True),
+        config=ExecutorConfig(simulation=True),
         resource_runtime=ledger,
         residency=residency,
     )
@@ -125,7 +137,7 @@ def ops(*kinds: str) -> list[dict[str, Any]]:
 
 def execute(model: RecordingModel, submitted_ops: list[dict[str, Any]]) -> dict[str, Any]:
     req_ids = sorted({int(op["req_id"]) for op in submitted_ops})
-    return ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
+    return ModelExecutor(model, config=ExecutorConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
@@ -150,6 +162,56 @@ def test_runner_executes_model_forward_under_inference_mode():
     execute(model, ops("prefill_und"))
 
     assert model.inference_modes == [True]
+
+
+def test_executor_replays_one_committed_step_without_a_second_model_effect():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+    executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
+    batch = {
+        "step_id": 7,
+        "new_reqs": [{"req_id": 1, "block_ids": []}],
+        "ops": ops("prefill_und"),
+    }
+
+    first = executor.execute(batch)
+    replay = executor.execute(batch)
+
+    assert replay == first
+    assert len(model.calls) == 1
+    assert executor.request_states.get(1).version == 1
+
+
+def test_executor_rejects_a_digest_conflict_for_a_committed_step():
+    model = RecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+    executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
+    batch = {
+        "step_id": 8,
+        "new_reqs": [{"req_id": 1, "block_ids": []}],
+        "ops": ops("prefill_und"),
+    }
+    executor.execute(batch)
+    conflicting = {**batch, "ops": [{**batch["ops"][0], "token_ids": [999]}]}
+
+    with pytest.raises(WorkerError, match="conflicts with its committed batch digest"):
+        executor.execute(conflicting)
+
+
+def test_executor_forward_failure_rolls_back_admission_and_allows_repair_retry():
+    model = FailOnceRecordingModel(BatchPolicy(max_batch_ops=8, supports_mixed_modes=False))
+    executor = ModelExecutor(model, config=ExecutorConfig(simulation=True))
+    batch = {
+        "step_id": 9,
+        "new_reqs": [{"req_id": 1, "block_ids": [3]}],
+        "ops": ops("prefill_und"),
+    }
+
+    with pytest.raises(RuntimeError, match="injected forward failure"):
+        executor.execute(batch)
+    assert 1 not in executor.request_states
+
+    result = executor.execute(batch)
+    assert result["per_seq"][0]["req_id"] == 1
+    assert executor.request_states.get(1).version == 1
 
 
 def test_complete_mixed_batch_preserves_result_alignment_in_one_model_call():
@@ -510,7 +572,7 @@ def test_batch_policy_rejects_invalid_max_batch():
 def test_forward_metrics_env_counts_modes_and_tokens(monkeypatch):
     monkeypatch.setenv("UNISERVE_FORWARD_METRICS", "1")
     model = RecordingModel(BatchPolicy(max_batch_ops=4, supports_mixed_modes=True))
-    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
     result = runner.execute(
         {
             "step_id": 7,
@@ -545,7 +607,7 @@ def test_text_denoise_route_uses_one_complete_batch_forward(text_kind):
     submitted = ops(text_kind, "denoise_gen")
 
     req_ids = sorted({int(op["req_id"]) for op in submitted})
-    result = ModelRunner(model, config=RunnerConfig(simulation=True)).execute(
+    result = ModelExecutor(model, config=ExecutorConfig(simulation=True)).execute(
         {
             "step_id": 1,
             "new_reqs": [{"req_id": req_id, "block_ids": []} for req_id in req_ids],
