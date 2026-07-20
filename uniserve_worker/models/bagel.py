@@ -87,7 +87,6 @@ from ..runtime.residency import (
     ResidencyManager,
     encoder_handle_from_mm_hash,
 )
-from .cache_registrations import bagel_cache_registration
 from .registry import UniModelBase
 
 __all__ = [
@@ -704,7 +703,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         "vit_encode",
         "vae_encode",
     )
-    cache_registration_factory = staticmethod(bagel_cache_registration)
     supported_controls = ("free_encoder", "load_lora", "unload_lora")
     adapter_mode = "engine_wide"
     resource_plan = ResourcePlan(

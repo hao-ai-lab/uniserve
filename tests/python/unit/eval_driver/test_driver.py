@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from PIL import Image
 
 import uniserve_eval.backends
 import uniserve_eval.harness.runner as harness_runner
@@ -458,6 +459,25 @@ def test_sensenova_default_gate_declares_complete_image_lifecycle():
     assert workload["expect_images"] == image_config["num_images"]
     assert workload["expect_image_steps"] == image_config["steps"] * image_config["num_images"]
     assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 200}}) == 200
+
+
+def test_sensenova_t2i_gate_rejects_an_image_that_misses_prompt_color_semantics(tmp_path):
+    config = load_config(DEFAULT_CONFIG)
+    expectation = config["workloads"]["gate/sensenova/t2i-seed42"][
+        "expect_image_channel_dominance"
+    ]
+    matching = tmp_path / "matching.png"
+    mismatching = tmp_path / "mismatching.png"
+    Image.new("RGB", (4, 4), (180, 60, 40)).save(matching)
+    Image.new("RGB", (4, 4), (40, 60, 180)).save(mismatching)
+
+    uniserve_eval.verify.verify_image_channel_dominance(
+        [{"path": str(matching)}], expectation
+    )
+    with pytest.raises(SystemExit, match="expected image mean red channel to exceed blue"):
+        uniserve_eval.verify.verify_image_channel_dominance(
+            [{"path": str(mismatching)}], expectation
+        )
 
 
 def test_benchmark_runner_forwards_wire(tmp_path):

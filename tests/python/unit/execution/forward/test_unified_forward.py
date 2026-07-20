@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,6 +13,7 @@ from uniserve_worker.contracts.forward_batch import (
     DenoisePostprocessEntry,
     ForwardBatch,
     ForwardResult,
+    TextPostprocessEntry,
 )
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.execution import ModelRunner, RunnerConfig
@@ -104,6 +106,41 @@ def test_typed_mixed_result_is_postprocessed_once_at_the_runner_boundary():
     assert result["per_seq"][1] == {"req_id": 2, "denoise_done": True, "num_steps_done": 1}
     assert len(accepted) == 1
     torch.testing.assert_close(accepted[0], torch.tensor([3.0]))
+
+
+def test_text_forward_result_commits_recurrent_state_for_the_next_workflow_step():
+    ops = [{"req_id": 1, "kind": "prefill_und", "token_ids": [4, 5, 6], "pos_range": [0, 3]}]
+    cache = SimpleNamespace(length=0)
+    sequence = SimpleNamespace(
+        t_index=-1,
+        last_logits=None,
+        last_token_id=None,
+    )
+    model = _Model(
+        ForwardResult(
+            text_logits=torch.tensor([[0.0, 5.0]], dtype=torch.float32),
+            text_postprocess=(
+                TextPostprocessEntry(
+                    row_index=0,
+                    req_id=1,
+                    logits_index=0,
+                    position_id=3,
+                    kv_new_length=3,
+                    last_input_token=6,
+                    program_state=SimpleNamespace(cond=sequence),
+                    persistent_cache=cache,
+                ),
+            ),
+        )
+    )
+
+    result = _execute(model, ops)
+
+    assert result["per_seq"][0]["sampled_token_id"] == 1
+    assert cache.length == 3
+    assert sequence.t_index == 2
+    assert sequence.last_token_id == 6
+    torch.testing.assert_close(sequence.last_logits, torch.tensor([[[0.0, 5.0]]]))
 
 
 def test_invalid_model_result_is_rejected_before_any_result_is_published():

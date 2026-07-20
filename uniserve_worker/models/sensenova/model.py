@@ -103,7 +103,6 @@ from ...runtime.tower_handoff import (
     TowerBinding,
     TowerHandoff,
 )
-from ..cache_registrations import sensenova_cache_registration
 from ..registry import UniModelBase
 from .config import NeoChatConfig
 
@@ -2351,7 +2350,6 @@ class SenseNovaU1ForUnifiedGeneration(
         "commit_writeback",
         "vit_encode",
     )
-    cache_registration_factory = staticmethod(sensenova_cache_registration)
     supported_controls: tuple[str, ...] = ("free_encoder",)
     adapter_mode = "none"
     resource_plan = ResourcePlan(

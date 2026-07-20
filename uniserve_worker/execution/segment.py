@@ -2554,6 +2554,13 @@ class SegmentExecutor(SegmentRuntime):
         request_states: Any,
         defer_text_cpu_results: bool = False,
     ) -> Any:
+        if batch.op_modes and all(
+            mode in {ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.VERIFY_DRAFT}
+            for mode in batch.op_modes
+        ):
+            default_forward = get_forward_context().default_model_forward
+            if callable(default_forward):
+                return default_forward(self.adapter, batch)
         results: list[Any] = [None] * len(batch.ops)
         denoise_steps: list[tuple[int, PreparedFlowStep]] = []
         commit_rows: list[tuple[int, int, dict[str, Any]]] = []

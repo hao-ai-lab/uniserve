@@ -1,6 +1,6 @@
 """One prepare, model-forward, and postprocess pipeline for scheduler batches.
 
-The runner orchestrates immutable plans and device batches from ``execution.planning``, invokes the model once, and projects sequence, flow, encode, and materialize results. Transaction lifecycle and schema lowering live in torch-free modules; graph capture and replay live in ``execution.graph``.
+The runner orchestrates immutable plans and device batches from ``execution.planning``, invokes the model once, and projects sequence, flow, encode, and materialize results. Graph capture and replay live in ``execution.graph``.
 """
 
 from __future__ import annotations
@@ -186,6 +186,7 @@ class _ForwardPostprocessor:
     def _can_apply_text_batch(plan: ForwardPlan, result: ForwardResult) -> bool:
         return (
             isinstance(result.text_logits, torch.Tensor)
+            and not result.text_postprocess
             and bool(plan.output_slots)
             and all(slot.kind is ForwardOutputKind.TEXT_TOKEN for slot in plan.output_slots)
         )

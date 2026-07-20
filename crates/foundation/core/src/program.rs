@@ -1,7 +1,5 @@
 //! Dormant bounded typed inference program.
 //!
-//! Target contract from `specs/unified_inference_runtime.md` (Slice 2:
-//! "Program, Product, Resource, And Scheduler Foundation"). An
 //! [`InferenceProgram`] is a deterministic, bounded, typed state machine
 //! compiled from one semantic request: typed input and product slots, a sealed
 //! model-backed operation algebra
@@ -10,9 +8,7 @@
 //! callbacks, media bytes, or model objects, and public media names never
 //! appear below this seam.
 //!
-//! Nothing in production submits these programs yet; per the migration plan
-//! the stack stays unreachable from production traffic until the whole-slice
-//! cutover. This module owns the value shapes, the validation obligations that
+//! Nothing in production submits these programs yet. This module owns the value shapes, the validation obligations that
 //! are provable at the contract level, and the canonical fingerprint, so the
 //! scheduler runtime and the Python worker can later negotiate one exact
 //! schema.

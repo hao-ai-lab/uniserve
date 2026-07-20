@@ -7,7 +7,6 @@ __all__ = [
     "FlowContext",
     "ForwardStats",
     "ModelLoadScope",
-    "OperationTag",
     "UniModel",
 ]
 
@@ -16,7 +15,6 @@ _EXPORTS = {
     "FlowContext": ("model_protocols", "FlowContext"),
     "ForwardStats": ("forward_context", "ForwardStats"),
     "ModelLoadScope": ("model_family", "ModelLoadScope"),
-    "OperationTag": ("execution", "OperationTag"),
     "UniModel": ("model_protocols", "UniModel"),
 }
 

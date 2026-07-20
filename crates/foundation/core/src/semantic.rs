@@ -1,8 +1,6 @@
 //! Dormant canonical semantic request contracts.
 //!
-//! Target contract from `specs/unified_inference_runtime.md` (Slice 1:
-//! "Canonical Semantic And Artifact Contracts"). One ordered semantic context
-//! plus typed output intents replaces top-level request variants: raw prompts,
+//! One ordered semantic context plus typed output intents replaces top-level request variants: raw prompts,
 //! pre-tokenized input, chat messages, tool results, and media are context
 //! entries, never runtime request shapes, and every requested output is an
 //! explicit typed [`OutputIntent`] with a finite bound.
