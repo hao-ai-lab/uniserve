@@ -29,7 +29,7 @@ __all__ = [
     "GenResidencySpec",
     "KvPool",
     "ScratchKvPool",
-    "LatentPool",
+    "LatentStore",
     "EncoderCache",
     "ResidencyManager",
     "encoder_handle_from_mm_hash",
@@ -71,8 +71,8 @@ class ScratchKvPool(PagedKVPool):
         self.release_blocks(getattr(cache, "block_ids", []) or [])
 
 
-class LatentPool:
-    """System-owned per-request denoise latent (``x_t``) buffers.
+class LatentStore:
+    """Own per-request latent buffers and active flow/generation state.
 
     The latent trajectory ``x_t`` is a leased buffer the system owns, addressed
     by a handle (the request id). The generation model reads/writes it through
@@ -81,6 +81,7 @@ class LatentPool:
 
     def __init__(self) -> None:
         self._buffers: dict[int, Any] = {}
+        self._states: dict[int, Any] = {}
 
     def set(self, handle: int, latent: Any) -> None:
         self._buffers[int(handle)] = latent
@@ -90,6 +91,46 @@ class LatentPool:
 
     def free(self, handle: int) -> None:
         self._buffers.pop(int(handle), None)
+
+    def state(self, request_id: int) -> Any | None:
+        return self._states.get(int(request_id))
+
+    def set_state(self, request_id: int, state: Any) -> None:
+        self._states[int(request_id)] = state
+
+    def pop_state(self, request_id: int) -> Any | None:
+        return self._states.pop(int(request_id), None)
+
+    def snapshot_requests(
+        self,
+        request_ids: set[int],
+    ) -> dict[int, tuple[bool, Any, bool, Any]]:
+        return {
+            request_id: (
+                request_id in self._buffers,
+                self._buffers.get(request_id),
+                request_id in self._states,
+                self._states.get(request_id),
+            )
+            for request_id in {int(value) for value in request_ids}
+        }
+
+    def restore_requests(
+        self,
+        request_ids: set[int],
+        snapshot: dict[int, tuple[bool, Any, bool, Any]],
+    ) -> None:
+        for request_id in {int(value) for value in request_ids}:
+            self._buffers.pop(request_id, None)
+            self._states.pop(request_id, None)
+            had_buffer, buffer, had_state, state = snapshot.get(
+                request_id,
+                (False, None, False, None),
+            )
+            if had_buffer:
+                self._buffers[request_id] = buffer
+            if had_state:
+                self._states[request_id] = state
 
     def __contains__(self, handle: int) -> bool:
         return int(handle) in self._buffers
@@ -201,7 +242,7 @@ class ResidencyManager:
         # are pure dict residency — always present so the universal "handle->buffer"
         # rule holds even before a model declares GPU geometry. The sized GPU pools
         # (kv / scratch / gen_scratch) are what build()/build_gen() add.
-        self.latent = latent if latent is not None else LatentPool()      # image_latent class
+        self.latent = latent if latent is not None else LatentStore()     # image_latent class
         self.scratch = scratch        # ScratchKvPool: per-CFG-branch uncond KV (scratch class)
         self.gen_scratch = gen_scratch  # gen-device scratch (tower-axis generation pool)
         self.encoder = (
@@ -293,7 +334,7 @@ class ResidencyManager:
             kv=kv,
             scratch=scratch,
             gen_scratch=gen_scratch,
-            latent=LatentPool(),
+            latent=LatentStore(),
             encoder_cache_budget=spec.encoder_cache_budget,
         )
 

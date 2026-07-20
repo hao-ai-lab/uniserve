@@ -70,6 +70,7 @@ from uniserve_worker.nn.sampler import (
 )
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
+from uniserve_worker.runtime.product_store import ProductStore
 from uniserve_worker.runtime.request_session import SessionStore
 from uniserve_worker.runtime.residency_manager import ResidencyLeaseManager
 from uniserve_worker.runtime.resources import ResourceRuntime
@@ -88,6 +89,8 @@ from .diffusion import (
     _DiffusionRuntime,
 )
 from .flow import (
+    KvStore,
+    LatentView,
     PreparedFlowStep,
     combine_flow_velocity,
     flow_branches,
@@ -846,11 +849,33 @@ class ModelExecutor:
         self._init_unified_forward_execution(model, residency)
         self.multimodal_processor = dependencies.multimodal_processor
         self._init_resource_accounting(resource_runtime, residency)
+        state_residency = residency or getattr(model, "residency", None)
+        segment_executor = getattr(model, "segment_executor", None)
+        if state_residency is not None and segment_executor is not None:
+            rng_device = getattr(model, "gen_device", getattr(model, "device", "cpu"))
+            self.kv_store: KvStore | None = KvStore(
+                self.sessions,
+                state_residency.latent,
+                rng_device=rng_device,
+            )
+            self.latent_store = state_residency.latent
+            self.product_store: ProductStore | None = ProductStore()
+            transaction_stores = (
+                self.kv_store,
+                self.latent_store,
+                self.product_store,
+            )
+        else:
+            self.kv_store = None
+            self.latent_store = None
+            self.product_store = None
+            transaction_stores = ()
         self.operation_executor = OperationExecutor(
             self.sessions,
             self._execute_once,
             admit=self._register_new_reqs,
             resources=self.resource_runtime,
+            stores=transaction_stores,
         )
         # CUDA Green Context SM partitioning. ``None`` unless runtime config
         # enables it and the model runs on a CUDA device.
@@ -1088,7 +1113,24 @@ class ModelExecutor:
         return torch.cuda.stream(stream)
 
     def drop_request(self, req_id: int) -> None:
-        self.model.drop_request(req_id)
+        if self.kv_store is not None and self.latent_store is not None:
+            residency = self.residency or getattr(self.model, "residency", None)
+            segment_executor = getattr(self.model, "segment_executor", None)
+            latent_view = LatentView(
+                self.latent_store,
+                (int(req_id),),
+                kv_store=self.kv_store,
+                residency=residency,
+                segment_executor=segment_executor,
+            )
+            latent_view.pop_state(int(req_id))
+            self.kv_store.drop(
+                int(req_id),
+                residency=residency,
+                segment_executor=segment_executor,
+            )
+            if self.product_store is not None:
+                self.product_store.drop(int(req_id))
         self._accountant.release_request(int(req_id))
         self.sessions.drop(req_id)
 
@@ -1127,6 +1169,27 @@ class ModelExecutor:
         if forward_stats is not None:
             self._record_group_shape(forward_stats, plan)
         device = torch.device(str(getattr(self.model, "device", "cpu") or "cpu"))
+        request_ids = tuple(int(row.req_id) for row in plan.rows)
+        if self.kv_store is not None and self.latent_store is not None:
+            residency = self.residency or getattr(self.model, "residency", None)
+            segment_executor = getattr(self.model, "segment_executor", None)
+            kv_view = self.kv_store.view(request_ids)
+            latent_view = LatentView(
+                self.latent_store,
+                request_ids,
+                kv_store=self.kv_store,
+                residency=residency,
+                segment_executor=segment_executor,
+            )
+            product_view = (
+                self.product_store.view(request_ids, self.sessions)
+                if self.product_store is not None
+                else None
+            )
+        else:
+            kv_view = None
+            latent_view = None
+            product_view = None
         context = ForwardContext(
             attention_backend=self.attention_backend,
             attention_preference=self.attention_preference,
@@ -1136,6 +1199,9 @@ class ModelExecutor:
             execution_options=options,
             default_model_forward=self._default_model_forward,
             tensor_store=self.tensor_store,
+            kv_view=kv_view,
+            latent_view=latent_view,
+            product_view=product_view,
         )
 
         def prepare() -> ForwardBatch:
@@ -1186,8 +1252,9 @@ class ModelExecutor:
                     options,
                 )
             ]
-        self._advance_state(plan, outputs)
-        self._stamp_conditioning_locators(plan, outputs)
+        with use_forward_context(context):
+            self._advance_state(plan, outputs)
+            self._stamp_conditioning_locators(plan, outputs)
         response: dict[str, Any] = {"step_id": parsed.step_id, "per_seq": outputs}
         if forward_stats is not None:
             response["forward_stats"] = forward_stats.to_wire()
@@ -1250,7 +1317,6 @@ class ModelExecutor:
                     self._accountant.release_request(int(req_id))
                     self.sessions.drop(req_id)
                 raise
-            self.model.on_new_request(req_id, state)
 
     def _stamp_conditioning_locators(
         self,

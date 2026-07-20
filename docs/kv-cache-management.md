@@ -188,7 +188,7 @@ The worker's `ResidencyManager` owns multiple physical pools:
 | `kv` | `PagedKVPool` | Main paged KV storage. Block IDs are host-issued. |
 | `scratch` | `ScratchKvPool` | Per-CFG-branch unconditional KV workspace. Worker-local allocation. |
 | `gen_scratch` | `PagedKVPool` | Gen-device scratch pool (tower split topologies). |
-| `latent` | `LatentPool` | In-flight denoise trajectories. |
+| `latent` | `LatentStore` | In-flight denoise trajectories. |
 | `encoder` | `EncoderCache` | Encoder output residency, keyed by `encoder_handle` derived from `mm_hash`. |
 
 ### Three-Cache CFG Architecture

@@ -101,12 +101,6 @@ class UniModel(ABC):
             encoder_cache_budget=getattr(self, "encoder_cache_budget", None),
         )
 
-    def on_new_request(self, req_id: int, state: Any) -> None:
-        pass
-
-    def drop_request(self, req_id: int) -> None:
-        pass
-
     def configure_runtime(self, **kwargs: Any) -> None:
         pass
 

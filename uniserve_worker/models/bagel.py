@@ -22,6 +22,7 @@ from uniserve_worker.execution.flow import (
     FlowGraphExecution,
     FlowRow,
     PreparedFlowStep,
+    ProgramState,
     flow_cfg_branch_count,
 )
 from uniserve_worker.execution.segment import SegmentExecutor
@@ -94,7 +95,6 @@ __all__ = [
     "LLMConfig",
     "BagelConfig",
     "GenState",
-    "BagelTextRequestState",
     "BagelForUnifiedGeneration",
     "EntryClass",
 ]
@@ -678,19 +678,6 @@ _BAGEL_IMG_START_TOKEN = "<|vision_start|>"
 _BAGEL_SCRATCH_CAPACITY_TOKENS = 65536
 
 
-@dataclass
-class BagelTextRequestState:
-    """Per-request state for system sequence execution.
-
-    ``cond`` is the single conditional text branch; its ``block_ids`` list is
-    shared (same object) with the runner ``RequestState.block_ids`` so the
-    driver's text ops and BAGEL's encode/denoise/commit ops ingest host
-    ``new_block_ids`` into one list and every path sees every block.
-    """
-
-    cond: SequenceCache = field(default_factory=SequenceCache)
-
-
 class BagelForUnifiedGeneration(UniModelBase):
     """BAGEL unified text/image model with VAE denoise and ViT/VAE encode paths."""
 
@@ -753,12 +740,10 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.image_processor = image_processor or (
             BagelImageProcessor() if model is not None else None
         )
-        self.generation_session = TextImageGenerationSession(self)
         # Interleaved-text-driver owner surface: per-request driver states plus
         # the marker/eos ids the driver reads as configuration. BAGEL has no
         # worker-side tokenizer (the host tokenizes). The scratch pool holds
         # the denoise CFG-branch prefixes and their transient gen rows.
-        self.reqs: dict[int, BagelTextRequestState] = {}
         self.tokenizer = None
         self.scratch_pool: PagedKVPool | None = None
         self._scratch_blocks = 0
@@ -915,24 +900,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             store_dtype=self.kv_cache_dtype,
         )
 
-    def on_new_request(self, req_id: int, state: RequestState) -> None:
-        r = int(req_id)
-        self.reqs.pop(r, None)
-        self.generation_session.begin_request(
-            r,
-            sampling=state.sampling,
-            image=state.image,
-            neg_token_ids=state.neg_token_ids,
-            lora_id=state.lora_id,
-        )
-
-    def drop_request(self, req_id: int) -> None:
-        r = int(req_id)
-        text_state = self.reqs.pop(r, None)
-        if text_state is not None:
-            self.segment_executor.release_staging(text_state.cond.past)
-        self.generation_session.release_request(r)
-
     def free_encoder(self, handles) -> None:
         # Encoder-output residency is system-owned: the handle→embedding store lives
         # on the ResidencyManager, not the model.
@@ -954,8 +921,11 @@ class BagelForUnifiedGeneration(UniModelBase):
         if count:
             logger.info("unmerged LoRA adapter %s", lora_id)
 
-    def _record(self, req_id: int) -> dict:
-        return self.generation_session.record(int(req_id))
+    def _record(self, req_id: int) -> Any:
+        product_view = get_forward_context().product_view
+        if product_view is None:
+            raise invalid_descriptor("BAGEL product metadata requires an executor view")
+        return product_view.record(int(req_id))
 
     def _state(self, req_id: int) -> RequestState:
         request_states = get_forward_context().request_states
@@ -970,18 +940,22 @@ class BagelForUnifiedGeneration(UniModelBase):
         self._state(req_id).set_kv_length(value)
 
     def _gen_state(self, req_id: int) -> GenState | None:
-        return self.generation_session.generation_state(int(req_id))
+        latent_view = get_forward_context().latent_view
+        if latent_view is None:
+            raise invalid_descriptor("BAGEL generation state requires an executor view")
+        return latent_view.state(int(req_id))
 
     def _set_gen_state(self, req_id: int, value: GenState) -> None:
-        self.generation_session.set_generation_state(int(req_id), value)
+        latent_view = get_forward_context().latent_view
+        if latent_view is None:
+            raise invalid_descriptor("BAGEL generation state requires an executor view")
+        latent_view.set_state(int(req_id), value)
 
     def _pop_gen_state(self, req_id: int) -> GenState | None:
-        return self.generation_session.release_generated_state(int(req_id))
-
-    def _release_paged_denoise_branches(self, gs: GenState) -> None:
-        if gs.graph_image is not None:
-            gs.graph_image = None
-        self.generation_session.release_paged_branches(gs)
+        latent_view = get_forward_context().latent_view
+        if latent_view is None:
+            raise invalid_descriptor("BAGEL generation state requires an executor view")
+        return latent_view.pop_state(int(req_id))
 
     def _extend_blocks(self, op) -> list[int]:
         state = self._state(int(op["req_id"]))
@@ -1004,7 +978,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         if driver is None:
             driver = SequenceExecutor(
                 self,
-                request_state_factory=BagelTextRequestState,
+                request_state_factory=ProgramState,
                 image_start_token=_BAGEL_IMG_START_TOKEN,
             )
             self._shared_text_driver = driver
@@ -1016,16 +990,11 @@ class BagelForUnifiedGeneration(UniModelBase):
     def _ensure_host_cache(self, cache: SequenceCache) -> None:
         self._text_driver().ensure_host_cache(cache)
 
-    def program_state(self, req_id: int) -> BagelTextRequestState:
-        req_id = int(req_id)
-        st = self.reqs.get(req_id)
-        if st is None:
-            st = BagelTextRequestState()
-            # Share one block list between the driver's text cache and the
-            # runner request state (see BagelTextRequestState docstring).
-            st.cond.block_ids = self._state(req_id).block_ids
-            self.reqs[req_id] = st
-        return st
+    def program_state(self, req_id: int) -> ProgramState:
+        kv_view = get_forward_context().kv_view
+        if kv_view is None:
+            raise invalid_descriptor("BAGEL sequence state requires an executor KV view")
+        return kv_view.program(int(req_id))
 
     def sequence_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._ensure_loaded().model.embed_tokens(input_ids).to(torch.bfloat16)
@@ -1356,11 +1325,11 @@ class BagelForUnifiedGeneration(UniModelBase):
                 item["state"].cond.last_logits = m.logits(hidden[-1:]).unsqueeze(0)
             self._set_length(req_id, new_len)
             record = self._record(req_id)
-            record["dims"] = item["image_hw"]
+            record.dimensions = tuple(item["image_hw"])
             if item["kind"] == "vit_encode":
-                record["context_image_feedback"] = True
-                record["text_branch_kvlen"] = new_len
-                record["text_branch_pos"] = int(item["rope"]) + 1
+                record.context_image_feedback = True
+                record.text_branch_kvlen = new_len
+                record.text_branch_pos = int(item["rope"]) + 1
             outputs.append(
                 {
                     "req_id": req_id,
@@ -1469,10 +1438,10 @@ class BagelForUnifiedGeneration(UniModelBase):
         m = self._ensure_loaded().model
         state = self._state(int(op["req_id"]))
         rec = self._record(op["req_id"])
-        ip = rec.get("image") or {}
+        ip = rec.image or {}
         cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
         cond_pos = int(op["cond_pos"])
-        dims = rec.get("dims")
+        dims = rec.dimensions
         parse_ip = dict(ip)
         if dims is not None:
             parse_ip["height"] = int(dims[0])
@@ -1491,7 +1460,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             (num_vae, m.cfg.patch_latent_dim),
             seed=params.seed if params.seed is not None else state.seed,
         )
-        if bool(rec.get("context_image_feedback")):
+        if rec.context_image_feedback:
             raise capability_mismatch(
                 "BAGEL context-image generation has no graph-ready CFG branch layout"
             )
@@ -1514,7 +1483,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             cond_pos=cond_pos,
             cond_branch_kvlen=cond_pos,
         )
-        neg = list(rec.get("neg_token_ids") or [])
+        neg = list(rec.neg_token_ids or [])
         gs.cfg_pos = len(neg) if (gs.cfg_text_scale > 1.0 and neg) else 0
         self._init_paged_denoise_branches(op, gs, neg)
         self._set_gen_state(op["req_id"], gs)
@@ -1891,7 +1860,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         self._extend_blocks(op)
         img = m.vae_decode(gs.x_t, gs.H, gs.W)
         rec = self._record(r)
-        retain_images = bool((rec.get("image") or {}).get("retain_images", True))
+        retain_images = bool((rec.image or {}).get("retain_images", True))
         added = 0
         if retain_images:
             # Program continuation: persist the generated latents into the
@@ -1920,14 +1889,15 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     @torch.no_grad()
     def forward(self, batch: ForwardBatch) -> Any:
-        from ..contracts.forward_context import get_forward_context
-
         self._ensure_loaded()
-        options = get_forward_context().execution_options
+        context = get_forward_context()
+        options = context.execution_options
+        if context.request_states is None:
+            raise invalid_descriptor("BAGEL forward requires executor request state")
         with self._autocast():
             return self.segment_executor.execute(
                 batch,
-                request_states=self.states,
+                request_states=context.request_states,
                 defer_text_cpu_results=bool(getattr(options, "defer_text_cpu_results", False)),
             )
 
@@ -1963,102 +1933,3 @@ class BagelForUnifiedGeneration(UniModelBase):
 
 
 EntryClass = BagelForUnifiedGeneration
-
-
-# ---------------------
-# Text-image generation workflow session (family-owned request lifecycle)
-# ---------------------
-
-
-class TextImageGenerationSession:
-    """Owns request lifecycle state for text-image generation flows."""
-
-    def __init__(self, owner: Any, req_id: int | None = None) -> None:
-        self.owner = owner
-        self.req_id = None if req_id is None else int(req_id)
-        self.records: dict[int, dict[str, Any]] = {}
-        self.generated: dict[int, Any] = {}
-
-    def begin_request(
-        self,
-        req_id: int,
-        *,
-        sampling: dict[str, Any] | None = None,
-        image: dict[str, Any] | None = None,
-        neg_token_ids: list[int] | None = None,
-        lora_id: Any = None,
-    ) -> dict[str, Any]:
-        record = {
-            "sampling": dict(sampling or {}),
-            "image": dict(image or {}),
-            "neg_token_ids": list(neg_token_ids or []),
-            "lora_id": lora_id,
-            "dims": None,
-        }
-        self.records[int(req_id)] = record
-        self.release_generated_state(req_id)
-        return record
-
-    def record(self, req_id: int) -> dict[str, Any]:
-        return self.records.setdefault(int(req_id), {})
-
-    def generation_state(self, req_id: int) -> Any | None:
-        return self.generated.get(int(req_id))
-
-    def set_generation_state(self, req_id: int, value: Any) -> None:
-        self.generated[int(req_id)] = value
-
-    def release_generated_state(self, req_id: int) -> Any | None:
-        state = self.generated.pop(int(req_id), None)
-        if state is not None:
-            self.release_paged_branches(state)
-        return state
-
-    def release_request(self, req_id: int, *, request_state: Any | None = None) -> None:
-        target = int(req_id)
-        self.release_generated_state(target)
-        self.records.pop(target, None)
-        if request_state is not None:
-            request_state.kv_lengths.pop("default", None)
-
-    def release_paged_branches(self, state: Any) -> None:
-        branches = getattr(state, "paged_branches", None)
-        if branches is None:
-            return
-        branches.release(self.owner.residency)
-        state.paged_branches = None
-
-    def start(self, op: dict[str, Any]) -> Any:
-        state = getattr(self.owner, "_state", None)
-        if callable(state):
-            return state(int(op["req_id"]))
-        return None
-
-    def encode(self, *args: Any, **kwargs: Any) -> Any:
-        encode = getattr(self.owner, "encode_image", None)
-        if callable(encode):
-            return encode(*args, **kwargs)
-        raise RuntimeError("generation session owner does not expose image encoding")
-
-    def prepare_flow(self, state: Any, op: dict[str, Any]) -> Any:
-        prepare = getattr(self.owner, "prepare_flow", None)
-        if callable(prepare):
-            return prepare(state, op)
-        raise RuntimeError("generation session owner does not expose denoise preparation")
-
-    def predict(self, *args: Any, **kwargs: Any) -> Any:
-        predict = getattr(self.owner, "predict_velocity", None)
-        if callable(predict):
-            return predict(*args, **kwargs)
-        raise RuntimeError("generation session owner does not expose denoise prediction")
-
-    def commit(self, *args: Any, **kwargs: Any) -> Any:
-        decode = getattr(self.owner, "decode_image", None)
-        if callable(decode):
-            return decode(*args, **kwargs)
-        raise RuntimeError("generation session owner does not expose image commit")
-
-    def release(self, req_id: int | None = None) -> None:
-        target = self.req_id if req_id is None else int(req_id)
-        if target is not None:
-            self.release_request(target)
