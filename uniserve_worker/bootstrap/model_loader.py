@@ -19,6 +19,7 @@ from ..models.registry import (
     resolve_model_descriptor,
 )
 from ..nn.quant.base import process_quantized_modules
+from ..runtime.compile import TorchCompileConfig, compile_model_pieces
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
         )
 
     _configure_model_tokenizer(model, model_path)
+    _compile_model(model)
     _check_model_conformance(model)
     return LoadedWorkerModel(
         model=model,
@@ -128,6 +130,16 @@ def _load_via_model(
 def _check_model_conformance(model: UniModel) -> None:
     if not isinstance(model, UniModel):
         raise capability_mismatch(f"{type(model).__name__} must inherit UniModel")
+
+
+def _compile_model(model: UniModel) -> None:
+    config = TorchCompileConfig.from_runtime_config()
+    report = compile_model_pieces(model, config=config)
+    if report.compiled:
+        logger.info(
+            "enabled model-stack torch.compile pieces count=%s",
+            report.compiled,
+        )
 
 
 def _configure_model_tokenizer(model: UniModel, model_path: str) -> None:

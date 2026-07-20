@@ -477,7 +477,6 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
             )
         )
         self.prepare_serving_dtype()
-        self._maybe_compile_piecewise()
 
     def configure_tokenizer(
         self,

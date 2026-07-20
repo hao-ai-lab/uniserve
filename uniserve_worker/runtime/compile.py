@@ -1,4 +1,4 @@
-"""Default-off torch.compile helpers for model-owned piecewise compilation."""
+"""System-owned model compile planning and application."""
 
 from __future__ import annotations
 
@@ -172,12 +172,7 @@ def compile_targets(
     *,
     config: TorchCompileConfig | None = None,
 ) -> CompileReport:
-    """Compile and replace a model-declared set of piecewise modules.
-
-    The model remains the source of truth for which submodules are safe graph
-    islands. This helper only centralizes the opt-in, failure, and replacement
-    semantics so each model does not grow its own compile loop.
-    """
+    """Compile and replace a declared set of piecewise modules."""
 
     cfg = config or TorchCompileConfig.from_runtime_config()
     if not cfg.enabled:

@@ -2398,7 +2398,6 @@ class SenseNovaU1ForUnifiedGeneration(
         self.block_size = int(block_size)
         self.kv_token_capacity = kv_token_capacity
         self.attention_backend = attention_backend or "auto"
-        self.runner_states: dict[int, RunnerRequestState] = {}
         # Per-request program state, keyed by req_id and
         # cleared in drop_request (the authoritative owner).
         self.reqs: dict[int, ProgramState] = {}
@@ -2415,7 +2414,6 @@ class SenseNovaU1ForUnifiedGeneration(
         self._init_empty_residency_state()
         if self.model is not None:
             self._init_loaded_model_residency(n_kv, head_dim, gen_snapshot_kv_capacity)
-            self._maybe_compile_piecewise()
         # The und↔gen crossing is one model-facing object over the tower axis.
         # In-process transport binds NVLink peer copy; a trivial tower binds None
         # and degrades to a same-device scratch copy. The binding resolves live
@@ -3250,7 +3248,6 @@ class SenseNovaU1ForUnifiedGeneration(
 
     def on_new_request(self, req_id: int, state: RunnerRequestState) -> None:
         req_id = int(req_id)
-        self.runner_states[req_id] = state
         existing = self.reqs.get(req_id)
         if isinstance(existing, ProgramState):
             existing.sampling = dict(state.sampling or existing.sampling or {})
@@ -3280,9 +3277,10 @@ class SenseNovaU1ForUnifiedGeneration(
         existing = self.reqs.get(req_id)
         if isinstance(existing, ProgramState):
             return existing
-        state = self.runner_states.get(req_id)
-        if state is None:
+        request_states = get_forward_context().request_states
+        if request_states is None:
             return self.reqs.setdefault(req_id, ProgramState())
+        state = request_states.get(req_id)
         created = self._new_program_state(state)
         self.reqs[req_id] = created
         return created
@@ -3291,7 +3289,6 @@ class SenseNovaU1ForUnifiedGeneration(
 
     def drop_request(self, req_id: int) -> None:
         req_id = int(req_id)
-        self.runner_states.pop(req_id, None)
         st = self.reqs.pop(req_id, None)
         if st is not None:
             self._release_image_state_caches(st.image_state)
@@ -3351,9 +3348,12 @@ class SenseNovaU1ForUnifiedGeneration(
         if self.model is None:
             raise RuntimeError("SenseNova model weights are not loaded")
         options = get_forward_context().execution_options
+        request_states = get_forward_context().request_states
+        if request_states is None:
+            raise invalid_descriptor("SenseNova forward requires executor request state")
         return self.segment_executor.execute(
             batch,
-            request_states=self.runner_states,
+            request_states=request_states,
             defer_text_cpu_results=bool(getattr(options, "defer_text_cpu_results", False)),
         )
 
