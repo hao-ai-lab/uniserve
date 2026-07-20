@@ -860,8 +860,10 @@ class SegmentAdapter(Protocol):
     model: Any
     device: Any
     eos_id: int
-    num_layers: int
     residency: Any
+
+    @property
+    def num_layers(self) -> int: ...
 
     def prepare_flow(self, state: Any, op: dict[str, Any]) -> PreparedFlowStep: ...
     def program_state(self, req_id: int) -> Any: ...
@@ -869,7 +871,15 @@ class SegmentAdapter(Protocol):
     def _ensure_host_cache(self, cache: Any) -> None: ...
     def _denoise_branch_inputs(self, image: Any, branch: str) -> tuple[torch.Tensor, Any]: ...
     def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
-    def packed_decoder_forward(self, input_embeds: torch.Tensor, **kwargs: Any) -> torch.Tensor: ...
+    def packed_decoder_forward(
+        self,
+        input_embeds: torch.Tensor,
+        *,
+        route_indicators: torch.Tensor,
+        indexes: torch.Tensor,
+        forward_stream: Any,
+        kv_view: Any,
+    ) -> torch.Tensor: ...
     def packed_text_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
     def packed_hidden_to_velocity(
         self,
@@ -882,6 +892,21 @@ class SegmentAdapter(Protocol):
     ) -> torch.Tensor: ...
     def segment_graph_attention(self) -> Any: ...
     def accept_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None: ...
+    def encode_image(
+        self,
+        pixels: Any = None,
+        grid: Any = None,
+        *,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any: ...
+    def encode_latents(
+        self,
+        pixels: Any = None,
+        grid: Any = None,
+        *,
+        op: Mapping[str, Any] | None = None,
+    ) -> Any: ...
+    def _text_driver(self) -> Any: ...
     def decode_image(
         self,
         latent: Any,

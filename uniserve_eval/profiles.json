@@ -360,14 +360,28 @@
         "image_config": {
           "width": 2048,
           "height": 1152,
-          "steps": 50,
+          "steps": 200,
           "num_images": 4
         }
       },
       "expect_images": 4,
-      "expect_image_steps": 200,
+      "expect_image_steps": 800,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
+      "image_comparison": {
+        "color_representation": "RGB uint8",
+        "lpips": {
+          "network": "alex",
+          "input_size": [256, 256],
+          "aggregation": "every image",
+          "maximum": 0.15
+        },
+        "pixel_error": {
+          "metric": "mean absolute error over full-resolution RGB uint8 values",
+          "aggregation": "every image",
+          "maximum": 12.0
+        }
+      },
       "timeout_s": 900,
       "description": "SenseNova default correctness gate."
     },
@@ -1250,6 +1264,163 @@
         "uniserve_radix_cache": {
           "status": "required",
           "reason": "Qwen3 ShareGPT comparison requires cache-mode evidence for the declared SGLang and UniServe server profiles."
+        }
+      }
+    },
+    "execution": {
+      "artifact_root": "artifacts/benchmark/execution",
+      "description": "Model execution stage acceptance points.",
+      "hardware_requirements": {
+        "gpu_count_per_process": 1,
+        "gpu_model": "NVIDIA GB200"
+      },
+      "acceptance": {
+        "baseline_measurements": 1,
+        "candidate_measurements": 1,
+        "throughput_minimum_ratio": 0.95,
+        "latency_maximum_ratio": 1.05,
+        "points": {
+          "qwen3_sharegpt_r16": ["output_tokens_per_second", "mean_ttft_ms", "mean_tpot_ms"],
+          "sensenova_t2i_c32": ["images_per_second"],
+          "sensenova_i2t_r16": ["output_tokens_per_second"]
+        }
+      },
+      "defaults": {
+        "warmup_requests": 1,
+        "seed": 42,
+        "measurement_interface": "public_protocol_adapter",
+        "cache_read_policy": "enabled",
+        "cache_write_policy": "enabled",
+        "adapter_selection": "base",
+        "structured_output_policy": "none",
+        "measured_runs": 1,
+        "server_topology": "single_server_single_harness",
+        "acceptance_min_success": 1,
+        "acceptance_max_failed": 0
+      },
+      "load_cases": {
+        "text_r16": [
+          {
+            "id": "r16",
+            "request_rate": 16
+          }
+        ],
+        "image_c32": [
+          {
+            "id": "c32",
+            "request_rate": "inf",
+            "max_concurrency": 32
+          }
+        ]
+      },
+      "datasets": {
+        "beans": {
+          "type": "hf_image_sample",
+          "name": "AI-Lab-Makerere/beans",
+          "revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
+          "split": "train",
+          "count": 200,
+          "seed": 42,
+          "output_dir": "datasets/i2t_beans",
+          "prefix": "beans"
+        }
+      },
+      "groups": {
+        "qwen": {
+          "server": "benchmark/server/qwen-uniserve",
+          "points": ["qwen3_sharegpt_r16"]
+        },
+        "sensenova": {
+          "server": "benchmark/server/sensenova-uniserve",
+          "points": ["sensenova_t2i_c32", "sensenova_i2t_r16"]
+        }
+      },
+      "points": {
+        "qwen3_sharegpt_r16": {
+          "load_case_set": "text_r16",
+          "name": "qwen3-sharegpt-{load_id}",
+          "output": "qwen3_sharegpt/{load_id}",
+          "harness": {
+            "task": "text",
+            "model": "Qwen3-32B",
+            "dataset": "sharegpt",
+            "dataset_revision": "192ab2185289094fc556ec8ce5ce1e8e587154ca",
+            "tokenizer": "${UNISERVE_QWEN3_MODEL}",
+            "num_prompts": 200,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 20,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "chat_template_kwargs": {
+              "enable_thinking": true
+            },
+            "runtime_profile_id": "qwen3",
+            "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "und_only",
+            "preprocessing": "sharegpt_token_length_shaping_v1"
+          }
+        },
+        "sensenova_t2i_c32": {
+          "load_case_set": "image_c32",
+          "name": "sensenova-t2i-{load_id}",
+          "output": "sensenova_t2i/{load_id}",
+          "harness": {
+            "task": "t2i",
+            "model": "SenseNova-U1",
+            "dataset": "mjhq",
+            "dataset_revision": "15b0a659e066e763d0e9a6cd8f00e25f8af5e084",
+            "num_prompts": 32,
+            "steps": 50,
+            "denoise_updates": 50,
+            "width": 2048,
+            "height": 1152,
+            "wire": "openai_chat_json",
+            "max_images": 1,
+            "guidance_scale": 4.0,
+            "image_guidance_scale": 1.0,
+            "cfg_norm": "none",
+            "cfg_interval": [0.0, 1.0],
+            "timestep_shift": 3.0,
+            "image_think": false,
+            "image_t_eps": 0.02,
+            "runtime_profile_id": "sensenova-u1",
+            "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "gen_only",
+            "preprocessing": "mjhq_prompt_text_v1",
+            "acceptance_min_images_per_success": 1.0
+          }
+        },
+        "sensenova_i2t_r16": {
+          "load_case_set": "text_r16",
+          "name": "sensenova-i2t-{load_id}",
+          "output": "sensenova_i2t/{load_id}",
+          "harness": {
+            "task": "i2t",
+            "model": "SenseNova-U1",
+            "dataset": "image-dir",
+            "dataset_revision": "27aa014ce09b193e1a6f58112d4a66e0eddb69c5",
+            "dataset_ref": "beans",
+            "num_prompts": 32,
+            "max_tokens": 256,
+            "temperature": 0,
+            "top_p": 1.0,
+            "top_k": 1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "sampling_seed": 42,
+            "disable_ignore_eos": true,
+            "wire": "openai_chat_json",
+            "runtime_profile_id": "sensenova-u1",
+            "plan_evidence_policy": "runtime_inspection",
+            "output_constraint": "und_only",
+            "preprocessing": "beans_jpeg95_seed42_v1"
+          }
         }
       }
     }

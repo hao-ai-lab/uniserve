@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from PIL import Image
@@ -150,7 +150,7 @@ class StubUniModel(UniModelBase):
         handler = self._FORWARD_BY_MODE.get(batch.mode)
         if handler is None:
             return self._mixed(batch)
-        return handler(self, batch)
+        return cast(list[ForwardOutput], handler(self, batch))
 
     def _mixed(self, batch: ForwardBatch) -> list[ForwardOutput]:
         outputs: list[ForwardOutput] = []
@@ -159,7 +159,7 @@ class StubUniModel(UniModelBase):
             handler = self._FORWARD_BY_MODE.get(row.mode)
             if handler is None:
                 raise RuntimeError(f"unsupported stub forward mode {row.mode}")
-            outputs.extend(handler(self, row))
+            outputs.extend(cast(list[ForwardOutput], handler(self, row)))
         return outputs
 
     def _text(self, batch: ForwardBatch) -> list[TextTokenOutput]:

@@ -548,6 +548,8 @@ def _active_benchmark_parts(
         raise ValueError("load case has unknown fields")
     load_case_harness_overrides(case)
     request_rate = case.get("request_rate")
+    if request_rate is None:
+        raise ValueError("load case request_rate must be numeric or 'inf'")
     try:
         numeric_rate = float(request_rate)
     except (TypeError, ValueError) as error:
@@ -653,6 +655,7 @@ def benchmark_matrix_definition_contract(
         "load_case_definition_sha256": _canonical_sha256(load_case),
         "load_case_set_definition_sha256": _canonical_sha256(case_set),
         "hardware_requirements_sha256": _canonical_sha256(benchmark.get("hardware_requirements")),
+        "acceptance_definition_sha256": _canonical_sha256(benchmark.get("acceptance")),
         "datasets_definition_sha256": _canonical_sha256(benchmark.get("datasets", {})),
         "declared_semantics_sha256": _canonical_sha256(semantics),
         "environment_wildcard_fields": wildcard_fields,
@@ -715,6 +718,7 @@ def benchmark_matrix_definition_matches(
         "load_case_definition_sha256",
         "load_case_set_definition_sha256",
         "hardware_requirements_sha256",
+        "acceptance_definition_sha256",
         "datasets_definition_sha256",
         "declared_semantics_sha256",
         "environment_wildcard_fields",

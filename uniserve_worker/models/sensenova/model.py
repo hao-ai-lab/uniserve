@@ -2423,7 +2423,7 @@ class SenseNovaU1ForUnifiedGeneration(
         self._tower_handoff: TowerHandoff = LocalP2PTowerHandoff(self._resolve_tower_binding)
         self.tower_session = ProductTransferSession(self, states=self.reqs)
         self.flow_execution = FlowExecution(self, transfer=self.tower_session)
-        self.segment_executor = SegmentExecutor(self)
+        self.segment_executor: SegmentExecutor = SegmentExecutor(self)
         self._img_start_token = IMG_START_TOKEN
 
     def _init_tower_profile(self) -> None:
