@@ -70,7 +70,6 @@ from uniserve_worker.nn.sampler import (
 )
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
-from uniserve_worker.runtime.replay import ReplayStore
 from uniserve_worker.runtime.request_session import SessionStore
 from uniserve_worker.runtime.residency_manager import ResidencyLeaseManager
 from uniserve_worker.runtime.resources import ResourceRuntime
@@ -95,6 +94,7 @@ from .flow import (
     flow_cfg_branch_count,
     flow_cfg_plan,
 )
+from .operation_executor import OperationExecutor
 from .planning import _TEXT_MODES, _ForwardPlanBuilder, _UnifiedForwardBatchBuilder
 from .sampling import (
     _DECODE_RELAY,
@@ -836,7 +836,6 @@ class ModelExecutor:
             bool(dependencies.defer_sampling) and dependencies.tensor_store is not None
         )
         self.tensor_store = dependencies.tensor_store
-        self.replay_store = ReplayStore()
         self.simulation = bool(dependencies.simulation)
         self.batch_policy = dependencies.batch_policy or self._model_batch_policy()
         self.attention_backend, self.attention_preference = self._resolve_attention_backend(
@@ -847,6 +846,12 @@ class ModelExecutor:
         self._init_unified_forward_execution(model, residency)
         self.multimodal_processor = dependencies.multimodal_processor
         self._init_resource_accounting(resource_runtime, residency)
+        self.operation_executor = OperationExecutor(
+            self.sessions,
+            self._execute_once,
+            admit=self._register_new_reqs,
+            resources=self.resource_runtime,
+        )
         # CUDA Green Context SM partitioning. ``None`` unless runtime config
         # enables it and the model runs on a CUDA device.
         self.stream_manager = self._maybe_build_stream_manager()
@@ -1093,28 +1098,10 @@ class ModelExecutor:
         *,
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
-        parsed = WireBatch.from_wire(batch)
-        replay = self.replay_store.lookup(parsed.ops)
-        if replay is not None:
-            return replay
-        new_request_ids = {int(item["req_id"]) for item in parsed.new_reqs}
-        self.sessions.validate_operations(parsed.ops, new_request_ids)
-        txn = self.sessions.begin_step(
-            parsed.step_id,
-            parsed.ops,
-            self.resource_runtime,
+        return self.operation_executor.execute(
+            batch,
+            defer_text_cpu_results=defer_text_cpu_results,
         )
-        try:
-            response = self._execute_once(
-                parsed,
-                defer_text_cpu_results=defer_text_cpu_results,
-            )
-            txn.commit()
-        except BaseException:
-            txn.rollback()
-            raise
-        self.replay_store.commit(parsed.ops, response)
-        return response
 
     def _execute_once(
         self,
@@ -1126,7 +1113,6 @@ class ModelExecutor:
             defer_text_cpu_results=defer_text_cpu_results,
             defer_sampling=self.defer_sampling,
         )
-        self._register_new_reqs(parsed)
         if len(parsed.ops) > int(self.batch_policy.max_batch_ops):
             raise invalid_descriptor("execute batch exceeds the model's maximum operation count")
         group = list(enumerate(parsed.ops))
@@ -1202,11 +1188,6 @@ class ModelExecutor:
             ]
         self._advance_state(plan, outputs)
         self._stamp_conditioning_locators(plan, outputs)
-        for operation, output in zip(parsed.ops, outputs, strict=True):
-            output["op_id"] = operation.op_id
-            output["epoch"] = operation.epoch
-            output["base_version"] = operation.base_version
-            output["result_version"] = operation.base_version + 1
         response: dict[str, Any] = {"step_id": parsed.step_id, "per_seq": outputs}
         if forward_stats is not None:
             response["forward_stats"] = forward_stats.to_wire()

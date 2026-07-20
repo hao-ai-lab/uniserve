@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
 import torch
 
+from ..contracts.operation import OperationClass
 from ..foundation.errors import invalid_descriptor
 from .request_state import (
     RequestLifecycle,
@@ -28,6 +29,14 @@ __all__ = [
 if TYPE_CHECKING:
     from ..contracts.batches import OperationEnvelope
     from .resources import ResourceRuntime
+
+
+class TransactionalStore(Protocol):
+    """Store whose request-scoped effects participate in a step transaction."""
+
+    def snapshot_requests(self, request_ids: set[int]) -> Any: ...
+
+    def restore_requests(self, request_ids: set[int], snapshot: Any) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -190,8 +199,15 @@ class SessionStore(_RequestStateTable):
         step_id: int,
         operations: tuple["OperationEnvelope", ...],
         resources: "ResourceRuntime",
+        stores: Sequence[TransactionalStore] = (),
     ) -> "StepTxn":
-        return StepTxn(self, resources, step_id=int(step_id), operations=operations)
+        return StepTxn(
+            self,
+            resources,
+            step_id=int(step_id),
+            operations=operations,
+            stores=stores,
+        )
 
 
 @dataclass(frozen=True)
@@ -212,16 +228,24 @@ class StepTxn:
         *,
         step_id: int,
         operations: tuple["OperationEnvelope", ...],
+        stores: Sequence[TransactionalStore] = (),
     ) -> None:
         self.sessions = sessions
         self.resources = resources
         self.step_id = int(step_id)
         self.operations = operations
         self.request_ids = {operation.session_id for operation in operations}
+        operations_by_request = {
+            operation.session_id: operation for operation in operations
+        }
         self._snapshots = {
-            request_id: self._snapshot(request_id) for request_id in self.request_ids
+            request_id: self._snapshot(request_id, operations_by_request[request_id])
+            for request_id in self.request_ids
         }
         self._resource_snapshot = resources.snapshot_requests(self.request_ids)
+        self._store_snapshots = [
+            (store, store.snapshot_requests(self.request_ids)) for store in stores
+        ]
         self._closed = False
 
     def commit(self) -> None:
@@ -256,9 +280,15 @@ class StepTxn:
                 if rng is not None:
                     rng.set_state(rng_state)
         self.resources.restore_requests(self.request_ids, self._resource_snapshot)
+        for store, snapshot in self._store_snapshots:
+            store.restore_requests(self.request_ids, snapshot)
         self._closed = True
 
-    def _snapshot(self, request_id: int) -> _SessionSnapshot:
+    def _snapshot(
+        self,
+        request_id: int,
+        operation: "OperationEnvelope",
+    ) -> _SessionSnapshot:
         state = self.sessions._states.get(request_id)
         if state is None:
             return _SessionSnapshot(False, None, None, {})
@@ -273,10 +303,22 @@ class StepTxn:
         snapshot.residency = copy.copy(state.residency)
         snapshot.decode_relay = copy.copy(state.decode_relay)
         snapshot.cfg_geometry = dict(state.cfg_geometry) if state.cfg_geometry is not None else None
-        rng_state = state.rng.get_state().clone() if state.rng is not None else None
-        device_rng_states = {
-            key: generator.get_state().clone() for key, generator in state.device_rngs.items()
-        }
+        snapshots_rng = operation.operation is not OperationClass.SEQUENCE or float(
+            state.sampling.get("temperature", 0.0) or 0.0
+        ) > 0.0
+        rng_state = (
+            state.rng.get_state().clone()
+            if snapshots_rng and state.rng is not None
+            else None
+        )
+        device_rng_states = (
+            {
+                key: generator.get_state().clone()
+                for key, generator in state.device_rngs.items()
+            }
+            if snapshots_rng
+            else {}
+        )
         return _SessionSnapshot(True, snapshot, rng_state, device_rng_states)
 
     def _require_open(self) -> None:

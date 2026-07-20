@@ -191,9 +191,6 @@ table NewRequestData {
 
 table ForwardOp {
   req_id:ulong;
-  epoch:ulong;
-  base_version:ulong;
-  digest:string;
   kind:OpKind;
   modality:Modality;
   new_block_ids:[uint];
@@ -236,13 +233,16 @@ table ForwardOp {
   decode_stop_terminal:bool = false;
   // Request all token-position logits for prompt scoring. Append-only.
   return_all_logits:bool = false;
+  epoch:ulong;
+  base_version:ulong;
+  digest:string;
 }
 
 table ForwardBatch {
-  protocol_version:ushort;
   step_id:ulong;
   new_reqs:[NewRequestData];
   ops:[ForwardOp];
+  protocol_version:ushort;
 }
 
 table SeqResult {
@@ -259,9 +259,6 @@ table SeqResult {
   num_tokens:uint = null;
   num_accepted_tokens:uint = null;
   op_id:ulong = null;
-  epoch:ulong = null;
-  base_version:ulong = null;
-  result_version:ulong = null;
   // Sampler stage: handle to the logits this op produced, when sampling is
   // peeled into a separate Sampler pool. Scalar id; routing key.
   logits_handle:ulong = null;
@@ -281,6 +278,9 @@ table SeqResult {
   // Ranked candidate sets for prompt positions scored by this prefill chunk.
   // Append-only; the first prompt token has no entry.
   prompt_logprobs:[PositionLogprobs];
+  epoch:ulong = null;
+  base_version:ulong = null;
+  result_version:ulong = null;
 }
 
 table ForwardResult {

@@ -26,14 +26,26 @@ class ReplayStore:
         if int(capacity) <= 0:
             raise ValueError("replay capacity must be positive")
         self.capacity = int(capacity)
-        self._records: OrderedDict[tuple[int, int, int], tuple[str, dict[str, Any]]] = OrderedDict()
+        self._records: OrderedDict[tuple[int, int, int], tuple[str, int, Any]] = OrderedDict()
 
     @staticmethod
     def _key(operation: OperationIdentity) -> tuple[int, int, int]:
         return (int(operation.session_id), int(operation.epoch), int(operation.op_id))
 
-    def lookup(self, operations: Sequence[OperationIdentity]) -> dict[str, Any] | None:
-        records: list[dict[str, Any]] = []
+    @staticmethod
+    def _clone_result(result: Any) -> Any:
+        if isinstance(result, dict):
+            return copy.deepcopy(result)
+        return result
+
+    def lookup(
+        self,
+        operations: Sequence[OperationIdentity],
+        *,
+        step_id: int,
+    ) -> dict[str, Any] | None:
+        records: list[Any] = []
+        recorded_steps: list[int] = []
         missing = 0
         for operation in operations:
             key = self._key(operation)
@@ -41,32 +53,41 @@ class ReplayStore:
             if record is None:
                 missing += 1
                 continue
-            recorded_digest, result = record
+            recorded_digest, recorded_step, result = record
             if recorded_digest != operation.digest:
                 raise invalid_descriptor(
                     f"operation {operation.op_id} conflicts with its committed digest"
                 )
             self._records.move_to_end(key)
+            recorded_steps.append(recorded_step)
             records.append(result)
         if missing == len(operations):
             return None
         if missing:
             raise invalid_descriptor("execute batch mixes committed and uncommitted operations")
-        first = records[0]
-        if any(result != first for result in records[1:]):
-            raise invalid_descriptor(
-                "execute batch replay records do not share one terminal result"
-            )
-        return copy.deepcopy(first)
+        del step_id
+        if len(set(recorded_steps)) != 1:
+            raise invalid_descriptor("execute batch replay records come from different submissions")
+        return {
+            "step_id": recorded_steps[0],
+            "per_seq": [self._clone_result(result) for result in records],
+        }
 
     def commit(
         self,
         operations: Sequence[OperationIdentity],
         result: dict[str, Any],
     ) -> None:
-        for operation in operations:
+        per_seq = result.get("per_seq")
+        if not isinstance(per_seq, list) or len(per_seq) != len(operations):
+            raise invalid_descriptor("terminal result does not align with its operations")
+        for operation, sequence_result in zip(operations, per_seq, strict=True):
             key = self._key(operation)
-            self._records[key] = (str(operation.digest), copy.deepcopy(result))
+            self._records[key] = (
+                str(operation.digest),
+                int(result["step_id"]),
+                self._clone_result(sequence_result),
+            )
             self._records.move_to_end(key)
         while len(self._records) > self.capacity:
             self._records.popitem(last=False)

@@ -39,6 +39,8 @@ __all__ = [
     "parse_batch",
 ]
 
+_NATIVE_ENVELOPE_VALIDATED = "_native_envelope_validated"
+
 
 def seal_batch(
     step_id: int,
@@ -113,14 +115,19 @@ class Batch:
         raw_ops = batch.get("ops")
         if not isinstance(raw_ops, list):
             raise invalid_descriptor("execute batch.ops must be a list")
-        ops = tuple(
-            OperationEnvelope.from_wire(
-                operation,
-                protocol_version=protocol_version,
-                index=index,
+        if batch.get(_NATIVE_ENVELOPE_VALIDATED) is True:
+            ops = tuple(
+                OperationEnvelope.from_validated_wire(operation) for operation in raw_ops
             )
-            for index, operation in enumerate(raw_ops)
-        )
+        else:
+            ops = tuple(
+                OperationEnvelope.from_wire(
+                    operation,
+                    protocol_version=protocol_version,
+                    index=index,
+                )
+                for index, operation in enumerate(raw_ops)
+            )
         if not ops:
             raise invalid_descriptor("execute batch must contain an operation")
         sessions = {operation.session_id for operation in ops}
