@@ -11,7 +11,7 @@ from ..contracts.model_protocols import UniModel
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
-from ..runtime.request_state import RequestStateTable
+from ..runtime.request_session import RequestSessionTable
 from .protocol import (
     BaseWorker,
     ResultPolicy,
@@ -34,7 +34,7 @@ class EncoderWorker(BaseWorker):
         super().__init__(block_size=block_size)
         if not isinstance(model, UniModel):
             raise capability_mismatch("encoder worker model must inherit UniModel")
-        self.request_states = RequestStateTable()
+        self.request_states = RequestSessionTable()
         self.model = model
         self.runner = ModelRunner(model, request_states=self.request_states)
         supported_ops = self._supported_encode_ops()

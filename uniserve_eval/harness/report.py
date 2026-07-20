@@ -741,14 +741,14 @@ def _reference_request_matches_contract(request: dict[str, Any], spec: Benchmark
         "presence_penalty": spec.presence_penalty,
         "seed": spec.sampling_seed,
     }
-    for key, expected in optional_generation_fields.items():
-        if expected is None:
+    for key, expected_value in optional_generation_fields.items():
+        if expected_value is None:
             continue
         actual = generation.get(key)
-        if isinstance(expected, float):
-            if not _same_float(actual, expected):
+        if isinstance(expected_value, float):
+            if not _same_float(actual, expected_value):
                 return False
-        elif actual != expected:
+        elif actual != expected_value:
             return False
     if generation.get("chat_template_kwargs") != spec.chat_template_kwargs:
         return False

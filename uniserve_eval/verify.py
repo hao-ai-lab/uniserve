@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import struct
 import time
+from io import BytesIO
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -19,6 +21,21 @@ from .profiles import (
     workload_env,
     workload_spec,
 )
+
+
+def canonical_digest(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def bytes_digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def parse_sse_line(line: str, current_event: str | None) -> tuple[str | None, dict[str, Any] | None, bool]:
@@ -219,6 +236,17 @@ def finish_count(obj: dict[str, Any]) -> int:
     return sum(1 for choice in choices if isinstance(choice, dict) and choice.get("finish_reason"))
 
 
+def finish_reasons(obj: dict[str, Any]) -> list[str]:
+    choices = obj.get("choices")
+    if not isinstance(choices, list):
+        return []
+    return [
+        str(choice["finish_reason"])
+        for choice in choices
+        if isinstance(choice, dict) and choice.get("finish_reason") is not None
+    ]
+
+
 def usage_completion_tokens(obj: dict[str, Any]) -> int | None:
     usage = obj.get("usage")
     if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
@@ -239,11 +267,37 @@ def save_image(url: str, out_dir: Any, images: list[dict[str, Any]]) -> None:
         raise SystemExit("chat response returned an unsupported image URL shape")
     data = base64.b64decode(payload)
     size = png_size(data)
+    from PIL import Image
+
+    with Image.open(BytesIO(data)) as loaded:
+        loaded.load()
+        rgb = loaded.convert("RGB")
+        rgb_sha256 = bytes_digest(rgb.tobytes())
     idx = len(images) + 1
     image_path = out_dir / f"image_{idx}.png"
     image_path.write_bytes(data)
-    images.append({"path": str(image_path), "size": list(size)})
+    images.append(
+        {
+            "path": str(image_path),
+            "size": list(size),
+            "png_sha256": bytes_digest(data),
+            "rgb_sha256": rgb_sha256,
+            "color_representation": "RGB uint8",
+        }
+    )
     print(f"IMAGE_DONE {idx} {size} {image_path}")
+
+
+def event_manifest_entry(obj: dict[str, Any]) -> dict[str, Any]:
+    text = text_from_chunk(obj)
+    return {
+        "type": str(obj.get("type", "unknown")),
+        "visible_text_bytes": len(text.encode("utf-8")),
+        "image_count": len(image_urls_from_chunk(obj)),
+        "finish_reasons": finish_reasons(obj),
+        "has_usage": isinstance(obj.get("usage"), dict),
+        "has_error": isinstance(obj.get("error"), dict),
+    }
 
 
 def verify(args: argparse.Namespace) -> None:
@@ -278,6 +332,7 @@ def verify(args: argparse.Namespace) -> None:
     finished = 0
     current_event: str | None = None
     done_seen = False
+    event_manifest: list[dict[str, Any]] = []
     timeout_s = float(workload.get("timeout_s", 600))
     old_env: dict[str, str | None] = {}
     for key, value in workload_env(workload).items():
@@ -311,6 +366,7 @@ def verify(args: argparse.Namespace) -> None:
                     if done:
                         break
                     continue
+                event_manifest.append(event_manifest_entry(obj))
                 typ = str(obj.get("type", "unknown"))
                 event_counts[typ] = event_counts.get(typ, 0) + 1
                 if isinstance(obj.get("error"), dict):
@@ -341,6 +397,16 @@ def verify(args: argparse.Namespace) -> None:
             image_steps = usage_image_steps(obj)
             for image_url in image_urls_from_response(obj):
                 save_image(image_url, out_dir, images)
+            event_manifest.append(
+                {
+                    "type": "chat.completion",
+                    "visible_text_bytes": len(text.encode("utf-8")),
+                    "image_count": len(images),
+                    "finish_reasons": finish_reasons(obj),
+                    "has_usage": isinstance(obj.get("usage"), dict),
+                    "has_error": isinstance(obj.get("error"), dict),
+                }
+            )
     text_unit_count = completion_tokens if completion_tokens is not None else len(text.split())
     summary = {
         "endpoint": endpoint,
@@ -349,7 +415,11 @@ def verify(args: argparse.Namespace) -> None:
         "image_steps": image_steps,
         "images": images,
         "text": text,
+        "visible_text_sha256": bytes_digest(text.encode("utf-8")),
         "text_unit_count": text_unit_count,
+        "request_sha256": canonical_digest(payload),
+        "event_manifest": event_manifest,
+        "event_manifest_sha256": canonical_digest(event_manifest),
         "event_counts": event_counts,
         "errors": errors,
         "request": payload,

@@ -796,7 +796,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         else:
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
         self.flow_graph_execution = FlowGraphExecution(self)
-        self.segment_executor = SegmentExecutor(self)
+        self.segment_executor: SegmentExecutor = SegmentExecutor(self)
 
     def _build_resource_plan(self) -> ResourcePlan:
         return ResourcePlan(
@@ -1258,10 +1258,10 @@ class BagelForUnifiedGeneration(UniModelBase):
                     item
                 )
             else:
-                handle = op.get("image_in")
-                if not isinstance(handle, int) or isinstance(handle, bool):
+                cached_handle = op.get("image_in")
+                if not isinstance(cached_handle, int) or isinstance(cached_handle, bool):
                     raise invalid_descriptor("cached image encode requires an encoder handle")
-                payload = self.residency.encoder.get(handle)
+                payload = self.residency.encoder.get(cached_handle)
                 if not isinstance(payload, Mapping) or payload.get("kind") != kind:
                     raise invalid_descriptor("cached image encode handle is not resident")
                 cached_image_hw = payload.get("image_hw")

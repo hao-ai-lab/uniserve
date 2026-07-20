@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import dataclasses
+import hashlib
 import importlib.util
 import json
 import os
@@ -458,7 +460,74 @@ def test_sensenova_default_gate_declares_complete_image_lifecycle():
 
     assert workload["expect_images"] == image_config["num_images"]
     assert workload["expect_image_steps"] == image_config["steps"] * image_config["num_images"]
-    assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 200}}) == 200
+    assert image_config["steps"] == 200
+    assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 800}}) == 800
+
+
+def test_execution_benchmark_locks_only_the_declared_high_load_points():
+    benchmark = load_config(DEFAULT_CONFIG)["benchmarks"]["execution"]
+
+    assert set(benchmark["points"]) == {
+        "qwen3_sharegpt_r16",
+        "sensenova_t2i_c32",
+        "sensenova_i2t_r16",
+    }
+    assert benchmark["load_cases"] == {
+        "text_r16": [{"id": "r16", "request_rate": 16}],
+        "image_c32": [{"id": "c32", "request_rate": "inf", "max_concurrency": 32}],
+    }
+    assert benchmark["acceptance"] == {
+        "baseline_measurements": 1,
+        "candidate_measurements": 1,
+        "throughput_minimum_ratio": 0.95,
+        "latency_maximum_ratio": 1.05,
+        "points": {
+            "qwen3_sharegpt_r16": [
+                "output_tokens_per_second",
+                "mean_ttft_ms",
+                "mean_tpot_ms",
+            ],
+            "sensenova_t2i_c32": ["images_per_second"],
+            "sensenova_i2t_r16": ["output_tokens_per_second"],
+        },
+    }
+
+
+def test_verify_reference_evidence_uses_exact_transport_and_rgb_bytes(tmp_path):
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (2, 1), (10, 20, 30)).save(buffer, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    images: list[dict] = []
+
+    uniserve_eval.verify.save_image(image_url, tmp_path, images)
+    event = uniserve_eval.verify.event_manifest_entry(
+        {
+            "type": "chat.completion.chunk",
+            "choices": [
+                {
+                    "delta": {"content": "trail", "images": [{"image_url": {"url": image_url}}]},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"completion_tokens": 1},
+        }
+    )
+
+    assert images[0]["color_representation"] == "RGB uint8"
+    assert images[0]["png_sha256"] == hashlib.sha256(buffer.getvalue()).hexdigest()
+    assert images[0]["rgb_sha256"] == hashlib.sha256(bytes((10, 20, 30, 10, 20, 30))).hexdigest()
+    assert event == {
+        "type": "chat.completion.chunk",
+        "visible_text_bytes": 5,
+        "image_count": 1,
+        "finish_reasons": ["stop"],
+        "has_usage": True,
+        "has_error": False,
+    }
 
 
 def test_sensenova_t2i_gate_rejects_an_image_that_misses_prompt_color_semantics(tmp_path):

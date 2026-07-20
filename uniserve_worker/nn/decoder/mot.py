@@ -1016,7 +1016,8 @@ class MoTModel(nn.Module):
         cos, sin = self.rotary.cos_sin_1d(indexes[0].reshape(-1))
         hidden_states = inputs_embeds
         for layer_idx, layer_module in enumerate(self.layers):
-            hidden_states = layer_module.forward_packed_visible(
+            layer = cast(MoTDecoderLayer, layer_module)
+            hidden_states = layer.forward_packed_visible(
                 layer_idx,
                 hidden_states,
                 text_mask=text_mask,

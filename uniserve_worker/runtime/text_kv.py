@@ -147,7 +147,7 @@ class TextAttentionPlan:
         plan = self.to_plan()
         batch.attn_plan = plan
         batch.block_table = plan.block_table
-        batch.cache_seqlens = plan.cache_seqlens
+        batch.cache_seqlens = getattr(plan, "cache_seqlens", None)
         return plan
 
 

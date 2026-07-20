@@ -222,7 +222,7 @@ def _interleave_block(successful: list[RequestRecord]) -> dict[str, Any] | None:
     multimodal = [record for record in successful if record.images > 0]
     if not multimodal:
         return None
-    transitions = [max(0, len(record.output_modalities) - 1) for record in multimodal]
+    transitions = [float(max(0, len(record.output_modalities) - 1)) for record in multimodal]
     patterns: dict[str, int] = {}
     for record in multimodal:
         pattern = "->".join(record.output_modalities)
