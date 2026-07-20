@@ -71,7 +71,7 @@ from uniserve_worker.nn.sampler import (
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
 from uniserve_worker.runtime.replay import ReplayStore, batch_digest
-from uniserve_worker.runtime.request_session import RequestSessionTable
+from uniserve_worker.runtime.request_session import SessionStore
 from uniserve_worker.runtime.residency_manager import ResidencyLeaseManager
 from uniserve_worker.runtime.resources import ResourceRuntime
 
@@ -139,7 +139,7 @@ class _ForwardPostprocessor:
     """Project neural results using explicitly bound runtime services."""
 
     def __init__(self, *, request_states: Any = None, tensor_store: Any = None) -> None:
-        self.request_states = request_states
+        self.sessions = request_states
         self.tensor_store = tensor_store
 
     def apply(
@@ -249,7 +249,7 @@ class _ForwardPostprocessor:
             raise invalid_descriptor("batched text logits rows must form a [batch, vocab] tensor")
         if int(logits_batch.shape[0]) != len(req_ids):
             raise invalid_descriptor("batched text logits row count must match req_ids")
-        request_states = self.request_states
+        request_states = self.sessions
         if request_states is None:
             return [
                 TextTokenOutput(
@@ -354,7 +354,7 @@ class _ForwardPostprocessor:
     def _publish_decode_position_relays(self, text: Any, device: torch.device) -> None:
         if text.mode is not ForwardMode.DECODE:
             return
-        request_states = self.request_states
+        request_states = self.sessions
         if request_states is None:
             return
         if any(len(tokens) != 1 for tokens in text.token_ids):
@@ -369,14 +369,14 @@ class _ForwardPostprocessor:
     def _advance_text_kv_lengths(self, text: Any) -> None:
         if text.mode not in _TEXT_MODES:
             return
-        request_states = self.request_states
+        request_states = self.sessions
         if request_states is None:
             return
         for req_id, pos_range in zip(text.req_ids, text.pos_ranges, strict=True):
             request_states.get(int(req_id)).set_kv_length(int(pos_range[1]), lane="text")
 
     def _sample_text(self, req_id: int, op: Any, logits: torch.Tensor) -> dict[str, Any]:
-        request_states = self.request_states
+        request_states = self.sessions
         if request_states is not None:
             state = request_states.get(int(req_id))
             return sample_logits_result(req_id=int(req_id), state=state, logits=logits, op=op)
@@ -400,7 +400,7 @@ class _ForwardPostprocessor:
             range(len(entries_by_index))
         ):
             raise invalid_descriptor("text postprocess logits indices must be contiguous")
-        request_states = self.request_states
+        request_states = self.sessions
         params: list[dict[str, Any]] = []
         recent: list[list[int] | tuple[int, ...]] = []
         allowed: list[list[int] | tuple[int, ...] | None] = []
@@ -571,7 +571,7 @@ class _ForwardPostprocessor:
             return CommitOutput(req_id=row.req_id)
         return _commit_output_from_value(
             int(row.req_id),
-            self.request_states.get(int(row.req_id)) if self.request_states is not None else None,
+            self.sessions.get(int(row.req_id)) if self.sessions is not None else None,
             row.op,
             result.commit_outputs[int(row_index)],
         )
@@ -803,7 +803,7 @@ class ModelExecutor:
     def __init__(
         self,
         model: UniModel,
-        request_states: RequestSessionTable | None = None,
+        sessions: SessionStore | None = None,
         *,
         config: ExecutorConfig | None = None,
         resource_runtime: ResourceRuntime | None = None,
@@ -828,7 +828,7 @@ class ModelExecutor:
         self.model = model
         self.runner = ModelRunner(model)
         self.residency = residency
-        self.request_states = request_states or RequestSessionTable()
+        self.sessions = sessions or SessionStore()
         # Deferred sampling: text decode/extend ops publish logits to
         # ``tensor_store`` and return handles — a separate Sampler worker samples.
         # Off = sample inline (default).
@@ -862,7 +862,7 @@ class ModelExecutor:
         self.unified_forward_batch_builder = _UnifiedForwardBatchBuilder(
             runtime_builder=self.forward_batch_builder,
             kv_pool=kv_pool,
-            request_states=self.request_states,
+            request_states=self.sessions,
             default_device=device,
         )
         self.forward_graph_policy = ForwardGraphPolicy(
@@ -870,7 +870,7 @@ class ModelExecutor:
             strict=not self.simulation,
         )
         self.forward_postprocessor = _ForwardPostprocessor(
-            request_states=self.request_states,
+            request_states=self.sessions,
             tensor_store=self.tensor_store,
         )
         self.plan_stream_overlap = self._maybe_build_plan_stream_overlap(device)
@@ -929,7 +929,7 @@ class ModelExecutor:
         # is seen by both.
         self._accountant = ResidencyLeaseManager(
             self.resource_runtime,
-            self.request_states,
+            self.sessions,
             resource_plan,
             residency=residency,
         )
@@ -1085,7 +1085,7 @@ class ModelExecutor:
     def drop_request(self, req_id: int) -> None:
         self.model.drop_request(req_id)
         self._accountant.release_request(int(req_id))
-        self.request_states.drop(req_id)
+        self.sessions.drop(req_id)
 
     def execute(
         self,
@@ -1099,7 +1099,7 @@ class ModelExecutor:
         if replay is not None:
             return replay
         request_ids = {int(item["req_id"]) for item in (*parsed.new_reqs, *parsed.ops)}
-        txn = self.request_states.begin_step(
+        txn = self.sessions.begin_step(
             parsed.step_id,
             request_ids,
             self.resource_runtime,
@@ -1133,7 +1133,7 @@ class ModelExecutor:
         self._accountant.account_group(group)
         plan = self.forward_plan_builder.build(
             group,
-            request_states=self.request_states,
+            request_states=self.sessions,
             step_id=parsed.step_id,
             graph_policy=self.forward_graph_policy,
         )
@@ -1146,7 +1146,7 @@ class ModelExecutor:
             attention_preference=self.attention_preference,
             kv_pool=self.residency.kv if self.residency is not None else None,
             stats=forward_stats,
-            request_states=self.request_states,
+            request_states=self.sessions,
             execution_options=options,
             default_model_forward=self._default_model_forward,
             tensor_store=self.tensor_store,
@@ -1155,7 +1155,7 @@ class ModelExecutor:
         def prepare() -> ForwardBatch:
             text_batch = self._autoregressive.prepare_batch(
                 plan,
-                self.request_states,
+                self.sessions,
                 device=device,
             )
             if text_batch is not None:
@@ -1217,14 +1217,12 @@ class ModelExecutor:
         if batch.op_modes and all(mode in _TEXT_MODES for mode in batch.op_modes):
             return self._autoregressive.forward_result(
                 batch,
-                self.request_states,
+                self.sessions,
                 model,
                 options=options,
                 tensor_store=self.tensor_store,
             )
-        items = [
-            (int(op["req_id"]), self.request_states.get(int(op["req_id"])), op) for op in batch.ops
-        ]
+        items = [(int(op["req_id"]), self.sessions.get(int(op["req_id"])), op) for op in batch.ops]
         rows = tuple(range(len(items)))
         if batch.mode is ForwardMode.DENOISE:
             result = self._diffusion.forward_result(
@@ -1250,14 +1248,14 @@ class ModelExecutor:
         """
         for nr in new_reqs:
             req_id = nr["req_id"]
-            existed = req_id in self.request_states
-            state = self.request_states.create_or_update(req_id, dict(nr))
+            existed = req_id in self.sessions
+            state = self.sessions.create_or_update(req_id, dict(nr))
             try:
                 self._accountant.account_blocks(req_id, state.block_ids, append_to_state=False)
             except Exception:
                 if not existed:
                     self._accountant.release_request(int(req_id))
-                    self.request_states.drop(req_id)
+                    self.sessions.drop(req_id)
                 raise
             self.model.on_new_request(req_id, state)
 
@@ -1356,7 +1354,7 @@ class ModelExecutor:
 
     def _advance_op_state(self, mode: ForwardMode, result: Any) -> None:
         if mode == ForwardMode.DENOISE:
-            self.request_states.advance_denoise(
+            self.sessions.advance_denoise(
                 int(result["req_id"]),
                 int(result["num_steps_done"]) if result.get("num_steps_done") is not None else None,
             )
@@ -1393,7 +1391,7 @@ class ModelExecutor:
             return len(tokens) if isinstance(tokens, (list, tuple)) else 0
         if mode == ForwardMode.DENOISE:
             req_id = int(op["req_id"])
-            state = self.request_states.get(req_id)
+            state = self.sessions.get(req_id)
             cfg = op.get("cfg")
             # Token throughput counts every denoise CFG branch iteration.
             branch_count = int(cfg.get("branch_count") or 1) if isinstance(cfg, Mapping) else 1
@@ -1406,7 +1404,7 @@ class ModelExecutor:
             )
         if mode == ForwardMode.COMMIT:
             req_id = int(op["req_id"])
-            state = self.request_states.get(req_id)
+            state = self.sessions.get(req_id)
             latent_rule = self.resource_plan.image_latent or LatentTokens(downsample=16)
             return self._accountant.latent_units(op, state.image, latent_rule)
         return 0
