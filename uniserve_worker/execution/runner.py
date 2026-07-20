@@ -1,6 +1,6 @@
-"""One prepare, model-forward, and postprocess pipeline for scheduler batches.
+"""System execution orchestration and the raw neural runner boundary.
 
-The runner orchestrates immutable plans and device batches from ``execution.planning``, invokes the model once, and projects sequence, flow, encode, and materialize results. Graph capture and replay live in ``execution.graph``.
+The executor owns plans, transactions, replay, and result projection. The runner invokes a model with one prepared batch. Graph capture and replay live in ``execution.graph``.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ from uniserve_worker.nn.sampler import (
 )
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
+from uniserve_worker.runtime.replay import ReplayStore, batch_digest
 from uniserve_worker.runtime.request_session import RequestSessionTable
 from uniserve_worker.runtime.residency_manager import ResidencyLeaseManager
 from uniserve_worker.runtime.resources import ResourceRuntime
@@ -116,9 +117,10 @@ __all__ = [
     "DeferredDecodeBurstSeqResult",
     "DeferredTerminalDecodeBurstSeqResult",
     "DeferredTextSeqResult",
+    "ModelExecutor",
     "ModelRunner",
     "PreparedFlowStep",
-    "RunnerConfig",
+    "ExecutorConfig",
     "TextDecodeRelay",
     "combine_flow_velocity",
     "flow_branches",
@@ -750,8 +752,8 @@ def _model_max_context_len(model: Any) -> int:
 
 
 @dataclass
-class RunnerConfig:
-    """ModelRunner configuration knobs.
+class ExecutorConfig:
+    """ModelExecutor configuration knobs.
 
     Groups the sampler-stage split (``defer_sampling``/``tensor_store``),
     multimodal processor, batch policy, and attention-backend selection.
@@ -766,7 +768,7 @@ class RunnerConfig:
 
 
 @dataclass
-class _ResolvedRunnerDependencies:
+class _ResolvedExecutorDependencies:
     batch_policy: BatchPolicy | None
     attention_backend: Any | None
     multimodal_processor: Any | None
@@ -783,14 +785,27 @@ class _TextExecutionStack:
 
 
 class ModelRunner:
-    """Prepare, execute, and project one intact model batch."""
+    """Invoke the neural model for one prepared forward batch."""
+
+    def __init__(self, model: UniModel) -> None:
+        if not isinstance(model, UniModel):
+            raise capability_mismatch("runner model must inherit UniModel")
+        self.model = model
+
+    def run(self, batch: ForwardBatch) -> ForwardResult:
+        """Return raw neural outputs without lifecycle or session mutation."""
+        return coerce_forward_result(self.model.forward(batch))
+
+
+class ModelExecutor:
+    """Plan, transact, execute, and project one scheduler batch."""
 
     def __init__(
         self,
         model: UniModel,
         request_states: RequestSessionTable | None = None,
         *,
-        config: RunnerConfig | None = None,
+        config: ExecutorConfig | None = None,
         resource_runtime: ResourceRuntime | None = None,
         residency: "ResidencyManager | None" = None,
         batch_policy: BatchPolicy | None = None,
@@ -800,7 +815,7 @@ class ModelRunner:
         tensor_store: Any | None = None,
     ):
         if not isinstance(model, UniModel):
-            raise capability_mismatch("runner model must inherit UniModel")
+            raise capability_mismatch("executor model must inherit UniModel")
         dependencies = self._resolve_dependencies(
             config=config,
             batch_policy=batch_policy,
@@ -811,6 +826,7 @@ class ModelRunner:
         )
 
         self.model = model
+        self.runner = ModelRunner(model)
         self.residency = residency
         self.request_states = request_states or RequestSessionTable()
         # Deferred sampling: text decode/extend ops publish logits to
@@ -820,6 +836,7 @@ class ModelRunner:
             bool(dependencies.defer_sampling) and dependencies.tensor_store is not None
         )
         self.tensor_store = dependencies.tensor_store
+        self.replay_store = ReplayStore()
         self.simulation = bool(dependencies.simulation)
         self.batch_policy = dependencies.batch_policy or self._model_batch_policy()
         self.attention_backend, self.attention_preference = self._resolve_attention_backend(
@@ -908,7 +925,7 @@ class ModelRunner:
             totals=self._model_resource_totals(classes),
         )
         # The accountant holds ``resource_plan`` as the single source of truth;
-        # ``ModelRunner.resource_plan`` forwards to it so a runtime reassignment
+        # ``ModelExecutor.resource_plan`` forwards to it so a runtime reassignment
         # is seen by both.
         self._accountant = ResidencyLeaseManager(
             self.resource_runtime,
@@ -920,15 +937,15 @@ class ModelRunner:
     @staticmethod
     def _resolve_dependencies(
         *,
-        config: RunnerConfig | None,
+        config: ExecutorConfig | None,
         batch_policy: BatchPolicy | None,
         attention_backend: Any | None,
         multimodal_processor: Any | None,
         defer_sampling: bool,
         tensor_store: Any | None,
-    ) -> _ResolvedRunnerDependencies:
-        config = config or RunnerConfig()
-        return _ResolvedRunnerDependencies(
+    ) -> _ResolvedExecutorDependencies:
+        config = config or ExecutorConfig()
+        return _ResolvedExecutorDependencies(
             batch_policy=batch_policy if batch_policy is not None else config.batch_policy,
             attention_backend=(
                 attention_backend if attention_backend is not None else config.attention_backend
@@ -1077,6 +1094,34 @@ class ModelRunner:
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
         parsed = WireExecuteBatch.from_wire(batch)
+        digest = batch_digest(batch)
+        replay = self.replay_store.lookup(parsed.step_id, digest)
+        if replay is not None:
+            return replay
+        request_ids = {int(item["req_id"]) for item in (*parsed.new_reqs, *parsed.ops)}
+        txn = self.request_states.begin_step(
+            parsed.step_id,
+            request_ids,
+            self.resource_runtime,
+        )
+        try:
+            response = self._execute_once(
+                parsed,
+                defer_text_cpu_results=defer_text_cpu_results,
+            )
+            txn.commit()
+        except BaseException:
+            txn.rollback()
+            raise
+        self.replay_store.commit(parsed.step_id, digest, response)
+        return response
+
+    def _execute_once(
+        self,
+        parsed: WireExecuteBatch,
+        *,
+        defer_text_cpu_results: bool,
+    ) -> dict[str, Any]:
         options = ForwardExecutionOptions(
             defer_text_cpu_results=defer_text_cpu_results,
             defer_sampling=self.defer_sampling,
@@ -1134,7 +1179,7 @@ class ModelRunner:
                 use_forward_context(context),
                 self._forward_stream_context(plan),
             ):
-                return coerce_forward_result(self.model.forward(forward_batch))
+                return self.runner.run(forward_batch)
 
         if overlap is not None and prepared is not None:
             result = overlap.launch(prepared, run_forward, retain=forward_batch)

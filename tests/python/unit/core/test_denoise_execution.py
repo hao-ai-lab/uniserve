@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from uniserve_worker.contracts import UniModel
-from uniserve_worker.execution import ModelRunner, RunnerConfig
+from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 
 pytestmark = pytest.mark.unit
 
@@ -26,8 +26,8 @@ class RecordingVelocityModel(UniModel):
         return torch.full_like(latent, float(branch.rsplit("_", 1)[-1]))
 
 
-def _runner(model: UniModel) -> ModelRunner:
-    return ModelRunner(model, config=RunnerConfig(simulation=True))
+def _runner(model: UniModel) -> ModelExecutor:
+    return ModelExecutor(model, config=ExecutorConfig(simulation=True))
 
 
 def _new_request(req_id: int, *, seed: int, steps: int = 1) -> dict:
@@ -54,16 +54,10 @@ def test_denoise_request_advances_its_schedule_across_runner_steps():
             "ops": [{"req_id": 11, "kind": "denoise_gen"}],
         }
     )
-    second = runner.execute(
-        {"step_id": 2, "ops": [{"req_id": 11, "kind": "denoise_gen"}]}
-    )
+    second = runner.execute({"step_id": 2, "ops": [{"req_id": 11, "kind": "denoise_gen"}]})
 
-    assert first["per_seq"] == [
-        {"req_id": 11, "denoise_done": False, "num_steps_done": 1}
-    ]
-    assert second["per_seq"] == [
-        {"req_id": 11, "denoise_done": True, "num_steps_done": 2}
-    ]
+    assert first["per_seq"] == [{"req_id": 11, "denoise_done": False, "num_steps_done": 1}]
+    assert second["per_seq"] == [{"req_id": 11, "denoise_done": True, "num_steps_done": 2}]
     assert model.branches == ["branch_0", "branch_1", "branch_0", "branch_1"]
     assert not torch.equal(model.latents[0], model.latents[2])
 

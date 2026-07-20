@@ -124,6 +124,9 @@ class RequestState:
     prompt_last_logits: torch.Tensor | None = None
     cfg_geometry: dict[str, Any] | None = None
     lifecycle: RequestLifecycle = RequestLifecycle.CREATED
+    epoch: int = 0
+    version: int = 0
+    last_step_id: int | None = None
 
     def extend_block_ids(self, block_ids: list[int] | tuple[int, ...]) -> None:
         self.block_ids.extend(int(block_id) for block_id in block_ids)
@@ -210,6 +213,8 @@ class RequestStateTable:
                 state.block_ids = incoming
         state.lora_id = new_req.get("lora_id")
         state.raw_new_request = dict(new_req)
+        if "epoch" in new_req:
+            state.epoch = int(new_req["epoch"])
         cfg = new_req.get("cfg") or state.image.get("cfg")
         if isinstance(cfg, dict):
             state.cfg_geometry = dict(cfg)

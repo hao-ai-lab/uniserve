@@ -10,7 +10,7 @@ from uniserve_worker.contracts.caps import validate_caps, validate_forward_resul
 from uniserve_worker.contracts.forward_mode import ForwardMode, mode_for_op
 from uniserve_worker.contracts.op_kinds import OP_KIND_TABLE, OP_KINDS
 from uniserve_worker.contracts.resource_plan import ResourcePlan
-from uniserve_worker.execution import ModelRunner, RunnerConfig
+from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import PagedTextCache
@@ -37,9 +37,9 @@ def test_validate_caps_accepts_stub_caps():
 
 
 def test_runner_preserves_contextual_auto_attention_backend():
-    runner = ModelRunner(
+    runner = ModelExecutor(
         StubUniModel(),
-        config=RunnerConfig(simulation=True),
+        config=ExecutorConfig(simulation=True),
         attention_backend=None,
     )
     assert runner.attention_backend is None
@@ -233,7 +233,7 @@ class CommitCapabilityModel(UniModel):
 
 def test_runner_commit_uses_decode_image_capability_and_resets_state():
     model = CommitCapabilityModel()
-    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
 
     result = runner.execute(
         {
@@ -264,9 +264,9 @@ class CommitLogitsCapabilityModel(UniModel):
 
 
 def test_runner_commit_samples_model_logits():
-    runner = ModelRunner(
+    runner = ModelExecutor(
         CommitLogitsCapabilityModel(),
-        config=RunnerConfig(simulation=True),
+        config=ExecutorConfig(simulation=True),
     )
     result = runner.execute(
         {
@@ -354,9 +354,9 @@ def _thin_text_runner(model):
         device="cpu",
         ledger=ledger,
     )
-    return ModelRunner(
+    return ModelExecutor(
         model,
-        config=RunnerConfig(simulation=True),
+        config=ExecutorConfig(simulation=True),
         resource_runtime=ledger,
         residency=residency,
     )
@@ -364,7 +364,7 @@ def _thin_text_runner(model):
 
 def test_runner_text_applies_sampling_masks_and_logprobs():
     model = TextCapabilityModel()
-    runner = ModelRunner(model, config=RunnerConfig(simulation=True))
+    runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
 
     result = runner.execute(
         {
@@ -433,9 +433,9 @@ def test_runner_request_state_keeps_op_block_deltas_authoritative():
 
     model = TextCapabilityModel()
     model.resource_classes = ("kv_block",)
-    runner = ModelRunner(
+    runner = ModelExecutor(
         model,
-        config=RunnerConfig(simulation=True),
+        config=ExecutorConfig(simulation=True),
         resource_runtime=ResourceRuntime(("kv_block",), totals={"kv_block": 4}),
     )
 

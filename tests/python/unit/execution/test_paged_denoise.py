@@ -1,4 +1,5 @@
 """Contracts for shared paged-denoise helpers."""
+
 from __future__ import annotations
 
 import pytest

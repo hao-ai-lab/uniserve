@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from uniserve_worker.execution import ModelRunner
+from uniserve_worker.execution import ModelExecutor
 
 from ..contracts.model_protocols import UniModel
 from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
@@ -36,7 +36,7 @@ class EncoderWorker(BaseWorker):
             raise capability_mismatch("encoder worker model must inherit UniModel")
         self.request_states = RequestSessionTable()
         self.model = model
-        self.runner = ModelRunner(model, request_states=self.request_states)
+        self.executor = ModelExecutor(model, request_states=self.request_states)
         supported_ops = self._supported_encode_ops()
         if not supported_ops:
             raise capability_mismatch("encoder worker requires encode_image() or encode_latents()")
@@ -63,10 +63,10 @@ class EncoderWorker(BaseWorker):
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
         del defer_text_cpu_results
-        return self.runner.execute(batch)
+        return self.executor.execute(batch)
 
     def drop_request(self, request_id: int) -> None:
-        self.runner.drop_request(int(request_id))
+        self.executor.drop_request(int(request_id))
 
     def free_encoder(self, handles: Any) -> None:
         self.model.free_encoder(handles)

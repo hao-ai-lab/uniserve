@@ -3,13 +3,13 @@
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .runner import ModelRunner, RunnerConfig
+    from .runner import ExecutorConfig, ModelExecutor, ModelRunner
 
-_RUNNER_EXPORTS = frozenset({"ModelRunner", "RunnerConfig"})
+_EXECUTION_EXPORTS = frozenset({"ModelExecutor", "ModelRunner", "ExecutorConfig"})
 
 
 def __getattr__(name: str) -> Any:
-    if name not in _RUNNER_EXPORTS:
+    if name not in _EXECUTION_EXPORTS:
         raise AttributeError(name)
     from . import runner
 
@@ -17,7 +17,9 @@ def __getattr__(name: str) -> Any:
     globals()[name] = value
     return value
 
+
 __all__ = [
+    "ModelExecutor",
     "ModelRunner",
-    "RunnerConfig",
+    "ExecutorConfig",
 ]

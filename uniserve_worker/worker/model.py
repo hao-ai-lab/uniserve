@@ -1,4 +1,4 @@
-"""Model-backed worker built around the shared :class:`ModelRunner`."""
+"""Model-backed worker built around the shared :class:`ModelExecutor`."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
-from uniserve_worker.execution.runner import ModelRunner, RunnerConfig
+from uniserve_worker.execution.runner import ExecutorConfig, ModelExecutor
 
 from ..backends.attention import (
     get_attention_backend,
@@ -92,9 +92,9 @@ class ModelWorker(BaseWorker):
             tensor_store = TensorStore(transport=make_transport(self.transfer_backend))
         resource_runtime = self._create_resource_runtime()
         residency = self._create_residency_manager(resource_runtime)
-        self.model_runner = ModelRunner(
+        self.model_executor = ModelExecutor(
             model,
-            config=RunnerConfig(simulation=bool(simulation)),
+            config=ExecutorConfig(simulation=bool(simulation)),
             attention_backend=self.attention_backend,
             resource_runtime=resource_runtime,
             multimodal_processor=get_processor_for_descriptor(self.family_descriptor),
@@ -110,13 +110,13 @@ class ModelWorker(BaseWorker):
         *,
         defer_text_cpu_results: bool = False,
     ) -> dict[str, Any]:
-        return self.model_runner.execute(
+        return self.model_executor.execute(
             dict(batch),
             defer_text_cpu_results=defer_text_cpu_results,
         )
 
     def drop_request(self, request_id: int) -> None:
-        self.model_runner.drop_request(int(request_id))
+        self.model_executor.drop_request(int(request_id))
 
     def copy_blocks(self, copies: Any) -> None:
         self.model.copy_blocks(copies)
@@ -142,7 +142,7 @@ class ModelWorker(BaseWorker):
         wake_up()
 
     def resource_pressure(self) -> list[dict[str, Any]]:
-        return self.model_runner.resource_runtime.pressure()
+        return self.model_executor.resource_runtime.pressure()
 
     def _build_model_capabilities(self) -> Caps:
         arguments = {
