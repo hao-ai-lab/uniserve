@@ -32,6 +32,7 @@ from uniserve_worker.runtime.paged_denoise import (
 )
 
 from ..contracts.forward_batch import ForwardBatch
+from ..contracts.forward_context import get_forward_context
 from ..contracts.resource_plan import (
     AdapterResourcePolicy,
     CapsDescriptor,
@@ -752,7 +753,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.image_processor = image_processor or (
             BagelImageProcessor() if model is not None else None
         )
-        self.states: dict[int, RequestState] = {}
         self.generation_session = TextImageGenerationSession(self)
         # Interleaved-text-driver owner surface: per-request driver states plus
         # the marker/eos ids the driver reads as configuration. BAGEL has no
@@ -917,9 +917,7 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     def on_new_request(self, req_id: int, state: RequestState) -> None:
         r = int(req_id)
-        self.states[r] = state
         self.reqs.pop(r, None)
-        self.program_state(r)
         self.generation_session.begin_request(
             r,
             sampling=state.sampling,
@@ -930,11 +928,10 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     def drop_request(self, req_id: int) -> None:
         r = int(req_id)
-        state = self.states.pop(r, None)
         text_state = self.reqs.pop(r, None)
         if text_state is not None:
             self.segment_executor.release_staging(text_state.cond.past)
-        self.generation_session.release_request(r, request_state=state)
+        self.generation_session.release_request(r)
 
     def free_encoder(self, handles) -> None:
         # Encoder-output residency is system-owned: the handle→embedding store lives
@@ -961,14 +958,10 @@ class BagelForUnifiedGeneration(UniModelBase):
         return self.generation_session.record(int(req_id))
 
     def _state(self, req_id: int) -> RequestState:
-        req_id = int(req_id)
-        state = self.states.get(req_id)
-        if state is None:
-            state = RequestState()
-            state.seed = req_id
-            state.rng = torch.Generator(device="cpu").manual_seed(req_id)
-            self.states[req_id] = state
-        return state
+        request_states = get_forward_context().request_states
+        if request_states is None:
+            raise invalid_descriptor("BAGEL request state requires an executor-bound forward")
+        return request_states.get(int(req_id))
 
     def _length(self, req_id: int) -> int:
         return self._state(req_id).kv_length()

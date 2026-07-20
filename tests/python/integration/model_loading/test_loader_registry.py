@@ -356,8 +356,9 @@ def test_qwen3_always_advertises_mixed_batch(monkeypatch):
     assert model.batch_policy().supports_mixed_modes
 
 
-def test_qwen3_runtime_applies_opt_in_model_stack_compile(monkeypatch):
+def test_compile_runtime_applies_qwen3_model_stack_once(monkeypatch):
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+    from uniserve_worker.runtime.compile import compile_model_pieces
 
     calls = []
 
@@ -385,8 +386,8 @@ def test_qwen3_runtime_applies_opt_in_model_stack_compile(monkeypatch):
         },
     )
 
-    model.configure_runtime(block_size=16, kv_token_capacity=64)
-    model.configure_runtime(block_size=16, kv_token_capacity=64)
+    compile_model_pieces(model)
+    compile_model_pieces(model)
 
     assert len(calls) == 1
     assert all(kwargs["backend"] == "eager" for _, kwargs in calls)
@@ -447,7 +448,9 @@ def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
         }
     )
     model.model = native_model
-    model._maybe_compile_piecewise()
+    from uniserve_worker.runtime.compile import compile_model_pieces
+
+    compile_model_pieces(model)
 
     assert len(calls) == 1
     assert all(kwargs["backend"] == "eager" for _, kwargs in calls)

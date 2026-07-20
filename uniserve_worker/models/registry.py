@@ -23,7 +23,6 @@ from ..foundation.plugins import discover_package_plugins
 from ..foundation.runtime_config import get_execution_config
 from ..nn.quant import get_current_kv_cache_dtype, kv_store_dtype_name, resolve_kv_store_dtype
 from ..nn.quant.kv_cache import KV_CACHE_NO_OVERRIDE_SENTINELS
-from ..runtime.compile import TorchCompileConfig, compile_model_pieces
 
 if TYPE_CHECKING:
     import torch
@@ -63,10 +62,6 @@ class UniModelBase(UniModel):
 
     kv_cache_dtype: Any
 
-    # Config-gated piecewise torch.compile is applied at most once per model
-    # instance; subclasses call this after weights/residency are ready.
-    _torch_compile_applied: bool = False
-
     def _kv_store_dtype_for(self, compute_dtype: "torch.dtype") -> "torch.dtype":
         return resolve_kv_store_dtype(compute_dtype, self.kv_cache_dtype)
 
@@ -94,21 +89,6 @@ class UniModelBase(UniModel):
         if scale is None:
             scale = attn.scaling
         return int(attn.num_heads), float(scale), attn.q_norm.weight.dtype
-
-    def _maybe_compile_piecewise(self) -> None:
-        if self._torch_compile_applied:
-            return
-        cfg = TorchCompileConfig.from_runtime_config()
-        if not cfg.enabled:
-            return
-        report = compile_model_pieces(self, config=cfg)
-        self._torch_compile_applied = True
-        if report.compiled:
-            logger.info(
-                "enabled %s model-stack torch.compile pieces count=%s",
-                type(self).__name__,
-                report.compiled,
-            )
 
     def _caps_descriptor(
         self,
