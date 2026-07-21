@@ -30,7 +30,7 @@ from uniserve_worker.execution.products import (
     ImageMaterializer,
     ProductTransferSession,
 )
-from uniserve_worker.execution.segment import SegmentExecutor
+from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
 
@@ -2363,6 +2363,8 @@ class SenseNovaU1ForUnifiedGeneration(
 
     # System-provisioned at worker bring-up from ``gen_residency_spec()``.
     residency: ResidencyManager
+    # System-provisioned at worker bring-up from ``segment_adapter()``.
+    segment_executor: SegmentExecutor
 
     def velocity_parameterization(self) -> str:
         return "velocity"
@@ -2421,7 +2423,6 @@ class SenseNovaU1ForUnifiedGeneration(
         self._tower_handoff: TowerHandoff = LocalP2PTowerHandoff(self._resolve_tower_binding)
         self.tower_session = ProductTransferSession(self)
         self.flow_execution = FlowExecution(self, transfer=self.tower_session)
-        self.segment_executor: SegmentExecutor = SegmentExecutor(self)
         self._img_start_token = IMG_START_TOKEN
 
     def _init_tower_profile(self) -> None:
@@ -2531,6 +2532,9 @@ class SenseNovaU1ForUnifiedGeneration(
             ),
             encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
         )
+
+    def segment_adapter(self) -> SegmentAdapter:
+        return self
 
     def _ensure_rope_buffers_on_device(self, device: torch.device | str) -> None:
         if self.model is None:

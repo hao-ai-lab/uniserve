@@ -2591,7 +2591,7 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     kv_segments = []
     indexes = torch.tensor([[5, 5], [0, 0], [0, 1]], dtype=torch.long)
 
-    wrapper.segment_executor._add_denoise_forward_segment(
+    SegmentExecutor(wrapper)._add_denoise_forward_segment(
         builder=builder,
         kv_segments=kv_segments,
         row_index=0,

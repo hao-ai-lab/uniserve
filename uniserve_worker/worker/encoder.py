@@ -12,7 +12,7 @@ from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..runtime.request_session import SessionStore
-from .model import bind_model_residency
+from .model import bind_model_residency, bind_model_segment_execution
 from .protocol import (
     BaseWorker,
     ResultPolicy,
@@ -41,6 +41,7 @@ class EncoderWorker(BaseWorker):
         self.sessions = SessionStore()
         self.model = model
         bind_model_residency(model, self._create_residency_manager())
+        bind_model_segment_execution(model)
         self.executor = ModelExecutor(model, sessions=self.sessions)
         supported_ops = self._supported_encode_ops()
         if not supported_ops:
