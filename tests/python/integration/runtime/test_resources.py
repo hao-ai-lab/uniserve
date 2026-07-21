@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.server.stub import StubUniModel, StubWorker
 from uniserve_worker.worker.model import ModelWorker
@@ -18,10 +19,9 @@ pytestmark = pytest.mark.integration
 
 def _run_request(engine, rid):
     engine.execute(
-        {
-            "step_id": rid,
-            "new_reqs": [{"req_id": rid, "image": {"steps": 2}}],
-            "ops": [
+        seal_batch(
+            rid,
+            [
                 {
                     "req_id": rid,
                     "kind": "prefill_und",
@@ -30,7 +30,8 @@ def _run_request(engine, rid):
                     "token_ids": [1, 2, 3],
                 }
             ],
-        }
+            new_reqs=[{"req_id": rid, "image": {"steps": 2}}],
+        )
     )
 
 
@@ -38,13 +39,13 @@ def test_drop_request_leaves_no_resident_state():
     engine = StubWorker(block_size=256)
     _run_request(engine, 1)
     _run_request(engine, 2)
-    # the stub keeps per-request bookkeeping in reqs/emitted/steps
-    assert 1 in engine.reqs or 1 in engine.emitted
+    sessions = engine.model_executor.sessions
+    assert 1 in sessions and 2 in sessions
     engine.drop_request(1)
-    for table in (engine.reqs, engine.emitted, engine.steps):
-        assert 1 not in table, "dropped request must leave no worker-resident state"
+    assert 1 not in sessions, "dropped request must leave no worker-resident state"
     # request 2 untouched
-    assert 2 in engine.emitted
+    assert 2 in sessions
+    assert sessions.get(2).kv_length("stub_emitted") == 1
 
 
 def test_model_executor_default_resource_runtime_enforces_model_totals():
@@ -62,13 +63,11 @@ def test_model_executor_default_resource_runtime_enforces_model_totals():
     runner = ModelExecutor(TinyBlockModel(), config=ExecutorConfig(simulation=True))
     with pytest.raises(WorkerError) as exc:
         runner.execute(
-            {
-                "step_id": 1,
-                "new_reqs": [{"req_id": 1, "block_ids": [1, 2]}],
-                "ops": [
-                    {"req_id": 1, "kind": "prefill_und", "token_ids": [1], "pos_range": [0, 1]}
-                ],
-            }
+            seal_batch(
+                1,
+                [{"req_id": 1, "kind": "prefill_und", "token_ids": [1], "pos_range": [0, 1]}],
+                new_reqs=[{"req_id": 1, "block_ids": [1, 2]}],
+            )
         )
     assert exc.value.code == ErrorCode.RESOURCE_LEASE_VIOLATION
     assert runner.resource_runtime.used("kv_block") == 0
@@ -78,12 +77,9 @@ def test_model_executor_default_resource_runtime_enforces_model_totals():
 def test_model_executor_resource_runtime_tracks_blocks_latents_and_drop():
     worker = ModelWorker(StubUniModel(), block_size=256, simulation=True)
     worker.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [
-                {"req_id": 7, "block_ids": [1, 2], "image": {"height": 32, "width": 48, "steps": 1}}
-            ],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {
                     "req_id": 7,
                     "kind": "prefill_und",
@@ -92,16 +88,22 @@ def test_model_executor_resource_runtime_tracks_blocks_latents_and_drop():
                     "new_block_ids": [2, 3],
                 }
             ],
-        }
+            new_reqs=[
+                {
+                    "req_id": 7,
+                    "block_ids": [1, 2],
+                    "image": {"height": 32, "width": 48, "steps": 1},
+                }
+            ],
+        )
     )
     rt = worker.model_executor.resource_runtime
     assert rt.used("kv_block") == 3
 
     worker.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [],
-            "ops": [
+        seal_batch(
+            2,
+            [
                 {
                     "req_id": 7,
                     "kind": "denoise_gen",
@@ -109,17 +111,18 @@ def test_model_executor_resource_runtime_tracks_blocks_latents_and_drop():
                     "latent_shape": [1, 2, 3],
                 }
             ],
-        }
+            base_version=1,
+        )
     )
     assert rt.used("image_latent") == 6
     assert rt.used("scratch") == 1
 
     worker.execute(
-        {
-            "step_id": 3,
-            "new_reqs": [],
-            "ops": [{"req_id": 7, "kind": "commit_gen"}],
-        }
+        seal_batch(
+            3,
+            [{"req_id": 7, "kind": "commit_gen"}],
+            base_version=2,
+        )
     )
     assert rt.used("image_latent") == 0
     assert rt.used("scratch") == 0
@@ -132,57 +135,70 @@ def test_model_executor_resource_runtime_tracks_blocks_latents_and_drop():
 def test_model_executor_denoise_scratch_is_one_live_lease_per_cfg_branch():
     worker = ModelWorker(StubUniModel(), block_size=256, simulation=True)
     worker.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 17, "image": {"height": 32, "width": 32, "steps": 2}}],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {
                     "req_id": 17,
                     "kind": "denoise_gen",
                     "timestep_idx": 0,
                     "latent_shape": [1, 2, 2],
-                    "cfg": {"branch_count": 3},
+                    "cfg": {
+                        "branch_count": 3,
+                        "text_scale": 1.0,
+                        "img_scale": 1.0,
+                        "renorm_type": "none",
+                        "renorm_min": 0.0,
+                        "interval": [0.0, 1.0],
+                    },
                 }
             ],
-        }
+            new_reqs=[{"req_id": 17, "image": {"height": 32, "width": 32, "steps": 2}}],
+        )
     )
     rt = worker.model_executor.resource_runtime
     assert rt.used("image_latent") == 4
     assert rt.used("scratch") == 3
 
     worker.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [],
-            "ops": [
+        seal_batch(
+            2,
+            [
                 {
                     "req_id": 17,
                     "kind": "denoise_gen",
                     "timestep_idx": 1,
                     "latent_shape": [1, 2, 2],
-                    "cfg": {"branch_count": 3},
+                    "cfg": {
+                        "branch_count": 3,
+                        "text_scale": 1.0,
+                        "img_scale": 1.0,
+                        "renorm_type": "none",
+                        "renorm_min": 0.0,
+                        "interval": [0.0, 1.0],
+                    },
                 }
             ],
-        }
+            base_version=1,
+        )
     )
     assert rt.used("image_latent") == 4
     assert rt.used("scratch") == 3
 
     worker.execute(
-        {
-            "step_id": 3,
-            "new_reqs": [],
-            "ops": [{"req_id": 17, "kind": "commit_gen"}],
-        }
+        seal_batch(
+            3,
+            [{"req_id": 17, "kind": "commit_gen"}],
+            base_version=2,
+        )
     )
     assert rt.used("image_latent") == 0
     assert rt.used("scratch") == 0
 
     worker.execute(
-        {
-            "step_id": 4,
-            "new_reqs": [],
-            "ops": [
+        seal_batch(
+            4,
+            [
                 {
                     "req_id": 17,
                     "kind": "denoise_gen",
@@ -190,7 +206,8 @@ def test_model_executor_denoise_scratch_is_one_live_lease_per_cfg_branch():
                     "latent_shape": [1, 3, 2],
                 }
             ],
-        }
+            base_version=3,
+        )
     )
     assert rt.used("image_latent") == 6
     assert rt.used("scratch") == 1
@@ -200,10 +217,9 @@ def test_model_executor_rejects_kv_blocks_beyond_declared_capacity():
     worker = ModelWorker(StubUniModel(), block_size=256, kv_token_capacity=512)
     with pytest.raises(WorkerError) as exc:
         worker.execute(
-            {
-                "step_id": 1,
-                "new_reqs": [{"req_id": 9, "block_ids": [1, 2, 3]}],
-                "ops": [
+            seal_batch(
+                1,
+                [
                     {
                         "req_id": 9,
                         "kind": "prefill_und",
@@ -211,7 +227,8 @@ def test_model_executor_rejects_kv_blocks_beyond_declared_capacity():
                         "token_ids": [10],
                     }
                 ],
-            }
+                new_reqs=[{"req_id": 9, "block_ids": [1, 2, 3]}],
+            )
         )
     assert exc.value.code == ErrorCode.RESOURCE_LEASE_VIOLATION
     assert worker.model_executor.resource_runtime.used("kv_block") == 0
@@ -224,10 +241,9 @@ def test_model_executor_rolls_back_denoise_latent_if_scratch_admission_fails():
     worker.model_executor.resource_runtime.totals["scratch"] = 0
 
     worker.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [{"req_id": 11, "image": {"steps": 1}}],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {
                     "req_id": 11,
                     "kind": "prefill_und",
@@ -236,17 +252,17 @@ def test_model_executor_rolls_back_denoise_latent_if_scratch_admission_fails():
                     "new_block_ids": [1],
                 }
             ],
-        }
+            new_reqs=[{"req_id": 11, "image": {"steps": 1}}],
+        )
     )
 
     worker.model_executor.resource_runtime.totals["scratch"] = 1
     worker.model_executor.resource_runtime.acquire("scratch", req_id=99, units=1)
     with pytest.raises(WorkerError) as exc:
         worker.execute(
-            {
-                "step_id": 2,
-                "new_reqs": [],
-                "ops": [
+            seal_batch(
+                2,
+                [
                     {
                         "req_id": 11,
                         "kind": "denoise_gen",
@@ -254,7 +270,8 @@ def test_model_executor_rolls_back_denoise_latent_if_scratch_admission_fails():
                         "latent_shape": [8],
                     }
                 ],
-            }
+                base_version=1,
+            )
         )
     assert exc.value.code == ErrorCode.RESOURCE_LEASE_VIOLATION
     assert worker.model_executor.resource_runtime.used("image_latent") == 0
@@ -274,15 +291,9 @@ def test_model_executor_uses_resource_plan_latent_downsample_for_image_accountin
     worker.model_executor.resource_runtime.totals["image_latent"] = 4096
 
     worker.execute(
-        {
-            "step_id": 1,
-            "new_reqs": [
-                {
-                    "req_id": 21,
-                    "image": {"height": 1152, "width": 2048, "steps": 2},
-                }
-            ],
-            "ops": [
+        seal_batch(
+            1,
+            [
                 {
                     "req_id": 21,
                     "kind": "prefill_und",
@@ -291,22 +302,31 @@ def test_model_executor_uses_resource_plan_latent_downsample_for_image_accountin
                     "new_block_ids": [1],
                 }
             ],
-        }
+            new_reqs=[
+                {
+                    "req_id": 21,
+                    "image": {"height": 1152, "width": 2048, "steps": 2},
+                }
+            ],
+        )
     )
 
     result = worker.execute(
-        {
-            "step_id": 2,
-            "new_reqs": [],
-            "ops": [
+        seal_batch(
+            2,
+            [
                 {
                     "req_id": 21,
                     "kind": "denoise_gen",
                     "timestep_idx": 0,
                 }
             ],
-        }
+            base_version=1,
+        )
     )
 
-    assert result["per_seq"] == [{"req_id": 21, "denoise_done": False, "num_steps_done": 1}]
+    [row] = result["per_seq"]
+    assert row["req_id"] == 21
+    assert row["denoise_done"] is False
+    assert row["num_steps_done"] == 1
     assert worker.model_executor.resource_runtime.used("image_latent") == 2304

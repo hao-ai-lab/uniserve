@@ -3,9 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.execution.flow import PreparedFlowStep
 from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
 from uniserve_worker.nn.diffusion.cfg import Branch
+from uniserve_worker.runtime.graph_store import GraphStore
 from uniserve_worker.runtime.paged_denoise import PagedDenoiseBranchSet
 
 pytestmark = pytest.mark.unit
@@ -105,16 +107,17 @@ def test_bagel_coalesces_compatible_requests_into_one_denoise_forward(monkeypatc
     ]
     captured = []
 
-    def graph_forward(rows):
+    def graph_forward(_owner, rows, *, return_hidden=False):
+        assert return_hidden is False
         captured.append(rows)
         return torch.stack(
             [row.step.latent + float(row.step.t) for row in rows],
             dim=0,
         )
 
-    monkeypatch.setattr(owner.flow_graph_execution, "maybe_run_graph", graph_forward)
-
-    outputs = owner.predict_flow_velocity_batch(steps, [branch_names, branch_names])
+    graph_view = GraphStore(flow=SimpleNamespace(maybe_run_rows=graph_forward)).view()
+    with use_forward_context(ForwardContext(graph_view=graph_view)):
+        outputs = owner.predict_flow_velocity_batch(steps, [branch_names, branch_names])
 
     assert len(captured) == 1
     assert [row.step.req_id for row in captured[0]] == [1, 1, 2, 2]

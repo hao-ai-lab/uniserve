@@ -13,7 +13,7 @@ use uniserve_core::{
     ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling, score_token_logprobs,
 };
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
-use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind, SeqResult};
+use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardOp, ForwardResult, OpKind, SeqResult};
 
 /// Default fabricated-text length before a synthetic EOS (overridable via
 /// [`SimEngine::set_text_len`]).
@@ -30,6 +30,18 @@ const DEFAULT_DENOISE_STEPS: u16 = 50;
 /// Image dimensions (height, width) assumed when a request carries no
 /// [`ImageParams`] height/width.
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
+
+fn operation_result(op: &ForwardOp, result: SeqResult) -> SeqResult {
+    SeqResult {
+        req_id: op.req_id,
+        op_kind: Some(op.kind),
+        op_id: op.op_id,
+        epoch: Some(op.epoch),
+        base_version: Some(op.base_version),
+        result_version: Some(op.base_version.saturating_add(1)),
+        ..result
+    }
+}
 
 enum Job {
     Batch(ForwardBatch),
@@ -397,9 +409,6 @@ impl ModelEngine for SimEngine {
         let mut per_seq = Vec::new();
         for op in batch.ops {
             let r = op.req_id;
-            // Echo the op's op_id on its result, exactly as the GPU worker does,
-            // so the host's op_id-correlated completion path is exercised here.
-            let op_id = op.op_id;
             match op.kind {
                 OpKind::PrefillUnd | OpKind::DecodeUnd => {
                     let n = *self.emitted.get(&r).unwrap_or(&0);
@@ -437,29 +446,29 @@ impl ModelEngine for SimEngine {
                     if op.kind == OpKind::DecodeUnd {
                         self.emitted.insert(r, n + 1);
                     }
-                    per_seq.push(SeqResult {
-                        req_id: r,
-                        op_kind: Some(op.kind),
-                        op_id,
-                        sampled_token_id: Some(out.token),
-                        sampled_logprob: sampling
-                            .as_ref()
-                            .is_some_and(SamplingParams::generated_logprobs_requested)
-                            .then_some(out.logprob),
-                        top_logprobs: if out.top.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                out.top
-                                    .into_iter()
-                                    .map(|(token, logprob, rank)| {
-                                        uniserve_worker_wire::TokenLogprob(token, logprob, rank)
-                                    })
-                                    .collect(),
-                            )
-                        },
-                        prompt_logprobs: sampling.as_ref().and_then(|sampling| {
-                            (op.kind == OpKind::PrefillUnd && sampling.prompt_logprobs_requested())
+                    per_seq.push(operation_result(
+                        &op,
+                        SeqResult {
+                            sampled_token_id: Some(out.token),
+                            sampled_logprob: sampling
+                                .as_ref()
+                                .is_some_and(SamplingParams::generated_logprobs_requested)
+                                .then_some(out.logprob),
+                            top_logprobs: if out.top.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    out.top
+                                        .into_iter()
+                                        .map(|(token, logprob, rank)| {
+                                            uniserve_worker_wire::TokenLogprob(token, logprob, rank)
+                                        })
+                                        .collect(),
+                                )
+                            },
+                            prompt_logprobs: sampling.as_ref().and_then(|sampling| {
+                                (op.kind == OpKind::PrefillUnd
+                                    && sampling.prompt_logprobs_requested())
                                 .then(|| {
                                     let tokens = op.token_ids.as_deref().unwrap_or_default();
                                     let skip = usize::from(op.pos_range.0 == 0);
@@ -490,9 +499,10 @@ impl ModelEngine for SimEngine {
                                         })
                                         .collect()
                                 })
-                        }),
-                        ..Default::default()
-                    });
+                            }),
+                            ..Default::default()
+                        },
+                    ));
                 }
                 OpKind::DenoiseGen => {
                     let s = self
@@ -507,14 +517,14 @@ impl ModelEngine for SimEngine {
                         .and_then(|rec| rec.image.as_ref())
                         .map(|i| i.steps)
                         .unwrap_or(DEFAULT_DENOISE_STEPS);
-                    per_seq.push(SeqResult {
-                        req_id: r,
-                        op_kind: Some(op.kind),
-                        op_id,
-                        denoise_done: s >= total,
-                        num_steps_done: Some(s),
-                        ..Default::default()
-                    });
+                    per_seq.push(operation_result(
+                        &op,
+                        SeqResult {
+                            denoise_done: s >= total,
+                            num_steps_done: Some(s),
+                            ..Default::default()
+                        },
+                    ));
                 }
                 OpKind::CommitGen => {
                     self.steps.remove(&r);
@@ -540,27 +550,27 @@ impl ModelEngine for SimEngine {
                         })
                         .unwrap_or(0);
                     let png = synthetic_png_b64(hw.1, hw.0)?;
-                    per_seq.push(SeqResult {
-                        req_id: r,
-                        op_kind: Some(op.kind),
-                        op_id,
-                        sampled_token_id: self.commit_token,
-                        sampled_logprob: self.commit_token.map(|_| 0.0),
-                        image_png_b64: Some(png),
-                        image_hw: Some(hw),
-                        num_tokens: Some(committed_kv_tokens),
-                        locator: Some(format!("sim-image-{}", r.0)),
-                        ..Default::default()
-                    });
+                    per_seq.push(operation_result(
+                        &op,
+                        SeqResult {
+                            sampled_token_id: self.commit_token,
+                            sampled_logprob: self.commit_token.map(|_| 0.0),
+                            image_png_b64: Some(png),
+                            image_hw: Some(hw),
+                            num_tokens: Some(committed_kv_tokens),
+                            locator: Some(format!("sim-image-{}", r.0)),
+                            ..Default::default()
+                        },
+                    ));
                 }
                 OpKind::CommitWriteback => {
-                    per_seq.push(SeqResult {
-                        req_id: r,
-                        op_kind: Some(op.kind),
-                        op_id,
-                        num_tokens: Some(1),
-                        ..Default::default()
-                    });
+                    per_seq.push(operation_result(
+                        &op,
+                        SeqResult {
+                            num_tokens: Some(1),
+                            ..Default::default()
+                        },
+                    ));
                 }
                 OpKind::VitEncode | OpKind::VaeEncode => {
                     // Fabricate a deterministic worker-side encoder handle from the
@@ -571,22 +581,17 @@ impl ModelEngine for SimEngine {
                         .get(&r)
                         .and_then(|rec| rec.image.as_ref())
                         .map(|i| (i.height, i.width));
-                    per_seq.push(SeqResult {
-                        req_id: r,
-                        op_kind: Some(op.kind),
-                        op_id,
-                        encoder_handle: Some(handle),
-                        num_tokens: Some(1),
-                        image_hw,
-                        ..Default::default()
-                    });
+                    per_seq.push(operation_result(
+                        &op,
+                        SeqResult {
+                            encoder_handle: Some(handle),
+                            num_tokens: Some(1),
+                            image_hw,
+                            ..Default::default()
+                        },
+                    ));
                 }
-                _ => per_seq.push(SeqResult {
-                    req_id: r,
-                    op_kind: Some(op.kind),
-                    op_id,
-                    ..Default::default()
-                }),
+                _ => per_seq.push(operation_result(&op, SeqResult::default())),
             }
         }
         Ok(ForwardResult {
@@ -608,6 +613,7 @@ impl ModelEngine for SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uniserve_core::Modality;
 
     #[test]
     fn control_wait_acks_every_control_op() {
@@ -633,6 +639,29 @@ mod tests {
             assert!(acks[0].ok);
         }
         exec.shutdown();
+    }
+
+    #[test]
+    fn operation_results_echo_the_version_envelope() {
+        let mut operation = ForwardOp {
+            req_id: RequestId(9),
+            kind: OpKind::PrefillUnd,
+            modality: Modality::Und,
+            token_ids: Some(vec![1, 2]),
+            pos_range: (0, 2),
+            ..Default::default()
+        };
+        operation.seal(3, 17, 11);
+        let mut engine = SimEngine::new();
+        let result = engine
+            .execute(ForwardBatch::new(4, Vec::new(), vec![operation]))
+            .expect("execute versioned operation");
+
+        let row = &result.per_seq[0];
+        assert_eq!(row.op_id, Some(17));
+        assert_eq!(row.epoch, Some(3));
+        assert_eq!(row.base_version, Some(11));
+        assert_eq!(row.result_version, Some(12));
     }
 
     #[test]

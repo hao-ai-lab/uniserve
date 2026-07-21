@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
@@ -141,9 +141,6 @@ class SequenceAdapter(Protocol):
     def device(self) -> Any: ...
 
     @property
-    def reqs(self) -> dict[int, Any]: ...
-
-    @property
     def kv_pool(self) -> "PagedKVPool | None": ...
 
     @property
@@ -178,6 +175,7 @@ class SequenceAdapter(Protocol):
         return_all_logits: bool = False,
     ) -> Any: ...
     def sequence_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
+    def program_state(self, req_id: int) -> Any: ...
 
 
 class SequenceExecutor:
@@ -187,21 +185,15 @@ class SequenceExecutor:
         self,
         owner: SequenceAdapter,
         *,
-        request_state_factory: Callable[[], Any],
         image_start_token: str,
     ) -> None:
         self.owner = owner
-        self.request_state_factory = request_state_factory
         self.image_start_token = image_start_token
         self._step_runner: Any | None = None
         self._span_runner: Any | None = None
 
     def state(self, op: Mapping[str, Any]) -> Any:
-        req_id = int(op["req_id"])
-        hook = getattr(self.owner, "program_state", None)
-        if callable(hook):
-            return hook(req_id)
-        return self.owner.reqs.setdefault(req_id, self.request_state_factory())
+        return self.owner.program_state(int(op["req_id"]))
 
     def run_text_logits_batch(self, ops: Sequence[Mapping[str, Any]]) -> list[torch.Tensor]:
         """Return one logits row per op, graphing the eligible one-token decode batch.

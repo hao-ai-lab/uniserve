@@ -19,11 +19,11 @@ from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from uniserve_worker.execution.flow import (
-    FlowGraphExecution,
     FlowRow,
     PreparedFlowStep,
     ProgramState,
     flow_cfg_branch_count,
+    run_flow_graph,
 )
 from uniserve_worker.execution.segment import SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
@@ -780,7 +780,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             self.lora = MergeOnLoadLoRA(self.model)
         else:
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
-        self.flow_graph_execution = FlowGraphExecution(self)
         self.segment_executor: SegmentExecutor = SegmentExecutor(self)
 
     def _build_resource_plan(self) -> ResourcePlan:
@@ -978,7 +977,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         if driver is None:
             driver = SequenceExecutor(
                 self,
-                request_state_factory=ProgramState,
                 image_start_token=_BAGEL_IMG_START_TOKEN,
             )
             self._shared_text_driver = driver
@@ -1761,7 +1759,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             rows = [entry[2] for entry in group]
             group_num_vae = int(rows[0].img.token_w) - _BAGEL_IMAGE_MARKER_TOKENS
             m.gen_segment_graph_layout(len(rows), group_num_vae)
-            velocity = self.flow_graph_execution.maybe_run_graph(rows)
+            velocity = run_flow_graph(self, rows)
             if not isinstance(velocity, torch.Tensor):
                 return None
             if int(velocity.shape[0]) != len(group):

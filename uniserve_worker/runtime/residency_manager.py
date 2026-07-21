@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from ..contracts.op_kinds import DENOISE_GEN
 from ..contracts.resource_plan import LatentTokens, PerBranch, ResourcePlan
@@ -45,7 +45,7 @@ class ResidencyLeaseManager:
         self.resource_plan = resource_plan
         self.residency = residency
 
-    def account_group(self, group: list[tuple[int, Mapping[str, Any]]]) -> None:
+    def account_group(self, group: Sequence[tuple[int, Mapping[str, Any]]]) -> None:
         accounted: list[LeaseAccountingDelta] = []
         try:
             for _, op in group:

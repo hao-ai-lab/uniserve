@@ -2842,7 +2842,6 @@ class SenseNovaU1ForUnifiedGeneration(
         if driver is None:
             driver = SequenceExecutor(
                 self,
-                request_state_factory=ProgramState,
                 image_start_token=self._img_start_token,
             )
             self._shared_text_driver = driver

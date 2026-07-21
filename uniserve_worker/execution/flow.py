@@ -610,24 +610,22 @@ class FlowGraphRunner(FailureManagedRunner):
         return state.logits
 
 
-class FlowGraphExecution:
-    """Own CUDA graph state for one family flow adapter."""
+def run_flow_graph(
+    adapter: Any,
+    rows: "Sequence[FlowRow]",
+    *,
+    return_hidden: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    """Run flow rows through the executor-owned graph view.
 
-    def __init__(self, adapter: Any, *, runner: FlowGraphRunner | None = None) -> None:
-        self.adapter = adapter
-        self.graph_runner = runner or FlowGraphRunner()
+    A forward without a flow graph runner in its view is a graph miss: the
+    caller falls back to the equivalent eager execution.
+    """
 
-    def maybe_run_graph(
-        self,
-        rows: "Sequence[FlowRow]",
-        *,
-        return_hidden: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
-        return self.graph_runner.maybe_run_rows(
-            self.adapter,
-            rows,
-            return_hidden=return_hidden,
-        )
+    runner = getattr(get_forward_context().graph_view, "flow", None)
+    if runner is None:
+        return None
+    return runner.maybe_run_rows(adapter, rows, return_hidden=return_hidden)
 
 
 # ---------------------
@@ -986,7 +984,7 @@ class FlowAdapter(Protocol):
     def flow_timestep_embeddings(self, t_values: torch.Tensor) -> torch.Tensor: ...
 
 
-class FlowExecution(FlowGraphExecution):
+class FlowExecution:
     """Implement flow setup, branch batching, velocity prediction, and updates."""
 
     def __init__(
@@ -995,7 +993,7 @@ class FlowExecution(FlowGraphExecution):
         *,
         transfer: ProductTransferState | None = None,
     ) -> None:
-        super().__init__(adapter)
+        self.adapter = adapter
         self.transfer = transfer
 
     @property
@@ -1411,7 +1409,7 @@ class FlowExecution(FlowGraphExecution):
         # Strict unified-forward callers use ``graph_mode="require"`` and reject
         # the batch when its geometry is not covered.
         if graph_mode != "eager":
-            graphed = self.maybe_run_graph(rows, return_hidden=return_hidden)
+            graphed = run_flow_graph(self.adapter, rows, return_hidden=return_hidden)
             if graphed is not None:
                 return graphed
             if graph_mode == "require":
