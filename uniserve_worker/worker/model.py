@@ -9,6 +9,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from uniserve_worker.execution.runner import ExecutorConfig, ModelExecutor
+from uniserve_worker.execution.segment import SegmentExecutor
 
 from ..backends.attention import (
     get_attention_backend,
@@ -48,6 +49,19 @@ def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") 
     ):
         if hasattr(model, name):
             setattr(model, name, pool)
+
+
+def bind_model_segment_execution(model: UniModel) -> None:
+    """Build the system-owned segment executor over the model's family adapter.
+
+    A model that lowers heterogeneous operations through segment execution
+    declares its adapter surface via ``segment_adapter()``; the executor lands
+    on the contract-declared ``model.segment_executor``.
+    """
+    adapter = model.segment_adapter()
+    if adapter is None:
+        return
+    model.segment_executor = SegmentExecutor(adapter)
 
 
 class ModelWorker(BaseWorker):
@@ -114,6 +128,7 @@ class ModelWorker(BaseWorker):
         resource_runtime = self._create_resource_runtime()
         residency = self._create_residency_manager(resource_runtime)
         bind_model_residency(self.model, residency)
+        bind_model_segment_execution(self.model)
         self.model_executor = ModelExecutor(
             model,
             config=ExecutorConfig(simulation=bool(simulation)),

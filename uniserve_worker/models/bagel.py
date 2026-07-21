@@ -25,7 +25,7 @@ from uniserve_worker.execution.flow import (
     flow_cfg_branch_count,
     run_flow_graph,
 )
-from uniserve_worker.execution.segment import SegmentExecutor
+from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.paged_denoise import (
     PagedDenoiseBranchSet,
@@ -709,6 +709,8 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     # System-provisioned at worker bring-up from ``gen_residency_spec()``.
     residency: ResidencyManager
+    # System-provisioned at worker bring-up from ``segment_adapter()``.
+    segment_executor: SegmentExecutor
 
     @classmethod
     def recognizes(cls, model_path: str | Path) -> bool:
@@ -779,7 +781,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             self.lora = MergeOnLoadLoRA(self.model)
         else:
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
-        self.segment_executor: SegmentExecutor = SegmentExecutor(self)
 
     def _build_resource_plan(self) -> ResourcePlan:
         return ResourcePlan(
@@ -822,6 +823,9 @@ class BagelForUnifiedGeneration(UniModelBase):
             reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
             encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
         )
+
+    def segment_adapter(self) -> SegmentAdapter:
+        return self
 
     @classmethod
     def from_pretrained(

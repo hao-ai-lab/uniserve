@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     import torch
 
     from uniserve_worker.execution.flow import PreparedFlowStep
-    from uniserve_worker.execution.segment import SegmentExecutor
+    from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
     from uniserve_worker.runtime.residency import ResidencyManager
 
     from .caps import Caps
@@ -53,6 +53,8 @@ class UniModel(ABC):
     supported_controls: tuple[str, ...] = ()
     adapter_mode: str = "none"
     resource_plan: "ResourcePlan" = ResourcePlan()
+    # System-provisioned segment execution; the worker builds the executor
+    # over the model-declared family adapter and binds it here.
     segment_executor: "SegmentExecutor | None" = None
     # System-provisioned physical residency; the worker builds it from the
     # model-declared geometry and binds it here.
@@ -185,6 +187,9 @@ class UniModel(ABC):
         return None
 
     def gen_residency_spec(self) -> Any | None:
+        return None
+
+    def segment_adapter(self) -> "SegmentAdapter | None":
         return None
 
     def batch_policy(self) -> Any:
