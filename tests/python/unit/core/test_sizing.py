@@ -161,7 +161,6 @@ def test_sensenova_caps_declare_worker_owned_encoder_residency():
 
     assert "encoder_output" in caps.resource_classes
     assert caps.encoder_cache_budget == model.ENCODER_CACHE_BUDGET
-    assert model.residency.encoder.budget == caps.encoder_cache_budget
 
 
 def test_bagel_caps_reserve_decode_graph_padding_blocks():

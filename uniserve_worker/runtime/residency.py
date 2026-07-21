@@ -282,13 +282,18 @@ class ResidencyManager:
         return cls(kv=kv, ledger=ledger)
 
     @classmethod
-    def build_gen(cls, spec: GenResidencySpec) -> "ResidencyManager":
+    def build_gen(
+        cls,
+        spec: GenResidencySpec,
+        *,
+        ledger: "ResourceRuntime | None" = None,
+    ) -> "ResidencyManager":
         """Construct a generation model's pools from its declared geometry.
 
         Builds the text ``kv`` pool, the per-CFG-branch uncond ``scratch`` pool,
         and (for a tower/gen-device split) the ``gen_scratch`` pool on the gen
-        device. This is where the multimodal models' pool construction lives now
-        — in the system, not under ``models/``.
+        device. This is where the multimodal models' pool construction lives —
+        in the system, not under ``models/``.
         """
 
         kv = PagedKVPool(
@@ -337,6 +342,7 @@ class ResidencyManager:
             gen_scratch=gen_scratch,
             latent=LatentStore(),
             encoder_cache_budget=spec.encoder_cache_budget,
+            ledger=ledger,
         )
 
     def kv_pool(self) -> PagedKVPool:

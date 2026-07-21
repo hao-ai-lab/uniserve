@@ -6,7 +6,7 @@ import inspect
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from uniserve_worker.execution.runner import ExecutorConfig, ModelExecutor
 
@@ -26,7 +26,28 @@ from ..processors import get_processor_for_descriptor
 from ..runtime.resources import ResourceRuntime
 from .protocol import BaseWorker, ResultPolicy
 
+if TYPE_CHECKING:
+    from ..runtime.residency import ResidencyManager
+
 logger = logging.getLogger(__name__)
+
+
+def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") -> None:
+    """Hand the system-built residency to the model surfaces that read it.
+
+    The manager itself lands on the contract-declared ``model.residency``; the
+    pool aliases land only on the slots the model declares.
+    """
+    if residency is None:
+        return
+    model.residency = residency
+    for name, pool in (
+        ("kv_pool", residency.kv),
+        ("scratch_pool", residency.scratch),
+        ("gen_scratch_pool", residency.gen_scratch),
+    ):
+        if hasattr(model, name):
+            setattr(model, name, pool)
 
 
 class ModelWorker(BaseWorker):
@@ -92,6 +113,7 @@ class ModelWorker(BaseWorker):
             tensor_store = TensorStore(transport=make_transport(self.transfer_backend))
         resource_runtime = self._create_resource_runtime()
         residency = self._create_residency_manager(resource_runtime)
+        bind_model_residency(self.model, residency)
         self.model_executor = ModelExecutor(
             model,
             config=ExecutorConfig(simulation=bool(simulation)),
@@ -173,13 +195,14 @@ class ModelWorker(BaseWorker):
             tp_size=int(mesh.tp_size),
         )
 
-    def _create_residency_manager(self, resource_runtime: ResourceRuntime):
+    def _create_residency_manager(
+        self, resource_runtime: ResourceRuntime
+    ) -> "ResidencyManager | None":
         from ..runtime.residency import ResidencyManager
 
-        existing = getattr(self.model, "residency", None)
-        if isinstance(existing, ResidencyManager):
-            existing.ledger = resource_runtime
-            return existing
+        generation_spec = self.model.gen_residency_spec()
+        if generation_spec is not None:
+            return ResidencyManager.build_gen(generation_spec, ledger=resource_runtime)
         specification = self.model.kv_cache_spec()
         if specification is None:
             return None

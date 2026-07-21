@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from uniserve_worker.execution.flow import PreparedFlowStep
     from uniserve_worker.execution.segment import SegmentExecutor
+    from uniserve_worker.runtime.residency import ResidencyManager
 
     from .caps import Caps
     from .forward_batch import ForwardBatch
@@ -53,6 +54,9 @@ class UniModel(ABC):
     adapter_mode: str = "none"
     resource_plan: "ResourcePlan" = ResourcePlan()
     segment_executor: "SegmentExecutor | None" = None
+    # System-provisioned physical residency; the worker builds it from the
+    # model-declared geometry and binds it here.
+    residency: "ResidencyManager | None" = None
 
     def forward(self, batch: "ForwardBatch") -> Any:
         """Execute a complete homogeneous batch through runner-bound runtime services."""
@@ -178,6 +182,9 @@ class UniModel(ABC):
         raise invalid_descriptor("commit-capable model must implement decode_image()")
 
     def kv_cache_spec(self) -> Any | None:
+        return None
+
+    def gen_residency_spec(self) -> Any | None:
         return None
 
     def batch_policy(self) -> Any:

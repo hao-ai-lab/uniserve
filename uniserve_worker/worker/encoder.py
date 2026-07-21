@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from uniserve_worker.execution import ModelExecutor
 
@@ -12,11 +12,15 @@ from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..runtime.request_session import SessionStore
+from .model import bind_model_residency
 from .protocol import (
     BaseWorker,
     ResultPolicy,
     model_free_capabilities,
 )
+
+if TYPE_CHECKING:
+    from ..runtime.residency import ResidencyManager
 
 
 class EncoderWorker(BaseWorker):
@@ -36,6 +40,7 @@ class EncoderWorker(BaseWorker):
             raise capability_mismatch("encoder worker model must inherit UniModel")
         self.sessions = SessionStore()
         self.model = model
+        bind_model_residency(model, self._create_residency_manager())
         self.executor = ModelExecutor(model, sessions=self.sessions)
         supported_ops = self._supported_encode_ops()
         if not supported_ops:
@@ -70,6 +75,14 @@ class EncoderWorker(BaseWorker):
 
     def free_encoder(self, handles: Any) -> None:
         self.model.free_encoder(handles)
+
+    def _create_residency_manager(self) -> ResidencyManager | None:
+        from ..runtime.residency import ResidencyManager
+
+        generation_spec = self.model.gen_residency_spec()
+        if generation_spec is None:
+            return None
+        return ResidencyManager.build_gen(generation_spec)
 
     def _supported_encode_ops(self) -> tuple[str, ...]:
         supported_ops: list[str] = []

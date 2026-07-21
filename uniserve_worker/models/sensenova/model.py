@@ -2361,6 +2361,9 @@ class SenseNovaU1ForUnifiedGeneration(
     ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
     checkpoint_layout = CheckpointLayout(stacked=_SENSENOVA_STACKED_PARAMS)
 
+    # System-provisioned at worker bring-up from ``gen_residency_spec()``.
+    residency: ResidencyManager
+
     def velocity_parameterization(self) -> str:
         return "velocity"
 
@@ -2407,10 +2410,10 @@ class SenseNovaU1ForUnifiedGeneration(
             scratch=PerBranch(),
         )
 
-        n_kv, head_dim = self._init_kv_geometry(config, llm_cfg, kv_token_capacity)
-        self._init_empty_residency_state()
+        self._init_kv_geometry(config, llm_cfg, kv_token_capacity)
+        self._init_residency_slots()
         if self.model is not None:
-            self._init_loaded_model_residency(n_kv, head_dim, gen_snapshot_kv_capacity)
+            self._init_loaded_model_placement(gen_snapshot_kv_capacity)
         # The und↔gen crossing is one model-facing object over the tower axis.
         # In-process transport binds NVLink peer copy; a trivial tower binds None
         # and degrades to a same-device scratch copy. The binding resolves live
@@ -2467,7 +2470,7 @@ class SenseNovaU1ForUnifiedGeneration(
         config: Any | None,
         llm_cfg: Any,
         kv_token_capacity: int | None,
-    ) -> tuple[int, int]:
+    ) -> None:
         if isinstance(llm_cfg, dict):
             self.num_layers = int(llm_cfg["num_hidden_layers"])
             n_kv = int(llm_cfg["num_key_value_heads"])
@@ -2487,53 +2490,47 @@ class SenseNovaU1ForUnifiedGeneration(
         self._kv_head_dim = head_dim
         self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
         self.num_blocks = derive_num_blocks(self.block_size, kv_token_capacity)
-        return n_kv, head_dim
 
-    def _init_empty_residency_state(self) -> None:
+    def _init_residency_slots(self) -> None:
         self.kv_pool: PagedKVPool | None = None
         self.scratch_pool: PagedKVPool | None = None
         self.gen_scratch_pool: PagedKVPool | None = None
         self._scratch_blocks = 0
-        self.residency = ResidencyManager(encoder_cache_budget=self.ENCODER_CACHE_BUDGET)
+        self._gen_scratch_blocks: int | None = None
 
-    def _init_loaded_model_residency(
-        self,
-        n_kv: int,
-        head_dim: int,
-        gen_snapshot_kv_capacity: int | None,
-    ) -> None:
-        dtype = torch.bfloat16
+    def _init_loaded_model_placement(self, gen_snapshot_kv_capacity: int | None) -> None:
         self._annotate_towers()
         place_towers(self.model, self.mesh)
         self._ensure_rope_buffers_on_device(torch.device(str(self.device)))
-        self.bytes_per_token = self._kv_bytes_per_token(dtype)
-        scratch_blocks, gen_blocks = self._scratch_block_counts(gen_snapshot_kv_capacity)
-        self.residency = ResidencyManager.build_gen(
-            GenResidencySpec(
-                kv=KvCacheSpec(
-                    num_layers=self.num_layers,
-                    num_kv_heads=n_kv,
-                    head_dim=head_dim,
-                    dtype=dtype,
-                    store_dtype=self._kv_store_dtype_for(dtype),
-                ),
-                num_blocks=self.num_blocks,
-                block_size=self.block_size,
-                device=self.device,
-                scratch_num_blocks=scratch_blocks,
-                reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
-                gen_scratch_num_blocks=gen_blocks,
-                gen_device=self.gen_device if gen_blocks is not None else None,
-                gen_tower_coord=(
-                    self._tower_coords[Modality.GEN] if self._tower_coords is not None else None
-                ),
-                encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
-            )
+        self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
+        self._scratch_blocks, self._gen_scratch_blocks = self._scratch_block_counts(
+            gen_snapshot_kv_capacity
         )
-        self.kv_pool = self.residency.kv
-        self.scratch_pool = self.residency.scratch
-        self.gen_scratch_pool = self.residency.gen_scratch
-        self._scratch_blocks = scratch_blocks
+
+    def gen_residency_spec(self) -> GenResidencySpec | None:
+        if self.model is None:
+            return None
+        dtype = torch.bfloat16
+        return GenResidencySpec(
+            kv=KvCacheSpec(
+                num_layers=self.num_layers,
+                num_kv_heads=self._kv_num_heads,
+                head_dim=self._kv_head_dim,
+                dtype=dtype,
+                store_dtype=self._kv_store_dtype_for(dtype),
+            ),
+            num_blocks=self.num_blocks,
+            block_size=self.block_size,
+            device=self.device,
+            scratch_num_blocks=self._scratch_blocks,
+            reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
+            gen_scratch_num_blocks=self._gen_scratch_blocks,
+            gen_device=self.gen_device if self._gen_scratch_blocks is not None else None,
+            gen_tower_coord=(
+                self._tower_coords[Modality.GEN] if self._tower_coords is not None else None
+            ),
+            encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
+        )
 
     def _ensure_rope_buffers_on_device(self, device: torch.device | str) -> None:
         if self.model is None:

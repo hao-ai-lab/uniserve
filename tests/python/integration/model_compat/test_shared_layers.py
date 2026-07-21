@@ -272,9 +272,9 @@ def test_sensenova_kv_geometry_honors_runtime_cache_dtype_override(monkeypatch):
     llm_cfg = SimpleNamespace(num_hidden_layers=2, num_key_value_heads=1, head_dim=8)
     config = SimpleNamespace(quantization_config={"kv_cache_dtype": "bf16"})
 
-    n_kv, head_dim = wrapper._init_kv_geometry(config, llm_cfg, kv_token_capacity=128)
+    wrapper._init_kv_geometry(config, llm_cfg, kv_token_capacity=128)
 
-    assert (n_kv, head_dim) == (1, 8)
+    assert (wrapper._kv_num_heads, wrapper._kv_head_dim) == (1, 8)
     assert wrapper.kv_cache_dtype == "fp32"
     assert wrapper.bytes_per_token == 1 * 8 * 2 * 2 * 4
 
