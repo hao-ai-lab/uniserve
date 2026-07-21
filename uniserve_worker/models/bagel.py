@@ -707,6 +707,9 @@ class BagelForUnifiedGeneration(UniModelBase):
     # Encoder-output cache capacity reported to the host scheduler.
     ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
 
+    # System-provisioned at worker bring-up from ``gen_residency_spec()``.
+    residency: ResidencyManager
+
     @classmethod
     def recognizes(cls, model_path: str | Path) -> bool:
         root = Path(model_path)
@@ -751,14 +754,12 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.img_start_id = int(self.cfg.start_of_image_id)
         self.img_end_id = int(self.cfg.end_of_image_id)
         self._shared_text_driver: SequenceExecutor | None = None
-        self.pool: PagedKVPool | None = None
-        self.residency = ResidencyManager(encoder_cache_budget=self.ENCODER_CACHE_BUDGET)
+        self.kv_pool: PagedKVPool | None = None
         self.lora: MergeOnLoadLoRA | None = None
         # engine_wide LoRA merges/unmerges mutate shared model weights in place;
         # serialize load/unload so a concurrent control op cannot interleave a
         # half-applied delta with another adapter's merge.
         self._lora_lock = threading.Lock()
-        c = self.cfg.llm
         self.kv_cache_dtype = get_current_kv_cache_dtype(config)
         self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
         if self.model is not None:
@@ -773,9 +774,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                 ).token_capacity
             )
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
-            self.residency = self._build_residency(c)
-            self.pool = self.residency.kv
-            self.scratch_pool = self.residency.scratch
+            self._scratch_blocks = self._scratch_num_blocks()
             self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
             self.lora = MergeOnLoadLoRA(self.model)
         else:
@@ -801,28 +800,27 @@ class BagelForUnifiedGeneration(UniModelBase):
         # reservation without allowing it to consume text-staging headroom.
         return self._denoise_scratch_num_blocks(block_size) + int(self.num_blocks)
 
-    def _build_residency(self, cfg: LLMConfig) -> ResidencyManager:
-        # System-owned residency: the worker-owned ResidencyManager constructs
-        # and owns the KV pool; the model declares only geometry/sizing here.
-        # The scratch pool holds denoise CFG branches and same-pool text mirrors
-        # used by shared packed text/denoise forwards.
-        self._scratch_blocks = self._scratch_num_blocks()
-        return ResidencyManager.build_gen(
-            GenResidencySpec(
-                kv=KvCacheSpec(
-                    num_layers=cfg.num_hidden_layers,
-                    num_kv_heads=local_kv_head_count(cfg.num_key_value_heads),
-                    head_dim=cfg.head_dim,
-                    dtype=torch.bfloat16,
-                    store_dtype=self._kv_store_dtype_for(torch.bfloat16),
-                ),
-                num_blocks=self.num_blocks,
-                block_size=self.block_size,
-                device=self.device,
-                scratch_num_blocks=self._scratch_blocks,
-                reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
-                encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
-            )
+    def gen_residency_spec(self) -> GenResidencySpec | None:
+        # The model declares only geometry/sizing; the system builds and owns
+        # the pools. The scratch pool holds denoise CFG branches and same-pool
+        # text mirrors used by shared packed text/denoise forwards.
+        if self.model is None:
+            return None
+        cfg = self.cfg.llm
+        return GenResidencySpec(
+            kv=KvCacheSpec(
+                num_layers=cfg.num_hidden_layers,
+                num_kv_heads=local_kv_head_count(cfg.num_key_value_heads),
+                head_dim=cfg.head_dim,
+                dtype=torch.bfloat16,
+                store_dtype=self._kv_store_dtype_for(torch.bfloat16),
+            ),
+            num_blocks=self.num_blocks,
+            block_size=self.block_size,
+            device=self.device,
+            scratch_num_blocks=self._scratch_blocks,
+            reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
+            encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
         )
 
     @classmethod
@@ -962,11 +960,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         return state.block_ids
 
     # ---- sequence adapter surface ------------------------------------------
-
-    @property
-    def kv_pool(self) -> PagedKVPool | None:
-        # Sequence execution uses this request KV pool.
-        return self.pool
 
     @property
     def num_layers(self) -> int:
@@ -1912,7 +1905,7 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     def _ensure_loaded(self) -> _LoadedBagelRuntime:
         model = self.model
-        pool = self.pool
+        pool = self.kv_pool
         image_processor = self.image_processor
         if model is None or pool is None or image_processor is None:
             raise capability_mismatch("BAGEL model weights are not loaded")
