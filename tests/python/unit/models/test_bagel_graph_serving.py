@@ -4,9 +4,11 @@ import pytest
 import torch
 import torch.nn as nn
 
+from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig
 from uniserve_worker.nn.decoder import Modality, MoTModel
+from uniserve_worker.runtime.graph_store import GraphStore
 
 pytestmark = pytest.mark.unit
 
@@ -228,21 +230,20 @@ def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
 
     captured = []
 
-    def graph_forward(owner, rows):
+    def graph_forward(owner, rows, *, return_hidden=False):
+        assert return_hidden is False
         captured.append((owner, rows))
         return torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
 
     owner = Owner()
-    owner.flow_graph_execution = SimpleNamespace(
-        maybe_run_graph=lambda rows: graph_forward(owner, rows)
-    )
-
-    result = BagelForUnifiedGeneration.predict_flow_velocity_batch(
-        owner,
-        [step],
-        [("cond", "text_uncond")],
-        graph_mode="require",
-    )
+    graph_view = GraphStore(flow=SimpleNamespace(maybe_run_rows=graph_forward)).view()
+    with use_forward_context(ForwardContext(graph_view=graph_view)):
+        result = BagelForUnifiedGeneration.predict_flow_velocity_batch(
+            owner,
+            [step],
+            [("cond", "text_uncond")],
+            graph_mode="require",
+        )
 
     assert len(captured) == 1
     rows = captured[0][1]

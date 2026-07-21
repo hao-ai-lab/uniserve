@@ -18,6 +18,7 @@ from uniserve_worker.bootstrap.model_loader import (
     model_architecture_candidates,
 )
 from uniserve_worker.contracts import ModelLoadScope, UniModel
+from uniserve_worker.contracts.batches import seal_batch
 from uniserve_worker.contracts.caps import Caps, ExecutionConstraints
 from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
@@ -246,10 +247,9 @@ def test_model_worker_executes_registered_stub_model():
     model = StubUniModel()
     worker = ModelWorker(model, block_size=256, simulation=True)
     result = worker.execute(
-        {
-            "step_id": 7,
-            "new_reqs": [{"req_id": 1, "sampling": {}, "image": {"steps": 1}}],
-            "ops": [
+        seal_batch(
+            7,
+            [
                 {
                     "kind": "prefill_und",
                     "req_id": 1,
@@ -257,7 +257,8 @@ def test_model_worker_executes_registered_stub_model():
                     "pos_range": [0, 2],
                 }
             ],
-        }
+            new_reqs=[{"req_id": 1, "sampling": {}, "image": {"steps": 1}}],
+        )
     )
     assert result["step_id"] == 7
     assert result["per_seq"][0]["req_id"] == 1
@@ -290,10 +291,9 @@ def test_qwen3_entry_executes_through_model_worker():
         simulation=True,
     )
     result = worker.execute(
-        {
-            "step_id": 8,
-            "new_reqs": [{"req_id": 1, "sampling": {"temperature": 0.0}, "block_ids": []}],
-            "ops": [
+        seal_batch(
+            8,
+            [
                 {
                     "kind": "prefill_und",
                     "req_id": 1,
@@ -302,7 +302,8 @@ def test_qwen3_entry_executes_through_model_worker():
                     "new_block_ids": [1],
                 }
             ],
-        }
+            new_reqs=[{"req_id": 1, "sampling": {"temperature": 0.0}, "block_ids": []}],
+        )
     )
 
     assert result["step_id"] == 8
@@ -463,10 +464,9 @@ def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():
     cls = UniServeZeroDayCfgZeroStarModel
     worker = ModelWorker(cls(), block_size=256, simulation=True)
     result = worker.execute(
-        {
-            "step_id": 9,
-            "new_reqs": [{"req_id": 11, "sampling": {}, "image": {"steps": 1}}],
-            "ops": [
+        seal_batch(
+            9,
+            [
                 {
                     "kind": "denoise_gen",
                     "req_id": 11,
@@ -476,14 +476,21 @@ def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():
                     "cfg": {
                         "branch_count": 2,
                         "text_scale": 2.0,
+                        "img_scale": 1.0,
                         "renorm_type": "cfg_zero_star",
+                        "renorm_min": 0.0,
+                        "interval": [0.0, 1.0],
                     },
                 }
             ],
-        }
+            new_reqs=[{"req_id": 11, "sampling": {}, "image": {"steps": 1}}],
+        )
     )
     assert result["step_id"] == 9
-    assert result["per_seq"] == [{"req_id": 11, "denoise_done": True, "num_steps_done": 1}]
+    [row] = result["per_seq"]
+    assert row["req_id"] == 11
+    assert row["denoise_done"] is True
+    assert row["num_steps_done"] == 1
 
 
 class TinyLoadableModel(nn.Module):

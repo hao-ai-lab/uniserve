@@ -13,10 +13,14 @@ __all__ = ["ReplayStore"]
 
 
 class OperationIdentity(Protocol):
-    session_id: int
-    epoch: int
-    op_id: int
-    digest: str
+    @property
+    def session_id(self) -> int: ...
+    @property
+    def epoch(self) -> int: ...
+    @property
+    def op_id(self) -> int: ...
+    @property
+    def digest(self) -> str: ...
 
 
 class ReplayStore:

@@ -9,7 +9,7 @@ import base64
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
@@ -69,9 +69,10 @@ from uniserve_worker.nn.sampler import (
     is_deferred_sampling_result,
 )
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
+from uniserve_worker.runtime.graph_store import GraphStore
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
 from uniserve_worker.runtime.product_store import ProductStore
-from uniserve_worker.runtime.request_session import SessionStore
+from uniserve_worker.runtime.request_session import SessionStore, TransactionalStore
 from uniserve_worker.runtime.residency_manager import ResidencyLeaseManager
 from uniserve_worker.runtime.resources import ResourceRuntime
 
@@ -89,6 +90,7 @@ from .diffusion import (
     _DiffusionRuntime,
 )
 from .flow import (
+    FlowGraphRunner,
     KvStore,
     LatentView,
     PreparedFlowStep,
@@ -108,6 +110,7 @@ from .sampling import (
     sample_logits_result,
     text_input_id_replacements_from_relays,
 )
+from .segment import SegmentGraphRunner
 
 if TYPE_CHECKING:
     from uniserve_worker.contracts.forward_batch import ForwardBatch, ForwardGraphPolicy
@@ -625,7 +628,7 @@ _STREAM_OVERLAP_MODES = frozenset(
 )
 
 
-def _overlap_eligible(group: list[tuple[int, Mapping[str, Any]]]) -> bool:
+def _overlap_eligible(group: Sequence[tuple[int, Mapping[str, Any]]]) -> bool:
     """Plan/forward stream overlap covers text-only groups.
 
     Flow, encode, and commit groups run packed graph programs with their own
@@ -860,7 +863,7 @@ class ModelExecutor:
             )
             self.latent_store = state_residency.latent
             self.product_store: ProductStore | None = ProductStore()
-            transaction_stores = (
+            transaction_stores: tuple[TransactionalStore, ...] = (
                 self.kv_store,
                 self.latent_store,
                 self.product_store,
@@ -935,12 +938,17 @@ class ModelExecutor:
         text_stack = self._build_text_execution(model, residency)
         self.forward_batch_builder = text_stack.builder
         self.text_gate = text_stack.gate
-        self.text_graph_runner = text_stack.graph_runner
+        has_segment_runtime = getattr(model, "segment_executor", None) is not None
+        self.graph_store = GraphStore(
+            text=text_stack.graph_runner,
+            flow=FlowGraphRunner() if has_segment_runtime else None,
+            segment=SegmentGraphRunner() if has_segment_runtime else None,
+        )
         self._autoregressive = _AutoregressiveRuntime(
             builder=self.forward_batch_builder,
             gate=self.text_gate,
             kv_pool=residency.kv if residency is not None else None,
-            graph_runner=self.text_graph_runner,
+            graph_runner=self.graph_store.view().text,
         )
 
     def _init_resource_accounting(
@@ -1202,6 +1210,7 @@ class ModelExecutor:
             kv_view=kv_view,
             latent_view=latent_view,
             product_view=product_view,
+            graph_view=self.graph_store.view(),
         )
 
         def prepare() -> ForwardBatch:
@@ -1345,7 +1354,7 @@ class ModelExecutor:
     def _log_mixed_proof(
         self,
         fb: ForwardBatch,
-        group: list[tuple[int, Mapping[str, Any]]],
+        group: Sequence[tuple[int, Mapping[str, Any]]],
     ) -> None:
         # Per-step "mixed forward executed" trace (opt-in via the proof flag).
         n_ext = sum(1 for m in fb.op_modes if m == ForwardMode.EXTEND)

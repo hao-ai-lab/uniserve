@@ -290,7 +290,8 @@ class OperationEnvelope(Mapping[str, Any]):
             or any(character not in "0123456789abcdef" for character in digest)
         ):
             raise invalid_descriptor(f"{where}.digest must be a lowercase SHA-256 digest")
-        operation_class = _OPERATION_CLASSES.get(operation.get("kind"))
+        kind = operation.get("kind")
+        operation_class = _OPERATION_CLASSES.get(kind) if isinstance(kind, str) else None
         if operation_class is None:
             raise invalid_descriptor(f"{where}.kind is not in the operation union")
         expected = operation_digest(operation, protocol_version)

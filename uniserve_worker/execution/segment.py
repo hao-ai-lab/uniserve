@@ -83,7 +83,6 @@ from uniserve_worker.runtime.tensor_staging import TextTensorStager, TextTensorS
 logger = logging.getLogger(__name__)
 
 
-_RUNNER_ATTR = "_segment_graph_runner"
 _MAX_RESIDENT_CAPACITIES = 8
 
 
@@ -817,12 +816,14 @@ def _backend_can_host_graph(backend: Any) -> bool:
     return bool(getattr(caps, "visible_end_cuda_graph", False))
 
 
-def segment_graph_runner(runtime: "SegmentRuntime") -> SegmentGraphRunner:
-    runner = getattr(runtime, _RUNNER_ATTR, None)
-    if runner is None:
-        runner = SegmentGraphRunner()
-        setattr(runtime, _RUNNER_ATTR, runner)
-    return runner
+def segment_graph_runner() -> SegmentGraphRunner | None:
+    """Return the packed-forward runner borrowed from the executor graph view.
+
+    ``None`` when the current forward carries no segment graph runner; callers
+    treat that as a graph miss and fall back to eager execution.
+    """
+
+    return getattr(get_forward_context().graph_view, "segment", None)
 
 
 def maybe_run_segment_graph(
@@ -835,9 +836,9 @@ def maybe_run_segment_graph(
     text_kv_promotions: tuple[PagedTextCacheSpanCopy, ...] = (),
     text_kv_promotion_capacity: int | None = None,
 ) -> torch.Tensor | None:
-    runner = getattr(runtime, _RUNNER_ATTR, None)
+    runner = segment_graph_runner()
     if runner is None:
-        runner = segment_graph_runner(runtime)
+        return None
     return runner.maybe_run(
         runtime.adapter,
         packed_embeds,
@@ -1877,11 +1878,16 @@ def _run_segment_forward_impl(
         graph_promoted_text_kv = hidden is not None and bool(graph_text_kv_promotions)
         if hidden is None:
             if require_graph:
-                graph_runner = getattr(runtime, "_segment_graph_runner", None)
+                graph_runner = segment_graph_runner()
+                miss_reason = (
+                    getattr(graph_runner, "last_miss_reason", None)
+                    if graph_runner is not None
+                    else "no segment graph runner in the executor graph view"
+                )
                 raise capability_mismatch(
                     "packed forward CUDA graph did not produce hidden states",
                     details={
-                        "graph_miss_reason": getattr(graph_runner, "last_miss_reason", None),
+                        "graph_miss_reason": miss_reason,
                         "packed_tokens": int(packed_embeds.shape[0]),
                         "segments": len(forward_stream.segments),
                         "block_width": max(

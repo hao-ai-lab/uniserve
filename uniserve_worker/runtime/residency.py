@@ -12,6 +12,7 @@ lease-balance cross-check; the tensors have a single system owner here.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -103,7 +104,7 @@ class LatentStore:
 
     def snapshot_requests(
         self,
-        request_ids: set[int],
+        request_ids: AbstractSet[int],
     ) -> dict[int, tuple[bool, Any, bool, Any]]:
         return {
             request_id: (
@@ -117,7 +118,7 @@ class LatentStore:
 
     def restore_requests(
         self,
-        request_ids: set[int],
+        request_ids: AbstractSet[int],
         snapshot: dict[int, tuple[bool, Any, bool, Any]],
     ) -> None:
         for request_id in {int(value) for value in request_ids}:

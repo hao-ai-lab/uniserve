@@ -32,13 +32,14 @@ from uniserve_worker.contracts.forward_context import (
     use_forward_context,
 )
 from uniserve_worker.execution.flow import (
-    FlowGraphExecution,
     FlowGraphRunner,
     FlowRow,
+    run_flow_graph,
 )
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.ops import AttentionRegime
 from uniserve_worker.runtime import paged_denoise as paged_denoise_mod
+from uniserve_worker.runtime.graph_store import GraphStore
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_denoise import can_run_paged_denoise_attention
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
@@ -591,13 +592,15 @@ def test_denoise_step_graph_is_enabled_by_default():
 
     with torch.inference_mode():
         eager = _eager_reference(owner, rows)
-    with torch.inference_mode(), use_forward_context(ForwardContext(stats=ForwardStats())):
-        execution = FlowGraphExecution(owner)
-        out = execution.maybe_run_graph(rows)
+    runner = FlowGraphRunner()
+    graph_view = GraphStore(flow=runner).view()
+    with torch.inference_mode(), use_forward_context(
+        ForwardContext(stats=ForwardStats(), graph_view=graph_view)
+    ):
+        out = run_flow_graph(owner, rows)
     torch.cuda.synchronize()
     assert out is not None
     assert torch.equal(out, eager)
-    runner = execution.graph_runner
     runner.clear()
     assert runner.states == {}
 

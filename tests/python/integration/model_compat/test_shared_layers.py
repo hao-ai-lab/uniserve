@@ -2514,8 +2514,11 @@ def test_sensenova_span_batch_uses_graph_result_before_scalar(monkeypatch):
 
 
 def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatch):
+    from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
+    from uniserve_worker.execution.flow import KvStore
     from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.runtime.kv_pool import PagedKVPool
+    from uniserve_worker.runtime.request_state import RequestStateTable
 
     class FakeLanguage(nn.Module):
         def forward(self, **_kwargs):
@@ -2537,13 +2540,18 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
         device="cpu",
         dtype=torch.float32,
     )
-    for req_id, block_id, length in ((11, 0, 3), (12, 1, 5)):
-        state = wrapper.program_state(req_id)
-        state.cond.block_ids = [block_id]
-        wrapper._ensure_host_cache(state.cond)
-        state.cond.past.length = length
-        state.cond.t_index = length - 1
-        state.cond.last_token_id = 100 + req_id
+    states = RequestStateTable()
+    for req_id, block_id in ((11, 0), (12, 1)):
+        states.create_or_update(req_id, {"req_id": req_id, "block_ids": [block_id]})
+    kv_store = KvStore(states, SimpleNamespace(), rng_device="cpu")
+    context = ForwardContext(kv_view=kv_store.view((11, 12)))
+    with use_forward_context(context):
+        for req_id, length in ((11, 3), (12, 5)):
+            state = wrapper.program_state(req_id)
+            wrapper._ensure_host_cache(state.cond)
+            state.cond.past.length = length
+            state.cond.t_index = length - 1
+            state.cond.last_token_id = 100 + req_id
 
     scalar_calls = []
 
@@ -2555,12 +2563,13 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
     driver = wrapper._text_driver()
     monkeypatch.setattr(driver, "_run_text_logits_one", scalar_fallback)
 
-    logits = wrapper.run_text_logits_batch(
-        [
-            {"req_id": 11, "kind": "decode_und", "token_ids": [7], "pos_range": [3, 4]},
-            {"req_id": 12, "kind": "decode_und", "token_ids": [9], "pos_range": [5, 6]},
-        ]
-    )
+    with use_forward_context(context):
+        logits = wrapper.run_text_logits_batch(
+            [
+                {"req_id": 11, "kind": "decode_und", "token_ids": [7], "pos_range": [3, 4]},
+                {"req_id": 12, "kind": "decode_und", "token_ids": [9], "pos_range": [5, 6]},
+            ]
+        )
 
     assert len(logits) == 2
     torch.testing.assert_close(logits[0], torch.tensor([[0.0, 1.0, 2.0]]))
@@ -2603,52 +2612,51 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
     assert kv_segments[0].branch_id == 1
 
 
-def test_sensenova_request_cleanup_releases_segment_staging(monkeypatch):
-    from uniserve_worker.execution.flow import ProgramState
-    from uniserve_worker.models.sensenova import model as sensenova_u1
-
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
-        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
-    )
-    state = ProgramState()
-    caches = [object(), object(), object()]
-    state.cond.past, state.tu.past, state.iu.past = caches
-    wrapper.reqs[3] = state
-    wrapper.residency = SimpleNamespace(release_scratch_cache=lambda _cache: None)
-    released: list[object] = []
-    monkeypatch.setattr(wrapper.segment_executor, "release_staging", released.append)
-
-    wrapper.drop_request(3)
-
-    assert released == caches
-
-
-def test_sensenova_duplicate_new_request_preserves_live_interleaved_cache():
-    from uniserve_worker.models.sensenova import model as sensenova_u1
+def test_request_drop_releases_segment_staging():
+    from uniserve_worker.execution.flow import KvStore
     from uniserve_worker.runtime.request_state import RequestStateTable
 
-    wrapper = sensenova_u1.SenseNovaU1ForUnifiedGeneration(
-        config={"llm_config": {"num_hidden_layers": 1, "num_key_value_heads": 1, "head_dim": 4}}
-    )
     states = RequestStateTable()
-    state = states.create_or_update(
+    states.create_or_update(3, {"req_id": 3})
+    store = KvStore(states, SimpleNamespace(), rng_device="cpu")
+    program = store.program(3)
+    caches = [object(), object(), object()]
+    program.cond.past, program.tu.past, program.iu.past = caches
+    staged: list[object] = []
+    scratch: list[object] = []
+
+    store.drop(
+        3,
+        residency=SimpleNamespace(release_scratch_cache=scratch.append),
+        segment_executor=SimpleNamespace(release_staging=staged.append),
+    )
+
+    assert staged == caches
+    assert scratch == caches
+
+
+def test_duplicate_new_request_preserves_live_interleaved_cache():
+    from uniserve_worker.execution.flow import KvStore
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    states = RequestStateTable()
+    states.create_or_update(
         6,
         {"req_id": 6, "block_ids": [10, 11], "sampling": {"temperature": 0.0}},
     )
-    wrapper.on_new_request(6, state)
-    image_state = wrapper.program_state(6)
+    store = KvStore(states, SimpleNamespace(), rng_device="cpu")
+    image_state = store.program(6)
     sentinel_past = object()
     image_state.cond.block_ids = [10, 11, 12, 13, 14]
     image_state.cond.past = sentinel_past
     image_state.cond.t_index = 1085
 
-    duplicate = states.create_or_update(
+    states.create_or_update(
         6,
         {"req_id": 6, "block_ids": [], "sampling": {"temperature": 0.0}},
     )
-    wrapper.on_new_request(6, duplicate)
 
-    assert wrapper.program_state(6) is image_state
+    assert store.program(6) is image_state
     assert states.get(6).block_ids == [10, 11]
     assert image_state.cond.block_ids == [10, 11, 12, 13, 14]
     assert image_state.cond.past is sentinel_past
