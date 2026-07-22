@@ -178,6 +178,16 @@ class StubUniModel(UniModelBase):
         return outputs
 
     def _text(self, batch: ForwardBatch) -> list[TextTokenOutput]:
+        """Emit the deterministic sim token stream as pass-through row outputs.
+
+        The stub is the sim-only exception to the raw-logits sequence contract:
+        its mixed und/gen forwards return one pass-through output per row, and a
+        per-slot logits result would require the flow branch velocities the stub
+        does not compute. The fixed token formula (EOS after
+        ``STUB_TEXT_EOS_STEP`` tokens, image trigger at
+        ``STUB_IMAGE_TRIGGER_STEP``) is the wire contract sim serving tests
+        depend on.
+        """
         out = []
         for req_id in batch.as_text().req_ids:
             state = get_forward_context().request_states.get(int(req_id))

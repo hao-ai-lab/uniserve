@@ -303,9 +303,11 @@ class StepTxn:
         snapshot.residency = copy.copy(state.residency)
         snapshot.decode_relay = copy.copy(state.decode_relay)
         snapshot.cfg_geometry = dict(state.cfg_geometry) if state.cfg_geometry is not None else None
-        snapshots_rng = operation.operation is not OperationClass.SEQUENCE or float(
-            state.sampling.get("temperature", 0.0) or 0.0
-        ) > 0.0
+        # Sequence-op token draws are counter-seeded from (request seed, token
+        # position), so replaying a rolled-back sequence op reproduces its
+        # randomness without restoring generator state. Flow and image ops
+        # still advance stateful request generators and keep the snapshot.
+        snapshots_rng = operation.operation is not OperationClass.SEQUENCE
         rng_state = (
             state.rng.get_state().clone()
             if snapshots_rng and state.rng is not None

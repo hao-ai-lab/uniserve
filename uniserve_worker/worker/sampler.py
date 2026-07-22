@@ -11,6 +11,7 @@ import torch
 from ..contracts.batches import Batch
 from ..contracts.outputs import SampleOutput
 from ..execution.operation_executor import OperationExecutor
+from ..execution.sampling import sampled_token_position, sampling_draw_generator
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..nn.sampler import sample_one_from_logits
@@ -118,7 +119,11 @@ class SamplerWorker(BaseWorker):
             allowed=operation.get("allowed_tokens"),
             suppress=operation.get("suppress_tokens"),
             n_logprobs=int(sampling_params.get("n_logprobs", 0) or 0),
-            generator=state.device_rng(logits.device, stream="sampling"),
+            generator=sampling_draw_generator(
+                state,
+                logits.device,
+                position=sampled_token_position(operation),
+            ),
         )
         output = SampleOutput(
             req_id=request_id,

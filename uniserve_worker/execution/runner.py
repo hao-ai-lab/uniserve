@@ -108,6 +108,8 @@ from .sampling import (
     DeferredTextSeqResult,
     TextDecodeRelay,
     sample_logits_result,
+    sample_text_rows_batched,
+    sampling_draw_generator,
     text_input_id_replacements_from_relays,
 )
 from .segment import SegmentGraphRunner
@@ -222,7 +224,6 @@ class _ForwardPostprocessor:
             self._advance_text_kv_lengths(text)
             return published_outputs
         sampled_outputs = self._sample_text_logits_batch(
-            plan,
             list(text.ops),
             req_ids,
             logits_batch,
@@ -243,7 +244,6 @@ class _ForwardPostprocessor:
 
     def _sample_text_logits_batch(
         self,
-        plan: ForwardPlan,
         ops: list[Mapping[str, Any]],
         req_ids: list[int],
         logits_batch: torch.Tensor,
@@ -251,10 +251,6 @@ class _ForwardPostprocessor:
         defer_cpu_results: bool,
         cuda_ready_start_event: torch.cuda.Event | None,
     ) -> list[TextTokenOutput | DeferredTextSeqResult]:
-        if logits_batch.ndim != 2:
-            raise invalid_descriptor("batched text logits rows must form a [batch, vocab] tensor")
-        if int(logits_batch.shape[0]) != len(req_ids):
-            raise invalid_descriptor("batched text logits row count must match req_ids")
         request_states = self.sessions
         if request_states is None:
             return [
@@ -266,73 +262,14 @@ class _ForwardPostprocessor:
             ]
         stats = get_forward_context().stats
         start = component_timer_start(stats)
-        params: list[dict[str, Any]] = []
-        recent: list[list[int] | tuple[int, ...]] = []
-        allowed: list[list[int] | tuple[int, ...] | None] = []
-        suppress: list[list[int] | tuple[int, ...] | None] = []
-        generators: list[torch.Generator] = []
-        for op, req_id in zip(ops, req_ids, strict=True):
-            state = request_states.get(int(req_id))
-            params.append(dict(state.sampling or {}))
-            recent.append(op.get("recent_tokens") or [])
-            allowed.append(op.get("allowed_tokens"))
-            suppress.append(op.get("suppress_tokens"))
-            generators.append(state.device_rng(logits_batch.device, stream="text_sampling"))
-        sampling_result = apply_sampling_batched_with_device_tokens(
+        outputs = sample_text_rows_batched(
+            ops,
+            req_ids,
             logits_batch,
-            params,
-            recent,
-            allowed,
-            suppress,
-            generators=generators,
-            defer_cpu=defer_cpu_results,
-            enable_cuda_timing=cuda_ready_start_event is not None,
+            request_states,
+            defer_cpu_results=defer_cpu_results,
+            cuda_ready_start_event=cuda_ready_start_event,
         )
-        if is_deferred_sampling_result(sampling_result):
-            sampling_result.set_ready_start_event(cuda_ready_start_event)
-            outputs: list[TextTokenOutput | DeferredTextSeqResult] = []
-            for row, req_id in enumerate(req_ids):
-                state = request_states.get(int(req_id))
-                relay_token_tensor = sampling_result.device_tokens[row : row + 1]
-                _DECODE_RELAY.publish_sample(
-                    state,
-                    token_id=None,
-                    token_tensor=relay_token_tensor,
-                )
-                outputs.append(
-                    DeferredTextSeqResult(
-                        req_id=req_id,
-                        row=row,
-                        state=state,
-                        sampling_result=sampling_result,
-                        relay_token_tensor=relay_token_tensor,
-                    )
-                )
-            record_component_elapsed(stats, "text_sample", start)
-            return outputs
-
-        immediate_result = finalize_sampling_result(sampling_result)
-        outputs = []
-        for row, (req_id, (tok, lp, top)) in enumerate(
-            zip(req_ids, immediate_result.samples, strict=True)
-        ):
-            _DECODE_RELAY.publish_sample(
-                request_states.get(int(req_id)),
-                token_id=int(tok),
-                token_tensor=immediate_result.device_tokens[row : row + 1],
-            )
-            outputs.append(
-                TextTokenOutput(
-                    req_id=int(req_id),
-                    sampled_token_id=int(tok),
-                    sampled_logprob=lp,
-                    top_logprobs=(
-                        [(int(item[0]), float(item[1]), int(item[2])) for item in top]
-                        if top
-                        else None
-                    ),
-                )
-            )
         record_component_elapsed(stats, "text_sample", start)
         return outputs
 
@@ -422,7 +359,11 @@ class _ForwardPostprocessor:
             generators.append(
                 None
                 if state is None
-                else state.device_rng(logits_rows.device, stream="text_sampling")
+                else sampling_draw_generator(
+                    state,
+                    logits_rows.device,
+                    position=int(entry.position_id),
+                )
             )
         sampling_result = apply_sampling_batched_with_device_tokens(
             logits_rows[: len(entries_by_index)],
