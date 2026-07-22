@@ -3101,12 +3101,6 @@ class SenseNovaU1ForUnifiedGeneration(
             "image_hw": image_hw,
         }
 
-    def free_encoder(self, handles: Any) -> None:
-        # Encoder-output residency is system-owned: the handle store lives on
-        # the ResidencyManager, not the model.
-        for handle in handles or []:
-            self.residency.encoder.pop(int(handle))
-
     def program_state(self, req_id: int) -> ProgramState:
         kv_view = get_forward_context().kv_view
         if kv_view is None:

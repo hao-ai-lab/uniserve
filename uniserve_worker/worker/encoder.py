@@ -12,7 +12,7 @@ from ..contracts.op_kinds import VAE_ENCODE, VIT_ENCODE
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..runtime.request_session import SessionStore
-from .model import bind_model_residency, bind_model_segment_execution
+from .model import bind_model_residency, bind_model_segment_execution, free_encoder_handles
 from .protocol import (
     BaseWorker,
     ResultPolicy,
@@ -75,7 +75,7 @@ class EncoderWorker(BaseWorker):
         self.executor.drop_request(int(request_id))
 
     def free_encoder(self, handles: Any) -> None:
-        self.model.free_encoder(handles)
+        free_encoder_handles(self.model, handles)
 
     def _create_residency_manager(self) -> ResidencyManager | None:
         from ..runtime.residency import ResidencyManager

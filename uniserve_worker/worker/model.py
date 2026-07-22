@@ -35,7 +35,21 @@ logger = logging.getLogger(__name__)
 
 # Controls the worker serves against system-owned state; a model declares them
 # as capability only and implements no method.
-WORKER_SERVED_CONTROLS = frozenset({"load_lora", "unload_lora"})
+ADAPTER_CONTROLS = frozenset({"load_lora", "unload_lora"})
+WORKER_SERVED_CONTROLS = ADAPTER_CONTROLS | {
+    "copy_blocks",
+    "free_encoder",
+    "reset_prefix_cache",
+}
+
+
+def free_encoder_handles(model: UniModel, handles: Any) -> None:
+    """Release system-owned encoder-output residency for the given handles."""
+    residency = model.residency
+    if residency is None:
+        return
+    for handle in handles or []:
+        residency.encoder.pop(int(handle))
 
 
 def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") -> None:
@@ -179,7 +193,7 @@ class ModelWorker(BaseWorker):
         self.model_executor.drop_request(int(request_id))
 
     def copy_blocks(self, copies: Any) -> None:
-        self.model.copy_blocks(copies)
+        del copies
 
     def load_lora(self, lora_id: int, lora_path: str) -> None:
         count = self._require_adapter_store().load(lora_id, lora_path)
@@ -191,10 +205,10 @@ class ModelWorker(BaseWorker):
             logger.info("unmerged LoRA adapter %s", lora_id)
 
     def free_encoder(self, handles: Any) -> None:
-        self.model.free_encoder(handles)
+        free_encoder_handles(self.model, handles)
 
     def reset_prefix_cache(self) -> None:
-        self.model.reset_prefix_cache()
+        pass
 
     def sleep(self) -> None:
         sleep = getattr(self.model, "sleep")
@@ -280,7 +294,7 @@ class ModelWorker(BaseWorker):
         for control in capabilities.supported_controls:
             name = str(control)
             if name in WORKER_SERVED_CONTROLS:
-                if capabilities.adapter_mode == "none":
+                if name in ADAPTER_CONTROLS and capabilities.adapter_mode == "none":
                     raise capability_mismatch(
                         f"control {name!r} is served by the worker adapter store and "
                         "requires a non-'none' adapter_mode"

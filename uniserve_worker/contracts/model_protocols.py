@@ -113,15 +113,6 @@ class UniModel(ABC):
     def bind_data_plane_handoff(self, handoff: Any) -> None:
         pass
 
-    def copy_blocks(self, copies: Any) -> None:
-        pass
-
-    def free_encoder(self, handles: Any) -> None:
-        pass
-
-    def reset_prefix_cache(self) -> None:
-        pass
-
     def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
         return None
 
