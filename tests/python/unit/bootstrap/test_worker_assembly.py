@@ -141,6 +141,7 @@ def test_encoder_assembly_executes_the_loaded_model(
         lambda _request: SimpleNamespace(
             model=_VisionModel(),
             descriptor=None,
+            resolved_digest=None,
         ),
     )
 

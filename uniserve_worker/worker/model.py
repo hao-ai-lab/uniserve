@@ -118,9 +118,16 @@ class ModelWorker(BaseWorker):
         model_scope: ModelLoadScope = ModelLoadScope.WHOLE,
         family_descriptor: ModelFamilyDescriptor | None = None,
         simulation: bool = False,
+        spec_digest: str | None = None,
     ) -> None:
         super().__init__(block_size=block_size)
         self.model = model
+        # Resolved ModelSpec + DeploymentOverlay identity from bootstrap; the
+        # caps wire schema carries no spec field yet, so the digest is logged
+        # here and scoped onto the executor's graph store.
+        self.spec_digest = spec_digest
+        if spec_digest is not None:
+            logger.info("model worker serving resolved spec digest=%s", spec_digest)
         self.attention_backend = attention_backend or DEFAULT_ATTENTION_BACKEND
         self.defer_sampling = bool(defer_sampling)
         self.transfer_backend = str(transfer_backend)
@@ -168,7 +175,7 @@ class ModelWorker(BaseWorker):
         self.adapter_store = build_model_adapter_store(self.model)
         self.model_executor = ModelExecutor(
             model,
-            config=ExecutorConfig(simulation=bool(simulation)),
+            config=ExecutorConfig(simulation=bool(simulation), spec_digest=spec_digest),
             attention_backend=self.attention_backend,
             resource_runtime=resource_runtime,
             multimodal_processor=get_processor_for_descriptor(self.family_descriptor),

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from .caps import Caps
     from .forward_batch import ForwardBatch
+    from .model_spec import ModelSpec
 
 __all__ = [
     "UniModel",
@@ -167,6 +168,10 @@ class UniModel(ABC):
         op: Mapping[str, Any] | None = None,
     ) -> Any:
         raise invalid_descriptor("commit-capable model must implement decode_image()")
+
+    def model_spec(self) -> "ModelSpec | None":
+        """The model's declarative identity composition; ``None`` when undeclared."""
+        return None
 
     def kv_cache_spec(self) -> Any | None:
         return None

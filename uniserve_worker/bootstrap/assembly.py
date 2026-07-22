@@ -69,6 +69,7 @@ def assemble_worker(config: WorkerLaunchConfig) -> Worker:
 
         model: UniModel = StubUniModel()
         descriptor: ModelFamilyDescriptor | None = None
+        spec_digest: str | None = None
     else:
         from .model_loader import (
             WorkerModelLoadRequest,
@@ -86,10 +87,13 @@ def assemble_worker(config: WorkerLaunchConfig) -> Worker:
                 attention_backend=config.model.attention_backend,
                 scope=plan.model_scope,
                 generation_kv_capacity_tokens=(config.resources.generation_kv_capacity_tokens),
+                tp_rank=config.placement.tp_rank,
+                tp_size=config.placement.tp_size,
             )
         )
         model = loaded_model.model
         descriptor = loaded_model.descriptor
+        spec_digest = loaded_model.resolved_digest
 
     if plan.implementation is WorkerImplementation.ENCODER:
         from ..worker.encoder import EncoderWorker
@@ -121,6 +125,7 @@ def assemble_worker(config: WorkerLaunchConfig) -> Worker:
             model_scope=plan.model_scope,
             family_descriptor=descriptor,
             simulation=config.use_stub_model,
+            spec_digest=spec_digest,
         )
     raise AssertionError(f"unhandled worker implementation {plan.implementation!r}")
 

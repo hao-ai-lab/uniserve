@@ -33,6 +33,7 @@ from uniserve_worker.runtime.paged_denoise import (
 
 from ..contracts.forward_batch import ForwardBatch
 from ..contracts.forward_context import get_forward_context
+from ..contracts.model_spec import CacheSpec, FlowSpec, InputSpec, ModelSpec, RouteSpec
 from ..contracts.resource_plan import (
     AdapterResourcePolicy,
     CapsDescriptor,
@@ -65,7 +66,13 @@ from ..loader.weight_spec import (
 from ..loader.weight_utils import tensor_shape
 from ..nn import LinearBase, MLPConnector, ParallelLMHead, local_kv_head_count
 from ..nn.decoder import KVCache, MoTDecoderLayer, MoTModel, Segment
-from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, TimestepEmbedder, init_latent
+from ..nn.diffusion import (
+    FlowMatchSchedule,
+    ScheduleDirection,
+    ScheduleShiftDomain,
+    TimestepEmbedder,
+    init_latent,
+)
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.quant import (
     QuantizationConfig,
@@ -761,6 +768,52 @@ class BagelForUnifiedGeneration(UniModelBase):
         # that exact capacity preserves the independently admitted denoise
         # reservation without allowing it to consume text-staging headroom.
         return self._denoise_scratch_num_blocks(block_size) + int(self.num_blocks)
+
+    def model_spec(self) -> ModelSpec:
+        llm = self.cfg.llm
+        return ModelSpec(
+            architecture=self.architectures[0],
+            routes=(
+                # Token and flow rows share the MoT backbone in one forward.
+                RouteSpec(
+                    name="mot",
+                    op_kinds=("prefill_und", "decode_und", "denoise_gen"),
+                    mixed=True,
+                    dtype="bfloat16",
+                    graph_eligible=True,
+                ),
+                RouteSpec(
+                    name="vae",
+                    op_kinds=("vae_encode", "commit_gen"),
+                    mixed=False,
+                    dtype="bfloat16",
+                    graph_eligible=False,
+                ),
+                RouteSpec(
+                    name="vit",
+                    op_kinds=("vit_encode",),
+                    mixed=False,
+                    dtype="bfloat16",
+                    graph_eligible=False,
+                ),
+            ),
+            weights=self.weight_spec,
+            # The host tokenizes for BAGEL; the worker holds no tokenizer.
+            inputs=InputSpec(requires_worker_tokenizer=False),
+            cache=CacheSpec(
+                num_layers=int(llm.num_hidden_layers),
+                num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads)),
+                head_dim=int(llm.head_dim),
+                dtype="bfloat16",
+                store_dtype=self._kv_dtype_name_for(torch.bfloat16),
+            ),
+            flow=FlowSpec(
+                latent_downsample=int(self.cfg.latent_downsample),
+                prediction=self.velocity_parameterization(),
+                schedule_direction=ScheduleDirection.DESCENDING.value,
+                schedule_shift_domain=ScheduleShiftDomain.TIME.value,
+            ),
+        )
 
     def gen_residency_spec(self) -> GenResidencySpec | None:
         # The model declares only geometry/sizing; the system builds and owns
