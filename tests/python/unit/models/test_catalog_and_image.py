@@ -1,8 +1,8 @@
-"""Unit tests for the model registry, BAGEL image decode, and tower role filter.
+"""Unit tests for the model catalog, BAGEL image decode, and tower role filter.
 
 Covers three public surfaces:
 
-* :class:`uniserve_worker.models.registry.ModelRegistry` -- duplicate-arch and
+* :class:`uniserve_worker.models.catalog.Catalog` -- duplicate-arch and
   strict unknown-architecture rejection, and ``resolve()`` filtering of disabled archs.
 * :meth:`uniserve_worker.processors.bagel.BagelImageProcessor.decode_image_b64`
   -- compositing of transparent / RGBA / palette-with-transparency inputs over
@@ -24,7 +24,7 @@ import torch.nn as nn
 from uniserve_worker.contracts import UniModel
 from uniserve_worker.foundation import runtime_config as runtime_config_module
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
-from uniserve_worker.models.registry import ModelRegistry
+from uniserve_worker.models.catalog import Catalog
 
 pytestmark = pytest.mark.unit
 
@@ -35,11 +35,16 @@ PIL_Image = pytest.importorskip("PIL.Image")
 # Minimal model stubs.
 #
 # These models satisfy the public nominal model contract while advertising no
-# operations, keeping the tests focused on registry naming and resolution.
+# operations, keeping the tests focused on catalog naming and resolution.
 # --------------------------------------------------------------------------- #
 
 
 class _ModelArch1(UniModel):
+    architectures = ("Arch1",)
+    supported_ops = ()
+
+
+class _ModelArch1Claimant(UniModel):
     architectures = ("Arch1",)
     supported_ops = ()
 
@@ -55,41 +60,32 @@ class _FallbackA(UniModel):
 
 
 # --------------------------------------------------------------------------- #
-# ModelRegistry.register
+# Catalog construction
 # --------------------------------------------------------------------------- #
 
 
-def test_register_rejects_already_registered_arch_with_invalid_descriptor():
-    registry = ModelRegistry()
-    registry.register(_ModelArch1, names=_ModelArch1.architectures)
-
+def test_catalog_rejects_two_entries_claiming_one_arch_with_invalid_descriptor():
     with pytest.raises(WorkerError) as excinfo:
-        registry.register(_ModelArch2, names=("Arch1",))
+        Catalog((_ModelArch1, _ModelArch1Claimant))
 
     assert excinfo.value.code == ErrorCode.INVALID_DESCRIPTOR
 
 
-def test_register_same_class_under_same_arch_is_idempotent():
-    registry = ModelRegistry()
-    registry.register(_ModelArch1, names=_ModelArch1.architectures)
-
-    # Re-registering the identical class under the same name is a no-op, not an
+def test_catalog_deduplicates_repeated_entries_of_one_class():
+    # Listing the identical class twice is harmless bootstrap data, not an
     # error; the arch still resolves to that one class.
-    registry.register(_ModelArch1, names=_ModelArch1.architectures)
+    catalog = Catalog((_ModelArch1, _ModelArch1))
 
-    assert registry.resolve(("Arch1",)) is _ModelArch1
+    assert catalog.resolve(("Arch1",)) is _ModelArch1
 
 # --------------------------------------------------------------------------- #
-# ModelRegistry.resolve -- disabled_model_archs filtering
+# Catalog.resolve -- disabled_model_archs filtering
 # --------------------------------------------------------------------------- #
 
 
 @pytest.fixture()
-def _two_arch_registry():
-    registry = ModelRegistry()
-    registry.register(_ModelArch1, names=_ModelArch1.architectures)
-    registry.register(_ModelArch2, names=_ModelArch2.architectures)
-    return registry
+def _two_arch_catalog():
+    return Catalog((_ModelArch1, _ModelArch2))
 
 
 @pytest.fixture()
@@ -108,58 +104,57 @@ def _restore_worker_config():
 
 
 def test_resolve_skips_disabled_arch_and_returns_next_enabled(
-    _two_arch_registry, _restore_worker_config
+    _two_arch_catalog, _restore_worker_config
 ):
     runtime_config_module.set_execution_config(
         replace(_restore_worker_config, disabled_model_archs=("Arch1",))
     )
 
     # Arch1 is requested first but disabled, so resolve falls through to Arch2.
-    resolved = _two_arch_registry.resolve(("Arch1", "Arch2"))
+    resolved = _two_arch_catalog.resolve(("Arch1", "Arch2"))
 
     assert resolved is _ModelArch2
 
 
-def test_resolve_returns_arch_when_not_disabled(_two_arch_registry, _restore_worker_config):
+def test_resolve_returns_arch_when_not_disabled(_two_arch_catalog, _restore_worker_config):
     runtime_config_module.set_execution_config(
         replace(_restore_worker_config, disabled_model_archs=("Arch2",))
     )
 
     # Only Arch2 is disabled, so a request for Arch1 still resolves to its class.
-    resolved = _two_arch_registry.resolve(("Arch1", "Arch2"))
+    resolved = _two_arch_catalog.resolve(("Arch1", "Arch2"))
 
     assert resolved is _ModelArch1
 
 
 def test_resolve_raises_capability_mismatch_when_all_requested_disabled(
-    _two_arch_registry, _restore_worker_config
+    _two_arch_catalog, _restore_worker_config
 ):
     runtime_config_module.set_execution_config(
         replace(_restore_worker_config, disabled_model_archs=("Arch1", "Arch2"))
     )
 
     with pytest.raises(WorkerError) as excinfo:
-        _two_arch_registry.resolve(("Arch1", "Arch2"))
+        _two_arch_catalog.resolve(("Arch1", "Arch2"))
 
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
 
 
-def test_resolve_raises_capability_mismatch_for_unknown_arch(_two_arch_registry):
+def test_resolve_raises_capability_mismatch_for_unknown_arch(_two_arch_catalog):
     with pytest.raises(WorkerError) as excinfo:
-        _two_arch_registry.resolve(("NoSuchArch",))
+        _two_arch_catalog.resolve(("NoSuchArch",))
 
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
 
 
 def test_resolve_rejects_unknown_arch(_restore_worker_config):
-    registry = ModelRegistry()
-    registry.register(_FallbackA, names=_FallbackA.architectures)
+    catalog = Catalog((_FallbackA,))
 
     with pytest.raises(WorkerError) as excinfo:
-        registry.resolve(("NoSuchArch",))
+        catalog.resolve(("NoSuchArch",))
 
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
-    assert "no UniModel registered" in str(excinfo.value)
+    assert "no UniModel catalog entry" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #

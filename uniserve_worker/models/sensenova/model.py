@@ -1,7 +1,7 @@
 """SenseNova-U1 UniModel entry.
 
-This is the registry/runner-facing model port. Execution is driven by
-``ModelExecutor`` through ``ModelRunner`` and selected by ``models.registry``; text and denoise attention
+This is the catalog/runner-facing model port. Execution is driven by
+``ModelExecutor`` through ``ModelRunner`` and resolved through the composition root's model catalog; text and denoise attention
 use the worker-owned paged KV pool through the shared ``RadixAttention`` seam.
 """
 
@@ -103,7 +103,7 @@ from ...runtime.tower_handoff import (
     TowerBinding,
     TowerHandoff,
 )
-from ..registry import UniModelBase
+from ..catalog import UniModelBase
 from .config import NeoChatConfig
 
 __all__ = [
@@ -115,7 +115,6 @@ __all__ = [
     "NEOChatModel",
     "check_checkpoint_compatibility",
     "SenseNovaU1ForUnifiedGeneration",
-    "EntryClass",
 ]
 
 IMG_START_TOKEN = "<img>"
@@ -3303,5 +3302,3 @@ class SenseNovaU1ForUnifiedGeneration(
             raise invalid_descriptor("SenseNova text forward must return logits")
         return logits
 
-
-EntryClass = SenseNovaU1ForUnifiedGeneration

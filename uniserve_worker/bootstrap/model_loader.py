@@ -14,12 +14,9 @@ from ..contracts.model_protocols import UniModel
 from ..foundation.errors import capability_mismatch
 from ..loader import ModelBringUp, get_loader_for_descriptor
 from ..loader.paths import read_config, resolve_model_path
-from ..models.registry import (
-    detect_model_architectures,
-    resolve_model_descriptor,
-)
 from ..nn.quant.base import process_quantized_modules
 from ..runtime.compile import TorchCompileConfig, compile_model_pieces
+from .catalog import MODEL_CATALOG
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +43,7 @@ class LoadedWorkerModel:
 
 def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
     model_path = resolve_model_path(request.model_path)
-    descriptor = resolve_model_descriptor(model_architecture_candidates(model_path))
+    descriptor = MODEL_CATALOG.resolve_descriptor(model_architecture_candidates(model_path))
     model_class = descriptor.model_class
     _require_supported_scope(model_class, request.scope)
 
@@ -221,5 +218,5 @@ def model_architecture_candidates(model_path: str) -> list[str]:
         architectures.append(str(model_type))
     if not architectures:
         architectures.append(Path(model_path).name)
-    architectures.extend(detect_model_architectures(model_path))
+    architectures.extend(MODEL_CATALOG.detect_architectures(model_path))
     return architectures

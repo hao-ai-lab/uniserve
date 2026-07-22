@@ -645,8 +645,6 @@ pub(crate) struct WorkerLaunchArgs {
     pub transformers_attn_implementation: String,
     #[arg(long = "disable-model-arch", hide = true)]
     pub disable_model_arch: Vec<String>,
-    #[arg(long, hide = true)]
-    pub strict_model_imports: bool,
     /// Parallelism mesh forwarded to the Python worker, e.g.
     /// `tower=text:cuda:0;gen:cuda:1,tower-kv-capacity=65536`.
     #[arg(long, hide = true)]
@@ -715,7 +713,6 @@ impl WorkerLaunchArgs {
             transformers_trust_remote_code: self.transformers_trust_remote_code,
             transformers_attn_implementation: self.transformers_attn_implementation.clone(),
             disable_model_arch: self.disable_model_arch.clone(),
-            strict_model_imports: self.strict_model_imports,
             mesh: self.worker_mesh.clone(),
             tp_backend: self.tp_backend.clone(),
             mooncake_device: self.mooncake_device.clone(),
@@ -772,9 +769,6 @@ impl WorkerLaunchArgs {
         for arch in &cfg.disable_model_arch {
             args.push("--disable-model-arch".to_string());
             args.push(arch.clone());
-        }
-        if cfg.strict_model_imports {
-            args.push("--strict-model-imports".to_string());
         }
         push_option(args, "--worker-mesh", cfg.mesh.as_ref());
         push_option(args, "--tp-backend", cfg.tp_backend.as_ref());
