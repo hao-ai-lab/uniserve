@@ -83,13 +83,9 @@ class ResidencyLeaseManager:
     ) -> None:
         state = self.request_states.get(req_id)
         if append_to_state and block_ids:
-            ingest = getattr(self.request_states, "ingest_new_blocks", None)
-            if callable(ingest):
-                ingest(req_id, tuple(int(block_id) for block_id in block_ids))
-            else:
-                from .request_state import append_new_block_ids
-
-                append_new_block_ids(state.block_ids, tuple(int(block_id) for block_id in block_ids))
+            self.request_states.ingest_new_blocks(
+                req_id, tuple(int(block_id) for block_id in block_ids)
+            )
         if "kv_block" not in self.resource_runtime.classes:
             return
         incoming = {int(block_id) for block_id in block_ids}

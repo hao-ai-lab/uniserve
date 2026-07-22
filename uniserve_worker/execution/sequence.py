@@ -30,9 +30,9 @@ from uniserve_worker.foundation.errors import invalid_descriptor, model_executio
 from uniserve_worker.foundation.runtime_config import get_execution_config
 from uniserve_worker.nn.logits import forced_eos_logits
 from uniserve_worker.runtime.forward_stream import build_text_position_indexes
+from uniserve_worker.runtime.kv_store import append_new_block_ids
 from uniserve_worker.runtime.masks import create_causal_mask
 from uniserve_worker.runtime.paged_text_cache import BatchedPagedRequestCache, PagedTextCache
-from uniserve_worker.runtime.request_state import append_new_block_ids
 from uniserve_worker.runtime.tensor_staging import TextTensorStager
 
 if TYPE_CHECKING:
@@ -298,8 +298,38 @@ class SequenceExecutor:
         # use worker-local block ids and must not ingest host ids.
         if cache.past is None or getattr(cache.past, "pool", None) is self.owner.kv_pool:
             append_new_block_ids(cache.block_ids, op.get("new_block_ids"))
+            self._validate_cache_write_range(cache, op)
         if cache.past is not None and getattr(cache.past, "pool", None) is self.owner.kv_pool:
             cache.past.set_blocks(cache.block_ids)
+
+    @staticmethod
+    def _validate_cache_write_range(cache: SequenceCache, op: Mapping[str, Any]) -> None:
+        """Guard the op's declared host-KV write span before any KV mutation.
+
+        The runtime ``KvStore`` (owned by the ambient session table) checks the
+        span against the request's prefix-reference boundary and the cache's
+        leased block capacity.
+        """
+        pos_range = op.get("pos_range")
+        if not pos_range or len(pos_range) < 2:
+            return
+        sessions = get_forward_context().request_states
+        kv_store = getattr(sessions, "kv", None)
+        if kv_store is None:
+            return
+        req_id = op.get("req_id")
+        if req_id is None:
+            return
+        state = sessions.peek(int(req_id))
+        if state is None:
+            return
+        kv_store.validate_write_range(
+            int(req_id),
+            state,
+            int(pos_range[0]),
+            int(pos_range[1]),
+            block_ids=cache.block_ids,
+        )
 
     def ensure_host_cache(self, cache: SequenceCache) -> None:
         if cache.past is not None:

@@ -10,10 +10,10 @@ import torch
 
 from ..contracts.operation import OperationClass
 from ..foundation.errors import invalid_descriptor
+from .kv_store import KvStore
 from .request_state import (
     RequestLifecycle,
     RequestState,
-    append_new_block_ids,
 )
 from .request_state import (
     RequestStateTable as _RequestStateTable,
@@ -57,44 +57,37 @@ class RequestSession:
     with lifecycle or ordering invariants is defined here.
     """
 
-    def __init__(self, req_id: int, state: RequestState) -> None:
+    def __init__(self, req_id: int, state: RequestState, kv: KvStore) -> None:
         self.req_id = int(req_id)
         self.state = state
-
-    def ingest_registered_blocks(self, block_ids: list[int] | tuple[int, ...] | None) -> None:
-        incoming = [int(block_id) for block_id in (block_ids or ())]
-        if not incoming:
-            return
-        if not self.state.block_ids:
-            self.state.block_ids.extend(incoming)
-            return
-        if self.state.block_ids == incoming:
-            return
-        if (
-            len(incoming) > len(self.state.block_ids)
-            and incoming[: len(self.state.block_ids)] == self.state.block_ids
-        ):
-            self.state.block_ids[:] = incoming
-            return
-        if (
-            len(self.state.block_ids) >= len(incoming)
-            and self.state.block_ids[: len(incoming)] == incoming
-        ):
-            return
-        self.ingest_new_blocks(incoming)
+        self.kv = kv
 
     def ingest_new_blocks(self, block_ids: list[int] | tuple[int, ...] | None) -> bool:
-        return append_new_block_ids(self.state.block_ids, block_ids)
+        return self.kv.ingest_new_blocks(self.req_id, self.state, block_ids)
 
     def resolve_text_row(self, op: Mapping[str, Any]) -> PreparedTextRow:
-        self.ingest_new_blocks(tuple(int(block_id) for block_id in (op.get("new_block_ids") or ())))
+        entry = self.state.kv
         pos_range = op.get("pos_range") or (0, 0)
         base_len = int(pos_range[0])
         query_len = len(op.get("token_ids") or ())
+        # The prefix-reference bound is validated before the block ingest so a
+        # rejected write leaves the session's references untouched.
+        if query_len and base_len < entry.ref_len:
+            raise invalid_descriptor(
+                f"request {self.req_id} writes KV at {base_len} below its "
+                f"prefix reference boundary {entry.ref_len}"
+            )
+        new_block_ids = op.get("new_block_ids")
+        if new_block_ids:
+            self.kv.ingest_new_blocks(self.req_id, self.state, new_block_ids)
+        if query_len:
+            self.kv.validate_write_range(
+                self.req_id, self.state, base_len, base_len + query_len
+            )
         return PreparedTextRow(
             req_id=self.req_id,
             op=op,
-            block_ids=tuple(int(block_id) for block_id in self.state.block_ids),
+            block_ids=tuple(entry.block_ids),
             base_len=base_len,
             query_len=query_len,
         )
@@ -136,7 +129,7 @@ class SessionStore(_RequestStateTable):
     """System authority for request sessions and their mutation scopes."""
 
     def session(self, req_id: int) -> RequestSession:
-        return RequestSession(int(req_id), self.get(int(req_id)))
+        return RequestSession(int(req_id), self.get(int(req_id)), self.kv)
 
     def admit(
         self,
@@ -151,7 +144,7 @@ class SessionStore(_RequestStateTable):
         if not existed:
             state.epoch = int(epoch)
             state.version = int(base_version)
-        return RequestSession(int(req_id), state)
+        return RequestSession(int(req_id), state, self.kv)
 
     def validate_operations(
         self,
@@ -184,13 +177,6 @@ class SessionStore(_RequestStateTable):
     def resolve_text_row(self, req_id: int, op: Mapping[str, Any]) -> PreparedTextRow:
         return self.session(int(req_id)).resolve_text_row(op)
 
-    def ingest_new_blocks(
-        self,
-        req_id: int,
-        block_ids: list[int] | tuple[int, ...] | None,
-    ) -> bool:
-        return self.session(int(req_id)).ingest_new_blocks(block_ids)
-
     def finish_generation(self, req_id: int, *, committed: bool) -> None:
         self.session(int(req_id)).finish_generation(committed=committed)
 
@@ -201,12 +187,14 @@ class SessionStore(_RequestStateTable):
         resources: "ResourceRuntime",
         stores: Sequence[TransactionalStore] = (),
     ) -> "StepTxn":
+        # The KV store joins every step transaction: it is the sole
+        # snapshotter of block tables, prefix references, and lane lengths.
         return StepTxn(
             self,
             resources,
             step_id=int(step_id),
             operations=operations,
-            stores=stores,
+            stores=(self.kv, *stores),
         )
 
 
@@ -293,13 +281,15 @@ class StepTxn:
         if state is None:
             return _SessionSnapshot(False, None, None, {})
         snapshot = copy.copy(state)
+        # ``state.kv`` (block table, prefix reference, lane lengths) stays
+        # shared with the snapshot on purpose: the KvStore in the transaction's
+        # stores tuple is its single snapshotter and restores the entry in
+        # place, preserving the aliased block-table list object.
         snapshot.sampling = dict(state.sampling)
         snapshot.image = dict(state.image)
         snapshot.neg_token_ids = list(state.neg_token_ids)
-        snapshot.block_ids = list(state.block_ids)
         snapshot.resident_block_ids = set(state.resident_block_ids)
         snapshot.device_rngs = dict(state.device_rngs)
-        snapshot.kv_lengths = dict(state.kv_lengths)
         snapshot.residency = copy.copy(state.residency)
         snapshot.decode_relay = copy.copy(state.decode_relay)
         snapshot.cfg_geometry = dict(state.cfg_geometry) if state.cfg_geometry is not None else None
