@@ -128,6 +128,10 @@ class RequestState:
     neg_token_ids: list[int] = field(default_factory=list)
     block_ids: list[int] = field(default_factory=list)
     resident_block_ids: set[int] = field(default_factory=set)
+    # Scheduler-declared prefix-cache reuse boundary in tokens: the leading
+    # span of ``block_ids`` whose KV is already resident through prefix reuse
+    # (0 on a cold admission). Ingested from ``NewRequestData.prefix_len``.
+    prefix_len: int = 0
     lora_id: int | None = None
     raw_new_request: dict[str, Any] = field(default_factory=dict)
     seed: int | None = None
@@ -233,6 +237,7 @@ class RequestStateTable:
                 _merge_registered_block_ids(state.block_ids, incoming)
             else:
                 state.block_ids = incoming
+        state.prefix_len = int(new_req.get("prefix_len") or 0)
         state.lora_id = new_req.get("lora_id")
         state.raw_new_request = dict(new_req)
         if "epoch" in new_req:

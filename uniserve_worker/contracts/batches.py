@@ -111,6 +111,8 @@ class Batch:
             if not isinstance(nr, Mapping):
                 raise invalid_descriptor("execute batch.new_reqs entries must be maps")
             _int(nr.get("req_id"), "execute batch.new_reqs[].req_id")
+            if nr.get("prefix_len") is not None:
+                _int(nr.get("prefix_len"), "execute batch.new_reqs[].prefix_len", minimum=0)
             new_reqs.append(nr)
         raw_ops = batch.get("ops")
         if not isinstance(raw_ops, list):

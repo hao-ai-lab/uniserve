@@ -187,6 +187,10 @@ table NewRequestData {
   lora_id:uint = null;
   block_ids:[uint];
   group_id:uint;
+  // Number of leading prompt tokens already resident under the prefix cache
+  // (the scheduler's reuse boundary). Scalar descriptor only; append-only for
+  // FlatBuffers compatibility.
+  prefix_len:uint;
 }
 
 table ForwardOp {

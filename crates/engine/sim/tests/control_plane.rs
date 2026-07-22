@@ -2132,6 +2132,117 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
     );
 }
 
+/// `NewRequestData.prefix_len` carries the scheduler's prefix-cache reuse
+/// boundary to the worker as a typed field: 0 on a cold admission, and
+/// cached-blocks x block-size when the admission reuses a cached prompt prefix.
+#[test]
+fn new_request_data_carries_the_prefix_reuse_boundary() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult};
+
+    #[derive(Default)]
+    struct Log {
+        registrations: Vec<(RequestId, u32)>,
+    }
+
+    struct Recording {
+        inner: SimExecutor,
+        log: Arc<Mutex<Log>>,
+    }
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
+            let mut log = self.log.lock().unwrap();
+            for nr in &b.new_reqs {
+                log.registrations.push((nr.req_id, nr.prefix_len));
+            }
+            drop(log);
+            self.inner.submit(b)
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+            self.inner.poll()
+        }
+        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+            self.inner.next_result()
+        }
+        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(op)
+        }
+        fn control_wait(
+            &mut self,
+            op: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(op, targets)
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_text_len(4);
+    let block_size = sim.mut_caps_for_test().block_size;
+    assert_eq!(block_size, 64, "test geometry assumes the sim block size");
+    let log = Arc::new(Mutex::new(Log::default()));
+    let exec = Recording {
+        inner: SimExecutor::new(Box::new(sim)),
+        log: log.clone(),
+    };
+    let mut sched = Scheduler::new(Box::new(exec), ctrl(), 32);
+
+    // 600 tokens => 9 full 64-token blocks + a partial; the 9 full blocks are
+    // the cacheable shared prefix.
+    let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
+    let run_one = |rid: u64, sched: &mut Scheduler| {
+        let _erx = sched.submit_for_test(generation_request(
+            RequestId(rid),
+            text_context(prompt.clone()),
+            SamplingParams::default(),
+            ImageParams::default(),
+            GenerationConstraint::UndOnly,
+            8,
+        ));
+        for _ in 0..10_000 {
+            if !sched.step() {
+                break;
+            }
+        }
+    };
+
+    // cold: req1 populates the prefix cache and registers with no reuse.
+    run_one(1, &mut sched);
+    // warm: req2 (same prompt) registers with the reused prefix boundary.
+    run_one(2, &mut sched);
+
+    let log = log.lock().unwrap();
+    let prefix_of = |rid: u64| -> Vec<u32> {
+        log.registrations
+            .iter()
+            .filter(|(r, _)| r.0 == rid)
+            .map(|(_, p)| *p)
+            .collect()
+    };
+    assert_eq!(
+        prefix_of(1),
+        vec![0],
+        "a cold admission must register prefix_len == 0"
+    );
+    assert_eq!(
+        prefix_of(2),
+        vec![9 * block_size],
+        "a prefix-cache-hit admission must register prefix_len == cached blocks x block size"
+    );
+}
+
 /// Structured outputs end to end under the sim: a guided choice gates on grammar
 /// compilation (skipped_waiting), masks every decode step to the choice trie,
 /// and terminates after one alternative completes.

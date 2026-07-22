@@ -2864,6 +2864,13 @@ impl Scheduler {
                                 neg_token_ids: neg,
                                 lora_id: st.req.lora_id,
                                 block_ids: std::mem::take(&mut op.new_block_ids),
+                                // Prefix-cache reuse boundary: the committed
+                                // prompt cursor at registration equals the
+                                // admission-time prefix hit (cached blocks x
+                                // block size; 0 cold). Re-registration after
+                                // preemption re-runs the lookup, so the
+                                // current cursor is always the reuse boundary.
+                                prefix_len: st.ingest.prompt_cursor,
                                 group_id: 0,
                                 ..NewRequestData::new(id)
                             });
