@@ -725,8 +725,29 @@ class ProgramState:
             self._latent_store.set_state(self._request_id, value)
 
 
+@dataclass(frozen=True)
+class _ProgramSnapshot:
+    """One request's committed branch state captured for a step transaction.
+
+    ``caches`` records each live branch cache with its committed length and
+    block table; ``cond_blocks_shared`` records whether the conditional branch
+    shares its block-id list with the request session, so a restore rebuilds
+    the same single block-table list.
+    """
+
+    program: ProgramState
+    caches: tuple[tuple[Any, int, tuple[int, ...]], ...]
+    cond_blocks_shared: bool
+
+
 class KvStore:
-    """Own per-request conditional and CFG sequence branches."""
+    """Own per-request conditional and CFG sequence branches.
+
+    The branch caches hold the committed sequence-KV lengths and block tables
+    for interleaved execution; ``snapshot_requests``/``restore_requests`` make
+    them transactional, so a failed step leaves the committed length and block
+    table of every touched request unchanged.
+    """
 
     def __init__(self, sessions: Any, latents: Any, *, rng_device: Any) -> None:
         self.sessions = sessions
@@ -787,9 +808,9 @@ class KvStore:
                 segment_executor.release_staging(cache)
             residency.release_scratch_cache(cache)
 
-    def snapshot_requests(self, request_ids: set[int]) -> dict[int, ProgramState]:
+    def snapshot_requests(self, request_ids: set[int]) -> dict[int, _ProgramSnapshot]:
         return {
-            request_id: self._snapshot(program)
+            request_id: self._snapshot(request_id, program)
             for request_id in {int(value) for value in request_ids}
             if (program := self._programs.get(request_id)) is not None
         }
@@ -797,23 +818,46 @@ class KvStore:
     def restore_requests(
         self,
         request_ids: set[int],
-        snapshot: dict[int, ProgramState],
+        snapshot: dict[int, _ProgramSnapshot],
     ) -> None:
         for request_id in {int(value) for value in request_ids}:
             self._programs.pop(request_id, None)
-        self._programs.update(snapshot)
+        for request_id, snap in snapshot.items():
+            program = snap.program
+            if snap.cond_blocks_shared:
+                program.cond.block_ids = self.sessions.get(request_id).block_ids
+            for cache, length, block_ids in snap.caches:
+                cache.restore_committed(length, block_ids)
+            self._programs[request_id] = program
 
-    @staticmethod
-    def _snapshot(program: ProgramState) -> ProgramState:
+    def _snapshot(self, request_id: int, program: ProgramState) -> _ProgramSnapshot:
         cloned = copy.copy(program)
         cloned.sampling = dict(program.sampling)
         cloned.image = dict(program.image)
         cloned.neg_token_ids = list(program.neg_token_ids)
+        caches: list[tuple[Any, int, tuple[int, ...]]] = []
+        seen: set[int] = set()
         for name in ("cond", "tu", "iu"):
             branch = copy.copy(getattr(program, name))
             branch.block_ids = list(branch.block_ids)
             setattr(cloned, name, branch)
-        return cloned
+            past = branch.past
+            if (
+                past is not None
+                and id(past) not in seen
+                and callable(getattr(past, "restore_committed", None))
+            ):
+                seen.add(id(past))
+                caches.append(
+                    (past, int(past.length), tuple(int(block) for block in past.block_ids))
+                )
+        return _ProgramSnapshot(
+            program=cloned,
+            caches=tuple(caches),
+            cond_blocks_shared=(
+                program.cond.block_ids is self.sessions.get(request_id).block_ids
+            ),
+        )
 
 
 class KvView:

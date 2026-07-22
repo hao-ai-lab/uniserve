@@ -272,6 +272,22 @@ class PagedTextCache:
             self._updated_layers.clear()
             self._update_view_cache = None
 
+    def restore_committed(self, length: int, block_ids: Sequence[int]) -> None:
+        """Reset the cache to a committed length and block table.
+
+        The step transaction calls this on rollback: the logical length, the
+        block table, and any partially applied layer span return to the
+        committed state. K/V already written past the committed length is
+        inert scratch that the next span write at those slots overwrites.
+        """
+        self.block_ids = self.pool.validate_block_ids(block_ids)
+        self.length = int(length)
+        self._active_start = None
+        self._active_count = None
+        self._updated_layers.clear()
+        self._update_view_cache = None
+        self._transient_view_cache = None
+
 
 def stage_paged_text_cache_prefix(
     source: PagedTextCache,

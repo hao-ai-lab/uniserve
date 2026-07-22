@@ -905,12 +905,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             raise invalid_descriptor("BAGEL request state requires an executor-bound forward")
         return request_states.get(int(req_id))
 
-    def _length(self, req_id: int) -> int:
-        return self._state(req_id).kv_length()
-
-    def _set_length(self, req_id: int, value: int) -> None:
-        self._state(req_id).set_kv_length(value)
-
     def _gen_state(self, req_id: int) -> GenState | None:
         latent_view = get_forward_context().latent_view
         if latent_view is None:
@@ -1289,7 +1283,6 @@ class BagelForUnifiedGeneration(UniModelBase):
                 or int(sampling.get("n_prompt_logprobs", 0) or 0) > 0
             ):
                 item["state"].cond.last_logits = m.logits(hidden[-1:]).unsqueeze(0)
-            self._set_length(req_id, new_len)
             record = self._record(req_id)
             record.dimensions = tuple(item["image_hw"])
             if item["kind"] == "vit_encode":
@@ -1341,28 +1334,19 @@ class BagelForUnifiedGeneration(UniModelBase):
 
         Batching and the one-token decode CUDA graph are system-owned by the
         driver; BAGEL contributes only the MoT und-expert forward
-        (``sequence_forward``). The host's ``pos_range`` stays
-        authoritative for every op's rope position — matching the pre-driver
-        Segment path, since BAGEL's 1-D positions do not advance across image
-        spans the way KV length does — and the request-state KV-length mirror
-        is refreshed from the text cache afterwards for the encode/denoise/
-        commit paths that read it.
+        (``sequence_forward``). The host's ``pos_range`` stays authoritative
+        for every op's rope position, since BAGEL's 1-D positions do not
+        advance across image spans the way KV length does; the committed KV
+        length lives on the driver-owned text cache.
         """
         self._ensure_loaded()
-        op_list = self._prepare_text_logits_batch(ops)
-        out = self._text_driver().run_text_logits_batch(op_list)
-        self._sync_text_cache_lengths(op_list)
-        return out
+        return self._text_driver().run_text_logits_batch(self._prepare_text_logits_batch(ops))
 
     def try_run_graph_logits_batch(self, ops):
         """Return text logits only when the shared CUDA graph covers the batch."""
         self._ensure_loaded()
         op_list = self._prepare_text_logits_batch(ops)
-        out = self._text_driver().try_run_graph_logits_batch(op_list)
-        if out is None:
-            return None
-        self._sync_text_cache_lengths(op_list)
-        return out
+        return self._text_driver().try_run_graph_logits_batch(op_list)
 
     def _prepare_text_logits_batch(self, ops):
         op_list = [dict(op) for op in ops]
@@ -1372,13 +1356,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             if st.cond.past is not None and pos_range:
                 st.cond.t_index = int(pos_range[0]) - 1
         return op_list
-
-    def _sync_text_cache_lengths(self, ops) -> None:
-        for op in ops:
-            r = int(op["req_id"])
-            st = self.program_state(r)
-            if st.cond.past is not None:
-                self._set_length(r, int(st.cond.past.length))
 
     def run_text_logits(self, op):
         return self.run_text_logits_batch([dict(op)])[0]
@@ -1838,7 +1815,6 @@ class BagelForUnifiedGeneration(UniModelBase):
                 gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True
             )
             m.run([commit_seg])
-            self._set_length(r, gs.cond_pos + gs.num_vae + 2)
             # gen_rope_advance=2: following text continues at cond_pos + 2.
             self._sync_text_cache_after_image(
                 r, length=gs.cond_pos + gs.num_vae + 2, last_position=gs.cond_pos + 1

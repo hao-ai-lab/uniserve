@@ -134,9 +134,8 @@ def test_bagel_packed_route_indices_include_text_rows_and_generation_markers():
     torch.testing.assert_close(gen_indices, torch.tensor([4, 5, 6, 9, 10]))
 
 
-def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
+def test_bagel_graph_only_text_hook_syncs_rope_position_from_pos_range():
     calls = []
-    synced = []
     past = SimpleNamespace(length=23)
     state = SimpleNamespace(cond=SimpleNamespace(past=past, t_index=-1))
     logits = [torch.tensor([[1.0, 2.0]])]
@@ -148,7 +147,6 @@ def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
 
     class Owner:
         _prepare_text_logits_batch = BagelForUnifiedGeneration._prepare_text_logits_batch
-        _sync_text_cache_lengths = BagelForUnifiedGeneration._sync_text_cache_lengths
 
         def _ensure_loaded(self):
             return None
@@ -159,9 +157,6 @@ def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
 
         def _text_driver(self):
             return GraphDriver()
-
-        def _set_length(self, req_id, length):
-            synced.append((int(req_id), int(length)))
 
     op = {
         "req_id": 7,
@@ -176,7 +171,6 @@ def test_bagel_graph_only_text_hook_preserves_position_and_cache_mirrors():
     assert result is logits
     assert calls == [[op]]
     assert state.cond.t_index == 10
-    assert synced == [(7, 23)]
 
 
 def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
