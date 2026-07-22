@@ -605,9 +605,18 @@ class _LoadedBagelRuntime:
 
 @dataclass(slots=True)
 class GenState:
-    """Mutable image-generation state for one BAGEL denoise/commit cycle."""
+    """Mutable image-generation state for one BAGEL denoise/commit cycle.
 
-    x_t: torch.Tensor
+    The latent trajectory ``x_t`` is not stored on the model state — it lives
+    in the system-owned :class:`~uniserve_worker.runtime.residency.LatentStore`
+    as a leased buffer addressed by ``latent_handle``. ``x_t`` here is a
+    property reading/writing that system buffer; an accepted denoise update
+    replaces the buffer entry, so a failed step's rollback restores the prior
+    committed latent tensor.
+    """
+
+    latent_pool: Any  # system LatentStore (residency.latent)
+    latent_handle: int  # request-scoped handle into the LatentStore
     vae_pos_ids: torch.Tensor
     num_vae: int
     H: int
@@ -623,6 +632,14 @@ class GenState:
     cfg_pos: int = 0
     paged_branches: PagedDenoiseBranchSet | None = None
     graph_image: _BagelDenoiseGraphImage | None = None
+
+    @property
+    def x_t(self) -> torch.Tensor:
+        return self.latent_pool.get(self.latent_handle)
+
+    @x_t.setter
+    def x_t(self, value: torch.Tensor) -> None:
+        self.latent_pool.set(self.latent_handle, value)
 
 
 @dataclass(slots=True)
@@ -1423,7 +1440,8 @@ class BagelForUnifiedGeneration(UniModelBase):
                 "BAGEL context-image generation has no graph-ready CFG branch layout"
             )
         gs = GenState(
-            x_t=x_t,
+            latent_pool=self.residency.latent,
+            latent_handle=int(op["req_id"]),
             vae_pos_ids=vae_pos_ids,
             num_vae=num_vae,
             H=height,
@@ -1441,6 +1459,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             cond_pos=cond_pos,
             cond_branch_kvlen=cond_pos,
         )
+        gs.x_t = x_t  # store the initial noise into the system LatentStore
         neg = list(rec.neg_token_ids or [])
         gs.cfg_pos = len(neg) if (gs.cfg_text_scale > 1.0 and neg) else 0
         self._init_paged_denoise_branches(op, gs, neg)
