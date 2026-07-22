@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from ..contracts.forward_batch import ForwardBatch
 import torch.nn as nn
 
+from ..contracts.model_spec import CacheSpec, InputSpec, ModelSpec, RouteSpec
 from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
 from ..foundation.runtime_config import get_execution_config
 from ..foundation.sizing import (
@@ -420,6 +421,23 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
     @property
     def device(self) -> str:
         return str(next(self.parameters()).device)
+
+    def model_spec(self) -> ModelSpec:
+        return ModelSpec(
+            architecture=self.architectures[0],
+            routes=(
+                RouteSpec(
+                    name="text",
+                    op_kinds=tuple(self.supported_ops),
+                    mixed=True,
+                    dtype="bfloat16",
+                    graph_eligible=True,
+                ),
+            ),
+            weights=self.weight_spec,
+            inputs=InputSpec(requires_worker_tokenizer=True),
+            cache=CacheSpec.from_kv_geometry(self.kv_cache_spec()),
+        )
 
     # -- system-managed residency: the model only *declares* its KV geometry --
     def kv_cache_spec(self) -> KvCacheSpec:

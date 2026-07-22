@@ -771,6 +771,7 @@ class ExecutorConfig:
     defer_sampling: bool = False
     tensor_store: Any | None = None
     simulation: bool = False
+    spec_digest: str | None = None
 
 
 @dataclass
@@ -781,6 +782,7 @@ class _ResolvedExecutorDependencies:
     defer_sampling: bool
     tensor_store: Any | None
     simulation: bool
+    spec_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -843,6 +845,7 @@ class ModelExecutor:
         )
         self.tensor_store = dependencies.tensor_store
         self.simulation = bool(dependencies.simulation)
+        self.spec_digest = dependencies.spec_digest
         self.batch_policy = dependencies.batch_policy or self._model_batch_policy()
         self.attention_backend, self.attention_preference = self._resolve_attention_backend(
             dependencies.attention_backend
@@ -943,6 +946,7 @@ class ModelExecutor:
             text=text_stack.graph_runner,
             flow=FlowGraphRunner() if has_segment_runtime else None,
             segment=SegmentGraphRunner() if has_segment_runtime else None,
+            spec_digest=self.spec_digest,
         )
         self._autoregressive = _AutoregressiveRuntime(
             builder=self.forward_batch_builder,
@@ -996,6 +1000,7 @@ class ModelExecutor:
             defer_sampling=defer_sampling or config.defer_sampling,
             tensor_store=tensor_store if tensor_store is not None else config.tensor_store,
             simulation=bool(config.simulation),
+            spec_digest=config.spec_digest,
         )
 
     @staticmethod

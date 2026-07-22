@@ -9,6 +9,7 @@ from PIL import Image
 from ..contracts.forward_batch import BatchPolicy, ForwardBatch
 from ..contracts.forward_context import get_forward_context
 from ..contracts.forward_mode import ForwardMode
+from ..contracts.model_spec import CacheSpec, FlowSpec, InputSpec, ModelSpec, RouteSpec
 from ..contracts.op_kinds import COMMIT_GEN, COMMIT_WRITEBACK, DECODE_UND, DENOISE_GEN, PREFILL_UND
 from ..contracts.outputs import (
     CommitOutput,
@@ -26,6 +27,7 @@ from ..contracts.resource_plan import (
 )
 from ..foundation.env import env_int
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
+from ..loader.weight_spec import weight_spec_of
 from ..models.catalog import UniModelBase
 from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.image_utils import pil_image_to_png_b64
@@ -97,6 +99,36 @@ class StubUniModel(UniModelBase):
 
     def batch_policy(self) -> BatchPolicy:
         return BatchPolicy(max_batch_ops=self.max_batch_ops, supports_mixed_modes=True)
+
+    def model_spec(self) -> ModelSpec:
+        return ModelSpec(
+            architecture=self.architectures[0],
+            routes=(
+                RouteSpec(
+                    name="stub",
+                    op_kinds=tuple(self.supported_ops),
+                    mixed=True,
+                    dtype="bfloat16",
+                    graph_eligible=False,
+                ),
+            ),
+            weights=weight_spec_of(type(self)),
+            inputs=InputSpec(requires_worker_tokenizer=False),
+            # Synthetic geometry consistent with the advertised bytes_per_token
+            # (2 tensors x 2 bytes x 8 heads x 64 dim x 28 layers = 57344).
+            cache=CacheSpec(
+                num_layers=self.num_layers,
+                num_kv_heads=8,
+                head_dim=64,
+                dtype="bfloat16",
+            ),
+            flow=FlowSpec(
+                latent_downsample=self.latent_downsample,
+                prediction=self.velocity_parameterization(),
+                schedule_direction="ascending",
+                schedule_shift_domain="time",
+            ),
+        )
 
     def _caps_descriptor(
         self,

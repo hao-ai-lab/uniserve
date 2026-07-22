@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -159,6 +160,64 @@ def test_partial_model_scope_requires_explicit_model_support(tmp_path):
         )
 
     assert error.value.code is ErrorCode.CAPABILITY_MISMATCH
+
+
+def test_load_worker_model_resolves_spec_overlay_and_digest(tmp_path):
+    from uniserve_worker.contracts.model_spec import resolved_digest
+    from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
+
+    config = {
+        "architectures": ["Qwen3ForCausalLM"],
+        "vocab_size": 32,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
+        "attention_bias": False,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    torch.manual_seed(3)
+    checkpoint = {
+        name: tensor.detach().clone()
+        for name, tensor in Qwen3ForCausalLM(config=config).state_dict().items()
+    }
+    save_file(checkpoint, tmp_path / "model.safetensors")
+
+    loaded = load_worker_model(
+        WorkerModelLoadRequest(
+            model_path=str(tmp_path),
+            device="cpu",
+            block_size=16,
+            kv_token_capacity=64,
+            attention_backend="auto",
+        )
+    )
+
+    assert loaded.spec.architecture == "Qwen3ForCausalLM"
+    assert loaded.spec.revision
+    assert loaded.spec.op_kinds() == frozenset(loaded.model.supported_ops)
+    assert loaded.overlay.device == "cpu"
+    assert loaded.overlay.block_size == 16
+    assert loaded.resolved_digest == resolved_digest(loaded.spec, loaded.overlay)
+
+    # The same checkpoint under a different deployment overlay is a different
+    # resolved identity; the same request resolves the same identity again.
+    assert (
+        resolved_digest(loaded.spec, replace(loaded.overlay, block_size=32))
+        != loaded.resolved_digest
+    )
+    reloaded = load_worker_model(
+        WorkerModelLoadRequest(
+            model_path=str(tmp_path),
+            device="cpu",
+            block_size=16,
+            kv_token_capacity=64,
+            attention_backend="auto",
+        )
+    )
+    assert reloaded.resolved_digest == loaded.resolved_digest
 
 
 def test_transformers_dtype_typos_fail_loudly():

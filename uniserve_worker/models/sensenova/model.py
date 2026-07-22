@@ -37,6 +37,7 @@ from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardSt
 
 from ...contracts.forward_batch import ForwardBatch
 from ...contracts.forward_context import get_forward_context
+from ...contracts.model_spec import CacheSpec, FlowSpec, InputSpec, ModelSpec, RouteSpec
 from ...contracts.resource_plan import (
     CapsDescriptor,
     EncoderResourcePolicy,
@@ -2482,6 +2483,50 @@ class SenseNovaU1ForUnifiedGeneration(
         self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
         self._scratch_blocks, self._gen_scratch_blocks = self._scratch_block_counts(
             gen_snapshot_kv_capacity
+        )
+
+    def model_spec(self) -> ModelSpec:
+        return ModelSpec(
+            architecture=self.architectures[0],
+            routes=(
+                # Token and flow rows share the MoT backbone in one forward.
+                RouteSpec(
+                    name="mot",
+                    op_kinds=("prefill_und", "decode_und", "denoise_gen"),
+                    mixed=True,
+                    dtype="bfloat16",
+                    graph_eligible=True,
+                ),
+                RouteSpec(
+                    name="vae",
+                    op_kinds=("commit_gen", "commit_writeback"),
+                    mixed=False,
+                    dtype="bfloat16",
+                    graph_eligible=False,
+                ),
+                RouteSpec(
+                    name="vit",
+                    op_kinds=("vit_encode",),
+                    mixed=False,
+                    dtype="bfloat16",
+                    graph_eligible=False,
+                ),
+            ),
+            weights=self.weight_spec,
+            inputs=InputSpec(requires_worker_tokenizer=True),
+            cache=CacheSpec(
+                num_layers=int(self.num_layers),
+                num_kv_heads=int(self._kv_num_heads),
+                head_dim=int(self._kv_head_dim),
+                dtype="bfloat16",
+                store_dtype=self._kv_dtype_name_for(torch.bfloat16),
+            ),
+            flow=FlowSpec(
+                latent_downsample=int(self.latent_downsample),
+                prediction=self.velocity_parameterization(),
+                schedule_direction=self.denoise_schedule_direction.value,
+                schedule_shift_domain=self.denoise_schedule_shift_domain.value,
+            ),
         )
 
     def gen_residency_spec(self) -> GenResidencySpec | None:
