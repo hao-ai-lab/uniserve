@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import threading
 from functools import lru_cache
+from typing import Any
 
 from ..contracts.model_family import ModelFamilyDescriptor
 from ..foundation.plugins import discover_package_plugins
@@ -14,8 +15,7 @@ __all__ = [
     'import_processors',
     'get_processor_for_descriptor',
     'get_processor_for_model',
-    'get_image_pipeline_for_descriptor',
-    'get_image_pipeline_for_model',
+    'build_image_input_stage',
 ]
 
 class _ProcessorRegistry:
@@ -85,17 +85,32 @@ def get_processor_for_model(model_cls: type) -> MultimodalProcessor | None:
     return get_processor_for_descriptor(ModelFamilyDescriptor.from_model_class(model_cls))
 
 
-def get_image_pipeline_for_descriptor(descriptor: ModelFamilyDescriptor):
-    processor = get_processor_for_descriptor(descriptor)
-    if processor is None:
+def build_image_input_stage(
+    model: Any,
+    descriptor: ModelFamilyDescriptor | None = None,
+):
+    """Build the system image-input stage for one loaded model.
+
+    Composition-root-only: reads the model's declared ``InputSpec.images`` and
+    binds the family processor to it (a descriptor's explicit factory wins;
+    otherwise the registry class is constructed from the declaration). Models
+    without declared image transforms get no stage.
+    """
+    model_spec = getattr(model, "model_spec", None)
+    spec = model_spec() if callable(model_spec) else None
+    images = spec.inputs.images if spec is not None else None
+    if images is None:
         return None
-    pipeline = descriptor.image_pipeline(processor)
-    if pipeline is not None:
-        return pipeline
+    resolved = descriptor or ModelFamilyDescriptor.from_model_class(type(model))
+    processor = resolved.processor()
+    if processor is None:
+        processor_cls = _processor_factory_for_descriptor(resolved)
+        if processor_cls is None:
+            return None
+        from_image_spec = getattr(processor_cls, "from_image_spec", None)
+        processor = (
+            from_image_spec(images) if callable(from_image_spec) else processor_cls()
+        )
     from .image_pipeline import ImageInputPipeline
 
-    return ImageInputPipeline(processor)
-
-
-def get_image_pipeline_for_model(model_cls: type):
-    return get_image_pipeline_for_descriptor(ModelFamilyDescriptor.from_model_class(model_cls))
+    return ImageInputPipeline(images, processor, device=getattr(model, "device", None))

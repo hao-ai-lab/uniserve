@@ -38,6 +38,8 @@ __all__ = [
     "CfgRecipeKind",
     "DenoiseInputs",
     "EncodeInputs",
+    "EncodeContext",
+    "EncodeRow",
     "CommitInputs",
     "ForwardBatch",
     "ForwardModality",
@@ -233,6 +235,43 @@ class EncodeInputs:
     out_handle: int
     mm_hash: int | None = None
     cond_pos: int = 0
+
+
+@dataclass(frozen=True)
+class EncodeContext:
+    """Bounded per-op view for a model's neural encode entry points.
+
+    The system input stage decodes and transforms the request's image payload
+    ahead of the model; the model receives only this context plus the typed
+    pixel/grid tensors. ``handle`` names the encoder-residency slot the row's
+    embeddings live under (the system derives it from the request's media hash,
+    or it is the resident handle a payload-free row replays). ``image_hw`` is
+    the reported image dimensions for a row that carries pixels and ``None``
+    for a resident replay. ``new_block_ids``/``pos_range`` bound the KV span
+    the appended vision tokens may write.
+    """
+
+    req_id: int
+    kind: str  # "vit_encode" | "vae_encode"
+    handle: int
+    temporal_index: int | None = None
+    image_hw: tuple[int, int] | None = None
+    new_block_ids: tuple[int, ...] = ()
+    pos_range: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class EncodeRow:
+    """One prepared encode operation: typed tensors plus its bounded context.
+
+    ``pixels``/``grid`` are the input stage's transform products staged for the
+    model (``grid`` only for patch-row layouts). ``pixels is None`` marks a
+    resident replay: the embeddings already live under ``ctx.handle``.
+    """
+
+    ctx: EncodeContext
+    pixels: torch.Tensor | None = None
+    grid: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

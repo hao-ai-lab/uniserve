@@ -27,9 +27,13 @@ __all__ = [
     "CacheSpec",
     "DeploymentOverlay",
     "FlowSpec",
+    "ImageInputSpec",
+    "ImagePatchSpec",
+    "ImageTowerSpec",
     "InputSpec",
     "ModelSpec",
     "RouteSpec",
+    "StrideResizeSpec",
     "resolved_digest",
 ]
 
@@ -65,15 +69,105 @@ class RouteSpec:
 
 
 @dataclass(frozen=True)
+class ImagePatchSpec:
+    """Flattened conv-embedder patch rows from one understanding image.
+
+    The transform chain is: grid-rounded resize (height/width divide
+    ``patch_size / downsample_ratio`` with the pixel count scaled into
+    ``[min_pixels, max_pixels]``, the per-image budget shrinking under
+    ``multi_image_pixel_budget``), the named ``normalization``, then
+    patchification into ``[grid_h * grid_w, channels * patch_size**2]`` rows
+    plus a ``[1, 2]`` grid tensor. Reported image dimensions are the decoded
+    source dimensions.
+    """
+
+    patch_size: int
+    downsample_ratio: float
+    min_pixels: int
+    max_pixels: int
+    multi_image_pixel_budget: int
+    normalization: str = "imagenet"
+
+    def __post_init__(self) -> None:
+        if int(self.patch_size) < 1:
+            raise invalid_descriptor("ImagePatchSpec.patch_size must be at least 1")
+        if not 0 < float(self.downsample_ratio) <= 1:
+            raise invalid_descriptor("ImagePatchSpec.downsample_ratio must be in (0, 1]")
+        if not 0 < int(self.min_pixels) <= int(self.max_pixels):
+            raise invalid_descriptor("ImagePatchSpec pixel bounds must satisfy 0 < min <= max")
+        if not self.normalization:
+            raise invalid_descriptor("ImagePatchSpec.normalization must not be empty")
+
+
+@dataclass(frozen=True)
+class StrideResizeSpec:
+    """Stride-aligned bounded resize: scale into ``[min_size, max_size]``,
+    round each side to ``stride``, and cap the pixel count at ``max_pixels``."""
+
+    max_size: int
+    min_size: int
+    stride: int
+    max_pixels: int
+
+    def __post_init__(self) -> None:
+        if int(self.stride) < 1:
+            raise invalid_descriptor("StrideResizeSpec.stride must be at least 1")
+        if not 0 < int(self.min_size) <= int(self.max_size):
+            raise invalid_descriptor("StrideResizeSpec sizes must satisfy 0 < min <= max")
+        if int(self.max_pixels) < 1:
+            raise invalid_descriptor("StrideResizeSpec.max_pixels must be at least 1")
+
+
+@dataclass(frozen=True)
+class ImageTowerSpec:
+    """Whole-image CHW tower input: one stride-aligned resize plus the named
+    per-channel ``normalization`` (no patchification; the tower patchifies)."""
+
+    resize: StrideResizeSpec
+    normalization: str = "signed_unit"
+
+    def __post_init__(self) -> None:
+        if not self.normalization:
+            raise invalid_descriptor("ImageTowerSpec.normalization must not be empty")
+
+
+@dataclass(frozen=True)
+class ImageInputSpec:
+    """Declared image decode and transform requirements for encode routes.
+
+    ``vit`` and ``vae`` declare the transform chain behind the matching encode
+    op kind; an undeclared kind accepts no image payload. When ``vae`` is
+    declared, every encode input is first resized onto that canvas — the
+    canvas dimensions are the reported image dimensions — before the per-kind
+    tower transform runs; without one, reported dimensions are the decoded
+    source dimensions. ``staging_dtype`` names the device dtype pixels are
+    staged to ahead of the neural encode (``None`` keeps the transform's
+    dtype). Base64 payloads decode to RGB with transparency composited over
+    white for every declared chain.
+    """
+
+    vit: ImagePatchSpec | ImageTowerSpec | None = None
+    vae: ImageTowerSpec | None = None
+    staging_dtype: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.vit is None and self.vae is None:
+            raise invalid_descriptor("ImageInputSpec must declare at least one transform")
+
+
+@dataclass(frozen=True)
 class InputSpec:
     """Declarative input requirements.
 
-    ``requires_worker_tokenizer`` is the only field with a real consumer today
-    (worker-side tokenizer materialization and vocabulary configuration at
-    bootstrap); typed image/patch transforms arrive with the Product stage.
+    ``requires_worker_tokenizer`` drives worker-side tokenizer materialization
+    and vocabulary configuration at bootstrap. ``images`` declares the image
+    decode/transform chains the system input stage runs ahead of the model's
+    encode entry points; models whose routes accept no encode work leave it
+    ``None``.
     """
 
     requires_worker_tokenizer: bool = False
+    images: ImageInputSpec | None = None
 
 
 @dataclass(frozen=True)

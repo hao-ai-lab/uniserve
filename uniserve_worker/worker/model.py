@@ -23,7 +23,7 @@ from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..nn.mesh import get_current_mesh
-from ..processors import get_processor_for_descriptor
+from ..processors import build_image_input_stage
 from ..runtime.adapter_store import AdapterStore
 from ..runtime.resources import ResourceRuntime
 from .protocol import BaseWorker, ResultPolicy
@@ -70,17 +70,18 @@ def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") 
             setattr(model, name, pool)
 
 
-def bind_model_segment_execution(model: UniModel) -> None:
+def bind_model_segment_execution(model: UniModel, image_stage: Any = None) -> None:
     """Build the system-owned segment executor over the model's family adapter.
 
     A model that lowers heterogeneous operations through segment execution
     declares its adapter surface via ``segment_adapter()``; the executor lands
-    on the contract-declared ``model.segment_executor``.
+    on the contract-declared ``model.segment_executor`` and stages encode-op
+    image inputs through ``image_stage`` ahead of the adapter's neural encode.
     """
     adapter = model.segment_adapter()
     if adapter is None:
         return
-    model.segment_executor = SegmentExecutor(adapter)
+    model.segment_executor = SegmentExecutor(adapter, image_stage=image_stage)
 
 
 def build_model_adapter_store(model: UniModel) -> AdapterStore | None:
@@ -171,14 +172,15 @@ class ModelWorker(BaseWorker):
         resource_runtime = self._create_resource_runtime()
         residency = self._create_residency_manager(resource_runtime)
         bind_model_residency(self.model, residency)
-        bind_model_segment_execution(self.model)
+        image_stage = build_image_input_stage(self.model, self.family_descriptor)
+        bind_model_segment_execution(self.model, image_stage)
         self.adapter_store = build_model_adapter_store(self.model)
         self.model_executor = ModelExecutor(
             model,
             config=ExecutorConfig(simulation=bool(simulation), spec_digest=spec_digest),
             attention_backend=self.attention_backend,
             resource_runtime=resource_runtime,
-            multimodal_processor=get_processor_for_descriptor(self.family_descriptor),
+            image_input_stage=image_stage,
             defer_sampling=self.defer_sampling,
             tensor_store=tensor_store,
             residency=residency,

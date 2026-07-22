@@ -31,9 +31,18 @@ from uniserve_worker.runtime.paged_denoise import (
     can_run_paged_denoise_attention,
 )
 
-from ..contracts.forward_batch import ForwardBatch
+from ..contracts.forward_batch import EncodeContext, EncodeRow, ForwardBatch
 from ..contracts.forward_context import get_forward_context
-from ..contracts.model_spec import CacheSpec, FlowSpec, InputSpec, ModelSpec, RouteSpec
+from ..contracts.model_spec import (
+    CacheSpec,
+    FlowSpec,
+    ImageInputSpec,
+    ImageTowerSpec,
+    InputSpec,
+    ModelSpec,
+    RouteSpec,
+    StrideResizeSpec,
+)
 from ..contracts.resource_plan import (
     AdapterResourcePolicy,
     CapsDescriptor,
@@ -88,7 +97,7 @@ from ..nn.vision import (
     get_flattened_position_ids_extrapolate,
     patchify_batch,
 )
-from ..processors.bagel import BagelImageProcessor
+from ..processors.bagel import BAGEL_GEOMETRY
 from ..runtime.image_params import parse_text_image_generation_params
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
@@ -99,7 +108,6 @@ from ..runtime.residency import (
     GenResidencySpec,
     KvCacheSpec,
     ResidencyManager,
-    encoder_handle_from_mm_hash,
 )
 from .catalog import UniModelBase
 
@@ -594,7 +602,6 @@ _BAGEL_STACKED = (
 class _LoadedBagelRuntime:
     model: _BagelGraph
     pool: PagedKVPool
-    image_processor: BagelImageProcessor
 
 
 @dataclass(slots=True)
@@ -698,7 +705,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         config: Any | None = None,
         *,
         model: _BagelGraph | None = None,
-        image_processor: BagelImageProcessor | None = None,
         block_size: int = DEFAULT_BLOCK_SIZE,
         kv_token_capacity: int | None = None,
         attention_backend: str | None = None,
@@ -716,9 +722,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             else (config if isinstance(config, BagelConfig) else BagelConfig())
         )
         self.resource_plan = self._build_resource_plan()
-        self.image_processor = image_processor or (
-            BagelImageProcessor() if model is not None else None
-        )
         # Interleaved-text-driver owner surface: per-request driver states plus
         # the marker/eos ids the driver reads as configuration. BAGEL has no
         # worker-side tokenizer (the host tokenizes). The scratch pool holds
@@ -799,7 +802,29 @@ class BagelForUnifiedGeneration(UniModelBase):
             ),
             weights=self.weight_spec,
             # The host tokenizes for BAGEL; the worker holds no tokenizer.
-            inputs=InputSpec(requires_worker_tokenizer=False),
+            inputs=InputSpec(
+                requires_worker_tokenizer=False,
+                images=ImageInputSpec(
+                    vit=ImageTowerSpec(
+                        resize=StrideResizeSpec(
+                            max_size=BAGEL_GEOMETRY.vit_max_size,
+                            min_size=BAGEL_GEOMETRY.vit_min_size,
+                            stride=BAGEL_GEOMETRY.vit_stride,
+                            max_pixels=BAGEL_GEOMETRY.max_pixels,
+                        ),
+                        normalization="signed_unit",
+                    ),
+                    vae=ImageTowerSpec(
+                        resize=StrideResizeSpec(
+                            max_size=BAGEL_GEOMETRY.vae_max_size,
+                            min_size=BAGEL_GEOMETRY.vae_min_size,
+                            stride=BAGEL_GEOMETRY.vae_stride,
+                            max_pixels=BAGEL_GEOMETRY.max_pixels,
+                        ),
+                        normalization="signed_unit",
+                    ),
+                ),
+            ),
             cache=CacheSpec(
                 num_layers=int(llm.num_hidden_layers),
                 num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads)),
@@ -1133,28 +1158,32 @@ class BagelForUnifiedGeneration(UniModelBase):
         layer = cast(MoTDecoderLayer, self._ensure_loaded().model.lm.layers[0])
         return int(layer.n_heads), float(layer.scale), torch.bfloat16
 
-    @staticmethod
-    def _encoder_handle(mm_hash: Any) -> int:
-        return encoder_handle_from_mm_hash(mm_hash)
-
-    def encode_many(self, ops: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-        if not ops:
+    def encode_many(self, rows: Sequence[EncodeRow]) -> list[dict[str, Any]]:
+        if not rows:
             return []
         loaded = self._ensure_loaded()
         m = loaded.model
         pool = loaded.pool
-        image_processor = loaded.image_processor
         driver = self._text_driver()
         items: list[dict[str, Any]] = []
         feature_groups: dict[tuple[str, tuple[int, ...]], list[dict[str, Any]]] = {}
-        for raw_op in ops:
-            op = dict(raw_op)
-            req_id = int(op["req_id"])
-            kind = str(op["kind"])
+        for row in rows:
+            ctx = row.ctx
+            req_id = ctx.req_id
+            kind = ctx.kind
             if kind not in {"vae_encode", "vit_encode"}:
                 raise invalid_descriptor(f"unsupported image encode kind: {kind}")
+            if ctx.temporal_index is None:
+                raise invalid_descriptor(
+                    "image encode requires the shared temporal index (cond_pos)"
+                )
             state = self.program_state(req_id)
-            driver.extend_cache_blocks(state.cond, op)
+            driver.extend_cache_span(
+                state.cond,
+                req_id=req_id,
+                new_block_ids=ctx.new_block_ids,
+                pos_range=ctx.pos_range,
+            )
             driver.ensure_host_cache(state.cond)
             base_len = int(state.cond.past.length)
             item: dict[str, Any] = {
@@ -1163,27 +1192,23 @@ class BagelForUnifiedGeneration(UniModelBase):
                 "state": state,
                 "base_len": base_len,
                 "view": pool.view(state.cond.block_ids, base_len),
-                "rope": int(op["cond_pos"]),
+                "rope": int(ctx.temporal_index),
+                "handle": int(ctx.handle),
             }
-            image_b64 = op.get("image_b64")
-            if image_b64:
-                preprocessed = image_processor.prepare_from_b64(image_b64)
-                image_hw = [preprocessed.size[1], preprocessed.size[0]]
-                handle = self._encoder_handle(op.get("mm_hash"))
-                tensor = (
-                    image_processor.vae_tensor(preprocessed)
-                    if kind == "vae_encode"
-                    else image_processor.vit_tensor(preprocessed)
+            if row.pixels is not None:
+                if ctx.image_hw is None:
+                    raise invalid_descriptor("image encode pixels require image dimensions")
+                item.update(
+                    {
+                        "image_hw": [int(value) for value in ctx.image_hw],
+                        "tensor": row.pixels,
+                    }
                 )
-                item.update({"image_hw": image_hw, "handle": handle, "tensor": tensor})
-                feature_groups.setdefault((kind, tuple(int(v) for v in tensor.shape)), []).append(
-                    item
-                )
+                feature_groups.setdefault(
+                    (kind, tuple(int(v) for v in row.pixels.shape)), []
+                ).append(item)
             else:
-                cached_handle = op.get("image_in")
-                if not isinstance(cached_handle, int) or isinstance(cached_handle, bool):
-                    raise invalid_descriptor("cached image encode requires an encoder handle")
-                payload = self.residency.encoder.get(cached_handle)
+                payload = self.residency.encoder.get(ctx.handle)
                 if not isinstance(payload, Mapping) or payload.get("kind") != kind:
                     raise invalid_descriptor("cached image encode handle is not resident")
                 cached_image_hw = payload.get("image_hw")
@@ -1199,7 +1224,6 @@ class BagelForUnifiedGeneration(UniModelBase):
                 item.update(
                     {
                         "image_hw": [int(value) for value in cached_image_hw],
-                        "handle": handle,
                         "payload": payload,
                     }
                 )
@@ -1299,35 +1323,26 @@ class BagelForUnifiedGeneration(UniModelBase):
             )
         return outputs
 
-    def run_encode(self, op: Mapping[str, Any]) -> dict[str, Any]:
-        return self.encode_many((op,))[0]
-
     def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
         return self.program_state(int(req_id)).cond.last_logits
 
     def encode_image(
         self,
-        pixels: Any = None,
-        grid: Any = None,
+        pixels: torch.Tensor | None = None,
+        grid: torch.Tensor | None = None,
         *,
-        op: Mapping[str, Any] | None = None,
+        ctx: EncodeContext,
     ) -> Any:
-        del pixels, grid
-        if op is None:
-            raise invalid_descriptor("BAGEL image encode requires an op descriptor")
-        return self.run_encode(dict(op))
+        return self.encode_many((EncodeRow(ctx=ctx, pixels=pixels, grid=grid),))[0]
 
     def encode_latents(
         self,
-        pixels: Any = None,
-        grid: Any = None,
+        pixels: torch.Tensor | None = None,
+        grid: torch.Tensor | None = None,
         *,
-        op: Mapping[str, Any] | None = None,
+        ctx: EncodeContext,
     ) -> Any:
-        del pixels, grid
-        if op is None:
-            raise invalid_descriptor("BAGEL latent encode requires an op descriptor")
-        return self.run_encode(dict(op))
+        return self.encode_many((EncodeRow(ctx=ctx, pixels=pixels, grid=grid),))[0]
 
     def run_text_logits_batch(self, ops):
         """Sequence prefill/decode through the system executor.
@@ -1862,14 +1877,9 @@ class BagelForUnifiedGeneration(UniModelBase):
     def _ensure_loaded(self) -> _LoadedBagelRuntime:
         model = self.model
         pool = self.kv_pool
-        image_processor = self.image_processor
-        if model is None or pool is None or image_processor is None:
+        if model is None or pool is None:
             raise capability_mismatch("BAGEL model weights are not loaded")
-        return _LoadedBagelRuntime(
-            model=model,
-            pool=pool,
-            image_processor=image_processor,
-        )
+        return _LoadedBagelRuntime(model=model, pool=pool)
 
     def _autocast(self):
         self._ensure_loaded()

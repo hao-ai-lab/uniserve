@@ -109,7 +109,6 @@ class ModelFamilyDescriptor:
     execution: FamilyExecutionContract
     processor_factory: Callable[[], Any] | None = None
     loader_name: str = "default"
-    image_pipeline_factory: Callable[[Any], Any] | None = None
 
     @classmethod
     def from_model_class(
@@ -145,7 +144,6 @@ class ModelFamilyDescriptor:
         self,
         *,
         processor_factory: Callable[[], Any],
-        image_pipeline_factory: Callable[[Any], Any] | None = None,
     ) -> "ModelFamilyDescriptor":
         return ModelFamilyDescriptor(
             family=self.family,
@@ -154,15 +152,9 @@ class ModelFamilyDescriptor:
             execution=self.execution,
             processor_factory=processor_factory,
             loader_name=self.loader_name,
-            image_pipeline_factory=image_pipeline_factory,
         )
 
     def processor(self) -> Any | None:
         if self.processor_factory is None:
             return None
         return self.processor_factory()
-
-    def image_pipeline(self, processor: Any) -> Any | None:
-        if self.image_pipeline_factory is None:
-            return None
-        return self.image_pipeline_factory(processor)

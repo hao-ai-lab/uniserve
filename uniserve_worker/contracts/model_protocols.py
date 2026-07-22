@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from uniserve_worker.runtime.residency import ResidencyManager
 
     from .caps import Caps
-    from .forward_batch import ForwardBatch
+    from .forward_batch import EncodeContext, ForwardBatch
     from .model_spec import ModelSpec
 
 __all__ = [
@@ -129,14 +129,10 @@ class UniModel(ABC):
     def velocity_parameterization(self) -> str:
         return "velocity"
 
-    def encode_image(
-        self, pixels: Any = None, grid: Any = None, *, op: Mapping[str, Any] | None = None
-    ) -> Any:
+    def encode_image(self, pixels: Any = None, grid: Any = None, *, ctx: "EncodeContext") -> Any:
         raise invalid_descriptor("encode-capable model must implement encode_image()")
 
-    def encode_latents(
-        self, pixels: Any = None, grid: Any = None, *, op: Mapping[str, Any] | None = None
-    ) -> Any:
+    def encode_latents(self, pixels: Any = None, grid: Any = None, *, ctx: "EncodeContext") -> Any:
         raise invalid_descriptor("encode-capable model must implement encode_latents()")
 
     def run_text_logits_batch(self, ops: list[Mapping[str, Any]]) -> list[Any]:

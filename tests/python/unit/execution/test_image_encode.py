@@ -1,4 +1,4 @@
-"""Image preprocessing and sequence-cache ingestion contracts."""
+"""Image preprocessing, the system input stage, and sequence-cache ingestion contracts."""
 
 from __future__ import annotations
 
@@ -10,10 +10,16 @@ import pytest
 import torch
 from PIL import Image
 
+from uniserve_worker.contracts.forward_batch import EncodeContext
+from uniserve_worker.contracts.model_spec import ImageInputSpec, ImagePatchSpec
+from uniserve_worker.execution.codec import run_encode_ops
 from uniserve_worker.execution.products import ImageEncoder
 from uniserve_worker.execution.sequence import SequenceCache
+from uniserve_worker.models.bagel import BagelForUnifiedGeneration
 from uniserve_worker.nn.vision import build_abs_positions_from_grid_hw
 from uniserve_worker.processors import get_processor_for_model
+from uniserve_worker.processors.bagel import BagelImageProcessor
+from uniserve_worker.processors.image_pipeline import ImageInputPipeline
 from uniserve_worker.processors.sensenova import (
     SENSENOVA_IMAGE_GEOMETRY,
     SenseNovaImageProcessor,
@@ -87,6 +93,131 @@ def test_encoder_handle_is_stable_and_nonzero():
     assert encoder_handle_from_mm_hash(0) != 0
     assert encoder_handle_from_mm_hash(1234) == encoder_handle_from_mm_hash(1234)
     assert encoder_handle_from_mm_hash(1234) != encoder_handle_from_mm_hash(1235)
+
+
+def _deterministic_image_b64(width: int = 96, height: int = 64) -> str:
+    image = Image.new("RGB", (width, height))
+    image.putdata(
+        [((x * 255) // width, (y * 255) // height, (x + y) % 256)
+         for y in range(height) for x in range(width)]
+    )
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _sensenova_image_spec() -> ImageInputSpec:
+    geometry = SENSENOVA_IMAGE_GEOMETRY
+    return ImageInputSpec(
+        vit=ImagePatchSpec(
+            patch_size=geometry.patch_size,
+            downsample_ratio=geometry.downsample_ratio,
+            min_pixels=geometry.min_pixels,
+            max_pixels=geometry.max_pixels,
+            multi_image_pixel_budget=geometry.multi_image_pixel_budget,
+        ),
+    )
+
+
+def test_input_stage_matches_sensenova_processor_math_bit_for_bit():
+    image_b64 = _deterministic_image_b64()
+    images = _sensenova_image_spec()
+    processor = SenseNovaImageProcessor.from_image_spec(images)
+    stage = ImageInputPipeline(images, processor)
+
+    prepared = stage.prepare("vit_encode", image_b64)
+
+    reference = processor.decode_image_b64(image_b64)
+    expected_pixels, expected_grid = processor.understanding_patches(reference)
+    assert torch.equal(prepared.pixels, expected_pixels)
+    assert torch.equal(prepared.grid, expected_grid)
+    assert prepared.image_hw == (reference.height, reference.width)
+
+
+def test_input_stage_matches_bagel_processor_math_bit_for_bit():
+    image_b64 = _deterministic_image_b64()
+    images = BagelForUnifiedGeneration(config={}).model_spec().inputs.images
+    assert images is not None
+    processor = BagelImageProcessor.from_image_spec(images)
+    stage = ImageInputPipeline(images, processor)
+
+    canvas = processor.prepare_from_b64(image_b64)
+    expected_hw = (canvas.size[1], canvas.size[0])
+
+    vit = stage.prepare("vit_encode", image_b64)
+    assert torch.equal(vit.pixels, processor.vit_tensor(canvas))
+    assert vit.grid is None
+    assert vit.image_hw == expected_hw
+
+    vae = stage.prepare("vae_encode", image_b64)
+    assert torch.equal(vae.pixels, processor.vae_tensor(canvas))
+    assert vae.image_hw == expected_hw
+
+
+def test_input_stage_stages_declared_dtype():
+    image_b64 = _deterministic_image_b64()
+    images = _sensenova_image_spec()
+    staged_images = ImageInputSpec(vit=images.vit, staging_dtype="bfloat16")
+    processor = SenseNovaImageProcessor.from_image_spec(images)
+
+    float_pixels = ImageInputPipeline(images, processor).prepare("vit_encode", image_b64)
+    staged = ImageInputPipeline(staged_images, processor).prepare("vit_encode", image_b64)
+
+    assert staged.pixels.dtype == torch.bfloat16
+    assert torch.equal(staged.pixels, float_pixels.pixels.to(torch.bfloat16))
+    assert torch.equal(staged.grid, float_pixels.grid)
+
+
+class _TensorOnlyEncodeModel:
+    """Encode entry double asserting the system-staged tensor boundary."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[torch.Tensor | None, torch.Tensor | None, EncodeContext]] = []
+
+    def encode_image(self, pixels, grid=None, *, ctx):
+        assert isinstance(ctx, EncodeContext)
+        self.calls.append((pixels, grid, ctx))
+        return {"req_id": ctx.req_id, "encoder_handle": ctx.handle, "num_tokens": 3}
+
+
+def test_model_encode_entry_receives_tensors_and_bounded_context():
+    images = _sensenova_image_spec()
+    stage = ImageInputPipeline(images, SenseNovaImageProcessor.from_image_spec(images))
+    model = _TensorOnlyEncodeModel()
+    op = {
+        "req_id": 5,
+        "kind": "vit_encode",
+        "image_b64": _deterministic_image_b64(),
+        "mm_hash": 77,
+        "cond_pos": 9,
+        "new_block_ids": [4, 5],
+        "pos_range": [10, 12],
+    }
+
+    outputs = run_encode_ops(model, (op,), image_stage=stage)
+
+    assert outputs[0]["encoder_handle"] == encoder_handle_from_mm_hash(77)
+    pixels, grid, ctx = model.calls[0]
+    assert isinstance(pixels, torch.Tensor) and isinstance(grid, torch.Tensor)
+    assert ctx.temporal_index == 9
+    assert ctx.new_block_ids == (4, 5)
+    assert ctx.pos_range == (10, 12)
+    assert not hasattr(ctx, "get"), "encode context must be a bounded view, not an op mapping"
+
+
+def test_cached_encode_row_replays_resident_handle_without_pixels():
+    model = _TensorOnlyEncodeModel()
+
+    outputs = run_encode_ops(
+        model,
+        ({"req_id": 6, "kind": "vit_encode", "image_in": 314, "cond_pos": 2},),
+        image_stage=None,
+    )
+
+    assert outputs[0]["encoder_handle"] == 314
+    pixels, grid, ctx = model.calls[0]
+    assert pixels is None and grid is None
+    assert ctx.handle == 314 and ctx.temporal_index == 2
 
 
 class _FakePast:

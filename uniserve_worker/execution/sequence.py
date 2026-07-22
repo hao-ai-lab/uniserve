@@ -294,30 +294,48 @@ class SequenceExecutor:
         return runner
 
     def extend_cache_blocks(self, cache: SequenceCache, op: Mapping[str, Any]) -> None:
+        self.extend_cache_span(
+            cache,
+            req_id=op.get("req_id"),
+            new_block_ids=op.get("new_block_ids"),
+            pos_range=op.get("pos_range"),
+        )
+
+    def extend_cache_span(
+        self,
+        cache: SequenceCache,
+        *,
+        req_id: int | None,
+        new_block_ids: Sequence[int] | None,
+        pos_range: Sequence[int] | None,
+    ) -> None:
         # Host-issued KV block ids belong only to host-KV caches. Scratch caches
         # use worker-local block ids and must not ingest host ids.
         if cache.past is None or getattr(cache.past, "pool", None) is self.owner.kv_pool:
-            append_new_block_ids(cache.block_ids, op.get("new_block_ids"))
-            self._validate_cache_write_range(cache, op)
+            append_new_block_ids(cache.block_ids, list(new_block_ids or ()))
+            self._validate_cache_write_range(cache, req_id=req_id, pos_range=pos_range)
         if cache.past is not None and getattr(cache.past, "pool", None) is self.owner.kv_pool:
             cache.past.set_blocks(cache.block_ids)
 
     @staticmethod
-    def _validate_cache_write_range(cache: SequenceCache, op: Mapping[str, Any]) -> None:
-        """Guard the op's declared host-KV write span before any KV mutation.
+    def _validate_cache_write_range(
+        cache: SequenceCache,
+        *,
+        req_id: int | None,
+        pos_range: Sequence[int] | None,
+    ) -> None:
+        """Guard the declared host-KV write span before any KV mutation.
 
         The runtime ``KvStore`` (owned by the ambient session table) checks the
         span against the request's prefix-reference boundary and the cache's
         leased block capacity.
         """
-        pos_range = op.get("pos_range")
         if not pos_range or len(pos_range) < 2:
             return
         sessions = get_forward_context().request_states
         kv_store = getattr(sessions, "kv", None)
         if kv_store is None:
             return
-        req_id = op.get("req_id")
         if req_id is None:
             return
         state = sessions.peek(int(req_id))
