@@ -8,11 +8,13 @@ from uniserve_worker.execution.flow import PreparedFlowStep
 from uniserve_worker.models.bagel import (
     BagelConfig,
     BagelForUnifiedGeneration,
+    GenState,
     _BagelGraph,
 )
-from uniserve_worker.nn.diffusion import euler_step
+from uniserve_worker.nn.diffusion import FlowMatchSchedule, ScheduleDirection, euler_step
 from uniserve_worker.nn.diffusion.noise import init_latent
 from uniserve_worker.runtime.request_state import RequestState
+from uniserve_worker.runtime.residency import LatentStore
 
 pytestmark = pytest.mark.unit
 
@@ -116,12 +118,31 @@ def test_bagel_flow_update_keeps_fp32_state_and_matches_reference_arithmetic(dev
     t = torch.tensor(0.8, dtype=torch.float32, device=device)
     t_next = torch.tensor(0.7, dtype=torch.float32, device=device)
     expected = latent - velocity * (t - t_next)
-    generation_state = SimpleNamespace(x_t=latent)
+    store = LatentStore()
+    generation_state = GenState(
+        latent_pool=store,
+        latent_handle=1,
+        vae_pos_ids=torch.zeros(latent.shape[0], dtype=torch.long),
+        num_vae=int(latent.shape[0]),
+        H=32,
+        W=48,
+        schedule=FlowMatchSchedule(
+            num_steps=1, shift=1.0, direction=ScheduleDirection.DESCENDING
+        ),
+        cfg_text_scale=1.0,
+        cfg_img_scale=1.0,
+        cfg_renorm_type="global",
+        cfg_renorm_min=0.0,
+        cfg_interval=(0.4, 1.0),
+        cond_pos=0,
+    )
+    generation_state.x_t = latent
+    committed = latent.clone()
     step = PreparedFlowStep(
         req_id=1,
         state=RequestState(),
         op={},
-        latent=latent,
+        latent=generation_state.x_t,
         t=t,
         t_next=t_next,
         step_index=0,
@@ -134,10 +155,18 @@ def test_bagel_flow_update_keeps_fp32_state_and_matches_reference_arithmetic(dev
         extra={"gs": generation_state},
     )
 
-    owner.apply_flow_update(step, euler_step(latent, velocity, t, t_next))
+    updated = euler_step(generation_state.x_t, velocity, t, t_next)
+    owner.apply_flow_update(step, updated)
 
     assert generation_state.x_t.dtype == torch.float32
     assert torch.equal(generation_state.x_t, expected)
+    # The accepted update replaces the system latent buffer with the euler
+    # output itself — no copy on the success path — while the prior committed
+    # tensor object stays intact for transactional rollback.
+    assert generation_state.x_t is updated
+    assert store.get(1) is updated
+    assert updated is not latent
+    assert torch.equal(latent, committed)
 
 
 def test_euler_update_preserves_existing_bfloat16_latent_behavior():

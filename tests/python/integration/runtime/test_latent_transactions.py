@@ -1,0 +1,249 @@
+"""Latent transaction conformance for executor-driven denoise steps.
+
+A failed denoise step must leave every touched request's committed flow latent and schedule cursor unchanged, whether the failure lands in a sibling operation of the same step or midway through a multi-step denoise burst, and retrying the same operations must reproduce the uninterrupted trajectory bit for bit. The success path commits the accepted update tensor itself into the system latent store without an extra copy.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import torch
+
+from uniserve_worker.contracts import UniModel
+from uniserve_worker.contracts.batches import seal_batch
+from uniserve_worker.contracts.forward_context import get_forward_context
+from uniserve_worker.contracts.resource_plan import ResourcePlan
+from uniserve_worker.execution import ExecutorConfig, ModelExecutor
+from uniserve_worker.execution.flow import PreparedFlowStep
+from uniserve_worker.models.bagel import GenState
+from uniserve_worker.nn.diffusion import FlowMatchSchedule, ScheduleDirection
+from uniserve_worker.runtime.residency import KvCacheSpec, ResidencyManager
+from uniserve_worker.runtime.resources import ResourceRuntime
+
+pytestmark = pytest.mark.integration
+
+_STEPS = 4
+_LATENT_SHAPE = (4, 2)
+
+
+class HandleLatentDenoiseCPUModel(UniModel):
+    """Denoise model whose generation state leases its latent from the LatentStore.
+
+    The velocity is a deterministic function of the committed latent, so the final latent observably depends on every accepted step; per-(request, step) failure sets inject faults after a sibling's update was accepted and midway through a burst.
+    """
+
+    resource_classes = ("kv_block",)
+    resource_plan = ResourcePlan(kv_block="per_block")
+    supported_ops = ("denoise_gen",)
+    adapter_mode = "none"
+    device = "cpu"
+    num_layers = 1
+    num_blocks = 8
+    block_size = 16
+    eos_id = 2
+    img_start_id = 3
+
+    def __init__(self, residency: ResidencyManager) -> None:
+        self.residency = residency
+        self.segment_executor = SimpleNamespace(release_staging=lambda cache: None)
+        self.fail_predict: set[tuple[int, int]] = set()
+        self.fail_accept: set[tuple[int, int]] = set()
+        self.accepted: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def prepare_flow(self, state: Any, op: Any) -> PreparedFlowStep:
+        req_id = int(op["req_id"])
+        latent_view = get_forward_context().latent_view
+        assert latent_view is not None
+        generation_state = latent_view.state(req_id)
+        step_index = int(op.get("timestep_idx", state.schedule_cursor) or 0)
+        if step_index == 0 and generation_state is None:
+            generation_state = GenState(
+                latent_pool=self.residency.latent,
+                latent_handle=req_id,
+                vae_pos_ids=torch.zeros(_LATENT_SHAPE[0], dtype=torch.long),
+                num_vae=_LATENT_SHAPE[0],
+                H=8,
+                W=8,
+                schedule=FlowMatchSchedule(
+                    num_steps=_STEPS, shift=1.0, direction=ScheduleDirection.DESCENDING
+                ),
+                cfg_text_scale=1.0,
+                cfg_img_scale=1.0,
+                cfg_renorm_type="global",
+                cfg_renorm_min=0.0,
+                cfg_interval=(0.0, 1.0),
+                cond_pos=0,
+            )
+            generation_state.x_t = torch.randn(
+                _LATENT_SHAPE,
+                generator=torch.Generator(device="cpu").manual_seed(req_id),
+                dtype=torch.float32,
+            )
+            latent_view.set_state(req_id, generation_state)
+        assert generation_state is not None
+        t, t_next = generation_state.schedule.pair(step_index, device="cpu")
+        return PreparedFlowStep(
+            req_id=req_id,
+            state=state,
+            op=op,
+            latent=generation_state.x_t,
+            t=t,
+            t_next=t_next,
+            step_index=step_index,
+            total_steps=_STEPS,
+            cfg_text_scale=1.0,
+            cfg_img_scale=1.0,
+            cfg_interval=(0.0, 1.0),
+            cfg_renorm_type="global",
+            cfg_renorm_min=0.0,
+            cfg_branch_count=1,
+            extra={"gs": generation_state},
+        )
+
+    def predict_velocity(self, ctx: Any, t: Any, latent: Any, branch: Any) -> torch.Tensor:
+        if (int(ctx.req_id), int(ctx.step_index)) in self.fail_predict:
+            raise RuntimeError("injected failure in velocity prediction")
+        return latent * 0.5
+
+    def accept_flow_update(self, ctx: Any, latent: torch.Tensor) -> None:
+        if (int(ctx.req_id), int(ctx.step_index)) in self.fail_accept:
+            raise RuntimeError("injected failure before this row's update was accepted")
+        generation_state = ctx.extra["gs"]
+        generation_state.x_t = latent.to(
+            dtype=generation_state.x_t.dtype, device=generation_state.x_t.device
+        )
+        self.accepted.append((latent, generation_state.x_t))
+
+
+def _fresh() -> tuple[HandleLatentDenoiseCPUModel, ModelExecutor]:
+    ledger = ResourceRuntime(("kv_block",), totals={"kv_block": 8})
+    residency = ResidencyManager.build(
+        KvCacheSpec(num_layers=1, num_kv_heads=1, head_dim=4, dtype=torch.float32),
+        num_blocks=8,
+        block_size=16,
+        device="cpu",
+        ledger=ledger,
+    )
+    model = HandleLatentDenoiseCPUModel(residency)
+    executor = ModelExecutor(
+        model,
+        config=ExecutorConfig(simulation=True),
+        resource_runtime=ledger,
+        residency=residency,
+    )
+    assert executor.latent_store is not None
+    return model, executor
+
+
+def _denoise_batch(step_id: int, req_ids: list[int], **kwargs: Any) -> dict[str, Any]:
+    return seal_batch(
+        step_id,
+        [{"req_id": req_id, "kind": "denoise_gen"} for req_id in req_ids],
+        **kwargs,
+    )
+
+
+def _burst_batch(
+    step_id: int, req_id: int, *, step_count: int, **kwargs: Any
+) -> dict[str, Any]:
+    return seal_batch(
+        step_id,
+        [{"req_id": req_id, "kind": "denoise_gen", "denoise_step_count": step_count}],
+        **kwargs,
+    )
+
+
+def _new_reqs(req_ids: list[int]) -> list[dict[str, Any]]:
+    return [{"req_id": req_id, "block_ids": []} for req_id in req_ids]
+
+
+def test_failed_sibling_denoise_step_restores_latent_and_schedule_cursor():
+    model, executor = _fresh()
+    _control_model, control = _fresh()
+
+    executor.execute(_denoise_batch(1, [5, 6], new_reqs=_new_reqs([5, 6])))
+    control.execute(_denoise_batch(1, [5, 6], new_reqs=_new_reqs([5, 6])))
+    committed_5 = executor.latent_store.get(5)
+    committed_6 = executor.latent_store.get(6)
+    state_5 = executor.latent_store.state(5)
+    snapshot_5 = committed_5.clone()
+    snapshot_6 = committed_6.clone()
+
+    # Request 5's second update is accepted before request 6's acceptance fails,
+    # so the rollback must undo an already-applied sibling latent update.
+    model.fail_accept.add((6, 1))
+    with pytest.raises(RuntimeError, match="injected failure"):
+        executor.execute(_denoise_batch(2, [5, 6], base_version=1))
+    model.fail_accept.clear()
+
+    assert executor.latent_store.get(5) is committed_5
+    assert executor.latent_store.get(6) is committed_6
+    assert executor.latent_store.state(5) is state_5
+    assert torch.equal(committed_5, snapshot_5)
+    assert torch.equal(committed_6, snapshot_6)
+    assert executor.sessions.get(5).schedule_cursor == 1
+    assert executor.sessions.get(6).schedule_cursor == 1
+    assert executor.sessions.get(5).version == 1
+    assert executor.sessions.get(6).version == 1
+
+    # The retried step and the remaining schedule reproduce the uninterrupted
+    # trajectory bit for bit.
+    for step_id in (2, 3, 4):
+        retried = executor.execute(_denoise_batch(step_id, [5, 6], base_version=step_id - 1))
+        expected = control.execute(_denoise_batch(step_id, [5, 6], base_version=step_id - 1))
+        assert [row["num_steps_done"] for row in retried["per_seq"]] == [
+            row["num_steps_done"] for row in expected["per_seq"]
+        ]
+    for req_id in (5, 6):
+        assert torch.equal(executor.latent_store.get(req_id), control.latent_store.get(req_id))
+
+
+def test_mid_burst_failure_restores_pre_burst_latent_and_retry_is_bit_identical():
+    model, executor = _fresh()
+    _control_model, control = _fresh()
+
+    executor.execute(_denoise_batch(1, [7], new_reqs=_new_reqs([7])))
+    control.execute(_denoise_batch(1, [7], new_reqs=_new_reqs([7])))
+    committed = executor.latent_store.get(7)
+    snapshot = committed.clone()
+
+    # The burst covers the remaining three schedule steps and fails on its
+    # second one, after the first in-burst update was already accepted.
+    model.fail_predict.add((7, 2))
+    with pytest.raises(RuntimeError, match="injected failure"):
+        executor.execute(_burst_batch(2, 7, step_count=3, base_version=1))
+    model.fail_predict.clear()
+
+    assert executor.latent_store.get(7) is committed
+    assert torch.equal(committed, snapshot)
+    assert executor.sessions.get(7).schedule_cursor == 1
+    assert executor.sessions.get(7).version == 1
+
+    retried = executor.execute(_burst_batch(3, 7, step_count=3, base_version=1))
+    expected = control.execute(_burst_batch(2, 7, step_count=3, base_version=1))
+    assert retried["per_seq"][0]["denoise_done"] is True
+    assert retried["per_seq"][0]["num_steps_done"] == expected["per_seq"][0]["num_steps_done"]
+    assert torch.equal(executor.latent_store.get(7), control.latent_store.get(7))
+
+
+def test_denoise_success_path_commits_the_accepted_tensor_without_copies():
+    model, executor = _fresh()
+
+    executor.execute(_denoise_batch(1, [9], new_reqs=_new_reqs([9])))
+    first = executor.latent_store.get(9)
+    accepted, stored = model.accepted[-1]
+    assert stored is accepted
+    assert first is stored
+    first_snapshot = first.clone()
+
+    executor.execute(_denoise_batch(2, [9], base_version=1))
+    second = executor.latent_store.get(9)
+    accepted, stored = model.accepted[-1]
+    assert stored is accepted
+    assert second is stored
+    # Each accepted step replaces the buffer entry with a fresh tensor and
+    # leaves the prior step's tensor storage untouched.
+    assert second is not first
+    assert torch.equal(first, first_snapshot)
