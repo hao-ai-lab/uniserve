@@ -100,6 +100,7 @@ def test_pipeline_depth_is_part_of_worker_contract():
 
 
 class _VisionModel(UniModel):
+    supported_ops = ("vit_encode",)
     num_layers = 1
     encoder_cache_budget = 4
 

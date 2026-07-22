@@ -51,7 +51,7 @@ class EncoderWorker(BaseWorker):
         )
         supported_ops = self._supported_encode_ops()
         if not supported_ops:
-            raise capability_mismatch("encoder worker requires encode_image() or encode_latents()")
+            raise capability_mismatch("encoder worker model must declare an encode op")
         declared_capabilities = model_free_capabilities(
             block_size=self.block_size,
             supported_ops=supported_ops,
@@ -81,7 +81,7 @@ class EncoderWorker(BaseWorker):
         self.executor.drop_request(int(request_id))
 
     def free_encoder(self, handles: Any) -> None:
-        free_encoder_handles(self.model, handles)
+        free_encoder_handles(self.executor.product_store, handles)
 
     def _create_residency_manager(self) -> ResidencyManager | None:
         from ..runtime.residency import ResidencyManager
@@ -92,11 +92,5 @@ class EncoderWorker(BaseWorker):
         return ResidencyManager.build_gen(generation_spec)
 
     def _supported_encode_ops(self) -> tuple[str, ...]:
-        supported_ops: list[str] = []
-        encode_image = getattr(type(self.model), "encode_image", None)
-        if encode_image is not None and encode_image is not UniModel.encode_image:
-            supported_ops.append(VIT_ENCODE)
-        encode_latents = getattr(type(self.model), "encode_latents", None)
-        if encode_latents is not None and encode_latents is not UniModel.encode_latents:
-            supported_ops.append(VAE_ENCODE)
-        return tuple(supported_ops)
+        declared = tuple(str(op) for op in (self.model.supported_ops or ()))
+        return tuple(op for op in (VIT_ENCODE, VAE_ENCODE) if op in declared)

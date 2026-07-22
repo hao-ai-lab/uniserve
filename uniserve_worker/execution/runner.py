@@ -102,6 +102,7 @@ from .flow import (
 )
 from .operation_executor import OperationExecutor
 from .planning import _TEXT_MODES, _ForwardPlanBuilder, _UnifiedForwardBatchBuilder
+from .products import build_commit_materializer
 from .sampling import (
     _DECODE_RELAY,
     DeferredDecodeBurstSeqResult,
@@ -814,7 +815,14 @@ class ModelExecutor:
                 rng_device=rng_device,
             )
             self.latent_store = state_residency.latent
-            self.product_store: ProductStore | None = ProductStore()
+            self.product_store: ProductStore | None = ProductStore(
+                encoder_cache_budget=int(
+                    getattr(state_residency, "encoder_cache_budget", 0) or 0
+                ),
+            )
+            bind_products = getattr(segment_executor, "bind_products", None)
+            if callable(bind_products):
+                bind_products(self.product_store)
             transaction_stores: tuple[TransactionalStore, ...] = (
                 self.flow_store,
                 self.latent_store,
@@ -825,6 +833,14 @@ class ModelExecutor:
             self.latent_store = None
             self.product_store = None
             transaction_stores = ()
+        # Commit materialization is executor-owned: the family driver already
+        # held by the segment executor, or the family driver built from the
+        # model's declared adapter surface.
+        self.commit_materializer = (
+            getattr(segment_executor, "commit_materializer", None)
+            if segment_executor is not None
+            else None
+        ) or build_commit_materializer(model)
         self.operation_executor = OperationExecutor(
             self.sessions,
             self._execute_once,
@@ -1250,13 +1266,14 @@ class ModelExecutor:
                 return result
             return ForwardResult(runtime_outputs=tuple(self._diffusion.step_many(items, model)))
         if batch.mode is ForwardMode.COMMIT:
-            return commit_result(items, model, row_indices=rows)
+            return commit_result(items, self.commit_materializer, row_indices=rows)
         if batch.mode is ForwardMode.ENCODE:
             return encode_result(
                 batch,
                 model,
                 image_stage=self.image_input_stage,
                 row_indices=rows,
+                products=self.product_store,
             )
         raise invalid_descriptor("mixed-mode models must implement forward(batch)")
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -217,22 +219,22 @@ def test_paged_kv_pool_fp8_storage_dequantizes_dense_reads():
 
 
 class CommitCapabilityModel(UniModel):
+    """Commit-capable contract: the model exposes only the neural decode entry."""
+
     resource_classes: tuple[str, ...] = ()
 
     def __init__(self) -> None:
-        self.calls: list[int] = []
+        self.latents: list[Any] = []
         self.inference_modes: list[bool] = []
 
-    def decode_image(self, latent, *, req_id, state, op):
-        del latent, op
-        self.calls.append(req_id)
+    def vae_decode(self, latent, *, height=None, width=None):
+        del height, width
+        self.latents.append(latent)
         self.inference_modes.append(torch.is_inference_mode_enabled())
-        state.latent = "finished"
-        state.schedule_cursor = 7
-        return {"req_id": req_id, "image_hw": [8, 8]}
+        return {"image_hw": [8, 8]}
 
 
-def test_runner_commit_uses_decode_image_capability_and_resets_state():
+def test_runner_commit_drives_neural_decode_and_resets_state():
     model = CommitCapabilityModel()
     runner = ModelExecutor(model, config=ExecutorConfig(simulation=True))
 
@@ -243,12 +245,23 @@ def test_runner_commit_uses_decode_image_capability_and_resets_state():
             new_reqs=[{"req_id": 5, "block_ids": []}],
         )
     )
-
     assert result["per_seq"][0]["req_id"] == 5
     assert result["per_seq"][0]["image_hw"] == [8, 8]
-    assert model.calls == [5]
     assert model.inference_modes == [True]
+
+    # A later commit resets the request's generation state even when prior
+    # steps left a latent and schedule cursor behind.
     state = runner.sessions.get(5)
+    state.latent = "resident"
+    state.schedule_cursor = 7
+    runner.execute(
+        seal_batch(
+            2,
+            [{"req_id": 5, "kind": "commit_gen"}],
+            base_version=1,
+        )
+    )
+    assert model.latents[1] == "resident"
     assert state.latent is None
     assert state.schedule_cursor == 0
 
@@ -256,10 +269,9 @@ def test_runner_commit_uses_decode_image_capability_and_resets_state():
 class CommitLogitsCapabilityModel(UniModel):
     resource_classes: tuple[str, ...] = ()
 
-    def decode_image(self, latent, *, req_id, state, op):
-        del latent, state, op
+    def vae_decode(self, latent, *, height=None, width=None):
+        del latent, height, width
         return {
-            "req_id": req_id,
             "image_hw": [4, 4],
             "logits": torch.tensor([0.0, 2.0, 1.0], dtype=torch.float32),
         }

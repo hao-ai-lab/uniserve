@@ -31,9 +31,7 @@ __all__ = [
     "KvPool",
     "ScratchKvPool",
     "LatentStore",
-    "EncoderCache",
     "ResidencyManager",
-    "encoder_handle_from_mm_hash",
 ]
 
 DEFAULT_ENCODER_CACHE_BUDGET = 256
@@ -137,44 +135,6 @@ class LatentStore:
         return int(handle) in self._buffers
 
 
-def encoder_handle_from_mm_hash(mm_hash: int | None) -> int:
-    """Derive a stable, nonzero 64-bit encoder handle from an image content hash.
-
-    The handle must be deterministic from ``mm_hash`` and nonzero (0 means
-    no handle). A SplitMix64 finalizer spreads the hash across the u64 space.
-    """
-    x = int(mm_hash or 0) & 0xFFFFFFFFFFFFFFFF
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9 & 0xFFFFFFFFFFFFFFFF
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EB & 0xFFFFFFFFFFFFFFFF
-    x = (x ^ (x >> 31)) & 0xFFFFFFFFFFFFFFFF
-    return x or 0x9E3779B97F4A7C15
-
-
-class EncoderCache:
-    """System-owned encoder-output store (``encoder_output`` resource class).
-
-    Handle->embedding residency, keyed by the encoder handle the host issues
-    (derived from ``mm_hash`` for cross-request reuse). The worker owns the
-    budget and eviction.
-    """
-
-    def __init__(self, budget: int = 0) -> None:
-        self._store: dict[int, Any] = {}
-        self.budget = int(budget)
-
-    def put(self, handle: int, value: Any) -> None:
-        self._store[int(handle)] = value
-
-    def get(self, handle: int) -> Any:
-        return self._store.get(int(handle))
-
-    def pop(self, handle: int) -> Any:
-        return self._store.pop(int(handle), None)
-
-    def __contains__(self, handle: int) -> bool:
-        return int(handle) in self._store
-
-
 @dataclass(frozen=True)
 class KvCacheSpec:
     """The KV geometry a model *declares* so the system can own the pool.
@@ -222,9 +182,11 @@ class GenResidencySpec:
 class ResidencyManager:
     """Worker-owned physical residency for the leased resource classes.
 
-    Holds the KV pool today; the latent / scratch-KV / encoder-cache pools are
-    attached for generation (they share the same handle->buffer rule). The
-    optional ``ledger`` is the :class:`ResourceRuntime` count cross-check.
+    Holds the KV pool today; the latent / scratch-KV pools are attached for
+    generation (they share the same handle->buffer rule). Encoder-output
+    residency lives in the executor's ``ProductStore`` (intermediate products);
+    the manager carries only the declared budget. The optional ``ledger`` is
+    the :class:`ResourceRuntime` count cross-check.
     """
 
     def __init__(
@@ -234,21 +196,18 @@ class ResidencyManager:
         latent: Any | None = None,
         scratch: Any | None = None,
         gen_scratch: Any | None = None,
-        encoder: Any | None = None,
         encoder_cache_budget: int = 0,
         ledger: "ResourceRuntime | None" = None,
     ) -> None:
         self.kv = kv
-        # The handle-addressed stores (latent trajectories, encoder embeddings)
-        # are pure dict residency — always present so the universal "handle->buffer"
-        # rule holds even before a model declares GPU geometry. The sized GPU pools
-        # (kv / scratch / gen_scratch) are what build()/build_gen() add.
+        # The handle-addressed latent store is pure dict residency — always
+        # present so the universal "handle->buffer" rule holds even before a
+        # model declares GPU geometry. The sized GPU pools (kv / scratch /
+        # gen_scratch) are what build()/build_gen() add.
         self.latent = latent if latent is not None else LatentStore()     # image_latent class
         self.scratch = scratch        # ScratchKvPool: per-CFG-branch uncond KV (scratch class)
         self.gen_scratch = gen_scratch  # gen-device scratch (tower-axis generation pool)
-        self.encoder = (
-            encoder if encoder is not None else EncoderCache(encoder_cache_budget)
-        )  # encoder_output class
+        self.encoder_cache_budget = int(encoder_cache_budget)  # encoder_output class sizing
         self.ledger = ledger
 
     @classmethod

@@ -26,16 +26,12 @@ from uniserve_worker.execution.flow import (
     PreparedFlowStep,
     ProgramState,
 )
-from uniserve_worker.execution.products import (
-    ImageEncoder,
-    ImageMaterializer,
-    ProductTransferSession,
-)
+from uniserve_worker.execution.products import ProductTransferSession
 from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
 
-from ...contracts.forward_batch import EncodeContext, ForwardBatch
+from ...contracts.forward_batch import ForwardBatch
 from ...contracts.forward_context import get_forward_context
 from ...contracts.model_spec import (
     CacheSpec,
@@ -2797,13 +2793,6 @@ class SenseNovaU1ForUnifiedGeneration(
             self._shared_text_driver = driver
         return driver
 
-    def _commit_driver(self) -> ImageMaterializer:
-        driver = getattr(self, "_shared_commit_driver", None)
-        if driver is None:
-            driver = ImageMaterializer(self, self.tower_session)
-            self._shared_commit_driver = driver
-        return driver
-
     def _state(self, op: dict[str, Any]) -> ProgramState:
         return self._text_driver().state(op)
 
@@ -3054,101 +3043,6 @@ class SenseNovaU1ForUnifiedGeneration(
     def _empty_img_start_prefix(self) -> SequenceCache:
         return self._text_driver().empty_img_start_prefix()
 
-    def commit_generated_image(self, req_id: int, state: Any, op: dict[str, Any]) -> dict[str, Any]:
-        op = dict(op)
-        if op.get("kind") == "commit_writeback":
-            return self._commit_driver().commit_writeback(op)
-        return self._commit_driver().commit_generated_image(op)
-
-    def _ingest_driver(self) -> ImageEncoder:
-        driver = getattr(self, "_shared_ingest_driver", None)
-        if driver is None:
-            driver = ImageEncoder(self)
-            self._shared_ingest_driver = driver
-        return driver
-
-    def encode_image(
-        self,
-        pixels: torch.Tensor | None = None,
-        grid: torch.Tensor | None = None,
-        *,
-        ctx: EncodeContext,
-    ) -> dict[str, Any]:
-        """Ingest an external understanding image (``vit_encode``).
-
-        The system input stage hands the staged patch rows, grid, and the
-        shared temporal RoPE index; the begin/end markers are ordinary prompt
-        tokens, so this op appends only the patch block into the conditional
-        text cache and reports how many vision tokens it added.
-        """
-        if self.model is None:
-            raise RuntimeError("SenseNova model weights are not loaded")
-        if ctx.temporal_index is None:
-            raise invalid_descriptor("vit_encode requires the shared temporal index (cond_pos)")
-
-        st = self.program_state(ctx.req_id)
-        text_driver = self._text_driver()
-        text_driver.extend_cache_span(
-            st.cond,
-            req_id=ctx.req_id,
-            new_block_ids=ctx.new_block_ids,
-            pos_range=ctx.pos_range,
-        )
-        text_driver.ensure_host_cache(st.cond)
-
-        driver = self._ingest_driver()
-        if pixels is not None:
-            if grid is None or ctx.image_hw is None:
-                raise invalid_descriptor("vit_encode pixels require a patch grid and dimensions")
-            image_hw = [int(value) for value in ctx.image_hw]
-            vit_embeds = driver.encode_understanding_image(pixels, grid).detach()
-            grid_hw = grid
-            self.residency.encoder.put(
-                ctx.handle,
-                {
-                    "kind": "vit_encode",
-                    "vit_embeds": vit_embeds,
-                    "grid_hw": grid_hw.detach(),
-                    "image_hw": image_hw,
-                },
-            )
-        else:
-            cached = self.residency.encoder.get(ctx.handle)
-            if not isinstance(cached, Mapping) or cached.get("kind") != "vit_encode":
-                raise invalid_descriptor("cached vit_encode handle is not resident")
-            cached_vit_embeds = cached.get("vit_embeds")
-            cached_grid_hw = cached.get("grid_hw")
-            cached_image_hw = cached.get("image_hw")
-            if not isinstance(cached_vit_embeds, torch.Tensor) or not isinstance(
-                cached_grid_hw, torch.Tensor
-            ):
-                raise invalid_descriptor("cached vit_encode payload is incomplete")
-            if (
-                not isinstance(cached_image_hw, list)
-                or len(cached_image_hw) != 2
-                or any(
-                    not isinstance(value, int) or isinstance(value, bool)
-                    for value in cached_image_hw
-                )
-            ):
-                raise invalid_descriptor("cached vit_encode dimensions are invalid")
-            vit_embeds = cached_vit_embeds
-            grid_hw = cached_grid_hw
-            image_hw = [int(value) for value in cached_image_hw]
-
-        num_tokens = driver.ingest_understanding_embeddings(
-            st.cond,
-            vit_embeds,
-            grid_hw,
-            t_index=int(ctx.temporal_index),
-        )
-        return {
-            "req_id": ctx.req_id,
-            "encoder_handle": ctx.handle,
-            "num_tokens": num_tokens,
-            "image_hw": image_hw,
-        }
-
     def program_state(self, req_id: int) -> ProgramState:
         kv_view = get_forward_context().kv_view
         if kv_view is None:
@@ -3188,19 +3082,6 @@ class SenseNovaU1ForUnifiedGeneration(
 
     def _denoise_branch_inputs(self, image: FlowState, branch: str) -> tuple[torch.Tensor, Any]:
         return self.flow_execution._denoise_branch_inputs(image, branch)
-
-    def decode_image(
-        self,
-        latent: Any,
-        *,
-        req_id: int | None = None,
-        state: Any = None,
-        op: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del latent, state
-        if req_id is None or op is None:
-            raise invalid_descriptor("SenseNova image commit requires req_id and op")
-        return self.commit_generated_image(int(req_id), None, dict(op))
 
     @torch.inference_mode()
     def forward(self, batch: ForwardBatch) -> Any:

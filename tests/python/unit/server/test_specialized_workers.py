@@ -100,6 +100,7 @@ def test_frame_accumulator_worker_counts_and_releases_frames():
 
 
 class _FakeVisionModel(UniModel):
+    supported_ops = ("vit_encode",)
     num_layers = 2
     max_latent_size = 0
     latent_downsample = 1

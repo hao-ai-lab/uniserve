@@ -43,13 +43,12 @@ WORKER_SERVED_CONTROLS = ADAPTER_CONTROLS | {
 }
 
 
-def free_encoder_handles(model: UniModel, handles: Any) -> None:
-    """Release system-owned encoder-output residency for the given handles."""
-    residency = model.residency
-    if residency is None:
+def free_encoder_handles(products: Any, handles: Any) -> None:
+    """Release intermediate encoder-output products for the given handles."""
+    if products is None:
         return
     for handle in handles or []:
-        residency.encoder.pop(int(handle))
+        products.pop_intermediate(int(handle))
 
 
 def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") -> None:
@@ -214,7 +213,7 @@ class ModelWorker(BaseWorker):
             logger.info("unmerged LoRA adapter %s", lora_id)
 
     def free_encoder(self, handles: Any) -> None:
-        free_encoder_handles(self.model, handles)
+        free_encoder_handles(self.model_executor.product_store, handles)
 
     def reset_prefix_cache(self) -> None:
         pass
