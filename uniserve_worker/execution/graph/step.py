@@ -587,7 +587,7 @@ def _synthetic_plan(
     decode_page_ids, decode_page_offsets = decode_write_locations(
         block_table,
         cache_seqlens,
-        cache.pool.block_size,
+        cache.block_size,
     )
     return PagedDecodePlan(
         residency_cache=cache,
@@ -760,7 +760,7 @@ def copy_inputs(
         page_ids, offsets = decode_write_locations(
             state.block_table[:actual_batch],
             state.cache_seqlens[:actual_batch],
-            state.cache.pool.block_size,
+            state.cache.block_size,
         )
         decode_page_ids[:actual_batch].copy_(page_ids, non_blocking=True)
         decode_page_offsets[:actual_batch].copy_(offsets, non_blocking=True)
@@ -813,7 +813,7 @@ def copy_host(
         page_ids, offsets = _host_write_locations(
             block_rows,
             cache_lens,
-            int(state.cache.pool.block_size),
+            int(state.cache.block_size),
         )
 
     replacement_values = dense_replacements(

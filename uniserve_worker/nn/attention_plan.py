@@ -74,7 +74,7 @@ class AttentionExecutionPlan:
     ) -> Any:
         if kv_cache is None:
             return self._path.DENSE
-        paged_eligible = update_cache and hasattr(kv_cache, "pool")
+        paged_eligible = update_cache and callable(getattr(kv_cache, "layer_kv", None))
         if paged_eligible:
             if owner._can_run_paged_varlen_prefill(ctx, preferred, kv_cache, q, k, v):
                 return self._path.PAGED_VARLEN

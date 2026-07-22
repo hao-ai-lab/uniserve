@@ -301,7 +301,7 @@ class _AutoregressiveRuntime:
         ctx = get_forward_context()
         input_ids, positions = self._reshape_inputs(batch, text)
         with use_forward_context(
-            replace(ctx, attention_plan=batch.attn_plan, kv_pool=self.kv_pool)
+            replace(ctx, attention_plan=batch.attn_plan)
         ):
             logits = self._run_model_forward(
                 model,
@@ -807,7 +807,7 @@ class _AutoregressiveRuntime:
         input_ids, positions = self._reshape_inputs(fb, text)
         start = component_timer_start(stats)
         with profile_range("uniserve.text.model_forward"):
-            with use_forward_context(replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)):
+            with use_forward_context(replace(ctx, attention_plan=fb.attn_plan)):
                 logits = self._run_model_forward(
                     model,
                     input_ids,
@@ -855,7 +855,7 @@ class _AutoregressiveRuntime:
                 request_states=request_states,
                 input_ids_override=relay,
             )
-            with use_forward_context(replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)):
+            with use_forward_context(replace(ctx, attention_plan=fb.attn_plan)):
                 logits = _text_model_forward(model, fb)
             rows.append(logits.reshape(-1, logits.shape[-1])[-1])
             next_positions.append((int(req_id), int(pos_range[1])))
@@ -1089,7 +1089,7 @@ class _AutoregressiveRuntime:
             )
             batch.return_all_logits = bool(op.get("return_all_logits"))
             with use_forward_context(
-                replace(ctx, attention_plan=batch.attn_plan, kv_pool=self.kv_pool)
+                replace(ctx, attention_plan=batch.attn_plan)
             ):
                 logits = _text_model_forward(model, batch)
         if not isinstance(logits, torch.Tensor) or logits.ndim == 0:

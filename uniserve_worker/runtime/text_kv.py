@@ -8,8 +8,7 @@ from typing import Any, cast
 import torch
 
 from ..backends.paged_kv_math import decode_write_locations
-from ..contracts.attention_plan import AttentionPlanBase, PagedDecodePlan, PagedVarlenPlan
-from ..contracts.forward_context import AttentionCache
+from ..contracts.attention_plan import AttnPlan, KvView, PagedDecodePlan, PagedVarlenPlan
 from ..contracts.forward_mode import ForwardMode
 from .kv_pool import PagedKVPool
 from .paged_text_cache import BatchedPagedRequestCache
@@ -79,7 +78,7 @@ class TextAttentionPlan:
             page_ids, page_offsets = decode_write_locations(
                 block_table,
                 cache_seqlens,
-                cache.pool.block_size,
+                cache.block_size,
             )
             plan.decode_page_ids = page_ids
             plan.decode_page_offsets = page_offsets
@@ -93,8 +92,8 @@ class TextAttentionPlan:
         plan.cu_seqlens_k = torch.cat([zero, torch.cumsum(kv_seqlens, dim=0).to(torch.int32)])
         return plan
 
-    def to_plan(self) -> AttentionPlanBase:
-        residency = cast(AttentionCache, self.cache)
+    def to_plan(self) -> AttnPlan:
+        residency = cast(KvView, self.cache)
         if self.mode == ForwardMode.DECODE:
             if (
                 self.block_table is None
@@ -143,7 +142,7 @@ class TextAttentionPlan:
             mode=self.mode,
         )
 
-    def attach_to(self, batch: Any) -> AttentionPlanBase:
+    def attach_to(self, batch: Any) -> AttnPlan:
         plan = self.to_plan()
         batch.attn_plan = plan
         batch.block_table = plan.block_table

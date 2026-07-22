@@ -1155,7 +1155,6 @@ class ModelExecutor:
         context = ForwardContext(
             attention_backend=self.attention_backend,
             attention_preference=self.attention_preference,
-            kv_pool=self.residency.kv if self.residency is not None else None,
             stats=forward_stats,
             request_states=self.sessions,
             execution_options=options,

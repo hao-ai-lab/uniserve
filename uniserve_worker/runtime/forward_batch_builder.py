@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import torch
 
-from ..contracts.attention_plan import AttentionPlanBase
+from ..contracts.attention_plan import AttnPlan
 from ..contracts.forward_batch import ForwardBatch
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
@@ -60,7 +60,7 @@ def build_text_attention_plan(
     *,
     stager: Any | None = None,
     max_context_len: int = 0,
-) -> AttentionPlanBase:
+) -> AttnPlan:
     """Build the per-forward text attention plan from ``ForwardBatch`` indices.
 
     Relocated from the model: this is the system's per-forward plan (SGLang's

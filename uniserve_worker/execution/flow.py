@@ -460,7 +460,7 @@ class FlowGraphRunner(FailureManagedRunner):
             block_table_width=int(key[2]),
         )
         request_cache = cache.request_cache_for_transient(0, int(img.token_h) * int(img.token_w))
-        pool = request_cache.pool
+        pool = cache.pool
         head_dim = int(pool.head_dim)
         q_shape_probe = first.step.extra["image_embeds"].new_empty(
             (len(rows), 1, int(img.token_h) * int(img.token_w), head_dim)
@@ -599,7 +599,7 @@ class FlowGraphRunner(FailureManagedRunner):
             head_dim=state.head_dim,
             page_size=state.page_size,
             q_dtype=state.image_embeds.dtype,
-            kv_dtype=state.request_cache.pool.k.dtype,
+            kv_dtype=state.cache.pool.k.dtype,
             causal=False,
             scale=state.scale,
         )

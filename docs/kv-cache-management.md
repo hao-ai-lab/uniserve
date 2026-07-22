@@ -622,18 +622,21 @@ def write(self, layer, block_ids, *, start, k, v):
 
 ### Per-Request Views
 
-`PagedRequestCache` provides a per-request view over pool blocks. The `block_table` method produces the integer tensor that paged-attention kernels consume:
+`PagedRequestCache` provides a per-request view over pool blocks and is the whole KV surface model-side attention consumers see: the backing pool is private, reached only through the page geometry (`block_size`) and the per-layer device tensors (`layer_kv`). The `block_table` method produces the integer tensor that paged-attention kernels consume:
 
-```274:286:uniserve_worker/runtime/kv_pool.py
+```288:346:uniserve_worker/runtime/kv_pool.py
 class PagedRequestCache:
     def __init__(self, pool, block_ids, base_len):
         # ...
-        self.pool = pool
+        self._pool = pool
         self.block_ids = block_ids
         self.base_len = base_len
 
+    def layer_kv(self, layer):
+        return self._pool.layer_cache(layer)
+
     def append(self, layer, k, v):
-        self.pool.write(layer, self.block_ids, start=self.base_len, k=k, v=v)
+        self._pool.write(layer, self.block_ids, start=self.base_len, k=k, v=v)
 
     def block_table(self, *, device=None):
         # ...

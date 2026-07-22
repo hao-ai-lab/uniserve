@@ -109,6 +109,7 @@ class SegmentGraphState:
     num_kv_heads: int
     head_dim: int
     page_size: int
+    kv_dtype: torch.dtype
     scale: float
     release_backend: Any = None
     logits: torch.Tensor | None = None
@@ -292,11 +293,8 @@ class SegmentGraphRunner(FailureManagedRunner):
         topology_id: str,
     ) -> SegmentGraphState:
         first_attn = _first_attention(owner)
-        block_width_capacity = _graph_block_width_capacity(kv_view)
-        graph_kv_view = ForwardGraphPagedKVView(
-            kv_view.pool,
-            kv_view.segments,
-            block_width_capacity=block_width_capacity,
+        graph_kv_view = kv_view.graph_view(
+            block_width_capacity=kv_view.graph_block_width_capacity(),
         )
         max_context_len = graph_kv_view.max_seqlen_k()
         plan = PagedVarlenPlan(
@@ -325,7 +323,8 @@ class SegmentGraphRunner(FailureManagedRunner):
             num_q_heads=int(getattr(first_attn, "num_heads")),
             num_kv_heads=int(getattr(first_attn, "num_kv_heads")),
             head_dim=int(getattr(first_attn, "head_dim")),
-            page_size=int(kv_view.pool.block_size),
+            page_size=int(kv_view.block_size),
+            kv_dtype=graph_kv_view.layer_kv(0)[0].dtype,
             scale=_attention_scale(first_attn),
         )
         if text_kv_promotions:
@@ -490,7 +489,7 @@ class SegmentGraphRunner(FailureManagedRunner):
             head_dim=state.head_dim,
             page_size=state.page_size,
             q_dtype=state.packed_embeds.dtype,
-            kv_dtype=state.kv_view.pool.k.dtype,
+            kv_dtype=state.kv_dtype,
             causal=False,
             scale=state.scale,
         )
@@ -523,7 +522,7 @@ class SegmentGraphRunner(FailureManagedRunner):
                     int(getattr(first_attn, "head_dim")),
                 )
             )
-            k_cache, v_cache = kv_view.pool.layer_cache(0)
+            k_cache, v_cache = kv_view.layer_kv(0)
             req = ops.AttentionReq(
                 q=q_probe,
                 k=k_cache,
@@ -582,12 +581,12 @@ class SegmentGraphRunner(FailureManagedRunner):
     ) -> tuple[Any, ...] | None:
         if tuple(route_indicators.shape) != (int(packed_embeds.shape[0]),):
             return None
-        block_width_capacity = _graph_block_width_capacity(kv_view)
+        block_width_capacity = kv_view.graph_block_width_capacity()
         if block_width_capacity <= 0:
             return None
         return (
             id(owner),
-            id(kv_view.pool),
+            kv_view.pool_token(),
             str(getattr(backend, "name", type(backend).__name__)),
             str(packed_embeds.device),
             str(packed_embeds.dtype),
@@ -598,8 +597,8 @@ class SegmentGraphRunner(FailureManagedRunner):
             _route_index_capacity(forward_stream),
             _kv_capacity(kv_view),
             int(block_width_capacity),
-            int(kv_view.pool.block_size),
-            int(block_width_capacity * int(kv_view.pool.block_size)),
+            int(kv_view.block_size),
+            int(block_width_capacity * int(kv_view.block_size)),
             _promotion_geometry(
                 text_kv_promotions,
                 capacity=text_kv_promotion_capacity,
@@ -799,16 +798,8 @@ def _cache_positions(pool: Any, block_ids: list[int], start: int, length: int) -
 
 def _max_context_len(kv_view: ForwardPagedKVView) -> int:
     return max(
-        (len(seg.block_ids) * int(kv_view.pool.block_size) for seg in kv_view.segments), default=0
+        (len(seg.block_ids) * int(kv_view.block_size) for seg in kv_view.segments), default=0
     )
-
-
-def _graph_block_width_capacity(kv_view: ForwardPagedKVView) -> int:
-    required = max((len(seg.block_ids) for seg in kv_view.segments), default=0)
-    if required <= 0:
-        return 0
-    bucket = 1 << (required - 1).bit_length()
-    return min(bucket, int(kv_view.pool.num_blocks))
 
 
 def _backend_can_host_graph(backend: Any) -> bool:

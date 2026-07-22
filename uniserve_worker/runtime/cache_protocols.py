@@ -1,73 +1,24 @@
-"""Structural typing protocols for KV-cache, buffer-staging, and model caps.
+"""Structural typing protocols for buffer-staging and model caps.
 
 These ``typing.Protocol`` definitions name the duck-typed surfaces that the
 worker probes via ``getattr`` at runtime. They document the member set each
 collaborator must expose and let the type checker verify call sites; the
-concrete classes (``PagedRequestCache``, ``BatchedPagedRequestCache``,
-``PagedTextCache``, ``TextTensorStagingSlot``, the registered models) satisfy
-them structurally without an explicit subclass relationship.
+concrete classes (``TextTensorStagingSlot``, the registered models) satisfy
+them structurally without an explicit subclass relationship. The per-batch
+paged KV view surface lives in ``contracts.attention_plan.KvView``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 __all__ = [
-    "KVCacheView",
-    "BatchedKVCacheView",
     "BufferStager",
     "ModelCapabilities",
 ]
 
 if TYPE_CHECKING:
     import torch
-
-    from .kv_pool import PagedKVPool
-
-
-@runtime_checkable
-class KVCacheView(Protocol):
-    """Per-request KV-cache surface for attention and packed forward reads.
-
-    The canonical persistent-length member is ``base_len`` (an int attribute).
-    ``PagedRequestCache`` additionally exposes ``length()`` as a method that
-    returns the same value; new code reads ``base_len`` directly. Batched views
-    (``BatchedPagedRequestCache``) carry per-row ``base_lens`` and a scalar
-    ``base_len`` set to ``max(base_lens)``.
-    """
-
-    pool: PagedKVPool
-    base_len: int
-
-    def get(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
-
-    def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None: ...
-
-    def block_table(self, *, device: torch.device | str | None = ...) -> torch.Tensor: ...
-
-
-@runtime_checkable
-class BatchedKVCacheView(KVCacheView, Protocol):
-    """Batched KV-cache surface with per-row lengths and ragged append.
-
-    Extends :class:`KVCacheView` with the members the batched-paged attention
-    path probes: per-row ``base_lens`` and a varlen append.
-    """
-
-    base_lens: Sequence[int]
-
-    def append_varlen(
-        self,
-        layer: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        query_lens: Sequence[int],
-        *,
-        block_table: torch.Tensor | None = ...,
-        cache_seqlens: torch.Tensor | None = ...,
-        cu_seqlens_q: torch.Tensor | None = ...,
-    ) -> None: ...
 
 
 @runtime_checkable

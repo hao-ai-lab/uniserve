@@ -1058,11 +1058,11 @@ class _AttentionBackendProvider:
 
     @staticmethod
     def _paged_storage_supported(caps, req: AttentionReq) -> bool:
-        pool = getattr(req.kv_cache, "pool", None)
-        if pool is not None:
-            if not bool(getattr(pool, "supports_paged_attention_storage", True)):
+        view_block_size = getattr(req.kv_cache, "block_size", None)
+        if view_block_size is not None:
+            if not bool(getattr(req.kv_cache, "supports_paged_attention_storage", True)):
                 return False
-            block_size = int(getattr(pool, "block_size", 0) or 0)
+            block_size = int(view_block_size or 0)
         elif req.block_table is not None:
             if not isinstance(req.k, torch.Tensor) or req.k.ndim != 4:
                 return False

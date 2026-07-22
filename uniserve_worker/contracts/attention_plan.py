@@ -29,20 +29,70 @@ from __future__ import annotations
 
 from abc import ABC
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import torch
 
-    from .forward_context import AttentionCache
     from .forward_mode import ForwardMode
 
 __all__ = [
     "GraphBinding",
+    "KvView",
     "AttentionPlanBase",
     "PagedDecodePlan",
     "PagedVarlenPlan",
+    "AttnPlan",
 ]
+
+
+class KvView(Protocol):
+    """Per-batch paged KV residency view named by an attention plan.
+
+    This is the whole KV surface model-side attention consumers may touch: the
+    batch rows' persistent lengths, the page-table / cache-seqlens tensors, the
+    single- and ragged append entry points, the pool page geometry, and the
+    per-layer device K/V tensors via :meth:`layer_kv`. The system-owned pool
+    object itself is never exposed; the runtime constructs these views per
+    batch and system code holds the pool directly.
+
+    Concrete implementers: ``PagedRequestCache``, ``BatchedPagedRequestCache``,
+    and ``ForwardGraphPagedKVView`` — all structurally, without a subclass edge.
+    """
+
+    @property
+    def block_size(self) -> int: ...
+
+    @property
+    def supports_paged_attention_storage(self) -> bool: ...
+
+    @property
+    def base_len(self) -> int: ...
+
+    @property
+    def base_lens(self) -> "Sequence[int]": ...
+
+    def layer_kv(self, layer: int) -> "tuple[torch.Tensor, torch.Tensor]": ...
+
+    def block_table(self, *, device: "torch.device | str | None" = ...) -> "torch.Tensor": ...
+
+    def cache_seqlens(self, *, device: "torch.device | str | None" = ...) -> "torch.Tensor": ...
+
+    def append(self, layer: int, k: "torch.Tensor", v: "torch.Tensor") -> None: ...
+
+    def append_varlen(
+        self,
+        layer: int,
+        k: "torch.Tensor",
+        v: "torch.Tensor",
+        query_lens: "Sequence[int]",
+        *,
+        block_table: "torch.Tensor | None" = ...,
+        cache_seqlens: "torch.Tensor | None" = ...,
+        cu_seqlens_q: "torch.Tensor | None" = ...,
+    ) -> None: ...
 
 
 class GraphBinding:
@@ -84,7 +134,7 @@ class AttentionPlanBase(ABC):
 class PagedDecodePlan(AttentionPlanBase):
     """One-token-per-row paged decode attention plan."""
 
-    residency_cache: "AttentionCache"
+    residency_cache: "KvView"
     cache_seqlens: "torch.Tensor"
     kv_seqlens: "torch.Tensor"
     query_lens: "torch.Tensor"
@@ -95,7 +145,7 @@ class PagedDecodePlan(AttentionPlanBase):
     def for_decode_graph(
         cls,
         *,
-        residency_cache: "AttentionCache",
+        residency_cache: "KvView",
         batch_size: int,
         block_table: "torch.Tensor",
         cache_seqlens: "torch.Tensor",
@@ -138,8 +188,14 @@ class PagedVarlenPlan(AttentionPlanBase):
     cu_seqlens_k: "torch.Tensor"
     max_seqlen_q: int
     max_seqlen_k: int
-    residency_cache: "AttentionCache | None" = None
+    residency_cache: "KvView | None" = None
     cache_seqlens: "torch.Tensor | None" = None
     query_lens: "torch.Tensor | None" = None
     kv_seqlens: "torch.Tensor | None" = None
     mode: "ForwardMode | None" = None
+
+
+# The typed union of every concrete attention plan. ForwardContext and
+# ForwardBatch publish this — consumers that narrow with ``isinstance`` get
+# unconditional access to exactly the fields that regime guarantees.
+AttnPlan = PagedDecodePlan | PagedVarlenPlan
