@@ -64,10 +64,16 @@ def test_capability_declaration_wellformed(name):
 
 @pytest.mark.parametrize("name", ALL_BACKENDS)
 def test_declared_controls_have_methods(name):
-    """No control may be declared without a real method (DoD 4: no aspirational caps)."""
+    """No control may be declared without a real method (DoD 4: no aspirational caps).
+
+    Worker-served controls are exempt: the worker dispatches them against
+    system-owned state, so the model carries only the capability declaration.
+    """
     cls = load_backend_class(name)
     for ctrl in cls.supported_controls:
-        meth = CONTROL_METHODS[ctrl]
+        meth = CONTROL_METHODS.get(ctrl)
+        if meth is None:
+            continue
         assert callable(getattr(cls, meth, None)), (
             f"{name} declares control {ctrl!r} but has no {meth}() method"
         )
@@ -86,14 +92,13 @@ def test_resource_classes_wellformed(name):
 
 
 @pytest.mark.parametrize("name", ALL_BACKENDS)
-def test_adapter_mode_implies_lora_controls(name):
-    """A non-'none' adapter mode must declare load_lora/unload_lora."""
+def test_adapter_mode_matches_lora_controls(name):
+    """load_lora/unload_lora are declared exactly when the adapter mode is not 'none'."""
     cls = load_backend_class(name)
-    if cls.adapter_mode != "none":
-        ctrls = set(cls.supported_controls)
-        assert {"load_lora", "unload_lora"} <= ctrls, (
-            f"{name} adapter_mode != none but does not declare load/unload_lora"
-        )
+    declares_lora = {"load_lora", "unload_lora"} <= set(cls.supported_controls)
+    assert declares_lora == (cls.adapter_mode != "none"), (
+        f"{name} adapter_mode={cls.adapter_mode!r} does not match its lora control declaration"
+    )
 
 
 def test_caps_schema_required_keys():

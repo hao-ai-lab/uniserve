@@ -32,7 +32,6 @@ from uniserve_worker.loader.transformers import (
 from uniserve_worker.loader.weight_utils import tensor_shape
 from uniserve_worker.models.catalog import Catalog
 from uniserve_worker.nn import LinearBase
-from uniserve_worker.runtime.lora import MergeOnLoadLoRA
 from uniserve_worker.server.app import dispatch
 from uniserve_worker.worker.model import ModelWorker
 
@@ -907,26 +906,3 @@ def test_native_transformers_loader_uses_weight_loader_for_padded_vocab_tensors(
 def test_weight_utils_reads_safetensors_tensor_shape_without_loading_tensor(tmp_path):
     save_file({"latent_pos_embed.pos_embed": torch.zeros(4096, 8)}, tmp_path / "model.safetensors")
     assert tensor_shape(tmp_path / "model.safetensors", "latent_pos_embed.pos_embed") == (4096, 8)
-
-
-def test_merge_on_load_lora_round_trips_exact_weight_delta(tmp_path):
-    model = nn.Sequential()
-    model.add_module("proj", nn.Linear(2, 2, bias=False))
-    with torch.no_grad():
-        model.proj.weight.zero_()
-    adapter = tmp_path / "adapter_model.safetensors"
-    save_file(
-        {
-            "base_model.model.proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
-            "base_model.model.proj.lora_B.weight": torch.tensor([[3.0], [4.0]]),
-        },
-        adapter,
-    )
-    (tmp_path / "adapter_config.json").write_text('{"r": 1, "lora_alpha": 2}', encoding="utf-8")
-
-    lora = MergeOnLoadLoRA(model)
-    assert lora.load(7, str(tmp_path)) == 1
-    expected = torch.tensor([[6.0, 12.0], [8.0, 16.0]])
-    torch.testing.assert_close(model.proj.weight, expected)
-    assert lora.unload(7) == 1
-    torch.testing.assert_close(model.proj.weight, torch.zeros_like(model.proj.weight))

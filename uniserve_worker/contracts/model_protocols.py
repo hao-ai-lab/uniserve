@@ -116,12 +116,6 @@ class UniModel(ABC):
     def copy_blocks(self, copies: Any) -> None:
         pass
 
-    def load_lora(self, lora_id: int, lora_path: str) -> None:
-        pass
-
-    def unload_lora(self, lora_id: int) -> None:
-        pass
-
     def free_encoder(self, handles: Any) -> None:
         pass
 
