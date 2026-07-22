@@ -509,16 +509,6 @@ def test_forward_graph_paged_kv_view_refreshes_within_block_capacity():
         )
 
 
-def test_forward_paged_kv_view_requires_one_pool():
-    pool_a = PagedKVPool(1, 2, 4, 1, 2, device="cpu", dtype=torch.float32)
-    pool_b = PagedKVPool(1, 2, 4, 1, 2, device="cpu", dtype=torch.float32)
-    cache_a = pool_a.view([0], 0)
-    cache_b = pool_b.view([0], 0)
-
-    with pytest.raises(Exception, match="one PagedKVPool"):
-        ForwardPagedKVView.from_request_caches([cache_a, cache_b], [1, 1])
-
-
 def test_forward_paged_kv_view_rejects_wrong_packed_token_count():
     pool = PagedKVPool(1, 2, 4, 1, 2, device="cpu", dtype=torch.float32)
     view = ForwardPagedKVView(pool, [ForwardPagedKVSegment(block_ids=(0,), base_len=0, q_len=2)])

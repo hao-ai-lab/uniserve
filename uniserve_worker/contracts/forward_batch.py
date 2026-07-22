@@ -24,7 +24,7 @@ from ..foundation.errors import invalid_descriptor
 from .forward_mode import ForwardMode, mode_for_op
 
 if TYPE_CHECKING:
-    from .attention_plan import AttentionPlanBase
+    from .attention_plan import AttnPlan
     from .batches import CommitBatch, DenoiseBatch, EncodeBatch, MixedBatch, TextBatch
 
 __all__ = [
@@ -261,7 +261,7 @@ class ForwardBatch:
       handles inside :class:`DenoiseInputs` / :class:`EncodeInputs` /
       :class:`CommitInputs`) — never the pools or KV/latent bytes
     - modality and attention-regime metadata (``is_gen``, ``segments``)
-    - the per-forward :class:`~.attention_plan.AttentionPlanBase` attached by the
+    - the per-forward :data:`~.attention_plan.AttnPlan` attached by the
       system plan builder (``None`` for dense vision attention)
 
     Pool storage stays in the residency layer; shared layers resolve physical
@@ -308,7 +308,7 @@ class ForwardBatch:
     return_all_logits: bool = False
 
     # per-forward attention plan (system-attached; None for dense vision)
-    attn_plan: "AttentionPlanBase | None" = None
+    attn_plan: "AttnPlan | None" = None
 
     @property
     def mode(self) -> "ForwardMode":

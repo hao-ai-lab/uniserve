@@ -14,6 +14,7 @@ import torch
 from uniserve_worker.foundation.errors import ErrorCode, WorkerError
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.paged_text_cache import (
+    BatchedPagedRequestCache,
     BatchedPagedTextCache,
     PagedTextCache,
     PagedTextCacheSpanCopy,
@@ -433,6 +434,41 @@ def test_batched_rejects_caches_with_different_pools():
         BatchedPagedTextCache([cache_a, cache_b])
 
     assert exc.value.code == ErrorCode.INVALID_DESCRIPTOR
+
+
+def test_batched_request_cache_is_the_bounded_model_kv_view():
+    # The per-batch view is the whole KV surface model-side attention sees:
+    # per-layer device K/V come from ``layer_kv`` (aliasing the pool's layer
+    # storage), page geometry from ``block_size``, and the raw pool object is
+    # not part of the surface.
+    pool = _make_pool(num_layers=2, block_size=4, num_blocks=16)
+    view = BatchedPagedRequestCache(pool, [[0, 1], [2]], [4, 2])
+
+    assert view.block_size == pool.block_size
+    assert view.supports_paged_attention_storage is True
+    k_layer, v_layer = view.layer_kv(1)
+    assert k_layer.data_ptr() == pool.k[1].data_ptr()
+    assert v_layer.data_ptr() == pool.v[1].data_ptr()
+    assert not hasattr(view, "pool")
+
+
+def test_batched_request_cache_appends_are_bounded_to_the_batch_rows():
+    # Writes through the view cover exactly the batch's rows: a K/V payload
+    # carrying an extra row (a request outside this batch) is rejected before
+    # any KV write, for both the dense and the ragged append entry points.
+    pool = _make_pool(num_layers=1, block_size=4, num_blocks=16, num_kv_heads=2, head_dim=3)
+    view = BatchedPagedRequestCache(pool, [[0, 1], [2]], [1, 2])
+
+    k = torch.zeros(3, 1, 2, 3)  # three rows against a two-row batch
+    with pytest.raises(WorkerError) as exc:
+        view.append(0, k, k)
+    assert exc.value.code == ErrorCode.INVALID_DESCRIPTOR
+
+    ragged = torch.zeros(3, 2, 3)
+    with pytest.raises(WorkerError) as exc:
+        view.append_varlen(0, ragged, ragged, [1, 1, 1])
+    assert exc.value.code == ErrorCode.INVALID_DESCRIPTOR
+    torch.testing.assert_close(pool.k, torch.zeros_like(pool.k))
 
 
 # --------------------------------------------------------------------------

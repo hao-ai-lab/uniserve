@@ -12,7 +12,6 @@ import torch
 from uniserve_worker.backends.paged_kv_math import paged_kv_write
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.foundation.errors import invalid_descriptor
-from uniserve_worker.runtime.cache_protocols import KVCacheView
 from uniserve_worker.runtime.host_staging import fill_cpu_ints, is_pinned
 from uniserve_worker.runtime.kv_pool import PagedKVPool
 from uniserve_worker.runtime.tensor_staging import TextTensorStager, TextTensorStagingSlot
@@ -167,14 +166,19 @@ def _forward_paged_segment_signature(
 
 
 class ForwardPagedKVView:
-    """One-pool paged-KV view for ragged visible-end attention segments."""
+    """One-pool paged-KV view for ragged visible-end attention segments.
+
+    The view is the whole KV surface model-side consumers see: the backing
+    pool stays private and is reached only through the page geometry and
+    :meth:`layer_kv`.
+    """
 
     def __init__(
         self,
         pool: PagedKVPool,
         segments: list[ForwardPagedKVSegment] | tuple[ForwardPagedKVSegment, ...],
     ) -> None:
-        self.pool = pool
+        self._pool = pool
         self.segments = _normalize_forward_paged_segments(pool, segments)
         self._block_table_cache: dict[torch.device, torch.Tensor] = {}
         self._cache_seqlens_before_cache: dict[torch.device, torch.Tensor] = {}
@@ -186,8 +190,46 @@ class ForwardPagedKVView:
             tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
         ] = {}
 
+    @property
+    def block_size(self) -> int:
+        return self._pool.block_size
+
+    @property
+    def supports_paged_attention_storage(self) -> bool:
+        return bool(getattr(self._pool, "supports_paged_attention_storage", True))
+
+    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pool.layer_cache(layer)
+
+    def pool_token(self) -> int:
+        """Stable identity token for the backing pool (graph-key routing)."""
+
+        return id(self._pool)
+
+    def graph_block_width_capacity(self) -> int:
+        """Power-of-two block-table width bucket, clamped to the pool size."""
+
+        required = max((len(seg.block_ids) for seg in self.segments), default=0)
+        if required <= 0:
+            return 0
+        bucket = 1 << (required - 1).bit_length()
+        return min(bucket, int(self._pool.num_blocks))
+
+    def graph_view(
+        self,
+        *,
+        block_width_capacity: int | None = None,
+    ) -> "ForwardGraphPagedKVView":
+        """Build the graph-owned twin over the same pool and segments."""
+
+        return ForwardGraphPagedKVView(
+            self._pool,
+            self.segments,
+            block_width_capacity=block_width_capacity,
+        )
+
     def _target_device(self, device: torch.device | str | None = None) -> torch.device:
-        return torch.device(device if device is not None else self.pool.k.device)
+        return torch.device(device if device is not None else self._pool.k.device)
 
     def block_table(self, *, device: torch.device | str | None = None) -> torch.Tensor:
         target = self._target_device(device)
@@ -272,8 +314,8 @@ class ForwardPagedKVView:
             raise invalid_descriptor(
                 f"forward packed KV has {int(k.shape[0])} tokens, expected {expected}"
             )
-        if not getattr(self.pool, "is_quantized", False):
-            k_cache, v_cache = self.pool.layer_cache(layer)
+        if not getattr(self._pool, "is_quantized", False):
+            k_cache, v_cache = self._pool.layer_cache(layer)
             page_ids, offsets, token_indices = self._write_plan(device=k.device)
             k_src = k if token_indices is None else k.index_select(0, token_indices)
             v_src = v if token_indices is None else v.index_select(0, token_indices)
@@ -291,7 +333,7 @@ class ForwardPagedKVView:
         for seg in self.segments:
             end = offset + seg.q_len
             if seg.write_kv:
-                self.pool.write(
+                self._pool.write(
                     layer,
                     list(seg.block_ids),
                     start=seg.base_len,
@@ -322,13 +364,13 @@ class ForwardPagedKVView:
                 continue
             for local in range(seg.q_len):
                 position = int(seg.base_len) + local
-                block_slot = position // self.pool.block_size
+                block_slot = position // self._pool.block_size
                 if block_slot >= len(seg.block_ids):
                     raise invalid_descriptor(
                         "forward paged segment blocks do not cover current append"
                     )
                 page_ids.append(int(seg.block_ids[block_slot]))
-                offsets.append(position % self.pool.block_size)
+                offsets.append(position % self._pool.block_size)
                 token_indices.append(flat + local)
             flat += seg.q_len
 
@@ -342,33 +384,6 @@ class ForwardPagedKVView:
         cached = (page_tensor, offset_tensor, index_tensor)
         self._write_plan_cache[target] = cached
         return cached
-
-    @classmethod
-    def from_request_caches(
-        cls,
-        request_caches: Sequence[KVCacheView],
-        q_lens: Sequence[int],
-    ) -> "ForwardPagedKVView":
-        if len(request_caches) != len(q_lens):
-            raise invalid_descriptor("forward request caches and q_lens mismatch")
-        if not request_caches:
-            raise invalid_descriptor("forward request cache list must not be empty")
-        pool = request_caches[0].pool
-        if not isinstance(pool, PagedKVPool):
-            raise invalid_descriptor("forward request cache must expose a PagedKVPool")
-        segments = []
-        for cache, q_len in zip(request_caches, q_lens):
-            if cache.pool is not pool:
-                raise invalid_descriptor("forward request caches must share one PagedKVPool")
-            # ``base_len`` is the persistent sequence length on ``KVCacheView``.
-            segments.append(
-                ForwardPagedKVSegment(
-                    block_ids=tuple(int(block_id) for block_id in getattr(cache, "block_ids", ())),
-                    base_len=int(cache.base_len),
-                    q_len=int(q_len),
-                )
-            )
-        return cls(pool, segments)
 
 
 class ForwardGraphStreamState:
@@ -448,7 +463,7 @@ class ForwardGraphPagedKVView:
         device: torch.device | str | None = None,
         block_width_capacity: int | None = None,
     ) -> None:
-        self.pool = pool
+        self._pool = pool
         self.segments = _normalize_forward_paged_segments(pool, segments)
         self._signature = _forward_paged_segment_signature(self.segments)
         self._device = torch.device(device if device is not None else pool.k.device)
@@ -496,11 +511,22 @@ class ForwardGraphPagedKVView:
         )
         self.refresh(self.segments)
 
+    @property
+    def block_size(self) -> int:
+        return self._pool.block_size
+
+    @property
+    def supports_paged_attention_storage(self) -> bool:
+        return bool(getattr(self._pool, "supports_paged_attention_storage", True))
+
+    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pool.layer_cache(layer)
+
     def refresh(
         self,
         segments: list[ForwardPagedKVSegment] | tuple[ForwardPagedKVSegment, ...],
     ) -> "ForwardGraphPagedKVView":
-        normalized = _normalize_forward_paged_segments(self.pool, segments)
+        normalized = _normalize_forward_paged_segments(self._pool, segments)
         if _forward_paged_segment_signature(normalized) != self._signature:
             raise invalid_descriptor("forward graph paged KV capacity mismatch")
         if max(len(seg.block_ids) for seg in normalized) > self._block_width:
@@ -675,7 +701,7 @@ class ForwardGraphPagedKVView:
         return self._persistent_cache_seqlens_after
 
     def max_seqlen_k(self) -> int:
-        return int(self._block_width) * int(self.pool.block_size)
+        return int(self._block_width) * int(self._pool.block_size)
 
     def append_packed(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
         if k.shape != v.shape:
@@ -686,8 +712,8 @@ class ForwardGraphPagedKVView:
             raise invalid_descriptor(
                 f"forward packed KV has {int(k.shape[0])} tokens, expected {self._total_tokens}"
             )
-        if not getattr(self.pool, "is_quantized", False):
-            k_cache, v_cache = self.pool.layer_cache(layer)
+        if not getattr(self._pool, "is_quantized", False):
+            k_cache, v_cache = self._pool.layer_cache(layer)
             page_ids, offsets, token_indices = self._write_plan(device=k.device)
             k_src = k if token_indices is None else k.index_select(0, token_indices)
             v_src = v if token_indices is None else v.index_select(0, token_indices)
@@ -705,7 +731,7 @@ class ForwardGraphPagedKVView:
         for seg in self.segments:
             end = offset + seg.q_len
             if seg.write_kv:
-                self.pool.write(
+                self._pool.write(
                     layer,
                     list(seg.block_ids),
                     start=seg.base_len,
@@ -733,13 +759,13 @@ class ForwardGraphPagedKVView:
                 continue
             for local in range(seg.q_len):
                 position = int(seg.base_len) + local
-                block_slot = position // self.pool.block_size
+                block_slot = position // self._pool.block_size
                 if block_slot >= len(seg.block_ids):
                     raise invalid_descriptor(
                         "forward paged segment blocks do not cover current append"
                     )
                 page_ids.append(int(seg.block_ids[block_slot]))
-                offsets.append(position % self.pool.block_size)
+                offsets.append(position % self._pool.block_size)
         return page_ids, offsets
 
     @staticmethod

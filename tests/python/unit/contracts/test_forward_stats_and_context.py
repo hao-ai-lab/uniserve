@@ -15,6 +15,8 @@ accumulator and the per-forward context var:
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from uniserve_worker.contracts import ForwardStats
@@ -243,8 +245,21 @@ def test_get_forward_context_returns_default_empty_context_when_unset():
     assert ctx.attention_backend is None
     assert ctx.attention_plan is None
     assert ctx.graph_binding is None
-    assert ctx.kv_pool is None
+    assert ctx.kv_view is None
     assert ctx.stats is None
+
+
+def test_forward_context_never_publishes_the_raw_kv_pool():
+    # The per-forward KV surface is bounded: models resolve residency through
+    # the plan's per-batch view (``attention_plan.residency_cache``) and the
+    # flow-branch ``kv_view``; the system-owned pool object is not a context
+    # member, so model code cannot reach it ambiently.
+    ctx = ForwardContext()
+
+    assert not hasattr(ctx, "kv_pool")
+    field_names = {field.name for field in dataclasses.fields(ForwardContext)}
+    assert {"attention_plan", "kv_view"} <= field_names
+    assert "kv_pool" not in field_names
 
 
 def test_use_forward_context_publishes_context_inside_body():

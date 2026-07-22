@@ -512,7 +512,6 @@ class _SequenceDecodeGraphPast:
 
     def __init__(self, cache: BatchedPagedRequestCache) -> None:
         self.cache = cache
-        self.pool = cache.pool
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         return int(self.cache.base_len)
@@ -561,7 +560,6 @@ class _SequencePrefillGraphPast:
 
     def __init__(self, cache: BatchedPagedRequestCache) -> None:
         self.cache = cache
-        self.pool = cache.pool
 
     def get_seq_length(self, layer_idx: int = 0) -> int:
         del layer_idx

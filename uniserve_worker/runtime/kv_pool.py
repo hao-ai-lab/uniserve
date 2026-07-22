@@ -290,13 +290,15 @@ class PagedRequestCache:
 
     ``base_len`` is the persistent KV length before the current op's new tokens.
     Appends write at that offset; the runner/model wrapper advances the logical
-    length after the op succeeds.
+    length after the op succeeds. The view is the whole KV surface model-side
+    consumers see: the backing pool stays private and is reached only through
+    the page geometry and :meth:`layer_kv`.
     """
 
     def __init__(self, pool: PagedKVPool, block_ids: list[int], base_len: int) -> None:
         if base_len < 0:
             raise invalid_descriptor("PagedRequestCache.base_len must be non-negative")
-        self.pool = pool
+        self._pool = pool
         self.block_ids = block_ids
         # base_len is already coerced at the sole construction site (view()).
         self.base_len = base_len
@@ -309,20 +311,31 @@ class PagedRequestCache:
     def base_lens(self) -> tuple[int]:
         return (int(self.base_len),)
 
+    @property
+    def block_size(self) -> int:
+        return self._pool.block_size
+
+    @property
+    def supports_paged_attention_storage(self) -> bool:
+        return bool(getattr(self._pool, "supports_paged_attention_storage", True))
+
+    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pool.layer_cache(layer)
+
     def _target_device(self, device: torch.device | str | None = None) -> torch.device:
-        return torch.device(device if device is not None else self.pool.k.device)
+        return torch.device(device if device is not None else self._pool.k.device)
 
     def _spans(self, start: int, n: int) -> list[tuple[int, int, int]]:
-        return self.pool.spans(self.block_ids, start, n)
+        return self._pool.spans(self.block_ids, start, n)
 
     def length(self) -> int:
         return self.base_len
 
     def get(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        return self.pool.read(layer, self.block_ids, start=0, length=self.base_len)
+        return self._pool.read(layer, self.block_ids, start=0, length=self.base_len)
 
     def append(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        self.pool.write(layer, self.block_ids, start=self.base_len, k=k, v=v)
+        self._pool.write(layer, self.block_ids, start=self.base_len, k=k, v=v)
 
     def append_varlen(
         self,
@@ -369,11 +382,11 @@ class PagedRequestCache:
             return True
         if block_table is None or cache_seqlens is None or cu_seqlens_q is None:
             return False
-        if self.pool.is_quantized or not bool(getattr(self.pool, "supports_paged_attention_storage", True)):
+        if self._pool.is_quantized or not bool(getattr(self._pool, "supports_paged_attention_storage", True)):
             return False
-        if not (k.is_cuda and v.is_cuda and self.pool.k.is_cuda and self.pool.v.is_cuda):
+        if not (k.is_cuda and v.is_cuda and self._pool.k.is_cuda and self._pool.v.is_cuda):
             return False
-        if k.device != self.pool.k.device or v.device != self.pool.v.device:
+        if k.device != self._pool.k.device or v.device != self._pool.v.device:
             return False
         if int(block_table.shape[0]) != 1 or int(cache_seqlens.shape[0]) != 1:
             return False
@@ -381,7 +394,7 @@ class PagedRequestCache:
             return False
         if block_table.device != k.device or cache_seqlens.device != k.device or cu_seqlens_q.device != k.device:
             return False
-        if k.shape[1:] != (self.pool.n_kv, self.pool.head_dim):
+        if k.shape[1:] != (self._pool.n_kv, self._pool.head_dim):
             return False
         plan = self._varlen_append_plan(
             block_table=block_table,
@@ -389,8 +402,8 @@ class PagedRequestCache:
             cu_seqlens_q=cu_seqlens_q,
             total=total,
         )
-        self.pool.k[layer, plan.page_ids, plan.offsets] = k.to(dtype=self.pool.k.dtype)
-        self.pool.v[layer, plan.page_ids, plan.offsets] = v.to(dtype=self.pool.v.dtype)
+        self._pool.k[layer, plan.page_ids, plan.offsets] = k.to(dtype=self._pool.k.dtype)
+        self._pool.v[layer, plan.page_ids, plan.offsets] = v.to(dtype=self._pool.v.dtype)
         return True
 
     def _varlen_append_plan(
@@ -415,9 +428,9 @@ class PagedRequestCache:
             return cached
         token_offsets = torch.arange(int(total), device=block_table.device, dtype=torch.int64)
         positions = cache_seqlens[0].to(dtype=torch.int64) + token_offsets
-        block_slots = torch.div(positions, int(self.pool.block_size), rounding_mode="floor")
+        block_slots = torch.div(positions, int(self._pool.block_size), rounding_mode="floor")
         page_ids = block_table[0].to(dtype=torch.int64).index_select(0, block_slots).contiguous()
-        offsets = torch.remainder(positions, int(self.pool.block_size)).contiguous()
+        offsets = torch.remainder(positions, int(self._pool.block_size)).contiguous()
         plan = _VarlenAppendPlan(key=key, page_ids=page_ids, offsets=offsets)
         self._append_plan = plan
         return plan

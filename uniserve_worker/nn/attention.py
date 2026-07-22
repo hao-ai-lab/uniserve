@@ -230,7 +230,7 @@ class RadixAttention(nn.Module):
             cache_seqlens=plan.cache_seqlens,
             cu_seqlens_q=plan.cu_seqlens_q,
         )
-        k_cache, v_cache = plan.residency_cache.pool.layer_cache(self.layer_id)
+        k_cache, v_cache = plan.residency_cache.layer_kv(self.layer_id)
         out = ops.attention(
             q_run,
             k_cache,
@@ -277,7 +277,7 @@ class RadixAttention(nn.Module):
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
         )
-        k_cache, v_cache = kv_cache.pool.layer_cache(self.layer_id)
+        k_cache, v_cache = kv_cache.layer_kv(self.layer_id)
         out = ops.attention(
             q_run,
             k_cache,
@@ -328,7 +328,7 @@ class RadixAttention(nn.Module):
         past = int(length_fn())
         block_table = block_table_fn(device=device)
         cache_seqlens = cache_seqlens_fn(device=device)
-        block_size = int(getattr(getattr(kv_cache, "pool", None), "block_size", 0) or 0)
+        block_size = int(getattr(kv_cache, "block_size", 0) or 0)
         if block_size <= 0:
             return None
         if int(block_table.shape[-1]) * block_size < past + n_tokens:
@@ -410,7 +410,7 @@ class RadixAttention(nn.Module):
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
         )
-        k_cache, v_cache = kv_cache.pool.layer_cache(self.layer_id)
+        k_cache, v_cache = kv_cache.layer_kv(self.layer_id)
         return ops.attention(
             q,
             k_cache,
@@ -440,7 +440,7 @@ class RadixAttention(nn.Module):
         causal: bool,
         scale: float,
     ) -> torch.Tensor:
-        k_cache, v_cache = kv_cache.pool.layer_cache(self.layer_id)
+        k_cache, v_cache = kv_cache.layer_kv(self.layer_id)
         block_table, cache_seqlens = self._paged_metadata_tensors(ctx, kv_cache, q.device)
         if q.ndim == 3 and int(q.shape[0]) != int(block_table.shape[0]):
             # One decode row per block-table row is the contract; a mismatch
@@ -890,7 +890,7 @@ class RadixAttention(nn.Module):
         if batch <= 0 or q_len <= 0:
             return None
         if not (
-            hasattr(kv_cache, "pool")
+            callable(getattr(kv_cache, "layer_kv", None))
             and callable(getattr(kv_cache, "block_table", None))
             and callable(getattr(kv_cache, "cache_seqlens", None))
             and callable(getattr(kv_cache, "append_varlen", None))
@@ -952,8 +952,7 @@ class RadixAttention(nn.Module):
 
     @staticmethod
     def _raise_unsupported_paged_fallback(kv_cache) -> NoReturn:
-        pool = getattr(kv_cache, "pool", None)
-        if pool is not None and not bool(getattr(pool, "supports_paged_attention_storage", True)):
+        if not bool(getattr(kv_cache, "supports_paged_attention_storage", True)):
             raise capability_mismatch(
                 "quantized paged KV storage requires a scale-aware paged attention "
                 "backend for batched page-table caches; dense fallback is only "

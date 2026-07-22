@@ -26,7 +26,7 @@ from .host_staging import (
 from .host_staging import (
     is_pinned as _is_pinned,
 )
-from .kv_pool import PagedKVPool, PagedRequestCache
+from .kv_pool import PagedKVPool
 
 __all__ = [
     'PagedTransformerLayer',
@@ -319,7 +319,7 @@ def stage_paged_text_cache_prefix(
 
 
 def copy_paged_text_cache_span(
-    source: PagedTextCache | PagedRequestCache,
+    source: PagedTextCache,
     target: PagedTextCache,
     *,
     start: int,
@@ -495,7 +495,12 @@ def _span_positions(
 
 
 class BatchedPagedRequestCache:
-    """Batched transient page view over compatible request caches."""
+    """Batched transient page view over compatible request caches.
+
+    The per-batch view is the whole KV surface model-side consumers see: the
+    backing pool stays private and is reached only through the page geometry
+    and :meth:`layer_kv`.
+    """
 
     def __init__(
         self,
@@ -509,7 +514,7 @@ class BatchedPagedRequestCache:
             raise invalid_descriptor("batched paged request cache requires at least one row")
         if len(block_ids_by_row) != len(base_lens):
             raise invalid_descriptor("batched paged request cache rows and lengths mismatch")
-        self.pool = pool
+        self._pool = pool
         self.block_ids_by_row = [pool.validate_block_ids(ids) for ids in block_ids_by_row]
         self.base_lens = [int(length) for length in base_lens]
         if any(length < 0 for length in self.base_lens):
@@ -524,6 +529,17 @@ class BatchedPagedRequestCache:
         self._block_table_cache: dict[torch.device, torch.Tensor] = {}
         self._cache_seqlens_cache: dict[torch.device, torch.Tensor] = {}
 
+    @property
+    def block_size(self) -> int:
+        return self._pool.block_size
+
+    @property
+    def supports_paged_attention_storage(self) -> bool:
+        return bool(getattr(self._pool, "supports_paged_attention_storage", True))
+
+    def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pool.layer_cache(layer)
+
     def reset_rows(
         self,
         block_ids_by_row: Sequence[Sequence[int]],
@@ -534,7 +550,7 @@ class BatchedPagedRequestCache:
         new_lens = [int(length) for length in base_lens]
         if any(length < 0 for length in new_lens):
             raise invalid_descriptor("batched paged request cache lengths must be non-negative")
-        self.block_ids_by_row = [self.pool.validate_block_ids(ids) for ids in block_ids_by_row]
+        self.block_ids_by_row = [self._pool.validate_block_ids(ids) for ids in block_ids_by_row]
         self.base_lens = new_lens
         self.base_len = max(self.base_lens, default=0)
         minimum_width = max(len(ids) for ids in self.block_ids_by_row)
@@ -555,7 +571,7 @@ class BatchedPagedRequestCache:
 
         if len(block_ids_by_row) != len(self.block_ids_by_row) or len(base_lens) != len(self.base_lens):
             raise invalid_descriptor("batched paged request cache refresh shape mismatch")
-        rows = [self.pool.validate_block_ids(ids) for ids in block_ids_by_row]
+        rows = [self._pool.validate_block_ids(ids) for ids in block_ids_by_row]
         lengths = [int(length) for length in base_lens]
         if any(length < 0 for length in lengths):
             raise invalid_descriptor("batched paged request cache lengths must be non-negative")
@@ -640,7 +656,7 @@ class BatchedPagedRequestCache:
     ) -> torch.Tensor:
         max_blocks = self._block_table_width
         row_count = len(self.block_ids_by_row)
-        target = torch.device(device if device is not None else self.pool.k.device)
+        target = torch.device(device if device is not None else self._pool.k.device)
         if stager is None:
             cached = self._block_table_cache.get(target)
             if cached is not None:
@@ -670,7 +686,7 @@ class BatchedPagedRequestCache:
         device: torch.device | str | None = None,
         stager: BufferStager | None = None,
     ) -> torch.Tensor:
-        target = torch.device(device if device is not None else self.pool.k.device)
+        target = torch.device(device if device is not None else self._pool.k.device)
         if stager is None:
             cached = self._cache_seqlens_cache.get(target)
             if cached is not None:
@@ -702,7 +718,7 @@ class BatchedPagedRequestCache:
         if k.shape[0] != len(self.block_ids_by_row):
             raise invalid_descriptor("batched KV append batch size does not match cache rows")
         for row, block_ids in enumerate(self.block_ids_by_row):
-            self.pool.write(
+            self._pool.write(
                 layer,
                 block_ids,
                 start=self.base_lens[row],
@@ -746,7 +762,7 @@ class BatchedPagedRequestCache:
         offset = 0
         for row, (block_ids, length) in enumerate(zip(self.block_ids_by_row, query_lens)):
             if length:
-                self.pool.write(
+                self._pool.write(
                     layer,
                     block_ids,
                     start=self.base_lens[row],
@@ -770,11 +786,11 @@ class BatchedPagedRequestCache:
             return True
         if block_table is None or cache_seqlens is None or cu_seqlens_q is None:
             return False
-        if self.pool.is_quantized or not bool(getattr(self.pool, "supports_paged_attention_storage", True)):
+        if self._pool.is_quantized or not bool(getattr(self._pool, "supports_paged_attention_storage", True)):
             return False
-        if not (k.is_cuda and v.is_cuda and self.pool.k.is_cuda and self.pool.v.is_cuda):
+        if not (k.is_cuda and v.is_cuda and self._pool.k.is_cuda and self._pool.v.is_cuda):
             return False
-        if k.device != self.pool.k.device or v.device != self.pool.v.device:
+        if k.device != self._pool.k.device or v.device != self._pool.v.device:
             return False
         row_count = len(self.block_ids_by_row)
         if int(block_table.shape[0]) != row_count or int(cache_seqlens.shape[0]) != row_count:
@@ -783,7 +799,7 @@ class BatchedPagedRequestCache:
             return False
         if block_table.device != k.device or cache_seqlens.device != k.device or cu_seqlens_q.device != k.device:
             return False
-        if k.shape[1:] != (self.pool.n_kv, self.pool.head_dim):
+        if k.shape[1:] != (self._pool.n_kv, self._pool.head_dim):
             return False
         plan = self._varlen_append_plan(
             block_table=block_table,
@@ -791,8 +807,8 @@ class BatchedPagedRequestCache:
             cu_seqlens_q=cu_seqlens_q,
             total=total,
         )
-        self.pool.k[layer, plan.page_ids, plan.offsets] = k.to(dtype=self.pool.k.dtype)
-        self.pool.v[layer, plan.page_ids, plan.offsets] = v.to(dtype=self.pool.v.dtype)
+        self._pool.k[layer, plan.page_ids, plan.offsets] = k.to(dtype=self._pool.k.dtype)
+        self._pool.v[layer, plan.page_ids, plan.offsets] = v.to(dtype=self._pool.v.dtype)
         return True
 
     def _varlen_append_plan(
@@ -819,15 +835,15 @@ class BatchedPagedRequestCache:
         token_offsets = torch.arange(int(total), device=device, dtype=torch.int64)
         if len(self.block_ids_by_row) == 1:
             positions = cache_seqlens[0].to(dtype=torch.int64) + token_offsets
-            block_slots = torch.div(positions, int(self.pool.block_size), rounding_mode="floor")
+            block_slots = torch.div(positions, int(self._pool.block_size), rounding_mode="floor")
             page_ids = block_table[0].to(dtype=torch.int64).index_select(0, block_slots).contiguous()
         else:
             cu = cu_seqlens_q.to(dtype=torch.int64)
             row_ids = torch.bucketize(token_offsets, cu[1:].contiguous(), right=True)
             positions = cache_seqlens.to(dtype=torch.int64)[row_ids] + token_offsets - cu[row_ids]
-            block_slots = torch.div(positions, int(self.pool.block_size), rounding_mode="floor")
+            block_slots = torch.div(positions, int(self._pool.block_size), rounding_mode="floor")
             page_ids = block_table.to(dtype=torch.int64)[row_ids, block_slots].contiguous()
-        offsets = torch.remainder(positions, int(self.pool.block_size)).contiguous()
+        offsets = torch.remainder(positions, int(self._pool.block_size)).contiguous()
         plan = _VarlenAppendPlan(key=key, page_ids=page_ids, offsets=offsets)
         self._append_plan = plan
         return plan

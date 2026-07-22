@@ -629,7 +629,7 @@ class MoTDecoderLayer(nn.Module):
             expert = gen if any_gen else text
             q, k, v = expert.project_qkv(normed, cos, sin)
         kv_view.append_packed(layer_idx, k, v)
-        k_cache, v_cache = kv_view.pool.layer_cache(layer_idx)
+        k_cache, v_cache = kv_view.layer_kv(layer_idx)
         max_seqlen_k_hook = getattr(kv_view, "max_seqlen_k", None)
         max_seqlen_k = (
             int(max_seqlen_k_hook())

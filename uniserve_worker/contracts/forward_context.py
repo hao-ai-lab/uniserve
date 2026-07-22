@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, Any, Iterator, Protocol
 
 from .attention_plan import (
     AttentionPlanBase,
+    AttnPlan,
     GraphBinding,
+    KvView,
     PagedDecodePlan,
     PagedVarlenPlan,
 )
@@ -31,10 +33,11 @@ __all__ = [
     "FlashinferPlanStats",
     "OperatorStats",
     "SpecVerifyStats",
-    "KVPool",
-    "AttentionCache",
+    "KvView",
+    "FlowKvView",
     "GraphBinding",
     "AttentionPlanBase",
+    "AttnPlan",
     "PagedDecodePlan",
     "PagedVarlenPlan",
     "ForwardContext",
@@ -45,10 +48,6 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
-
-    import torch
-
     from ..backends.attention.base import AttentionBackend
 
 
@@ -635,57 +634,15 @@ class ForwardStats:
         }
 
 
-class KVPool(Protocol):
-    """System-owned KV pool published on :class:`ForwardContext`.
+class FlowKvView(Protocol):
+    """Batch-bounded flow-branch KV access published on :class:`ForwardContext`.
 
-    Structural surface consumers read: per-layer device cache pair, per-request
-    cache view, and page geometry. ``PagedKVPool`` is the concrete implementer
-    and satisfies this without an explicit subclass edge.
+    The runtime constructs one per forward covering exactly the batch's
+    requests; :meth:`program` raises for a request outside the batch. The flow
+    executor's ``KvView`` is the concrete implementer.
     """
 
-    @property
-    def block_size(self) -> int: ...
-
-    def layer_cache(self, layer: int) -> "tuple[torch.Tensor, torch.Tensor]": ...
-
-    def view(self, block_ids: "Iterable[int]", base_len: int) -> "AttentionCache": ...
-
-
-class AttentionCache(Protocol):
-    """Paged request-cache surface read by the attention path and graph runner.
-
-    Members consumed off the attention plan's ``residency_cache``: per-row persistent
-    lengths, page-table / cache-seqlens tensors, single- and ragged append entry
-    points, and the backing pool. Both ``PagedRequestCache`` and
-    ``BatchedPagedRequestCache`` satisfy it structurally.
-    """
-
-    @property
-    def pool(self) -> KVPool: ...
-
-    @property
-    def base_len(self) -> int: ...
-
-    @property
-    def base_lens(self) -> "Sequence[int]": ...
-
-    def block_table(self, *, device: "torch.device | str | None" = ...) -> "torch.Tensor": ...
-
-    def cache_seqlens(self, *, device: "torch.device | str | None" = ...) -> "torch.Tensor": ...
-
-    def append(self, layer: int, k: "torch.Tensor", v: "torch.Tensor") -> None: ...
-
-    def append_varlen(
-        self,
-        layer: int,
-        k: "torch.Tensor",
-        v: "torch.Tensor",
-        query_lens: "Sequence[int]",
-        *,
-        block_table: "torch.Tensor | None" = ...,
-        cache_seqlens: "torch.Tensor | None" = ...,
-        cu_seqlens_q: "torch.Tensor | None" = ...,
-    ) -> None: ...
+    def program(self, request_id: int) -> Any: ...
 
 
 @dataclass(frozen=True)
@@ -695,12 +652,14 @@ class ForwardContext:
     Published by the runtime for the duration of one forward. Carries:
 
     - the selected attention backend (and the routing preference)
-    - the system-built :class:`~.attention_plan.AttentionPlanBase` and the
-      system-owned :class:`KVPool` (the model builds neither; it resolves
-      residency from here)
+    - the system-built :data:`~.attention_plan.AttnPlan` whose
+      ``residency_cache`` is the batch's :class:`~.attention_plan.KvView`
+      (the model builds neither; it resolves residency from here — the raw
+      KV pool is never published)
     - an optional :class:`~.attention_plan.GraphBinding` identity token for
       CUDA-graph attention wrappers (plan tensors stay on ``attention_plan``;
       backends that need exclusive wrappers route by ``id(graph_binding)``)
+    - the batch-bounded :class:`FlowKvView` for flow-branch KV state
     - whether a missing physical graph may be captured during this forward
     - optional :class:`ForwardStats` for per-component timing
 
@@ -711,16 +670,15 @@ class ForwardContext:
 
     attention_backend: "AttentionBackend | None" = None
     attention_preference: str | None = None
-    attention_plan: AttentionPlanBase | None = None
+    attention_plan: AttnPlan | None = None
     graph_binding: GraphBinding | None = None
-    kv_pool: "KVPool | None" = None
     stats: ForwardStats | None = None
     allow_capture: bool = True
     request_states: Any = None
     execution_options: Any = None
     default_model_forward: Any = None
     tensor_store: Any = None
-    kv_view: Any = None
+    kv_view: FlowKvView | None = None
     latent_view: Any = None
     product_view: Any = None
     graph_view: Any = None

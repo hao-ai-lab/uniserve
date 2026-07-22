@@ -5,9 +5,8 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence, cast
 
 import torch
 
-from ..contracts.attention_plan import AttentionPlanBase, PagedDecodePlan, PagedVarlenPlan
+from ..contracts.attention_plan import AttnPlan, KvView, PagedDecodePlan, PagedVarlenPlan
 from ..contracts.forward_batch import ForwardBatch
-from ..contracts.forward_context import AttentionCache
 from ..contracts.forward_mode import ForwardMode
 from ..foundation.errors import invalid_descriptor
 from .kv_pool import PagedKVPool
@@ -98,7 +97,7 @@ class TextForwardAssembler:
         )
         block_table = cache.block_table(device=target)
         cache_seqlens = torch.tensor([int(pos_range[0])], dtype=torch.int32, device=target)
-        residency = cast(AttentionCache, cache)
+        residency = cast(KvView, cache)
         if mode == ForwardMode.DECODE and query_len == 1:
             kv_seqlens = cache_seqlens + 1
             from ..backends.paged_kv_math import decode_write_locations
@@ -106,9 +105,9 @@ class TextForwardAssembler:
             page_ids, page_offsets = decode_write_locations(
                 block_table,
                 cache_seqlens,
-                cache.pool.block_size,
+                kv_pool.block_size,
             )
-            plan: AttentionPlanBase = PagedDecodePlan(
+            plan: AttnPlan = PagedDecodePlan(
                 residency_cache=residency,
                 block_table=block_table,
                 cache_seqlens=cache_seqlens,
@@ -163,7 +162,7 @@ class TextForwardAssembler:
         kv_pool: PagedKVPool,
         request_states: "RequestStateTable",
         stager: Any | None = None,
-    ) -> AttentionPlanBase:
+    ) -> AttnPlan:
         rows = [
             self._resolve_row(request_states, int(req_id), op)
             for op, req_id in zip(fb.ops, fb.req_ids)

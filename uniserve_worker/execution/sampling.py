@@ -881,7 +881,7 @@ def verify_speculative_tokens(
             raise invalid_descriptor("speculative verification batch is missing text inputs")
         input_ids = fb.input_ids.reshape(len(rows), length)
         positions = fb.positions.reshape(len(rows), length)
-        with use_forward_context(replace(ctx, attention_plan=fb.attn_plan, kv_pool=kv_pool)):
+        with use_forward_context(replace(ctx, attention_plan=fb.attn_plan)):
             logits = _text_model_forward(
                 model,
                 fb,

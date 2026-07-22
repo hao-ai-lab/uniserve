@@ -1393,17 +1393,14 @@ def test_uni_attention_reuses_context_attention_plan_for_paged_update(monkeypatc
             self.kwargs = kwargs
             return torch.zeros_like(q)
 
-    class FakePool:
+    class FakeCache:
         block_size = 1
+        base_len = 0
 
-        def layer_cache(self, layer):
+        def layer_kv(self, layer):
             assert layer == 0
             empty = torch.empty(2, 1, 2, 4)
             return empty, empty
-
-    class FakeCache:
-        pool = FakePool()
-        base_len = 0
 
         def block_table(self, *, device=None):  # pragma: no cover - must not be called
             del device
@@ -1470,11 +1467,13 @@ def test_uni_attention_empty_batched_paged_prefill_appends_current_kv(monkeypatc
             return torch.zeros_like(q)
 
     class FakeCache:
-        pool = object()
-
         def __init__(self):
             self.base_lens = [0, 0]
             self.append_calls = []
+
+        def layer_kv(self, layer):  # pragma: no cover - branch appends without pool reads.
+            del layer
+            raise AssertionError("empty batched paged prefill should append directly")
 
         def append(self, layer, k, v):
             self.append_calls.append((layer, k, v))
@@ -1542,23 +1541,19 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_plan(monkeypatch):
             self.kwargs = kwargs
             return torch.zeros_like(q)
 
-    class FakePool:
+    class FakeCache:
         block_size = 2
         supports_paged_attention_storage = True
 
         def __init__(self):
             self.k_cache = torch.empty(4, 2, 2, 4)
             self.v_cache = torch.empty(4, 2, 2, 4)
-
-        def layer_cache(self, layer):
-            assert layer == 0
-            return self.k_cache, self.v_cache
-
-    class FakeCache:
-        def __init__(self):
-            self.pool = FakePool()
             self.base_lens = [2, 1]
             self.append_calls = []
+
+        def layer_kv(self, layer):
+            assert layer == 0
+            return self.k_cache, self.v_cache
 
         def append_varlen(self, layer, k, v, query_lens, **kwargs):
             del kwargs
@@ -1593,7 +1588,7 @@ def test_uni_attention_runs_paged_varlen_prefill_with_context_plan(monkeypatch):
     assert out.shape == q.shape
     assert cache.append_calls == [(0, k, v, (2, 1))]
     assert backend.calls == 1
-    assert backend.args == (q, cache.pool.k_cache, cache.pool.v_cache)
+    assert backend.args == (q, cache.k_cache, cache.v_cache)
     assert backend.kwargs["block_table"] is block_table
     assert backend.kwargs["cu_seqlens_q"] is plan.cu_seqlens_q
     assert backend.kwargs["cu_seqlens_k"] is plan.cu_seqlens_k
@@ -1622,25 +1617,21 @@ def test_uni_attention_runs_transient_paged_varlen_without_context_metadata():
             self.kwargs = kwargs
             return torch.zeros_like(q)
 
-    class FakePool:
+    class FakeCache:
         block_size = 4
         supports_paged_attention_storage = True
 
         def __init__(self):
             self.k_cache = torch.empty(8, 4, 2, 4)
             self.v_cache = torch.empty(8, 4, 2, 4)
-
-        def layer_cache(self, layer):
-            assert layer == 0
-            return self.k_cache, self.v_cache
-
-    class FakeCache:
-        def __init__(self):
-            self.pool = FakePool()
             self.base_lens = (3, 5)
             self.append_calls = []
             self._block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
             self._cache_seqlens = torch.tensor([3, 5], dtype=torch.int32)
+
+        def layer_kv(self, layer):
+            assert layer == 0
+            return self.k_cache, self.v_cache
 
         def block_table(self, *, device=None):
             return self._block_table.to(device=device)
@@ -1665,8 +1656,8 @@ def test_uni_attention_runs_transient_paged_varlen_without_context_metadata():
     assert backend.calls == 1
     q_run, k_cache, v_cache = backend.args
     torch.testing.assert_close(q_run, q.transpose(1, 2).reshape(6, 2, 4).contiguous())
-    assert k_cache is cache.pool.k_cache
-    assert v_cache is cache.pool.v_cache
+    assert k_cache is cache.k_cache
+    assert v_cache is cache.v_cache
     assert backend.kwargs["causal"] is False
     assert backend.kwargs["block_table"].tolist() == [[0, 1], [2, 3]]
     assert backend.kwargs["cu_seqlens_q"].tolist() == [0, 3, 6]
@@ -1697,19 +1688,17 @@ def test_uni_attention_rejects_dense_fallback_for_transient_paged_cache_layout()
             del args, kwargs
             raise AssertionError("multi-token transient attention must not run as paged decode")
 
-    class FakePool:
+    class FakeCache:
         block_size = 4
         supports_paged_attention_storage = True
 
-        def layer_cache(self, layer):
+        def __init__(self):
+            self.base_lens = (3, 5)
+
+        def layer_kv(self, layer):
             assert layer == 0
             empty = torch.empty(4, 4, 2, 4)
             return empty, empty
-
-    class FakeCache:
-        def __init__(self):
-            self.pool = FakePool()
-            self.base_lens = (3, 5)
 
         def block_table(self, *, device=None):
             return torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
@@ -2633,6 +2622,25 @@ def test_request_drop_releases_segment_staging():
 
     assert staged == caches
     assert scratch == caches
+
+
+def test_flow_kv_view_bounds_program_access_to_the_batch():
+    # The context-published flow KV view covers exactly the forward's batch:
+    # branch state for a batched request resolves through it, and a request
+    # outside the batch is rejected instead of reaching the branch store.
+    from uniserve_worker.execution.flow import FlowBranchStore
+    from uniserve_worker.runtime.request_state import RequestStateTable
+
+    states = RequestStateTable()
+    states.create_or_update(3, {"req_id": 3})
+    states.create_or_update(4, {"req_id": 4})
+    store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
+    view = store.view([3])
+
+    assert view.program(3) is store.program(3)
+    with pytest.raises(WorkerError) as exc_info:
+        view.program(4)
+    assert exc_info.value.code == "InvalidDescriptor"
 
 
 def test_duplicate_new_request_preserves_live_interleaved_cache():
@@ -4707,16 +4715,13 @@ def test_qwen_attention_paged_update_is_not_env_gated(monkeypatch):
             assert kwargs["v"] is not None
             return torch.zeros_like(q)
 
-    class FakePool:
+    class FakeView:
         block_size = 256
+        base_len = 0
 
-        def layer_cache(self, layer):
+        def layer_kv(self, layer):
             assert layer == 0
             return torch.empty(1, 256, 2, 8), torch.empty(1, 256, 2, 8)
-
-    class FakeView:
-        pool = FakePool()
-        base_len = 0
 
         def block_table(self, *, device=None):
             return torch.zeros(1, 1, dtype=torch.int32, device=device)

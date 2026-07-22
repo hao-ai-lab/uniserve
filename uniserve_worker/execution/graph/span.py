@@ -829,7 +829,7 @@ def copy_inputs(
         if padding_tokens > 0:
             required_blocks = ceil_div(
                 int(graph_cache_lens_cpu[padding_row]) + int(graph_lens[padding_row]),
-                int(state.cache.pool.block_size),
+                int(state.cache.block_size),
             )
             missing_blocks = required_blocks - len(graph_block_ids[padding_row])
             if missing_blocks > 0:

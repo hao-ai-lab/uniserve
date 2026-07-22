@@ -775,7 +775,7 @@ class _SenseNovaAttention(nn.Module):
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
             raise ValueError("SenseNova packed visible attention expects [N, H, D] tensors")
         kv_view.append_packed(self.layer_idx, k, v)
-        k_cache, v_cache = kv_view.pool.layer_cache(self.layer_idx)
+        k_cache, v_cache = kv_view.layer_kv(self.layer_idx)
         cache_after = kv_view.cache_seqlens_after(device=q.device)
         # max_seqlen_k is identical for every layer of the packed forward; derive
         # it on the host from the segment metadata (Python ints) instead of

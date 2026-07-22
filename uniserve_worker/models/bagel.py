@@ -1483,7 +1483,12 @@ class BagelForUnifiedGeneration(UniModelBase):
             cond_cache.ensure_capacity(cond_len + total_gen)
             if cond_len:
                 copy_paged_text_cache_span(
-                    pool.view(self._state(int(op["req_id"])).block_ids, cond_len),
+                    PagedTextCache(
+                        pool,
+                        self._state(int(op["req_id"])).block_ids,
+                        num_layers=self.num_layers,
+                        length=cond_len,
+                    ),
                     cond_cache,
                     start=0,
                     length=cond_len,
