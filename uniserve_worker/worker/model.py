@@ -25,6 +25,7 @@ from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..nn.mesh import get_current_mesh
 from ..processors import build_image_input_stage
 from ..runtime.adapter_store import AdapterStore
+from ..runtime.mover import Mover
 from ..runtime.resources import ResourceRuntime
 from .protocol import BaseWorker, ResultPolicy
 
@@ -132,7 +133,13 @@ class ModelWorker(BaseWorker):
         self.defer_sampling = bool(defer_sampling)
         self.transfer_backend = str(transfer_backend)
         self.model_scope = model_scope
-        self._validate_scope_transport()
+        # One transfer authority per worker: the Mover owns the register-once
+        # Transport and selects the und↔gen tower handoff for this deployment
+        # edge (validating the backend against a cross-process edge).
+        self.mover = Mover(
+            transfer_backend=self.transfer_backend,
+            cross_process=self.model_scope is not ModelLoadScope.WHOLE,
+        )
         self.family_descriptor = family_descriptor or ModelFamilyDescriptor.from_model_class(
             type(model)
         )
@@ -165,9 +172,8 @@ class ModelWorker(BaseWorker):
         tensor_store = None
         if self.defer_sampling:
             from ..runtime.tensor_store import TensorStore
-            from ..runtime.transfer import make_transport
 
-            tensor_store = TensorStore(transport=make_transport(self.transfer_backend))
+            tensor_store = TensorStore(transport=self.mover.transport)
         resource_runtime = self._create_resource_runtime()
         residency = self._create_residency_manager(resource_runtime)
         bind_model_residency(self.model, residency)
@@ -184,7 +190,7 @@ class ModelWorker(BaseWorker):
             tensor_store=tensor_store,
             residency=residency,
         )
-        self._bind_tower_transport()
+        self._install_tower_handoff()
 
     def execute(
         self,
@@ -330,18 +336,13 @@ class ModelWorker(BaseWorker):
         )
         return adjusted
 
-    def _validate_scope_transport(self) -> None:
-        if self.model_scope is ModelLoadScope.WHOLE:
-            return
-        if self.transfer_backend in {"", "local", "shm"}:
-            raise capability_mismatch(
-                f"{self.model_scope.value} model scope requires a "
-                "cross-process data-plane transport"
-            )
+    def _install_tower_handoff(self) -> None:
+        """Hand the Mover-selected und↔gen crossing to the family transfer session.
 
-    def _bind_tower_transport(self) -> None:
-        if self.model_scope is ModelLoadScope.WHOLE:
+        The model contributes only its tower geometry declaration through the
+        session; it never sees transport objects.
+        """
+        session = getattr(self.model, "tower_session", None)
+        if session is None:
             return
-        from ..runtime.transfer import make_transport
-
-        self.model.bind_data_plane_handoff(make_transport(self.transfer_backend))
+        session.use_tower_handoff(self.mover.tower_handoff(session.tower_binding))

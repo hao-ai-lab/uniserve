@@ -841,6 +841,9 @@ class ModelExecutor:
             if segment_executor is not None
             else None
         ) or build_commit_materializer(model)
+        # The family's tower transfer session, when declared; the executor
+        # drives the Mode-A conditioning publish from sampled text results.
+        self.transfer_session = getattr(model, "tower_session", None)
         self.operation_executor = OperationExecutor(
             self.sessions,
             self._execute_once,
@@ -1310,10 +1313,11 @@ class ModelExecutor:
         """Mode A: stamp the und->gen conditioning locator on a text result that
         begins an image, so the gen pool can fetch the conditioning KV.
 
-        Delegates the decision to the model's ``maybe_publish_conditioning`` hook
-        (a no-op unless a data-plane handoff is bound). Only fires for text-decode
+        Driven through the family's transfer session (a no-op unless a
+        cross-process crossing is installed). Only fires for text-decode
         results carrying an inline sampled token (the image-start trigger)."""
-        if plan.forward_mode not in _TEXT_MODES:
+        session = self.transfer_session
+        if session is None or plan.forward_mode not in _TEXT_MODES:
             return
         for row in plan.rows:
             result = results[row.original_index]
@@ -1322,7 +1326,7 @@ class ModelExecutor:
             sampled = result.get("sampled_token_id")
             if sampled is None:
                 continue
-            locator = self.model.maybe_publish_conditioning(int(row.req_id), int(sampled))
+            locator = session.maybe_publish_conditioning(int(row.req_id), int(sampled))
             if locator:
                 result["locator"] = locator
 
