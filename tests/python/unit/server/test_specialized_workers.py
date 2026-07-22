@@ -105,8 +105,8 @@ class _FakeVisionModel(UniModel):
     latent_downsample = 1
     encoder_cache_budget = 4
 
-    def encode_image(self, pixels, grid, op=None):
-        return EncodeOutput(req_id=int(op["req_id"]), encoder_handle=999, num_tokens=16)
+    def encode_image(self, pixels, grid=None, *, ctx):
+        return EncodeOutput(req_id=ctx.req_id, encoder_handle=999, num_tokens=16)
 
     def free_encoder(self, handles):
         pass
@@ -120,7 +120,7 @@ def test_encoder_worker_dispatches_vision_encode():
     out = worker.execute(
         seal_batch(
             3,
-            [{"req_id": 1, "kind": "vit_encode", "mm_hash": 123}],
+            [{"req_id": 1, "kind": "vit_encode", "image_in": 123}],
             new_reqs=[{"req_id": 1}],
         )
     )

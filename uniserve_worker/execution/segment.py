@@ -23,6 +23,7 @@ from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPl
 from uniserve_worker.contracts.forward_batch import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
+    EncodeContext,
     ForwardBatch,
     ForwardExecutionOptions,
     ForwardPlan,
@@ -32,6 +33,7 @@ from uniserve_worker.contracts.forward_batch import (
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
 from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.outputs import TextTokenOutput
+from uniserve_worker.execution.codec import run_encode_ops
 from uniserve_worker.execution.diffusion import _execute_required_denoise
 from uniserve_worker.execution.flow import PreparedFlowStep, flow_branches, flow_cfg_plan
 from uniserve_worker.execution.graph.bucket import padding_blocks
@@ -892,14 +894,14 @@ class SegmentAdapter(Protocol):
         pixels: Any = None,
         grid: Any = None,
         *,
-        op: Mapping[str, Any] | None = None,
+        ctx: EncodeContext,
     ) -> Any: ...
     def encode_latents(
         self,
         pixels: Any = None,
         grid: Any = None,
         *,
-        op: Mapping[str, Any] | None = None,
+        ctx: EncodeContext,
     ) -> Any: ...
     def _text_driver(self) -> Any: ...
     def decode_image(
@@ -2571,8 +2573,9 @@ _RELAY_PLACEHOLDER_TOKEN_ID = -1
 class SegmentExecutor(SegmentRuntime):
     """Long-lived executor for one family's heterogeneous segment programs."""
 
-    def __init__(self, adapter: SegmentAdapter) -> None:
+    def __init__(self, adapter: SegmentAdapter, *, image_stage: Any = None) -> None:
         super().__init__(adapter)
+        self.image_stage = image_stage
 
     def execute(
         self,
@@ -2663,25 +2666,7 @@ class SegmentExecutor(SegmentRuntime):
         if not rows:
             return
         ops = [op for _row_index, op in rows]
-        encode_many = getattr(self.adapter, "encode_many", None)
-        if callable(encode_many):
-            encoded = list(encode_many(tuple(ops)))
-        else:
-            encoded = []
-            for op in ops:
-                kind = str(op.get("kind"))
-                if kind == "vit_encode":
-                    encoded.append(
-                        self.adapter.encode_image(op.get("pixels"), op.get("grid"), op=op)
-                    )
-                elif kind == "vae_encode":
-                    encoded.append(
-                        self.adapter.encode_latents(op.get("pixels"), op.get("grid"), op=op)
-                    )
-                else:
-                    raise invalid_descriptor(f"unsupported encode op {kind!r}")
-        if len(encoded) != len(rows):
-            raise invalid_descriptor("model returned the wrong number of encode outputs")
+        encoded = run_encode_ops(self.adapter, ops, image_stage=self.image_stage)
         for (row_index, _op), output in zip(rows, encoded, strict=True):
             results[row_index] = output
 

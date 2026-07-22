@@ -16,9 +16,8 @@ def test_processor_registry_auto_discovers_bagel_processor():
     assert isinstance(get_processor_for_model(BagelForUnifiedGeneration), BagelImageProcessor)
 
 
-def test_model_worker_attaches_discovered_multimodal_processor():
+def test_model_worker_attaches_declared_image_input_stage():
     worker = ModelWorker(BagelForUnifiedGeneration(config={}))
-    assert isinstance(
-        worker.model_executor.multimodal_processor,
-        BagelImageProcessor,
-    )
+    stage = worker.model_executor.image_input_stage
+    assert stage is not None
+    assert isinstance(stage.processor, BagelImageProcessor)

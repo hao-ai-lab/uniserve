@@ -704,12 +704,12 @@ class ExecutorConfig:
     """ModelExecutor configuration knobs.
 
     Groups the sampler-stage split (``defer_sampling``/``tensor_store``),
-    multimodal processor, batch policy, and attention-backend selection.
+    the image input stage, batch policy, and attention-backend selection.
     """
 
     batch_policy: BatchPolicy | None = None
     attention_backend: Any | None = None
-    multimodal_processor: Any | None = None
+    image_input_stage: Any | None = None
     defer_sampling: bool = False
     tensor_store: Any | None = None
     simulation: bool = False
@@ -720,7 +720,7 @@ class ExecutorConfig:
 class _ResolvedExecutorDependencies:
     batch_policy: BatchPolicy | None
     attention_backend: Any | None
-    multimodal_processor: Any | None
+    image_input_stage: Any | None
     defer_sampling: bool
     tensor_store: Any | None
     simulation: bool
@@ -760,7 +760,7 @@ class ModelExecutor:
         residency: "ResidencyManager | None" = None,
         batch_policy: BatchPolicy | None = None,
         attention_backend: Any | None = None,
-        multimodal_processor: Any | None = None,
+        image_input_stage: Any | None = None,
         defer_sampling: bool = False,
         tensor_store: Any | None = None,
     ):
@@ -770,7 +770,7 @@ class ModelExecutor:
             config=config,
             batch_policy=batch_policy,
             attention_backend=attention_backend,
-            multimodal_processor=multimodal_processor,
+            image_input_stage=image_input_stage,
             defer_sampling=defer_sampling,
             tensor_store=tensor_store,
         )
@@ -795,7 +795,7 @@ class ModelExecutor:
         self._diffusion = _DiffusionRuntime()
         self._init_text_execution(model, residency)
         self._init_unified_forward_execution(model, residency)
-        self.multimodal_processor = dependencies.multimodal_processor
+        self.image_input_stage = dependencies.image_input_stage
         self._init_resource_accounting(resource_runtime, residency)
         state_residency = residency or getattr(model, "residency", None)
         # The runtime KV store is the worker authority for sequence-KV
@@ -931,7 +931,7 @@ class ModelExecutor:
         config: ExecutorConfig | None,
         batch_policy: BatchPolicy | None,
         attention_backend: Any | None,
-        multimodal_processor: Any | None,
+        image_input_stage: Any | None,
         defer_sampling: bool,
         tensor_store: Any | None,
     ) -> _ResolvedExecutorDependencies:
@@ -941,10 +941,10 @@ class ModelExecutor:
             attention_backend=(
                 attention_backend if attention_backend is not None else config.attention_backend
             ),
-            multimodal_processor=(
-                multimodal_processor
-                if multimodal_processor is not None
-                else config.multimodal_processor
+            image_input_stage=(
+                image_input_stage
+                if image_input_stage is not None
+                else config.image_input_stage
             ),
             defer_sampling=defer_sampling or config.defer_sampling,
             tensor_store=tensor_store if tensor_store is not None else config.tensor_store,
@@ -1252,7 +1252,12 @@ class ModelExecutor:
         if batch.mode is ForwardMode.COMMIT:
             return commit_result(items, model, row_indices=rows)
         if batch.mode is ForwardMode.ENCODE:
-            return encode_result(batch, model, row_indices=rows)
+            return encode_result(
+                batch,
+                model,
+                image_stage=self.image_input_stage,
+                row_indices=rows,
+            )
         raise invalid_descriptor("mixed-mode models must implement forward(batch)")
 
     def _register_new_reqs(self, batch: WireBatch) -> None:

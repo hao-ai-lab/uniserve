@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 from PIL import Image
 
+from ..contracts.model_spec import ImageInputSpec, ImageTowerSpec
+from ..foundation.errors import invalid_descriptor
 from .base import MultimodalProcessor
 from .registry import register_processor
 
@@ -22,10 +24,10 @@ __all__ = [
 class BagelGeometry:
     """BAGEL's fixed ViT/VAE preprocessing geometry (architecture constants).
 
-    `(max_size, min_size, stride)` for each tower. `BagelConfig` models only the
-    ViT image-size/patch, so the min-size and the VAE geometry are not
-    config-derivable and are pinned here as the single BAGEL-specific source
-    rather than scattered positional literals.
+    `(max_size, min_size, stride)` for each tower plus the shared pixel cap.
+    `BagelConfig` models only the ViT image-size/patch, so the min-size and the
+    VAE geometry are not config-derivable and are pinned here as the single
+    BAGEL-specific source rather than scattered positional literals.
     """
 
     vit_max_size: int = 980
@@ -34,6 +36,7 @@ class BagelGeometry:
     vae_max_size: int = 1024
     vae_min_size: int = 512
     vae_stride: int = 16
+    max_pixels: int = 14 * 14 * 9 * 1024
 
 
 BAGEL_GEOMETRY = BagelGeometry()
@@ -92,10 +95,37 @@ class BagelImageProcessor(MultimodalProcessor):
 
     def __init__(self, geometry: BagelGeometry = BAGEL_GEOMETRY) -> None:
         self.vit_transform = ImageTransform(
-            geometry.vit_max_size, geometry.vit_min_size, geometry.vit_stride
+            geometry.vit_max_size,
+            geometry.vit_min_size,
+            geometry.vit_stride,
+            geometry.max_pixels,
         )
         self.vae_transform = ImageTransform(
-            geometry.vae_max_size, geometry.vae_min_size, geometry.vae_stride
+            geometry.vae_max_size,
+            geometry.vae_min_size,
+            geometry.vae_stride,
+            geometry.max_pixels,
+        )
+
+    @classmethod
+    def from_image_spec(cls, images: "ImageInputSpec") -> "BagelImageProcessor":
+        """Construct the processor from a model's declared image transforms."""
+        vit = images.vit
+        vae = images.vae
+        if not isinstance(vit, ImageTowerSpec) or vae is None:
+            raise invalid_descriptor("BAGEL image inputs require vit and vae tower transforms")
+        if vit.resize.max_pixels != vae.resize.max_pixels:
+            raise invalid_descriptor("BAGEL tower transforms share one pixel cap")
+        return cls(
+            BagelGeometry(
+                vit_max_size=int(vit.resize.max_size),
+                vit_min_size=int(vit.resize.min_size),
+                vit_stride=int(vit.resize.stride),
+                vae_max_size=int(vae.resize.max_size),
+                vae_min_size=int(vae.resize.min_size),
+                vae_stride=int(vae.resize.stride),
+                max_pixels=int(vit.resize.max_pixels),
+            )
         )
 
     @staticmethod

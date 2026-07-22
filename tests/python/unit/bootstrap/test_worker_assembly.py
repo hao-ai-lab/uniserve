@@ -103,9 +103,9 @@ class _VisionModel(UniModel):
     num_layers = 1
     encoder_cache_budget = 4
 
-    def encode_image(self, pixels, grid, op=None):
+    def encode_image(self, pixels, grid=None, *, ctx):
         return EncodeOutput(
-            req_id=int(op["req_id"]),
+            req_id=ctx.req_id,
             encoder_handle=7,
             num_tokens=1,
         )
@@ -151,7 +151,7 @@ def test_encoder_assembly_executes_the_loaded_model(
     result = worker.execute(
         seal_batch(
             1,
-            [{"req_id": 3, "kind": "vit_encode", "mm_hash": 11}],
+            [{"req_id": 3, "kind": "vit_encode", "image_in": 11}],
             new_reqs=[{"req_id": 3}],
         )
     )

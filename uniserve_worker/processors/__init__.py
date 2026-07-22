@@ -1,8 +1,7 @@
 """Multimodal processor registry."""
 from .base import MultimodalDataItem, MultimodalProcessor
 from .registry import (
-    get_image_pipeline_for_descriptor,
-    get_image_pipeline_for_model,
+    build_image_input_stage,
     get_processor_for_descriptor,
     get_processor_for_model,
     register_processor,
@@ -11,8 +10,7 @@ from .registry import (
 __all__ = [
     "MultimodalDataItem",
     "MultimodalProcessor",
-    "get_image_pipeline_for_descriptor",
-    "get_image_pipeline_for_model",
+    "build_image_input_stage",
     "get_processor_for_descriptor",
     "get_processor_for_model",
     "register_processor",

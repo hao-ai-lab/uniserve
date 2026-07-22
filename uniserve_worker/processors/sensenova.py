@@ -16,6 +16,8 @@ from dataclasses import dataclass
 import torch
 from PIL import Image
 
+from ..contracts.model_spec import ImageInputSpec, ImagePatchSpec
+from ..foundation.errors import invalid_descriptor
 from .base import MultimodalProcessor
 from .registry import register_processor
 
@@ -104,6 +106,24 @@ class SenseNovaImageProcessor(MultimodalProcessor):
 
     def __init__(self, geometry: SenseNovaImageGeometry = SENSENOVA_IMAGE_GEOMETRY) -> None:
         self.geometry = geometry
+
+    @classmethod
+    def from_image_spec(cls, images: "ImageInputSpec") -> "SenseNovaImageProcessor":
+        """Construct the processor from a model's declared image transforms."""
+        vit = images.vit
+        if not isinstance(vit, ImagePatchSpec):
+            raise invalid_descriptor(
+                "SenseNova understanding inputs require a declared vit patch transform"
+            )
+        return cls(
+            SenseNovaImageGeometry(
+                patch_size=int(vit.patch_size),
+                downsample_ratio=float(vit.downsample_ratio),
+                min_pixels=int(vit.min_pixels),
+                max_pixels=int(vit.max_pixels),
+                multi_image_pixel_budget=int(vit.multi_image_pixel_budget),
+            )
+        )
 
     @staticmethod
     def decode_image_b64(image_b64: str) -> Image.Image:

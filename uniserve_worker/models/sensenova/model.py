@@ -35,9 +35,17 @@ from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
 from uniserve_worker.runtime.forward_stream import ForwardPagedKVView, ForwardStream
 
-from ...contracts.forward_batch import ForwardBatch
+from ...contracts.forward_batch import EncodeContext, ForwardBatch
 from ...contracts.forward_context import get_forward_context
-from ...contracts.model_spec import CacheSpec, FlowSpec, InputSpec, ModelSpec, RouteSpec
+from ...contracts.model_spec import (
+    CacheSpec,
+    FlowSpec,
+    ImageInputSpec,
+    ImagePatchSpec,
+    InputSpec,
+    ModelSpec,
+    RouteSpec,
+)
 from ...contracts.resource_plan import (
     CapsDescriptor,
     EncoderResourcePolicy,
@@ -86,7 +94,7 @@ from ...nn.quant import (
     use_quantization_config,
 )
 from ...nn.vision import NeoVitConfig, NeoVitEncoder, build_abs_positions_from_grid_hw
-from ...processors.registry import get_processor_for_model
+from ...processors.sensenova import SENSENOVA_IMAGE_GEOMETRY
 from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
 from ...runtime.request_state import RequestState as RunnerRequestState
@@ -95,7 +103,6 @@ from ...runtime.residency import (
     GenResidencySpec,
     KvCacheSpec,
     ResidencyManager,
-    encoder_handle_from_mm_hash,
 )
 from ...runtime.tower_handoff import (
     ConditioningSnapshot,
@@ -2513,7 +2520,22 @@ class SenseNovaU1ForUnifiedGeneration(
                 ),
             ),
             weights=self.weight_spec,
-            inputs=InputSpec(requires_worker_tokenizer=True),
+            inputs=InputSpec(
+                requires_worker_tokenizer=True,
+                images=ImageInputSpec(
+                    vit=ImagePatchSpec(
+                        patch_size=SENSENOVA_IMAGE_GEOMETRY.patch_size,
+                        downsample_ratio=SENSENOVA_IMAGE_GEOMETRY.downsample_ratio,
+                        min_pixels=SENSENOVA_IMAGE_GEOMETRY.min_pixels,
+                        max_pixels=SENSENOVA_IMAGE_GEOMETRY.max_pixels,
+                        multi_image_pixel_budget=(
+                            SENSENOVA_IMAGE_GEOMETRY.multi_image_pixel_budget
+                        ),
+                        normalization="imagenet",
+                    ),
+                    staging_dtype="bfloat16",
+                ),
+            ),
             cache=CacheSpec(
                 num_layers=int(self.num_layers),
                 num_kv_heads=int(self._kv_num_heads),
@@ -3045,59 +3067,44 @@ class SenseNovaU1ForUnifiedGeneration(
             self._shared_ingest_driver = driver
         return driver
 
-    def _understanding_processor(self) -> Any:
-        processor = getattr(self, "_shared_understanding_processor", None)
-        if processor is None:
-            processor = get_processor_for_model(type(self))
-            if processor is None:
-                raise capability_mismatch(
-                    "no multimodal processor is registered for SenseNova understanding inputs"
-                )
-            self._shared_understanding_processor = processor
-        return processor
-
     def encode_image(
         self,
-        pixels: Any = None,
-        grid: Any = None,
+        pixels: torch.Tensor | None = None,
+        grid: torch.Tensor | None = None,
         *,
-        op: Mapping[str, Any] | None = None,
+        ctx: EncodeContext,
     ) -> dict[str, Any]:
         """Ingest an external understanding image (``vit_encode``).
 
-        The engine hands the image bytes plus the shared temporal RoPE index
-        (``cond_pos``); the begin/end markers are ordinary prompt tokens, so
-        this op appends only the patch block into the conditional text cache
-        and reports how many vision tokens it added.
+        The system input stage hands the staged patch rows, grid, and the
+        shared temporal RoPE index; the begin/end markers are ordinary prompt
+        tokens, so this op appends only the patch block into the conditional
+        text cache and reports how many vision tokens it added.
         """
-        del pixels, grid
-        if op is None:
-            raise invalid_descriptor("SenseNova image encode requires an op descriptor")
         if self.model is None:
             raise RuntimeError("SenseNova model weights are not loaded")
-        op = dict(op)
-        req_id = int(op["req_id"])
-        image_b64 = op.get("image_b64")
-        cond_pos = op.get("cond_pos")
-        if cond_pos is None:
+        if ctx.temporal_index is None:
             raise invalid_descriptor("vit_encode requires the shared temporal index (cond_pos)")
 
-        st = self._state(op)
+        st = self.program_state(ctx.req_id)
         text_driver = self._text_driver()
-        text_driver.extend_cache_blocks(st.cond, op)
+        text_driver.extend_cache_span(
+            st.cond,
+            req_id=ctx.req_id,
+            new_block_ids=ctx.new_block_ids,
+            pos_range=ctx.pos_range,
+        )
         text_driver.ensure_host_cache(st.cond)
 
         driver = self._ingest_driver()
-        if image_b64:
-            processor = self._understanding_processor()
-            image = processor.decode_image_b64(str(image_b64))
-            image_hw = [int(image.height), int(image.width)]
-            flattened, grid_hw = processor.understanding_patches(image)
-            flattened = flattened.to(device=self.device, dtype=self.model.dtype)
-            vit_embeds = driver.encode_understanding_image(flattened, grid_hw).detach()
-            handle = encoder_handle_from_mm_hash(op.get("mm_hash"))
+        if pixels is not None:
+            if grid is None or ctx.image_hw is None:
+                raise invalid_descriptor("vit_encode pixels require a patch grid and dimensions")
+            image_hw = [int(value) for value in ctx.image_hw]
+            vit_embeds = driver.encode_understanding_image(pixels, grid).detach()
+            grid_hw = grid
             self.residency.encoder.put(
-                handle,
+                ctx.handle,
                 {
                     "kind": "vit_encode",
                     "vit_embeds": vit_embeds,
@@ -3106,10 +3113,7 @@ class SenseNovaU1ForUnifiedGeneration(
                 },
             )
         else:
-            cached_handle = op.get("image_in")
-            if not isinstance(cached_handle, int) or isinstance(cached_handle, bool):
-                raise invalid_descriptor("cached vit_encode requires an encoder handle")
-            cached = self.residency.encoder.get(cached_handle)
+            cached = self.residency.encoder.get(ctx.handle)
             if not isinstance(cached, Mapping) or cached.get("kind") != "vit_encode":
                 raise invalid_descriptor("cached vit_encode handle is not resident")
             cached_vit_embeds = cached.get("vit_embeds")
@@ -3131,17 +3135,16 @@ class SenseNovaU1ForUnifiedGeneration(
             vit_embeds = cached_vit_embeds
             grid_hw = cached_grid_hw
             image_hw = [int(value) for value in cached_image_hw]
-            handle = cached_handle
 
         num_tokens = driver.ingest_understanding_embeddings(
             st.cond,
             vit_embeds,
             grid_hw,
-            t_index=int(cond_pos),
+            t_index=int(ctx.temporal_index),
         )
         return {
-            "req_id": req_id,
-            "encoder_handle": handle,
+            "req_id": ctx.req_id,
+            "encoder_handle": ctx.handle,
             "num_tokens": num_tokens,
             "image_hw": image_hw,
         }
