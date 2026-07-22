@@ -42,7 +42,7 @@ from ..foundation.sizing import (
     derive_num_blocks,
     derive_runtime_kv_capacity,
 )
-from ..loader.weight_utils import WeightLoadReport, stacked_params_mapping_loop
+from ..loader.weight_spec import StackedParamMapping, WeightSpec
 from ..nn import (
     FusedMoE,
     LinearBase,
@@ -382,6 +382,15 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
     supported_controls: tuple[str, ...] = ()
     adapter_mode = "none"
     resource_plan = ResourcePlan(kv_block=KvBlockResourcePolicy.PER_BLOCK)
+    weight_spec = WeightSpec(
+        stacked=(
+            StackedParamMapping("qkv_proj", "q_proj", "q"),
+            StackedParamMapping("qkv_proj", "k_proj", "k"),
+            StackedParamMapping("qkv_proj", "v_proj", "v"),
+            StackedParamMapping("gate_up_proj", "gate_proj", 0),
+            StackedParamMapping("gate_up_proj", "up_proj", 1),
+        ),
+    )
 
     def __init__(self, config: Any | None = None) -> None:
         super().__init__()
@@ -607,20 +616,4 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
                 },
             )
         return capacity.num_blocks
-
-    def load_weights(self, weights) -> WeightLoadReport:
-        stacked: list[tuple[str, str, str | int]] = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        loaded, ignored = stacked_params_mapping_loop(
-            self,
-            list(weights),
-            stacked,
-            name_mapper=lambda name: name,
-        )
-        return WeightLoadReport(loaded=loaded, ignored=tuple(ignored))
 

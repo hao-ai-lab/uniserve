@@ -109,7 +109,6 @@ class ModelFamilyDescriptor:
     execution: FamilyExecutionContract
     processor_factory: Callable[[], Any] | None = None
     loader_name: str = "default"
-    checkpoint_layout: Any | None = None
     image_pipeline_factory: Callable[[Any], Any] | None = None
 
     @classmethod
@@ -122,13 +121,16 @@ class ModelFamilyDescriptor:
         family_names = names or tuple(
             str(name) for name in getattr(model_cls, "architectures", (model_cls.__name__,))
         )
+        # The family's declared WeightSpec names the loader that serves its
+        # checkpoint layout; a family without one uses the default loader.
         return cls(
             family=str(getattr(model_cls, "family", model_cls.__name__)),
             names=family_names,
             model_class=model_cls,
             execution=FamilyExecutionContract.from_model_class(model_cls),
-            loader_name=str(getattr(model_cls, "loader_name", "default")),
-            checkpoint_layout=getattr(model_cls, "checkpoint_layout", None),
+            loader_name=str(
+                getattr(getattr(model_cls, "weight_spec", None), "loader", "default")
+            ),
         )
 
     @property
@@ -152,7 +154,6 @@ class ModelFamilyDescriptor:
             execution=self.execution,
             processor_factory=processor_factory,
             loader_name=self.loader_name,
-            checkpoint_layout=self.checkpoint_layout,
             image_pipeline_factory=image_pipeline_factory,
         )
 

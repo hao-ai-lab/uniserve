@@ -1,16 +1,15 @@
-"""Shared Hugging Face Transformers checkpoint loading helpers."""
+"""Hugging Face native checkpoint loader: meta-init plus per-tensor streaming."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 from torch import nn
 
-from ..contracts.model_family import ModelFamilyDescriptor
 from ..foundation.env import DEFAULT_ATTENTION_BACKEND
 from ..foundation.runtime_config import get_execution_config
+from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..nn.placement import get_shard_plan
 from ..nn.quant import QuantizationConfig, use_quantization_config
 from ..nn.quant.base import process_quantized_modules
@@ -26,19 +25,16 @@ from ..nn.quant.load_state import (
     skip_serving_cast,
 )
 from .base import BaseModelLoader, LoadResult
-from .checkpoint_layout import CheckpointLayout
 from .registry import register_loader
+from .weight_spec import WeightSpec, weight_spec_of
 from .weight_utils import StackedParamMapping, iter_weights, load_parameter, resolve_weight_files
 
 __all__ = [
     "dtype_from_name",
     "infer_input_device",
     "load_native_transformers_checkpoint",
-    "NativeLoadSpec",
     "NativeTransformersLoader",
 ]
-
-ParamFilterFromModel = Callable[[nn.Module, str | None], Callable[[str], bool] | None]
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -92,6 +88,22 @@ def infer_input_device(
     return torch.device(fallback) if isinstance(fallback, str) else fallback
 
 
+def _check_min_code_version(config: Any, key: str | None, code_version: str | None) -> None:
+    """Reject a checkpoint that declares a newer minimum model-code version."""
+    if key is None or code_version is None:
+        return
+    try:
+        from packaging.version import Version
+    except ImportError:  # pragma: no cover
+        return
+    cfg = config.to_dict() if hasattr(config, "to_dict") else config
+    if not isinstance(cfg, dict):
+        return
+    required = cfg.get(key)
+    if required and Version(code_version) < Version(str(required)):
+        raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
+
+
 def load_native_transformers_checkpoint(
     model_dir: str,
     device: str,
@@ -102,13 +114,10 @@ def load_native_transformers_checkpoint(
     attention_backend: str | None = None,
     use_fast: bool = False,
     extra_special_tokens: dict[str, Any] | None = None,
-    config_patch: Callable[[Any], None] | None = None,
-    compatibility_check: Callable[[Any], None] | None = None,
+    min_version_key: str | None = None,
+    code_version: str | None = None,
     param_filter: Callable[[str], bool] | None = None,
-    param_filter_from_model: ParamFilterFromModel | None = None,
-    tower_role: str | None = None,
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = (),
-    checkpoint_layout: CheckpointLayout | None = None,
 ) -> tuple[nn.Module, Any, str]:
     """Instantiate a native ``nn.Module`` model and stream HF-format weights.
 
@@ -132,10 +141,7 @@ def load_native_transformers_checkpoint(
 
     config = config_cls.from_pretrained(model_dir)
     config.uniserve_attention_backend = attn_backend
-    if config_patch is not None:
-        config_patch(config)
-    if compatibility_check is not None:
-        compatibility_check(config)
+    _check_min_code_version(config, min_version_key, code_version)
 
     tokenizer = _load_tokenizer(
         tokenizer_cls,
@@ -147,32 +153,6 @@ def load_native_transformers_checkpoint(
     with use_quantization_config(quant_config):
         with init_empty_weights():
             model = model_cls(config)
-    if param_filter_from_model is not None:
-        derived_filter = param_filter_from_model(model, tower_role)
-        if param_filter is not None and derived_filter is not None:
-            base_filter = param_filter
-
-            def combined_param_filter(name: str) -> bool:
-                return base_filter(name) and derived_filter(name)
-
-            param_filter = combined_param_filter
-        elif derived_filter is not None:
-            param_filter = derived_filter
-    if checkpoint_layout is not None:
-        layout_filter = checkpoint_layout.tower_filter(tower_role)
-        if param_filter is not None and layout_filter is not None:
-            base_filter = param_filter
-
-            def combined_layout_filter(name: str) -> bool:
-                return base_filter(name) and layout_filter(name)
-
-            param_filter = combined_layout_filter
-        elif layout_filter is not None:
-            param_filter = layout_filter
-        stacked_params_mapping = (
-            *stacked_params_mapping,
-            *checkpoint_layout.stacked_params(),
-        )
     _stream_checkpoint_weights(
         model,
         model_dir,
@@ -181,7 +161,6 @@ def load_native_transformers_checkpoint(
         set_module_tensor_to_device=set_module_tensor_to_device,
         param_filter=param_filter,
         stacked_params_mapping=stacked_params_mapping,
-        checkpoint_layout=checkpoint_layout,
     )
     process_quantized_modules(model.modules())
     model.eval()
@@ -293,7 +272,6 @@ def _stream_checkpoint_weights(
     set_module_tensor_to_device: Callable[..., Any],
     param_filter: Callable[[str], bool] | None = None,
     stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = (),
-    checkpoint_layout: CheckpointLayout | None = None,
 ) -> None:
     """Stream HF-format weights into ``model`` one tensor at a time.
 
@@ -309,8 +287,6 @@ def _stream_checkpoint_weights(
     expected = set(model.state_dict().keys())
     in_scope = {n for n in expected if param_filter(n)} if param_filter is not None else expected
     optional = {name for name, param in model.named_parameters() if is_optional_checkpoint(param)}
-    if checkpoint_layout is not None:
-        optional.update(name for name in expected if checkpoint_layout.optional_tensor(name))
     loaded: set[str] = set()
     unexpected: list[str] = []
     params = dict(model.named_parameters())
@@ -319,9 +295,7 @@ def _stream_checkpoint_weights(
         for item in stacked_params_mapping
     ]
     for name, tensor in iter_weights(resolve_weight_files(model_dir)):
-        if checkpoint_layout is not None and checkpoint_layout.ignored_tensor(name):
-            continue
-        target_name = checkpoint_layout.map_name(name) if checkpoint_layout is not None else name
+        target_name = name
         shard_id: str | int | None = None
         matched_stacked = False
         for item in stacked:
@@ -486,36 +460,15 @@ def _mark_quant_tensor_loaded(module: nn.Module, leaf: str, tensor: torch.Tensor
         set_fp8_weight_loaded_offline(module, True)
 
 
-@dataclass(frozen=True)
-class NativeLoadSpec:
-    """A model's declaration of how its native HF checkpoint is materialized.
-
-    A wrapper model class returns this from ``native_load_spec()`` so
-    :class:`NativeTransformersLoader` can drive the meta-init + per-tensor
-    streaming generically; the wrapper then builds its serving wrapper via
-    ``from_native``.
-    """
-
-    config_cls: Any
-    model_cls: Any
-    tokenizer_cls: Any
-    config_patch: Callable[[Any], None] | None = None
-    compatibility_check: Callable[[Any], None] | None = None
-    use_fast: bool = False
-    extra_special_tokens: dict[str, Any] | None = None
-    param_filter_from_model: ParamFilterFromModel | None = None
-    stacked_params_mapping: tuple[StackedParamMapping | tuple[str, str, str | int], ...] = ()
-    checkpoint_layout: CheckpointLayout | None = None
-
-
 class NativeTransformersLoader(BaseModelLoader):
     """The native HF weight-streaming materialization, governed by the loader ABC.
 
     Registered under the ``native`` load_format. ``model_cls`` is the serving
-    wrapper class, which declares its materialization via ``native_load_spec()``
-    and builds the final ``UniModel`` via ``from_native``. This brings the
-    complex per-tensor materialization (``load_native_transformers_checkpoint``)
-    under one governed contract instead of leaving it outside the ABC.
+    wrapper class; its declared ``WeightSpec`` names the native config,
+    tokenizer, and inner-module bindings plus the stacked-parameter and
+    tower-split rules. The loader meta-initializes the inner module, streams
+    the checkpoint into it, and constructs the serving wrapper around the
+    ready module.
     """
 
     def load_model(
@@ -530,38 +483,42 @@ class NativeTransformersLoader(BaseModelLoader):
         del config  # the native path resolves its own HF config from model_path
         if model_path is None:
             raise ValueError("NativeTransformersLoader requires model_path")
-        spec: NativeLoadSpec = model_cls.native_load_spec()
-        descriptor = ModelFamilyDescriptor.from_model_class(model_cls)
-        checkpoint_layout = kwargs.get("checkpoint_layout")
-        if checkpoint_layout is None:
-            checkpoint_layout = spec.checkpoint_layout or descriptor.checkpoint_layout
-        # Tower partial load: a tower model declares which checkpoint params belong
-        # to a ``tower_role`` so an und/gen worker materializes only its tower.
-        # Whole-model kinds pass ``tower_role=None`` (no filter).
-        param_filter = None
+        spec: WeightSpec = weight_spec_of(model_cls)
+        native = spec.native
+        if native is None:
+            raise ValueError(
+                f"{model_cls.__name__} declares no native checkpoint source in its weight_spec"
+            )
+        # Tower partial load: the spec's tower split names the checkpoint params
+        # belonging to a ``tower_role`` so an und/gen worker materializes only
+        # its tower. Whole-model kinds pass ``tower_role=None`` (no filter).
         tower_role = kwargs.get("tower_role")
-        if tower_role is not None:
-            role_filter_fn = getattr(model_cls, "tower_role_param_filter", None)
-            if role_filter_fn is not None:
-                param_filter = role_filter_fn(tower_role)
+        param_filter = spec.tower.role_filter(tower_role) if spec.tower is not None else None
         inner, tokenizer, real_device = load_native_transformers_checkpoint(
             model_path,
             device,
-            config_cls=spec.config_cls,
-            model_cls=spec.model_cls,
-            tokenizer_cls=spec.tokenizer_cls,
+            config_cls=native.config_cls,
+            model_cls=native.module_cls,
+            tokenizer_cls=native.tokenizer_cls,
             attention_backend=kwargs.get("attention_backend"),
-            use_fast=spec.use_fast,
-            extra_special_tokens=spec.extra_special_tokens,
-            config_patch=spec.config_patch,
-            compatibility_check=spec.compatibility_check,
+            use_fast=native.use_fast,
+            extra_special_tokens=native.extra_special_tokens,
+            min_version_key=native.min_version_key,
+            code_version=native.code_version,
             param_filter=param_filter,
-            param_filter_from_model=spec.param_filter_from_model,
-            tower_role=tower_role,
-            stacked_params_mapping=spec.stacked_params_mapping,
-            checkpoint_layout=checkpoint_layout,
+            stacked_params_mapping=spec.stacked,
         )
-        model = model_cls.from_native(inner, tokenizer=tokenizer, device=real_device, **kwargs)
+        model = model_cls(
+            inner.config,
+            model=inner,
+            tokenizer=tokenizer,
+            device=real_device,
+            gen_snapshot_kv_capacity=kwargs.get("gen_snapshot_kv_capacity"),
+            block_size=kwargs.get("block_size", DEFAULT_BLOCK_SIZE),
+            kv_token_capacity=kwargs.get("kv_token_capacity"),
+            attention_backend=kwargs.get("attention_backend"),
+            tower_role=tower_role,
+        )
         return LoadResult(model=model, tokenizer=tokenizer, device=real_device)
 
 

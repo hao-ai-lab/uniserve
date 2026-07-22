@@ -56,7 +56,14 @@ from ..foundation.sizing import (
     derive_num_blocks,
     derive_runtime_kv_capacity,
 )
-from ..loader.weight_utils import iter_weights, stacked_params_mapping_loop, tensor_shape
+from ..loader.weight_spec import (
+    GraphSource,
+    Rename,
+    Sidecar,
+    StackedParamMapping,
+    WeightSpec,
+)
+from ..loader.weight_utils import tensor_shape
 from ..nn import LinearBase, MLPConnector, ParallelLMHead, local_kv_head_count
 from ..nn.decoder import KVCache, MoTDecoderLayer, MoTModel, Segment
 from ..nn.diffusion import FlowMatchSchedule, ScheduleDirection, TimestepEmbedder, init_latent
@@ -536,91 +543,46 @@ class _BagelGraph(nn.Module):
         img = (img * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         return Image.fromarray(img.to(torch.uint8).cpu().numpy())
 
-    def load_weights(self, weights, *, dtype: torch.dtype = torch.bfloat16) -> None:
-        exact = {
-            "language_model.model.embed_tokens.weight": "lm.embed_tokens.weight",
-            "language_model.model.norm.weight": "lm.norm.weight",
-            "language_model.model.norm_moe_gen.weight": "lm.norm_moe_gen.weight",
-            "language_model.lm_head.weight": "lm_head.weight",
-            "vae2llm.weight": "vae2llm.weight",
-            "vae2llm.bias": "vae2llm.bias",
-            "llm2vae.weight": "llm2vae.weight",
-            "llm2vae.bias": "llm2vae.bias",
-            "time_embedder.mlp.0.weight": "time_embedder.mlp.0.weight",
-            "time_embedder.mlp.0.bias": "time_embedder.mlp.0.bias",
-            "time_embedder.mlp.2.weight": "time_embedder.mlp.2.weight",
-            "time_embedder.mlp.2.bias": "time_embedder.mlp.2.bias",
-            "latent_pos_embed.pos_embed": "latent_pos_embed.pos_embed",
-        }
-        stacked: list[tuple[str, str, str | int]] = [
-            ("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
-            ("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
-            ("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
 
-        def map_name(name: str) -> str | None:
-            if name in exact:
-                return exact[name]
-            if name.startswith("language_model.model.layers."):
-                mapped = name.replace("language_model.model.layers.", "lm.layers.", 1)
-                return mapped.replace(".self_attn.", ".")
-            if name.startswith("vit_model.vision_model.embeddings."):
-                return name.replace("vit_model.vision_model.embeddings.", "vit_model.", 1)
-            if name.startswith("vit_model.vision_model.encoder."):
-                mapped = name.replace("vit_model.vision_model.", "vit_model.", 1)
-                mapped = mapped.replace(".mlp.fc1.", ".mlp.0.")
-                return mapped.replace(".mlp.fc2.", ".mlp.2.")
-            if name.startswith("vit_model.vision_model.post_layernorm."):
-                return name.replace(
-                    "vit_model.vision_model.post_layernorm.",
-                    "vit_model.encoder.post_layernorm.",
-                    1,
-                )
-            if name.startswith(("connector.", "vit_pos_embed.")):
-                return name
-            return None
+# Checkpoint tensor names map onto the ``_BagelGraph`` parameter tree through
+# these ordered rules; a name outside them is not a graph target (the VAE loads
+# from its sidecar file).
+_BAGEL_RENAMES = (
+    Rename("language_model.model.embed_tokens.weight", "lm.embed_tokens.weight", exact=True),
+    Rename("language_model.model.norm.weight", "lm.norm.weight", exact=True),
+    Rename("language_model.model.norm_moe_gen.weight", "lm.norm_moe_gen.weight", exact=True),
+    Rename("language_model.lm_head.weight", "lm_head.weight", exact=True),
+    Rename("language_model.model.layers.", "lm.layers.", then=((".self_attn.", "."),)),
+    Rename("vit_model.vision_model.embeddings.", "vit_model."),
+    Rename(
+        "vit_model.vision_model.encoder.",
+        "vit_model.encoder.",
+        then=((".mlp.fc1.", ".mlp.0."), (".mlp.fc2.", ".mlp.2.")),
+    ),
+    Rename(
+        "vit_model.vision_model.post_layernorm.",
+        "vit_model.encoder.post_layernorm.",
+    ),
+    Rename("connector.", "connector."),
+    Rename("vit_pos_embed.", "vit_pos_embed."),
+    Rename("vae2llm.", "vae2llm."),
+    Rename("llm2vae.", "llm2vae."),
+    Rename("time_embedder.", "time_embedder."),
+    Rename("latent_pos_embed.", "latent_pos_embed."),
+)
 
-        all_weights = list(weights)
-        loaded, ignored = stacked_params_mapping_loop(
-            self,
-            all_weights,
-            stacked,
-            name_mapper=map_name,
-            dtype=dtype,
-        )
-        expected = {name for name, _ in self.named_parameters() if not name.startswith("vae.")}
-        missing = sorted(expected - loaded)
-        if missing:
-            raise capability_mismatch(
-                "BAGEL weight load mismatch: "
-                f"missing={missing[:8]} ({len(missing)}) ignored={ignored[:8]}"
-            )
-        logger.info("loaded BAGEL graph weights (%d params)", len(loaded))
-
-    def load_vae_weights(self, weights) -> None:
-        state_dict = dict(weights)
-        missing, unexpected = self.vae.load_state_dict(state_dict, strict=False)
-        real_missing = [name for name in missing if "reg" not in name]
-        if real_missing or unexpected:
-            raise capability_mismatch(
-                "BAGEL VAE weight load mismatch: "
-                f"missing={real_missing[:8]} unexpected={unexpected[:8]}"
-            )
-        logger.info("loaded BAGEL VAE weights (%d tensors)", len(state_dict))
-
-
-def _load_bagel(model_dir: str, device: str = "cuda") -> _BagelGraph:
-    cfg = BagelConfig.from_pretrained(model_dir)
-    model = _BagelGraph(cfg).eval()
-    model.load_weights(iter_weights([Path(_weights_file(model_dir))]))
-    model.load_vae_weights(iter_weights([Path(model_dir) / "ae.safetensors"]))
-    model.to(device=device, dtype=torch.bfloat16)
-    return model
+# The ``_moe_gen`` rules precede the base rules: their source fragments contain
+# the base fragments as substrings, and first match wins.
+_BAGEL_STACKED = (
+    StackedParamMapping("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
+    StackedParamMapping("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
+    StackedParamMapping("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
+    StackedParamMapping("qkv_proj", "q_proj", "q"),
+    StackedParamMapping("qkv_proj", "k_proj", "k"),
+    StackedParamMapping("qkv_proj", "v_proj", "v"),
+    StackedParamMapping("gate_up_proj", "gate_proj", 0),
+    StackedParamMapping("gate_up_proj", "up_proj", 1),
+)
 
 
 @dataclass(frozen=True)
@@ -698,6 +660,14 @@ class BagelForUnifiedGeneration(UniModelBase):
         image_latent=LatentTokens(downsample=16),
         scratch=PerBranch(),
         adapter=AdapterResourcePolicy.PER_ADAPTER,
+    )
+    weight_spec = WeightSpec(
+        graph=GraphSource(config_cls=BagelConfig, module_cls=_BagelGraph),
+        checkpoint_files=("ema.safetensors", "model.safetensors"),
+        renames=_BAGEL_RENAMES,
+        stacked=_BAGEL_STACKED,
+        unmatched="skip",
+        sidecars=(Sidecar(file="ae.safetensors", module="vae", optional_substrings=("reg",)),),
     )
 
     def velocity_parameterization(self) -> str:
@@ -825,28 +795,6 @@ class BagelForUnifiedGeneration(UniModelBase):
 
     def segment_adapter(self) -> SegmentAdapter:
         return self
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: str,
-        *,
-        device: str,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        kv_token_capacity: int | None = None,
-        attention_backend: str | None = None,
-        **_kwargs: Any,
-    ) -> "BagelForUnifiedGeneration":
-        model = _load_bagel(model_path, device=device)
-        return cls(
-            model.cfg,
-            model=model,
-            device=device,
-            block_size=block_size,
-            kv_token_capacity=kv_token_capacity,
-            image_processor=BagelImageProcessor(),
-            attention_backend=attention_backend,
-        )
 
     def _caps_descriptor(
         self,

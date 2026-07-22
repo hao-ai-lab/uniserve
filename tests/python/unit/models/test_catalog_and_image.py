@@ -7,9 +7,9 @@ Covers three public surfaces:
 * :meth:`uniserve_worker.processors.bagel.BagelImageProcessor.decode_image_b64`
   -- compositing of transparent / RGBA / palette-with-transparency inputs over
   opaque white, and the straight RGB conversion of an opaque input.
-* :meth:`SenseNovaU1ForUnifiedGeneration.tower_role_param_filter_from_model` -- the
-  ``None`` / ``"gen"`` / ``"und"`` / unknown-role behavior and the disjoint,
-  jointly-complete gen/und predicates.
+* the SenseNova ``weight_spec`` tower split -- the ``None`` / ``"gen"`` /
+  ``"und"`` / unknown-role behavior and the disjoint, jointly-complete gen/und
+  predicates.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import io
 from dataclasses import replace
 
 import pytest
-import torch.nn as nn
 
 from uniserve_worker.contracts import UniModel
 from uniserve_worker.foundation import runtime_config as runtime_config_module
@@ -245,66 +244,13 @@ def test_decode_image_b64_always_returns_rgb_for_grayscale_input():
 
 
 # --------------------------------------------------------------------------- #
-# SenseNovaU1ForUnifiedGeneration.tower_role_param_filter
+# SenseNova weight_spec tower split
 # --------------------------------------------------------------------------- #
-
-
-class _FakeTowerAttention(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.q_proj = nn.Linear(1, 1, bias=False)
-        self.qkv_proj_mot_gen = nn.Linear(1, 1, bias=False)
-        self.o_proj_mot_gen = nn.Linear(1, 1, bias=False)
-        self.q_norm_mot_gen = nn.Linear(1, 1, bias=False)
-        self.k_norm_mot_gen = nn.Linear(1, 1, bias=False)
-        self.q_norm_hw_mot_gen = nn.Linear(1, 1, bias=False)
-        self.k_norm_hw_mot_gen = nn.Linear(1, 1, bias=False)
-
-
-class _FakeTowerLayer(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.self_attn = _FakeTowerAttention()
-        self.mlp = nn.Module()
-        self.mlp.gate_proj = nn.Linear(1, 1, bias=False)
-        self.input_layernorm_mot_gen = nn.Linear(1, 1, bias=False)
-        self.post_attention_layernorm_mot_gen = nn.Linear(1, 1, bias=False)
-        self.mlp_mot_gen = nn.Linear(1, 1, bias=False)
-
-
-class _FakeTowerDecoder(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.embed_tokens = nn.Linear(1, 1, bias=False)
-        self.norm = nn.Linear(1, 1, bias=False)
-        self.norm_mot_gen = nn.Linear(1, 1, bias=False)
-        self.layers = nn.ModuleList([_FakeTowerLayer()])
-
-
-class _FakeTowerLanguageModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.model = _FakeTowerDecoder()
-
-
-class _FakeTowerModel(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.language_model = _FakeTowerLanguageModel()
-        self.lm_head = nn.Linear(1, 1, bias=False)
-        self.vision_model = nn.Module()
-        self.vision_model.patch_embed = nn.Linear(1, 1, bias=False)
-        self.fm_modules = nn.ModuleDict(
-            {
-                "vision_model_mot_gen": nn.Linear(1, 1, bias=False),
-                "timestep_embedder": nn.Linear(1, 1, bias=False),
-            }
-        )
 
 
 # A representative checkpoint param-name set spanning understanding-tower modules
 # (embed/lm_head/und attn-mlp-norm/model norm/und ViT) and generation-tower
-# modules (the modules tagged by the SenseNova tower layout).
+# modules (``fm_modules`` plus the decoder ``*_mot_gen`` modules).
 _UND_PARAM_NAMES = (
     "language_model.model.embed_tokens.weight",
     "lm_head.weight",
@@ -323,16 +269,12 @@ _GEN_PARAM_NAMES = (
 
 def _tower_filter(tower_role):
     # SenseNova model import is heavy but CPU-only and needs no checkpoint; the
-    # classmethod under test derives its predicate from module annotations on a
-    # lightweight representative model tree.
+    # declared tower split partitions checkpoint param names as pure data.
     from uniserve_worker.models.sensenova.model import (
         SenseNovaU1ForUnifiedGeneration,
     )
 
-    return SenseNovaU1ForUnifiedGeneration.tower_role_param_filter_from_model(
-        _FakeTowerModel(),
-        tower_role,
-    )
+    return SenseNovaU1ForUnifiedGeneration.weight_spec.tower.role_filter(tower_role)
 
 
 def test_tower_role_param_filter_none_role_returns_none():

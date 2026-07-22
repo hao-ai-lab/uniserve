@@ -1,4 +1,4 @@
-"""Default checkpoint loader for new-style UniModel classes."""
+"""Default checkpoint loader: spec-driven streaming into a config-built model."""
 from __future__ import annotations
 
 import logging
@@ -8,9 +8,11 @@ from typing import Any, Type, cast
 from ..contracts.model_protocols import UniModel
 from ..nn.quant import QuantizationConfig, use_quantization_config
 from ..nn.quant.base import process_quantized_modules
+from ..nn.quant.load_state import is_optional_checkpoint
 from .base import BaseModelLoader, LoadResult
 from .registry import register_loader
-from .weight_utils import iter_weights, resolve_weight_files, strict_load_weights
+from .weight_spec import weight_spec_of
+from .weight_utils import iter_weights, resolve_weight_files, stacked_params_mapping_loop
 
 __all__ = [
     'DefaultModelLoader',
@@ -20,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 
 class DefaultModelLoader(BaseModelLoader):
+    """Streams a checkpoint into ``model_cls(config=config)`` per its ``WeightSpec``.
+
+    Checkpoint tensors flow through the declared rename/stack rules into the
+    destination parameters' weight hooks. A parameter with no checkpoint
+    tensor fails the load (optional-checkpoint parameters are exempt);
+    checkpoint tensors that target no parameter are reported and skipped.
+    """
+
     def load_model(
         self,
         model_cls: Type[UniModel],
@@ -33,11 +43,18 @@ class DefaultModelLoader(BaseModelLoader):
         if model_path is None:
             raise ValueError("DefaultModelLoader requires model_path")
         start = time.perf_counter()
+        spec = weight_spec_of(model_cls)
         quant_config = QuantizationConfig.from_model_config(config)
         with use_quantization_config(quant_config):
             model = cast(Any, model_cls)(config=config)
         files = resolve_weight_files(model_path)
-        summary = strict_load_weights(model, iter_weights(files))
+        loaded, ignored = stacked_params_mapping_loop(
+            model,
+            iter_weights(files),
+            spec.stacked,
+            name_mapper=spec.map_name,
+        )
+        _require_loaded_parameters(model, loaded)
         modules = getattr(model, "modules", None)
         if callable(modules):
             process_quantized_modules(modules())
@@ -56,7 +73,6 @@ class DefaultModelLoader(BaseModelLoader):
         if callable(evaluate):
             evaluate()
         dtype, real_device = _first_parameter_dtype_device(model)
-        loaded = summary.loaded_count if summary.loaded_count is not None else summary.tensors_seen
         elapsed = time.perf_counter() - start
         logger.info(
             "loaded model checkpoint",
@@ -64,24 +80,38 @@ class DefaultModelLoader(BaseModelLoader):
                 "model_class": model_cls.__name__,
                 "model_path": str(model_path),
                 "files": [str(path) for path in files],
-                "tensors_seen": summary.tensors_seen,
-                "loaded_tensors": loaded,
-                "ignored_tensors": len(summary.ignored),
+                "loaded_tensors": len(loaded),
+                "ignored_tensors": len(ignored),
                 "dtype": dtype,
                 "device": real_device or str(device),
                 "elapsed_s": round(elapsed, 3),
             },
         )
-        if summary.ignored:
+        if ignored:
             logger.warning(
                 "ignored checkpoint tensors during model load",
                 extra={
                     "model_class": model_cls.__name__,
-                    "ignored_tensors": len(summary.ignored),
-                    "ignored_preview": list(summary.ignored[:20]),
+                    "ignored_tensors": len(ignored),
+                    "ignored_preview": list(ignored[:20]),
                 },
             )
         return LoadResult(model=model, tokenizer=None, device=real_device or str(device))
+
+
+def _require_loaded_parameters(model: Any, loaded: set[str]) -> None:
+    """Fail loudly when a required parameter received no checkpoint tensor."""
+    missing = sorted(
+        name
+        for name, param in model.named_parameters()
+        if name not in loaded and not is_optional_checkpoint(param)
+    )
+    if missing:
+        preview = missing[:20]
+        raise RuntimeError(
+            f"checkpoint load mismatch: missing={len(missing)} {preview!r}"
+            + ("" if len(missing) <= 20 else f" (+{len(missing) - 20} more)")
+        )
 
 
 def _first_parameter_dtype_device(model: UniModel) -> tuple[str | None, str | None]:

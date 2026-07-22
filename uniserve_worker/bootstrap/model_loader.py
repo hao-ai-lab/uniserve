@@ -12,9 +12,8 @@ from typing import Any, cast
 from ..contracts.model_family import ModelFamilyDescriptor, ModelLoadScope
 from ..contracts.model_protocols import UniModel
 from ..foundation.errors import capability_mismatch
-from ..loader import ModelBringUp, get_loader_for_descriptor
+from ..loader import get_loader_for_descriptor
 from ..loader.paths import read_config, resolve_model_path
-from ..nn.quant.base import process_quantized_modules
 from ..runtime.compile import TorchCompileConfig, compile_model_pieces
 from .catalog import MODEL_CATALOG
 
@@ -47,29 +46,25 @@ def load_worker_model(request: WorkerModelLoadRequest) -> LoadedWorkerModel:
     model_class = descriptor.model_class
     _require_supported_scope(model_class, request.scope)
 
-    if issubclass(model_class, ModelBringUp):
-        model = _load_via_model(model_class, model_path, request)
-    else:
-        loader_override = None if request.load_format.lower() == "default" else request.load_format
-        model = (
-            get_loader_for_descriptor(
-                descriptor,
-                override=loader_override,
-            )
-            .load_model(
-                cast(type[UniModel], model_class),
-                read_config(model_path),
-                device=request.device,
-                model_path=model_path,
-                checkpoint_layout=descriptor.checkpoint_layout,
-                block_size=request.block_size,
-                kv_token_capacity=request.kv_token_capacity,
-                attention_backend=request.attention_backend,
-                gen_snapshot_kv_capacity=(request.generation_kv_capacity_tokens),
-                tower_role=request.scope.tower_role,
-            )
-            .model
+    loader_override = None if request.load_format.lower() == "default" else request.load_format
+    model = (
+        get_loader_for_descriptor(
+            descriptor,
+            override=loader_override,
         )
+        .load_model(
+            cast(type[UniModel], model_class),
+            read_config(model_path),
+            device=request.device,
+            model_path=model_path,
+            block_size=request.block_size,
+            kv_token_capacity=request.kv_token_capacity,
+            attention_backend=request.attention_backend,
+            gen_snapshot_kv_capacity=(request.generation_kv_capacity_tokens),
+            tower_role=request.scope.tower_role,
+        )
+        .model
+    )
 
     _configure_model_tokenizer(model, model_path)
     _compile_model(model)
@@ -100,28 +95,6 @@ def _require_supported_scope(
         raise capability_mismatch(
             f"{model_class.__name__} does not support {scope.value!r} model materialization"
         )
-
-
-def _load_via_model(
-    model_class: type[ModelBringUp],
-    model_path: str,
-    request: WorkerModelLoadRequest,
-) -> UniModel:
-    model = model_class.from_pretrained(
-        model_path,
-        device=request.device,
-        block_size=request.block_size,
-        kv_token_capacity=request.kv_token_capacity,
-        attention_backend=request.attention_backend,
-        gen_snapshot_kv_capacity=request.generation_kv_capacity_tokens,
-        tower_role=request.scope.tower_role,
-    )
-    modules = getattr(model, "modules", None)
-    if not callable(modules):
-        modules = getattr(getattr(model, "model", None), "modules", None)
-    if callable(modules):
-        process_quantized_modules(modules())
-    return model
 
 
 def _check_model_conformance(model: UniModel) -> None:
