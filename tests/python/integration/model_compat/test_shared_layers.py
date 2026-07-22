@@ -4347,13 +4347,11 @@ def test_sensenova_packed_forward_commit_samples_followup_token(monkeypatch):
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     class Owner:
-        def decode_image(self, _latent, *, req_id, state, op):
-            assert req_id == 7
-            assert op["kind"] == "commit_gen"
+        def vae_decode(self, _latent, *, height=None, width=None):
             logits = torch.zeros((1, 1, 6), dtype=torch.float32)
             logits[..., 5] = 10.0
             return {
-                "req_id": req_id,
+                "req_id": 7,
                 "image_png_b64": "png",
                 "image_hw": [16, 16],
                 "logits": logits,

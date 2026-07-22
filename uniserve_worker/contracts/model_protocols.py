@@ -155,15 +155,15 @@ class UniModel(ABC):
     def predict_flow_velocity_batch(self, steps: Any, branches_by_step: Any) -> Any:
         return None
 
-    def decode_image(
+    def vae_decode(
         self,
         latent: Any,
         *,
-        req_id: int | None = None,
-        state: Any = None,
-        op: Mapping[str, Any] | None = None,
+        height: int | None = None,
+        width: int | None = None,
     ) -> Any:
-        raise invalid_descriptor("commit-capable model must implement decode_image()")
+        """Neural latent->pixels decode; the executor owns product materialization."""
+        raise invalid_descriptor("commit-capable model must implement vae_decode()")
 
     def model_spec(self) -> "ModelSpec | None":
         """The model's declarative identity composition; ``None`` when undeclared."""

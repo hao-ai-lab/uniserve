@@ -23,7 +23,6 @@ from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPl
 from uniserve_worker.contracts.forward_batch import (
     DenoiseBranchKey,
     DenoisePostprocessEntry,
-    EncodeContext,
     ForwardBatch,
     ForwardExecutionOptions,
     ForwardPlan,
@@ -39,6 +38,7 @@ from uniserve_worker.execution.flow import PreparedFlowStep, flow_branches, flow
 from uniserve_worker.execution.graph.bucket import padding_blocks
 from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
 from uniserve_worker.execution.graph.executor import backend_name
+from uniserve_worker.execution.products import build_commit_materializer
 from uniserve_worker.execution.sampling import (
     DeferredDecodeBurstSeqResult,
     DeferredTerminalDecodeBurstSeqResult,
@@ -889,29 +889,7 @@ class SegmentAdapter(Protocol):
     ) -> torch.Tensor: ...
     def segment_graph_attention(self) -> Any: ...
     def accept_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None: ...
-    def encode_image(
-        self,
-        pixels: Any = None,
-        grid: Any = None,
-        *,
-        ctx: EncodeContext,
-    ) -> Any: ...
-    def encode_latents(
-        self,
-        pixels: Any = None,
-        grid: Any = None,
-        *,
-        ctx: EncodeContext,
-    ) -> Any: ...
     def _text_driver(self) -> Any: ...
-    def decode_image(
-        self,
-        latent: Any,
-        *,
-        req_id: int | None = None,
-        state: Any = None,
-        op: Mapping[str, Any] | None = None,
-    ) -> Any: ...
 
 
 class SegmentRuntime:
@@ -979,7 +957,7 @@ class SegmentRuntime:
                 (int(row.req_id), request_states.get(int(row.req_id)), row.op)
                 for row in commit_rows
             ),
-            self.adapter,
+            getattr(self, "commit_materializer", None),
             row_indices=tuple(int(row.row_index) for row in commit_rows),
         )
         if not isinstance(commit_result, ForwardResult) or commit_result.commit_outputs is None:
@@ -2576,6 +2554,15 @@ class SegmentExecutor(SegmentRuntime):
     def __init__(self, adapter: SegmentAdapter, *, image_stage: Any = None) -> None:
         super().__init__(adapter)
         self.image_stage = image_stage
+        # Executor-held product drivers: the system dispatch drives commit
+        # materialization and encode ingest directly; models expose only
+        # neural entries on the adapter surface.
+        self.commit_materializer = build_commit_materializer(adapter)
+        self.products: Any = None
+
+    def bind_products(self, products: Any) -> None:
+        """Bind the executor's ``ProductStore`` for intermediate residency."""
+        self.products = products
 
     def execute(
         self,
@@ -2666,7 +2653,12 @@ class SegmentExecutor(SegmentRuntime):
         if not rows:
             return
         ops = [op for _row_index, op in rows]
-        encoded = run_encode_ops(self.adapter, ops, image_stage=self.image_stage)
+        encoded = run_encode_ops(
+            self.adapter,
+            ops,
+            image_stage=self.image_stage,
+            products=self.products,
+        )
         for (row_index, _op), output in zip(rows, encoded, strict=True):
             results[row_index] = output
 
@@ -2678,12 +2670,7 @@ class SegmentExecutor(SegmentRuntime):
     ) -> None:
         for row_index, req_id, op in rows:
             state = request_states.get(req_id)
-            decoded = self.adapter.decode_image(
-                getattr(state, "latent", None),
-                req_id=req_id,
-                state=state,
-                op=op,
-            )
+            decoded = self.commit_materializer.commit(dict(op), state)
             out = dict(decoded)
             logits = out.pop("logits", None)
             if logits is not None:

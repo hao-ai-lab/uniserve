@@ -257,7 +257,8 @@ class OpKindSpec:
     validate: Callable[[Mapping[str, Any], str], None]
 
 
-# Image decode is ``commit_gen`` (decode_image), not a standalone forward op.
+# Image decode is ``commit_gen`` (executor-driven materialization over the
+# model's ``vae_decode``), not a standalone forward op.
 PREFILL_UND = "prefill_und"
 DECODE_UND = "decode_und"
 TARGET_VERIFY_UND = "target_verify_und"

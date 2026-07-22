@@ -5,16 +5,18 @@ from __future__ import annotations
 import base64
 import io
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 from PIL import Image
 
-from uniserve_worker.contracts.forward_batch import EncodeContext
+from uniserve_worker.contracts.forward_batch import EncodeContext, EncodeRow
 from uniserve_worker.contracts.model_spec import ImageInputSpec, ImagePatchSpec
 from uniserve_worker.execution.codec import run_encode_ops
 from uniserve_worker.execution.products import ImageEncoder
 from uniserve_worker.execution.sequence import SequenceCache
+from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration
 from uniserve_worker.nn.vision import build_abs_positions_from_grid_hw
 from uniserve_worker.processors import get_processor_for_model
@@ -25,7 +27,8 @@ from uniserve_worker.processors.sensenova import (
     SenseNovaImageProcessor,
     smart_resize,
 )
-from uniserve_worker.runtime.residency import encoder_handle_from_mm_hash
+from uniserve_worker.runtime.product_store import ProductStore, encoder_handle_from_mm_hash
+from uniserve_worker.worker.model import free_encoder_handles
 
 
 def _reference_smart_resize(height, width, factor=32, min_pixels=512 * 512, max_pixels=2048 * 2048):
@@ -312,3 +315,81 @@ def test_reusable_embeddings_attach_to_each_request_cache_without_reencoding():
 
     assert owner.feature_calls == 1
     assert len(owner.calls) == 2
+
+
+class _FakeSequences:
+    """Sequence-executor double: per-request program state plus span staging."""
+
+    def __init__(self) -> None:
+        self.states: dict[int, SimpleNamespace] = {}
+        self.spans: list[tuple[int, tuple[int, ...], tuple[int, int] | None]] = []
+
+    def state(self, op):
+        req_id = int(op["req_id"])
+        state = self.states.get(req_id)
+        if state is None:
+            cache = SequenceCache()
+            cache.past = _FakePast()
+            state = SimpleNamespace(cond=cache)
+            self.states[req_id] = state
+        return state
+
+    def extend_cache_span(self, cache, *, req_id, new_block_ids, pos_range):
+        del cache
+        self.spans.append((int(req_id), tuple(new_block_ids or ()), pos_range))
+
+    def ensure_host_cache(self, cache):
+        assert cache.past is not None
+
+
+def test_system_ingest_caches_intermediates_in_product_store_and_replays():
+    owner = _FakeOwner()
+    sequences = _FakeSequences()
+    products = ProductStore()
+    driver = ImageEncoder(owner, sequences=sequences, products=products)
+    handle = encoder_handle_from_mm_hash(77)
+    grid_hw = torch.tensor([[4, 6]])
+    pixels = torch.zeros(24, 3 * 16 * 16)
+
+    encoded = driver.encode_row(
+        EncodeRow(
+            ctx=EncodeContext(
+                req_id=5,
+                kind="vit_encode",
+                handle=handle,
+                temporal_index=9,
+                image_hw=(64, 96),
+                new_block_ids=(4, 5),
+                pos_range=(10, 12),
+            ),
+            pixels=pixels,
+            grid=grid_hw,
+        )
+    )
+    assert encoded == {
+        "req_id": 5,
+        "encoder_handle": handle,
+        "num_tokens": 6,
+        "image_hw": [64, 96],
+    }
+    assert sequences.spans == [(5, (4, 5), (10, 12))]
+
+    # A payload-free row on another request replays the resident intermediate
+    # without re-running the vision encoder.
+    replay = driver.encode_row(
+        EncodeRow(
+            ctx=EncodeContext(req_id=6, kind="vit_encode", handle=handle, temporal_index=2),
+        )
+    )
+    assert replay["num_tokens"] == 6 and replay["image_hw"] == [64, 96]
+    assert owner.feature_calls == 1
+
+    # Evicting the handle through the free_encoder control makes a later
+    # replay fail as non-resident.
+    free_encoder_handles(products, [handle])
+    with pytest.raises(WorkerError, match="not resident"):
+        driver.encode_row(
+            EncodeRow(
+                ctx=EncodeContext(req_id=7, kind="vit_encode", handle=handle, temporal_index=3),
+            )
+        )

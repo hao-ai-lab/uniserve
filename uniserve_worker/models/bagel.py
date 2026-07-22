@@ -99,7 +99,6 @@ from ..nn.vision import (
 )
 from ..processors.bagel import BAGEL_GEOMETRY
 from ..runtime.image_params import parse_text_image_generation_params
-from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
 from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from ..runtime.request_state import RequestState
@@ -942,12 +941,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             raise invalid_descriptor("BAGEL generation state requires an executor view")
         latent_view.set_state(int(req_id), value)
 
-    def _pop_gen_state(self, req_id: int) -> GenState | None:
-        latent_view = get_forward_context().latent_view
-        if latent_view is None:
-            raise invalid_descriptor("BAGEL generation state requires an executor view")
-        return latent_view.pop_state(int(req_id))
-
     def _extend_blocks(self, op) -> list[int]:
         state = self._state(int(op["req_id"]))
         state.append_new_block_ids(op.get("new_block_ids"))
@@ -1158,9 +1151,16 @@ class BagelForUnifiedGeneration(UniModelBase):
         layer = cast(MoTDecoderLayer, self._ensure_loaded().model.lm.layers[0])
         return int(layer.n_heads), float(layer.scale), torch.bfloat16
 
-    def encode_many(self, rows: Sequence[EncodeRow]) -> list[dict[str, Any]]:
+    def encode_many(
+        self,
+        rows: Sequence[EncodeRow],
+        *,
+        products: Any = None,
+    ) -> list[dict[str, Any]]:
         if not rows:
             return []
+        if products is None:
+            raise invalid_descriptor("BAGEL image encode requires the executor product store")
         loaded = self._ensure_loaded()
         m = loaded.model
         pool = loaded.pool
@@ -1208,7 +1208,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                     (kind, tuple(int(v) for v in row.pixels.shape)), []
                 ).append(item)
             else:
-                payload = self.residency.encoder.get(ctx.handle)
+                payload = products.intermediate(ctx.handle)
                 if not isinstance(payload, Mapping) or payload.get("kind") != kind:
                     raise invalid_descriptor("cached image encode handle is not resident")
                 cached_image_hw = payload.get("image_hw")
@@ -1241,7 +1241,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                         "image_hw": item["image_hw"],
                     }
                     item["payload"] = payload
-                    self.residency.encoder.put(item["handle"], payload)
+                    products.put_intermediate(item["handle"], payload)
             else:
                 embeddings = m.vit_encode_batch(tensors)
                 for index, item in enumerate(group):
@@ -1251,7 +1251,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                         "image_hw": item["image_hw"],
                     }
                     item["payload"] = payload
-                    self.residency.encoder.put(item["handle"], payload)
+                    products.put_intermediate(item["handle"], payload)
 
         segments: list[Segment] = []
         for item in items:
@@ -1796,58 +1796,38 @@ class BagelForUnifiedGeneration(UniModelBase):
         st.cond.past.length = int(length)
         st.cond.t_index = int(last_position)
 
-    def commit_generated_image(self, req_id: int, state, op) -> dict:
-        return self._commit_generated_image(dict(op))
-
-    def decode_image(
+    def vae_decode(
         self,
         latent: Any,
         *,
-        req_id: int | None = None,
-        state: Any = None,
-        op: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        del latent, state
-        if req_id is None or op is None:
-            raise invalid_descriptor("BAGEL image commit requires req_id and op")
-        return self._commit_generated_image(dict(op))
+        height: int | None = None,
+        width: int | None = None,
+    ) -> Image.Image:
+        """Neural latent->pixels VAE decode for the executor's materializer."""
+        if height is None or width is None:
+            raise invalid_descriptor("BAGEL VAE decode requires the image height and width")
+        return self._ensure_loaded().model.vae_decode(latent, int(height), int(width))
 
-    def _commit_generated_image(self, op):
+    def commit_generated_kv(self, req_id: int, gen_state: Any, block_ids: Any) -> int:
+        """Persist the generated latents into the request KV (program continuation).
+
+        The writeback is a forward pass of the unified MoT backbone over the
+        gen segment (``update=True``), so it stays a model neural entry;
+        following text conditions on the image and continues at
+        ``cond_pos + 2`` (gen_rope_advance).
+        """
         loaded = self._ensure_loaded()
         m = loaded.model
-        pool = loaded.pool
-        r = op["req_id"]
-        gs = self._gen_state(r)
-        if gs is None:
-            return {"req_id": r}
-        self._extend_blocks(op)
-        img = m.vae_decode(gs.x_t, gs.H, gs.W)
-        rec = self._record(r)
-        retain_images = bool((rec.image or {}).get("retain_images", True))
-        added = 0
-        if retain_images:
-            # Program continuation: persist the generated latents into the
-            # request KV so following text conditions on the image. The engine
-            # allocates these blocks only when retention is requested (pure
-            # image mode ends at the commit and skips both).
-            view = pool.view(self._state(r).block_ids, gs.cond_pos)
-            commit_seg = m.build_gen_segment(
-                gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True
-            )
-            m.run([commit_seg])
-            # gen_rope_advance=2: following text continues at cond_pos + 2.
-            self._sync_text_cache_after_image(
-                r, length=gs.cond_pos + gs.num_vae + 2, last_position=gs.cond_pos + 1
-            )
-            added = gs.num_vae + 2
-        b64 = pil_image_to_png_b64(img)
-        self._pop_gen_state(r)
-        return {
-            "req_id": r,
-            "image_png_b64": b64,
-            "image_hw": [gs.H, gs.W],
-            "num_tokens": added,
-        }
+        gs = gen_state
+        view = loaded.pool.view(list(block_ids), gs.cond_pos)
+        commit_seg = m.build_gen_segment(
+            gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True
+        )
+        m.run([commit_seg])
+        self._sync_text_cache_after_image(
+            int(req_id), length=gs.cond_pos + gs.num_vae + 2, last_position=gs.cond_pos + 1
+        )
+        return int(gs.num_vae) + 2
 
     @torch.no_grad()
     def forward(self, batch: ForwardBatch) -> Any:

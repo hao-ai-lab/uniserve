@@ -52,7 +52,7 @@ class ModelOperation:
         if mode is ForwardMode.DENOISE:
             return cls(str(kind), "predict_velocity")
         if mode is ForwardMode.COMMIT:
-            return cls(str(kind), "decode_image")
+            return cls(str(kind), "vae_decode")
         if mode is ForwardMode.ENCODE and kind == "vit_encode":
             return cls(str(kind), "encode_image")
         if mode is ForwardMode.ENCODE and kind == "vae_encode":

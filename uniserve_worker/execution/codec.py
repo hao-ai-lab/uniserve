@@ -22,10 +22,11 @@ from uniserve_worker.contracts.outputs import (
     CommitOutput,
     EncodeOutput,
 )
+from uniserve_worker.execution.products import build_understanding_encoder
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.runtime.image_utils import pil_image_to_png_b64, to_uint8_image
+from uniserve_worker.runtime.product_store import encoder_handle_from_mm_hash
 from uniserve_worker.runtime.request_state import RequestState
-from uniserve_worker.runtime.residency import encoder_handle_from_mm_hash
 
 if TYPE_CHECKING:
     from uniserve_worker.contracts.forward_batch import ForwardBatch
@@ -44,6 +45,7 @@ def encode_result(
     *,
     image_stage: Any = None,
     row_indices: tuple[int, ...] | list[int] | None = None,
+    products: Any = None,
 ) -> ForwardResult:
     ops = fb.as_encode().ops
     rows = tuple(range(len(ops))) if row_indices is None else tuple(int(row) for row in row_indices)
@@ -51,7 +53,7 @@ def encode_result(
         raise invalid_descriptor("encode row_indices must align with encode ops")
     outputs = [
         _coerce_encode_output(output)
-        for output in run_encode_ops(model, ops, image_stage=image_stage)
+        for output in run_encode_ops(model, ops, image_stage=image_stage, products=products)
     ]
     return ForwardResult(encode_outputs=dict(zip(rows, outputs, strict=True)))
 
@@ -61,20 +63,28 @@ def run_encode_ops(
     ops: Sequence[Mapping[str, Any]],
     *,
     image_stage: Any = None,
+    products: Any = None,
 ) -> list[Any]:
-    """Stage every encode op's inputs, then dispatch the model's neural encode.
+    """Stage every encode op's inputs, then drive the family's neural encode.
 
     Op parsing, media decode, declared transforms, and device staging happen
     here — before the model is invoked — so encode entry points receive typed
-    :class:`EncodeRow` values only.
+    :class:`EncodeRow` values only. Families declaring the shared ingest
+    surface are driven through the system :class:`ImageEncoder`, which owns
+    cache staging and intermediate-product residency; the model contributes
+    only feature extraction and the sequence forward.
     """
     rows = [prepare_encode_row(op, image_stage) for op in ops]
     encode_many = getattr(model, "encode_many", None)
-    outputs = (
-        list(encode_many(tuple(rows)))
-        if callable(encode_many)
-        else [_encode_one(model, row) for row in rows]
-    )
+    if callable(encode_many):
+        outputs = list(encode_many(tuple(rows), products=products))
+    else:
+        encoder = build_understanding_encoder(model, products)
+        outputs = (
+            [encoder.encode_row(row) for row in rows]
+            if encoder is not None
+            else [_encode_one(model, row) for row in rows]
+        )
     if len(outputs) != len(ops):
         raise invalid_descriptor(f"model returned {len(outputs)} encode outputs for {len(ops)} ops")
     return outputs
@@ -185,18 +195,24 @@ def _image_hw(value: Any) -> tuple[int, int] | None:
 def commit_result(
     items: list[tuple[int, RequestState, Mapping[str, Any]]]
     | tuple[tuple[int, RequestState, Mapping[str, Any]], ...],
-    model: Any,
+    materializer: Any,
     *,
     row_indices: tuple[int, ...] | list[int] | None = None,
 ) -> ForwardResult:
+    """Drive the executor-held commit materializer for every commit row.
+
+    Materialization is system-owned: the materializer orchestrates staging,
+    product persistence, and response assembly while the model contributes
+    only neural decode entries.
+    """
     rows = (
         tuple(range(len(items))) if row_indices is None else tuple(int(row) for row in row_indices)
     )
     if len(rows) != len(items):
         raise invalid_descriptor("commit row_indices must align with commit items")
     outputs = {
-        int(row): model.decode_image(state.latent, req_id=int(req_id), state=state, op=op)
-        for row, (req_id, state, op) in zip(rows, items, strict=True)
+        int(row): materializer.commit(dict(op), state)
+        for row, (_req_id, state, op) in zip(rows, items, strict=True)
     }
     return ForwardResult(commit_outputs=outputs)
 
@@ -225,13 +241,13 @@ def _image_to_result(req_id: int, image: Any) -> dict[str, Any]:
         return out
     if isinstance(image, torch.Tensor):
         if image.ndim not in (3, 4):
-            raise invalid_descriptor("decode_image tensor output must be CHW or NCHW")
+            raise invalid_descriptor("image decode tensor output must be CHW or NCHW")
         try:
             from PIL import Image
         except Exception as exc:  # pragma: no cover - dependency failure is environment-specific.
             raise invalid_descriptor("PIL is required to encode tensor image outputs") from exc
-        # decode_image returns already-normalized [0, 1] image space (not the
-        # diffusion [-1, 1] latent convention), so decode against that range.
+        # Neural image decode returns already-normalized [0, 1] image space
+        # (not the diffusion [-1, 1] latent convention), so use that range.
         pil = Image.fromarray(to_uint8_image(image, value_range=(0.0, 1.0)))
         return _image_to_result(req_id, pil)
-    raise invalid_descriptor("decode_image must return a mapping, PIL image, or image tensor")
+    raise invalid_descriptor("image decode must return a mapping, PIL image, or image tensor")
