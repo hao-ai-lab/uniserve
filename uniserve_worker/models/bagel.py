@@ -89,14 +89,13 @@ from ..runtime.residency import (
     ResidencyManager,
     encoder_handle_from_mm_hash,
 )
-from .registry import UniModelBase
+from .catalog import UniModelBase
 
 __all__ = [
     "LLMConfig",
     "BagelConfig",
     "GenState",
     "BagelForUnifiedGeneration",
-    "EntryClass",
 ]
 
 logger = logging.getLogger(__name__)
@@ -1926,5 +1925,3 @@ class BagelForUnifiedGeneration(UniModelBase):
             return torch.autocast("cuda", dtype=torch.bfloat16)
         return nullcontext()
 
-
-EntryClass = BagelForUnifiedGeneration

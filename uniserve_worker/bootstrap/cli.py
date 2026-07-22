@@ -61,11 +61,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--disable-model-arch", action="append", default=[])
     parser.add_argument(
-        "--strict-model-imports",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
         "--tp-rank",
         type=int,
         default=0,

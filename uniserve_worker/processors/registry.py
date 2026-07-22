@@ -54,7 +54,6 @@ def import_processors() -> None:
     # module-import time, so importing each plugin module is all that is needed.
     discover_package_plugins(
         importlib.import_module(__package__ or "uniserve_worker.processors"),
-        strict=True,
     )
     _PROCESSOR_REGISTRY.freeze()
 

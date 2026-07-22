@@ -1,25 +1,22 @@
-"""Model registry: architecture resolution plus the shared ``UniModelBase`` glue.
+"""Model catalog: architecture resolution plus the shared ``UniModelBase`` glue.
 
-The registry owns architecture-to-class registration and the concrete contract
-base shared by registered families. Family implementations stay in their
-family modules.
+The ``Catalog`` is an immutable mapping from stable architecture identifiers to
+concrete model constructors, built from explicit entries by the worker
+composition root. This module also holds the concrete contract base shared by
+cataloged families; family implementations stay in their family modules.
 """
 
 from __future__ import annotations
 
-import importlib
-import logging
-from functools import lru_cache
+from collections.abc import Iterable
 from pathlib import Path
-from types import ModuleType
-from typing import TYPE_CHECKING, Any, Type
+from typing import TYPE_CHECKING, Any
 
 from ..contracts.caps import Caps, ExecutionConstraints
 from ..contracts.forward_batch import BatchPolicy
 from ..contracts.model_family import ModelFamilyDescriptor, ModelOperationSet
 from ..contracts.model_protocols import UniModel
-from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
-from ..foundation.plugins import discover_package_plugins
+from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import get_execution_config
 from ..nn.quant import get_current_kv_cache_dtype, kv_store_dtype_name, resolve_kv_store_dtype
 from ..nn.quant.kv_cache import KV_CACHE_NO_OVERRIDE_SENTINELS
@@ -30,16 +27,9 @@ if TYPE_CHECKING:
     from ..contracts.resource_plan import CapsDescriptor
 
 __all__ = [
-    "ModelRegistry",
-    "MODEL_REGISTRY",
+    "Catalog",
     "UniModelBase",
-    "import_model_classes",
-    "resolve_model_cls",
-    "resolve_model_descriptor",
-    "detect_model_architectures",
 ]
-
-logger = logging.getLogger(__name__)
 
 
 class UniModelBase(UniModel):
@@ -144,30 +134,33 @@ class UniModelBase(UniModel):
         )
 
 
-class ModelRegistry:
-    """Maps architecture names to :class:`UniModel` implementations."""
+class Catalog:
+    """Immutable mapping from stable architecture identifiers to model constructors.
 
-    def __init__(self) -> None:
-        self._classes: dict[str, Type[UniModel]] = {}
-        self._descriptors: dict[str, ModelFamilyDescriptor] = {}
+    Entries are explicit bootstrap data supplied at construction; each entry's
+    identifiers come from the model class's ``architectures`` declaration (its
+    class name when absent). Every entry passes contract validation when the
+    catalog is built.
+    """
 
-    def register(
-        self, model_cls: Type[UniModel], *, names: list[str] | tuple[str, ...] | None = None
-    ) -> None:
-        _validate_model_contract(model_cls)
-        keys = tuple(names or (model_cls.__name__,))
-        descriptor = ModelFamilyDescriptor.from_model_class(
-            model_cls, names=tuple(str(key) for key in keys)
-        )
-        for key in keys:
-            if key in self._classes:
-                if self._classes[key] is model_cls:
-                    continue
-                raise invalid_descriptor(f"model architecture {key!r} already registered")
-            self._classes[key] = model_cls
-            self._descriptors[key] = descriptor
+    def __init__(self, model_classes: Iterable[type[UniModel]]) -> None:
+        self._entries: tuple[type[UniModel], ...] = tuple(dict.fromkeys(model_classes))
+        classes: dict[str, type[UniModel]] = {}
+        descriptors: dict[str, ModelFamilyDescriptor] = {}
+        for model_cls in self._entries:
+            _validate_model_contract(model_cls)
+            descriptor = ModelFamilyDescriptor.from_model_class(model_cls)
+            for name in descriptor.names:
+                if name in classes:
+                    raise invalid_descriptor(
+                        f"model architecture {name!r} already has a catalog entry"
+                    )
+                classes[name] = model_cls
+                descriptors[name] = descriptor
+        self._classes = classes
+        self._descriptors = descriptors
 
-    def resolve(self, architectures: list[str] | tuple[str, ...]) -> Type[UniModel]:
+    def resolve(self, architectures: list[str] | tuple[str, ...]) -> type[UniModel]:
         return self.resolve_descriptor(architectures).model_class
 
     def resolve_descriptor(
@@ -182,78 +175,25 @@ class ModelRegistry:
                 return self._descriptors[arch]
         known = ", ".join(sorted(self._classes)) or "<none>"
         raise capability_mismatch(
-            f"no UniModel registered for architectures {architectures!r}; "
+            f"no UniModel catalog entry for architectures {architectures!r}; "
             f"known architectures: {known}"
         )
 
-    def registered_classes(self) -> tuple[Type[UniModel], ...]:
-        """Distinct registered model classes (a name may map several aliases)."""
-        return tuple(dict.fromkeys(self._classes.values()))
+    def detect_architectures(self, model_path: str | Path) -> list[str]:
+        """Ask each cataloged model class whether it recognizes a checkpoint path."""
+
+        path = Path(model_path)
+        detected: list[str] = []
+        for cls in self._entries:
+            recognizes = getattr(cls, "recognizes", None)
+            if callable(recognizes) and bool(recognizes(path)):
+                detected.extend(
+                    str(name) for name in getattr(cls, "architectures", (cls.__name__,))
+                )
+        return detected
 
 
-MODEL_REGISTRY = ModelRegistry()
-
-
-def _register_module_models(module: ModuleType, *, strict: bool) -> None:
-    entry = getattr(module, "EntryClass", None)
-    if entry is None:
-        return
-    entries = entry if isinstance(entry, list) else [entry]
-    for cls in entries:
-        names = getattr(cls, "architectures", None)
-        try:
-            MODEL_REGISTRY.register(cls, names=names)
-        except (WorkerError, ValueError):
-            # Duplicate registration or contract mismatch: skip in non-strict mode.
-            if strict:
-                raise
-            logger.error(
-                "skipping model class that failed contract validation",
-                extra={
-                    "module_name": module.__name__,
-                    "model_class": getattr(cls, "__name__", repr(cls)),
-                },
-                exc_info=True,
-            )
-
-
-@lru_cache(maxsize=1)
-def import_model_classes(strict: bool | None = None) -> None:
-    if strict is None:
-        strict = get_execution_config().strict_model_imports
-    discover_package_plugins(
-        importlib.import_module(__package__ or "uniserve_worker.models"),
-        strict=bool(strict),
-        on_module=lambda module: _register_module_models(module, strict=bool(strict)),
-    )
-
-
-def resolve_model_cls(architectures: list[str] | tuple[str, ...]) -> Type[UniModel]:
-    import_model_classes()
-    return MODEL_REGISTRY.resolve(tuple(architectures))
-
-
-def resolve_model_descriptor(
-    architectures: list[str] | tuple[str, ...],
-) -> ModelFamilyDescriptor:
-    import_model_classes()
-    return MODEL_REGISTRY.resolve_descriptor(tuple(architectures))
-
-
-def detect_model_architectures(model_path: str | Path) -> list[str]:
-    """Ask registered model classes whether they recognize a checkpoint path."""
-
-    import_model_classes()
-    path = Path(model_path)
-    detected: list[str] = []
-    for cls in MODEL_REGISTRY.registered_classes():
-        recognizes = getattr(cls, "recognizes", None)
-        if callable(recognizes) and bool(recognizes(path)):
-            detected.extend(str(name) for name in getattr(cls, "architectures", (cls.__name__,)))
-    return detected
-
-
-def _validate_model_contract(model_cls: Type[UniModel]) -> None:
+def _validate_model_contract(model_cls: type[UniModel]) -> None:
     if not issubclass(model_cls, UniModel):
         raise capability_mismatch(f"{model_cls.__name__} must inherit UniModel")
     ModelOperationSet.from_model_class(model_cls).validate(model_cls)

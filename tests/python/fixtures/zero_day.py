@@ -2,7 +2,7 @@
 
 This model is intentionally tiny, but it exercises the real runner-owned
 denoise path and the new ``cfg_zero_star`` guidance primitive as a model add
-without being auto-discovered as a production model.
+outside the worker's production catalog.
 """
 
 from __future__ import annotations
@@ -63,6 +63,3 @@ class UniServeZeroDayCfgZeroStarModel(UniModel):
         else:
             value = {"img_uncond": 0.0, "text_uncond": 1.0}.get(branch, 1.0)
         return torch.full_like(latent, value)
-
-
-EntryClass = UniServeZeroDayCfgZeroStarModel

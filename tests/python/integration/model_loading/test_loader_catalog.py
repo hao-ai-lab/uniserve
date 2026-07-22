@@ -1,4 +1,4 @@
-"""Conformance for new-style model discovery and dummy loading."""
+"""Conformance for catalog-driven model resolution and dummy loading."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 import uniserve_worker.foundation.runtime_config as runtime_config
+from uniserve_worker.bootstrap.catalog import MODEL_CATALOG
 from uniserve_worker.bootstrap.model_loader import (
     WorkerModelLoadRequest,
     load_worker_model,
@@ -29,7 +30,7 @@ from uniserve_worker.loader.transformers import (
     load_native_transformers_checkpoint,
 )
 from uniserve_worker.loader.weight_utils import tensor_shape
-from uniserve_worker.models.registry import resolve_model_cls
+from uniserve_worker.models.catalog import Catalog
 from uniserve_worker.nn import LinearBase
 from uniserve_worker.runtime.lora import MergeOnLoadLoRA
 from uniserve_worker.server.app import dispatch
@@ -46,22 +47,23 @@ def _set_worker_runtime(monkeypatch, **kwargs):
     )
 
 
-def test_registry_resolves_real_model_entries():
-    assert resolve_model_cls(("NEOChatModel",)).__name__ == "SenseNovaU1ForUnifiedGeneration"
-    assert resolve_model_cls(("BagelForUnifiedGeneration",)).__name__ == "BagelForUnifiedGeneration"
-    assert resolve_model_cls(("Qwen3ForCausalLM",)).__name__ == "Qwen3ForCausalLM"
+def test_catalog_resolves_real_model_entries():
+    assert MODEL_CATALOG.resolve(("NEOChatModel",)).__name__ == "SenseNovaU1ForUnifiedGeneration"
+    assert (
+        MODEL_CATALOG.resolve(("BagelForUnifiedGeneration",)).__name__
+        == "BagelForUnifiedGeneration"
+    )
+    assert MODEL_CATALOG.resolve(("Qwen3ForCausalLM",)).__name__ == "Qwen3ForCausalLM"
 
 
-def test_registry_rejects_unknown_architecture(monkeypatch):
+def test_catalog_rejects_unknown_architecture(monkeypatch):
     _set_worker_runtime(monkeypatch)
 
     with pytest.raises(WorkerError) as excinfo:
-        resolve_model_cls(("CompletelyNewCausalLM",))
+        MODEL_CATALOG.resolve(("CompletelyNewCausalLM",))
 
     assert excinfo.value.code == ErrorCode.CAPABILITY_MISMATCH
-    assert "no UniModel registered" in str(excinfo.value)
-
-
+    assert "no UniModel catalog entry" in str(excinfo.value)
 
 
 
@@ -97,51 +99,14 @@ def test_model_worker_rejects_declared_missing_control():
         raise AssertionError("missing control declaration should fail at startup")
 
 
-def test_registry_rejects_classes_outside_the_model_contract():
-    from uniserve_worker.models.registry import ModelRegistry
-
+def test_catalog_rejects_classes_outside_the_model_contract():
     class BadDenoiseModel:
         supported_ops = ("denoise_gen",)
 
     with pytest.raises(WorkerError) as exc:
-        ModelRegistry().register(BadDenoiseModel, names=("bad",))
+        Catalog((BadDenoiseModel,))
     assert exc.value.code == ErrorCode.CAPABILITY_MISMATCH
     assert "inherit UniModel" in exc.value.message
-
-
-def test_model_import_isolation_warns_and_continues(monkeypatch, caplog):
-    import importlib
-    from types import SimpleNamespace
-
-    import uniserve_worker.foundation.plugins as plugins
-    import uniserve_worker.models.registry as registry
-
-    # Plugin discovery (import isolation) lives in foundation.plugins; the registry
-    # delegates to discover_package_plugins. Patch the plugins-layer iteration/import.
-    registry.import_model_classes.cache_clear()
-    real_import = importlib.import_module
-
-    def fake_iter_modules(_paths):
-        return [SimpleNamespace(name="broken"), SimpleNamespace(name="empty")]
-
-    def fake_import_module(name):
-        if name.endswith(".broken"):
-            raise RuntimeError("broken import")
-        if name.endswith(".empty"):
-            return SimpleNamespace(EntryClass=None)
-        return real_import(name)
-
-    monkeypatch.setattr(plugins.pkgutil, "iter_modules", fake_iter_modules)
-    monkeypatch.setattr(plugins.importlib, "import_module", fake_import_module)
-
-    with caplog.at_level("WARNING"):
-        registry.import_model_classes(strict=False)
-    assert "skipping plugin module" in caplog.text
-
-    registry.import_model_classes.cache_clear()
-    with pytest.raises(RuntimeError, match="broken import"):
-        registry.import_model_classes(strict=True)
-    registry.import_model_classes.cache_clear()
 
 
 def test_dummy_loader_constructs_registered_model():
@@ -461,7 +426,9 @@ def test_sensenova_applies_opt_in_native_model_stack_compile(monkeypatch):
 def test_zero_day_diffusion_model_uses_shared_cfg_zero_star_path():
     from tests.python.fixtures.zero_day import UniServeZeroDayCfgZeroStarModel
 
-    cls = UniServeZeroDayCfgZeroStarModel
+    # A test-only model enters serving through an explicit catalog entry.
+    catalog = Catalog((UniServeZeroDayCfgZeroStarModel,))
+    cls = catalog.resolve(("UniServeZeroDayCfgZeroStarModel",))
     worker = ModelWorker(cls(), block_size=256, simulation=True)
     result = worker.execute(
         seal_batch(

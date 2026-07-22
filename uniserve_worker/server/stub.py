@@ -27,7 +27,7 @@ from ..contracts.resource_plan import (
 )
 from ..foundation.env import env_int
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-from ..models.registry import UniModelBase
+from ..models.catalog import UniModelBase
 from ..runtime.image_params import required_image_height, required_image_width
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..worker.model import ModelWorker

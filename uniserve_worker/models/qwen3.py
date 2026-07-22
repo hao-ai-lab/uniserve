@@ -28,7 +28,6 @@ __all__ = [
     "Qwen3DecoderLayer",
     "Qwen3Model",
     "Qwen3ForCausalLM",
-    "EntryClass",
 ]
 
 if TYPE_CHECKING:
@@ -66,7 +65,7 @@ from ..nn.quant import (
 )
 from ..runtime.compile import CompileTarget
 from ..runtime.residency import KvCacheSpec
-from .registry import UniModelBase
+from .catalog import UniModelBase
 
 logger = logging.getLogger(__name__)
 
@@ -625,5 +624,3 @@ class Qwen3ForCausalLM(UniModelBase, nn.Module):
         )
         return WeightLoadReport(loaded=loaded, ignored=tuple(ignored))
 
-
-EntryClass = Qwen3ForCausalLM
