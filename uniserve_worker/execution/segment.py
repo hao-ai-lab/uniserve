@@ -34,7 +34,7 @@ from uniserve_worker.contracts.forward_mode import ForwardMode
 from uniserve_worker.contracts.outputs import TextTokenOutput
 from uniserve_worker.execution.codec import run_encode_ops
 from uniserve_worker.execution.diffusion import _execute_required_denoise
-from uniserve_worker.execution.flow import PreparedFlowStep, flow_branches, flow_cfg_plan
+from uniserve_worker.execution.flow import GuidePlan, PreparedFlowStep, build_flow_execution
 from uniserve_worker.execution.graph.bucket import padding_blocks
 from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
 from uniserve_worker.execution.graph.executor import backend_name
@@ -56,7 +56,7 @@ from uniserve_worker.foundation.profiling import profile_range
 from uniserve_worker.foundation.runtime_config import DEFAULT_DECODE_GRAPH_BATCH_SIZES
 from uniserve_worker.foundation.sizing import DEFAULT_BLOCK_SIZE, ceil_div
 from uniserve_worker.nn.diffusion import euler_step
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgPlan
+from uniserve_worker.nn.diffusion.cfg import Branch
 from uniserve_worker.nn.sampler import (
     apply_sampling_batched_with_device_tokens,
     finalize_sampling_result,
@@ -862,11 +862,9 @@ class SegmentAdapter(Protocol):
     @property
     def num_layers(self) -> int: ...
 
-    def prepare_flow(self, state: Any, op: dict[str, Any]) -> PreparedFlowStep: ...
     def program_state(self, req_id: int) -> Any: ...
     def _extend_cache_blocks(self, cache: Any, op: dict[str, Any]) -> None: ...
     def _ensure_host_cache(self, cache: Any) -> None: ...
-    def _denoise_branch_inputs(self, image: Any, branch: str) -> tuple[torch.Tensor, Any]: ...
     def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor: ...
     def packed_decoder_forward(
         self,
@@ -888,7 +886,6 @@ class SegmentAdapter(Protocol):
         image_size: tuple[int, int] | None,
     ) -> torch.Tensor: ...
     def segment_graph_attention(self) -> Any: ...
-    def accept_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None: ...
     def _text_driver(self) -> Any: ...
 
 
@@ -897,11 +894,21 @@ class SegmentRuntime:
 
     Family models are collaborators, not runtime base classes. A long-lived
     :class:`SegmentExecutor` binds one family adapter and keeps graph and
-    staging state out of the model inheritance tree.
+    staging state out of the model inheritance tree. Flow orchestration is
+    executor-held: ``flow_execution`` is the family flow driver composed over
+    the adapter's declared surface at construction.
     """
 
-    def __init__(self, adapter: SegmentAdapter) -> None:
+    def __init__(self, adapter: SegmentAdapter, *, flow_execution: Any | None = None) -> None:
         self.adapter = adapter
+        self.flow_execution = (
+            flow_execution if flow_execution is not None else build_flow_execution(adapter)
+        )
+
+    def _require_flow_execution(self) -> Any:
+        if self.flow_execution is None:
+            raise capability_mismatch("segment denoise execution requires a family flow driver")
+        return self.flow_execution
 
     def run_segment_graph(
         self,
@@ -936,7 +943,9 @@ class SegmentRuntime:
             if row.mode is not ForwardMode.DENOISE:
                 continue
             state = request_states.get(int(row.req_id))
-            step = self.adapter.prepare_flow(state, dict(row.op))
+            step = self._require_flow_execution().prepare_flow_step(
+                int(row.req_id), state, dict(row.op)
+            )
             denoise_steps.append((int(row.row_index), step))
 
         result = self.run_segment_forward_result(
@@ -1179,8 +1188,8 @@ class SegmentRuntime:
         target_pool = None
         for _row_index, step in denoise_steps:
             image = step.extra["img"]
-            for branch in flow_branches(step):
-                _indexes, cache = self.adapter._denoise_branch_inputs(image, branch)
+            for branch in step.guide.branches:
+                _indexes, cache = self._require_flow_execution().branch_inputs(image, branch)
                 pool = getattr(cache, "pool", None)
                 if pool is None:
                     return None
@@ -1372,7 +1381,7 @@ class SegmentPlan:
     results: list[Any]
     text_result_slots: list[TextResultSlot] = field(default_factory=list)
     denoise_result_slots: list[DenoiseResultSlot] = field(default_factory=list)
-    denoise_cfg_plans: dict[int, CfgPlan] = field(default_factory=dict)
+    denoise_guides: dict[int, GuidePlan] = field(default_factory=dict)
 
     def denoise_step_for_row(self, row_index: int) -> PreparedFlowStep:
         for result_index, step in self.denoise_steps:
@@ -1416,14 +1425,14 @@ class SegmentPlan:
             (int(row_index), step, int(segment_start), int(q_len), branch)
         )
 
-    def set_denoise_cfg_plan(self, row_index: int, cfg_plan: CfgPlan) -> None:
-        self.denoise_cfg_plans[int(row_index)] = cfg_plan
+    def set_denoise_guide(self, row_index: int, guide: GuidePlan) -> None:
+        self.denoise_guides[int(row_index)] = guide
 
-    def denoise_cfg_plan_for_row(self, row_index: int) -> CfgPlan:
-        cfg_plan = self.denoise_cfg_plans.get(int(row_index))
-        if cfg_plan is None:
-            raise invalid_descriptor(f"no denoise CFG plan prepared for row {int(row_index)}")
-        return cfg_plan
+    def denoise_guide_for_row(self, row_index: int) -> GuidePlan:
+        guide = self.denoise_guides.get(int(row_index))
+        if guide is None:
+            raise invalid_descriptor(f"no denoise guide plan prepared for row {int(row_index)}")
+        return guide
 
     def set_text_result(self, row_index: int, output: Any) -> None:
         self.results[int(row_index)] = output
@@ -1653,12 +1662,14 @@ def _run_segment_forward_impl(
                 elif mode is ForwardMode.DENOISE:
                     flush_text_rows()
                     step = plan.denoise_step_for_row(row_index)
-                    cfg_plan = flow_cfg_plan(step)
-                    plan.set_denoise_cfg_plan(row_index, cfg_plan)
-                    for branch_index, branch in enumerate(cfg_plan.branches):
+                    guide = step.guide
+                    plan.set_denoise_guide(row_index, guide)
+                    for branch_index, branch in enumerate(guide.branches):
                         img = step.extra["img"]
                         with profile_range("uniserve.packed_forward.denoise_branch_inputs"):
-                            indexes, cache = adapter._denoise_branch_inputs(img, branch)
+                            indexes, cache = runtime._require_flow_execution().branch_inputs(
+                                img, branch
+                            )
                         if cache is None or getattr(cache, "pool", None) is None:
                             if require_graph:
                                 raise capability_mismatch(
@@ -2105,27 +2116,27 @@ def _run_segment_forward_impl(
         if return_forward_result:
             denoise_updates: dict[int, DenoisePostprocessEntry] = {}
             for result_index, step in plan.denoise_steps:
-                cfg_plan = plan.denoise_cfg_plan_for_row(result_index)
+                guide = plan.denoise_guide_for_row(result_index)
 
                 def combine_velocity(
                     values: Mapping[Any, torch.Tensor],
-                    current_plan: CfgPlan = cfg_plan,
+                    current_guide: GuidePlan = guide,
                 ) -> torch.Tensor:
-                    return current_plan.combine(values)
+                    return current_guide.combine(values)
 
                 def accept_update(
                     updated: torch.Tensor,
-                    current_adapter: Any = adapter,
+                    current_flow: Any = runtime._require_flow_execution(),
                     current_step: PreparedFlowStep = step,
                 ) -> None:
-                    current_adapter.accept_flow_update(current_step, updated)
+                    current_flow.apply_flow_update(current_step, updated)
 
                 denoise_updates[int(result_index)] = DenoisePostprocessEntry(
                     row_index=int(result_index),
                     req_id=int(step.req_id),
                     step_index=int(step.step_index),
                     total_steps=int(step.total_steps),
-                    branch_names=tuple(cfg_plan.branches),
+                    branch_names=tuple(guide.branches),
                     latent=step.latent,
                     t=step.t,
                     t_next=step.t_next,
@@ -2159,9 +2170,9 @@ def _run_segment_forward_impl(
                             details={"row_index": int(result_index)},
                         )
                     return False
-                velocity = plan.denoise_cfg_plan_for_row(result_index).combine(velocities)
+                velocity = plan.denoise_guide_for_row(result_index).combine(velocities)
                 updated = euler_step(step.latent, velocity, step.t, step.t_next)
-                adapter.accept_flow_update(step, updated)
+                runtime._require_flow_execution().apply_flow_update(step, updated)
                 plan.set_denoise_result(result_index, step)
         timing.stop("denoise_update_ms", update_start)
         ctx.record_component_elapsed("packed_forward_denoise_update", update_stats_start)
@@ -2553,8 +2564,14 @@ _RELAY_PLACEHOLDER_TOKEN_ID = -1
 class SegmentExecutor(SegmentRuntime):
     """Long-lived executor for one family's heterogeneous segment programs."""
 
-    def __init__(self, adapter: SegmentAdapter, *, image_stage: Any = None) -> None:
-        super().__init__(adapter)
+    def __init__(
+        self,
+        adapter: SegmentAdapter,
+        *,
+        image_stage: Any = None,
+        flow_execution: Any | None = None,
+    ) -> None:
+        super().__init__(adapter, flow_execution=flow_execution)
         self.image_stage = image_stage
         # Executor-held product drivers: the system dispatch drives commit
         # materialization and encode ingest directly; models expose only
@@ -2595,7 +2612,8 @@ class SegmentExecutor(SegmentRuntime):
                 ):
                     has_burst_rows = True
                 if mode is ForwardMode.DENOISE:
-                    step = self.adapter.prepare_flow(
+                    step = self._require_flow_execution().prepare_flow_step(
+                        req_id,
                         request_states.get(req_id),
                         dict(op),
                     )
@@ -2925,7 +2943,7 @@ class SegmentExecutor(SegmentRuntime):
             items.append((req_id, request_states.get(req_id), followup))
         if not items:
             return
-        outputs = _execute_required_denoise(items, self.adapter)
+        outputs = _execute_required_denoise(items, self.adapter, self._require_flow_execution())
         for row_index, output in zip(row_indexes, outputs, strict=True):
             results[row_index] = output
 

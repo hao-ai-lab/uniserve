@@ -18,19 +18,11 @@ from PIL import Image
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from uniserve_worker.execution.flow import (
-    FlowRow,
     PreparedFlowStep,
     ProgramState,
-    flow_cfg_branch_count,
-    run_flow_graph,
-    schedule_from_flow_spec,
 )
 from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
-from uniserve_worker.runtime.paged_denoise import (
-    PagedDenoiseBranchSet,
-    can_run_paged_denoise_attention,
-)
 
 from ..contracts.forward_batch import EncodeContext, EncodeRow, ForwardBatch
 from ..contracts.forward_context import get_forward_context
@@ -54,7 +46,7 @@ from ..contracts.resource_plan import (
     ResourcePlan,
     active_latent_capacity_tokens,
 )
-from ..foundation.errors import WorkerError, capability_mismatch, invalid_descriptor
+from ..foundation.errors import capability_mismatch, invalid_descriptor
 from ..foundation.runtime_config import (
     decode_graph_padding_block_count,
     get_execution_config,
@@ -77,11 +69,9 @@ from ..loader.weight_utils import tensor_shape
 from ..nn import LinearBase, MLPConnector, ParallelLMHead, local_kv_head_count
 from ..nn.decoder import KVCache, MoTDecoderLayer, MoTModel, Segment
 from ..nn.diffusion import (
-    FlowMatchSchedule,
     ScheduleDirection,
     ScheduleShiftDomain,
     TimestepEmbedder,
-    init_latent,
 )
 from ..nn.diffusion.cfg import CfgRecipe
 from ..nn.quant import (
@@ -99,9 +89,8 @@ from ..nn.vision import (
     patchify_batch,
 )
 from ..processors.bagel import BAGEL_GEOMETRY
-from ..runtime.image_params import parse_text_image_generation_params
 from ..runtime.kv_pool import PagedKVPool
-from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
+from ..runtime.paged_text_cache import PagedTextCache
 from ..runtime.request_state import RequestState
 from ..runtime.residency import (
     DEFAULT_ENCODER_CACHE_BUDGET,
@@ -114,7 +103,6 @@ from .catalog import UniModelBase
 __all__ = [
     "LLMConfig",
     "BagelConfig",
-    "GenState",
     "BagelForUnifiedGeneration",
 ]
 
@@ -604,57 +592,6 @@ class _LoadedBagelRuntime:
     pool: PagedKVPool
 
 
-@dataclass(slots=True)
-class GenState:
-    """Mutable image-generation state for one BAGEL denoise/commit cycle.
-
-    The latent trajectory ``x_t`` is not stored on the model state — it lives
-    in the system-owned :class:`~uniserve_worker.runtime.residency.LatentStore`
-    as a leased buffer addressed by ``latent_handle``. ``x_t`` here is a
-    property reading/writing that system buffer; an accepted denoise update
-    replaces the buffer entry, so a failed step's rollback restores the prior
-    committed latent tensor.
-    """
-
-    latent_pool: Any  # system LatentStore (residency.latent)
-    latent_handle: int  # request-scoped handle into the LatentStore
-    vae_pos_ids: torch.Tensor
-    num_vae: int
-    H: int
-    W: int
-    schedule: FlowMatchSchedule
-    cfg_text_scale: float
-    cfg_img_scale: float
-    cfg_renorm_type: str
-    cfg_renorm_min: float
-    cfg_interval: tuple[float, float]
-    cond_pos: int
-    cond_branch_kvlen: int = 0
-    cfg_pos: int = 0
-    paged_branches: PagedDenoiseBranchSet | None = None
-    graph_image: _BagelDenoiseGraphImage | None = None
-
-    @property
-    def x_t(self) -> torch.Tensor:
-        return self.latent_pool.get(self.latent_handle)
-
-    @x_t.setter
-    def x_t(self, value: torch.Tensor) -> None:
-        self.latent_pool.set(self.latent_handle, value)
-
-
-@dataclass(slots=True)
-class _BagelDenoiseGraphImage:
-    token_h: int
-    token_w: int
-    height: int
-    width: int
-    cond_cache: PagedTextCache | None = None
-    tu_cache: PagedTextCache | None = None
-    iu_cache: PagedTextCache | None = None
-    indexes: dict[str, torch.Tensor] = field(default_factory=dict)
-
-
 # BAGEL's start-of-image marker string (token id 151652 in the Qwen2 vocab).
 # The worker never tokenizes it (encode ops embed the marker directly); the
 # shared text driver takes it as configuration.
@@ -948,23 +885,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         if request_states is None:
             raise invalid_descriptor("BAGEL request state requires an executor-bound forward")
         return request_states.get(int(req_id))
-
-    def _gen_state(self, req_id: int) -> GenState | None:
-        latent_view = get_forward_context().latent_view
-        if latent_view is None:
-            raise invalid_descriptor("BAGEL generation state requires an executor view")
-        return latent_view.state(int(req_id))
-
-    def _set_gen_state(self, req_id: int, value: GenState) -> None:
-        latent_view = get_forward_context().latent_view
-        if latent_view is None:
-            raise invalid_descriptor("BAGEL generation state requires an executor view")
-        latent_view.set_state(int(req_id), value)
-
-    def _extend_blocks(self, op) -> list[int]:
-        state = self._state(int(op["req_id"]))
-        state.append_new_block_ids(op.get("new_block_ids"))
-        return state.block_ids
 
     # ---- sequence adapter surface ------------------------------------------
 
@@ -1395,365 +1315,49 @@ class BagelForUnifiedGeneration(UniModelBase):
     def run_text_logits(self, op):
         return self.run_text_logits_batch([dict(op)])[0]
 
-    def _init_generation_noise(
-        self,
-        shape: tuple[int, ...] | list[int],
-        *,
-        seed: int | None,
-    ) -> torch.Tensor:
-        """Sample BAGEL's request-private CPU-FP32 initial-noise stream."""
-        effective_seed = int(seed if seed is not None else 0)
-        return init_latent(
-            shape,
-            rng=torch.Generator(device="cpu").manual_seed(effective_seed),
-            device=self.device,
-            dtype=torch.float32,
-            source_device="cpu",
-            source_dtype=torch.float32,
-        )
-
-    def _init_gen(self, op):
+    def gen_latent_layout(self, height: int, width: int) -> tuple[int, torch.Tensor, int]:
+        """``(num_vae, vae_pos_ids, latent_dim)`` for one generated image."""
         m = self._ensure_loaded().model
-        state = self._state(int(op["req_id"]))
-        rec = self._record(op["req_id"])
-        ip = rec.image or {}
-        cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
-        cond_pos = int(op["cond_pos"])
-        dims = rec.dimensions
-        parse_ip = dict(ip)
-        if dims is not None:
-            parse_ip["height"] = int(dims[0])
-            parse_ip["width"] = int(dims[1])
-        params = parse_text_image_generation_params(
-            parse_ip,
-            cfg=cfg,
-            timestep_shift_default=self._flow.timestep_shift,
-        )
-        height = int(params.height)
-        width = int(params.width)
-        h, w = m.latent_hw(height, width)
-        num_vae = h * w
-        vae_pos_ids = m.latent_position_ids(height, width).to(self.device)
-        x_t = self._init_generation_noise(
-            (num_vae, m.cfg.patch_latent_dim),
-            seed=params.seed if params.seed is not None else state.seed,
-        )
-        if rec.context_image_feedback:
-            raise capability_mismatch(
-                "BAGEL context-image generation has no graph-ready CFG branch layout"
-            )
-        gs = GenState(
-            latent_pool=self.residency.latent,
-            latent_handle=int(op["req_id"]),
-            vae_pos_ids=vae_pos_ids,
-            num_vae=num_vae,
-            H=height,
-            W=width,
-            schedule=schedule_from_flow_spec(
-                self._flow,
-                num_steps=params.steps,
-                shift=params.timestep_shift,
-            ),
-            cfg_text_scale=float(params.cfg_text),
-            cfg_img_scale=float(params.cfg_img),
-            cfg_renorm_type=str(params.cfg_norm),
-            cfg_renorm_min=float(params.cfg_renorm_min),
-            cfg_interval=(float(params.cfg_interval[0]), float(params.cfg_interval[1])),
-            cond_pos=cond_pos,
-            cond_branch_kvlen=cond_pos,
-        )
-        gs.x_t = x_t  # store the initial noise into the system LatentStore
-        neg = list(rec.neg_token_ids or [])
-        gs.cfg_pos = len(neg) if (gs.cfg_text_scale > 1.0 and neg) else 0
-        self._init_paged_denoise_branches(op, gs, neg)
-        self._set_gen_state(op["req_id"], gs)
-
-    def _init_paged_denoise_branches(self, op, gs: GenState, neg: list[int]) -> None:
-        """Stage the t2i CFG branch prefixes into scratch-paged caches.
-
-        The batched denoise path runs all active branches as rows of ONE
-        gen-expert forward over a shared batched paged cache, which requires
-        every row — the cond prefix included — to live in one KV pool, with
-        each step's transient gen rows written past the row's fixed prefix.
-        The request pool satisfies neither constraint (the neg branch cannot
-        share it, and pure-t2i requests carry no host-allocated capacity for
-        the ``num_vae + 2`` transient span), so the cond prefix KV
-        ``[0, cond_kvlen)`` is copied once per image into the scratch pool —
-        the same staging SenseNova's tower handoff performs on its
-        trivial-tower path. The neg-prompt (text-uncond) branch prefills
-        directly into scratch through the shared paged und-stack forward.
-
-        Graph serving requires the branch caches to share one paged scratch
-        pool. Missing capacity or backend support is a capability error.
-        """
-        if self.scratch_pool is None:
-            raise capability_mismatch("BAGEL denoise requires a scratch KV pool")
-        allocate_blocks = self.residency.allocator_for_pool(self.scratch_pool)
-        if not callable(allocate_blocks):
-            raise capability_mismatch("BAGEL denoise scratch KV allocation is unavailable")
-        loaded = self._ensure_loaded()
-        m = loaded.model
-        pool = loaded.pool
-        total_gen = int(gs.num_vae) + 2
-        cond_len = int(gs.cond_branch_kvlen)
-        caches: dict[str, PagedTextCache] = {}
-        positions: dict[str, int] = {}
-        try:
-            cond_cache = PagedTextCache(
-                self.scratch_pool,
-                [],
-                num_layers=self.num_layers,
-                allocate_blocks=allocate_blocks,
-            )
-            caches["cond"] = cond_cache
-            if not can_run_paged_denoise_attention(
-                cond_cache,
-                prototype=self.scratch_pool.k,
-                query_width=self.cfg.llm.head_dim,
-                query_tokens=total_gen,
-                batch_size=1,
-                attention_backend=self.attention_backend,
-            ):
-                raise capability_mismatch(
-                    "BAGEL denoise attention backend does not support the graph row geometry"
-                )
-            cond_cache.ensure_capacity(cond_len + total_gen)
-            if cond_len:
-                copy_paged_text_cache_span(
-                    PagedTextCache(
-                        pool,
-                        self._state(int(op["req_id"])).block_ids,
-                        num_layers=self.num_layers,
-                        length=cond_len,
-                    ),
-                    cond_cache,
-                    start=0,
-                    length=cond_len,
-                    num_layers=self.num_layers,
-                )
-            cond_cache.length = cond_len
-            positions["cond"] = int(gs.cond_pos)
-            if gs.cfg_img_scale > 1.0:
-                caches["img_uncond"] = cond_cache
-                positions["img_uncond"] = int(gs.cond_pos)
-            if gs.cfg_text_scale > 1.0:
-                tu_cache = PagedTextCache(
-                    self.scratch_pool,
-                    [],
-                    num_layers=self.num_layers,
-                    allocate_blocks=allocate_blocks,
-                )
-                caches["text_uncond"] = tu_cache
-                tu_cache.ensure_capacity(len(neg) + total_gen)
-                if neg:
-                    ids = torch.as_tensor(neg, dtype=torch.long, device=self.device)
-                    m.lm.forward_paged_text(
-                        m.embed_tokens(ids).to(torch.bfloat16),
-                        torch.arange(len(neg), device=self.device),
-                        tu_cache,
-                    )
-                positions["text_uncond"] = int(gs.cfg_pos)
-        except Exception as exc:
-            released: set[int] = set()
-            for cache in caches.values():
-                if id(cache) in released:
-                    continue
-                released.add(id(cache))
-                self.residency.release_scratch_cache(cache)
-            if isinstance(exc, WorkerError):
-                raise
-            raise capability_mismatch("BAGEL denoise branch staging failed") from exc
-        gs.paged_branches = PagedDenoiseBranchSet(caches=caches, positions=positions)
-        gs.graph_image = _BagelDenoiseGraphImage(
-            token_h=1,
-            token_w=int(gs.num_vae) + _BAGEL_IMAGE_MARKER_TOKENS,
-            height=int(gs.H),
-            width=int(gs.W),
-            cond_cache=caches.get("cond"),
-            tu_cache=caches.get("text_uncond"),
-            iu_cache=caches.get("img_uncond"),
-            indexes={
-                name: torch.stack(
-                    (
-                        torch.full(
-                            (total_gen,),
-                            int(positions[name]),
-                            dtype=torch.long,
-                            device=self.device,
-                        ),
-                        torch.zeros(total_gen, dtype=torch.long, device=self.device),
-                        torch.zeros(total_gen, dtype=torch.long, device=self.device),
-                    ),
-                    dim=0,
-                )
-                for name in caches
-            },
+        h, w = m.latent_hw(int(height), int(width))
+        return (
+            int(h * w),
+            m.latent_position_ids(int(height), int(width)).to(self.device),
+            int(m.cfg.patch_latent_dim),
         )
 
-    def prepare_flow_step(self, req_id: int, state, op: dict) -> PreparedFlowStep:
-        r = int(req_id)
-        self._extend_blocks(op)
-        if int(op.get("timestep_idx") or 0) == 0 and self._gen_state(r) is None:
-            self._init_gen(op)
-        gs = self._gen_state(r)
-        if gs is None:
-            raise invalid_descriptor("denoise generation state is not initialized")
-        i = int(op.get("timestep_idx") or 0)
-        t, t_next = gs.schedule.pair(i, device=self.device, dtype=torch.float32)
-        total_steps = int(gs.schedule.num_steps)
-        if gs.paged_branches is None or gs.graph_image is None:
-            raise capability_mismatch("BAGEL denoise requires graph-ready paged branch caches")
-        image_embeds = (
-            self._ensure_loaded()
-            .model.gen_segment_embeds(
-                int(gs.num_vae),
-                gs.vae_pos_ids,
-                gs.x_t,
-                float(t.detach().float().item()),
-            )
-            .unsqueeze(0)
-        )
-        return PreparedFlowStep(
-            req_id=r,
-            state=state,
-            op=op,
-            latent=gs.x_t,
-            t=t,
-            t_next=t_next,
-            step_index=i,
-            total_steps=total_steps,
-            cfg_text_scale=float(gs.cfg_text_scale),
-            cfg_img_scale=float(gs.cfg_img_scale),
-            cfg_interval=(float(gs.cfg_interval[0]), float(gs.cfg_interval[1])),
-            cfg_renorm_type=str(gs.cfg_renorm_type),
-            cfg_renorm_min=float(gs.cfg_renorm_min),
-            cfg_branch_count=flow_cfg_branch_count(op),
-            image_scale_applies_to_text=CfgRecipe(self._flow.cfg_recipe),
-            extra={"gs": gs, "img": gs.graph_image, "image_embeds": image_embeds},
-        )
-
-    def prepare_flow(
+    def gen_segment_embeds(
         self,
-        state: Any,
-        op: Mapping[str, Any],
-    ) -> PreparedFlowStep:
-        return self.prepare_flow_step(int(op["req_id"]), state, dict(op))
-
-    def predict_velocity(
-        self,
-        ctx: PreparedFlowStep,
-        t: torch.Tensor,
+        num_vae: int,
+        vae_pos_ids: torch.Tensor,
         latent: torch.Tensor,
-        branch: str,
+        timestep: float,
     ) -> torch.Tensor:
-        del t, latent
-        return self.predict_flow_velocity(ctx, branch)
+        return self._ensure_loaded().model.gen_segment_embeds(
+            int(num_vae),
+            vae_pos_ids,
+            latent,
+            float(timestep),
+        )
 
-    def _denoise_branch_inputs(
+    def gen_segment_graph_layout(
         self,
-        image: _BagelDenoiseGraphImage,
-        branch: Any,
-    ) -> tuple[torch.Tensor, PagedTextCache]:
-        name = str(getattr(branch, "value", branch))
-        cache_by_name = {
-            "cond": image.cond_cache,
-            "text_uncond": image.tu_cache,
-            "img_uncond": image.iu_cache,
-        }
-        cache = cache_by_name.get(name)
-        indexes = image.indexes.get(name)
-        if cache is None or indexes is None:
-            raise invalid_descriptor(f"BAGEL denoise branch {name!r} is not initialized")
-        return indexes, cache
+        batch_size: int,
+        num_vae: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._ensure_loaded().model.gen_segment_graph_layout(
+            int(batch_size),
+            int(num_vae),
+        )
 
-    def predict_flow_velocity_batch(
-        self,
-        steps,
-        branches_by_step,
-        *,
-        graph_mode: str = "auto",
-    ):
-        """Execute compatible request and CFG rows through CUDA graphs."""
-        self._ensure_loaded()
-        if graph_mode == "eager":
-            raise capability_mismatch("BAGEL denoise execution requires CUDA graphs")
-        graphed = self._predict_flow_velocity_graph(steps, branches_by_step)
-        if graphed is None and graph_mode == "require":
-            return None
-        if graphed is None:
-            raise capability_mismatch("BAGEL denoise CUDA graph did not cover the batch")
-        return graphed
-
-    def _predict_flow_velocity_graph(
-        self,
-        steps,
-        branches_by_step,
-    ) -> list[dict[str, torch.Tensor]] | None:
+    def prefill_text_branch(self, token_ids: Sequence[int], cache: PagedTextCache) -> None:
+        """Prefill a CFG text-branch prefix through the paged und-stack forward."""
         m = self._ensure_loaded().model
-        results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
-        groups: dict[tuple[Any, ...], list[tuple[int, str, FlowRow]]] = {}
-        for step_index, (step, branches) in enumerate(zip(steps, branches_by_step, strict=True)):
-            gs = step.extra["gs"]
-            paged_branches = gs.paged_branches
-            graph_image = getattr(gs, "graph_image", None)
-            names = tuple(str(getattr(branch, "value", branch)) for branch in branches)
-            if paged_branches is None or graph_image is None or not paged_branches.has_all(names):
-                return None
-            total = int(gs.num_vae) + _BAGEL_IMAGE_MARKER_TOKENS
-            embeds = m.gen_segment_embeds(
-                int(gs.num_vae),
-                gs.vae_pos_ids,
-                step.latent,
-                float(step.t.detach().float().item()),
-            )
-            positions = paged_branches.positions_tensor(
-                names,
-                device=self.device,
-                width=total,
-            )
-            step.extra["image_embeds"] = embeds.unsqueeze(0)
-            step.extra["img"] = graph_image
-            first_cache = paged_branches.caches[names[0]]
-            signature = (
-                id(first_cache.pool),
-                tuple(int(dim) for dim in embeds.shape),
-                str(embeds.device),
-                str(embeds.dtype),
-                tuple(int(dim) for dim in step.latent.shape),
-                str(step.latent.device),
-                str(step.latent.dtype),
-                tuple(int(dim) for dim in positions.shape[1:]),
-                str(positions.dtype),
-            )
-            group = groups.setdefault(signature, [])
-            for branch_index, name in enumerate(names):
-                group.append(
-                    (
-                        step_index,
-                        name,
-                        FlowRow(
-                            step_index=step_index,
-                            step=step,
-                            branch=name,
-                            img=graph_image,
-                            indexes=positions[branch_index],
-                            cache=paged_branches.caches[name],
-                        ),
-                    )
-                )
-
-        for group in groups.values():
-            rows = [entry[2] for entry in group]
-            group_num_vae = int(rows[0].img.token_w) - _BAGEL_IMAGE_MARKER_TOKENS
-            m.gen_segment_graph_layout(len(rows), group_num_vae)
-            velocity = run_flow_graph(self, rows)
-            if not isinstance(velocity, torch.Tensor):
-                return None
-            if int(velocity.shape[0]) != len(group):
-                raise invalid_descriptor("BAGEL denoise graph rows must align with CFG rows")
-            for row_index, (step_index, name, _row) in enumerate(group):
-                results[step_index][name] = velocity[row_index]
-        return results
+        ids = torch.as_tensor(list(token_ids), dtype=torch.long, device=self.device)
+        m.lm.forward_paged_text(
+            m.embed_tokens(ids).to(torch.bfloat16),
+            torch.arange(int(ids.numel()), device=self.device),
+            cache,
+        )
 
     def flow_predict_velocity(
         self,
@@ -1788,23 +1392,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         if return_hidden:
             return velocity, hidden
         return velocity
-
-    def predict_flow_velocity(self, step: PreparedFlowStep, branch: str) -> torch.Tensor:
-        result = self.predict_flow_velocity_batch(
-            [step],
-            [(branch,)],
-            graph_mode="require",
-        )
-        if result is None:
-            raise capability_mismatch("BAGEL denoise CUDA graph did not cover the branch")
-        return result[0][branch]
-
-    def apply_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None:
-        gs = step.extra["gs"]
-        gs.x_t = latent.to(dtype=gs.x_t.dtype, device=gs.x_t.device)
-
-    def accept_flow_update(self, ctx: PreparedFlowStep, latent: torch.Tensor) -> None:
-        self.apply_flow_update(ctx, latent)
 
     def _sync_text_cache_after_image(self, req_id: int, *, length: int, last_position: int) -> None:
         """Advance the driver's text cache past an image KV span written outside it.

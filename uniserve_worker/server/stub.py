@@ -181,12 +181,14 @@ class StubUniModel(UniModelBase):
         """Emit the deterministic sim token stream as pass-through row outputs.
 
         The stub is the sim-only exception to the raw-logits sequence contract:
-        its mixed und/gen forwards return one pass-through output per row, and a
-        per-slot logits result would require the flow branch velocities the stub
-        does not compute. The fixed token formula (EOS after
-        ``STUB_TEXT_EOS_STEP`` tokens, image trigger at
-        ``STUB_IMAGE_TRIGGER_STEP``) is the wire contract sim serving tests
-        depend on.
+        its forwards return one pass-through output per row. A per-slot logits
+        result would need a full-vocabulary row per token (its token ids reach
+        ~151k), which costs roughly 0.75ms per token to synthesize and sample
+        on CPU versus sub-microsecond pass-through outputs — a four-orders-of-
+        magnitude regression that would dominate sim-harness end-to-end time.
+        The fixed token formula (EOS after ``STUB_TEXT_EOS_STEP`` tokens, image
+        trigger at ``STUB_IMAGE_TRIGGER_STEP``) is the wire contract sim
+        serving tests depend on.
         """
         out = []
         for req_id in batch.as_text().req_ids:

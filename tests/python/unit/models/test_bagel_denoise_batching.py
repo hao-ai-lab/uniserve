@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
-from uniserve_worker.execution.flow import PreparedFlowStep
+from uniserve_worker.execution.flow import (
+    PagedGenFlowExecution,
+    PreparedFlowStep,
+    build_flow_execution,
+)
 from uniserve_worker.models.bagel import BagelConfig, BagelForUnifiedGeneration
 from uniserve_worker.nn.diffusion.cfg import Branch
 from uniserve_worker.runtime.graph_store import GraphStore
@@ -61,6 +65,8 @@ class _Graph:
 
 
 def _step(req_id, timestep, latent, branches):
+    from uniserve_worker.execution.flow import GuidePlan
+
     return PreparedFlowStep(
         req_id=req_id,
         state=None,
@@ -70,11 +76,15 @@ def _step(req_id, timestep, latent, branches):
         t_next=torch.tensor(timestep - 0.1),
         step_index=0,
         total_steps=10,
-        cfg_text_scale=4.0,
-        cfg_img_scale=1.0,
-        cfg_interval=(0.4, 1.0),
-        cfg_renorm_type="global",
-        cfg_renorm_min=0.0,
+        guide=GuidePlan.resolve(
+            recipe="image_over_text",
+            text_scale=4.0,
+            img_scale=1.0,
+            interval=(0.4, 1.0),
+            renorm="global",
+            renorm_min=0.0,
+            t=float(timestep),
+        ),
         extra={
             "gs": SimpleNamespace(
                 num_vae=2,
@@ -86,10 +96,12 @@ def _step(req_id, timestep, latent, branches):
     )
 
 
-def test_bagel_coalesces_compatible_requests_into_one_denoise_forward(monkeypatch):
+def test_gen_flow_driver_coalesces_compatible_requests_into_one_denoise_forward(monkeypatch):
     owner = BagelForUnifiedGeneration(config=BagelConfig(), device="cpu")
     graph = _Graph()
     monkeypatch.setattr(owner, "_ensure_loaded", lambda: SimpleNamespace(model=graph))
+    driver = build_flow_execution(owner)
+    assert isinstance(driver, PagedGenFlowExecution)
     pool = object()
     branch_names = (Branch.COND, Branch.TEXT_UNCOND)
 
@@ -117,7 +129,7 @@ def test_bagel_coalesces_compatible_requests_into_one_denoise_forward(monkeypatc
 
     graph_view = GraphStore(flow=SimpleNamespace(maybe_run_rows=graph_forward)).view()
     with use_forward_context(ForwardContext(graph_view=graph_view)):
-        outputs = owner.predict_flow_velocity_batch(steps, [branch_names, branch_names])
+        outputs = driver.predict_flow_velocity_batch(steps, [branch_names, branch_names])
 
     assert len(captured) == 1
     assert [row.step.req_id for row in captured[0]] == [1, 1, 2, 2]
