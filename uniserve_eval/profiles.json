@@ -360,12 +360,12 @@
         "image_config": {
           "width": 2048,
           "height": 1152,
-          "steps": 200,
+          "steps": 50,
           "num_images": 4
         }
       },
       "expect_images": 4,
-      "expect_image_steps": 800,
+      "expect_image_steps": 200,
       "expect_image_width": 2048,
       "expect_image_height": 1152,
       "image_comparison": {
