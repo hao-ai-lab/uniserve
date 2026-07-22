@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import os
-import threading
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -86,7 +85,6 @@ from ..processors.bagel import BagelImageProcessor
 from ..runtime.image_params import parse_text_image_generation_params
 from ..runtime.image_utils import pil_image_to_png_b64
 from ..runtime.kv_pool import PagedKVPool
-from ..runtime.lora import MergeOnLoadLoRA
 from ..runtime.paged_text_cache import PagedTextCache, copy_paged_text_cache_span
 from ..runtime.request_state import RequestState
 from ..runtime.residency import (
@@ -726,11 +724,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         self.img_end_id = int(self.cfg.end_of_image_id)
         self._shared_text_driver: SequenceExecutor | None = None
         self.kv_pool: PagedKVPool | None = None
-        self.lora: MergeOnLoadLoRA | None = None
-        # engine_wide LoRA merges/unmerges mutate shared model weights in place;
-        # serialize load/unload so a concurrent control op cannot interleave a
-        # half-applied delta with another adapter's merge.
-        self._lora_lock = threading.Lock()
         self.kv_cache_dtype = get_current_kv_cache_dtype(config)
         self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
         if self.model is not None:
@@ -747,7 +740,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
             self._scratch_blocks = self._scratch_num_blocks()
             self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
-            self.lora = MergeOnLoadLoRA(self.model)
         else:
             self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
 
@@ -853,21 +845,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         # on the ResidencyManager, not the model.
         for h in handles or []:
             self.residency.encoder.pop(int(h))
-
-    def load_lora(self, lora_id, lora_path) -> None:
-        if self.lora is None:
-            raise capability_mismatch("BAGEL model weights are not loaded")
-        with self._lora_lock:
-            count = self.lora.load(lora_id, lora_path)
-        logger.info("merged LoRA adapter %s into %d parameters", lora_id, count)
-
-    def unload_lora(self, lora_id) -> None:
-        if self.lora is None:
-            raise capability_mismatch("BAGEL model weights are not loaded")
-        with self._lora_lock:
-            count = self.lora.unload(lora_id)
-        if count:
-            logger.info("unmerged LoRA adapter %s", lora_id)
 
     def _record(self, req_id: int) -> Any:
         product_view = get_forward_context().product_view

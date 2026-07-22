@@ -75,8 +75,6 @@ class StubUniModel(UniModelBase):
     )
     supported_controls: tuple[str, ...] = (
         "copy_blocks",
-        "load_lora",
-        "unload_lora",
         "free_encoder",
         "reset_prefix_cache",
     )

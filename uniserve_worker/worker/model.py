@@ -24,6 +24,7 @@ from ..foundation.errors import capability_mismatch
 from ..foundation.sizing import DEFAULT_BLOCK_SIZE
 from ..nn.mesh import get_current_mesh
 from ..processors import get_processor_for_descriptor
+from ..runtime.adapter_store import AdapterStore
 from ..runtime.resources import ResourceRuntime
 from .protocol import BaseWorker, ResultPolicy
 
@@ -31,6 +32,10 @@ if TYPE_CHECKING:
     from ..runtime.residency import ResidencyManager
 
 logger = logging.getLogger(__name__)
+
+# Controls the worker serves against system-owned state; a model declares them
+# as capability only and implements no method.
+WORKER_SERVED_CONTROLS = frozenset({"load_lora", "unload_lora"})
 
 
 def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") -> None:
@@ -62,6 +67,23 @@ def bind_model_segment_execution(model: UniModel) -> None:
     if adapter is None:
         return
     model.segment_executor = SegmentExecutor(adapter)
+
+
+def build_model_adapter_store(model: UniModel) -> AdapterStore | None:
+    """Build the system-owned adapter store over the model's module graph.
+
+    Adapter state is system-owned: the worker serves the load_lora/unload_lora
+    controls against the store, and the store keeps pre-merge copies of only
+    the parameters an adapter touches. A model constructed without loaded
+    weights has no module graph yet and therefore no store; adapter controls
+    against such a worker fail with a capability mismatch.
+    """
+    if model.adapter_mode == "none":
+        return None
+    module = getattr(model, "model", None)
+    if module is None:
+        return None
+    return AdapterStore(module)
 
 
 class ModelWorker(BaseWorker):
@@ -129,6 +151,7 @@ class ModelWorker(BaseWorker):
         residency = self._create_residency_manager(resource_runtime)
         bind_model_residency(self.model, residency)
         bind_model_segment_execution(self.model)
+        self.adapter_store = build_model_adapter_store(self.model)
         self.model_executor = ModelExecutor(
             model,
             config=ExecutorConfig(simulation=bool(simulation)),
@@ -159,10 +182,13 @@ class ModelWorker(BaseWorker):
         self.model.copy_blocks(copies)
 
     def load_lora(self, lora_id: int, lora_path: str) -> None:
-        self.model.load_lora(lora_id, lora_path)
+        count = self._require_adapter_store().load(lora_id, lora_path)
+        logger.info("merged LoRA adapter %s into %d parameters", lora_id, count)
 
     def unload_lora(self, lora_id: int) -> None:
-        self.model.unload_lora(lora_id)
+        count = self._require_adapter_store().unload(lora_id)
+        if count:
+            logger.info("unmerged LoRA adapter %s", lora_id)
 
     def free_encoder(self, handles: Any) -> None:
         self.model.free_encoder(handles)
@@ -245,9 +271,22 @@ class ModelWorker(BaseWorker):
             totals=totals,
         )
 
+    def _require_adapter_store(self) -> AdapterStore:
+        if self.adapter_store is None:
+            raise capability_mismatch("adapter controls require loaded model weights")
+        return self.adapter_store
+
     def _validate_declared_controls(self, capabilities: Caps) -> None:
         for control in capabilities.supported_controls:
-            if not callable(getattr(self.model, str(control), None)):
+            name = str(control)
+            if name in WORKER_SERVED_CONTROLS:
+                if capabilities.adapter_mode == "none":
+                    raise capability_mismatch(
+                        f"control {name!r} is served by the worker adapter store and "
+                        "requires a non-'none' adapter_mode"
+                    )
+                continue
+            if not callable(getattr(self.model, name, None)):
                 raise capability_mismatch(
                     f"model declares control {control!r} but does not implement it"
                 )

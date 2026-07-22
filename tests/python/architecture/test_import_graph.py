@@ -32,7 +32,6 @@ MODELS_SYSTEM_LAYER_EDGES = (
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.image_params"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.image_utils"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.kv_pool"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.lora"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.paged_denoise"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.paged_text_cache"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.request_state"),
