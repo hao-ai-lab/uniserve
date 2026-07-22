@@ -30,9 +30,16 @@ KNOWN_CONTROLS = {
     "sleep",
     "wake_up",
 }
-# Controls the worker serves against system-owned state (the AdapterStore); a
-# model declares them as capability only and implements no method.
-WORKER_SERVED_CONTROLS = {"load_lora", "unload_lora"}
+# Controls the worker serves against system-owned state (the AdapterStore and
+# encoder residency); a model declares them as capability only and implements
+# no method.
+WORKER_SERVED_CONTROLS = {
+    "load_lora",
+    "unload_lora",
+    "copy_blocks",
+    "free_encoder",
+    "reset_prefix_cache",
+}
 # control wire name -> engine method name (here they coincide).
 CONTROL_METHODS = {name: name for name in KNOWN_CONTROLS - WORKER_SERVED_CONTROLS}
 ADAPTER_MODES = {"none", "engine_wide", "per_request", "multi_adapter"}

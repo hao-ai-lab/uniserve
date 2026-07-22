@@ -840,12 +840,6 @@ class BagelForUnifiedGeneration(UniModelBase):
             store_dtype=self.kv_cache_dtype,
         )
 
-    def free_encoder(self, handles) -> None:
-        # Encoder-output residency is system-owned: the handle→embedding store lives
-        # on the ResidencyManager, not the model.
-        for h in handles or []:
-            self.residency.encoder.pop(int(h))
-
     def _record(self, req_id: int) -> Any:
         product_view = get_forward_context().product_view
         if product_view is None:
