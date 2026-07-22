@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, NamedTuple
 
@@ -16,9 +15,6 @@ __all__ = [
     'resolve_weight_files',
     'iter_weights',
     'tensor_shape',
-    'WeightLoadReport',
-    'WeightLoadSummary',
-    'strict_load_weights',
     'StackedParamMapping',
     'parameter_by_name',
     'load_parameter',
@@ -79,58 +75,6 @@ def tensor_shape(path: str | Path, tensor_name: str) -> tuple[int, ...]:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{tensor_name!r} in {file_path} is not a tensor")
     return tuple(int(v) for v in tensor.shape)
-
-
-@dataclass(frozen=True)
-class WeightLoadReport:
-    loaded: set[str] = field(default_factory=set)
-    ignored: tuple[str, ...] = ()
-    missing: tuple[str, ...] = ()
-    unexpected: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class WeightLoadSummary:
-    tensors_seen: int
-    loaded_count: int | None
-    ignored: tuple[str, ...] = ()
-
-
-def strict_load_weights(model, weights) -> WeightLoadSummary:
-    if not hasattr(model, "load_weights"):
-        raise TypeError(f"{type(model).__name__} must implement load_weights(weights)")
-    tensors_seen = 0
-
-    def counted_weights():
-        nonlocal tensors_seen
-        for item in weights:
-            tensors_seen += 1
-            yield item
-
-    result = model.load_weights(counted_weights())
-    loaded_count: int | None = None
-    ignored: tuple[str, ...] = ()
-    if result is not None:
-        if isinstance(result, set):
-            loaded_count = len(result)
-            missing = None
-            unexpected = None
-        else:
-            # Consume the typed WeightLoadReport by attribute (its real
-            # producer's contract), not by reflecting HF-style
-            # ``.missing_keys``/``.unexpected_keys`` names no producer emits.
-            loaded = getattr(result, "loaded", None)
-            loaded_count = len(loaded) if loaded is not None else None
-            ignored = tuple(getattr(result, "ignored", ()) or ())
-            missing = getattr(result, "missing", None)
-            unexpected = getattr(result, "unexpected", None)
-        if missing or unexpected:
-            raise RuntimeError(f"weight load mismatch: missing={missing} unexpected={unexpected}")
-    return WeightLoadSummary(
-        tensors_seen=tensors_seen,
-        loaded_count=loaded_count,
-        ignored=ignored,
-    )
 
 
 class StackedParamMapping(NamedTuple):

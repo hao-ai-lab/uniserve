@@ -16,6 +16,7 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoTokenizer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 import uniserve_worker.ops as ops
@@ -53,8 +54,7 @@ from ...foundation.sizing import (
     ceil_div,
     derive_num_blocks,
 )
-from ...loader.checkpoint_layout import CheckpointLayout
-from ...loader.transformers import NativeLoadSpec
+from ...loader.weight_spec import NativeSource, StackedParamMapping, TowerSplit, WeightSpec
 from ...nn import (
     LinearBase,
     ParallelLMHead,
@@ -66,7 +66,6 @@ from ...nn import (
     WeightMode,
     get_current_mesh,
     get_rope,
-    get_tower_coord,
     place_towers,
     set_tower_coord,
 )
@@ -113,7 +112,6 @@ __all__ = [
     "MAX_BATCH_OPS",
     "NeoVisionModel",
     "NEOChatModel",
-    "check_checkpoint_compatibility",
     "SenseNovaU1ForUnifiedGeneration",
 ]
 
@@ -194,42 +192,24 @@ class _SenseNovaTowerLayout:
             ):
                 set_tower_coord(module, gen)
 
-    def filter_from_model(
-        self,
-        model: nn.Module,
-        tower_role: str | None,
-    ) -> Callable[[str], bool] | None:
-        if tower_role is None:
-            return None
-        if tower_role not in {"gen", "und"}:
-            raise ValueError(f"unknown tower_role {tower_role!r}")
-        self.tag_generation_modules(model, 1)
-        gen_names = self._tagged_param_names(model)
-        if tower_role == "gen":
-            return gen_names.__contains__
-        return lambda name: name not in gen_names
-
-    @staticmethod
-    def _tagged_param_names(model: nn.Module) -> set[str]:
-        names: set[str] = set()
-        for module_name, module in model.named_modules():
-            if get_tower_coord(module) is None:
-                continue
-            for param_name, _ in module.named_parameters(recurse=True):
-                names.add(f"{module_name}.{param_name}" if module_name else param_name)
-        return names
-
 
 _TOWER_LAYOUT = _SenseNovaTowerLayout()
 _SENSENOVA_STACKED_PARAMS = (
-    ("qkv_proj", "q_proj", "q"),
-    ("qkv_proj", "k_proj", "k"),
-    ("qkv_proj", "v_proj", "v"),
-    ("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
-    ("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
-    ("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
-    ("gate_up_proj", "gate_proj", 0),
-    ("gate_up_proj", "up_proj", 1),
+    StackedParamMapping("qkv_proj", "q_proj", "q"),
+    StackedParamMapping("qkv_proj", "k_proj", "k"),
+    StackedParamMapping("qkv_proj", "v_proj", "v"),
+    StackedParamMapping("qkv_proj_mot_gen", "q_proj_mot_gen", "q"),
+    StackedParamMapping("qkv_proj_mot_gen", "k_proj_mot_gen", "k"),
+    StackedParamMapping("qkv_proj_mot_gen", "v_proj_mot_gen", "v"),
+    StackedParamMapping("gate_up_proj", "gate_proj", 0),
+    StackedParamMapping("gate_up_proj", "up_proj", 1),
+)
+
+# The generation tower is the ``fm_modules`` subtree plus every ``*_mot_gen``
+# module in the decoder stack; the understanding tower is the complement.
+_SENSENOVA_TOWER_SPLIT = TowerSplit(
+    gen_prefixes=("fm_modules.",),
+    gen_infixes=("_mot_gen.",),
 )
 
 
@@ -2320,19 +2300,6 @@ class NEOChatModel(nn.Module):
         return self.language_model.get_input_embeddings()
 
 
-def check_checkpoint_compatibility(config_or_dict: Any) -> None:
-    try:
-        from packaging.version import Version
-    except ImportError:  # pragma: no cover
-        return
-    cfg = config_or_dict.to_dict() if hasattr(config_or_dict, "to_dict") else config_or_dict
-    if not isinstance(cfg, dict):
-        return
-    required = cfg.get("uniserve_sensenova_min_version")
-    if required and Version(SENSENOVA_MODEL_CODE_VERSION) < Version(str(required)):
-        raise RuntimeError(f"checkpoint requires UniServe model code >= {required}")
-
-
 class SenseNovaU1ForUnifiedGeneration(
     UniModelBase,
 ):
@@ -2358,7 +2325,17 @@ class SenseNovaU1ForUnifiedGeneration(
         scratch=PerBranch(),
     )
     ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
-    checkpoint_layout = CheckpointLayout(stacked=_SENSENOVA_STACKED_PARAMS)
+    weight_spec = WeightSpec(
+        native=NativeSource(
+            config_cls=NeoChatConfig,
+            module_cls=NEOChatModel,
+            tokenizer_cls=AutoTokenizer,
+            min_version_key="uniserve_sensenova_min_version",
+            code_version=SENSENOVA_MODEL_CODE_VERSION,
+        ),
+        stacked=_SENSENOVA_STACKED_PARAMS,
+        tower=_SENSENOVA_TOWER_SPLIT,
+    )
 
     # System-provisioned at worker bring-up from ``gen_residency_spec()``.
     residency: ResidencyManager
@@ -2574,100 +2551,6 @@ class SenseNovaU1ForUnifiedGeneration(
     def _active_latent_capacity_tokens(self, kv_token_capacity: int | None) -> int:
         """Total concurrently resident image-latent tokens this worker advertises."""
         return active_latent_capacity_tokens(self.max_latent_size, kv_token_capacity)
-
-    @classmethod
-    def native_load_spec(cls) -> NativeLoadSpec:
-        """Declare how the native HF checkpoint is materialized.
-
-        ``NativeTransformersLoader`` drives the meta-init + per-tensor streaming
-        from this spec; ``from_native`` then builds the serving wrapper.
-        """
-        from transformers import AutoTokenizer
-
-        return NativeLoadSpec(
-            config_cls=NeoChatConfig,
-            model_cls=NEOChatModel,
-            tokenizer_cls=AutoTokenizer,
-            config_patch=None,
-            compatibility_check=check_checkpoint_compatibility,
-            param_filter_from_model=cls.tower_role_param_filter_from_model,
-            checkpoint_layout=cls.checkpoint_layout,
-        )
-
-    @classmethod
-    def tower_role_param_filter_from_model(cls, model: nn.Module, tower_role: str | None) -> Any:
-        """Map a tower role to a checkpoint-param predicate for partial load.
-
-        ``"gen"`` keeps only the generation-tower params; ``"und"`` keeps the
-        complement (embed/lm_head/und attn-mlp-norm/model norm/und ViT). ``None``
-        returns ``None`` (no filter — the whole model loads).
-        """
-        return _TOWER_LAYOUT.filter_from_model(model, tower_role)
-
-    @classmethod
-    def from_native(
-        cls,
-        inner: nn.Module,
-        *,
-        tokenizer: Any,
-        device: str,
-        gen_snapshot_kv_capacity: int | None = None,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        kv_token_capacity: int | None = None,
-        attention_backend: str | None = None,
-        tower_role: str | None = None,
-        **_kwargs: Any,
-    ) -> "SenseNovaU1ForUnifiedGeneration":
-        """Wrap the natively-materialized inner model into the serving model."""
-        return cls(
-            inner.config,
-            model=inner,
-            tokenizer=tokenizer,
-            device=device,
-            gen_snapshot_kv_capacity=gen_snapshot_kv_capacity,
-            block_size=block_size,
-            kv_token_capacity=kv_token_capacity,
-            attention_backend=attention_backend,
-            tower_role=tower_role,
-        )
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: str,
-        *,
-        device: str,
-        gen_snapshot_kv_capacity: int | None = None,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        kv_token_capacity: int | None = None,
-        attention_backend: str | None = None,
-        tower_role: str | None = None,
-        **_kwargs: Any,
-    ) -> "SenseNovaU1ForUnifiedGeneration":
-        # Route the heavy materialization through the registered native loader so
-        # it is governed by the BaseModelLoader contract; ``from_native`` builds
-        # the serving wrapper from the loader's result. ``tower_role`` selects the
-        # loader's partial-load filter and is threaded to the wrapper.
-        from ...loader import get_loader
-
-        loaded = (
-            get_loader("native")
-            .load_model(
-                cast(Any, cls),
-                None,
-                device=device,
-                model_path=model_path,
-                gen_snapshot_kv_capacity=gen_snapshot_kv_capacity,
-                block_size=block_size,
-                kv_token_capacity=kv_token_capacity,
-                attention_backend=attention_backend,
-                tower_role=tower_role,
-            )
-            .model
-        )
-        if not isinstance(loaded, cls):
-            raise TypeError("native loader returned the wrong SenseNova model type")
-        return loaded
 
     def _caps_descriptor(
         self,

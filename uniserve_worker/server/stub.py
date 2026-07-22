@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
-from typing import Any, cast
+from typing import cast
 
 import numpy as np
 from PIL import Image
@@ -97,9 +96,6 @@ class StubUniModel(UniModelBase):
         self.config = config
         self._die_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
         self._executes = 0
-
-    def load_weights(self, weights: Iterable[tuple[str, Any]]) -> set[str]:
-        return {str(name) for name, _tensor in weights}
 
     def batch_policy(self) -> BatchPolicy:
         return BatchPolicy(max_batch_ops=self.max_batch_ops, supports_mixed_modes=True)

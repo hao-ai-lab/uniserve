@@ -123,20 +123,22 @@ def test_no_arg_loader_is_default():
     assert isinstance(get_loader(), DefaultModelLoader)
 
 
-def test_model_bring_up_contract_selects_the_from_pretrained_path():
-    # load_worker_model dispatches on the ModelBringUp contract instead of
-    # reflecting an incidental ``from_pretrained`` attribute: model-owned
-    # bring-up classes satisfy it, config-driven (registry-loaded) ones do not.
-    from uniserve_worker.loader import ModelBringUp
+def test_descriptor_loader_name_follows_the_declared_weight_spec():
+    # Each family's WeightSpec names the loader that serves its checkpoint
+    # layout; a family without one uses the default loader.
+    from uniserve_worker.contracts.model_family import ModelFamilyDescriptor
     from uniserve_worker.models.bagel import BagelForUnifiedGeneration
     from uniserve_worker.models.qwen3 import Qwen3ForCausalLM
     from uniserve_worker.models.sensenova.model import SenseNovaU1ForUnifiedGeneration
     from uniserve_worker.server.stub import StubUniModel
 
-    assert issubclass(SenseNovaU1ForUnifiedGeneration, ModelBringUp)
-    assert issubclass(BagelForUnifiedGeneration, ModelBringUp)
-    assert not issubclass(Qwen3ForCausalLM, ModelBringUp)
-    assert not issubclass(StubUniModel, ModelBringUp)
+    def loader_name(cls):
+        return ModelFamilyDescriptor.from_model_class(cls).loader_name
+
+    assert loader_name(SenseNovaU1ForUnifiedGeneration) == "native"
+    assert loader_name(BagelForUnifiedGeneration) == "composite"
+    assert loader_name(Qwen3ForCausalLM) == "default"
+    assert loader_name(StubUniModel) == "default"
 
 
 def test_partial_model_scope_requires_explicit_model_support(tmp_path):
@@ -466,19 +468,6 @@ class TinyLoadableModel(nn.Module):
         self.config = config
         self.proj = LinearBase(3, 2, bias=True)
 
-    def load_weights(self, weights):
-        params = dict(self.named_parameters())
-        seen = set()
-        for name, tensor in weights:
-            param = params[name]
-            param.weight_loader(param, tensor)
-            seen.add(name)
-        missing = set(params) - seen
-        unexpected = seen - set(params)
-        if missing or unexpected:
-            return type("LoadResult", (), {"missing": missing, "unexpected": unexpected})()
-        return None
-
 
 def test_default_loader_streams_safetensors_into_weight_hooks(tmp_path):
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
@@ -495,6 +484,19 @@ def test_default_loader_streams_safetensors_into_weight_hooks(tmp_path):
     model = result.model
     torch.testing.assert_close(model.proj.weight, weight)
     torch.testing.assert_close(model.proj.bias, bias)
+
+
+def test_default_loader_fails_loudly_when_a_parameter_has_no_checkpoint_tensor(tmp_path):
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    save_file({"proj.weight": weight}, tmp_path / "model.safetensors")
+
+    with pytest.raises(RuntimeError, match="missing"):
+        get_loader("default").load_model(
+            TinyLoadableModel,
+            {"model_type": "tiny"},
+            device="cpu",
+            model_path=str(tmp_path),
+        )
 
 
 def test_native_transformers_loader_streams_to_plain_module(tmp_path):
@@ -630,11 +632,11 @@ def test_native_transformers_loader_maps_separate_projection_weights_to_fused_pa
     )
 
 
-def test_native_loader_class_orchestrates_spec_and_from_native(tmp_path):
-    # The registered "native" BaseModelLoader reads the wrapper's native_load_spec,
-    # materializes the inner module, and builds the serving model via from_native,
-    # returning a LoadResult(model + tokenizer + device).
-    from uniserve_worker.loader import LoadResult, NativeLoadSpec, get_loader
+def test_native_loader_builds_the_serving_wrapper_from_its_weight_spec(tmp_path):
+    # The registered "native" BaseModelLoader reads the wrapper's declared
+    # WeightSpec, materializes the inner module, and constructs the serving
+    # wrapper around it, returning a LoadResult(model + tokenizer + device).
+    from uniserve_worker.loader import LoadResult, NativeSource, WeightSpec, get_loader
 
     class TinyConfig(SimpleNamespace):
         @classmethod
@@ -653,23 +655,20 @@ def test_native_loader_class_orchestrates_spec_and_from_native(tmp_path):
             self.proj = nn.Linear(3, 2)
 
     class TinyWrapper:
-        def __init__(self, inner, tokenizer, device):
-            self.model = inner
+        weight_spec = WeightSpec(
+            native=NativeSource(
+                config_cls=TinyConfig,
+                module_cls=TinyNativeModel,
+                tokenizer_cls=TinyTokenizer,
+            ),
+        )
+
+        def __init__(self, config, *, model, tokenizer, device, **serving):
+            del serving
+            self.config = config
+            self.model = model
             self.tokenizer = tokenizer
             self.device = device
-
-        @classmethod
-        def native_load_spec(cls):
-            return NativeLoadSpec(
-                config_cls=TinyConfig,
-                model_cls=TinyNativeModel,
-                tokenizer_cls=TinyTokenizer,
-            )
-
-        @classmethod
-        def from_native(cls, inner, *, tokenizer, device, **kwargs):
-            del kwargs
-            return cls(inner, tokenizer, device)
 
     weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     bias = torch.tensor([0.25, -0.75], dtype=torch.float32)
@@ -687,8 +686,8 @@ def test_native_loader_class_orchestrates_spec_and_from_native(tmp_path):
     torch.testing.assert_close(result.model.model.proj.weight, weight.to(torch.bfloat16))
 
 
-def test_native_loader_derives_tower_filter_from_meta_model(tmp_path):
-    from uniserve_worker.loader import NativeLoadSpec
+def test_native_loader_materializes_only_the_declared_tower_role(tmp_path):
+    from uniserve_worker.loader import NativeSource, TowerSplit, WeightSpec
 
     class TinyConfig(SimpleNamespace):
         @classmethod
@@ -708,33 +707,18 @@ def test_native_loader_derives_tower_filter_from_meta_model(tmp_path):
             self.gen = nn.Linear(2, 2, bias=False)
 
     class TinyWrapper:
-        def __init__(self, inner):
-            self.model = inner
-
-        @classmethod
-        def native_load_spec(cls):
-            return NativeLoadSpec(
+        weight_spec = WeightSpec(
+            native=NativeSource(
                 config_cls=TinyConfig,
-                model_cls=TinyNativeModel,
+                module_cls=TinyNativeModel,
                 tokenizer_cls=TinyTokenizer,
-                param_filter_from_model=cls.tower_role_param_filter_from_model,
-            )
+            ),
+            tower=TowerSplit(gen_prefixes=("gen.",)),
+        )
 
-        @classmethod
-        def tower_role_param_filter_from_model(cls, model, tower_role):
-            assert isinstance(model, TinyNativeModel)
-            if tower_role is None:
-                return None
-            if tower_role == "gen":
-                return lambda name: name == "gen.weight"
-            if tower_role == "und":
-                return lambda name: name != "gen.weight"
-            raise ValueError(tower_role)
-
-        @classmethod
-        def from_native(cls, inner, *, tokenizer, device, **kwargs):
-            del tokenizer, device, kwargs
-            return cls(inner)
+        def __init__(self, config, *, model, tokenizer, device, **serving):
+            del config, tokenizer, device, serving
+            self.model = model
 
     shared = torch.ones(2, 2)
     gen = torch.arange(4, dtype=torch.float32).reshape(2, 2)
@@ -751,6 +735,67 @@ def test_native_loader_derives_tower_filter_from_meta_model(tmp_path):
     assert result.model.model.shared.weight.is_meta
     assert not result.model.model.gen.weight.is_meta
     torch.testing.assert_close(result.model.model.gen.weight, gen.to(torch.bfloat16))
+
+
+def test_composite_loader_streams_root_file_sidecar_and_wraps_the_graph(tmp_path):
+    # The registered "composite" BaseModelLoader builds the inner graph from
+    # its declared config, streams the first existing root file through the
+    # declared rename rules, loads sidecar submodule files, casts to the
+    # declared serving dtype, and constructs the serving wrapper.
+    from uniserve_worker.foundation.errors import WorkerError
+    from uniserve_worker.loader import GraphSource, Rename, Sidecar, WeightSpec, get_loader
+
+    class TinyGraphConfig:
+        @classmethod
+        def from_pretrained(cls, model_dir):
+            del model_dir
+            return cls()
+
+    class TinyGraph(nn.Module):
+        def __init__(self, cfg):
+            super().__init__()
+            self.cfg = cfg
+            self.core = nn.Linear(2, 2, bias=False)
+            self.vae = nn.Linear(2, 2, bias=False)
+
+    class TinyComposite:
+        weight_spec = WeightSpec(
+            graph=GraphSource(config_cls=TinyGraphConfig, module_cls=TinyGraph),
+            checkpoint_files=("ema.safetensors", "model.safetensors"),
+            renames=(Rename("inner.core.", "core."),),
+            unmatched="skip",
+            sidecars=(Sidecar(file="ae.safetensors", module="vae"),),
+        )
+
+        def __init__(self, config, *, model, device, **serving):
+            del serving
+            self.config = config
+            self.model = model
+            self.device = device
+
+    core = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    vae = torch.arange(4, dtype=torch.float32).reshape(2, 2) + 10
+    save_file(
+        {"inner.core.weight": core, "ignored.tensor": torch.zeros(1)},
+        tmp_path / "ema.safetensors",
+    )
+    save_file({"weight": vae}, tmp_path / "ae.safetensors")
+
+    result = get_loader("composite").load_model(
+        TinyComposite, None, device="cpu", model_path=str(tmp_path)
+    )
+
+    assert isinstance(result.model, TinyComposite)
+    graph = result.model.model
+    assert graph.core.weight.dtype == torch.bfloat16
+    torch.testing.assert_close(graph.core.weight, core.to(torch.bfloat16))
+    torch.testing.assert_close(graph.vae.weight, vae.to(torch.bfloat16))
+
+    save_file({"unrelated.weight": core}, tmp_path / "ema.safetensors")
+    with pytest.raises(WorkerError, match="missing"):
+        get_loader("composite").load_model(
+            TinyComposite, None, device="cpu", model_path=str(tmp_path)
+        )
 
 
 def test_native_transformers_loader_preserves_fp8_linear_checkpoint_tensors(tmp_path):
