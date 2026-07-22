@@ -1265,9 +1265,11 @@ class SegmentRuntime:
         )
 
     def _wait_gen_cache_ready(self, cache: Any) -> None:
-        wait = getattr(self.adapter, "_wait_gen_cache_ready", None)
-        if callable(wait):
-            wait(cache)
+        # B2: the staged snapshot's readiness barrier before the gen tower
+        # reads the replica, served by the family's transfer session.
+        session = getattr(self.adapter, "tower_session", None)
+        if session is not None:
+            session.wait_gen_cache_ready(cache)
 
     def packed_denoise_indicators(
         self,

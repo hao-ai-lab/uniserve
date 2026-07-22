@@ -100,12 +100,7 @@ from ...runtime.residency import (
     KvCacheSpec,
     ResidencyManager,
 )
-from ...runtime.tower_handoff import (
-    ConditioningSnapshot,
-    LocalP2PTowerHandoff,
-    TowerBinding,
-    TowerHandoff,
-)
+from ...runtime.tower_handoff import TowerBinding
 from ..catalog import UniModelBase
 from .config import NeoChatConfig
 
@@ -2396,11 +2391,10 @@ class SenseNovaU1ForUnifiedGeneration(
         self._init_residency_slots()
         if self.model is not None:
             self._init_loaded_model_placement(gen_snapshot_kv_capacity)
-        # The und↔gen crossing is one model-facing object over the tower axis.
-        # In-process transport binds NVLink peer copy; a trivial tower binds None
-        # and degrades to a same-device scratch copy. The binding resolves live
-        # so destination residency tracks the tower-vs-trivial choice.
-        self._tower_handoff: TowerHandoff = LocalP2PTowerHandoff(self._resolve_tower_binding)
+        # The und↔gen crossing is owned by the system transfer session and the
+        # worker's Mover; this family contributes only the tower geometry
+        # declaration (``tower_binding``), resolved live so destination
+        # residency tracks the tower-vs-trivial choice.
         self.tower_session = ProductTransferSession(self)
         self.flow_execution = FlowExecution(self, transfer=self.tower_session)
         self._img_start_token = IMG_START_TOKEN
@@ -2688,11 +2682,7 @@ class SenseNovaU1ForUnifiedGeneration(
             return
         _TOWER_LAYOUT.tag_generation_modules(self.model, self._tower_coords[Modality.GEN])
 
-    def _wait_gen_cache_ready(self, cache: Any) -> None:
-        """Gen tower waits until the staged snapshot is fully written."""
-        self.tower_session.wait_gen_cache_ready(cache)
-
-    def _resolve_tower_binding(self) -> TowerBinding:
+    def tower_binding(self) -> TowerBinding:
         """Resolve the live destination residency + coordinates for a crossing.
 
         A tower split stages into the gen-tower KV residency over the tower
@@ -2728,60 +2718,6 @@ class SenseNovaU1ForUnifiedGeneration(
             target_device=self.device,
             allocate_blocks=allocate_blocks,
         )
-
-    def _denoise_cache(self, cache: Any) -> Any:
-        """Snapshot the cond-KV into a writable replica for denoising.
-
-        The whole und->gen KV crossing is owned by :class:`TowerHandoff`."""
-        return self.tower_session.denoise_cache(cache)
-
-    def bind_data_plane_handoff(self, transport: Any) -> None:
-        """Bind the Mode-A cross-process und<->gen handoff to a data-plane transport.
-
-        Called by the runner driver on a tower-disaggregated (und/gen) worker. The
-        per-branch :attr:`_tower_handoff` (local, same-device) is unchanged; this
-        adds the cross-process publish (und) / fetch (gen) of the conditioning KV
-        over the registered ``cuda_ipc`` / ``mooncake`` transport."""
-        self.tower_session.bind_data_plane_handoff(transport)
-
-    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
-        """und side: when text decode emits ``img_start``, publish ``st.cond``.
-
-        Returns the wire locator (for ``SeqResult.locator``) the gen pool will fetch
-        and rebuild ``st.cond`` from, or ``None`` outside Mode A / a non-image token.
-        A no-op unless a data-plane handoff is bound (Mode A)."""
-        return self.tower_session.publish_conditioning(
-            self.program_state(int(req_id)),
-            sampled_token_id,
-        )
-
-    def _stage_text_cache_from_snapshot(
-        self,
-        target: SequenceCache,
-        snapshot: ConditioningSnapshot,
-        *,
-        locators: tuple[Any, ...],
-        length: int,
-        t_index: int,
-        last_token_id: int | None,
-    ) -> None:
-        self.tower_session.stage_text_cache_from_snapshot(
-            target,
-            snapshot,
-            locators=locators,
-            length=length,
-            t_index=t_index,
-            last_token_id=last_token_id,
-        )
-
-    def _maybe_stage_conditioning_from_op(self, st: Any, op: dict[str, Any]) -> None:
-        """gen side: rebuild ``st.cond`` from the fetched conditioning snapshot.
-
-        When a ``denoise_gen`` op carries the und pool's conditioning locator and
-        this request has no local ``st.cond`` (the gen pool never ran the und text),
-        fetch the published KV into the gen replica and populate the decode-state
-        scalars the denoise setup reads. A no-op in Mode C / single-device."""
-        self.tower_session.stage_conditioning_from_op(st, op)
 
     def _text_driver(self) -> SequenceExecutor:
         driver = getattr(self, "_shared_text_driver", None)

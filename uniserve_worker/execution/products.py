@@ -22,7 +22,12 @@ from uniserve_worker.runtime.image_utils import (
     tensor_to_png_bytes,
 )
 from uniserve_worker.runtime.masks import build_commit_attention_mask
-from uniserve_worker.runtime.tower_handoff import ConditioningSnapshot, DataPlaneTowerHandoff
+from uniserve_worker.runtime.tower_handoff import (
+    ConditioningSnapshot,
+    DataPlaneTowerHandoff,
+    LocalP2PTowerHandoff,
+    TowerHandoff,
+)
 from uniserve_worker.runtime.transfer import Locator
 
 # ---------------------
@@ -627,36 +632,69 @@ class ProductTransferAdapter(Protocol):
     gen_device: Any
     img_start_id: int
     residency: Any
-    _tower_handoff: Any
 
-    def _resolve_tower_binding(self) -> Any: ...
+    def tower_binding(self) -> Any: ...
+    def program_state(self, req_id: int) -> Any: ...
     def _ensure_img_start(self, cache: SequenceCache | None) -> None: ...
     def _empty_img_start_prefix(self) -> SequenceCache: ...
     def product_transfer_dtype(self) -> torch.dtype: ...
 
 
 class ProductTransferSession:
-    """Own product and recurrent-state transfer between execution towers."""
+    """Own product and recurrent-state transfer between execution towers.
+
+    The session always carries an in-process staging handoff built over the
+    family's declared tower geometry (``owner.tower_binding``). The worker's
+    Mover selects the und↔gen crossing for the deployment edge and installs it
+    through :meth:`use_tower_handoff`; a cross-process crossing additionally
+    enables the data-plane publish/fetch surface.
+    """
 
     def __init__(
         self,
         owner: ProductTransferAdapter,
     ) -> None:
         self.owner = owner
+        self._handoff: TowerHandoff = LocalP2PTowerHandoff(owner.tower_binding)
         self._data_plane_handoff: DataPlaneTowerHandoff | None = None
 
     @property
     def distributed(self) -> bool:
         return self._data_plane_handoff is not None
 
-    def bind_data_plane_handoff(self, transport: Any) -> None:
-        self._data_plane_handoff = DataPlaneTowerHandoff(
-            data_plane=transport,
-            bind=self.owner._resolve_tower_binding,
-        )
+    @property
+    def tower_binding(self) -> Any:
+        """The family's live tower geometry declaration (for the Mover)."""
+        return self.owner.tower_binding
+
+    def use_tower_handoff(self, handoff: TowerHandoff) -> None:
+        """Install the Mover-selected und↔gen crossing for this worker's edge.
+
+        An in-process crossing replaces the staging handoff; a cross-process
+        crossing adds the data-plane publish/fetch surface while the in-process
+        handoff keeps serving same-device staging.
+        """
+        if isinstance(handoff, DataPlaneTowerHandoff):
+            self._data_plane_handoff = handoff
+        else:
+            self._handoff = handoff
 
     def wait_gen_cache_ready(self, cache: Any) -> None:
-        self.owner._tower_handoff.await_ready(cache)
+        self._handoff.await_ready(cache)
+
+    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
+        """und side: when text decode samples ``img_start``, publish ``st.cond``.
+
+        Returns the wire locator (for ``SeqResult.locator``) the gen pool will
+        fetch and rebuild ``st.cond`` from, or ``None`` outside a cross-process
+        edge / a non-image token.
+        """
+        if self._data_plane_handoff is None:
+            return None
+        return self.publish_conditioning(
+            self.owner.program_state(int(req_id)),
+            sampled_token_id,
+        )
 
     def publish_conditioning(self, state: Any, sampled_token_id: int) -> Any:
         handoff = self._data_plane_handoff
@@ -699,12 +737,6 @@ class ProductTransferSession:
             iu_last_token_id=state.iu.last_token_id,
         )
         return snapshot.to_wire() if snapshot is not None else None
-
-    def fetch_conditioning(self, locator: Any) -> Any:
-        handoff = self._data_plane_handoff
-        if handoff is not None and hasattr(handoff, "fetch_conditioning"):
-            return handoff.fetch_conditioning(locator)
-        return None
 
     def stage_text_cache_from_snapshot(
         self,
@@ -786,7 +818,7 @@ class ProductTransferSession:
         )
 
     def denoise_cache(self, cache: Any) -> Any:
-        return self.owner._tower_handoff.stage_conditioning(cache)
+        return self._handoff.stage_conditioning(cache)
 
     def prepare_commit_latent(self, image_state: Any) -> torch.Tensor:
         if self._data_plane_handoff is not None:
@@ -799,7 +831,7 @@ class ProductTransferSession:
                     non_blocking=True,
                 )
             )
-        return self.owner._tower_handoff.writeback_commit(
+        return self._handoff.writeback_commit(
             image_state.x_t[0].unsqueeze(0),
             device=self.owner.device,
             dtype=torch.bfloat16,

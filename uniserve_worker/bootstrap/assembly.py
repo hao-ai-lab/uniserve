@@ -43,12 +43,13 @@ def assemble_worker(config: WorkerLaunchConfig) -> Worker:
 
     plan = resolve_worker_plan(config.worker_kind)
     if plan.implementation is WorkerImplementation.SAMPLER:
+        from ..runtime.mover import Mover
         from ..runtime.tensor_store import TensorStore
-        from ..runtime.transfer import make_transport
         from ..worker.sampler import SamplerWorker
 
+        mover = Mover(transfer_backend=config.data_plane.backend)
         return SamplerWorker(
-            tensor_store=TensorStore(transport=make_transport(config.data_plane.backend)),
+            tensor_store=TensorStore(transport=mover.transport),
             allowed_ops=plan.allowed_ops,
             pipeline_depth=config.ipc.pipeline_depth,
             result_policy=plan.result_policy,

@@ -939,11 +939,15 @@ class LatentView:
             raise invalid_descriptor(f"request {request_id} is outside the latent view")
 
 
-class ProductTransferState(Protocol):
-    """Transfer state consulted while constructing a flow operation."""
+class ProductTransfer(Protocol):
+    """Tower transfer surface flow execution drives per operation."""
 
     @property
     def distributed(self) -> bool: ...
+
+    def stage_conditioning_from_op(self, state: Any, op: dict[str, Any]) -> None: ...
+    def denoise_cache(self, cache: Any) -> Any: ...
+    def wait_gen_cache_ready(self, cache: Any) -> None: ...
 
 
 class FlowAdapter(Protocol):
@@ -969,13 +973,10 @@ class FlowAdapter(Protocol):
 
     # Collaborator methods.
     def _state(self, op: dict[str, Any]) -> "ProgramState": ...
-    def _maybe_stage_conditioning_from_op(self, st: "ProgramState", op: dict[str, Any]) -> None: ...
     def _extend_cache_blocks(self, cache: "SequenceCache", op: dict[str, Any]) -> None: ...
     def _ensure_img_start(self, cache: "SequenceCache | None") -> None: ...
     def _prefix_from_query(self, query: str) -> "SequenceCache": ...
     def _empty_img_start_prefix(self) -> "SequenceCache": ...
-    def _denoise_cache(self, cache: Any) -> Any: ...
-    def _wait_gen_cache_ready(self, cache: Any) -> None: ...
     def flow_query(self, text: str, *, append_text: str) -> str: ...
     def flow_indexes(
         self,
@@ -1035,7 +1036,7 @@ class FlowExecution:
         self,
         adapter: FlowAdapter,
         *,
-        transfer: ProductTransferState | None = None,
+        transfer: ProductTransfer | None = None,
     ) -> None:
         self.adapter = adapter
         self.transfer = transfer
@@ -1043,6 +1044,17 @@ class FlowExecution:
     @property
     def distributed(self) -> bool:
         return self.transfer is not None and self.transfer.distributed
+
+    def _stage_denoise_cache(self, cache: Any) -> Any:
+        """Snapshot a conditioning-KV branch into a writable gen-side replica."""
+        if self.transfer is None:
+            return cache
+        return self.transfer.denoise_cache(cache)
+
+    def _wait_gen_cache_ready(self, cache: Any) -> None:
+        """B2: wait the snapshot's readiness before the gen tower reads it."""
+        if self.transfer is not None:
+            self.transfer.wait_gen_cache_ready(cache)
 
     def _init_image_state(
         self,
@@ -1081,9 +1093,9 @@ class FlowExecution:
         )
 
         x_t = self._init_latent(st, params, device, noise_scale)
-        cond_cache = adapter._denoise_cache(cond.past)
-        tu_cache = adapter._denoise_cache(st.tu.past)
-        iu_cache = adapter._denoise_cache(st.iu.past)
+        cond_cache = self._stage_denoise_cache(cond.past)
+        tu_cache = self._stage_denoise_cache(st.tu.past)
+        iu_cache = self._stage_denoise_cache(st.iu.past)
         # The latent lives in the system-owned LatentStore, keyed by the request
         # handle; ``FlowState.x_t`` reads/writes that buffer.
         latent_handle = int(op["req_id"]) if op and "req_id" in op else id(st)
@@ -1229,7 +1241,8 @@ class FlowExecution:
         # Mode A (tower disaggregation): the gen pool never ran the und text, so
         # rebuild st.cond from the conditioning KV the und pool published (carried
         # on op["locator"]). A no-op in Mode C / single-device.
-        adapter._maybe_stage_conditioning_from_op(st, op)
+        if self.transfer is not None:
+            self.transfer.stage_conditioning_from_op(st, op)
         adapter._extend_cache_blocks(st.cond, op)
         if st.image_state is None:
             st.image_state = self._init_image_state(st, op)
@@ -1448,7 +1461,7 @@ class FlowExecution:
         first = rows[0]
         img = first.img
         for row in rows:
-            self.adapter._wait_gen_cache_ready(row.cache)
+            self._wait_gen_cache_ready(row.cache)
         # Capture or replay the whole compatible batched step as one CUDA graph.
         # Strict unified-forward callers use ``graph_mode="require"`` and reject
         # the batch when its geometry is not covered.
@@ -1495,7 +1508,7 @@ class FlowExecution:
         if indexes is None or cache is None:
             raise model_execution_error("required CFG cache is not initialized")
         # B2: wait the snapshot's readiness before the gen tower reads the replica.
-        self.adapter._wait_gen_cache_ready(cache)
+        self._wait_gen_cache_ready(cache)
         return self.adapter.flow_predict_velocity(
             image_embeds,
             indexes,

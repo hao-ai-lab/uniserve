@@ -111,12 +111,6 @@ class UniModel(ABC):
     def configure_runtime(self, **kwargs: Any) -> None:
         pass
 
-    def bind_data_plane_handoff(self, handoff: Any) -> None:
-        pass
-
-    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
-        return None
-
     def prompt_predecessor_logits(self, req_id: int) -> Any | None:
         """Return worker-resident logits that predict the next prompt token."""
         return None

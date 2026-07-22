@@ -23,14 +23,27 @@ _VOCAB = 64
 _SEED = 11
 
 
+class _FailingTransferSession:
+    """Transfer session whose post-draw conditioning publish can be failed."""
+
+    def __init__(self, owner: "SpreadLogitsTextModel") -> None:
+        self.owner = owner
+
+    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
+        del sampled_token_id
+        if int(req_id) in self.owner.fail_after_sampling:
+            raise RuntimeError("injected failure after the draw")
+        return None
+
+
 class SpreadLogitsTextModel(UniModel):
     """Thin system-managed text model emitting one fixed, dispersed logits row.
 
     Every row receives the same mild logits spread, so a temperature-1
     multinomial has real dispersion and the drawn token depends only on the
-    system sampler's RNG. ``fail_after_sampling`` raises from the
-    post-sampling conditioning hook, failing the step after the draw already
-    advanced the request's device generator.
+    system sampler's RNG. ``fail_after_sampling`` raises from the transfer
+    session's post-draw conditioning publish, failing the step after the draw
+    already advanced the request's device generator.
     """
 
     resource_classes = ("kv_block",)
@@ -44,17 +57,13 @@ class SpreadLogitsTextModel(UniModel):
 
     def __init__(self) -> None:
         self.fail_after_sampling: set[int] = set()
+        self.tower_session = _FailingTransferSession(self)
 
     def kv_cache_spec(self) -> KvCacheSpec:
         return KvCacheSpec(num_layers=1, num_kv_heads=1, head_dim=4, dtype=torch.float32)
 
     def forward_text(self, forward_batch) -> torch.Tensor:
         return torch.linspace(0.0, 4.0, _VOCAB).repeat(forward_batch.batch_size, 1)
-
-    def maybe_publish_conditioning(self, req_id: int, sampled_token_id: int) -> str | None:
-        if int(req_id) in self.fail_after_sampling:
-            raise RuntimeError("injected failure after the draw")
-        return None
 
 
 def _fresh() -> tuple[SpreadLogitsTextModel, ModelExecutor]:
