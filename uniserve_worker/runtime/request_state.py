@@ -12,12 +12,31 @@ import torch
 __all__ = [
     "append_new_block_ids",
     "request_seed",
+    "sampling_draw_seed",
     "RequestLifecycle",
     "ResidencyFlags",
     "DecodeRelay",
     "RequestState",
     "RequestStateTable",
 ]
+
+_U64 = 0xFFFFFFFFFFFFFFFF
+_SPLITMIX64_GAMMA = 0x9E3779B97F4A7C15
+
+
+def sampling_draw_seed(seed: int, position: int) -> int:
+    """Counter-based generator seed for one sampled-token draw.
+
+    The coordinates are semantic: the request seed and the sequence position of
+    the token being drawn. The position selects the element of a SplitMix64
+    stream and the finalizer decorrelates neighboring coordinates, so the
+    randomness of a draw is a pure function of ``(seed, position)`` — thread
+    timing, batch composition, draw history, and retry count cannot change it.
+    """
+    x = (int(seed) + (int(position) + 1) * _SPLITMIX64_GAMMA) & _U64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64
+    return (x ^ (x >> 31)) & _U64
 
 
 def request_seed(request: Mapping[str, Any], req_id: int) -> int:

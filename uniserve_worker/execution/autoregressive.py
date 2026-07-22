@@ -33,9 +33,6 @@ from uniserve_worker.contracts.outputs import (
 from uniserve_worker.foundation.errors import invalid_descriptor
 from uniserve_worker.foundation.profiling import profile_range
 from uniserve_worker.nn.sampler import (
-    apply_sampling_batched_with_device_tokens,
-    finalize_sampling_result,
-    is_deferred_sampling_result,
     sample_one_from_logits,
     score_prompt_token_logprobs,
 )
@@ -53,6 +50,9 @@ from .sampling import (
     _DecodeBurstGraphMiss,
     _positive_int,
     _text_model_forward,
+    sample_text_rows_batched,
+    sampled_token_position,
+    sampling_draw_generator,
     text_input_id_replacements_from_relays,
     verify_speculative_tokens,
 )
@@ -1023,9 +1023,10 @@ class _AutoregressiveRuntime:
                 allowed=op.get("allowed_tokens"),
                 suppress=op.get("suppress_tokens"),
                 n_logprobs=int(state.sampling.get("n_logprobs", 0) or 0),
-                generator=state.device_rng(
+                generator=sampling_draw_generator(
+                    state,
                     logits_batch.device,
-                    stream="text_sampling",
+                    position=sampled_token_position(op),
                 ),
             )
             self._store_sampled_token_relay(
@@ -1137,75 +1138,14 @@ class _AutoregressiveRuntime:
         defer_cpu_results: bool = False,
         cuda_ready_start_event: torch.cuda.Event | None = None,
     ) -> list[TextTokenOutput | DeferredTextSeqResult]:
-        if logits_batch.ndim != 2:
-            raise invalid_descriptor("batched text logits rows must form a [batch, vocab] tensor")
-        if int(logits_batch.shape[0]) != len(req_ids):
-            raise invalid_descriptor("batched text logits row count must match req_ids")
-        params: list[dict[str, Any]] = []
-        recent: list[list[int] | tuple[int, ...]] = []
-        allowed: list[list[int] | tuple[int, ...] | None] = []
-        suppress: list[list[int] | tuple[int, ...] | None] = []
-        generators: list[torch.Generator] = []
-        for op, req_id in zip(ops, req_ids):
-            state = request_states.get(req_id)
-            params.append(dict(state.sampling or {}))
-            recent.append(op.get("recent_tokens") or [])
-            allowed.append(op.get("allowed_tokens"))
-            suppress.append(op.get("suppress_tokens"))
-            generators.append(state.device_rng(logits_batch.device, stream="text_sampling"))
-        with profile_range("uniserve.text.apply_sampling"):
-            sampling_result = apply_sampling_batched_with_device_tokens(
-                logits_batch,
-                params,
-                recent,
-                allowed,
-                suppress,
-                generators=generators,
-                defer_cpu=defer_cpu_results,
-                enable_cuda_timing=cuda_ready_start_event is not None,
-            )
-        if is_deferred_sampling_result(sampling_result):
-            sampling_result.set_ready_start_event(cuda_ready_start_event)
-            out: list[TextTokenOutput | DeferredTextSeqResult] = []
-            for row, req_id in enumerate(req_ids):
-                state = request_states.get(req_id)
-                relay_token_tensor = sampling_result.device_tokens[row : row + 1]
-                self._store_sampled_token_relay(
-                    state, token_id=None, token_tensor=relay_token_tensor
-                )
-                out.append(
-                    DeferredTextSeqResult(
-                        req_id=req_id,
-                        row=row,
-                        state=state,
-                        sampling_result=sampling_result,
-                        relay_token_tensor=relay_token_tensor,
-                    )
-                )
-            record_component_elapsed(stats, "text_sample", start)
-            return out
-
-        immediate_result = finalize_sampling_result(sampling_result)
-        samples = immediate_result.samples
-        out = []
-        for row, (req_id, (tok, lp, top)) in enumerate(zip(req_ids, samples)):
-            self._store_sampled_token_relay(
-                request_states.get(req_id),
-                token_id=int(tok),
-                token_tensor=immediate_result.device_tokens[row : row + 1],
-            )
-            out.append(
-                TextTokenOutput(
-                    req_id=int(req_id),
-                    sampled_token_id=tok,
-                    sampled_logprob=lp,
-                    top_logprobs=(
-                        [(int(item[0]), float(item[1]), int(item[2])) for item in top]
-                        if top
-                        else None
-                    ),
-                )
-            )
+        out = sample_text_rows_batched(
+            ops,
+            req_ids,
+            logits_batch,
+            request_states,
+            defer_cpu_results=defer_cpu_results,
+            cuda_ready_start_event=cuda_ready_start_event,
+        )
         record_component_elapsed(stats, "text_sample", start)
         return out
 

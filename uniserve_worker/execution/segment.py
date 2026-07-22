@@ -42,7 +42,10 @@ from uniserve_worker.execution.sampling import (
     DeferredTerminalDecodeBurstSeqResult,
     DeferredTextSeqResult,
     TextDecodeRelay,
+    batched_sampling_inputs,
     sample_logits_result,
+    sampled_token_position,
+    sampling_draw_generator,
 )
 from uniserve_worker.execution.sequence import hydrate_cached_prefix_from_op
 from uniserve_worker.foundation.env import env_flag
@@ -1948,16 +1951,18 @@ def _run_segment_forward_impl(
             else:
                 sample_logits: list[torch.Tensor] = []
                 sampling_params: list[dict[str, Any]] = []
-                sampling_generators: list[torch.Generator] = []
+                sampling_generators: list[torch.Generator | None] = []
                 with profile_range("uniserve.packed_forward.text_sampling_inputs"):
                     for row_index, *_rest in plan.text_result_slots:
-                        req_id = int(batch.ops[row_index]["req_id"])
+                        op = batch.ops[row_index]
+                        req_id = int(op["req_id"])
                         state = request_states.get(req_id)
                         sampling_params.append(dict(state.sampling or {}))
                         sampling_generators.append(
-                            state.device_rng(
+                            sampling_draw_generator(
+                                state,
                                 text_logits.device,
-                                stream="text_sampling",
+                                position=sampled_token_position(op),
                             )
                         )
                         sample_logits.append(
@@ -2859,18 +2864,12 @@ class SegmentExecutor(SegmentRuntime):
         if not rows:
             return []
         logits_batch = torch.stack(rows, dim=0)
-        sampling_params: list[dict[str, Any]] = []
-        recent: list[list[int] | tuple[int, ...]] = []
-        allowed: list[list[int] | tuple[int, ...] | None] = []
-        suppress: list[list[int] | tuple[int, ...] | None] = []
-        generators: list[torch.Generator] = []
-        for op in ops:
-            state = request_states.get(int(op["req_id"]))
-            sampling_params.append(dict(state.sampling or {}))
-            recent.append(op.get("recent_tokens") or [])
-            allowed.append(op.get("allowed_tokens"))
-            suppress.append(op.get("suppress_tokens"))
-            generators.append(state.device_rng(logits_batch.device, stream="text_sampling"))
+        sampling_params, recent, allowed, suppress, generators = batched_sampling_inputs(
+            ops,
+            [int(op["req_id"]) for op in ops],
+            request_states,
+            logits_batch.device,
+        )
         sampled = apply_sampling_batched_with_device_tokens(
             logits_batch,
             sampling_params,

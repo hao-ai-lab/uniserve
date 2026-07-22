@@ -27,9 +27,12 @@ from uniserve_worker.contracts.outputs import (
     TextTokenOutput,
 )
 from uniserve_worker.foundation.errors import capability_mismatch, invalid_descriptor
+from uniserve_worker.foundation.profiling import profile_range
 from uniserve_worker.nn.sampler import (
     DeferredBatchedSamplingResult,
     apply_sampling_batched_with_device_tokens,
+    finalize_sampling_result,
+    is_deferred_sampling_result,
     sample_one_from_logits,
 )
 from uniserve_worker.runtime.host_staging import (
@@ -39,7 +42,11 @@ from uniserve_worker.runtime.host_staging import (
     fill_cpu_ints,
     is_pinned,
 )
-from uniserve_worker.runtime.request_state import RequestState, RequestStateTable
+from uniserve_worker.runtime.request_state import (
+    RequestState,
+    RequestStateTable,
+    sampling_draw_seed,
+)
 from uniserve_worker.runtime.tensor_views import coalesce_one_token_rows
 from uniserve_worker.spec import speculative_sample_target_only
 
@@ -1005,6 +1012,24 @@ def _verify_spec_row_target_only(
     suppress: Any,
     stats: ForwardStats | None,
 ) -> dict[str, Any]:
+    # Counter-based accept/residual coins: one generator seeded from the first
+    # drawn position of this verify op, then the ``len(spec)`` accept coins and
+    # the final residual/bonus coin drawn in declared order. A retried or
+    # re-batched verify op reproduces the same coins.
+    first_drawn_position = int((op.get("pos_range") or (0, 0))[0]) + 1
+    generator = sampling_draw_generator(state, logits.device, position=first_drawn_position)
+    coins = torch.rand(
+        (len(spec),),
+        dtype=torch.float32,
+        device=logits.device,
+        generator=generator,
+    )
+    final_coin = torch.rand(
+        (1,),
+        dtype=torch.float32,
+        device=logits.device,
+        generator=generator,
+    )
     spec_sample = speculative_sample_target_only(
         logits[: len(spec) + 1].reshape(len(spec) + 1, -1),
         spec,
@@ -1012,6 +1037,8 @@ def _verify_spec_row_target_only(
         recent=recent,
         allowed=allowed,
         suppress=suppress,
+        uniform_samples=coins,
+        uniform_sample_for_final=final_coin,
     )
     accepted = int(spec_sample.num_accepted_tokens)
     next_pos = _advance_spec_kv(state, op, accepted)
@@ -1045,6 +1072,7 @@ def _verify_spec_row_sequential(
     sampled_token_tensor = None
     sampled_logprob = None
     top_logprobs = None
+    base_position = int((op.get("pos_range") or (0, 0))[0])
     for pos in range(len(spec) + 1):
         requested_logprobs = n_logprobs if n_logprobs > 0 else 0
         sampling_for_pos = dict(sampling)
@@ -1055,7 +1083,13 @@ def _verify_spec_row_sequential(
             [recent],
             [allowed],
             [suppress],
-            generators=[state.device_rng(logits.device, stream="text_sampling")],
+            generators=[
+                sampling_draw_generator(
+                    state,
+                    logits.device,
+                    position=base_position + 1 + pos,
+                )
+            ],
         )
         token, logprob, top = sampling_result.samples[0]
         if pos < len(spec) and int(token) == int(spec[pos]):
@@ -1177,6 +1211,81 @@ def _record_spec_verify_stats(
 
 
 # ---------------------
+# Sampling RNG coordinates
+# ---------------------
+
+
+def sampled_token_position(op: Mapping[str, Any]) -> int:
+    """Sequence position of the token an op's sampler row draws.
+
+    ``pos_range`` spans the op's input tokens, so the freshly drawn token sits
+    at ``pos_range[1]`` for prefill chunks, decode steps, and burst iterations
+    alike. This is the position coordinate of the counter-based draw seed.
+    """
+    pos = op.get("pos_range") or (0, 0)
+    return int(pos[1])
+
+
+def sampling_draw_generator(
+    state: "RequestState",
+    device: torch.device,
+    *,
+    position: int,
+) -> torch.Generator | None:
+    """Per-draw generator seeded from the draw's semantic coordinates.
+
+    The single owner of sampled-row RNG policy: greedy rows never draw and get
+    ``None`` (no per-row seeding cost); sampled rows reuse the request's cached
+    device generator reseeded with ``sampling_draw_seed(request seed, position)``
+    so a retried or re-batched draw reproduces the same token. ``manual_seed``
+    is a host-side state write — it enqueues no device work and never
+    synchronizes.
+    """
+    sampling = state.sampling
+    if not sampling or float(sampling.get("temperature", 0.0) or 0.0) <= 0.0:
+        return None
+    generator = state.device_rng(device, stream="text_sampling")
+    generator.manual_seed(
+        sampling_draw_seed(0 if state.seed is None else int(state.seed), int(position))
+    )
+    return generator
+
+
+def batched_sampling_inputs(
+    ops: Sequence[Mapping[str, Any]],
+    req_ids: Sequence[int],
+    request_states: "RequestStateTable",
+    device: torch.device,
+) -> tuple[
+    list[dict[str, Any]],
+    list[list[int] | tuple[int, ...]],
+    list[list[int] | tuple[int, ...] | None],
+    list[list[int] | tuple[int, ...] | None],
+    list[torch.Generator | None],
+]:
+    """Per-row sampler inputs for a batched text draw.
+
+    Computes the sampling params, penalty/mask lists, and counter-seeded
+    generators in one place so every batched text path shares one policy.
+    """
+    params: list[dict[str, Any]] = []
+    recent: list[list[int] | tuple[int, ...]] = []
+    allowed: list[list[int] | tuple[int, ...] | None] = []
+    suppress: list[list[int] | tuple[int, ...] | None] = []
+    generators: list[torch.Generator | None] = []
+    for op, req_id in zip(ops, req_ids, strict=True):
+        state = request_states.get(int(req_id))
+        params.append(dict(state.sampling or {}))
+        recent.append(op.get("recent_tokens") or [])
+        allowed.append(op.get("allowed_tokens"))
+        suppress.append(op.get("suppress_tokens"))
+        generators.append(
+            sampling_draw_generator(state, device, position=sampled_token_position(op))
+        )
+    return params, recent, allowed, suppress, generators
+
+
+# ---------------------
 # Text sequence execution
 # ---------------------
 
@@ -1261,7 +1370,11 @@ def sample_logits_result(
         allowed=op.get("allowed_tokens"),
         suppress=op.get("suppress_tokens"),
         n_logprobs=int(sp.get("n_logprobs", 0) or 0),
-        generator=state.device_rng(vocab_logits.device, stream="text_sampling"),
+        generator=sampling_draw_generator(
+            state,
+            vocab_logits.device,
+            position=sampled_token_position(op),
+        ),
     )
     result: dict[str, Any] = {"req_id": int(req_id), "sampled_token_id": tok}
     if lp is not None:
@@ -1269,3 +1382,88 @@ def sample_logits_result(
     if top:
         result["top_logprobs"] = top
     return result
+
+
+def sample_text_rows_batched(
+    ops: Sequence[Mapping[str, Any]],
+    req_ids: Sequence[int],
+    logits_batch: torch.Tensor,
+    request_states: "RequestStateTable",
+    *,
+    defer_cpu_results: bool = False,
+    cuda_ready_start_event: "torch.cuda.Event | None" = None,
+) -> list[TextTokenOutput | DeferredTextSeqResult]:
+    """Sample one token per text row and publish the decode token relays.
+
+    The batched text sampler behind every system text path: it derives the
+    per-row sampler inputs (including the counter-seeded draw generators),
+    runs the canonical batched pipeline, and wraps rows as immediate
+    ``TextTokenOutput`` values or, when the CPU copy is event-backed and
+    deferral is requested, as ``DeferredTextSeqResult`` handles.
+    """
+    if logits_batch.ndim != 2:
+        raise invalid_descriptor("batched text logits rows must form a [batch, vocab] tensor")
+    if int(logits_batch.shape[0]) != len(req_ids):
+        raise invalid_descriptor("batched text logits row count must match req_ids")
+    params, recent, allowed, suppress, generators = batched_sampling_inputs(
+        ops,
+        req_ids,
+        request_states,
+        logits_batch.device,
+    )
+    with profile_range("uniserve.text.apply_sampling"):
+        sampling_result = apply_sampling_batched_with_device_tokens(
+            logits_batch,
+            params,
+            recent,
+            allowed,
+            suppress,
+            generators=generators,
+            defer_cpu=defer_cpu_results,
+            enable_cuda_timing=cuda_ready_start_event is not None,
+        )
+    if is_deferred_sampling_result(sampling_result):
+        sampling_result.set_ready_start_event(cuda_ready_start_event)
+        deferred_outputs: list[TextTokenOutput | DeferredTextSeqResult] = []
+        for row, req_id in enumerate(req_ids):
+            state = request_states.get(int(req_id))
+            relay_token_tensor = sampling_result.device_tokens[row : row + 1]
+            _DECODE_RELAY.publish_sample(
+                state,
+                token_id=None,
+                token_tensor=relay_token_tensor,
+            )
+            deferred_outputs.append(
+                DeferredTextSeqResult(
+                    req_id=int(req_id),
+                    row=row,
+                    state=state,
+                    sampling_result=sampling_result,
+                    relay_token_tensor=relay_token_tensor,
+                )
+            )
+        return deferred_outputs
+
+    immediate_result = finalize_sampling_result(sampling_result)
+    outputs: list[TextTokenOutput | DeferredTextSeqResult] = []
+    for row, (req_id, (tok, lp, top)) in enumerate(
+        zip(req_ids, immediate_result.samples, strict=True)
+    ):
+        _DECODE_RELAY.publish_sample(
+            request_states.get(int(req_id)),
+            token_id=int(tok),
+            token_tensor=immediate_result.device_tokens[row : row + 1],
+        )
+        outputs.append(
+            TextTokenOutput(
+                req_id=int(req_id),
+                sampled_token_id=int(tok),
+                sampled_logprob=lp,
+                top_logprobs=(
+                    [(int(item[0]), float(item[1]), int(item[2])) for item in top]
+                    if top
+                    else None
+                ),
+            )
+        )
+    return outputs
