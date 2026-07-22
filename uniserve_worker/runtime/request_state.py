@@ -116,8 +116,10 @@ class RequestState:
     latent: Any = None
     rng: Any = None
     device_rngs: dict[str, torch.Generator] = field(default_factory=dict)
-    # Per-lane committed KV lengths (lane -> token count). Both the text driver
-    # and text models record their lane here through ``kv_length``/``set_kv_length``.
+    # Per-lane committed KV lengths (lane -> token count), recorded by the
+    # system executor through ``kv_length``/``set_kv_length``. The system-planned
+    # text path commits its lane here; interleaved sequence branches commit their
+    # lengths on the branch caches owned by the executor ``KvStore``.
     kv_lengths: dict[str, int] = field(default_factory=dict)
     residency: ResidencyFlags = field(default_factory=ResidencyFlags)
     decode_relay: DecodeRelay = field(default_factory=DecodeRelay)
