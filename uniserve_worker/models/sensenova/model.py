@@ -2341,14 +2341,6 @@ class SenseNovaU1ForUnifiedGeneration(
     # System-provisioned at worker bring-up from ``segment_adapter()``.
     segment_executor: SegmentExecutor
 
-    def velocity_parameterization(self) -> str:
-        return "velocity"
-
-    # Flow configuration consumed by the system FlowExecution engine.
-    denoise_schedule_direction = ScheduleDirection.ASCENDING
-    denoise_schedule_shift_domain = ScheduleShiftDomain.SIGMA
-    denoise_cfg_recipe = CfgRecipe.ADDITIVE_DELTAS
-
     def __init__(
         self,
         config: Any | None = None,
@@ -2391,12 +2383,22 @@ class SenseNovaU1ForUnifiedGeneration(
         self._init_residency_slots()
         if self.model is not None:
             self._init_loaded_model_placement(gen_snapshot_kv_capacity)
+        # Declarative flow semantics; ``model_spec()`` composes this same value
+        # and the system flow/product drivers resolve schedule and CFG recipe
+        # from it at composition.
+        self._flow = FlowSpec(
+            latent_downsample=int(self.latent_downsample),
+            prediction="velocity",
+            schedule_direction=ScheduleDirection.ASCENDING.value,
+            schedule_shift_domain=ScheduleShiftDomain.SIGMA.value,
+            cfg_recipe=CfgRecipe.ADDITIVE_DELTAS.value,
+        )
         # The und↔gen crossing is owned by the system transfer session and the
         # worker's Mover; this family contributes only the tower geometry
         # declaration (``tower_binding``), resolved live so destination
         # residency tracks the tower-vs-trivial choice.
-        self.tower_session = ProductTransferSession(self)
-        self.flow_execution = FlowExecution(self, transfer=self.tower_session)
+        self.tower_session = ProductTransferSession(self, flow=self._flow)
+        self.flow_execution = FlowExecution(self, flow=self._flow, transfer=self.tower_session)
         self._img_start_token = IMG_START_TOKEN
 
     def _init_tower_profile(self) -> None:
@@ -2533,12 +2535,7 @@ class SenseNovaU1ForUnifiedGeneration(
                 dtype="bfloat16",
                 store_dtype=self._kv_dtype_name_for(torch.bfloat16),
             ),
-            flow=FlowSpec(
-                latent_downsample=int(self.latent_downsample),
-                prediction=self.velocity_parameterization(),
-                schedule_direction=self.denoise_schedule_direction.value,
-                schedule_shift_domain=self.denoise_schedule_shift_domain.value,
-            ),
+            flow=self._flow,
         )
 
     def gen_residency_spec(self) -> GenResidencySpec | None:

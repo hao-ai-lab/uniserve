@@ -23,6 +23,7 @@ from uniserve_worker.execution.flow import (
     ProgramState,
     flow_cfg_branch_count,
     run_flow_graph,
+    schedule_from_flow_spec,
 )
 from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
 from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
@@ -698,9 +699,6 @@ class BagelForUnifiedGeneration(UniModelBase):
         sidecars=(Sidecar(file="ae.safetensors", module="vae", optional_substrings=("reg",)),),
     )
 
-    def velocity_parameterization(self) -> str:
-        return "velocity"
-
     # Encoder-output cache capacity reported to the host scheduler.
     ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
 
@@ -738,6 +736,16 @@ class BagelForUnifiedGeneration(UniModelBase):
             else (config if isinstance(config, BagelConfig) else BagelConfig())
         )
         self.resource_plan = self._build_resource_plan()
+        # Declarative flow semantics; ``model_spec()`` composes this same value
+        # and the denoise path derives its schedule and CFG recipe from it.
+        self._flow = FlowSpec(
+            latent_downsample=int(self.cfg.latent_downsample),
+            prediction="velocity",
+            schedule_direction=ScheduleDirection.DESCENDING.value,
+            schedule_shift_domain=ScheduleShiftDomain.TIME.value,
+            cfg_recipe=CfgRecipe.IMAGE_OVER_TEXT.value,
+            timestep_shift=float(self.cfg.timestep_shift),
+        )
         # Interleaved-text-driver owner surface: per-request driver states plus
         # the marker/eos ids the driver reads as configuration. BAGEL has no
         # worker-side tokenizer (the host tokenizes). The scratch pool holds
@@ -848,12 +856,7 @@ class BagelForUnifiedGeneration(UniModelBase):
                 dtype="bfloat16",
                 store_dtype=self._kv_dtype_name_for(torch.bfloat16),
             ),
-            flow=FlowSpec(
-                latent_downsample=int(self.cfg.latent_downsample),
-                prediction=self.velocity_parameterization(),
-                schedule_direction=ScheduleDirection.DESCENDING.value,
-                schedule_shift_domain=ScheduleShiftDomain.TIME.value,
-            ),
+            flow=self._flow,
         )
 
     def gen_residency_spec(self) -> GenResidencySpec | None:
@@ -1424,7 +1427,7 @@ class BagelForUnifiedGeneration(UniModelBase):
         params = parse_text_image_generation_params(
             parse_ip,
             cfg=cfg,
-            timestep_shift_default=m.cfg.timestep_shift,
+            timestep_shift_default=self._flow.timestep_shift,
         )
         height = int(params.height)
         width = int(params.width)
@@ -1446,10 +1449,10 @@ class BagelForUnifiedGeneration(UniModelBase):
             num_vae=num_vae,
             H=height,
             W=width,
-            schedule=FlowMatchSchedule(
-                num_steps=int(params.steps),
-                shift=float(params.timestep_shift),
-                direction=ScheduleDirection.DESCENDING,
+            schedule=schedule_from_flow_spec(
+                self._flow,
+                num_steps=params.steps,
+                shift=params.timestep_shift,
             ),
             cfg_text_scale=float(params.cfg_text),
             cfg_img_scale=float(params.cfg_img),
@@ -1625,7 +1628,7 @@ class BagelForUnifiedGeneration(UniModelBase):
             cfg_renorm_type=str(gs.cfg_renorm_type),
             cfg_renorm_min=float(gs.cfg_renorm_min),
             cfg_branch_count=flow_cfg_branch_count(op),
-            image_scale_applies_to_text=CfgRecipe.IMAGE_OVER_TEXT,
+            image_scale_applies_to_text=CfgRecipe(self._flow.cfg_recipe),
             extra={"gs": gs, "img": gs.graph_image, "image_embeds": image_embeds},
         )
 

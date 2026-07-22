@@ -17,6 +17,7 @@ from uniserve_worker.contracts.forward_batch import (
     ForwardResult,
 )
 from uniserve_worker.contracts.model_protocols import FlowContext
+from uniserve_worker.contracts.model_spec import FlowSpec
 from uniserve_worker.contracts.outputs import (
     FlowOutput,
 )
@@ -33,11 +34,18 @@ from uniserve_worker.nn.diffusion import (
 from uniserve_worker.runtime.image_params import required_image_height, required_image_width
 from uniserve_worker.runtime.request_state import RequestState
 
-from .flow import PreparedFlowStep, combine_flow_velocity, flow_branches
+from .flow import (
+    PreparedFlowStep,
+    combine_flow_velocity,
+    flow_branches,
+    resolve_flow_spec,
+    schedule_from_flow_spec,
+)
 
 
 def _execute_required_denoise(items: Any, model: Any) -> list[FlowOutput]:
-    return _DiffusionRuntime().step_many(items, model, graph_mode="require")
+    runtime = _DiffusionRuntime(flow=resolve_flow_spec(model))
+    return runtime.step_many(items, model, graph_mode="require")
 
 
 if TYPE_CHECKING:
@@ -104,10 +112,10 @@ class _FlowSession:
 # Flow-step execution (denoise)
 # ---------------------
 
-# Fallback latent geometry for the model-neutral generic path, used only when an
-# op/image descriptor supplies neither an explicit ``latent_shape`` nor the
-# per-field overrides. Production models compute their own latent geometry and
-# never reach this fallback.
+# Fallback latent geometry for the model-neutral generic path, used only when
+# the model declares no FlowSpec and the op/image descriptor supplies neither
+# an explicit ``latent_shape`` nor the per-field overrides. Production models
+# compute their own latent geometry and never reach this fallback.
 _DEFAULT_LATENT_DOWNSAMPLE = 16
 _DEFAULT_LATENT_CHANNELS = 4
 
@@ -116,12 +124,21 @@ class _DiffusionRuntime:
     """Execute one model-neutral flow-matching denoise step."""
 
     def __init__(
-        self, *, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32
+        self,
+        *,
+        flow: FlowSpec | None = None,
+        device: torch.device | str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ) -> None:
+        # ``flow`` is the model's declared FlowSpec, resolved once at executor
+        # composition. It drives schedule direction/shift-domain and prediction
+        # parameterization on the model-neutral generic path; ``None`` means
+        # the model declares no flow semantics (request keys apply).
         # ``device``/``dtype`` take effect only on the model-neutral generic
         # ``FlowContext``/``_latent`` path (see ``_finish_prepared_step``).
         # Production diffusion models return a ``PreparedFlowStep`` and run
         # on their own device/dtype, so these defaults are inert for them.
+        self._flow = flow
         self.device = device
         self.dtype = dtype
 
@@ -315,21 +332,15 @@ class _DiffusionRuntime:
         # Model-neutral generic flow-matching path. It is the contract for models
         # that return a FlowContext (and is exercised by the synthetic
         # velocity-only test model); the production diffusion models instead
-        # return a PreparedFlowStep above and build their own
-        # schedule with model-specific direction/shift-domain defaults. As a
-        # consequence the op-level schedule_direction/schedule_shift/flow_shift
-        # keys read below (and the equivalent DiffusionConfig fields) are INERT
-        # for those production models -- callers must not assume they take effect.
+        # return a PreparedFlowStep above with a spec-driven schedule. On this
+        # path a declared FlowSpec is the schedule authority; the op-level
+        # schedule_direction key applies only to models without one.
         image = dict(state.image or {})
         image.update(op.get("image") or {})
         steps = int(op.get("num_steps") or image.get("steps") or image.get("num_steps") or 50)
         if steps <= 0:
             raise invalid_descriptor("denoise steps must be positive")
-        schedule = FlowMatchSchedule(
-            num_steps=steps,
-            shift=float(image.get("schedule_shift", image.get("flow_shift", 1.0))),
-            direction=ScheduleDirection(str(image.get("schedule_direction", "ascending"))),
-        )
+        schedule = self._generic_schedule(steps, image)
         cursor = int(op.get("timestep_idx", state.schedule_cursor) or 0)
         t, t_next = schedule.pair(cursor, device=self.device, dtype=self.dtype)
         latent = self._latent(state, image, op)
@@ -342,7 +353,7 @@ class _DiffusionRuntime:
                 raise invalid_descriptor(
                     "predict_velocity(ctx, t, latent, branch) must return a tensor"
                 )
-            velocity = _maybe_convert_parameterization(model, velocity, latent, t)
+            velocity = self._to_velocity(velocity, latent, t)
             if velocity.shape != latent.shape:
                 raise invalid_descriptor(
                     f"velocity shape {tuple(velocity.shape)} does not match latent {tuple(latent.shape)}"
@@ -489,11 +500,7 @@ class _DiffusionRuntime:
         steps = int(op.get("num_steps") or image.get("steps") or image.get("num_steps") or 50)
         if steps <= 0:
             raise invalid_descriptor("denoise steps must be positive")
-        schedule = FlowMatchSchedule(
-            num_steps=steps,
-            shift=float(image.get("schedule_shift", image.get("flow_shift", 1.0))),
-            direction=ScheduleDirection(str(image.get("schedule_direction", "ascending"))),
-        )
+        schedule = self._generic_schedule(steps, image)
         cursor = int(op.get("timestep_idx", state.schedule_cursor) or 0)
         t, t_next = schedule.pair(cursor, device=self.device, dtype=self.dtype)
         latent = self._latent(state, image, op)
@@ -508,7 +515,7 @@ class _DiffusionRuntime:
                 raise invalid_descriptor(
                     "predict_velocity(ctx, t, latent, branch) must return a tensor"
                 )
-            velocity = _maybe_convert_parameterization(model, velocity, latent, t)
+            velocity = self._to_velocity(velocity, latent, t)
             if velocity.shape != latent.shape:
                 raise invalid_descriptor(
                     f"velocity shape {tuple(velocity.shape)} does not match latent {tuple(latent.shape)}"
@@ -535,6 +542,42 @@ class _DiffusionRuntime:
         )
         return entry, velocities
 
+    def _generic_schedule(self, num_steps: int, image: Mapping[str, Any]) -> FlowMatchSchedule:
+        """Generic-path schedule: a declared FlowSpec is the authority.
+
+        The shift stays per-request data (``schedule_shift``/``flow_shift``
+        keys), defaulting to the spec's declared ``timestep_shift`` when one
+        exists. Without a FlowSpec, direction also comes from the request.
+        """
+        if self._flow is not None:
+            default_shift = (
+                1.0 if self._flow.timestep_shift is None else float(self._flow.timestep_shift)
+            )
+            return schedule_from_flow_spec(
+                self._flow,
+                num_steps=num_steps,
+                shift=float(image.get("schedule_shift", image.get("flow_shift", default_shift))),
+            )
+        return FlowMatchSchedule(
+            num_steps=num_steps,
+            shift=float(image.get("schedule_shift", image.get("flow_shift", 1.0))),
+            direction=ScheduleDirection(str(image.get("schedule_direction", "ascending"))),
+        )
+
+    def _to_velocity(
+        self,
+        prediction: torch.Tensor,
+        latent: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert a raw prediction to velocity per the declared parameterization."""
+        parameterization = "velocity" if self._flow is None else str(self._flow.prediction)
+        if parameterization == "velocity":
+            return prediction
+        if parameterization == "x_pred":
+            return x_pred_to_velocity(prediction, latent, t)
+        raise invalid_descriptor(f"unsupported FlowSpec.prediction {parameterization!r}")
+
     def _latent(
         self, state: RequestState, image: Mapping[str, Any], op: Mapping[str, Any]
     ) -> torch.Tensor:
@@ -544,9 +587,13 @@ class _DiffusionRuntime:
         if shape is None:
             h = required_image_height(image)
             w = required_image_width(image)
+            default_downsample = (
+                int(self._flow.latent_downsample)
+                if self._flow is not None
+                else _DEFAULT_LATENT_DOWNSAMPLE
+            )
             downsample = int(
-                image.get("latent_downsample", _DEFAULT_LATENT_DOWNSAMPLE)
-                or _DEFAULT_LATENT_DOWNSAMPLE
+                image.get("latent_downsample", default_downsample) or default_downsample
             )
             channels = int(
                 image.get("latent_channels", _DEFAULT_LATENT_CHANNELS) or _DEFAULT_LATENT_CHANNELS
@@ -665,19 +712,3 @@ def _validate_batched_flow_outputs(
     return out
 
 
-def _maybe_convert_parameterization(
-    model: Any,
-    prediction: torch.Tensor,
-    latent: torch.Tensor,
-    t: torch.Tensor,
-) -> torch.Tensor:
-    parameterization = _velocity_parameterization(model)
-    if parameterization == "velocity":
-        return prediction
-    if parameterization == "x_pred":
-        return x_pred_to_velocity(prediction, latent, t)
-    raise invalid_descriptor(f"unsupported velocity_parameterization {parameterization!r}")
-
-
-def _velocity_parameterization(model: Any) -> str:
-    return str(model.velocity_parameterization() or "velocity")

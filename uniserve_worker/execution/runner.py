@@ -99,6 +99,7 @@ from .flow import (
     flow_branches,
     flow_cfg_branch_count,
     flow_cfg_plan,
+    resolve_flow_spec,
 )
 from .operation_executor import OperationExecutor
 from .planning import _TEXT_MODES, _ForwardPlanBuilder, _UnifiedForwardBatchBuilder
@@ -793,7 +794,10 @@ class ModelExecutor:
         self.attention_backend, self.attention_preference = self._resolve_attention_backend(
             dependencies.attention_backend
         )
-        self._diffusion = _DiffusionRuntime()
+        # One FlowSpec per worker: flow schedule/prediction semantics resolve
+        # from the model's declarative spec at composition, not from live
+        # model attributes.
+        self._diffusion = _DiffusionRuntime(flow=resolve_flow_spec(model))
         self._init_text_execution(model, residency)
         self._init_unified_forward_execution(model, residency)
         self.image_input_stage = dependencies.image_input_stage

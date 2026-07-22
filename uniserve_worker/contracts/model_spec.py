@@ -202,19 +202,34 @@ class CacheSpec:
 
 @dataclass(frozen=True)
 class FlowSpec:
-    """Declared flow-matching semantics for latent-generation families."""
+    """Declared flow-matching semantics for latent-generation families.
+
+    ``cfg_recipe`` names how text/image guidance deltas combine
+    (``nn.diffusion.cfg.CfgRecipe`` values). ``timestep_shift`` is the schedule
+    shift applied when the request carries none; ``None`` requires the request
+    to supply one.
+    """
 
     latent_downsample: int
     prediction: str
     schedule_direction: str
     schedule_shift_domain: str
+    cfg_recipe: str = "additive_deltas"
+    timestep_shift: float | None = None
 
     def __post_init__(self) -> None:
         if int(self.latent_downsample) < 1:
             raise invalid_descriptor("FlowSpec.latent_downsample must be at least 1")
-        for field_name in ("prediction", "schedule_direction", "schedule_shift_domain"):
+        for field_name in (
+            "prediction",
+            "schedule_direction",
+            "schedule_shift_domain",
+            "cfg_recipe",
+        ):
             if not getattr(self, field_name):
                 raise invalid_descriptor(f"FlowSpec.{field_name} must not be empty")
+        if self.timestep_shift is not None and float(self.timestep_shift) <= 0:
+            raise invalid_descriptor("FlowSpec.timestep_shift must be positive")
 
 
 @dataclass(frozen=True)
