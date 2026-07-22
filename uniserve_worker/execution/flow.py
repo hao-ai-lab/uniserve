@@ -21,7 +21,12 @@ from uniserve_worker.contracts.forward_context import get_forward_context, use_f
 from uniserve_worker.contracts.model_spec import FlowSpec
 from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
 from uniserve_worker.execution.sequence import SequenceCache
-from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
+from uniserve_worker.foundation.errors import (
+    WorkerError,
+    capability_mismatch,
+    invalid_descriptor,
+    model_execution_error,
+)
 from uniserve_worker.nn.attention import RadixAttention
 from uniserve_worker.nn.diffusion import (
     FlowMatchSchedule,
@@ -29,7 +34,7 @@ from uniserve_worker.nn.diffusion import (
     ScheduleShiftDomain,
     init_latent,
 )
-from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
+from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, RenormKind, build_flow_cfg_plan
 from uniserve_worker.nn.diffusion.cfg import CfgPlan as DiffusionCfgPlan
 from uniserve_worker.nn.vision import patchify_batch, unpatchify_batch
 from uniserve_worker.runtime.image_params import (
@@ -38,8 +43,15 @@ from uniserve_worker.runtime.image_params import (
 from uniserve_worker.runtime.image_params import (
     parse_text_image_generation_params,
 )
-from uniserve_worker.runtime.paged_denoise import can_run_paged_denoise_attention
-from uniserve_worker.runtime.paged_text_cache import BatchedPagedTextCache, PagedTextCache
+from uniserve_worker.runtime.paged_denoise import (
+    PagedDenoiseBranchSet,
+    can_run_paged_denoise_attention,
+)
+from uniserve_worker.runtime.paged_text_cache import (
+    BatchedPagedTextCache,
+    PagedTextCache,
+    copy_paged_text_cache_span,
+)
 
 # ---------------------
 # Flow-step graph runner
@@ -54,8 +66,86 @@ _MAX_GRAPH_ROWS = 6
 
 
 @dataclass(frozen=True)
+class GuidePlan:
+    """Executor-owned CFG branch set and combination relation for one flow step.
+
+    ``branches`` is the exact set of branches to evaluate, in declared stable
+    order. The plan is resolved by executor flow drivers from the declarative
+    ``FlowSpec`` recipe, the per-request guidance parameters, the op-level
+    ``cfg`` descriptor, and the step's timestep; ``combination`` is the
+    internal :class:`~uniserve_worker.nn.diffusion.cfg.CfgPlan` that implements
+    the declared relation.
+    """
+
+    branches: tuple[Branch, ...]
+    recipe: CfgRecipe
+    text_scale: float
+    img_scale: float
+    interval: tuple[float, float]
+    renorm: RenormKind
+    renorm_min: float
+    combination: DiffusionCfgPlan
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        recipe: CfgRecipe | str,
+        text_scale: float,
+        img_scale: float,
+        interval: tuple[float, float],
+        renorm: RenormKind | str,
+        renorm_min: float,
+        t: torch.Tensor | float,
+        branch_count: int | None = None,
+    ) -> "GuidePlan":
+        """Resolve the branch set and combination for one scheduled step.
+
+        ``branch_count`` is the op-level override: ``1`` pins the plan to the
+        conditioned branch regardless of scales; other values leave the
+        recipe-derived branch set authoritative.
+        """
+        resolved_recipe = CfgRecipe.coerce(recipe)
+        renorm_kind = renorm if isinstance(renorm, RenormKind) else RenormKind(str(renorm))
+        lo, hi = float(interval[0]), float(interval[1])
+        if branch_count is not None and int(branch_count) < 1:
+            raise invalid_descriptor("cfg branch_count must be a positive integer")
+        if branch_count == 1:
+            combination = DiffusionCfgPlan(branches=(Branch.COND,))
+        else:
+            t_value = float(t.detach().float().item()) if isinstance(t, torch.Tensor) else float(t)
+            combination = build_flow_cfg_plan(
+                cfg_text_scale=float(text_scale),
+                cfg_img_scale=float(img_scale),
+                recipe=resolved_recipe,
+                renorm=renorm_kind,
+                renorm_min=float(renorm_min),
+                use_cfg=lo <= t_value <= hi,
+            )
+        return cls(
+            branches=combination.branches,
+            recipe=resolved_recipe,
+            text_scale=float(text_scale),
+            img_scale=float(img_scale),
+            interval=(lo, hi),
+            renorm=renorm_kind,
+            renorm_min=float(renorm_min),
+            combination=combination,
+        )
+
+    def combine(self, outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Validate branch completeness, then apply the declared combination."""
+        missing = [str(branch.value) for branch in self.branches if branch not in outputs]
+        if missing:
+            raise model_execution_error(
+                f"denoise result is missing CFG branch predictions {missing}"
+            )
+        return self.combination.combine(outputs)
+
+
+@dataclass(frozen=True)
 class PreparedFlowStep:
-    """Model/runtime boundary for one scheduled denoise update."""
+    """Executor flow-driver state for one scheduled denoise update."""
 
     req_id: int
     state: Any
@@ -65,45 +155,8 @@ class PreparedFlowStep:
     t_next: torch.Tensor
     step_index: int
     total_steps: int
-    cfg_text_scale: float
-    cfg_img_scale: float
-    cfg_interval: tuple[float, float]
-    cfg_renorm_type: str
-    cfg_renorm_min: float
-    cfg_branch_count: int | None = None
-    image_scale_applies_to_text: CfgRecipe = CfgRecipe.ADDITIVE_DELTAS
+    guide: GuidePlan
     extra: Any = None
-
-    def __post_init__(self) -> None:
-        recipe = CfgRecipe.coerce(self.image_scale_applies_to_text)
-        if recipe is not self.image_scale_applies_to_text:
-            object.__setattr__(self, "image_scale_applies_to_text", recipe)
-        if self.cfg_branch_count is not None:
-            branch_count = int(self.cfg_branch_count)
-            if branch_count < 1:
-                raise ValueError("cfg_branch_count must be >= 1")
-            object.__setattr__(self, "cfg_branch_count", branch_count)
-
-
-def flow_cfg_plan(step: PreparedFlowStep) -> DiffusionCfgPlan:
-    """Resolve the branches and weights for one prepared denoise step."""
-
-    if step.cfg_branch_count == 1:
-        return DiffusionCfgPlan(branches=(Branch.COND,))
-    t_value = float(step.t.detach().float().item())
-    lo, hi = step.cfg_interval
-    return build_flow_cfg_plan(
-        cfg_text_scale=step.cfg_text_scale,
-        cfg_img_scale=step.cfg_img_scale,
-        recipe=step.image_scale_applies_to_text,
-        renorm=step.cfg_renorm_type,
-        renorm_min=step.cfg_renorm_min,
-        use_cfg=lo <= t_value <= hi,
-    )
-
-
-def flow_branches(step: PreparedFlowStep) -> tuple[str, ...]:
-    return flow_cfg_plan(step).branches
 
 
 def flow_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
@@ -117,13 +170,6 @@ def flow_cfg_branch_count(op: Mapping[str, Any]) -> int | None:
     if branch_count < 1:
         raise invalid_descriptor("cfg.branch_count must be a positive integer")
     return branch_count
-
-
-def combine_flow_velocity(
-    step: PreparedFlowStep,
-    outputs: Mapping[str, torch.Tensor],
-) -> torch.Tensor:
-    return flow_cfg_plan(step).combine(outputs)
 
 
 def resolve_flow_spec(model: Any) -> FlowSpec | None:
@@ -1329,13 +1375,16 @@ class FlowExecution:
             t_next=t_next,
             step_index=step_i,
             total_steps=total,
-            cfg_text_scale=img.cfg_text_scale,
-            cfg_img_scale=img.cfg_img_scale,
-            cfg_interval=img.cfg_interval,
-            cfg_renorm_type=img.cfg_norm,
-            cfg_renorm_min=img.cfg_renorm_min,
-            cfg_branch_count=flow_cfg_branch_count(op),
-            image_scale_applies_to_text=self.cfg_recipe,
+            guide=GuidePlan.resolve(
+                recipe=self.cfg_recipe,
+                text_scale=img.cfg_text_scale,
+                img_scale=img.cfg_img_scale,
+                interval=img.cfg_interval,
+                renorm=img.cfg_norm,
+                renorm_min=img.cfg_renorm_min,
+                t=t,
+                branch_count=flow_cfg_branch_count(op),
+            ),
             extra={
                 "img": img,
                 "image_embeds": image_embeds,
@@ -1350,7 +1399,7 @@ class FlowExecution:
         return_hidden: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         img = step.extra["img"]
-        indexes, cache = self._denoise_branch_inputs(img, branch)
+        indexes, cache = self.branch_inputs(img, branch)
         return self._predict_v(
             img,
             step.extra["image_embeds"],
@@ -1378,7 +1427,7 @@ class FlowExecution:
         for step_index, (step, branches) in enumerate(zip(steps, branches_by_step)):
             img = step.extra["img"]
             for branch in branches:
-                indexes, cache = self._denoise_branch_inputs(img, branch)
+                indexes, cache = self.branch_inputs(img, branch)
                 if not isinstance(cache, PagedTextCache):
                     if graph_mode == "require":
                         return None
@@ -1423,7 +1472,7 @@ class FlowExecution:
                 return None
         return results
 
-    def _denoise_branch_inputs(self, img: FlowState, branch: str) -> tuple[torch.Tensor, Any]:
+    def branch_inputs(self, img: FlowState, branch: str) -> tuple[torch.Tensor, Any]:
         # ``Branch`` is a ``str`` Enum, so this mapping resolves both ``Branch``
         # members and the equivalent bare strings ("cond"/"text_uncond"/
         # "img_uncond") to the same entry.
@@ -1550,3 +1599,538 @@ class FlowExecution:
             image_size=(img.width, img.height),
             return_hidden=return_hidden,
         )
+
+
+# ---------------------
+# Paged gen-segment flow driver
+# ---------------------
+
+# Marker tokens framing one paged gen segment: one start-of-image and one
+# end-of-image token around the latent span.
+_GEN_SEGMENT_MARKER_TOKENS = 2
+
+
+@dataclass(slots=True)
+class GenState:
+    """Mutable image-generation state for one paged gen denoise/commit cycle.
+
+    The latent trajectory ``x_t`` is not stored on the driver state — it lives
+    in the system-owned :class:`~uniserve_worker.runtime.residency.LatentStore`
+    as a leased buffer addressed by ``latent_handle``. ``x_t`` here is a
+    property reading/writing that system buffer; an accepted denoise update
+    replaces the buffer entry, so a failed step's rollback restores the prior
+    committed latent tensor.
+    """
+
+    latent_pool: Any  # system LatentStore (residency.latent)
+    latent_handle: int  # request-scoped handle into the LatentStore
+    vae_pos_ids: torch.Tensor
+    num_vae: int
+    H: int
+    W: int
+    schedule: FlowMatchSchedule
+    cfg_text_scale: float
+    cfg_img_scale: float
+    cfg_renorm_type: str
+    cfg_renorm_min: float
+    cfg_interval: tuple[float, float]
+    cond_pos: int
+    cond_branch_kvlen: int = 0
+    cfg_pos: int = 0
+    paged_branches: PagedDenoiseBranchSet | None = None
+    graph_image: "_PagedGenGraphImage | None" = None
+
+    @property
+    def x_t(self) -> torch.Tensor:
+        return self.latent_pool.get(self.latent_handle)
+
+    @x_t.setter
+    def x_t(self, value: torch.Tensor) -> None:
+        self.latent_pool.set(self.latent_handle, value)
+
+
+@dataclass(slots=True)
+class _PagedGenGraphImage:
+    token_h: int
+    token_w: int
+    height: int
+    width: int
+    cond_cache: PagedTextCache | None = None
+    tu_cache: PagedTextCache | None = None
+    iu_cache: PagedTextCache | None = None
+    indexes: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+class GenFlowAdapter(Protocol):
+    """Family boundary required by the paged gen-segment flow driver.
+
+    The driver owns generation-state setup, CFG branch staging, batching, and
+    latent updates; the adapter supplies neural computation and declared
+    residency collaborators.
+    """
+
+    device: Any
+    residency: Any  # ResidencyManager; .latent backs GenState.x_t
+    kv_pool: Any  # request KV pool holding the committed cond prefix
+    scratch_pool: Any  # paged scratch KV pool staging the CFG branches
+    num_layers: int
+    attention_backend: str
+
+    def gen_latent_layout(self, height: int, width: int) -> tuple[int, torch.Tensor, int]:
+        """``(num_vae, vae_pos_ids, latent_dim)`` for one generated image."""
+        ...
+
+    def gen_segment_embeds(
+        self,
+        num_vae: int,
+        vae_pos_ids: torch.Tensor,
+        latent: torch.Tensor,
+        timestep: float,
+    ) -> torch.Tensor: ...
+    def gen_segment_graph_layout(
+        self,
+        batch_size: int,
+        num_vae: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+    def prefill_text_branch(self, token_ids: Sequence[int], cache: Any) -> None: ...
+    def flow_predict_velocity(
+        self,
+        image_embeds: torch.Tensor,
+        indexes: torch.Tensor,
+        attention_mask: Any,
+        cache: Any,
+        t: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        image_token_num: int,
+        image_size: tuple[int, int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class PagedGenFlowExecution:
+    """Drive paged gen-segment denoise: setup, branch staging, batching, updates.
+
+    Each denoise step runs the active CFG branches as rows of one gen-expert
+    forward over shared batched paged caches, replayed through the executor's
+    flow CUDA graph. The adapter supplies only neural computation; generation
+    state lives in the executor's transactional latent view.
+    """
+
+    def __init__(self, adapter: GenFlowAdapter, *, flow: FlowSpec) -> None:
+        self.adapter = adapter
+        self.flow = flow
+        self.cfg_recipe = CfgRecipe(flow.cfg_recipe)
+
+    # -- executor-view state access ------------------------------------------------
+
+    @staticmethod
+    def _request_state(req_id: int) -> Any:
+        request_states = get_forward_context().request_states
+        if request_states is None:
+            raise invalid_descriptor("gen flow state requires an executor-bound forward")
+        return request_states.get(int(req_id))
+
+    @staticmethod
+    def _record(req_id: int) -> Any:
+        product_view = get_forward_context().product_view
+        if product_view is None:
+            raise invalid_descriptor("gen flow metadata requires an executor product view")
+        return product_view.record(int(req_id))
+
+    @staticmethod
+    def _gen_state(req_id: int) -> GenState | None:
+        latent_view = get_forward_context().latent_view
+        if latent_view is None:
+            raise invalid_descriptor("gen flow state requires an executor latent view")
+        return latent_view.state(int(req_id))
+
+    @staticmethod
+    def _set_gen_state(req_id: int, value: GenState) -> None:
+        latent_view = get_forward_context().latent_view
+        if latent_view is None:
+            raise invalid_descriptor("gen flow state requires an executor latent view")
+        latent_view.set_state(int(req_id), value)
+
+    # -- generation setup ------------------------------------------------------------
+
+    def _init_generation_noise(
+        self,
+        shape: tuple[int, ...] | list[int],
+        *,
+        seed: int | None,
+    ) -> torch.Tensor:
+        """Sample the request-private CPU-FP32 initial-noise stream."""
+        effective_seed = int(seed if seed is not None else 0)
+        return init_latent(
+            shape,
+            rng=torch.Generator(device="cpu").manual_seed(effective_seed),
+            device=self.adapter.device,
+            dtype=torch.float32,
+            source_device="cpu",
+            source_dtype=torch.float32,
+        )
+
+    def _init_gen(self, op: dict) -> None:
+        req_id = int(op["req_id"])
+        state = self._request_state(req_id)
+        rec = self._record(req_id)
+        ip = rec.image or {}
+        cfg = op.get("cfg") if isinstance(op.get("cfg"), dict) else {}
+        cond_pos = int(op["cond_pos"])
+        dims = rec.dimensions
+        parse_ip = dict(ip)
+        if dims is not None:
+            parse_ip["height"] = int(dims[0])
+            parse_ip["width"] = int(dims[1])
+        params = parse_text_image_generation_params(
+            parse_ip,
+            cfg=cfg,
+            timestep_shift_default=self.flow.timestep_shift,
+        )
+        height = int(params.height)
+        width = int(params.width)
+        num_vae, vae_pos_ids, latent_dim = self.adapter.gen_latent_layout(height, width)
+        x_t = self._init_generation_noise(
+            (int(num_vae), int(latent_dim)),
+            seed=params.seed if params.seed is not None else state.seed,
+        )
+        if rec.context_image_feedback:
+            raise capability_mismatch(
+                "context-image generation has no graph-ready CFG branch layout"
+            )
+        gs = GenState(
+            latent_pool=self.adapter.residency.latent,
+            latent_handle=req_id,
+            vae_pos_ids=vae_pos_ids,
+            num_vae=int(num_vae),
+            H=height,
+            W=width,
+            schedule=schedule_from_flow_spec(
+                self.flow,
+                num_steps=params.steps,
+                shift=params.timestep_shift,
+            ),
+            cfg_text_scale=float(params.cfg_text),
+            cfg_img_scale=float(params.cfg_img),
+            cfg_renorm_type=str(params.cfg_norm),
+            cfg_renorm_min=float(params.cfg_renorm_min),
+            cfg_interval=(float(params.cfg_interval[0]), float(params.cfg_interval[1])),
+            cond_pos=cond_pos,
+            cond_branch_kvlen=cond_pos,
+        )
+        gs.x_t = x_t  # store the initial noise into the system LatentStore
+        neg = list(rec.neg_token_ids or [])
+        gs.cfg_pos = len(neg) if (gs.cfg_text_scale > 1.0 and neg) else 0
+        self._init_paged_denoise_branches(op, gs, neg)
+        self._set_gen_state(req_id, gs)
+
+    def _init_paged_denoise_branches(self, op: dict, gs: GenState, neg: list[int]) -> None:
+        """Stage the t2i CFG branch prefixes into scratch-paged caches.
+
+        The batched denoise path runs all active branches as rows of ONE
+        gen-expert forward over a shared batched paged cache, which requires
+        every row — the cond prefix included — to live in one KV pool, with
+        each step's transient gen rows written past the row's fixed prefix.
+        The request pool satisfies neither constraint (the neg branch cannot
+        share it, and pure-t2i requests carry no host-allocated capacity for
+        the transient gen span), so the cond prefix KV ``[0, cond_kvlen)`` is
+        copied once per image into the scratch pool. The neg-prompt
+        (text-uncond) branch prefills directly into scratch through the
+        adapter's paged text forward.
+
+        Graph serving requires the branch caches to share one paged scratch
+        pool. Missing capacity or backend support is a capability error.
+        """
+        adapter = self.adapter
+        scratch_pool = adapter.scratch_pool
+        if scratch_pool is None:
+            raise capability_mismatch("paged gen denoise requires a scratch KV pool")
+        allocate_blocks = adapter.residency.allocator_for_pool(scratch_pool)
+        if not callable(allocate_blocks):
+            raise capability_mismatch("paged gen denoise scratch KV allocation is unavailable")
+        num_layers = int(adapter.num_layers)
+        total_gen = int(gs.num_vae) + _GEN_SEGMENT_MARKER_TOKENS
+        cond_len = int(gs.cond_branch_kvlen)
+        caches: dict[str, PagedTextCache] = {}
+        positions: dict[str, int] = {}
+        try:
+            cond_cache = PagedTextCache(
+                scratch_pool,
+                [],
+                num_layers=num_layers,
+                allocate_blocks=allocate_blocks,
+            )
+            caches["cond"] = cond_cache
+            if not can_run_paged_denoise_attention(
+                cond_cache,
+                prototype=scratch_pool.k,
+                query_width=int(scratch_pool.head_dim),
+                query_tokens=total_gen,
+                batch_size=1,
+                attention_backend=adapter.attention_backend,
+            ):
+                raise capability_mismatch(
+                    "paged gen denoise attention backend does not support the graph row geometry"
+                )
+            cond_cache.ensure_capacity(cond_len + total_gen)
+            if cond_len:
+                request_pool = adapter.kv_pool
+                if request_pool is None:
+                    raise capability_mismatch(
+                        "paged gen denoise requires the request KV pool for the cond prefix"
+                    )
+                state = self._request_state(int(op["req_id"]))
+                copy_paged_text_cache_span(
+                    PagedTextCache(
+                        request_pool,
+                        state.block_ids,
+                        num_layers=num_layers,
+                        length=cond_len,
+                    ),
+                    cond_cache,
+                    start=0,
+                    length=cond_len,
+                    num_layers=num_layers,
+                )
+            cond_cache.length = cond_len
+            positions["cond"] = int(gs.cond_pos)
+            if gs.cfg_img_scale > 1.0:
+                caches["img_uncond"] = cond_cache
+                positions["img_uncond"] = int(gs.cond_pos)
+            if gs.cfg_text_scale > 1.0:
+                tu_cache = PagedTextCache(
+                    scratch_pool,
+                    [],
+                    num_layers=num_layers,
+                    allocate_blocks=allocate_blocks,
+                )
+                caches["text_uncond"] = tu_cache
+                tu_cache.ensure_capacity(len(neg) + total_gen)
+                if neg:
+                    adapter.prefill_text_branch(neg, tu_cache)
+                positions["text_uncond"] = int(gs.cfg_pos)
+        except Exception as exc:
+            released: set[int] = set()
+            for cache in caches.values():
+                if id(cache) in released:
+                    continue
+                released.add(id(cache))
+                adapter.residency.release_scratch_cache(cache)
+            if isinstance(exc, WorkerError):
+                raise
+            raise capability_mismatch("paged gen denoise branch staging failed") from exc
+        gs.paged_branches = PagedDenoiseBranchSet(caches=caches, positions=positions)
+        gs.graph_image = _PagedGenGraphImage(
+            token_h=1,
+            token_w=int(gs.num_vae) + _GEN_SEGMENT_MARKER_TOKENS,
+            height=int(gs.H),
+            width=int(gs.W),
+            cond_cache=caches.get("cond"),
+            tu_cache=caches.get("text_uncond"),
+            iu_cache=caches.get("img_uncond"),
+            indexes={
+                name: torch.stack(
+                    (
+                        torch.full(
+                            (total_gen,),
+                            int(positions[name]),
+                            dtype=torch.long,
+                            device=adapter.device,
+                        ),
+                        torch.zeros(total_gen, dtype=torch.long, device=adapter.device),
+                        torch.zeros(total_gen, dtype=torch.long, device=adapter.device),
+                    ),
+                    dim=0,
+                )
+                for name in caches
+            },
+        )
+
+    # -- step preparation / prediction / update -------------------------------------
+
+    def prepare_flow_step(self, req_id: int, state: Any, op: dict) -> PreparedFlowStep:
+        r = int(req_id)
+        self._request_state(r).append_new_block_ids(op.get("new_block_ids"))
+        if int(op.get("timestep_idx") or 0) == 0 and self._gen_state(r) is None:
+            self._init_gen(op)
+        gs = self._gen_state(r)
+        if gs is None:
+            raise invalid_descriptor("denoise generation state is not initialized")
+        i = int(op.get("timestep_idx") or 0)
+        t, t_next = gs.schedule.pair(i, device=self.adapter.device, dtype=torch.float32)
+        total_steps = int(gs.schedule.num_steps)
+        if gs.paged_branches is None or gs.graph_image is None:
+            raise capability_mismatch("paged gen denoise requires graph-ready branch caches")
+        image_embeds = self.adapter.gen_segment_embeds(
+            int(gs.num_vae),
+            gs.vae_pos_ids,
+            gs.x_t,
+            float(t.detach().float().item()),
+        ).unsqueeze(0)
+        return PreparedFlowStep(
+            req_id=r,
+            state=state,
+            op=op,
+            latent=gs.x_t,
+            t=t,
+            t_next=t_next,
+            step_index=i,
+            total_steps=total_steps,
+            guide=GuidePlan.resolve(
+                recipe=self.cfg_recipe,
+                text_scale=float(gs.cfg_text_scale),
+                img_scale=float(gs.cfg_img_scale),
+                interval=(float(gs.cfg_interval[0]), float(gs.cfg_interval[1])),
+                renorm=str(gs.cfg_renorm_type),
+                renorm_min=float(gs.cfg_renorm_min),
+                t=t,
+                branch_count=flow_cfg_branch_count(op),
+            ),
+            extra={"gs": gs, "img": gs.graph_image, "image_embeds": image_embeds},
+        )
+
+    def branch_inputs(
+        self,
+        image: _PagedGenGraphImage,
+        branch: Any,
+    ) -> tuple[torch.Tensor, PagedTextCache]:
+        name = str(getattr(branch, "value", branch))
+        cache_by_name = {
+            "cond": image.cond_cache,
+            "text_uncond": image.tu_cache,
+            "img_uncond": image.iu_cache,
+        }
+        cache = cache_by_name.get(name)
+        indexes = image.indexes.get(name)
+        if cache is None or indexes is None:
+            raise invalid_descriptor(f"paged gen denoise branch {name!r} is not initialized")
+        return indexes, cache
+
+    def predict_flow_velocity_batch(
+        self,
+        steps: Sequence[PreparedFlowStep],
+        branches_by_step: Sequence[Sequence[str]],
+        *,
+        graph_mode: str = "auto",
+    ) -> list[dict[str, torch.Tensor]] | None:
+        """Execute compatible request and CFG rows through CUDA graphs."""
+        if graph_mode == "eager":
+            raise capability_mismatch("paged gen denoise execution requires CUDA graphs")
+        graphed = self._predict_flow_velocity_graph(steps, branches_by_step)
+        if graphed is None and graph_mode == "require":
+            return None
+        if graphed is None:
+            raise capability_mismatch("paged gen denoise CUDA graph did not cover the batch")
+        return graphed
+
+    def _predict_flow_velocity_graph(
+        self,
+        steps: Sequence[PreparedFlowStep],
+        branches_by_step: Sequence[Sequence[str]],
+    ) -> list[dict[str, torch.Tensor]] | None:
+        adapter = self.adapter
+        results: list[dict[str, torch.Tensor]] = [dict() for _ in steps]
+        groups: dict[tuple[Any, ...], list[tuple[int, str, FlowRow]]] = {}
+        for step_index, (step, branches) in enumerate(zip(steps, branches_by_step, strict=True)):
+            gs = step.extra["gs"]
+            paged_branches = gs.paged_branches
+            graph_image = getattr(gs, "graph_image", None)
+            names = tuple(str(getattr(branch, "value", branch)) for branch in branches)
+            if paged_branches is None or graph_image is None or not paged_branches.has_all(names):
+                return None
+            total = int(gs.num_vae) + _GEN_SEGMENT_MARKER_TOKENS
+            embeds = adapter.gen_segment_embeds(
+                int(gs.num_vae),
+                gs.vae_pos_ids,
+                step.latent,
+                float(step.t.detach().float().item()),
+            )
+            positions = paged_branches.positions_tensor(
+                names,
+                device=adapter.device,
+                width=total,
+            )
+            step.extra["image_embeds"] = embeds.unsqueeze(0)
+            step.extra["img"] = graph_image
+            first_cache = paged_branches.caches[names[0]]
+            signature = (
+                id(first_cache.pool),
+                tuple(int(dim) for dim in embeds.shape),
+                str(embeds.device),
+                str(embeds.dtype),
+                tuple(int(dim) for dim in step.latent.shape),
+                str(step.latent.device),
+                str(step.latent.dtype),
+                tuple(int(dim) for dim in positions.shape[1:]),
+                str(positions.dtype),
+            )
+            group = groups.setdefault(signature, [])
+            for branch_index, name in enumerate(names):
+                group.append(
+                    (
+                        step_index,
+                        name,
+                        FlowRow(
+                            step_index=step_index,
+                            step=step,
+                            branch=name,
+                            img=graph_image,
+                            indexes=positions[branch_index],
+                            cache=paged_branches.caches[name],
+                        ),
+                    )
+                )
+
+        for group in groups.values():
+            rows = [entry[2] for entry in group]
+            group_num_vae = int(rows[0].img.token_w) - _GEN_SEGMENT_MARKER_TOKENS
+            adapter.gen_segment_graph_layout(len(rows), group_num_vae)
+            velocity = run_flow_graph(adapter, rows)
+            if not isinstance(velocity, torch.Tensor):
+                return None
+            if int(velocity.shape[0]) != len(group):
+                raise invalid_descriptor("paged gen denoise graph rows must align with CFG rows")
+            for row_index, (step_index, name, _row) in enumerate(group):
+                results[step_index][name] = velocity[row_index]
+        return results
+
+    def predict_flow_velocity(self, step: PreparedFlowStep, branch: str) -> torch.Tensor:
+        result = self.predict_flow_velocity_batch(
+            [step],
+            [(branch,)],
+            graph_mode="require",
+        )
+        if result is None:
+            raise capability_mismatch("paged gen denoise CUDA graph did not cover the branch")
+        return result[0][branch]
+
+    def apply_flow_update(self, step: PreparedFlowStep, latent: torch.Tensor) -> None:
+        gs = step.extra["gs"]
+        gs.x_t = latent.to(dtype=gs.x_t.dtype, device=gs.x_t.device)
+
+
+def build_flow_execution(adapter: Any) -> "FlowExecution | PagedGenFlowExecution | None":
+    """Compose the executor-owned family flow driver over the declared adapter.
+
+    The adapter surface selects the driver: a paged gen-segment surface
+    (``gen_segment_embeds``) takes the paged gen driver; a staged text-KV
+    denoise surface (``flow_timestep_embeddings``) takes :class:`FlowExecution`
+    with the family's tower transfer session when one is declared. Adapters
+    without a declared ``FlowSpec`` or flow surface have no family driver and
+    run on the executor's generic flow path.
+    """
+    if not callable(getattr(adapter, "model_spec", None)):
+        return None
+    flow = resolve_flow_spec(adapter)
+    if flow is None:
+        return None
+    if callable(getattr(adapter, "gen_segment_embeds", None)):
+        return PagedGenFlowExecution(adapter, flow=flow)
+    if callable(getattr(adapter, "flow_timestep_embeddings", None)):
+        return FlowExecution(
+            adapter,
+            flow=flow,
+            transfer=getattr(adapter, "tower_session", None),
+        )
+    return None

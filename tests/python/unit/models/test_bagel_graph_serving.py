@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
+from uniserve_worker.execution.flow import PagedGenFlowExecution, build_flow_execution
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.models.bagel import BagelForUnifiedGeneration, LLMConfig
 from uniserve_worker.nn.decoder import Modality, MoTModel
@@ -13,12 +14,13 @@ from uniserve_worker.runtime.graph_store import GraphStore
 pytestmark = pytest.mark.unit
 
 
-def test_bagel_denoise_rejects_eager_execution(monkeypatch):
+def test_bagel_denoise_rejects_eager_execution():
     owner = BagelForUnifiedGeneration(device="cpu")
-    monkeypatch.setattr(owner, "_ensure_loaded", lambda: object())
+    driver = build_flow_execution(owner)
+    assert isinstance(driver, PagedGenFlowExecution)
 
     with pytest.raises(WorkerError, match="requires CUDA graphs"):
-        owner.predict_flow_velocity_batch([], [], graph_mode="eager")
+        driver.predict_flow_velocity_batch([], [], graph_mode="eager")
 
 
 def test_bagel_mot_packed_visible_routes_marker_tokens_through_text_expert():
@@ -173,7 +175,7 @@ def test_bagel_graph_only_text_hook_syncs_rope_position_from_pos_range():
     assert state.cond.t_index == 10
 
 
-def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
+def test_gen_flow_denoise_require_mode_uses_shared_graph_rows():
     cache_a = SimpleNamespace(pool=object())
     cache_b = SimpleNamespace(pool=cache_a.pool)
 
@@ -202,7 +204,9 @@ def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
         t=torch.tensor(0.5),
     )
 
-    class Model:
+    class Adapter:
+        device = "cpu"
+
         def gen_segment_embeds(self, num_vae, vae_pos_ids, latent, timestep):
             assert num_vae == 2
             assert vae_pos_ids is gs.vae_pos_ids
@@ -215,13 +219,6 @@ def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
             assert (batch_size, num_vae) == (2, 2)
             return torch.tensor([False, True, True, False]), torch.tensor([0, 3, 4, 7])
 
-    class Owner:
-        device = "cpu"
-        _predict_flow_velocity_graph = BagelForUnifiedGeneration._predict_flow_velocity_graph
-
-        def _ensure_loaded(self):
-            return SimpleNamespace(model=Model())
-
     captured = []
 
     def graph_forward(owner, rows, *, return_hidden=False):
@@ -229,11 +226,21 @@ def test_bagel_denoise_require_mode_uses_shared_graph_rows(monkeypatch):
         captured.append((owner, rows))
         return torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])
 
-    owner = Owner()
+    from uniserve_worker.contracts.model_spec import FlowSpec
+
+    driver = PagedGenFlowExecution(
+        Adapter(),
+        flow=FlowSpec(
+            latent_downsample=16,
+            prediction="velocity",
+            schedule_direction="descending",
+            schedule_shift_domain="time",
+            cfg_recipe="image_over_text",
+        ),
+    )
     graph_view = GraphStore(flow=SimpleNamespace(maybe_run_rows=graph_forward)).view()
     with use_forward_context(ForwardContext(graph_view=graph_view)):
-        result = BagelForUnifiedGeneration.predict_flow_velocity_batch(
-            owner,
+        result = driver.predict_flow_velocity_batch(
             [step],
             [("cond", "text_uncond")],
             graph_mode="require",

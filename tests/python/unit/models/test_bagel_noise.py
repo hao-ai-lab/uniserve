@@ -4,19 +4,33 @@ import pytest
 import torch
 import torch.nn as nn
 
-from uniserve_worker.execution.flow import PreparedFlowStep
-from uniserve_worker.models.bagel import (
-    BagelConfig,
-    BagelForUnifiedGeneration,
+from uniserve_worker.contracts.model_spec import FlowSpec
+from uniserve_worker.execution.flow import (
     GenState,
-    _BagelGraph,
+    GuidePlan,
+    PagedGenFlowExecution,
+    PreparedFlowStep,
 )
+from uniserve_worker.models.bagel import _BagelGraph
 from uniserve_worker.nn.diffusion import FlowMatchSchedule, ScheduleDirection, euler_step
 from uniserve_worker.nn.diffusion.noise import init_latent
 from uniserve_worker.runtime.request_state import RequestState
 from uniserve_worker.runtime.residency import LatentStore
 
 pytestmark = pytest.mark.unit
+
+
+def _gen_flow_driver(device: str = "cpu") -> PagedGenFlowExecution:
+    return PagedGenFlowExecution(
+        SimpleNamespace(device=device),
+        flow=FlowSpec(
+            latent_downsample=16,
+            prediction="velocity",
+            schedule_direction="descending",
+            schedule_shift_domain="time",
+            cfg_recipe="image_over_text",
+        ),
+    )
 
 
 def test_latent_noise_can_sample_cpu_float32_before_output_cast():
@@ -85,13 +99,13 @@ def test_latent_noise_default_samples_directly_in_output_format():
     assert torch.equal(actual, expected)
 
 
-def test_bagel_initial_noise_keeps_exact_cpu_float32_values():
-    owner = BagelForUnifiedGeneration(config=BagelConfig(), device="cpu")
+def test_gen_flow_initial_noise_keeps_exact_cpu_float32_values():
+    driver = _gen_flow_driver("cpu")
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(0)
         expected = torch.randn((6, 64), device="cpu", dtype=torch.float32)
 
-    actual = owner._init_generation_noise((6, 64), seed=0)
+    actual = driver._init_generation_noise((6, 64), seed=0)
 
     assert actual.dtype == torch.float32
     assert torch.equal(actual, expected)
@@ -107,9 +121,9 @@ def test_bagel_initial_noise_keeps_exact_cpu_float32_values():
         ),
     ],
 )
-def test_bagel_flow_update_keeps_fp32_state_and_matches_reference_arithmetic(device):
-    owner = BagelForUnifiedGeneration(config=BagelConfig(), device=device)
-    latent = owner._init_generation_noise((2, 3), seed=7)
+def test_gen_flow_update_keeps_fp32_state_and_matches_reference_arithmetic(device):
+    driver = _gen_flow_driver(device)
+    latent = driver._init_generation_noise((2, 3), seed=7)
     velocity = torch.tensor(
         [[0.125, -0.25, 0.5], [-0.75, 1.0, -1.25]],
         dtype=torch.bfloat16,
@@ -147,16 +161,20 @@ def test_bagel_flow_update_keeps_fp32_state_and_matches_reference_arithmetic(dev
         t_next=t_next,
         step_index=0,
         total_steps=1,
-        cfg_text_scale=1.0,
-        cfg_img_scale=1.0,
-        cfg_interval=(0.4, 1.0),
-        cfg_renorm_type="global",
-        cfg_renorm_min=0.0,
+        guide=GuidePlan.resolve(
+            recipe="image_over_text",
+            text_scale=1.0,
+            img_scale=1.0,
+            interval=(0.4, 1.0),
+            renorm="global",
+            renorm_min=0.0,
+            t=t,
+        ),
         extra={"gs": generation_state},
     )
 
     updated = euler_step(generation_state.x_t, velocity, t, t_next)
-    owner.apply_flow_update(step, updated)
+    driver.apply_flow_update(step, updated)
 
     assert generation_state.x_t.dtype == torch.float32
     assert torch.equal(generation_state.x_t, expected)

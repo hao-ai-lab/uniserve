@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -36,76 +35,18 @@ from uniserve_worker.runtime.request_state import RequestState
 
 from .flow import (
     PreparedFlowStep,
-    combine_flow_velocity,
-    flow_branches,
     resolve_flow_spec,
     schedule_from_flow_spec,
 )
 
 
-def _execute_required_denoise(items: Any, model: Any) -> list[FlowOutput]:
-    runtime = _DiffusionRuntime(flow=resolve_flow_spec(model))
+def _execute_required_denoise(items: Any, model: Any, flow_execution: Any) -> list[FlowOutput]:
+    runtime = _DiffusionRuntime(flow=resolve_flow_spec(model), flow_execution=flow_execution)
     return runtime.step_many(items, model, graph_mode="require")
 
 
 if TYPE_CHECKING:
     from uniserve_worker.contracts.model_protocols import UniModel
-
-
-# Decode token/position relays (device-resident sequence feedback)
-# ---------------------
-# Flow-step session (single denoise update)
-# ---------------------
-
-
-class _FlowSession:
-    """Owns branch prediction and latent update semantics for one denoise step."""
-
-    def __init__(
-        self,
-        model: Any,
-        step: Any,
-        *,
-        combine_velocity: Callable[[Any, Mapping[str, torch.Tensor]], torch.Tensor],
-        accept_update: Callable[[Any, Any, torch.Tensor], None],
-    ) -> None:
-        self.model = model
-        self.step = step
-        self._combine_velocity = combine_velocity
-        self._accept_update = accept_update
-
-    def prepare_step(self, op: Mapping[str, Any] | None = None) -> Any:
-        del op
-        return self.step
-
-    def predict_velocity(self, branch: str) -> torch.Tensor:
-        velocity = self.model.predict_velocity(
-            self.step,
-            self.step.t,
-            self.step.latent,
-            branch,
-        )
-        if not isinstance(velocity, torch.Tensor) or velocity.shape != self.step.latent.shape:
-            raise invalid_descriptor(
-                f"{branch} velocity must be a tensor matching the denoise latent"
-            )
-        return velocity
-
-    def apply_update(self, velocities: Mapping[str, torch.Tensor]) -> FlowOutput:
-        velocity = self._combine_velocity(self.step, velocities)
-        updated = euler_step(self.step.latent, velocity, self.step.t, self.step.t_next)
-        self._accept_update(self.model, self.step, updated)
-        done = self.step.step_index + 1 >= self.step.total_steps
-        return FlowOutput(
-            req_id=self.step.req_id,
-            denoise_done=done,
-            num_steps_done=self.step.step_index + 1,
-        )
-
-    def release(self) -> None:
-        release = getattr(self.step, "release", None)
-        if callable(release):
-            release()
 
 
 # ---------------------
@@ -127,6 +68,7 @@ class _DiffusionRuntime:
         self,
         *,
         flow: FlowSpec | None = None,
+        flow_execution: Any | None = None,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -134,11 +76,16 @@ class _DiffusionRuntime:
         # composition. It drives schedule direction/shift-domain and prediction
         # parameterization on the model-neutral generic path; ``None`` means
         # the model declares no flow semantics (request keys apply).
+        # ``flow_execution`` is the executor-owned family flow driver composed
+        # over the model's declared adapter surface; when present, every step
+        # is prepared, predicted, and updated through it. Without one, the
+        # runtime drives the model-neutral generic path over the model's raw
+        # ``predict_velocity`` neural entry.
         # ``device``/``dtype`` take effect only on the model-neutral generic
-        # ``FlowContext``/``_latent`` path (see ``_finish_prepared_step``).
-        # Production diffusion models return a ``PreparedFlowStep`` and run
-        # on their own device/dtype, so these defaults are inert for them.
+        # ``FlowContext``/``_latent`` path (see ``_finish_prepared_step``);
+        # family drivers run on their own device/dtype.
         self._flow = flow
+        self._flow_execution = flow_execution
         self.device = device
         self.dtype = dtype
 
@@ -311,13 +258,10 @@ class _DiffusionRuntime:
         model: "UniModel",
         op: Mapping[str, Any],
     ) -> FlowContext | PreparedFlowStep:
-        del req_id
-        prepared = _prepare_flow(model, state, op)
-        if isinstance(prepared, PreparedFlowStep):
-            return prepared
-        if not isinstance(prepared, FlowContext):
-            raise invalid_descriptor("prepare_flow(state, op) must return FlowContext")
-        return prepared
+        del model
+        if self._flow_execution is not None:
+            return self._flow_execution.prepare_flow_step(int(req_id), state, dict(op))
+        return FlowContext(state=state, op=op)
 
     def _finish_prepared_step(
         self,
@@ -361,9 +305,13 @@ class _DiffusionRuntime:
             velocities.append(velocity)
         velocity = combine_cfg(velocities, cfg)
         state.latent = euler_step(latent, velocity, t, t_next)
-        _accept_flow_update(model, prepared, state.latent)
         done = cursor + 1 >= steps
         return FlowOutput(req_id=req_id, denoise_done=done, num_steps_done=cursor + 1)
+
+    def _require_flow_execution(self) -> Any:
+        if self._flow_execution is None:
+            raise invalid_descriptor("prepared flow steps require an executor flow driver")
+        return self._flow_execution
 
     def _flow_steps(
         self,
@@ -372,23 +320,21 @@ class _DiffusionRuntime:
         *,
         graph_mode: str = "auto",
     ) -> list[FlowOutput]:
-        branches_by_step = [flow_branches(step) for step in steps]
-        batch_predict = _flow_batch_predictor(model)
-        if batch_predict is not None:
-            predicted = _call_flow_batch_predictor(
-                batch_predict,
-                steps,
-                branches_by_step,
-                graph_mode=graph_mode,
-            )
-        else:
-            predicted = None
+        del model
+        driver = self._require_flow_execution()
+        branches_by_step = [step.guide.branches for step in steps]
+        predicted = driver.predict_flow_velocity_batch(
+            steps,
+            branches_by_step,
+            graph_mode=graph_mode,
+        )
         if predicted is None and graph_mode == "require":
             raise invalid_descriptor("flow graph mode required a graphable batch")
+        branch_outputs: list[dict[str, torch.Tensor]]
         if predicted is None:
             branch_outputs = [
                 {
-                    branch: self._predict_flow_branch(model.predict_velocity, step, branch)
+                    branch.value: self._predict_flow_branch(driver, step, branch)
                     for branch in branches
                 }
                 for step, branches in zip(steps, branches_by_step)
@@ -397,19 +343,23 @@ class _DiffusionRuntime:
             branch_outputs = _validate_batched_flow_outputs(steps, branches_by_step, predicted)
         outputs = []
         for step, velocities in zip(steps, branch_outputs):
-            session = _FlowSession(
-                model,
-                step,
-                combine_velocity=combine_flow_velocity,
-                accept_update=_accept_flow_update,
+            velocity = step.guide.combine(velocities)
+            updated = euler_step(step.latent, velocity, step.t, step.t_next)
+            driver.apply_flow_update(step, updated)
+            done = step.step_index + 1 >= step.total_steps
+            outputs.append(
+                FlowOutput(
+                    req_id=step.req_id,
+                    denoise_done=done,
+                    num_steps_done=step.step_index + 1,
+                )
             )
-            outputs.append(session.apply_update(velocities))
         return outputs
 
     def _predict_flow_branch(
-        self, predict: Any, step: PreparedFlowStep, branch: str
+        self, driver: Any, step: PreparedFlowStep, branch: str
     ) -> torch.Tensor:
-        velocity = predict(step, step.t, step.latent, branch)
+        velocity = driver.predict_flow_velocity(step, branch)
         if not isinstance(velocity, torch.Tensor) or velocity.shape != step.latent.shape:
             raise invalid_descriptor(
                 f"{branch} velocity must be a tensor matching the denoise latent"
@@ -423,25 +373,22 @@ class _DiffusionRuntime:
         *,
         graph_mode: str = "auto",
     ) -> tuple[dict[DenoiseBranchKey, torch.Tensor], dict[int, DenoisePostprocessEntry]] | None:
+        del model
+        driver = self._require_flow_execution()
         steps = [step for _row_index, step in items]
-        branches_by_step = [flow_branches(step) for step in steps]
-        batch_predict = _flow_batch_predictor(model)
-        predicted = (
-            _call_flow_batch_predictor(
-                batch_predict,
-                steps,
-                branches_by_step,
-                graph_mode=graph_mode,
-            )
-            if batch_predict is not None
-            else None
+        branches_by_step = [step.guide.branches for step in steps]
+        predicted = driver.predict_flow_velocity_batch(
+            steps,
+            branches_by_step,
+            graph_mode=graph_mode,
         )
         if predicted is None and graph_mode == "require":
             return None
+        branch_outputs: list[dict[str, torch.Tensor]]
         if predicted is None:
             branch_outputs = [
                 {
-                    branch: self._predict_flow_branch(model.predict_velocity, step, branch)
+                    branch.value: self._predict_flow_branch(driver, step, branch)
                     for branch in branches
                 }
                 for step, branches in zip(steps, branches_by_step, strict=True)
@@ -463,14 +410,14 @@ class _DiffusionRuntime:
                 values: Mapping[Any, torch.Tensor],
                 current_step: PreparedFlowStep = step,
             ) -> torch.Tensor:
-                return combine_flow_velocity(current_step, values)
+                return current_step.guide.combine(values)
 
             def accept_step_update(
                 latent: torch.Tensor,
-                current_model: Any = model,
+                current_driver: Any = driver,
                 current_step: PreparedFlowStep = step,
             ) -> None:
-                _accept_flow_update(current_model, current_step, latent)
+                current_driver.apply_flow_update(current_step, latent)
 
             updates[int(row_index)] = DenoisePostprocessEntry(
                 row_index=int(row_index),
@@ -526,7 +473,7 @@ class _DiffusionRuntime:
             return combine_cfg([values[branch] for branch in branch_names], cfg)
 
         def accept_generic_update(latent_value: torch.Tensor) -> None:
-            _accept_flow_update(model, prepared, latent_value)
+            state.latent = latent_value
 
         entry = DenoisePostprocessEntry(
             row_index=int(row_index),
@@ -621,14 +568,6 @@ def _branch_name(branch_index: int, branch_count: int) -> str:
     return f"branch_{branch_index}"
 
 
-def _prepare_flow(
-    model: Any,
-    state: RequestState,
-    op: Mapping[str, Any],
-) -> FlowContext | PreparedFlowStep:
-    return model.prepare_flow(state, op)
-
-
 def _denoise_step_count(op: Mapping[str, Any]) -> int:
     raw = op.get("denoise_step_count") or 1
     try:
@@ -638,53 +577,6 @@ def _denoise_step_count(op: Mapping[str, Any]) -> int:
     if value <= 0:
         raise invalid_descriptor("denoise_step_count must be positive")
     return value
-
-
-def _flow_batch_predictor(model: Any) -> Any | None:
-    return model.predict_flow_velocity_batch
-
-
-def _call_flow_batch_predictor(
-    predictor: Any,
-    steps: Sequence[PreparedFlowStep],
-    branches_by_step: Sequence[Sequence[str]],
-    *,
-    graph_mode: str,
-) -> list[dict[str, torch.Tensor]] | None:
-    if graph_mode == "auto":
-        return predictor(steps, branches_by_step)
-    if not _accepts_graph_mode(predictor):
-        return None if graph_mode == "require" else predictor(steps, branches_by_step)
-    return predictor(steps, branches_by_step, graph_mode=graph_mode)
-
-
-def _accepts_graph_mode(callable_obj: Any) -> bool:
-    try:
-        signature = inspect.signature(callable_obj)
-    except (TypeError, ValueError):
-        return False
-    for parameter in signature.parameters.values():
-        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-            return True
-    return "graph_mode" in signature.parameters
-
-
-def _accept_flow_update(
-    model: Any,
-    ctx: FlowContext | PreparedFlowStep,
-    latent: torch.Tensor,
-) -> None:
-    accept = _flow_update_acceptor(model)
-    if accept is not None:
-        accept(ctx, latent)
-        return
-    state = getattr(ctx, "state", None)
-    if state is not None:
-        state.latent = latent
-
-
-def _flow_update_acceptor(model: Any) -> Any | None:
-    return model.accept_flow_update
 
 
 def _validate_batched_flow_outputs(

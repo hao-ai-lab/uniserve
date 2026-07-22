@@ -29,9 +29,7 @@ MODELS_SYSTEM_LAYER_EDGES = (
     ("uniserve_worker.models.bagel", "uniserve_worker.execution.flow"),
     ("uniserve_worker.models.bagel", "uniserve_worker.execution.segment"),
     ("uniserve_worker.models.bagel", "uniserve_worker.execution.sequence"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.image_params"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.kv_pool"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.paged_denoise"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.paged_text_cache"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.request_state"),
     ("uniserve_worker.models.bagel", "uniserve_worker.runtime.residency"),
@@ -45,7 +43,6 @@ MODELS_SYSTEM_LAYER_EDGES = (
     ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.forward_stream"),
     ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.kv_pool"),
     ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.masks"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.request_state"),
     ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.residency"),
     ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.tower_handoff"),
 )

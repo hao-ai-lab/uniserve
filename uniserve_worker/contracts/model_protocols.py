@@ -13,7 +13,6 @@ from .resource_plan import ResourcePlan
 if TYPE_CHECKING:
     import torch
 
-    from uniserve_worker.execution.flow import PreparedFlowStep
     from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
     from uniserve_worker.runtime.residency import ResidencyManager
 
@@ -115,11 +114,6 @@ class UniModel(ABC):
         """Return worker-resident logits that predict the next prompt token."""
         return None
 
-    def accept_flow_update(self, ctx: Any, latent: Any) -> None:
-        state = getattr(ctx, "state", None)
-        if state is not None:
-            state.latent = latent
-
     def encode_image(self, pixels: Any = None, grid: Any = None, *, ctx: "EncodeContext") -> Any:
         raise invalid_descriptor("encode-capable model must implement encode_image()")
 
@@ -135,16 +129,11 @@ class UniModel(ABC):
             "run_text_logits[_batch]"
         )
 
-    def prepare_flow(self, state: Any, op: Mapping[str, Any]) -> FlowContext | PreparedFlowStep:
-        return FlowContext(state=state, op=op)
-
     def predict_velocity(self, ctx: Any, t: Any, latent: Any, branch: str) -> Any:
+        """Raw per-branch neural prediction; flow orchestration is executor-owned."""
         raise invalid_descriptor(
             "diffusion model must implement predict_velocity(ctx, t, latent, branch)"
         )
-
-    def predict_flow_velocity_batch(self, steps: Any, branches_by_step: Any) -> Any:
-        return None
 
     def vae_decode(
         self,

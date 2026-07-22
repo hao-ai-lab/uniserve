@@ -21,9 +21,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 
 import uniserve_worker.ops as ops
 from uniserve_worker.execution.flow import (
-    FlowExecution,
-    FlowState,
-    PreparedFlowStep,
     ProgramState,
 )
 from uniserve_worker.execution.products import ProductTransferSession
@@ -93,7 +90,6 @@ from ...nn.vision import NeoVitConfig, NeoVitEncoder, build_abs_positions_from_g
 from ...processors.sensenova import SENSENOVA_IMAGE_GEOMETRY
 from ...runtime.compile import CompileTarget
 from ...runtime.kv_pool import PagedKVPool
-from ...runtime.request_state import RequestState as RunnerRequestState
 from ...runtime.residency import (
     DEFAULT_ENCODER_CACHE_BUDGET,
     GenResidencySpec,
@@ -2398,7 +2394,6 @@ class SenseNovaU1ForUnifiedGeneration(
         # declaration (``tower_binding``), resolved live so destination
         # residency tracks the tower-vs-trivial choice.
         self.tower_session = ProductTransferSession(self, flow=self._flow)
-        self.flow_execution = FlowExecution(self, flow=self._flow, transfer=self.tower_session)
         self._img_start_token = IMG_START_TOKEN
 
     def _init_tower_profile(self) -> None:
@@ -2983,38 +2978,6 @@ class SenseNovaU1ForUnifiedGeneration(
         return kv_view.program(int(req_id))
 
     transformers_image_state = program_state
-
-    def prepare_flow(self, state: RunnerRequestState, op: dict[str, Any] | Any) -> PreparedFlowStep:
-        req_id = int(op["req_id"])
-        return self.flow_execution.prepare_flow_step(req_id, state, dict(op))
-
-    def predict_velocity(
-        self,
-        ctx: PreparedFlowStep,
-        t: torch.Tensor,
-        latent: torch.Tensor,
-        branch: str,
-    ) -> torch.Tensor:
-        del t, latent
-        velocity = self.flow_execution.predict_flow_velocity(ctx, branch)
-        if not isinstance(velocity, torch.Tensor):
-            raise invalid_descriptor(
-                "SenseNova velocity prediction unexpectedly returned hidden state"
-            )
-        return velocity
-
-    def predict_flow_velocity_batch(self, steps, branches_by_step, *, graph_mode: str = "auto"):
-        return self.flow_execution.predict_flow_velocity_batch(
-            steps,
-            branches_by_step,
-            graph_mode=graph_mode,
-        )
-
-    def accept_flow_update(self, ctx: PreparedFlowStep, latent: torch.Tensor) -> None:
-        self.flow_execution.apply_flow_update(ctx, latent)
-
-    def _denoise_branch_inputs(self, image: FlowState, branch: str) -> tuple[torch.Tensor, Any]:
-        return self.flow_execution._denoise_branch_inputs(image, branch)
 
     @torch.inference_mode()
     def forward(self, batch: ForwardBatch) -> Any:

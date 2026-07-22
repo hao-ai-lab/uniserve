@@ -95,10 +95,6 @@ from .flow import (
     FlowGraphRunner,
     LatentView,
     PreparedFlowStep,
-    combine_flow_velocity,
-    flow_branches,
-    flow_cfg_branch_count,
-    flow_cfg_plan,
     resolve_flow_spec,
 )
 from .operation_executor import OperationExecutor
@@ -133,10 +129,6 @@ __all__ = [
     "PreparedFlowStep",
     "ExecutorConfig",
     "TextDecodeRelay",
-    "combine_flow_velocity",
-    "flow_branches",
-    "flow_cfg_branch_count",
-    "flow_cfg_plan",
     "text_input_id_replacements_from_relays",
 ]
 
@@ -796,8 +788,13 @@ class ModelExecutor:
         )
         # One FlowSpec per worker: flow schedule/prediction semantics resolve
         # from the model's declarative spec at composition, not from live
-        # model attributes.
-        self._diffusion = _DiffusionRuntime(flow=resolve_flow_spec(model))
+        # model attributes. The family flow driver is executor-held on the
+        # segment executor; models expose only raw neural prediction.
+        segment_executor = getattr(model, "segment_executor", None)
+        self._diffusion = _DiffusionRuntime(
+            flow=resolve_flow_spec(model),
+            flow_execution=getattr(segment_executor, "flow_execution", None),
+        )
         self._init_text_execution(model, residency)
         self._init_unified_forward_execution(model, residency)
         self.image_input_stage = dependencies.image_input_stage
@@ -810,7 +807,6 @@ class ModelExecutor:
         kv_pool = getattr(state_residency, "kv", None) if state_residency is not None else None
         if kv_pool is not None:
             self.kv_store.bind_block_size(int(kv_pool.block_size))
-        segment_executor = getattr(model, "segment_executor", None)
         if state_residency is not None and segment_executor is not None:
             rng_device = getattr(model, "gen_device", getattr(model, "device", "cpu"))
             self.flow_store: FlowBranchStore | None = FlowBranchStore(
