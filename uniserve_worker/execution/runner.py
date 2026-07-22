@@ -70,6 +70,7 @@ from uniserve_worker.nn.sampler import (
 )
 from uniserve_worker.runtime.forward_batch_builder import ForwardBatchBuilder
 from uniserve_worker.runtime.graph_store import GraphStore
+from uniserve_worker.runtime.kv_store import KvStore
 from uniserve_worker.runtime.paged_text_cache import copy_paged_text_cache_spans
 from uniserve_worker.runtime.product_store import ProductStore
 from uniserve_worker.runtime.request_session import SessionStore, TransactionalStore
@@ -90,8 +91,8 @@ from .diffusion import (
     _DiffusionRuntime,
 )
 from .flow import (
+    FlowBranchStore,
     FlowGraphRunner,
-    KvStore,
     LatentView,
     PreparedFlowStep,
     combine_flow_velocity,
@@ -797,10 +798,17 @@ class ModelExecutor:
         self.multimodal_processor = dependencies.multimodal_processor
         self._init_resource_accounting(resource_runtime, residency)
         state_residency = residency or getattr(model, "residency", None)
+        # The runtime KV store is the worker authority for sequence-KV
+        # references on every model; the session table constructs it and the
+        # session store joins it to each step transaction.
+        self.kv_store: KvStore = self.sessions.kv
+        kv_pool = getattr(state_residency, "kv", None) if state_residency is not None else None
+        if kv_pool is not None:
+            self.kv_store.bind_block_size(int(kv_pool.block_size))
         segment_executor = getattr(model, "segment_executor", None)
         if state_residency is not None and segment_executor is not None:
             rng_device = getattr(model, "gen_device", getattr(model, "device", "cpu"))
-            self.kv_store: KvStore | None = KvStore(
+            self.flow_store: FlowBranchStore | None = FlowBranchStore(
                 self.sessions,
                 state_residency.latent,
                 rng_device=rng_device,
@@ -808,12 +816,12 @@ class ModelExecutor:
             self.latent_store = state_residency.latent
             self.product_store: ProductStore | None = ProductStore()
             transaction_stores: tuple[TransactionalStore, ...] = (
-                self.kv_store,
+                self.flow_store,
                 self.latent_store,
                 self.product_store,
             )
         else:
-            self.kv_store = None
+            self.flow_store = None
             self.latent_store = None
             self.product_store = None
             transaction_stores = ()
@@ -1067,18 +1075,18 @@ class ModelExecutor:
         return torch.cuda.stream(stream)
 
     def drop_request(self, req_id: int) -> None:
-        if self.kv_store is not None and self.latent_store is not None:
+        if self.flow_store is not None and self.latent_store is not None:
             residency = self.residency or getattr(self.model, "residency", None)
             segment_executor = getattr(self.model, "segment_executor", None)
             latent_view = LatentView(
                 self.latent_store,
                 (int(req_id),),
-                kv_store=self.kv_store,
+                kv_store=self.flow_store,
                 residency=residency,
                 segment_executor=segment_executor,
             )
             latent_view.pop_state(int(req_id))
-            self.kv_store.drop(
+            self.flow_store.drop(
                 int(req_id),
                 residency=residency,
                 segment_executor=segment_executor,
@@ -1124,14 +1132,14 @@ class ModelExecutor:
             self._record_group_shape(forward_stats, plan)
         device = torch.device(str(getattr(self.model, "device", "cpu") or "cpu"))
         request_ids = tuple(int(row.req_id) for row in plan.rows)
-        if self.kv_store is not None and self.latent_store is not None:
+        if self.flow_store is not None and self.latent_store is not None:
             residency = self.residency or getattr(self.model, "residency", None)
             segment_executor = getattr(self.model, "segment_executor", None)
-            kv_view = self.kv_store.view(request_ids)
+            kv_view = self.flow_store.view(request_ids)
             latent_view = LatentView(
                 self.latent_store,
                 request_ids,
-                kv_store=self.kv_store,
+                kv_store=self.flow_store,
                 residency=residency,
                 segment_executor=segment_executor,
             )

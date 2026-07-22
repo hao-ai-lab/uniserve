@@ -138,7 +138,7 @@ def _fresh() -> tuple[InterleavedSequenceCPUModel, ModelExecutor]:
         resource_runtime=ledger,
         residency=residency,
     )
-    assert executor.kv_store is not None
+    assert executor.flow_store is not None
     return model, executor
 
 
@@ -180,8 +180,8 @@ def _decode_batch(step_id: int) -> dict[str, Any]:
 
 
 def _committed_text_state(executor: ModelExecutor, req_id: int) -> dict[str, Any]:
-    assert executor.kv_store is not None
-    program = executor.kv_store.program(req_id)
+    assert executor.flow_store is not None
+    program = executor.flow_store.program(req_id)
     session = executor.sessions.get(req_id)
     past = program.cond.past
     return {
@@ -189,6 +189,8 @@ def _committed_text_state(executor: ModelExecutor, req_id: int) -> dict[str, Any
         "cache_blocks": list(past.block_ids) if past is not None else None,
         "t_index": int(program.cond.t_index),
         "session_blocks": list(session.block_ids),
+        "ref_len": int(session.prefix_len),
+        "kv_lengths": dict(session.kv_lengths),
         "version": int(session.version),
     }
 
@@ -229,6 +231,45 @@ def test_failure_after_forward_kv_write_leaves_committed_length_and_blocks_uncha
     assert after["session_blocks"] == [0, 2]
     assert after["cache_blocks"] == [0, 2]
     assert executor.resource_runtime.used("kv_block") == 4
+
+
+def test_failure_injection_preserves_prefix_reference_blocks_and_lengths():
+    model, executor = _fresh()
+    _, control = _fresh()
+
+    # A warm admission: block 4 carries a reused prefix, the suffix prefill
+    # starts at the declared boundary and writes into the leased tail block.
+    warm_ops = [
+        {"req_id": 4, "kind": "prefill_und", "token_ids": [5, 6, 7], "pos_range": [16, 19]}
+    ]
+    warm_new_reqs = [
+        {
+            "req_id": 4,
+            "block_ids": [4, 5],
+            "prefix_len": 16,
+            "sampling": {"temperature": 0.0},
+        }
+    ]
+    executor.execute(seal_batch(1, warm_ops, new_reqs=warm_new_reqs))
+    control.execute(seal_batch(1, warm_ops, new_reqs=warm_new_reqs))
+    committed = _committed_text_state(executor, 4)
+    assert committed["ref_len"] == 16
+    assert committed["session_blocks"] == [4, 5]
+
+    decode = [{"req_id": 4, "kind": "decode_und", "token_ids": [9], "pos_range": [19, 20]}]
+    model.fail_requests = {4}
+    with pytest.raises(RuntimeError, match="injected KV failure after forward write"):
+        executor.execute(seal_batch(2, decode, base_version=1))
+    model.fail_requests = set()
+
+    # The failed step left the prefix reference, block table, and committed
+    # lane lengths exactly at the prior commit.
+    assert _committed_text_state(executor, 4) == committed
+
+    retry = executor.execute(seal_batch(3, decode, base_version=1))
+    reference = control.execute(seal_batch(2, decode, base_version=1))
+    assert _sampled(retry) == _sampled(reference)
+    assert _committed_text_state(executor, 4) == _committed_text_state(control, 4)
 
 
 def test_failure_between_layer_writes_rolls_back_partial_span_and_retry_matches():

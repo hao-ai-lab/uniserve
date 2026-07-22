@@ -2515,7 +2515,7 @@ def test_sensenova_span_batch_uses_graph_result_before_scalar(monkeypatch):
 
 def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatch):
     from uniserve_worker.contracts.forward_context import ForwardContext, use_forward_context
-    from uniserve_worker.execution.flow import KvStore
+    from uniserve_worker.execution.flow import FlowBranchStore
     from uniserve_worker.models.sensenova import model as sensenova_u1
     from uniserve_worker.runtime.kv_pool import PagedKVPool
     from uniserve_worker.runtime.request_state import RequestStateTable
@@ -2543,7 +2543,7 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
     states = RequestStateTable()
     for req_id, block_id in ((11, 0), (12, 1)):
         states.create_or_update(req_id, {"req_id": req_id, "block_ids": [block_id]})
-    kv_store = KvStore(states, SimpleNamespace(), rng_device="cpu")
+    kv_store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
     context = ForwardContext(kv_view=kv_store.view((11, 12)))
     with use_forward_context(context):
         for req_id, length in ((11, 3), (12, 5)):
@@ -2613,12 +2613,12 @@ def test_sensenova_denoise_forward_segment_is_transient_not_persistent():
 
 
 def test_request_drop_releases_segment_staging():
-    from uniserve_worker.execution.flow import KvStore
+    from uniserve_worker.execution.flow import FlowBranchStore
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     states = RequestStateTable()
     states.create_or_update(3, {"req_id": 3})
-    store = KvStore(states, SimpleNamespace(), rng_device="cpu")
+    store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
     program = store.program(3)
     caches = [object(), object(), object()]
     program.cond.past, program.tu.past, program.iu.past = caches
@@ -2636,7 +2636,7 @@ def test_request_drop_releases_segment_staging():
 
 
 def test_duplicate_new_request_preserves_live_interleaved_cache():
-    from uniserve_worker.execution.flow import KvStore
+    from uniserve_worker.execution.flow import FlowBranchStore
     from uniserve_worker.runtime.request_state import RequestStateTable
 
     states = RequestStateTable()
@@ -2644,7 +2644,7 @@ def test_duplicate_new_request_preserves_live_interleaved_cache():
         6,
         {"req_id": 6, "block_ids": [10, 11], "sampling": {"temperature": 0.0}},
     )
-    store = KvStore(states, SimpleNamespace(), rng_device="cpu")
+    store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
     image_state = store.program(6)
     sentinel_past = object()
     image_state.cond.block_ids = [10, 11, 12, 13, 14]

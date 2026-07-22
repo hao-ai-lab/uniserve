@@ -173,6 +173,11 @@ impl PrefixCacheCoordinator {
         st.replay.prefix_cached_blocks = cached;
         st.ingest.prompt_cursor = (cached * bs) as u32;
         st.und.logical_pos = st.ingest.prompt_cursor;
+        // Reused blocks are physically resident in the request's block table:
+        // the next physical write lands directly after them, and every
+        // capacity computation derived from the physical cursor must cover
+        // the reused span.
+        st.und.physical_kv_len = st.ingest.prompt_cursor;
     }
 
     /// after a request's prompt is fully prefilled, publish its full prompt

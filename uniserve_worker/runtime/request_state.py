@@ -9,8 +9,9 @@ from typing import Any
 
 import torch
 
+from .kv_store import KvEntry, KvStore, append_new_block_ids
+
 __all__ = [
-    "append_new_block_ids",
     "request_seed",
     "sampling_draw_seed",
     "RequestLifecycle",
@@ -48,43 +49,6 @@ def request_seed(request: Mapping[str, Any], req_id: int) -> int:
         image.get("seed") if isinstance(image, Mapping) else None,
     )
     return next((int(value) for value in candidates if value is not None), int(req_id))
-
-
-def append_new_block_ids(
-    block_ids: list[int],
-    new_block_ids: list[int] | tuple[int, ...] | None,
-) -> bool:
-    """Idempotently ingest a host ``ForwardOp.new_block_ids`` payload.
-
-    This is the single source of truth for the host->worker block-id append
-    contract: every consumer of ``new_block_ids`` must route through it so the
-    idempotency rule lives in exactly one place. A retried/duplicated op that
-    carries the same tail of block ids is a no-op (the tail already matches), so
-    appends are not double-applied; any other suffix is appended verbatim.
-
-    Mutates ``block_ids`` in place and returns ``True`` iff blocks were appended.
-    """
-    new_blocks = [int(block_id) for block_id in (new_block_ids or [])]
-    if new_blocks and block_ids[-len(new_blocks) :] != new_blocks:
-        block_ids.extend(new_blocks)
-        return True
-    return False
-
-
-def _merge_registered_block_ids(block_ids: list[int], registered: list[int]) -> None:
-    if not registered:
-        return
-    if not block_ids:
-        block_ids.extend(registered)
-        return
-    if block_ids == registered:
-        return
-    if len(registered) > len(block_ids) and registered[: len(block_ids)] == block_ids:
-        block_ids[:] = registered
-        return
-    if len(block_ids) >= len(registered) and block_ids[: len(registered)] == registered:
-        return
-    append_new_block_ids(block_ids, registered)
 
 
 class RequestLifecycle(StrEnum):
@@ -126,12 +90,11 @@ class RequestState:
     sampling: dict[str, Any] = field(default_factory=dict)
     image: dict[str, Any] = field(default_factory=dict)
     neg_token_ids: list[int] = field(default_factory=list)
-    block_ids: list[int] = field(default_factory=list)
+    # Sequence-KV references (block table, prefix-reference boundary, per-lane
+    # committed lengths). The entry is the storage; every mutating policy is
+    # owned by the table's ``KvStore``.
+    kv: KvEntry = field(default_factory=KvEntry)
     resident_block_ids: set[int] = field(default_factory=set)
-    # Scheduler-declared prefix-cache reuse boundary in tokens: the leading
-    # span of ``block_ids`` whose KV is already resident through prefix reuse
-    # (0 on a cold admission). Ingested from ``NewRequestData.prefix_len``.
-    prefix_len: int = 0
     lora_id: int | None = None
     raw_new_request: dict[str, Any] = field(default_factory=dict)
     seed: int | None = None
@@ -139,11 +102,6 @@ class RequestState:
     latent: Any = None
     rng: Any = None
     device_rngs: dict[str, torch.Generator] = field(default_factory=dict)
-    # Per-lane committed KV lengths (lane -> token count), recorded by the
-    # system executor through ``kv_length``/``set_kv_length``. The system-planned
-    # text path commits its lane here; interleaved sequence branches commit their
-    # lengths on the branch caches owned by the executor ``KvStore``.
-    kv_lengths: dict[str, int] = field(default_factory=dict)
     residency: ResidencyFlags = field(default_factory=ResidencyFlags)
     decode_relay: DecodeRelay = field(default_factory=DecodeRelay)
     prompt_last_logits: torch.Tensor | None = None
@@ -154,8 +112,33 @@ class RequestState:
     last_op_id: int | None = None
     last_step_id: int | None = None
 
+    @property
+    def block_ids(self) -> list[int]:
+        """The request's block table — THE aliased list object, never rebound."""
+        return self.kv.block_ids
+
+    @property
+    def prefix_len(self) -> int:
+        """Scheduler-declared prefix-cache reuse boundary in tokens.
+
+        The leading span of ``block_ids`` whose KV is already resident through
+        prefix reuse (0 on a cold admission). Ingested from
+        ``NewRequestData.prefix_len`` as the entry's prefix reference.
+        """
+        return self.kv.ref_len
+
+    @property
+    def kv_lengths(self) -> dict[str, int]:
+        """Per-lane committed KV lengths (lane -> token count).
+
+        Recorded by the system executor through ``kv_length``/``set_kv_length``.
+        The system-planned text path commits its lane here; interleaved sequence
+        branches commit their lengths on the executor-owned branch caches.
+        """
+        return self.kv.lengths
+
     def extend_block_ids(self, block_ids: list[int] | tuple[int, ...]) -> None:
-        self.block_ids.extend(int(block_id) for block_id in block_ids)
+        self.kv.block_ids.extend(int(block_id) for block_id in block_ids)
 
     def append_new_block_ids(self, new_block_ids: list[int] | tuple[int, ...] | None) -> bool:
         """Tail-deduping ingest of a host ``new_block_ids`` payload.
@@ -164,13 +147,13 @@ class RequestState:
         idempotency contract is defined exactly once. Returns ``True`` iff
         blocks were appended.
         """
-        return append_new_block_ids(self.block_ids, new_block_ids)
+        return append_new_block_ids(self.kv.block_ids, new_block_ids)
 
     def kv_length(self, lane: str = "default") -> int:
-        return int(self.kv_lengths.get(lane, 0))
+        return int(self.kv.lengths.get(lane, 0))
 
     def set_kv_length(self, value: int, lane: str = "default") -> None:
-        self.kv_lengths[lane] = int(value)
+        self.kv.lengths[lane] = int(value)
 
     def device_rng(
         self,
@@ -212,10 +195,16 @@ class RequestState:
 
 
 class RequestStateTable:
-    """In-memory table of ``RequestState`` keyed by request id."""
+    """In-memory table of ``RequestState`` keyed by request id.
+
+    The table constructs the :class:`KvStore` that owns every sequence-KV
+    reference policy (lease ingest, write guarding, reclamation) over the
+    entries stored on its request states.
+    """
 
     def __init__(self) -> None:
         self._states: dict[int, RequestState] = {}
+        self.kv = KvStore(self)
 
     def create_or_update(self, req_id: int, new_req: dict[str, Any]) -> RequestState:
         state = self._states.get(req_id)
@@ -231,13 +220,7 @@ class RequestStateTable:
         state.lifecycle = RequestLifecycle.ACTIVE
         state.image = dict(new_req.get("image") or {})
         state.neg_token_ids = list(new_req.get("neg_token_ids") or [])
-        if "block_ids" in new_req:
-            incoming = [int(block_id) for block_id in (new_req.get("block_ids") or [])]
-            if existed:
-                _merge_registered_block_ids(state.block_ids, incoming)
-            else:
-                state.block_ids = incoming
-        state.prefix_len = int(new_req.get("prefix_len") or 0)
+        self.kv.admit(int(req_id), state, new_req, fresh=not existed)
         state.lora_id = new_req.get("lora_id")
         state.raw_new_request = dict(new_req)
         if "epoch" in new_req:
@@ -249,6 +232,16 @@ class RequestStateTable:
 
     def get(self, req_id: int) -> RequestState:
         return self._states.setdefault(req_id, RequestState())
+
+    def peek(self, req_id: int) -> RequestState | None:
+        return self._states.get(int(req_id))
+
+    def ingest_new_blocks(
+        self,
+        req_id: int,
+        block_ids: list[int] | tuple[int, ...] | None,
+    ) -> bool:
+        return self.kv.ingest_new_blocks(int(req_id), self.get(int(req_id)), block_ids)
 
     def advance_denoise(self, req_id: int, num_steps_done: int | None = None) -> None:
         state = self.get(req_id)
@@ -266,7 +259,9 @@ class RequestStateTable:
             state.clear_generation_state(reset_cursor=False)
 
     def drop(self, req_id: int) -> None:
-        self._states.pop(req_id, None)
+        state = self._states.pop(req_id, None)
+        if state is not None:
+            self.kv.release(int(req_id), state)
 
     def __contains__(self, req_id: int) -> bool:
         return req_id in self._states

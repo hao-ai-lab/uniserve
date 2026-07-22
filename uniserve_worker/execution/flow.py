@@ -740,7 +740,7 @@ class _ProgramSnapshot:
     cond_blocks_shared: bool
 
 
-class KvStore:
+class FlowBranchStore:
     """Own per-request conditional and CFG sequence branches.
 
     The branch caches hold the committed sequence-KV lengths and block tables
@@ -863,7 +863,7 @@ class KvStore:
 class KvView:
     """Batch-bounded access to request KV branch state."""
 
-    def __init__(self, store: KvStore, request_ids: frozenset[int]) -> None:
+    def __init__(self, store: FlowBranchStore, request_ids: frozenset[int]) -> None:
         self._store = store
         self._request_ids = request_ids
 
@@ -882,7 +882,7 @@ class LatentView:
         store: Any,
         request_ids: Iterable[int],
         *,
-        kv_store: KvStore,
+        kv_store: FlowBranchStore,
         residency: Any,
         segment_executor: Any,
     ) -> None:
