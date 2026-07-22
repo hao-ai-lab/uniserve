@@ -57,6 +57,13 @@ pub struct NewRequestData {
     pub lora_id: Option<u32>,
     /// Initial logical KV block allocation.
     pub block_ids: Vec<BlockId>,
+    /// Number of leading prompt tokens already resident in `block_ids` through
+    /// prefix-cache reuse (the scheduler's reuse boundary, in tokens: cached
+    /// blocks x block size; 0 on a cold admission). The typed source of truth
+    /// for worker-side prefix-reference registration. A scalar — never KV
+    /// bytes.
+    #[serde(default)]
+    pub prefix_len: u32,
     /// KV-cache group the block ids live in.
     pub group_id: u32,
 }
@@ -70,6 +77,7 @@ impl NewRequestData {
             neg_token_ids: None,
             lora_id: None,
             block_ids: Vec::new(),
+            prefix_len: 0,
             group_id: 0,
         }
     }
@@ -1056,6 +1064,7 @@ mod tests {
                 neg_token_ids: Some(vec![1, 2]),
                 lora_id: Some(7),
                 block_ids: vec![BlockId(9), BlockId(10)],
+                prefix_len: 512,
                 group_id: 2,
                 ..NewRequestData::new(RequestId(5))
             }],
@@ -1068,6 +1077,7 @@ mod tests {
         assert_eq!(batch.step_id, 11);
         assert_eq!(batch.new_reqs[0].image.as_ref().unwrap().width, 2048);
         assert_eq!(batch.new_reqs[0].block_ids, vec![BlockId(9), BlockId(10)]);
+        assert_eq!(batch.new_reqs[0].prefix_len, 512);
         assert_eq!(batch.ops[0].kind, OpKind::DenoiseGen);
         assert_eq!(batch.ops[0].token_source, TokenSource::LastSampled);
         assert_eq!(
@@ -1499,6 +1509,7 @@ mod tests {
             neg_token_ids: _, // id list
             lora_id: _,       // scalar handle
             block_ids: _,     // logical block ids (scalars), never KV bytes
+            prefix_len: _,    // prefix-cache reuse boundary in tokens (scalar)
             group_id: _,      // scalar
         } = NewRequestData::new(RequestId(0));
     }

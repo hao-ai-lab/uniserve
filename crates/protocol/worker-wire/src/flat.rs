@@ -188,6 +188,7 @@ fn new_request_to_fb(req: &NewRequestData) -> anyhow::Result<fbs::NewRequestData
         neg_token_ids: req.neg_token_ids.clone(),
         lora_id: req.lora_id,
         block_ids: Some(req.block_ids.iter().map(|id| id.0).collect()),
+        prefix_len: req.prefix_len,
         group_id: req.group_id,
     })
 }
@@ -205,6 +206,7 @@ fn new_request_from_fb(req: fbs::NewRequestDataT) -> anyhow::Result<NewRequestDa
             .into_iter()
             .map(BlockId)
             .collect(),
+        prefix_len: req.prefix_len,
         group_id: req.group_id,
     })
 }

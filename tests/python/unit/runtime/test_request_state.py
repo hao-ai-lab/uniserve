@@ -30,6 +30,23 @@ def test_duplicate_new_request_merges_a_longer_registered_chain():
     assert same.block_ids == [10, 11, 12]
 
 
+def test_admission_carries_the_prefix_reuse_boundary_into_request_state():
+    states = RequestStateTable()
+
+    warm = states.create_or_update(
+        6, {"req_id": 6, "block_ids": [10, 11, 12], "prefix_len": 128}
+    )
+    cold = states.create_or_update(7, {"req_id": 7, "block_ids": [20]})
+
+    assert warm.prefix_len == 128
+    assert cold.prefix_len == 0
+
+    # Re-registration (e.g. after preemption) carries the current boundary.
+    again = states.create_or_update(6, {"req_id": 6, "block_ids": [10, 11, 12]})
+    assert again is warm
+    assert again.prefix_len == 0
+
+
 def test_request_random_streams_are_persistent_and_domain_separated():
     states = RequestStateTable()
     state = states.create_or_update(6, {"req_id": 6, "sampling": {"seed": 0}})
