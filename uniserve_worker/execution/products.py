@@ -9,11 +9,11 @@ import torch
 
 from uniserve_worker.contracts.forward_batch import EncodeRow
 from uniserve_worker.contracts.forward_context import get_forward_context
+from uniserve_worker.contracts.model_spec import FlowSpec
 from uniserve_worker.contracts.op_kinds import COMMIT_WRITEBACK, VIT_ENCODE
-from uniserve_worker.execution.flow import FlowState
+from uniserve_worker.execution.flow import FlowState, resolve_flow_spec, schedule_from_flow_spec
 from uniserve_worker.execution.sequence import SequenceAdapter, SequenceCache, SequenceExecutor
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
-from uniserve_worker.nn.diffusion import FlowMatchSchedule
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
 from uniserve_worker.runtime.image_params import parse_text_image_generation_params
 from uniserve_worker.runtime.image_utils import (
@@ -43,10 +43,7 @@ class ImageMaterializeAdapter(SequenceAdapter, Protocol):
     persistence) is owned by :class:`ImageMaterializer`.
     """
 
-    latent_downsample: int
     img_end_id: int
-    denoise_schedule_direction: Any
-    denoise_schedule_shift_domain: Any
 
     def normalize_materialized_image(self, image: torch.Tensor) -> torch.Tensor: ...
     def sequence_position_indexes(
@@ -71,17 +68,24 @@ class ImageMaterializeAdapter(SequenceAdapter, Protocol):
         device: Any,
     ) -> torch.Tensor: ...
 class ImageMaterializer:
-    """Append a finished image into text caches and finalize the commit response."""
+    """Append a finished image into text caches and finalize the commit response.
+
+    Latent geometry and writeback schedule reconstruction come from the
+    family's declarative ``FlowSpec``, resolved once at composition.
+    """
 
     def __init__(
         self,
         owner: ImageMaterializeAdapter,
         transfer: "ProductTransferSession",
         sequences: SequenceExecutor,
+        *,
+        flow: FlowSpec,
     ) -> None:
         self.owner = owner
         self.transfer = transfer
         self.sequences = sequences
+        self.flow = flow
 
     def commit(self, op: dict[str, Any], state: Any = None) -> dict[str, Any]:
         del state
@@ -221,22 +225,24 @@ class ImageMaterializer:
         self, st: Any, op: dict[str, Any], latent: torch.Tensor
     ) -> FlowState:
         ip = st.image or {}
-        params = parse_text_image_generation_params(ip)
+        params = parse_text_image_generation_params(
+            ip,
+            timestep_shift_default=self.flow.timestep_shift,
+        )
         height = int(params.height)
         width = int(params.width)
-        token_h = height // self.owner.latent_downsample
-        token_w = width // self.owner.latent_downsample
+        token_h = height // self.flow.latent_downsample
+        token_w = width // self.flow.latent_downsample
         patch_size = self.owner.image_patch_size()
         grid_h = height // patch_size
         grid_w = width // patch_size
         device = self.owner.device
         latent_handle = int(op["req_id"])
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
-        schedule = FlowMatchSchedule(
-            num_steps=int(params.steps),
-            shift=float(params.timestep_shift),
-            direction=self.owner.denoise_schedule_direction,
-            shift_domain=self.owner.denoise_schedule_shift_domain,
+        schedule = schedule_from_flow_spec(
+            self.flow,
+            num_steps=params.steps,
+            shift=params.timestep_shift,
         )
         indexes_cond = self.owner.flow_indexes(
             token_h,
@@ -407,7 +413,10 @@ def build_commit_materializer(adapter: Any) -> Any:
     """Build the family's commit driver from its declared adapter surface."""
     transfer = getattr(adapter, "tower_session", None)
     if isinstance(transfer, ProductTransferSession):
-        return ImageMaterializer(adapter, transfer, sequences=adapter._text_driver())
+        flow = resolve_flow_spec(adapter)
+        if flow is None:
+            raise invalid_descriptor("image materialization requires a declared FlowSpec")
+        return ImageMaterializer(adapter, transfer, sequences=adapter._text_driver(), flow=flow)
     if callable(getattr(adapter, "commit_generated_kv", None)):
         return GenerationImageMaterializer(adapter)
     return LatentImageMaterializer(adapter)
@@ -653,8 +662,12 @@ class ProductTransferSession:
     def __init__(
         self,
         owner: ProductTransferAdapter,
+        *,
+        flow: FlowSpec,
     ) -> None:
         self.owner = owner
+        self.flow = flow
+        self.cfg_recipe = CfgRecipe(flow.cfg_recipe)
         self._handoff: TowerHandoff = LocalP2PTowerHandoff(owner.tower_binding)
         self._data_plane_handoff: DataPlaneTowerHandoff | None = None
 
@@ -705,11 +718,14 @@ class ProductTransferSession:
         if state.cond.past is None:
             return None
         self.owner._ensure_img_start(state.cond)
-        params = parse_text_image_generation_params(state.image or {})
+        params = parse_text_image_generation_params(
+            state.image or {},
+            timestep_shift_default=self.flow.timestep_shift,
+        )
         cfg_plan = build_flow_cfg_plan(
             cfg_text_scale=params.cfg_text,
             cfg_img_scale=params.cfg_img,
-            recipe=CfgRecipe.ADDITIVE_DELTAS,
+            recipe=self.cfg_recipe,
             renorm=params.cfg_norm,
             renorm_min=params.cfg_renorm_min,
         )

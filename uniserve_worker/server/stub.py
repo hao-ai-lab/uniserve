@@ -124,7 +124,7 @@ class StubUniModel(UniModelBase):
             ),
             flow=FlowSpec(
                 latent_downsample=self.latent_downsample,
-                prediction=self.velocity_parameterization(),
+                prediction="velocity",
                 schedule_direction="ascending",
                 schedule_shift_domain="time",
             ),

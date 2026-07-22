@@ -120,9 +120,6 @@ class UniModel(ABC):
         if state is not None:
             state.latent = latent
 
-    def velocity_parameterization(self) -> str:
-        return "velocity"
-
     def encode_image(self, pixels: Any = None, grid: Any = None, *, ctx: "EncodeContext") -> Any:
         raise invalid_descriptor("encode-capable model must implement encode_image()")
 

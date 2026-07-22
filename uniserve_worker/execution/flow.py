@@ -18,6 +18,7 @@ import torch
 import uniserve_worker.ops as ops
 from uniserve_worker.contracts.attention_plan import GraphBinding, PagedVarlenPlan
 from uniserve_worker.contracts.forward_context import get_forward_context, use_forward_context
+from uniserve_worker.contracts.model_spec import FlowSpec
 from uniserve_worker.execution.graph.capture import Event, FailureManagedRunner
 from uniserve_worker.execution.sequence import SequenceCache
 from uniserve_worker.foundation.errors import invalid_descriptor, model_execution_error
@@ -123,6 +124,31 @@ def combine_flow_velocity(
     outputs: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
     return flow_cfg_plan(step).combine(outputs)
+
+
+def resolve_flow_spec(model: Any) -> FlowSpec | None:
+    """The flow semantics the model's ``ModelSpec`` declares, if any."""
+    spec = model.model_spec()
+    return spec.flow if spec is not None else None
+
+
+def schedule_from_flow_spec(
+    flow: FlowSpec,
+    *,
+    num_steps: int,
+    shift: float,
+) -> FlowMatchSchedule:
+    """Build the flow-matching schedule declared by one ``FlowSpec``.
+
+    ``num_steps`` and ``shift`` are per-request values; direction and shift
+    domain are declarative model identity.
+    """
+    return FlowMatchSchedule(
+        num_steps=int(num_steps),
+        shift=float(shift),
+        direction=ScheduleDirection(flow.schedule_direction),
+        shift_domain=ScheduleShiftDomain(flow.schedule_shift_domain),
+    )
 
 
 class _GraphBackendUnplanned(RuntimeError):
@@ -960,16 +986,10 @@ class FlowAdapter(Protocol):
     # Collaborator attributes.
     device: Any
     gen_device: Any
-    latent_downsample: int
     merge_size: int
     _img_start_token: str
     residency: Any  # ResidencyManager; .latent backs FlowState.x_t
     attention_backend: str  # preferred attention provider ("auto" allowed)
-
-    # Owner-supplied denoise configuration (models differ only by these enums).
-    denoise_schedule_direction: ScheduleDirection
-    denoise_schedule_shift_domain: ScheduleShiftDomain
-    denoise_cfg_recipe: CfgRecipe
 
     # Collaborator methods.
     def _state(self, op: dict[str, Any]) -> "ProgramState": ...
@@ -1030,15 +1050,23 @@ class FlowAdapter(Protocol):
 
 
 class FlowExecution:
-    """Implement flow setup, branch batching, velocity prediction, and updates."""
+    """Implement flow setup, branch batching, velocity prediction, and updates.
+
+    Schedule and CFG-recipe selection is system behavior resolved once at
+    composition from the declarative ``FlowSpec``; the adapter supplies only
+    neural computation and cache collaborators.
+    """
 
     def __init__(
         self,
         adapter: FlowAdapter,
         *,
+        flow: FlowSpec,
         transfer: ProductTransfer | None = None,
     ) -> None:
         self.adapter = adapter
+        self.flow = flow
+        self.cfg_recipe = CfgRecipe(flow.cfg_recipe)
         self.transfer = transfer
 
     @property
@@ -1066,8 +1094,8 @@ class FlowExecution:
         cond = self._setup_cfg_caches(st, op, params)
 
         adapter = self.adapter
-        token_h = params.height // adapter.latent_downsample
-        token_w = params.width // adapter.latent_downsample
+        token_h = params.height // self.flow.latent_downsample
+        token_w = params.width // self.flow.latent_downsample
         patch_size = adapter.image_patch_size()
         grid_h = params.height // patch_size
         grid_w = params.width // patch_size
@@ -1076,11 +1104,10 @@ class FlowExecution:
             st, cond, token_h, token_w, device
         )
 
-        schedule = FlowMatchSchedule(
+        schedule = schedule_from_flow_spec(
+            self.flow,
             num_steps=params.steps,
             shift=params.timestep_shift,
-            direction=adapter.denoise_schedule_direction,
-            shift_domain=adapter.denoise_schedule_shift_domain,
         )
         timesteps = schedule.timesteps(device=device)
         grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
@@ -1129,7 +1156,10 @@ class FlowExecution:
         return image_state
 
     def _parse_image_params(self, ip: dict) -> _ImageParams:
-        return parse_text_image_generation_params(ip)
+        return parse_text_image_generation_params(
+            ip,
+            timestep_shift_default=self.flow.timestep_shift,
+        )
 
     def _setup_cfg_caches(
         self,
@@ -1162,7 +1192,7 @@ class FlowExecution:
         cfg_plan = build_flow_cfg_plan(
             cfg_text_scale=params.cfg_text,
             cfg_img_scale=params.cfg_img,
-            recipe=self.adapter.denoise_cfg_recipe,
+            recipe=self.cfg_recipe,
             renorm=params.cfg_norm,
             renorm_min=params.cfg_renorm_min,
         )
@@ -1255,7 +1285,7 @@ class FlowExecution:
         device = getattr(adapter, "gen_device", adapter.device)
         t, t_next = img.schedule.pair(step_i, device=device, dtype=img.timesteps.dtype)
         start = ctx.component_timer_start()
-        z = patchify_batch(img.x_t, adapter.latent_downsample)
+        z = patchify_batch(img.x_t, self.flow.latent_downsample)
         image_input = patchify_batch(
             img.x_t,
             adapter.image_patch_size(),
@@ -1305,7 +1335,7 @@ class FlowExecution:
             cfg_renorm_type=img.cfg_norm,
             cfg_renorm_min=img.cfg_renorm_min,
             cfg_branch_count=flow_cfg_branch_count(op),
-            image_scale_applies_to_text=adapter.denoise_cfg_recipe,
+            image_scale_applies_to_text=self.cfg_recipe,
             extra={
                 "img": img,
                 "image_embeds": image_embeds,
@@ -1489,7 +1519,7 @@ class FlowExecution:
         img = step.extra["img"]
         img.x_t = unpatchify_batch(
             latent,
-            self.adapter.latent_downsample,
+            self.flow.latent_downsample,
             height=img.height,
             width=img.width,
         )

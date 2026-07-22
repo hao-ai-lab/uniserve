@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from uniserve_worker.contracts.model_spec import FlowSpec
 from uniserve_worker.execution.flow import FlowExecution
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.runtime.image_params import parse_text_image_generation_params
@@ -25,7 +26,15 @@ def test_commit_attention_mask_blocks_image_tokens_from_end_marker_only():
 
 
 def test_image_params_preserve_zero_cfg_values_and_reject_zero_steps():
-    ops = FlowExecution(SimpleNamespace())
+    ops = FlowExecution(
+        SimpleNamespace(),
+        flow=FlowSpec(
+            latent_downsample=16,
+            prediction="velocity",
+            schedule_direction="ascending",
+            schedule_shift_domain="sigma",
+        ),
+    )
 
     params = ops._parse_image_params(
         {
