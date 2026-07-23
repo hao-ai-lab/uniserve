@@ -771,6 +771,23 @@ class KvStore:
             raise invalid_descriptor("published KV locator count does not match cache layers")
         from .transfer import Locator, fetch_locator
 
+        with self._lock:
+            resident = self.get(session_id)
+            if resident.group_id != snapshot.group_id:
+                raise invalid_descriptor("published KV group does not match the local session")
+            if (
+                resident.length == snapshot.kv_tokens
+                and tuple(resident.block_ids) == tuple(snapshot.block_ids)
+            ):
+                # Flow conditioning is re-published on every denoise step, but it
+                # is fixed across an image's steps. Once the session entry already
+                # holds exactly these blocks and tokens, re-fetching over the
+                # transport and re-copying the KV block-by-block is pure waste
+                # (it dominated the travel workload). The entry is unchanged, so
+                # there is nothing to write and nothing to roll back -- skip the
+                # fetch, the copy, and the per-block rollback snapshot entirely.
+                return
+
         tensors: list[tuple[torch.Tensor, torch.Tensor]] = []
         for layer in range(self.pool.num_layers):
             key = fetch_locator(transport, Locator.from_wire_json(snapshot.locators[2 * layer]))
