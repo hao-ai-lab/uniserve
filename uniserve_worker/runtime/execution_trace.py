@@ -108,7 +108,13 @@ class ExecutionTrace:
         )
         with self._lock:
             self._events.append(event)
-        logger.info("model execution phase", extra={"execution_event": event.to_wire()})
+        # One record per execution phase runs tens of thousands of times in a
+        # single multi-image request, so emit the wire trace only when DEBUG is
+        # actually enabled. The guard also skips the ``to_wire`` serialization,
+        # keeping this off the hot path at the default INFO level. The in-memory
+        # trace above remains the durable record.
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("model execution phase", extra={"execution_event": event.to_wire()})
         return event
 
     def snapshot(self) -> tuple[ExecutionEvent, ...]:
