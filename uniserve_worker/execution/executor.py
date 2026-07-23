@@ -2717,6 +2717,28 @@ def _sample_one_from_logits(
 
     if logits.ndim != 1 or not logits.is_floating_point() or int(logits.numel()) < 1:
         raise invalid_descriptor("sampling logits must be a non-empty floating vector")
+    wants_logprobs_out = (
+        parameters.return_logprobs
+        or int(n_logprobs) > 0
+        or bool(parameters.logprob_token_ids)
+    )
+    greedy_unshaped = (
+        parameters.temperature <= 0.0
+        and not allowed
+        and not suppress
+        and not parameters.logit_bias
+        and parameters.repetition_penalty == 1.0
+        and parameters.frequency_penalty == 0.0
+        and parameters.presence_penalty == 0.0
+    )
+    if greedy_unshaped and not wants_logprobs_out:
+        # Pure-greedy fast path. With temperature<=0 and no biasing/penalty/
+        # masking policy, the shaping chain leaves the argmax unchanged
+        # (top-k/top-p/min-p never mask the maximum), so skip the full-vocab
+        # float clone and reduction chain -- including its per-token host-sync
+        # NaN guard -- and read the argmax directly. This is the dominant
+        # temperature-0 decode path (e.g. the travel workflow's text spans).
+        return _TokenSample(int(torch.argmax(logits).item()), None, None)
     work = logits.float().clone()
     vocab = int(work.numel())
     temperature = _shape_sampling_logits(
