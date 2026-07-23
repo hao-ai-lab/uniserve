@@ -968,7 +968,7 @@ mod tests {
     use crate::ModalityPolicy;
     use crate::text::tokenizer::{DynTokenizer, Tokenizer};
     use base64::Engine as _;
-    use uniserve_core::OpKind;
+    use uniserve_core::OperationType;
     use uniserve_model_profile::dialect::resolve_generation_dialect_for_model;
 
     use super::*;
@@ -1042,14 +1042,14 @@ mod tests {
 
     fn test_capabilities() -> GenerationRuntimeCapabilities {
         GenerationRuntimeCapabilities {
-            supported_ops: vec![
-                OpKind::PrefillUnd,
-                OpKind::DecodeUnd,
-                OpKind::VaeEncode,
-                OpKind::VitEncode,
-                OpKind::DenoiseGen,
-                OpKind::CommitGen,
-                OpKind::CommitWriteback,
+            supported_operation_types: vec![
+                OperationType::SequenceExtend,
+                OperationType::SequenceDecode,
+                OperationType::EncodeLatent,
+                OperationType::EncodeVision,
+                OperationType::Flow,
+                OperationType::MaterializeImage,
+                OperationType::TransferKv,
             ],
             max_latent_units: 65_536,
             latent_downsample: 16,
@@ -1358,7 +1358,7 @@ mod tests {
             !inline_request
                 .behavior
                 .required_operations(&inline_request.policy, std::iter::empty())
-                .contains(&OpKind::CommitWriteback)
+                .contains(&OperationType::TransferKv)
         );
 
         let mut separate = test_capabilities();
@@ -1387,7 +1387,7 @@ mod tests {
             separate_request
                 .behavior
                 .required_operations(&separate_request.policy, std::iter::empty())
-                .contains(&OpKind::CommitWriteback)
+                .contains(&OperationType::TransferKv)
         );
 
         let mut unsupported = test_capabilities();

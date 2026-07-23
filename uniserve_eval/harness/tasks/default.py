@@ -39,7 +39,7 @@ class DefaultTask(BenchmarkTask):
 
         image_config = dict(image)
         if item.get("aspect_ratio") is not None:
-            image_config["aspect_ratio"] = str(item["aspect_ratio"])
+            image_config["resolution"] = str(item["aspect_ratio"])
         payload: dict[str, Any] = {
             "model": self.spec.model,
             "stream": True,

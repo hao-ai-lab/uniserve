@@ -401,9 +401,8 @@ mod tests {
     use llm_multimodal::ImageDetail;
     use serde_json::json;
     use uniserve_openai_types::{
-        AssistantRole, ChatCompletionMessage, ChatCompletionRequest, ChatMessage, ContentPart,
-        Function, FunctionCallResponse, ImageUrl, MessageContent, Tool, ToolCall, ToolChoice,
-        ToolChoiceValue, VideoUrl,
+        ChatCompletionRequest, ChatMessage, ContentPart, Function, FunctionCallResponse, ImageUrl,
+        MessageContent, Tool, ToolCall, ToolChoice, ToolChoiceValue, VideoUrl,
     };
     use uniserve_serving::chat::{
         AssistantContentBlock, AssistantToolCall, ChatContentPart,
@@ -809,20 +808,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_chat_request_accepts_assistant_reasoning_history() {
-        let message = ChatCompletionMessage {
-            role: AssistantRole,
-            content: Some("answer".to_string()),
-            tool_calls: None,
-            reasoning: Some("inner".to_string()),
-            images: None,
-        };
-        let message_json = serde_json::to_value(message).expect("message serializes");
-
+    fn prepare_chat_request_preserves_assistant_reasoning_history() {
         let request = ChatCompletionRequest {
-            messages: vec![
-                serde_json::from_value(message_json).expect("response message is valid history"),
-            ],
+            messages: vec![ChatMessage::Assistant {
+                content: Some(MessageContent::Text("answer".to_string())),
+                name: None,
+                tool_calls: None,
+                reasoning: Some("inner".to_string()),
+            }],
             add_generation_prompt: Some(false),
             ..base_request()
         };
@@ -848,40 +841,6 @@ mod tests {
         assert_eq!(
             *chat_context(&prepared.serve_request).3,
             ChatToolChoice::Auto
-        );
-    }
-
-    #[test]
-    fn prepare_chat_request_accepts_reasoning_content_alias() {
-        let request = ChatCompletionRequest {
-            messages: vec![
-                serde_json::from_value(json!({
-                    "role": "assistant",
-                    "content": "answer",
-                    "reasoning_content": "inner",
-                }))
-                .expect("reasoning_content alias is accepted"),
-            ],
-            add_generation_prompt: Some(false),
-            ..base_request()
-        };
-
-        let prepared = prepare_chat_request(
-            request,
-            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
-            ResolvedRequestContext::default(),
-        )
-        .expect("request is valid");
-        assert_eq!(
-            chat_context(&prepared.serve_request).0,
-            vec![UniserveChatMessage::assistant_blocks(vec![
-                AssistantContentBlock::Reasoning {
-                    text: "inner".to_string(),
-                },
-                AssistantContentBlock::Text {
-                    text: "answer".to_string(),
-                },
-            ])]
         );
     }
 

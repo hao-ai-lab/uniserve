@@ -40,7 +40,6 @@ use zeromq::prelude::{Socket, SocketRecv, SocketSend};
 use zeromq::util::PeerIdentity;
 use zeromq::{DealerSocket, PushSocket, SocketOptions, ZmqMessage};
 
-use uniserve_core::ModelDtype;
 use uniserve_engine_runtime::{EngineCore, EngineCoreConfig};
 use uniserve_engine_wire::generation::GenerationControlTokens;
 use uniserve_engine_wire::handshake::EngineCoreReadyResponse;
@@ -89,18 +88,13 @@ fn apply_generation_controls(config: &mut EngineCoreConfig, ctrl: &GenerationCon
     }
 }
 
-fn model_dtype(core: &EngineCore) -> ModelDtype {
-    // shared kv_dtype-alias parser (see `ModelDtype::from_kv_str`).
-    ModelDtype::from_kv_str(core.caps().kv_dtype.as_str())
-}
-
 fn ready_response(core: &EngineCore) -> EngineCoreReadyResponse {
     let caps = core.caps();
     EngineCoreReadyResponse {
         max_model_len: core.max_model_len() as u64,
         num_gpu_blocks: caps.num_blocks as u64,
         dp_stats_address: None,
-        dtype: model_dtype(core),
+        dtype: core.model_dtype(),
         uniserve_version: env!("CARGO_PKG_VERSION").to_string(),
         generation_capabilities: core.generation_capabilities(),
     }

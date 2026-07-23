@@ -4,49 +4,128 @@
 //! turns it into worker ops. They are data-only: no channels, worker handles,
 //! scheduler state, or model-local logic belongs here.
 
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
 use crate::Modality;
 use crate::{ImageParams, ImageParamsError, RequestId, SamplingParams, SamplingParamsError};
 
-/// Closed worker operation taxonomy shared by capability advertisement,
-/// scheduling, and the worker wire protocol.
+/// Top-level member of the closed execution operation algebra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum OpKind {
-    PrefillUnd,
-    DecodeUnd,
-    TargetVerifyUnd,
-    DenoiseGen,
-    CommitGen,
-    CommitWriteback,
-    VaeEncode,
-    VitEncode,
-    Sample,
-    EncodeFrame,
+pub enum OperationKind {
+    Sequence,
+    Flow,
+    Encode,
+    Materialize,
+    Transfer,
 }
 
-impl OpKind {
+impl OperationKind {
+    pub const ALL: [Self; 5] = [
+        Self::Sequence,
+        Self::Flow,
+        Self::Encode,
+        Self::Materialize,
+        Self::Transfer,
+    ];
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceMode {
+    Extend,
+    Decode,
+    Verify,
+    Sample,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncodeKind {
+    Vision,
+    Latent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializeKind {
+    Image,
+    Frame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferKind {
+    Product,
+    Kv,
+}
+
+/// Complete discriminator used for capability negotiation and routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationType {
+    SequenceExtend,
+    SequenceDecode,
+    SequenceVerify,
+    SequenceSample,
+    Flow,
+    EncodeVision,
+    EncodeLatent,
+    MaterializeImage,
+    MaterializeFrame,
+    TransferProduct,
+    TransferKv,
+}
+
+impl OperationType {
+    pub const ALL: [Self; 11] = [
+        Self::SequenceExtend,
+        Self::SequenceDecode,
+        Self::SequenceVerify,
+        Self::SequenceSample,
+        Self::Flow,
+        Self::EncodeVision,
+        Self::EncodeLatent,
+        Self::MaterializeImage,
+        Self::MaterializeFrame,
+        Self::TransferProduct,
+        Self::TransferKv,
+    ];
+
+    pub const fn kind(self) -> OperationKind {
+        match self {
+            Self::SequenceExtend
+            | Self::SequenceDecode
+            | Self::SequenceVerify
+            | Self::SequenceSample => OperationKind::Sequence,
+            Self::Flow => OperationKind::Flow,
+            Self::EncodeVision | Self::EncodeLatent => OperationKind::Encode,
+            Self::MaterializeImage | Self::MaterializeFrame => OperationKind::Materialize,
+            Self::TransferProduct | Self::TransferKv => OperationKind::Transfer,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::PrefillUnd => "prefill_und",
-            Self::DecodeUnd => "decode_und",
-            Self::TargetVerifyUnd => "target_verify_und",
-            Self::DenoiseGen => "denoise_gen",
-            Self::CommitGen => "commit_gen",
-            Self::CommitWriteback => "commit_writeback",
-            Self::VaeEncode => "vae_encode",
-            Self::VitEncode => "vit_encode",
-            Self::Sample => "sample",
-            Self::EncodeFrame => "encode_frame",
+            Self::SequenceExtend => "sequence_extend",
+            Self::SequenceDecode => "sequence_decode",
+            Self::SequenceVerify => "sequence_verify",
+            Self::SequenceSample => "sequence_sample",
+            Self::Flow => "flow",
+            Self::EncodeVision => "encode_vision",
+            Self::EncodeLatent => "encode_latent",
+            Self::MaterializeImage => "materialize_image",
+            Self::MaterializeFrame => "materialize_frame",
+            Self::TransferProduct => "transfer_product",
+            Self::TransferKv => "transfer_kv",
         }
     }
 }
 
-impl std::fmt::Display for OpKind {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for OperationType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
 }
@@ -464,30 +543,30 @@ impl GenerationBehaviorDescriptor {
         &self,
         policy: &GenerationPolicyDescriptor,
         context_image_steps: impl IntoIterator<Item = ImageIngestStep>,
-    ) -> Vec<OpKind> {
-        let mut operations = vec![OpKind::PrefillUnd];
+    ) -> Vec<OperationType> {
+        let mut operations = vec![OperationType::SequenceExtend];
         if self.und_decode {
-            operations.push(OpKind::DecodeUnd);
+            operations.push(OperationType::SequenceDecode);
         }
         for step in context_image_steps {
             operations.push(match step {
-                ImageIngestStep::VaeEncode => OpKind::VaeEncode,
-                ImageIngestStep::VitEncode => OpKind::VitEncode,
+                ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
+                ImageIngestStep::VitEncode => OperationType::EncodeVision,
             });
         }
         if self.gen_output {
-            operations.extend([OpKind::DenoiseGen, OpKind::CommitGen]);
+            operations.extend([OperationType::Flow, OperationType::MaterializeImage]);
         }
         if self.generated_image_feedback
             && let Some(feedback) = &policy.feedback
         {
             if feedback.commit == CommitRecipe::CommitGenThenWriteback {
-                operations.push(OpKind::CommitWriteback);
+                operations.push(OperationType::TransferKv);
             }
             if let FeedbackWriteback::Reingest { ingest } = &feedback.writeback {
                 operations.extend(ingest.steps.iter().map(|step| match step {
-                    ImageIngestStep::VaeEncode => OpKind::VaeEncode,
-                    ImageIngestStep::VitEncode => OpKind::VitEncode,
+                    ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
+                    ImageIngestStep::VitEncode => OperationType::EncodeVision,
                 }));
             }
         }
@@ -528,11 +607,11 @@ pub struct GenerationResourceBounds {
 /// Generated-image commit shapes executable on a runtime topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GeneratedImageCommitCapabilities {
-    /// `commit_gen` appends generated-image KV on the same worker.
+    /// Image materialization appends generated-image KV on the same worker.
     #[serde(default)]
     pub inline: bool,
-    /// `commit_gen` publishes a locator and `commit_writeback` appends KV on a
-    /// distinct worker pool.
+    /// Image materialization publishes a locator and a transfer appends KV on
+    /// a distinct worker pool.
     #[serde(default)]
     pub separate_writeback: bool,
 }
@@ -549,7 +628,7 @@ impl GeneratedImageCommitCapabilities {
 /// Worker and scheduler limits needed to compile a bounded generation graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct GenerationRuntimeCapabilities {
-    pub supported_ops: Vec<OpKind>,
+    pub supported_operation_types: Vec<OperationType>,
     pub max_latent_units: u64,
     pub latent_downsample: u32,
     pub max_vae_grid_tokens: u32,
@@ -565,8 +644,8 @@ pub struct GenerationRuntimeCapabilities {
 }
 
 impl GenerationRuntimeCapabilities {
-    pub fn supports(&self, operation: OpKind) -> bool {
-        self.supported_ops.contains(&operation)
+    pub fn supports(&self, operation: OperationType) -> bool {
+        self.supported_operation_types.contains(&operation)
     }
 }
 
@@ -1276,14 +1355,14 @@ mod tests {
 
     fn runtime_capabilities() -> GenerationRuntimeCapabilities {
         GenerationRuntimeCapabilities {
-            supported_ops: vec![
-                OpKind::PrefillUnd,
-                OpKind::DecodeUnd,
-                OpKind::VaeEncode,
-                OpKind::VitEncode,
-                OpKind::DenoiseGen,
-                OpKind::CommitGen,
-                OpKind::CommitWriteback,
+            supported_operation_types: vec![
+                OperationType::SequenceExtend,
+                OperationType::SequenceDecode,
+                OperationType::EncodeLatent,
+                OperationType::EncodeVision,
+                OperationType::Flow,
+                OperationType::MaterializeImage,
+                OperationType::TransferKv,
             ],
             max_latent_units: 4_096,
             latent_downsample: 16,
@@ -1475,7 +1554,11 @@ mod tests {
         assert!(immediate.finish_after_gen_commit);
         assert_eq!(
             immediate.required_operations(&immediate_policy, []),
-            vec![OpKind::PrefillUnd, OpKind::DenoiseGen, OpKind::CommitGen,]
+            vec![
+                OperationType::SequenceExtend,
+                OperationType::Flow,
+                OperationType::MaterializeImage,
+            ]
         );
     }
 

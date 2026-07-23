@@ -7,6 +7,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ...forward import ForwardContext
+from ..layer import LayerSpec
 from ..linear import LinearBase
 from .encoder import VisionEncoder, VisionEncoderConfig
 from .patching import patchify_batch
@@ -39,7 +41,7 @@ SIGLIP_SO400M = SiglipNavitConfig()
 class SiglipNavitEncoder(nn.Module):
     """Linear-patch, learned-absolute-position NaViT encoder."""
 
-    def __init__(self, cfg: SiglipNavitConfig) -> None:
+    def __init__(self, cfg: SiglipNavitConfig, *, spec: LayerSpec) -> None:
         super().__init__()
         self.patch_size = int(cfg.patch_size)
         hidden = int(cfg.hidden_size)
@@ -51,7 +53,10 @@ class SiglipNavitEncoder(nn.Module):
         self.num_channels = int(cfg.num_channels)
         self.max_num_patch_per_side = image_size // self.patch_size
         self.patch_embedding = LinearBase(
-            self.num_channels * self.patch_size * self.patch_size, hidden, bias=True
+            self.num_channels * self.patch_size * self.patch_size,
+            hidden,
+            spec=spec,
+            bias=True,
         )
         self.position_embedding = nn.Embedding(self.max_num_patch_per_side**2, hidden)
         self.encoder = VisionEncoder(
@@ -61,13 +66,19 @@ class SiglipNavitEncoder(nn.Module):
                 intermediate_size=intermediate,
                 num_hidden_layers=layers,
                 layer_norm_eps=eps,
-            )
+            ),
+            spec=spec,
         )
 
-    def forward(self, pixels: torch.Tensor, grid: Any | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        pixels: torch.Tensor,
+        grid: Any,
+        context: ForwardContext,
+    ) -> torch.Tensor:
         packed, pos_ids, cu_seqlens = self._pack_inputs(pixels, grid)
         x = self.patch_embedding(packed) + self.position_embedding(pos_ids)
-        return self.encoder(x, cu_seqlens)
+        return self.encoder(x, context, cu_seqlens)
 
     def _pack_inputs(self, pixels: torch.Tensor, grid: Any | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if isinstance(grid, dict):

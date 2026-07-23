@@ -5,21 +5,32 @@ embeds tokens, runs the decoder stack (single-axis RoPE via
 ``RotaryEmbedding.cos_sin_1d``, full ``head_dim`` QK-norm, the fused
 QK-norm+RoPE kernel), and calls :class:`RadixAttention` per layer. It owns **no**
 KV pool, builds **no** attention metadata, captures **no** CUDA graphs, and never
-advances KV length — the worker runtime (``ResidencyManager`` /
-``ForwardBatchBuilder`` / the system attention plan / the CUDA-graph runner /
-the sampler) owns all of that. The model only *declares* its KV geometry via
-:meth:`kv_cache_spec` so the system can own the pool.
+advances KV length. The executor, runner, and stores own those behaviors, while
+the immutable model spec declares KV geometry.
 """
 
 from __future__ import annotations
 
-import logging
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import cast
 
 import torch
 
-import uniserve_worker.ops as ops
+from ..forward import (
+    ForwardBatch,
+    ForwardContext,
+    ForwardOutput,
+    TokenEmbeddings,
+    TokenHidden,
+    TokenIds,
+    TokenLogits,
+    TokenOutput,
+    TokenRow,
+    TokenSegments,
+    TokenSelection,
+)
 
 __all__ = [
     "Qwen3Attention",
@@ -30,22 +41,11 @@ __all__ = [
     "Qwen3ForCausalLM",
 ]
 
-if TYPE_CHECKING:
-    from ..contracts.forward_batch import ForwardBatch
 import torch.nn as nn
 
-from ..contracts.model_spec import CacheSpec, InputSpec, ModelSpec, RouteSpec
-from ..contracts.resource_plan import CapsDescriptor, KvBlockResourcePolicy, ResourcePlan
-from ..foundation.runtime_config import get_execution_config
-from ..foundation.sizing import (
-    DEFAULT_BLOCK_SIZE,
-    DEFAULT_MAX_BATCH_OPS,
-    derive_num_blocks,
-    derive_runtime_kv_capacity,
-)
-from ..loader.weight_spec import StackedParamMapping, WeightSpec
 from ..nn import (
     FusedMoE,
+    LayerSpec,
     LinearBase,
     ParallelLMHead,
     QKVParallelLinear,
@@ -53,66 +53,163 @@ from ..nn import (
     RMSNorm,
     RowParallelLinear,
     VocabParallelEmbedding,
-    get_current_mesh,
     get_rope,
+    local_attention_head_count,
     local_kv_head_count,
+    qk_norm_rope,
 )
 from ..nn.decoder import Qwen3MLP
 from ..nn.logits import LogitsProcessor
-from ..nn.quant import (
-    QuantizationConfig,
-    kv_cache_bytes_per_token,
-    use_quantization_config,
+from ..spec import (
+    CacheSpec,
+    InputSpec,
+    ModelSpec,
+    OperationSpec,
+    OperationStageSpec,
+    OperationType,
+    RouteOutputKind,
+    RoutePlacement,
+    RouteRowKind,
+    RouteShape,
+    RouteSpec,
+    Stack,
+    WeightSpec,
 )
-from ..runtime.compile import CompileTarget
-from ..runtime.residency import KvCacheSpec
-from .catalog import UniModelBase
-
-logger = logging.getLogger(__name__)
 
 
-def _cfg(config: Any | None) -> SimpleNamespace:
-    if isinstance(config, SimpleNamespace):
-        cfg = config
-    elif isinstance(config, dict):
-        cfg = SimpleNamespace(**config)
-    else:
-        values = {
-            name: getattr(config, name)
-            for name in dir(config or object())
-            if not name.startswith("_") and not callable(getattr(config, name, None))
-        }
-        cfg = SimpleNamespace(**values)
-    cfg.vocab_size = int(getattr(cfg, "vocab_size", 0))
-    cfg.hidden_size = int(getattr(cfg, "hidden_size", 4096))
-    cfg.intermediate_size = int(getattr(cfg, "intermediate_size", cfg.hidden_size * 4))
-    cfg.num_hidden_layers = int(getattr(cfg, "num_hidden_layers", 1))
-    cfg.num_attention_heads = int(getattr(cfg, "num_attention_heads", 1))
-    cfg.num_key_value_heads = int(getattr(cfg, "num_key_value_heads", cfg.num_attention_heads))
-    cfg.head_dim = int(getattr(cfg, "head_dim", cfg.hidden_size // max(1, cfg.num_attention_heads)))
-    cfg.hidden_act = str(getattr(cfg, "hidden_act", "silu"))
-    cfg.rms_norm_eps = float(getattr(cfg, "rms_norm_eps", 1e-6))
-    cfg.rope_theta = float(getattr(cfg, "rope_theta", 10000.0))
-    cfg.max_position_embeddings = int(getattr(cfg, "max_position_embeddings", 4096))
-    cfg.attention_bias = bool(getattr(cfg, "attention_bias", False))
-    cfg.tie_word_embeddings = bool(getattr(cfg, "tie_word_embeddings", False))
-    cfg.qk_norm_output_fp32 = bool(getattr(cfg, "qk_norm_output_fp32", False))
-    return cfg
+def _required_int(config: Mapping[str, object], name: str) -> int:
+    raw = config.get(name)
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        raise ValueError(f"Qwen3 config requires integer field {name!r}")
+    if raw <= 0:
+        raise ValueError(f"Qwen3 config field {name!r} must be positive")
+    return raw
 
 
-def _expert_cfg(cfg: SimpleNamespace, intermediate_size: int | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
+def _optional_int(
+    config: Mapping[str, object],
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+) -> int:
+    raw = config.get(name, default)
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < minimum:
+        raise ValueError(f"Qwen3 config field {name!r} must be an integer >= {minimum}")
+    return raw
+
+
+def _number(config: Mapping[str, object], name: str, default: float) -> float:
+    raw = config.get(name, default)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raise ValueError(f"Qwen3 config field {name!r} must be numeric")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"Qwen3 config field {name!r} must be finite and positive")
+    return value
+
+
+def _boolean(config: Mapping[str, object], name: str, default: bool) -> bool:
+    raw = config.get(name, default)
+    if not isinstance(raw, bool):
+        raise ValueError(f"Qwen3 config field {name!r} must be boolean")
+    return raw
+
+
+def _string(config: Mapping[str, object], name: str, default: str) -> str:
+    raw = config.get(name, default)
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"Qwen3 config field {name!r} must be a non-empty string")
+    return raw
+
+
+@dataclass(frozen=True, slots=True)
+class _QwenConfig:
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    hidden_act: str
+    rms_norm_eps: float
+    rope_theta: float
+    max_position_embeddings: int
+    attention_bias: bool
+    tie_word_embeddings: bool
+    num_experts: int
+    num_experts_per_tok: int
+    moe_intermediate_size: int
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, object]) -> "_QwenConfig":
+        hidden_size = _required_int(config, "hidden_size")
+        num_attention_heads = _required_int(config, "num_attention_heads")
+        if hidden_size % num_attention_heads:
+            raise ValueError("Qwen3 hidden_size must be divisible by num_attention_heads")
+        head_dim = _optional_int(
+            config,
+            "head_dim",
+            hidden_size // num_attention_heads,
+            minimum=1,
+        )
+        num_experts = _optional_int(config, "num_experts", 0, minimum=0)
+        num_experts_per_tok = _optional_int(config, "num_experts_per_tok", 1, minimum=1)
+        intermediate_size = _required_int(config, "intermediate_size")
+        cfg = cls(
+            vocab_size=_required_int(config, "vocab_size"),
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=_required_int(config, "num_hidden_layers"),
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=_required_int(config, "num_key_value_heads"),
+            head_dim=head_dim,
+            hidden_act=_string(config, "hidden_act", "silu"),
+            rms_norm_eps=_number(config, "rms_norm_eps", 1e-6),
+            rope_theta=_number(config, "rope_theta", 1_000_000.0),
+            max_position_embeddings=_optional_int(
+                config, "max_position_embeddings", 4096, minimum=1
+            ),
+            attention_bias=_boolean(config, "attention_bias", False),
+            tie_word_embeddings=_boolean(config, "tie_word_embeddings", False),
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            moe_intermediate_size=_optional_int(
+                config,
+                "moe_intermediate_size",
+                intermediate_size,
+                minimum=1,
+            ),
+        )
+        if cfg.head_dim <= 0 or cfg.max_position_embeddings <= 0:
+            raise ValueError("Qwen3 head_dim and max_position_embeddings must be positive")
+        if cfg.num_attention_heads % cfg.num_key_value_heads:
+            raise ValueError("Qwen3 attention heads must be divisible by KV heads")
+        if cfg.num_experts < 0 or cfg.num_experts_per_tok <= 0:
+            raise ValueError("Qwen3 expert counts must be non-negative and top-k must be positive")
+        if cfg.num_experts and cfg.num_experts_per_tok > cfg.num_experts:
+            raise ValueError("Qwen3 num_experts_per_tok must not exceed num_experts")
+        return cfg
+
+
+@dataclass(frozen=True, slots=True)
+class _MlpConfig:
+    hidden_size: int
+    intermediate_size: int
+
+
+def _expert_cfg(cfg: _QwenConfig, intermediate_size: int | None = None) -> _MlpConfig:
+    return _MlpConfig(
         hidden_size=cfg.hidden_size,
-        intermediate_size=int(
-            intermediate_size or getattr(cfg, "moe_intermediate_size", cfg.intermediate_size)
-        ),
+        intermediate_size=int(intermediate_size or cfg.moe_intermediate_size),
     )
 
 
 class Qwen3Attention(nn.Module):
     """Multi-head self-attention with QK-norm, RoPE, and paged KV via ``RadixAttention``."""
 
-    def __init__(self, cfg: SimpleNamespace, layer_id: int) -> None:
+    def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerSpec) -> None:
         super().__init__()
         self.total_num_heads = cfg.num_attention_heads
         self.total_num_kv_heads = cfg.num_key_value_heads
@@ -125,6 +222,7 @@ class Qwen3Attention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
+            spec=spec,
             bias=cfg.attention_bias,
         )
         self.q_size = int(self.qkv_proj.output_sizes[0])
@@ -133,7 +231,12 @@ class Qwen3Attention(nn.Module):
         self.num_kv_heads = self.kv_size // self.head_dim
         if self.num_heads <= 0 or self.num_kv_heads <= 0:
             raise ValueError("Qwen3 local attention heads must be positive")
-        self.o_proj = RowParallelLinear(self.total_q_size, cfg.hidden_size, bias=cfg.attention_bias)
+        self.o_proj = RowParallelLinear(
+            self.total_q_size,
+            cfg.hidden_size,
+            spec=spec,
+            bias=cfg.attention_bias,
+        )
         self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
         self.rope_theta = float(getattr(cfg, "rope_theta", 1000000.0))
@@ -144,7 +247,7 @@ class Qwen3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        forward_batch: "ForwardBatch",
+        context: ForwardContext,
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -155,7 +258,7 @@ class Qwen3Attention(nn.Module):
         batched = len(state_shape) == 2
         batched_decode = batched and int(state_shape[1]) == 1
         fused_prefill = self._try_fused_prefill(
-            qkv, state_shape, forward_batch, batched, cos, sin, positions
+            qkv, state_shape, context, batched, cos, sin, positions
         )
         if fused_prefill is not None:
             return fused_prefill
@@ -165,18 +268,17 @@ class Qwen3Attention(nn.Module):
         q_attn, k_attn, v_attn = self._attention_inputs(
             q, k, v, state_shape, batched_decode, batched
         )
-        out = self.attn(
-            q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale
-        )
+        out = self.attn(q_attn, k_attn, v_attn, context, causal=True, scale=self.scale)
         return self.o_proj(
-            self._restore_attention_output(out, state_shape, batched_decode, batched)
+            self._restore_attention_output(out, state_shape, batched_decode, batched),
+            context.mesh,
         )
 
     def _try_fused_prefill(
         self,
         qkv: torch.Tensor,
         state_shape: torch.Size,
-        forward_batch: "ForwardBatch",
+        context: ForwardContext,
         batched: bool,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -187,7 +289,7 @@ class Qwen3Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_attn = q.reshape(-1, self.num_heads, self.head_dim)
         k_attn = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        q_attn, k_attn = ops.qk_norm_rope(
+        q_attn, k_attn = qk_norm_rope(
             q_attn,
             k_attn,
             self.q_norm.weight,
@@ -195,15 +297,12 @@ class Qwen3Attention(nn.Module):
             cos,
             sin,
             self.q_norm.eps,
-            override=None,
         )
         v_attn = v.reshape(-1, self.num_kv_heads, self.head_dim)
         q_attn = q_attn.to(dtype=v_attn.dtype)
         k_attn = k_attn.to(dtype=v_attn.dtype)
-        out = self.attn(
-            q_attn, k_attn, v_attn, forward_batch, save_kv_cache=True, causal=True, scale=self.scale
-        )
-        return self.o_proj(out.reshape(*state_shape, self.q_size))
+        out = self.attn(q_attn, k_attn, v_attn, context, causal=True, scale=self.scale)
+        return self.o_proj(out.reshape(*state_shape, self.q_size), context.mesh)
 
     def _prepare_qk(
         self,
@@ -216,7 +315,7 @@ class Qwen3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q_heads = q.reshape(-1, self.num_heads, self.head_dim)
         k_heads = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        q, k = ops.qk_norm_rope(
+        q, k = qk_norm_rope(
             q_heads,
             k_heads,
             self.q_norm.weight,
@@ -275,31 +374,38 @@ class Qwen3Attention(nn.Module):
 class Qwen3MoE(nn.Module):
     """Mixture-of-experts feed-forward routed by a learned gate."""
 
-    def __init__(self, cfg: SimpleNamespace) -> None:
+    def __init__(self, cfg: _QwenConfig, *, spec: LayerSpec) -> None:
         super().__init__()
-        num_experts = int(getattr(cfg, "num_experts", 0) or 0)
-        top_k = int(getattr(cfg, "num_experts_per_tok", 1) or 1)
-        self.gate = LinearBase(cfg.hidden_size, num_experts, bias=False)
+        num_experts = cfg.num_experts
+        top_k = cfg.num_experts_per_tok
+        self.gate = LinearBase(cfg.hidden_size, num_experts, spec=spec, bias=False)
         expert_intermediate = int(
-            getattr(cfg, "moe_intermediate_size", cfg.intermediate_size) or cfg.intermediate_size
+            cfg.moe_intermediate_size or cfg.intermediate_size
         )
         self.experts = FusedMoE(
-            [Qwen3MLP(_expert_cfg(cfg, expert_intermediate)) for _ in range(num_experts)],
+            [
+                Qwen3MLP(_expert_cfg(cfg, expert_intermediate), spec=spec)
+                for _ in range(num_experts)
+            ],
             top_k=top_k,
             norm_topk_prob=True,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.experts(hidden_states, self.gate(hidden_states))
+    def forward(self, hidden_states: torch.Tensor, context: ForwardContext) -> torch.Tensor:
+        return self.experts(hidden_states, self.gate(hidden_states), context.mesh)
 
 
 class Qwen3DecoderLayer(nn.Module):
     """One transformer decoder layer (attention + MLP or MoE)."""
 
-    def __init__(self, cfg: SimpleNamespace, layer_id: int) -> None:
+    def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerSpec) -> None:
         super().__init__()
-        self.self_attn = Qwen3Attention(cfg, layer_id)
-        self.mlp = Qwen3MoE(cfg) if int(getattr(cfg, "num_experts", 0) or 0) > 0 else Qwen3MLP(cfg)
+        self.self_attn = Qwen3Attention(cfg, layer_id, spec=spec)
+        self.mlp = (
+            Qwen3MoE(cfg, spec=spec)
+            if cfg.num_experts > 0
+            else Qwen3MLP(cfg, spec=spec)
+        )
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
@@ -307,7 +413,7 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        forward_batch: "ForwardBatch",
+        context: ForwardContext,
         *,
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -322,23 +428,25 @@ class Qwen3DecoderLayer(nn.Module):
                 residual,
                 in_place=True,
             )
-        attn_out = self.self_attn(attn_in, forward_batch, cos=cos, sin=sin, positions=positions)
+        attn_out = self.self_attn(attn_in, context, cos=cos, sin=sin, positions=positions)
         mlp_in, residual = self.post_attention_layernorm.forward_with_residual(
             attn_out,
             residual,
             in_place=True,
         )
-        return self.mlp(mlp_in), residual
+        if isinstance(self.mlp, Qwen3MoE):
+            return self.mlp(mlp_in, context), residual
+        return self.mlp(mlp_in, context.mesh), residual
 
 
 class Qwen3Model(nn.Module):
     """Stack of Qwen3 decoder layers with token embeddings and final RMSNorm."""
 
-    def __init__(self, cfg: SimpleNamespace) -> None:
+    def __init__(self, cfg: _QwenConfig, *, spec: LayerSpec) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(cfg.vocab_size, cfg.hidden_size, spec=spec)
         self.layers = nn.ModuleList(
-            Qwen3DecoderLayer(cfg, idx) for idx in range(cfg.num_hidden_layers)
+            Qwen3DecoderLayer(cfg, idx, spec=spec) for idx in range(cfg.num_hidden_layers)
         )
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.rotary = get_rope(
@@ -351,11 +459,13 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        forward_batch: "ForwardBatch",
+        context: ForwardContext,
         *,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
+        hidden_states = (
+            input_embeds if input_embeds is not None else self.embed_tokens(input_ids, context.mesh)
+        )
         cos, sin = self.rotary.cos_sin_1d(positions.reshape(-1))
         residual = None
         for layer_module in self.layers:
@@ -363,7 +473,7 @@ class Qwen3Model(nn.Module):
             hidden_states, residual = layer(
                 hidden_states,
                 residual,
-                forward_batch,
+                context,
                 cos=cos,
                 sin=sin,
                 positions=positions,
@@ -374,264 +484,136 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(UniModelBase, nn.Module):
+class Qwen3ForCausalLM(nn.Module):
     """Qwen3 serving model with a thin tensor-level text core."""
 
-    family = "qwen3"
-    architectures = ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM")
-    supported_ops = ("prefill_und", "decode_und", "target_verify_und")
-    supported_controls: tuple[str, ...] = ()
-    adapter_mode = "none"
-    resource_plan = ResourcePlan(kv_block=KvBlockResourcePolicy.PER_BLOCK)
     weight_spec = WeightSpec(
-        stacked=(
-            StackedParamMapping("qkv_proj", "q_proj", "q"),
-            StackedParamMapping("qkv_proj", "k_proj", "k"),
-            StackedParamMapping("qkv_proj", "v_proj", "v"),
-            StackedParamMapping("gate_up_proj", "gate_proj", 0),
-            StackedParamMapping("gate_up_proj", "up_proj", 1),
+        transforms=(
+            Stack("qkv_proj", "q_proj", "q"),
+            Stack("qkv_proj", "k_proj", "k"),
+            Stack("qkv_proj", "v_proj", "v"),
+            Stack("gate_up_proj", "gate_proj", 0),
+            Stack("gate_up_proj", "up_proj", 1),
         ),
     )
 
-    def __init__(self, config: Any | None = None) -> None:
+    def __init__(self, config: Mapping[str, object], *, layer_spec: LayerSpec) -> None:
         super().__init__()
-        self.mesh = get_current_mesh()
-        self.config = _cfg(config)
-        if self.config.vocab_size <= 0:
-            raise ValueError("Qwen3 config must provide vocab_size")
-        # Derive the checkpoint quantization policy from the original HF config
-        # and enter it for layer construction so the model is self-contained.
-        self._quant_config = QuantizationConfig.from_model_config(config)
-        with use_quantization_config(self._quant_config):
-            self.model = Qwen3Model(self.config)
-            self.lm_head = ParallelLMHead(
-                self.config.hidden_size, self.config.vocab_size, bias=False
-            )
-        if self.config.tie_word_embeddings:
+        if not isinstance(config, Mapping):
+            raise TypeError("Qwen3 config must be a mapping")
+        cfg = _QwenConfig.from_mapping(config)
+        self._parallel = layer_spec.parallel
+        self.model = Qwen3Model(cfg, spec=layer_spec)
+        self.lm_head = ParallelLMHead(
+            cfg.hidden_size,
+            cfg.vocab_size,
+            spec=layer_spec,
+            bias=False,
+        )
+        if cfg.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits = LogitsProcessor()
-        self.num_layers = self.config.num_hidden_layers
-        self.head_dim = int(self.config.head_dim)
-        self.block_size = DEFAULT_BLOCK_SIZE
-        self.num_blocks = derive_num_blocks(self.block_size, None)
-        self.output_vocab_size: int | None = None
-        self.kv_cache_dtype = self._requested_kv_cache_dtype_for(self.config)
-        self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
+        self.num_layers = cfg.num_hidden_layers
+        self.head_dim = cfg.head_dim
+        self.spec = self._build_spec(cfg)
 
-    @property
-    def device(self) -> str:
-        return str(next(self.parameters()).device)
-
-    def model_spec(self) -> ModelSpec:
+    def _build_spec(self, cfg: _QwenConfig) -> ModelSpec:
         return ModelSpec(
-            architecture=self.architectures[0],
+            architecture="Qwen3ForCausalLM",
             routes=(
                 RouteSpec(
                     name="text",
-                    op_kinds=tuple(self.supported_ops),
-                    mixed=True,
+                    row_kinds=(RouteRowKind.TOKEN,),
+                    output_kinds=(RouteOutputKind.TOKEN,),
+                    mixed_combinations=(),
                     dtype="bfloat16",
+                    placement=RoutePlacement.PRIMARY,
+                    topology_axes=("tp",),
+                    shape=RouteShape(
+                        max_tokens_per_row=cfg.max_position_embeddings,
+                        token_multiple=1,
+                    ),
                     graph_eligible=True,
                 ),
             ),
+            operations=tuple(
+                OperationSpec(kind, (OperationStageSpec("text", RouteRowKind.TOKEN),))
+                for kind in (
+                    OperationType.SEQUENCE_EXTEND,
+                    OperationType.SEQUENCE_DECODE,
+                    OperationType.SEQUENCE_VERIFY,
+                )
+            ),
             weights=self.weight_spec,
-            inputs=InputSpec(requires_worker_tokenizer=True),
-            cache=CacheSpec.from_kv_geometry(self.kv_cache_spec()),
-        )
-
-    # -- system-managed residency: the model only *declares* its KV geometry --
-    def kv_cache_spec(self) -> KvCacheSpec:
-        param = next(self.parameters())
-        return KvCacheSpec(
-            num_layers=int(self.num_layers),
-            num_kv_heads=local_kv_head_count(int(self.config.num_key_value_heads)),
-            head_dim=int(self.config.head_dim),
-            dtype=param.dtype,
-            store_dtype=self._kv_store_dtype_for(param.dtype),
-        )
-
-    def _caps_descriptor(
-        self,
-        *,
-        block_size: int | None = None,
-        kv_token_capacity: int | None = None,
-    ) -> CapsDescriptor:
-        block_size = DEFAULT_BLOCK_SIZE if block_size is None else int(block_size)
-        num_blocks = self._runtime_num_blocks(
-            block_size=block_size,
-            kv_token_capacity=kv_token_capacity,
-            compute_dtype=torch.bfloat16,
-        )
-        return CapsDescriptor(
-            block_size=block_size,
-            num_blocks=num_blocks,
-            num_layers=int(self.num_layers),
-            scratch_capacity_tokens=0,
-            max_latent_size=0,
-            latent_downsample=1,
-            bytes_per_token=int(self._kv_bytes_per_token(torch.bfloat16)),
-            max_batch_ops=DEFAULT_MAX_BATCH_OPS,
-            kv_dtype=self._kv_dtype_name_for(torch.bfloat16),
-        )
-
-    def compile_targets(self) -> tuple[CompileTarget, ...]:
-        return (
-            CompileTarget(
-                label="qwen3.model",
-                module=self.model,
-                owner=self,
-                attr_name="model",
+            inputs=InputSpec(),
+            cache=CacheSpec(
+                num_layers=int(self.num_layers),
+                num_attention_heads=local_attention_head_count(
+                    cfg.num_attention_heads,
+                    parallel=self._parallel,
+                ),
+                num_kv_heads=local_kv_head_count(
+                    cfg.num_key_value_heads,
+                    parallel=self._parallel,
+                ),
+                head_dim=cfg.head_dim,
+                dtype="bfloat16",
             ),
         )
 
-    def configure_runtime(
-        self,
-        *,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        kv_token_capacity: int | None = None,
-        caps: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        del kwargs
-        self.block_size = int(block_size)
-        self.num_blocks = int(
-            (caps or {}).get("num_blocks")
-            or self._runtime_num_blocks(
-                block_size=block_size,
-                kv_token_capacity=kv_token_capacity,
-                compute_dtype=torch.bfloat16,
-            )
-        )
-        self.prepare_serving_dtype()
-
-    def configure_tokenizer(
-        self,
-        *,
-        model_path: str | None = None,
-        tokenizer_vocab_size: int | None = None,
-    ) -> None:
-        del model_path
-        if tokenizer_vocab_size is None:
-            self.output_vocab_size = None
-            return
-        size = int(tokenizer_vocab_size)
-        if 0 < size <= int(self.config.vocab_size):
-            self.output_vocab_size = size
-
-    def embed_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_tokens(input_ids)
-
     @torch.inference_mode()
-    def forward_text(self, forward_batch: "ForwardBatch") -> torch.Tensor:
-        """Run the decoder and return sampling logits for ``forward_batch``.
-
-        The attention plan + paged residency are resolved from the published
-        context (system-built); the model threads only ``forward_batch`` down to
-        :class:`RadixAttention`. Returns ``[batch, vocab]`` reduced to the last
-        token per row for extend/decode, or per-position logits for verify.
-        """
-
-        input_ids = forward_batch.input_ids
-        positions = forward_batch.positions
-        if input_ids is None or positions is None:
-            raise RuntimeError("Qwen3 text forward requires input ids and positions")
-        hidden = self.model(input_ids, positions, forward_batch)
-        return self.compute_logits(hidden, forward_batch)
-
-    def compute_logits(self, hidden: torch.Tensor, forward_batch: "ForwardBatch") -> torch.Tensor:
-        """Reduce decoder hidden states to logits for ``forward_batch``.
-
-        ``target_verify`` keeps every position's logits (the verifier slices per
-        row); extend/decode reduce to the last token per request — flat token
-        streams gather via ``last_token_indices``, rectangular batches take the
-        final column.
-        """
-
-        from ..contracts.forward_mode import ForwardMode
-
-        if (
-            forward_batch.forward_mode == ForwardMode.VERIFY_DRAFT
-            or forward_batch.return_all_logits
-        ):
-            return self.logits(hidden, self.lm_head, valid_vocab_size=self.output_vocab_size)
-        if hidden.ndim == 3:
-            last_hidden = hidden[:, -1, :]
-        else:
-            if forward_batch.last_token_indices is None:
-                raise RuntimeError("flat Qwen3 logits require last-token indices")
-            last_hidden = hidden.index_select(0, forward_batch.last_token_indices)
-        return self.logits(last_hidden, self.lm_head, valid_vocab_size=self.output_vocab_size)
-
-    def prepare_serving_dtype(self) -> None:
-        """Fold checkpoint-loaded float32 weights down to the bf16 serving dtype."""
-        try:
-            param = next(self.parameters())
-        except StopIteration:
-            return
-        if param.dtype == torch.float32:
-            if self._has_quantized_linear_modules():
-                self._cast_non_quantized_float32_parameters(torch.bfloat16)
-                return
-            self.to(dtype=torch.bfloat16)
-
-    def _has_quantized_linear_modules(self) -> bool:
-        for module in self.modules():
-            method = getattr(module, "quant_method", None)
-            if method is not None and method.is_quantized:
-                return True
-        return False
-
-    def _cast_non_quantized_float32_parameters(self, dtype: torch.dtype) -> None:
-        for param in self.parameters():
-            if param.dtype == torch.float32 and not bool(
-                getattr(param, "_uniserve_skip_serving_cast", False)
-            ):
-                param.data = param.data.to(dtype=dtype)
-
-    def _kv_bytes_per_token(self, compute_dtype: torch.dtype) -> int:
-        return kv_cache_bytes_per_token(
-            num_kv_heads=local_kv_head_count(int(self.config.num_key_value_heads)),
-            head_dim=self.config.head_dim,
-            num_layers=self.num_layers,
-            compute_dtype=compute_dtype,
-            store_dtype=self.kv_cache_dtype,
-        )
-
-    def query_geometry(self) -> tuple[int, float, "torch.dtype"]:
-        return self._query_geometry_from(self.model.layers[0].self_attn)
-
-    def _runtime_num_blocks(
-        self,
-        *,
-        block_size: int,
-        kv_token_capacity: int | None,
-        compute_dtype: torch.dtype,
-    ) -> int:
-        try:
-            param = next(self.parameters())
-            device = getattr(param, "device", None)
-        except StopIteration:
-            device = None
-        capacity = derive_runtime_kv_capacity(
-            block_size=block_size,
-            kv_token_capacity=kv_token_capacity,
-            bytes_per_token=self._kv_bytes_per_token(compute_dtype),
-            device=device,
-            memory_fraction=get_execution_config().kv_memory_fraction,
-        )
-        if capacity.cuda is not None:
-            logger.info(
-                "auto-sized Qwen3 KV pool",
-                extra={
-                    "device": capacity.cuda.device,
-                    "free_bytes": capacity.cuda.free_bytes,
-                    "total_bytes": capacity.cuda.total_bytes,
-                    "fraction": capacity.cuda.memory_fraction,
-                    "bytes_per_token": capacity.cuda.bytes_per_token,
-                    "block_size": capacity.cuda.block_size,
-                    "num_blocks": capacity.cuda.num_blocks,
-                    "token_capacity": capacity.cuda.token_capacity,
-                },
+    def forward(self, batch: ForwardBatch) -> ForwardOutput:
+        if any(not isinstance(row, TokenRow) for row in batch.rows):
+            raise TypeError("Qwen3 text route accepts TokenRow values only")
+        rows = cast(tuple[TokenRow, ...], batch.rows)
+        positions = torch.cat(tuple(row.positions.reshape(-1) for row in rows), dim=0)
+        if all(isinstance(row.inputs, TokenIds) for row in rows):
+            input_ids = torch.cat(
+                tuple(cast(TokenIds, row.inputs).values.reshape(-1) for row in rows),
+                dim=0,
             )
-        return capacity.num_blocks
+            hidden = self.model(input_ids, positions, batch.context)
+        else:
+            embeddings = tuple(self._row_embeddings(row, batch.context) for row in rows)
+            inputs = torch.cat(embeddings, dim=0)
+            placeholder = torch.zeros(inputs.shape[0], dtype=torch.long, device=inputs.device)
+            hidden = self.model(
+                placeholder,
+                positions,
+                batch.context,
+                input_embeds=inputs,
+            )
+        outputs: list[TokenOutput] = []
+        begin = 0
+        for row in rows:
+            count = int(row.positions.numel())
+            row_hidden = hidden[begin : begin + count]
+            begin += count
+            value: TokenHidden | TokenLogits
+            if row.selection is TokenSelection.HIDDEN:
+                value = TokenHidden(row_hidden)
+            elif row.selection is TokenSelection.ALL_LOGITS:
+                value = TokenLogits(self.logits(self.lm_head(row_hidden, batch.context.mesh)))
+            else:
+                value = TokenLogits(
+                    self.logits(self.lm_head(row_hidden[-1:].contiguous(), batch.context.mesh))
+                )
+            outputs.append(TokenOutput(row.row_id, row.output_slot, value))
+        return ForwardOutput(tuple(outputs))
 
+    def _row_embeddings(self, row: TokenRow, context: ForwardContext) -> torch.Tensor:
+        if isinstance(row.inputs, TokenEmbeddings):
+            return row.inputs.values.reshape(-1, row.inputs.values.shape[-1])
+        if isinstance(row.inputs, TokenIds):
+            return self.model.embed_tokens(row.inputs.values.reshape(-1), context.mesh)
+        if not isinstance(row.inputs, TokenSegments):
+            raise TypeError("Qwen3 token row has an unknown input variant")
+        return torch.cat(
+            tuple(
+                self.model.embed_tokens(segment.values.reshape(-1), context.mesh)
+                if isinstance(segment, TokenIds)
+                else segment.values.reshape(-1, segment.values.shape[-1])
+                for segment in row.inputs.values
+            ),
+            dim=0,
+        )

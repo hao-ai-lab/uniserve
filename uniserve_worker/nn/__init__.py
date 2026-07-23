@@ -3,9 +3,8 @@
 This barrel resolves its public names lazily (PEP 562 ``__getattr__``): importing
 ``uniserve_worker.nn`` does not eagerly pull the entire layer zoo (attention,
 decoder, vae, vision, moe, quant, ...) and its torch/backends dependencies. A
-name listed in ``__all__`` is imported from its owning submodule on first
-access, so ``from ..nn import LinearBase`` keeps working while a consumer that
-only needs one layer pays only for that submodule.
+    name listed in ``__all__`` is imported from its owning submodule on first
+    access, so canonical package imports load only the layer they use.
 """
 from __future__ import annotations
 
@@ -22,12 +21,8 @@ _EXPORTS: dict[str, str] = {
     # attention
     "RadixAttention": "attention",
     # decoder
-    "KVCache": "decoder",
     "MoTDecoderLayer": "decoder",
-    "MoTLayer": "decoder",
-    "MoTMLP": "decoder",
     "MoTModel": "decoder",
-    "Segment": "decoder",
     # linear
     "ColumnParallelLinear": "linear",
     "LinearBase": "linear",
@@ -36,18 +31,16 @@ _EXPORTS: dict[str, str] = {
     "local_attention_head_count": "linear",
     "local_kv_head_count": "linear",
     "RowParallelLinear": "linear",
-    "default_weight_loader": "linear",
+    # immutable layer construction
+    "LayerSpec": "layer",
     # logits
     "LogitsProcessor": "logits",
     # mesh (parallelism topology + transports)
     "DataPlaneTowerTransport": "mesh",
     "DeviceMesh": "mesh",
     "MeshAxis": "mesh",
+    "TensorParallelSpec": "mesh",
     "divide": "mesh",
-    "get_current_mesh": "mesh",
-    "reset_current_mesh": "mesh",
-    "set_current_mesh": "mesh",
-    "use_mesh": "mesh",
     # moe
     "FusedMoE": "moe",
     "TopK": "moe",
@@ -82,10 +75,9 @@ _EXPORTS: dict[str, str] = {
     "apply_rotary_emb": "rope",
     "apply_rotary_pos_emb": "rope",
     "get_rope": "rope",
+    "qk_norm_rope": "rope",
     "rotate_half": "rope",
     "try_triton_qk_rms_norm_rope": "rope",
-    # sampler
-    "Sampler": "sampler",
     # vae
     "AutoEncoder": "vae",
     "AutoEncoderParams": "vae",
@@ -114,15 +106,13 @@ __all__ = [
     "FusedMoE",
     "GeluAndMul",
     "HFRotaryEmbedding",
-    "KVCache",
     "LinearBase",
+    "LayerSpec",
     "LogitsProcessor",
     "MLPConnector",
     "MergedColumnParallelLinear",
     "MeshAxis",
     "MoTDecoderLayer",
-    "MoTLayer",
-    "MoTMLP",
     "MoTModel",
     "NeoVitEncoder",
     "Partial",
@@ -139,8 +129,6 @@ __all__ = [
     "RotaryEmbedding",
     "Router",
     "RowParallelLinear",
-    "Sampler",
-    "Segment",
     "Shard",
     "ShardPlan",
     "ShardSlot",
@@ -150,6 +138,7 @@ __all__ = [
     "SiglipNavitEncoder",
     "SiluAndMul",
     "TensorParallelMode",
+    "TensorParallelSpec",
     "TopK",
     "VisionEncoder",
     "VocabParallelEmbedding",
@@ -157,26 +146,22 @@ __all__ = [
     "apply_rotary_emb",
     "apply_rotary_pos_emb",
     "default_ae_params",
-    "default_weight_loader",
     "divide",
     "get_act_fn",
-    "get_current_mesh",
     "get_rope",
+    "qk_norm_rope",
     "get_shard_plan",
     "get_tower_coord",
     "pad_vocab_size",
     "place_partitioned_tensor",
     "place_towers",
-    "reset_current_mesh",
     "reshard",
     "rotate_half",
-    "set_current_mesh",
     "set_shard_plan",
     "set_tower_coord",
     "shard_spec",
     "try_triton_qk_rms_norm",
     "try_triton_qk_rms_norm_rope",
-    "use_mesh",
 ]
 
 # Single-source-of-truth guard: the lazy resolver map and the advertised surface
@@ -201,25 +186,22 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager cost
     from .activation import GeluAndMul, SiluAndMul, get_act_fn
     from .attention import RadixAttention
-    from .decoder import KVCache, MoTDecoderLayer, MoTLayer, MoTMLP, MoTModel, Segment
+    from .decoder import MoTDecoderLayer, MoTModel
+    from .layer import LayerSpec
     from .linear import (
         ColumnParallelLinear,
         LinearBase,
         MergedColumnParallelLinear,
         QKVParallelLinear,
         RowParallelLinear,
-        default_weight_loader,
     )
     from .logits import LogitsProcessor
     from .mesh import (
         DataPlaneTowerTransport,
         DeviceMesh,
         MeshAxis,
+        TensorParallelSpec,
         divide,
-        get_current_mesh,
-        reset_current_mesh,
-        set_current_mesh,
-        use_mesh,
     )
     from .moe import FusedMoE, TopK
     from .norm import RMSNorm, try_triton_qk_rms_norm
@@ -252,10 +234,10 @@ if TYPE_CHECKING:  # let type-checkers see the concrete exports without eager co
         apply_rotary_emb,
         apply_rotary_pos_emb,
         get_rope,
+        qk_norm_rope,
         rotate_half,
         try_triton_qk_rms_norm_rope,
     )
-    from .sampler import Sampler
     from .vae import AutoEncoder, AutoEncoderParams, default_ae_params
     from .vision import MLPConnector, NeoVitEncoder, PatchEmbed, SiglipNavitEncoder, VisionEncoder
     from .vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding, pad_vocab_size

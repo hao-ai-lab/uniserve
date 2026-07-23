@@ -17,13 +17,18 @@ __all__ = [
     "ErrorCode",
     "ErrorPolicy",
     "WorkerError",
+    "InputError",
+    "ComputeError",
+    "ResourceError",
     "classify",
     "should_capture_trace",
     "invalid_descriptor",
     "capability_mismatch",
     "unsupported_operation",
     "unsupported_control",
-    "model_execution_error",
+    "input_error",
+    "compute_error",
+    "resource_error",
     "resource_lease_violation",
     "scheduler_bug",
     "distributed_setup_error",
@@ -33,9 +38,8 @@ __all__ = [
 class ErrorCode(StrEnum):
     """Stable wire-string error class identifiers.
 
-    Members are ``str`` values: they compare equal to and hash like their wire
-    string, so existing ``== "UnsupportedOperation"`` checks, dict lookups by
-    raw string, and serialization continue to work.
+    Members are ``str`` values because their values are the canonical wire
+    identifiers.
     """
 
     UNSUPPORTED_OPERATION = "UnsupportedOperation"
@@ -43,13 +47,11 @@ class ErrorCode(StrEnum):
     INVALID_DESCRIPTOR = "InvalidDescriptor"
     CAPABILITY_MISMATCH = "CapabilityMismatch"
     RESOURCE_LEASE_VIOLATION = "ResourceLeaseViolation"
-    WORKER_OOM = "WorkerOOM"
-    BACKEND_OOM = "BackendOOM"
-    MODEL_EXECUTION_ERROR = "ModelExecutionError"
+    INPUT_ERROR = "InputError"
+    COMPUTE_ERROR = "ComputeError"
+    RESOURCE_ERROR = "ResourceError"
     INVARIANT_VIOLATION = "InvariantViolation"
-    TRANSIENT_WORKER_FAILURE = "TransientWorkerFailure"
     FATAL_WORKER_FAILURE = "FatalWorkerFailure"
-    USER_INPUT_ERROR = "UserInputError"
     SCHEDULER_BUG = "SchedulerBug"
 
 
@@ -75,13 +77,11 @@ _POLICY: dict[str, ErrorPolicy] = {
     ErrorCode.INVALID_DESCRIPTOR: ErrorPolicy(False, False, False),
     ErrorCode.CAPABILITY_MISMATCH: ErrorPolicy(False, False, False),
     ErrorCode.RESOURCE_LEASE_VIOLATION: ErrorPolicy(False, False, False),
-    ErrorCode.WORKER_OOM: ErrorPolicy(True, False, True),
-    ErrorCode.BACKEND_OOM: ErrorPolicy(True, False, True),
-    ErrorCode.MODEL_EXECUTION_ERROR: ErrorPolicy(False, False, True),
+    ErrorCode.INPUT_ERROR: ErrorPolicy(False, False, False),
+    ErrorCode.COMPUTE_ERROR: ErrorPolicy(False, False, True),
+    ErrorCode.RESOURCE_ERROR: ErrorPolicy(True, False, True),
     ErrorCode.INVARIANT_VIOLATION: ErrorPolicy(False, True, True),
-    ErrorCode.TRANSIENT_WORKER_FAILURE: ErrorPolicy(True, False, False),
     ErrorCode.FATAL_WORKER_FAILURE: ErrorPolicy(False, True, True),
-    ErrorCode.USER_INPUT_ERROR: ErrorPolicy(False, False, False),
     ErrorCode.SCHEDULER_BUG: ErrorPolicy(False, False, False),
 }
 
@@ -106,6 +106,9 @@ class WorkerError(Exception):
     req_id: int | None = None
     op_id: int | None = None
     op_kind: str | None = None
+    phase: str | None = None
+    route: str | None = None
+    operations: tuple[tuple[int, int, int], ...] = ()
     details: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -114,15 +117,50 @@ class WorkerError(Exception):
     def to_wire(self) -> dict[str, Any]:
         # Only the fields modeled on the Rust WorkerResponse cross the wire.
         # Richer context (cleanup, req_id, op_id, op_kind, details) stays local
-        # for logging/metrics. ``code`` crosses as a plain ``str`` so the wire
-        # bytes are independent of whether it was built from an ``ErrorCode``.
+        # for logging and metrics.
         return {
             "kind": "error",
             "code": str(self.code),
             "message": self.message,
             "retryable": bool(self.retryable),
             "fatal": bool(self.fatal),
+            "phase": self.phase,
+            "route": self.route,
+            "operations": [
+                {"session_id": session_id, "epoch": epoch, "op_id": op_id}
+                for session_id, epoch, op_id in self.operations
+            ],
         }
+
+
+class InputError(WorkerError):
+    """A staged execution input violates its declared route contract."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        policy = _POLICY[ErrorCode.INPUT_ERROR]
+        kw.setdefault("retryable", policy.retryable)
+        kw.setdefault("fatal", policy.fatal)
+        super().__init__(code=ErrorCode.INPUT_ERROR, message=message, **kw)
+
+
+class ComputeError(WorkerError):
+    """Neural execution or raw-output validation failed."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        policy = _POLICY[ErrorCode.COMPUTE_ERROR]
+        kw.setdefault("retryable", policy.retryable)
+        kw.setdefault("fatal", policy.fatal)
+        super().__init__(code=ErrorCode.COMPUTE_ERROR, message=message, **kw)
+
+
+class ResourceError(WorkerError):
+    """Graph, device, allocation, communication, or residency failed."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        policy = _POLICY[ErrorCode.RESOURCE_ERROR]
+        kw.setdefault("retryable", policy.retryable)
+        kw.setdefault("fatal", policy.fatal)
+        super().__init__(code=ErrorCode.RESOURCE_ERROR, message=message, **kw)
 
 
 def _make(code: str, message: str, **kw: Any) -> WorkerError:
@@ -197,14 +235,16 @@ def capability_mismatch(message: str, **kw: Any) -> WorkerError:
     return _make(ErrorCode.CAPABILITY_MISMATCH, message, **kw)
 
 
-def model_execution_error(message: str, **kw: Any) -> WorkerError:
-    """A failure during model execution / internal worker state.
+def input_error(message: str, **kw: Any) -> InputError:
+    return InputError(message, **kw)
 
-    This is the class :func:`classify` assigns to an otherwise-unclassified
-    exception, so routing a bare ``RuntimeError`` through here is wire-equivalent
-    while removing the un-taxonomized raise.
-    """
-    return _make(ErrorCode.MODEL_EXECUTION_ERROR, message, **kw)
+
+def compute_error(message: str, **kw: Any) -> ComputeError:
+    return ComputeError(message, **kw)
+
+
+def resource_error(message: str, **kw: Any) -> ResourceError:
+    return ResourceError(message, **kw)
 
 
 def resource_lease_violation(message: str, **kw: Any) -> WorkerError:
@@ -232,15 +272,15 @@ def distributed_setup_error(message: str, **kw: Any) -> WorkerError:
 #     it also mentions "out of memory" (the worker cannot serve further work).
 #   - the typed checks (NotImplementedError / wire-decode errors / AssertionError)
 #     follow the text/hierarchy heuristics.
-# An exception matching no rule falls through to MODEL_EXECUTION_ERROR below.
+# An exception matching no rule falls through to ComputeError below.
 _CLASSIFY_RULES: list[tuple[Any, ErrorCode]] = [
     (lambda exc, lowered: _looks_like_fatal_cuda(lowered), ErrorCode.FATAL_WORKER_FAILURE),
-    (lambda exc, lowered: _looks_like_oom(exc, lowered), ErrorCode.WORKER_OOM),
+    (lambda exc, lowered: _looks_like_oom(exc, lowered), ErrorCode.RESOURCE_ERROR),
     (lambda exc, lowered: isinstance(exc, NotImplementedError), ErrorCode.UNSUPPORTED_OPERATION),
     # malformed op/descriptor decoded from the wire
     (
         lambda exc, lowered: isinstance(exc, (KeyError, IndexError, TypeError, ValueError)),
-        ErrorCode.INVALID_DESCRIPTOR,
+        ErrorCode.INPUT_ERROR,
     ),
     (lambda exc, lowered: isinstance(exc, AssertionError), ErrorCode.INVARIANT_VIOLATION),
 ]
@@ -264,9 +304,15 @@ def classify(exc: BaseException, *, context: str | None = None, **kw: Any) -> Wo
 
     # torch CUDA OOM (avoid importing torch here; match by class hierarchy + text).
     lowered = msg.lower()
-    code = ErrorCode.MODEL_EXECUTION_ERROR
+    code = ErrorCode.COMPUTE_ERROR
     for predicate, rule_code in _CLASSIFY_RULES:
         if predicate(exc, lowered):
             code = rule_code
             break
+    if code is ErrorCode.INPUT_ERROR:
+        return InputError(msg, **kw)
+    if code is ErrorCode.COMPUTE_ERROR:
+        return ComputeError(msg, **kw)
+    if code is ErrorCode.RESOURCE_ERROR:
+        return ResourceError(msg, **kw)
     return _make(code, msg, **kw)

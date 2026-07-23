@@ -8,9 +8,9 @@ from importlib import import_module
 
 import torch
 
-from ..contracts.attention_plan import PagedDecodePlan
+from ..forward import PagedDecodePlan
 from ..foundation.env import env_flag
-from .core import Capabilities, CommDispatcher, Dispatcher, Handoff, Provider
+from .core import Capabilities, CommDispatcher, Dispatcher, Handoff
 from .requests import (
     AddRmsNormReq,
     AttentionRegime,
@@ -1077,7 +1077,7 @@ class _AttentionBackendProvider:
     @staticmethod
     def _is_one_token_decode(req: AttentionReq) -> bool:
         if req.q.ndim == 3:
-            plan = getattr(req.ctx, "attention_plan", None) if req.ctx is not None else None
+            plan = getattr(req.ctx, "attention", None) if req.ctx is not None else None
             query_lens = getattr(plan, "query_lens_cpu", ()) or ()
             if isinstance(plan, PagedDecodePlan) and len(query_lens) == int(req.q.shape[0]):
                 return all(int(length) == 1 for length in query_lens)
@@ -1173,6 +1173,7 @@ class _AttentionBackendProvider:
                 scale=req.scale,
                 use_prefix_bounds=req.use_prefix_bounds,
                 fully_visible=req.fully_visible,
+                context=req.ctx,
             )
         if (
             req.cu_seqlens_q is not None
@@ -1190,6 +1191,7 @@ class _AttentionBackendProvider:
                 causal=req.causal,
                 scale=req.scale,
                 block_table=req.block_table,
+                context=req.ctx,
             )
         if (
             req.block_table is not None
@@ -1206,71 +1208,30 @@ class _AttentionBackendProvider:
                 v=req.current_v,
                 causal=req.causal,
                 scale=req.scale,
+                context=req.ctx,
             )
         return self.backend.forward(
-            req.q, req.k, req.v, causal=req.causal, scale=req.scale, attn_mask=req.attn_mask
+            req.q,
+            req.k,
+            req.v,
+            causal=req.causal,
+            scale=req.scale,
+            attn_mask=req.attn_mask,
+            context=req.ctx,
         )
 
 
-class _ContextAttentionProvider(_AttentionBackendProvider):
-    name = "context"
-
-    def __init__(self) -> None:
-        self.backend = None
-
-    def _backend(self, req: AttentionReq):
-        if req.backend is not None:
-            return req.backend
-        return getattr(req.ctx, "attention_backend", None) if req.ctx is not None else None
-
-    def display_name(self, req: AttentionReq) -> str:
-        backend = self._backend(req)
-        name = str(getattr(backend, "name", self.name))
-        if (
-            req.block_table is not None
-            and req.cu_seqlens_q is not None
-            and req.cu_seqlens_k is not None
-        ):
-            return f"{name}_paged_varlen"
-        return name
-
-    def capabilities(self) -> Capabilities:
-        return Capabilities(tags=frozenset({"context", "attention"}))
-
-    def can_run(self, req: AttentionReq) -> bool:
-        backend = self._backend(req)
-        if backend is None:
-            return False
-        return _AttentionBackendProvider(backend).can_run(req)
-
-    def run(self, req: AttentionReq):
-        backend = self._backend(req)
-        if backend is None:
-            raise RuntimeError("context attention backend disappeared")
-        return _AttentionBackendProvider(backend).run(req)
+def can_run_attention(selection, req: AttentionReq) -> bool:
+    return any(_AttentionBackendProvider(backend).can_run(req) for backend in selection.providers)
 
 
-@lru_cache(maxsize=1)
-def attention_dispatcher():
-    attention_pkg = import_module("uniserve_worker.backends.attention")
-    get_attention_backend = attention_pkg.get_attention_backend
-    init_attention_backends = attention_pkg.init_attention_backends
-
-    init_attention_backends()
-    names = ("trtllm_mha", "sgl_kernel", "flashinfer", "flash_attn", "fa4_cute", "torch_sdpa")
-    providers: list[Provider[AttentionReq, torch.Tensor]] = [_ContextAttentionProvider()]
-    for name in names:
-        try:
-            providers.append(_AttentionBackendProvider(get_attention_backend(name)))
-        except Exception:
-            continue
-    if not any(provider.name == "torch_sdpa" for provider in providers):
-        providers.append(_AttentionBackendProvider(get_attention_backend("torch_sdpa")))
-    return Dispatcher(
-        "attention",
-        providers,
-        fallback_names=("torch_sdpa",),
-    )
+def run_attention(selection, req: AttentionReq) -> torch.Tensor:
+    for backend in selection.providers:
+        provider = _AttentionBackendProvider(backend)
+        if provider.can_run(req):
+            return provider.run(req)
+    names = tuple(backend.name for backend in selection.providers)
+    raise RuntimeError(f"no provisioned attention backend can execute this request: {names!r}")
 
 
 logger = logging.getLogger(__name__)

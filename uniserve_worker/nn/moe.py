@@ -4,6 +4,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ..forward import MeshView
+
 __all__ = [
     'TopK',
     'FusedMoE',
@@ -48,7 +50,12 @@ class FusedMoE(nn.Module):
         self.experts = nn.ModuleList(experts)
         self.topk = TopK(top_k, renormalize=norm_topk_prob)
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        mesh: MeshView,
+    ) -> torch.Tensor:
         original_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, original_shape[-1])
         flat_logits = router_logits.reshape(-1, router_logits.shape[-1])
@@ -60,6 +67,6 @@ class FusedMoE(nn.Module):
             if not hits.any():
                 continue
             token_idx, kth = hits.nonzero(as_tuple=True)
-            expert_out = expert(flat[token_idx])
+            expert_out = expert(flat[token_idx], mesh)
             out[token_idx] += expert_out * weights[token_idx, kth].unsqueeze(-1).to(expert_out.dtype)
         return out.reshape(original_shape)

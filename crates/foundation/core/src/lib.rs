@@ -12,15 +12,15 @@ pub mod program_cursor;
 pub mod sampling;
 pub mod semantic;
 pub use generation::{
-    CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
+    CommitRecipe, ContextSegment, EncodeKind, FeedbackNextToken, FeedbackWriteback,
     GenOnlyStartPolicyDescriptor, GeneratedImageCommitCapabilities, GeneratedImageFeedbackRecipe,
     GenerationBehaviorDescriptor, GenerationCachePolicyDescriptor, GenerationConstraint,
     GenerationConstraintParseError, GenerationPolicyDescriptor, GenerationRequest,
     GenerationRequestError, GenerationResourceBounds, GenerationResourceError,
     GenerationRuntimeCapabilities, GrammarSpec, ImageIngestRecipe, ImageIngestStep, ImageKvEffect,
-    ImageSegment, OpKind, SegmentPlacement, TerminationPolicyDescriptor, TriggerPolicyDescriptor,
-    UndTokenAction, UndVisibility, VisibilityPolicyDescriptor, denoise_scratch_tokens,
-    encoder_cache_key,
+    ImageSegment, MaterializeKind, OperationKind, OperationType, SegmentPlacement, SequenceMode,
+    TerminationPolicyDescriptor, TransferKind, TriggerPolicyDescriptor, UndTokenAction,
+    UndVisibility, VisibilityPolicyDescriptor, denoise_scratch_tokens, encoder_cache_key,
 };
 pub use sampling::{SampleOutput, apply_sampling, score_token_logprobs};
 
@@ -139,12 +139,12 @@ impl ModelDtype {
         }
     }
 
-    /// Resolve worker dtype aliases into the semantic runtime vocabulary.
-    pub fn from_kv_str(kv_dtype: &str) -> Self {
-        match kv_dtype {
-            "fp16" | "float16" | "f16" => Self::Float16,
-            "fp32" | "float32" | "f32" => Self::Float32,
-            _ => Self::BFloat16,
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "float16" => Some(Self::Float16),
+            "bfloat16" => Some(Self::BFloat16),
+            "float32" => Some(Self::Float32),
+            _ => None,
         }
     }
 }
@@ -154,9 +154,8 @@ impl ModelDtype {
 /// Worker-side math (temperature, top_k, top_p, min_p, penalties, logit_bias)
 /// operates on the logits tensor inside the worker; control-flow floors
 /// (`min_tokens`, `ignore_eos`) are enforced on the host. Fields are scalars or
-/// small id/weight lists — never tensors — so they can ride on `ForwardOp.sampling`
-/// without crossing large payloads. New fields carry `#[serde(default)]` for
-/// backward-compatible decoding.
+/// small id/weight lists — never tensors — so they can cross the worker boundary
+/// without carrying device state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplingParams {
     pub temperature: f32,
@@ -345,7 +344,7 @@ impl ImageParams {
         let image_off = scale_approx(self.cfg_img_scale, 1.0);
         if text_off && image_off {
             1
-        } else if text_off || image_off || scale_approx(self.cfg_text_scale, self.cfg_img_scale) {
+        } else if text_off || image_off {
             2
         } else {
             3
@@ -573,7 +572,7 @@ pub struct KvCacheGroupSpec {
 /// Rank and parallelism topology descriptor reported by a worker. The host fans
 /// descriptors to ranks and joins small results; cross-rank KV movement lives
 /// inside the worker tier, not on the control-plane wire.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankInfo {
     pub tp_rank: u32,
     pub tp_size: u32,
@@ -767,13 +766,12 @@ mod tests {
     }
 
     #[test]
-    fn model_dtype_uses_canonical_strings_and_worker_aliases() {
+    fn model_dtype_uses_canonical_strings() {
         assert_eq!(
             serde_json::to_value(ModelDtype::Float16).unwrap(),
             serde_json::json!("float16")
         );
-        assert_eq!(ModelDtype::from_kv_str("bf16"), ModelDtype::BFloat16);
-        assert_eq!(ModelDtype::from_kv_str("fp32"), ModelDtype::Float32);
-        assert_eq!(ModelDtype::from_kv_str("fp8_e4m3"), ModelDtype::BFloat16);
+        assert_eq!(ModelDtype::parse("bfloat16"), Some(ModelDtype::BFloat16));
+        assert_eq!(ModelDtype::parse("float32"), Some(ModelDtype::Float32));
     }
 }

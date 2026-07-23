@@ -7,7 +7,9 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from ...forward import MeshView
 from ..activation import GeluAndMul
+from ..layer import LayerSpec
 from ..linear import MergedColumnParallelLinear, RowParallelLinear
 from ..placement import WeightMode
 
@@ -41,17 +43,24 @@ class Qwen3MLP(nn.Module):
         self,
         config: Any,
         *,
+        spec: LayerSpec,
         weight_mode: WeightMode = WeightMode.VANILLA,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             int(config.hidden_size),
             (int(config.intermediate_size), int(config.intermediate_size)),
+            spec=spec,
             bias=False,
             weight_mode=weight_mode,
         )
         self.act = qwen3_gate_up_activation(getattr(config, "hidden_act", "silu"))
-        self.down_proj = RowParallelLinear(int(config.intermediate_size), int(config.hidden_size), bias=False)
+        self.down_proj = RowParallelLinear(
+            int(config.intermediate_size),
+            int(config.hidden_size),
+            spec=spec,
+            bias=False,
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act(self.gate_up_proj(hidden_states)))
+    def forward(self, hidden_states: torch.Tensor, mesh: MeshView) -> torch.Tensor:
+        return self.down_proj(self.act(self.gate_up_proj(hidden_states)), mesh)

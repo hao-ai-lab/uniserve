@@ -8,7 +8,7 @@ use uniserve_core::{
     CommitRecipe, ContextSegment, FeedbackNextToken, FeedbackWriteback,
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
-    GenerationRuntimeCapabilities, ImageParams, OpKind, RequestId, SamplingParams,
+    GenerationRuntimeCapabilities, ImageParams, OperationType, RequestId, SamplingParams,
     TriggerPolicyDescriptor, UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, GenEvent};
@@ -61,12 +61,12 @@ fn main() {
             20,
             &cache,
             &GenerationRuntimeCapabilities {
-                supported_ops: vec![
-                    OpKind::PrefillUnd,
-                    OpKind::DecodeUnd,
-                    OpKind::DenoiseGen,
-                    OpKind::CommitGen,
-                    OpKind::CommitWriteback,
+                supported_operation_types: vec![
+                    OperationType::SequenceExtend,
+                    OperationType::SequenceDecode,
+                    OperationType::Flow,
+                    OperationType::MaterializeImage,
+                    OperationType::TransferKv,
                 ],
                 max_latent_units: 64,
                 latent_downsample: 16,

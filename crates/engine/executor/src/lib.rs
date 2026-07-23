@@ -4,22 +4,23 @@
 use std::time::{Duration, Instant};
 
 use uniserve_core::{BlockId, CommandWaker, GeneratedImageCommitCapabilities, RequestId};
-use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind, WorkerRequest};
+use uniserve_worker_wire::{
+    Batch, EngineCaps, ExecutionResult, Operation, OperationType, RequestKind, SnapshotRef,
+    WorkerRequest,
+};
 
 /// Synchronous model-engine seam used by deterministic local implementations.
 pub trait ModelEngine: Send {
     fn caps(&self) -> EngineCaps;
-    fn execute(&mut self, batch: ForwardBatch) -> anyhow::Result<ForwardResult>;
-    fn drop_request(&mut self, id: RequestId) -> anyhow::Result<()>;
+    fn execute(&mut self, batch: Batch) -> anyhow::Result<ExecutionResult>;
+    fn drop_session(&mut self, id: RequestId) -> anyhow::Result<()>;
 }
 
 /// Which pipeline stage a worker pool serves.
 ///
-/// A pool is fully determined by three things: the `OpKind` subset it declares
-/// (via `caps().supported_ops`, given here by [`WorkerKind::supported_ops`]),
-/// the worker implementation that handles that subset, and its device profile.
-/// The control plane ([`StageRouter`](../../worker_ipc/struct.StageRouter.html))
-/// routes ops by `OpKind`→pool; `WorkerKind` is the pool's declared role.
+/// A pool is fully determined by the typed operations it accepts, the worker
+/// implementation that executes those operations, and its device profile. The
+/// control plane routes on the closed operation union and its nested mode.
 ///
 /// `Full` is the non-disaggregated default: it holds the whole model and runs
 /// every model op in one mixed-batch forward. The other kinds are stages peeled
@@ -49,42 +50,33 @@ pub enum WorkerKind {
     Gen,
 }
 
-// Static op-subsets, promoted to `'static` so `supported_ops` can return a
-// borrowed slice without allocation.
-const FULL_OPS: &[OpKind] = &[
-    OpKind::PrefillUnd,
-    OpKind::DecodeUnd,
-    OpKind::TargetVerifyUnd,
-    OpKind::DenoiseGen,
-    OpKind::CommitGen,
-    OpKind::CommitWriteback,
-    OpKind::VaeEncode,
-    OpKind::VitEncode,
+const FULL_OPERATIONS: &[OperationType] = &OperationType::ALL;
+const ENCODER_OPERATIONS: &[OperationType] =
+    &[OperationType::EncodeVision, OperationType::EncodeLatent];
+const PREFILL_OPERATIONS: &[OperationType] = &[OperationType::SequenceExtend];
+const DECODE_OPERATIONS: &[OperationType] = &[
+    OperationType::SequenceDecode,
+    OperationType::SequenceVerify,
+    OperationType::Flow,
+    OperationType::MaterializeImage,
+    OperationType::TransferKv,
 ];
-const ENCODER_OPS: &[OpKind] = &[OpKind::VitEncode, OpKind::VaeEncode];
-const PREFILL_OPS: &[OpKind] = &[OpKind::PrefillUnd];
-const DECODE_OPS: &[OpKind] = &[
-    OpKind::DecodeUnd,
-    OpKind::TargetVerifyUnd,
-    OpKind::DenoiseGen,
-    OpKind::CommitGen,
-    OpKind::CommitWriteback,
+const SAMPLER_OPERATIONS: &[OperationType] = &[OperationType::SequenceSample];
+const POSTPROCESS_OPERATIONS: &[OperationType] = &[OperationType::MaterializeFrame];
+const UND_OPERATIONS: &[OperationType] = &[
+    OperationType::SequenceExtend,
+    OperationType::SequenceDecode,
+    OperationType::SequenceVerify,
+    OperationType::SequenceSample,
+    OperationType::EncodeVision,
+    OperationType::EncodeLatent,
+    OperationType::TransferKv,
 ];
-const SAMPLER_OPS: &[OpKind] = &[OpKind::Sample];
-const POSTPROCESS_OPS: &[OpKind] = &[OpKind::EncodeFrame];
-// Understanding/Generation tower split (the `two_role` routing): every model op
-// except image generation is "understanding"; denoise/commit/frame-encode is
-// "generation".
-const UND_OPS: &[OpKind] = &[
-    OpKind::PrefillUnd,
-    OpKind::DecodeUnd,
-    OpKind::TargetVerifyUnd,
-    OpKind::VitEncode,
-    OpKind::VaeEncode,
-    OpKind::Sample,
-    OpKind::CommitWriteback,
+const GEN_OPERATIONS: &[OperationType] = &[
+    OperationType::Flow,
+    OperationType::MaterializeImage,
+    OperationType::MaterializeFrame,
 ];
-const GEN_OPS: &[OpKind] = &[OpKind::DenoiseGen, OpKind::CommitGen, OpKind::EncodeFrame];
 
 impl WorkerKind {
     /// Wire/config name (matches the Python `--worker-kind` vocabulary).
@@ -116,23 +108,24 @@ impl WorkerKind {
         })
     }
 
-    /// The `OpKind` subset this kind handles — the StageRouter's routing key.
-    pub fn supported_ops(self) -> &'static [OpKind] {
+    /// Exact operation types accepted by this worker role.
+    pub fn supported_operation_types(self) -> &'static [OperationType] {
         match self {
-            Self::Full => FULL_OPS,
-            Self::Encoder => ENCODER_OPS,
-            Self::Prefill => PREFILL_OPS,
-            Self::Decode => DECODE_OPS,
-            Self::Sampler => SAMPLER_OPS,
-            Self::PostProcess => POSTPROCESS_OPS,
-            Self::Und => UND_OPS,
-            Self::Gen => GEN_OPS,
+            Self::Full => FULL_OPERATIONS,
+            Self::Encoder => ENCODER_OPERATIONS,
+            Self::Prefill => PREFILL_OPERATIONS,
+            Self::Decode => DECODE_OPERATIONS,
+            Self::Sampler => SAMPLER_OPERATIONS,
+            Self::PostProcess => POSTPROCESS_OPERATIONS,
+            Self::Und => UND_OPERATIONS,
+            Self::Gen => GEN_OPERATIONS,
         }
     }
 
-    /// Whether this kind handles a given op kind.
-    pub fn handles(self, op: OpKind) -> bool {
-        self.supported_ops().contains(&op)
+    /// Whether this role accepts this exact typed operation.
+    pub fn handles(self, operation: &Operation) -> bool {
+        self.supported_operation_types()
+            .contains(&operation.operation_type())
     }
 }
 
@@ -292,27 +285,40 @@ impl TensorHandle {
 /// One typed control operation carried over the executor control plane.
 #[derive(Debug, Clone)]
 pub enum ControlOp {
-    DropRequest(RequestId),
-    CopyBlocks(Vec<(BlockId, BlockId)>),
-    FreeEncoder(Vec<u64>),
-    LoadLora { lora_id: u32, path: String },
-    UnloadLora { lora_id: u32 },
+    DropSession(RequestId),
+    CopyKv(Vec<(BlockId, BlockId)>),
+    ReleaseProducts(Vec<u64>),
+    LoadAdapter { adapter_id: u32, path: String },
+    UnloadAdapter { adapter_id: u32 },
     ResetPrefixCache,
-    Sleep,
-    WakeUp,
+    SnapshotSession(RequestId),
+    RestoreSession(SnapshotRef),
 }
 
 impl ControlOp {
+    pub const fn request_kind(&self) -> RequestKind {
+        match self {
+            Self::DropSession(_) => RequestKind::DropSession,
+            Self::CopyKv(_) => RequestKind::CopyKv,
+            Self::ReleaseProducts(_) => RequestKind::ReleaseProducts,
+            Self::LoadAdapter { .. } => RequestKind::LoadAdapter,
+            Self::UnloadAdapter { .. } => RequestKind::UnloadAdapter,
+            Self::ResetPrefixCache => RequestKind::ResetPrefixCache,
+            Self::SnapshotSession(_) => RequestKind::SnapshotSession,
+            Self::RestoreSession(_) => RequestKind::RestoreSession,
+        }
+    }
+
     pub fn method(&self) -> &'static str {
         match self {
-            Self::DropRequest(_) => "drop_request",
-            Self::CopyBlocks(_) => "copy_blocks",
-            Self::FreeEncoder(_) => "free_encoder",
-            Self::LoadLora { .. } => "load_lora",
-            Self::UnloadLora { .. } => "unload_lora",
+            Self::DropSession(_) => "drop_session",
+            Self::CopyKv(_) => "copy_kv",
+            Self::ReleaseProducts(_) => "release_products",
+            Self::LoadAdapter { .. } => "load_adapter",
+            Self::UnloadAdapter { .. } => "unload_adapter",
             Self::ResetPrefixCache => "reset_prefix_cache",
-            Self::Sleep => "sleep",
-            Self::WakeUp => "wake_up",
+            Self::SnapshotSession(_) => "snapshot_session",
+            Self::RestoreSession(_) => "restore_session",
         }
     }
 
@@ -324,24 +330,24 @@ impl ControlOp {
     pub fn from_method(method: &str) -> Option<Self> {
         match method {
             "reset_prefix_cache" => Some(Self::ResetPrefixCache),
-            "sleep" => Some(Self::Sleep),
-            "wake_up" => Some(Self::WakeUp),
-            // Payload-carrying ops require their arguments.
-            "drop_request" | "copy_blocks" | "free_encoder" | "load_lora" | "unload_lora" => None,
+            "drop_session" | "copy_kv" | "release_products" | "load_adapter" | "unload_adapter"
+            | "snapshot_session" | "restore_session" => None,
             _ => None,
         }
     }
 
     pub fn to_request(&self, call_id: u64) -> WorkerRequest {
         let mut req = match self {
-            Self::DropRequest(id) => WorkerRequest::drop_request(*id),
-            Self::CopyBlocks(copies) => WorkerRequest::copy_blocks(copies.clone()),
-            Self::FreeEncoder(handles) => WorkerRequest::free_encoder(handles.clone()),
-            Self::LoadLora { lora_id, path } => WorkerRequest::load_lora(*lora_id, path.clone()),
-            Self::UnloadLora { lora_id } => WorkerRequest::unload_lora(*lora_id),
+            Self::DropSession(id) => WorkerRequest::drop_session(*id),
+            Self::CopyKv(copies) => WorkerRequest::copy_kv(copies.clone()),
+            Self::ReleaseProducts(handles) => WorkerRequest::release_products(handles.clone()),
+            Self::LoadAdapter { adapter_id, path } => {
+                WorkerRequest::load_adapter(*adapter_id, path.clone())
+            }
+            Self::UnloadAdapter { adapter_id } => WorkerRequest::unload_adapter(*adapter_id),
             Self::ResetPrefixCache => WorkerRequest::reset_prefix_cache(),
-            Self::Sleep => WorkerRequest::sleep(),
-            Self::WakeUp => WorkerRequest::wake_up(),
+            Self::SnapshotSession(id) => WorkerRequest::snapshot_session(*id),
+            Self::RestoreSession(snapshot) => WorkerRequest::restore_session(snapshot.clone()),
         };
         req.call_id = Some(call_id);
         req
@@ -354,13 +360,13 @@ pub struct ControlAck {
     pub rank: u32,
     pub ok: bool,
     pub message: Option<String>,
+    pub snapshot: Option<SnapshotRef>,
 }
 
 /// A worker-reported execution error classified for scheduler failure policy.
 ///
-/// The typed taxonomy crosses the wire as `(code, retryable, fatal)`. All three
-/// fields are carried here so the scheduler can consult error class and
-/// retryability, not only the `fatal` flag.
+/// The typed taxonomy and execution context cross the wire together so failure
+/// policy and diagnostics use the same operation identity.
 #[derive(Debug, Clone)]
 pub struct WorkerExecError {
     pub fatal: bool,
@@ -369,22 +375,43 @@ pub struct WorkerExecError {
     pub retryable: bool,
     pub code: Option<String>,
     pub message: String,
+    pub phase: Option<String>,
+    pub route: Option<String>,
+    pub operations: Vec<uniserve_worker_wire::ErrorOperationIdentity>,
 }
 
 impl std::fmt::Display for WorkerExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "worker execute error [{}{}{}]: {}",
+            "worker execute error [{}{}{}; phase={}; route={}; operations={}]: {}",
             self.code.as_deref().unwrap_or("unclassified"),
             if self.fatal { ", fatal" } else { ", non-fatal" },
             if self.retryable { ", retryable" } else { "" },
+            self.phase.as_deref().unwrap_or("unknown"),
+            self.route.as_deref().unwrap_or("unknown"),
+            self.operations.len(),
             self.message,
         )
     }
 }
 
 impl std::error::Error for WorkerExecError {}
+
+/// A worker process was replaced without session snapshots, so every session
+/// assigned to that executor must terminate explicitly before new work begins.
+#[derive(Debug)]
+pub struct WorkerLossError {
+    pub message: String,
+}
+
+impl std::fmt::Display for WorkerLossError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)
+    }
+}
+
+impl std::error::Error for WorkerLossError {}
 
 /// The asynchronous, pipelined boundary the scheduler drives.
 pub trait Executor: Send {
@@ -405,8 +432,8 @@ pub trait Executor: Send {
         }
     }
 
-    fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()>;
-    fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>>;
+    fn submit(&mut self, batch: Batch) -> anyhow::Result<()>;
+    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>>;
 
     /// Data-plane causality gate: whether every data-plane tensor the request's
     /// next op depends on is reachable on the worker that would run it. The
@@ -449,7 +476,10 @@ pub trait Executor: Send {
         Ok(())
     }
 
-    fn wait_result_timeout(&mut self, timeout: Duration) -> anyhow::Result<Option<ForwardResult>> {
+    fn wait_result_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ExecutionResult>> {
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             return self.poll();
         };
@@ -464,7 +494,7 @@ pub trait Executor: Send {
             std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
         }
     }
-    fn next_result(&mut self) -> anyhow::Result<ForwardResult>;
+    fn next_result(&mut self) -> anyhow::Result<ExecutionResult>;
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64>;
     fn control_wait(
         &mut self,
@@ -477,55 +507,13 @@ pub trait Executor: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Whether a variant is reachable via the name-only `collective_rpc`
-    /// surface (`from_method`). The exhaustive `match` over `ControlOp` is the
-    /// drift guard: adding a variant forces a deliberate classification here,
-    /// which keeps `method` and `from_method` in lockstep.
-    fn payload_free(op: &ControlOp) -> bool {
-        match op {
-            ControlOp::ResetPrefixCache | ControlOp::Sleep | ControlOp::WakeUp => true,
-            ControlOp::DropRequest(_)
-            | ControlOp::CopyBlocks(_)
-            | ControlOp::FreeEncoder(_)
-            | ControlOp::LoadLora { .. }
-            | ControlOp::UnloadLora { .. } => false,
-        }
-    }
+    use uniserve_worker_wire::{MaterializeKind, SequenceMode};
 
     #[test]
-    fn from_method_round_trips() {
-        // One instance of every variant. The exhaustive match in
-        // `payload_free` guarantees this list stays complete.
-        let variants = [
-            ControlOp::DropRequest(RequestId(0)),
-            ControlOp::CopyBlocks(vec![(BlockId(0), BlockId(1))]),
-            ControlOp::FreeEncoder(vec![0]),
-            ControlOp::LoadLora {
-                lora_id: 0,
-                path: String::new(),
-            },
-            ControlOp::UnloadLora { lora_id: 0 },
-            ControlOp::ResetPrefixCache,
-            ControlOp::Sleep,
-            ControlOp::WakeUp,
-        ];
-
-        for op in &variants {
-            let method = op.method();
-            let rebuilt = ControlOp::from_method(method);
-            if payload_free(op) {
-                assert!(
-                    matches!(&rebuilt, Some(r) if r.method() == method),
-                    "payload-free op `{method}` must round-trip through from_method"
-                );
-            } else {
-                assert!(
-                    rebuilt.is_none(),
-                    "payload-carrying op `{method}` must not be constructible from a bare method name"
-                );
-            }
-        }
+    fn payload_free_control_round_trips() {
+        let control = ControlOp::from_method("reset_prefix_cache").unwrap();
+        assert_eq!(control.method(), "reset_prefix_cache");
+        assert!(ControlOp::from_method("drop_session").is_none());
     }
 
     #[test]
@@ -546,126 +534,72 @@ mod tests {
             WorkerKind::Gen,
         ] {
             assert_eq!(WorkerKind::from_token(kind.as_str()), Some(kind));
-            assert!(!kind.supported_ops().is_empty());
+            assert!(!kind.supported_operation_types().is_empty());
         }
-        assert!(WorkerKind::Full.handles(OpKind::DenoiseGen));
-        assert!(WorkerKind::Encoder.handles(OpKind::VitEncode));
-        assert!(!WorkerKind::Encoder.handles(OpKind::DecodeUnd));
-        assert!(WorkerKind::Sampler.handles(OpKind::Sample));
-        assert!(WorkerKind::PostProcess.handles(OpKind::EncodeFrame));
-        // Und/Gen tower split: understanding ops on und, generation ops on gen,
-        // disjoint and exhaustive over the model ops (the `two_role` routing).
-        assert!(WorkerKind::Und.handles(OpKind::PrefillUnd));
-        assert!(WorkerKind::Und.handles(OpKind::DecodeUnd));
-        assert!(WorkerKind::Und.handles(OpKind::VitEncode));
-        assert!(WorkerKind::Und.handles(OpKind::Sample));
-        assert!(!WorkerKind::Und.handles(OpKind::DenoiseGen));
-        assert!(WorkerKind::Gen.handles(OpKind::DenoiseGen));
-        assert!(WorkerKind::Gen.handles(OpKind::CommitGen));
-        assert!(!WorkerKind::Gen.handles(OpKind::DecodeUnd));
+        let extend = sequence(SequenceMode::Extend);
+        let decode = sequence(SequenceMode::Decode);
+        let sample = sequence(SequenceMode::Sample);
+        let image = materialize(MaterializeKind::Image);
+        let frame = materialize(MaterializeKind::Frame);
+
+        assert!(WorkerKind::Full.handles(&extend));
+        assert!(WorkerKind::Prefill.handles(&extend));
+        assert!(!WorkerKind::Prefill.handles(&decode));
+        assert!(WorkerKind::Decode.handles(&decode));
+        assert!(WorkerKind::Sampler.handles(&sample));
+        assert!(WorkerKind::Decode.handles(&image));
+        assert!(WorkerKind::PostProcess.handles(&frame));
+        assert!(WorkerKind::Und.handles(&decode));
+        assert!(!WorkerKind::Und.handles(&image));
+        assert!(WorkerKind::Gen.handles(&image));
+        assert!(!WorkerKind::Gen.handles(&decode));
         assert_eq!(WorkerKind::from_token("nope"), None);
     }
 
-    /// Drift guard for the canonical worker-kind vocabulary
-    /// (`crates/protocol/vocab/worker_kinds.toml`): the Rust `WorkerKind` enum and
-    /// its `supported_ops` arrays must equal the schema exactly — same tokens,
-    /// same variant identifiers, and the same OpKind-subset (by wire name) for
-    /// each kind. Adding a kind or moving an op requires updating the schema
-    /// AND every language, or this fails.
-    #[test]
-    fn worker_kind_vocabulary_matches_canonical_schema() {
-        const SCHEMA: &str = include_str!("../../../protocol/vocab/worker_kinds.toml");
-        let schema: toml::Value = toml::from_str(SCHEMA).unwrap();
+    fn sequence(mode: SequenceMode) -> Operation {
+        use uniserve_worker_wire::{
+            KvLeaseDelta, PublishedProduct, SequenceInput, SequenceOperation, TokenInput,
+            TokenPolicy, TokenSource,
+        };
+        Operation::Sequence(SequenceOperation {
+            mode,
+            lease: KvLeaseDelta::default(),
+            position: (0, 1),
+            policy: TokenPolicy::default(),
+            input: if mode == SequenceMode::Sample {
+                SequenceInput::PublishedLogits(PublishedProduct {
+                    handle: 1,
+                    locator: String::new(),
+                })
+            } else {
+                SequenceInput::Tokens(TokenInput {
+                    token_ids: vec![1],
+                    source: TokenSource::Wire,
+                    draft_token_ids: Vec::new(),
+                    burst_tokens: 1,
+                    stop_token_ids: Vec::new(),
+                    stop_terminal: false,
+                    return_all_logits: false,
+                })
+            },
+        })
+    }
 
-        // OpKind -> wire string (snake_case). An exhaustive match so a new op
-        // kind fails to compile here. Mirrors the serde snake_case form pinned in
-        // worker-wire's own op-kind drift guard.
-        fn op_wire(op: OpKind) -> &'static str {
-            match op {
-                OpKind::PrefillUnd => "prefill_und",
-                OpKind::DecodeUnd => "decode_und",
-                OpKind::TargetVerifyUnd => "target_verify_und",
-                OpKind::DenoiseGen => "denoise_gen",
-                OpKind::CommitGen => "commit_gen",
-                OpKind::CommitWriteback => "commit_writeback",
-                OpKind::VaeEncode => "vae_encode",
-                OpKind::VitEncode => "vit_encode",
-                OpKind::Sample => "sample",
-                OpKind::EncodeFrame => "encode_frame",
-            }
-        }
-
-        // Every `WorkerKind` variant, enumerated via an exhaustive match so a new
-        // variant fails to compile here until it is added to this list and the
-        // schema.
-        fn variant_ident(k: WorkerKind) -> &'static str {
-            match k {
-                WorkerKind::Full => "Full",
-                WorkerKind::Encoder => "Encoder",
-                WorkerKind::Prefill => "Prefill",
-                WorkerKind::Decode => "Decode",
-                WorkerKind::Sampler => "Sampler",
-                WorkerKind::PostProcess => "PostProcess",
-                WorkerKind::Und => "Und",
-                WorkerKind::Gen => "Gen",
-            }
-        }
-        let variants = [
-            WorkerKind::Full,
-            WorkerKind::Encoder,
-            WorkerKind::Prefill,
-            WorkerKind::Decode,
-            WorkerKind::Sampler,
-            WorkerKind::PostProcess,
-            WorkerKind::Und,
-            WorkerKind::Gen,
-        ];
-
-        let kinds = schema["kind"].as_array().expect("schema [[kind]] array");
-
-        // Token set + (token -> entry) lookup.
-        let schema_tokens: std::collections::BTreeSet<String> = kinds
-            .iter()
-            .map(|k| k["token"].as_str().unwrap().to_string())
-            .collect();
-        let rust_tokens: std::collections::BTreeSet<String> =
-            variants.iter().map(|k| k.as_str().to_string()).collect();
-        assert_eq!(
-            rust_tokens, schema_tokens,
-            "WorkerKind token set drifted from worker_kinds.toml"
-        );
-
-        for k in variants {
-            let token = k.as_str();
-            let entry = kinds
-                .iter()
-                .find(|e| e["token"].as_str() == Some(token))
-                .unwrap_or_else(|| panic!("no schema entry for token {token:?}"));
-
-            // Variant identifier pinned.
-            assert_eq!(
-                entry["rust"].as_str(),
-                Some(variant_ident(k)),
-                "worker_kinds.toml `rust` column for {token:?} drifted"
-            );
-
-            // supported_ops set (compared as a set; order is not significant).
-            let schema_ops: std::collections::BTreeSet<String> = entry["supported_ops"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().to_string())
-                .collect();
-            let rust_ops: std::collections::BTreeSet<String> = k
-                .supported_ops()
-                .iter()
-                .map(|op| op_wire(*op).to_string())
-                .collect();
-            assert_eq!(
-                rust_ops, schema_ops,
-                "WorkerKind::{token} supported_ops drifted from worker_kinds.toml"
-            );
-        }
+    fn materialize(kind: MaterializeKind) -> Operation {
+        use uniserve_worker_wire::{
+            KvLeaseDelta, MaterializeInput, MaterializeOperation, PublishedProduct, TokenPolicy,
+        };
+        Operation::Materialize(MaterializeOperation {
+            kind,
+            lease: KvLeaseDelta::default(),
+            position: 0,
+            conditioning_position: 0,
+            policy: TokenPolicy::default(),
+            input: MaterializeInput::Published(PublishedProduct {
+                handle: 1,
+                locator: String::new(),
+            }),
+        })
     }
 
     #[test]

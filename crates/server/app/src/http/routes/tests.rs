@@ -2062,7 +2062,7 @@ async fn chat_completions_streams_default_image_deltas() {
                         "max_completion_tokens": 16,
                         "temperature": 0.0,
                         "image_config": {
-                            "aspect_ratio": "16:9",
+                            "resolution": "16:9",
                             "steps": 7,
                             "seed": 123,
                             "guidance_scale": 4.5,
@@ -2579,7 +2579,7 @@ async fn native_generate_routes_ordered_multimodal_context_to_runtime_events() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn chat_completions_maps_image_size_alias_to_profile_bucket() {
+async fn chat_completions_maps_resolution_to_profile_bucket() {
     let (mut app, engine_task) = test_app_with_native_engine_script(|mut mock| {
         boxed_test_future(async move {
             let request = mock.recv_request().await;
@@ -2629,7 +2629,7 @@ async fn chat_completions_maps_image_size_alias_to_profile_bucket() {
                         "model": "Qwen/Qwen1.5-0.5B-Chat",
                         "modalities": ["image"],
                         "messages": [{"role": "user", "content": "draw"}],
-                        "image_config": {"image_size": "1.5K", "steps": 7}
+                        "image_config": {"resolution": "1.5K", "steps": 7}
                     })
                     .to_string(),
                 ))
@@ -2649,44 +2649,6 @@ async fn chat_completions_maps_image_size_alias_to_profile_bucket() {
         .expect("images array");
     assert_eq!(images.len(), 1);
     assert_eq!(images[0]["image_url"]["url"], "data:image/png;base64,QUJD");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial]
-async fn chat_completions_rejects_ambiguous_resolution_aliases() {
-    let (mut app, engine_task) =
-        test_app_with_native_engine_script(|_mock| boxed_test_future(async move {})).await;
-
-    let response = app
-        .call(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({
-                        "model": "Qwen/Qwen1.5-0.5B-Chat",
-                        "modalities": ["image"],
-                        "messages": [{"role": "user", "content": "draw"}],
-                        "image_config": {"aspect_ratio": "16:9", "image_size": "1.5K"}
-                    })
-                    .to_string(),
-                ))
-                .expect("build request"),
-        )
-        .await
-        .expect("call app");
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    engine_task.await.expect("mock engine task");
-    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
-    assert_eq!(
-        json["error"]["message"],
-        "aspect_ratio and image_size are mutually exclusive"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

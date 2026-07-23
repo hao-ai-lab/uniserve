@@ -85,7 +85,6 @@ def build_serve_cmd(config: dict[str, Any], spec: dict[str, Any], *, strict_env:
         [
             _repo_path(config, "server_bin", "target/debug/uniserve"),
             "serve",
-            "--model-path",
             spec["model"],
             "--served-model-name",
             spec["served_model_name"],

@@ -6,15 +6,11 @@ before they can consume quantized pages directly.
 """
 from __future__ import annotations
 
-from types import MappingProxyType
-
 import torch
 
 __all__ = [
     'FP8_MAX',
     'SCALE_EPS',
-    'KV_CACHE_NO_OVERRIDE_SENTINELS',
-    'FP8_E4M3_ALIASES',
     'fp8_quantize',
     'fp8_scale_from',
     'resolve_kv_store_dtype',
@@ -31,51 +27,22 @@ FP8_MAX = 448.0
 SCALE_EPS = 1.0e-12
 
 
-# Names that mean "no explicit KV-cache dtype override" at both the
-# config-parse boundary and the dtype resolver below.
-KV_CACHE_NO_OVERRIDE_SENTINELS = frozenset({"auto", "none", "native", "compute"})
-
-
-FP8_E4M3_ALIASES = {
-    "fp8",
-    "fp8_e4m3",
-    "fp8_e4m3fn",
-    "float8_e4m3",
-    "float8_e4m3fn",
-    "torch.float8_e4m3fn",
+_KV_STORE_NAME_TO_DTYPE: dict[str, torch.dtype] = {
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
 }
-
-
-# One registry of (canonical_name, torch.dtype, aliases) rows from which both
-# name->dtype resolution and dtype->name lookup are derived. The canonical name
-# is what ``kv_store_dtype_name`` returns; aliases are additional accepted spellings
-# at the name->dtype boundary. ``aliases`` need not contain the canonical name.
-_KV_STORE_DTYPE_ROWS: tuple[tuple[str, torch.dtype, frozenset[str]], ...] = (
-    ("fp8_e4m3", torch.float8_e4m3fn, frozenset(FP8_E4M3_ALIASES)),
-    ("bf16", torch.bfloat16, frozenset({"bfloat16", "torch.bfloat16"})),
-    ("fp16", torch.float16, frozenset({"float16", "torch.float16"})),
-    ("fp32", torch.float32, frozenset({"float32", "torch.float32"})),
-)
-
-_KV_STORE_NAME_TO_DTYPE = MappingProxyType(
-    {
-        alias: dtype
-        for name, dtype, aliases in _KV_STORE_DTYPE_ROWS
-        for alias in (name, *aliases)
-    }
-)
 
 _KV_STORE_DTYPE_TO_NAME: dict[torch.dtype, str] = {
-    _dtype: _name for _name, _dtype, _aliases in _KV_STORE_DTYPE_ROWS
+    dtype: name for name, dtype in _KV_STORE_NAME_TO_DTYPE.items()
 }
-_KV_STORE_DTYPE_ITEMSIZE = MappingProxyType(
-    {
-        torch.float8_e4m3fn: 1,
-        torch.bfloat16: 2,
-        torch.float16: 2,
-        torch.float32: 4,
-    }
-)
+_KV_STORE_DTYPE_ITEMSIZE = {
+    torch.float8_e4m3fn: 1,
+    torch.bfloat16: 2,
+    torch.float16: 2,
+    torch.float32: 4,
+}
 
 
 def fp8_quantize(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -96,9 +63,7 @@ def resolve_kv_store_dtype(
         return compute_dtype
     if isinstance(store_dtype, torch.dtype):
         return store_dtype
-    name = str(store_dtype).strip().lower().replace("-", "_")
-    if name in KV_CACHE_NO_OVERRIDE_SENTINELS | {"", "unquantized"}:
-        return compute_dtype
+    name = str(store_dtype)
     resolved = _KV_STORE_NAME_TO_DTYPE.get(name)
     if resolved is not None:
         return resolved

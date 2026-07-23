@@ -40,9 +40,9 @@ impl ResourceClass {
     /// the single authoritative accounting **unit** for each class.
     /// Both sides MUST account this class in this unit: the host
     /// [`ResourceLease::capacity`] it issues and the worker's
-    /// `ResourceRuntime` used/total it reports for the same class must be the
-    /// same magnitude. KvBlock leases and reports blocks; Scratch leases and
-    /// reports CFG branch slots against the same unit on both sides.
+    /// physical-store pressure it reports for the same class must have the same
+    /// magnitude. KV leases and reports blocks; scratch leases and reports token
+    /// slots.
     pub fn unit(&self) -> &'static str {
         match self {
             // Logical KV-cache blocks (pages), not tokens.
@@ -51,11 +51,8 @@ impl ResourceClass {
             ResourceClass::EncoderOutput => "handles",
             // Image latent residency, counted in latent tokens.
             ResourceClass::ImageLatent => "latent_tokens",
-            // Transient denoise/CFG scratch, counted in CFG branch slots (one
-            // per active CFG branch). The physical scratch pool is sized in
-            // latent tokens worker-side, but the cross-side *ledger* accounts
-            // branch slots on both halves.
-            ResourceClass::Scratch => "branch_slots",
+            // Transient denoise/CFG scratch, counted in physical token slots.
+            ResourceClass::Scratch => "tokens",
             // Resident LoRA adapter slots.
             ResourceClass::Adapter => "adapters",
         }
@@ -158,10 +155,7 @@ mod tests {
         assert_eq!(ResourceClass::KvBlock.unit(), "blocks");
         assert_eq!(ResourceClass::EncoderOutput.unit(), "handles");
         assert_eq!(ResourceClass::ImageLatent.unit(), "latent_tokens");
-        // Scratch is the observe-only ledger's CFG branch-slot count (the host
-        // lease and the worker `_scratch_units` both use branch slots), distinct
-        // from the physical token-sized scratch pool.
-        assert_eq!(ResourceClass::Scratch.unit(), "branch_slots");
+        assert_eq!(ResourceClass::Scratch.unit(), "tokens");
         assert_eq!(ResourceClass::Adapter.unit(), "adapters");
     }
 

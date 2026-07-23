@@ -1,25 +1,6 @@
-"""System-owned model execution interface."""
+"""Canonical system-owned model execution boundary."""
 
-from typing import TYPE_CHECKING, Any
+from .executor import ModelExecutor
+from .model_runner import ModelRunner
 
-if TYPE_CHECKING:
-    from .runner import ExecutorConfig, ModelExecutor, ModelRunner
-
-_EXECUTION_EXPORTS = frozenset({"ModelExecutor", "ModelRunner", "ExecutorConfig"})
-
-
-def __getattr__(name: str) -> Any:
-    if name not in _EXECUTION_EXPORTS:
-        raise AttributeError(name)
-    from . import runner
-
-    value = getattr(runner, name)
-    globals()[name] = value
-    return value
-
-
-__all__ = [
-    "ModelExecutor",
-    "ModelRunner",
-    "ExecutorConfig",
-]
+__all__ = ["ModelExecutor", "ModelRunner"]

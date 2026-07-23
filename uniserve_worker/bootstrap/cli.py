@@ -116,12 +116,6 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--green-contexts", action="store_true", default=False)
-    parser.add_argument(
-        "--logits-processor-chunk-size",
-        type=int,
-        default=0,
-    )
     parser.add_argument(
         "--flashinfer-workspace-size",
         type=int,
@@ -152,6 +146,8 @@ def create_worker_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-model", action="store_true")
     parser.add_argument("--allow-stub", action="store_true", default=False)
+    parser.add_argument("--snapshot-dir", default=None)
+    parser.add_argument("--restore-snapshots", action="store_true", default=False)
     return parser
 
 

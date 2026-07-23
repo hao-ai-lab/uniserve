@@ -1,29 +1,10 @@
-"""Cross-language worker-role vocabulary.
-
-``WorkerKind`` is a deployment role used by the host to select a pool. It owns
-only the role's wire token and operation envelope; Python model-loading and
-execution implementation choices belong to :mod:`uniserve_worker.bootstrap`.
-"""
+"""Deployment roles and their exact execution-operation routes."""
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Mapping
 
-from ..contracts.op_kinds import (
-    COMMIT_GEN,
-    COMMIT_WRITEBACK,
-    DECODE_UND,
-    DENOISE_GEN,
-    PREFILL_UND,
-    TARGET_VERIFY_UND,
-    VAE_ENCODE,
-    VIT_ENCODE,
-)
-
-__all__ = [
-    "WorkerKind",
-]
+from ..spec import OperationType
 
 
 class WorkerKind(StrEnum):
@@ -37,47 +18,50 @@ class WorkerKind(StrEnum):
     GEN = "gen"
 
     @property
-    def supported_ops(self) -> frozenset[str]:
-        """Operation envelope routed to this worker role."""
-        return _SUPPORTED_OPS_BY_KIND[self]
+    def supported_operation_types(self) -> frozenset[OperationType]:
+        return _ROUTES[self]
 
     @classmethod
     def wire_values(cls) -> tuple[str, ...]:
         return tuple(member.value for member in cls)
 
 
-# Mirrors Rust ``WorkerKind::supported_ops``. This is protocol vocabulary, not a
-# Python implementation registry.
-_SUPPORTED_OPS_BY_KIND: Mapping[WorkerKind, frozenset[str]] = {
-    WorkerKind.FULL: frozenset(
+_ROUTES = {
+    WorkerKind.FULL: frozenset(OperationType),
+    WorkerKind.ENCODER: frozenset(
+        {OperationType.ENCODE_VISION, OperationType.ENCODE_LATENT}
+    ),
+    WorkerKind.PREFILL: frozenset({OperationType.SEQUENCE_EXTEND}),
+    WorkerKind.DECODE: frozenset(
         {
-            PREFILL_UND,
-            DECODE_UND,
-            TARGET_VERIFY_UND,
-            DENOISE_GEN,
-            COMMIT_GEN,
-            COMMIT_WRITEBACK,
-            VAE_ENCODE,
-            VIT_ENCODE,
+            OperationType.SEQUENCE_DECODE,
+            OperationType.SEQUENCE_VERIFY,
+            OperationType.FLOW,
+            OperationType.MATERIALIZE_IMAGE,
+            OperationType.TRANSFER_KV,
         }
     ),
-    WorkerKind.ENCODER: frozenset({VIT_ENCODE, VAE_ENCODE}),
-    WorkerKind.PREFILL: frozenset({PREFILL_UND}),
-    WorkerKind.DECODE: frozenset(
-        {DECODE_UND, TARGET_VERIFY_UND, DENOISE_GEN, COMMIT_GEN, COMMIT_WRITEBACK}
-    ),
-    WorkerKind.SAMPLER: frozenset({"sample"}),
-    WorkerKind.POSTPROCESS: frozenset({"encode_frame"}),
+    WorkerKind.SAMPLER: frozenset({OperationType.SEQUENCE_SAMPLE}),
+    WorkerKind.POSTPROCESS: frozenset({OperationType.MATERIALIZE_FRAME}),
     WorkerKind.UND: frozenset(
         {
-            PREFILL_UND,
-            DECODE_UND,
-            TARGET_VERIFY_UND,
-            VIT_ENCODE,
-            VAE_ENCODE,
-            "sample",
-            COMMIT_WRITEBACK,
+            OperationType.SEQUENCE_EXTEND,
+            OperationType.SEQUENCE_DECODE,
+            OperationType.SEQUENCE_VERIFY,
+            OperationType.SEQUENCE_SAMPLE,
+            OperationType.ENCODE_VISION,
+            OperationType.ENCODE_LATENT,
+            OperationType.TRANSFER_KV,
         }
     ),
-    WorkerKind.GEN: frozenset({DENOISE_GEN, COMMIT_GEN, "encode_frame"}),
+    WorkerKind.GEN: frozenset(
+        {
+            OperationType.FLOW,
+            OperationType.MATERIALIZE_IMAGE,
+            OperationType.MATERIALIZE_FRAME,
+        }
+    ),
 }
+
+
+__all__ = ["WorkerKind"]

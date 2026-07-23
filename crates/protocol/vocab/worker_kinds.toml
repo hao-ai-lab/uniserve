@@ -1,68 +1,61 @@
-# Canonical worker-kind vocabulary: the cross-language single source of truth.
-#
-# Mirrored by Rust `WorkerKind` and Python `WorkerKind`.
-#
-# Each `[[kind]]` entry pins one worker kind by:
-#   - `token`         : the `--worker-kind`/`--workers` wire/config token
-#                       (Python constant value, Rust `WorkerKind::as_str`).
-#   - `rust`          : the Rust `WorkerKind` variant identifier (CamelCase).
-#   - `supported_ops` : the OpKind subset (by `op_kinds.toml` wire name) this kind
-#                       handles — the StageRouter routing key. Order is not
-#                       significant; the guards compare as sets.
+# Canonical worker-kind routing vocabulary.
 
 [[kind]]
 token = "full"
 rust = "Full"
-supported_ops = [
-  "prefill_und",
-  "decode_und",
-  "target_verify_und",
-  "denoise_gen",
-  "commit_gen",
-  "commit_writeback",
-  "vae_encode",
-  "vit_encode",
+supported_operation_types = [
+  "sequence_extend",
+  "sequence_decode",
+  "sequence_verify",
+  "sequence_sample",
+  "flow",
+  "encode_vision",
+  "encode_latent",
+  "materialize_image",
+  "materialize_frame",
+  "transfer_product",
+  "transfer_kv",
 ]
 
 [[kind]]
 token = "encoder"
 rust = "Encoder"
-supported_ops = ["vit_encode", "vae_encode"]
+supported_operation_types = ["encode_vision", "encode_latent"]
 
 [[kind]]
 token = "prefill"
 rust = "Prefill"
-supported_ops = ["prefill_und"]
+supported_operation_types = ["sequence_extend"]
 
 [[kind]]
 token = "decode"
 rust = "Decode"
-supported_ops = ["decode_und", "target_verify_und", "denoise_gen", "commit_gen", "commit_writeback"]
+supported_operation_types = ["sequence_decode", "sequence_verify", "flow", "materialize_image", "transfer_kv"]
 
 [[kind]]
 token = "sampler"
 rust = "Sampler"
-supported_ops = ["sample"]
+supported_operation_types = ["sequence_sample"]
 
 [[kind]]
 token = "postprocess"
 rust = "PostProcess"
-supported_ops = ["encode_frame"]
+supported_operation_types = ["materialize_frame"]
 
 [[kind]]
 token = "und"
 rust = "Und"
-supported_ops = [
-  "prefill_und",
-  "decode_und",
-  "target_verify_und",
-  "vit_encode",
-  "vae_encode",
-  "sample",
-  "commit_writeback",
+supported_operation_types = [
+  "sequence_extend",
+  "sequence_decode",
+  "sequence_verify",
+  "sequence_sample",
+  "encode_vision",
+  "encode_latent",
+  "transfer_kv",
 ]
 
 [[kind]]
 token = "gen"
 rust = "Gen"
-supported_ops = ["denoise_gen", "commit_gen", "encode_frame"]
+supported_operation_types = ["flow", "materialize_image", "materialize_frame"]

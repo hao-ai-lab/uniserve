@@ -57,23 +57,23 @@ fatal = false
 capture_trace = false
 
 [[error]]
-python = "WORKER_OOM"
-code = "WorkerOOM"
-retryable = true
-fatal = false
-capture_trace = true
-
-[[error]]
-python = "BACKEND_OOM"
-code = "BackendOOM"
-retryable = true
-fatal = false
-capture_trace = true
-
-[[error]]
-python = "MODEL_EXECUTION_ERROR"
-code = "ModelExecutionError"
+python = "INPUT_ERROR"
+code = "InputError"
 retryable = false
+fatal = false
+capture_trace = false
+
+[[error]]
+python = "COMPUTE_ERROR"
+code = "ComputeError"
+retryable = false
+fatal = false
+capture_trace = true
+
+[[error]]
+python = "RESOURCE_ERROR"
+code = "ResourceError"
+retryable = true
 fatal = false
 capture_trace = true
 
@@ -85,25 +85,11 @@ fatal = true
 capture_trace = true
 
 [[error]]
-python = "TRANSIENT_WORKER_FAILURE"
-code = "TransientWorkerFailure"
-retryable = true
-fatal = false
-capture_trace = false
-
-[[error]]
 python = "FATAL_WORKER_FAILURE"
 code = "FatalWorkerFailure"
 retryable = false
 fatal = true
 capture_trace = true
-
-[[error]]
-python = "USER_INPUT_ERROR"
-code = "UserInputError"
-retryable = false
-fatal = false
-capture_trace = false
 
 [[error]]
 python = "SCHEDULER_BUG"

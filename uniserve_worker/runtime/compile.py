@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from ..foundation.env import DEFAULT_COMPILE_BACKEND
 from ..foundation.errors import capability_mismatch
-from ..foundation.runtime_config import get_execution_config
+from ..foundation.runtime_config import TorchCompileRuntimeConfig
 from ..foundation.triton_compat import ensure_blackwell_ptxas
 
 __all__ = [
@@ -65,8 +65,7 @@ class TorchCompileConfig:
     dynamic: bool | None = None
 
     @classmethod
-    def from_runtime_config(cls) -> "TorchCompileConfig":
-        cfg = get_execution_config().torch_compile
+    def from_runtime_config(cls, cfg: TorchCompileRuntimeConfig) -> "TorchCompileConfig":
         return cls(
             enabled=cfg.enabled,
             backend=cfg.backend,
@@ -99,11 +98,11 @@ def maybe_compile_module(
     module: nn.Module,
     *,
     label: str,
-    config: TorchCompileConfig | None = None,
+    config: TorchCompileConfig,
 ) -> nn.Module:
     """Compile ``module`` when explicitly enabled; otherwise return it unchanged."""
 
-    cfg = config or TorchCompileConfig.from_runtime_config()
+    cfg = config
     if not cfg.enabled:
         return module
     # UniServe owns explicit CUDA-graph capture; reject cudagraph-tree modes.
@@ -170,11 +169,11 @@ def _first_module_device(module: nn.Module) -> torch.device | None:
 def compile_targets(
     targets: Iterable[CompileTarget],
     *,
-    config: TorchCompileConfig | None = None,
+    config: TorchCompileConfig,
 ) -> CompileReport:
     """Compile and replace a declared set of piecewise modules."""
 
-    cfg = config or TorchCompileConfig.from_runtime_config()
+    cfg = config
     if not cfg.enabled:
         return CompileReport(attempted=0, compiled=0, labels=())
     attempted = 0
@@ -194,19 +193,21 @@ def compile_targets(
 
 
 def compile_model_pieces(
-    model: Any,
+    model: nn.Module,
     *,
-    config: TorchCompileConfig | None = None,
+    config: TorchCompileConfig,
 ) -> CompileReport:
-    """Compile model-declared piecewise targets when the opt-in flag is set."""
+    """Compile the neural core selected by the system module graph."""
 
-    cfg = config or TorchCompileConfig.from_runtime_config()
+    cfg = config
     if not cfg.enabled:
         return CompileReport(attempted=0, compiled=0, labels=())
-    hook = getattr(model, "compile_targets", None)
-    if not callable(hook):
-        return CompileReport(attempted=0, compiled=0, labels=())
-    return compile_targets(hook(), config=cfg)
+    targets = named_child_compile_targets(
+        model,
+        predicate=lambda name, _module: name in {"model", "model.language_model.model"},
+        label_prefix=type(model).__name__,
+    )
+    return compile_targets(targets, config=cfg)
 
 
 def named_child_compile_targets(

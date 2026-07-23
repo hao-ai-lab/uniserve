@@ -1,85 +1,50 @@
-"""BAGEL UniModel entry backed by the shared runner."""
+"""BAGEL neural model definition."""
 
 from __future__ import annotations
 
-import json
-import logging
-import math
-import os
-from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, cast
+from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
-from PIL import Image
-from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from uniserve_worker.execution.flow import (
-    PreparedFlowStep,
-    ProgramState,
+from ..forward import (
+    DecodeOutput,
+    DecodeRow,
+    EncodeKind,
+    EncodeOutput,
+    EncodeRow,
+    FlowOutput,
+    FlowRow,
+    ForwardBatch,
+    ForwardContext,
+    ForwardOutput,
+    NoFlowConditioning,
+    TokenEmbeddings,
+    TokenHidden,
+    TokenIds,
+    TokenLogits,
+    TokenOutput,
+    TokenRow,
+    TokenSegments,
+    TokenSelection,
+    TowerInput,
 )
-from uniserve_worker.execution.segment import SegmentAdapter, SegmentExecutor
-from uniserve_worker.execution.sequence import SequenceCache, SequenceExecutor
-
-from ..contracts.forward_batch import EncodeContext, EncodeRow, ForwardBatch
-from ..contracts.forward_context import get_forward_context
-from ..contracts.model_spec import (
-    CacheSpec,
-    FlowSpec,
-    ImageInputSpec,
-    ImageTowerSpec,
-    InputSpec,
-    ModelSpec,
-    RouteSpec,
-    StrideResizeSpec,
+from ..nn import (
+    LayerSpec,
+    LinearBase,
+    MLPConnector,
+    ParallelLMHead,
+    local_attention_head_count,
+    local_kv_head_count,
 )
-from ..contracts.resource_plan import (
-    AdapterResourcePolicy,
-    CapsDescriptor,
-    EncoderResourcePolicy,
-    KvBlockResourcePolicy,
-    LatentTokens,
-    PerBranch,
-    ResourcePlan,
-    active_latent_capacity_tokens,
-)
-from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import (
-    decode_graph_padding_block_count,
-    get_execution_config,
-)
-from ..foundation.sizing import (
-    DEFAULT_BLOCK_SIZE,
-    DEFAULT_MAX_BATCH_OPS,
-    ceil_div,
-    derive_num_blocks,
-    derive_runtime_kv_capacity,
-)
-from ..loader.weight_spec import (
-    GraphSource,
-    Rename,
-    Sidecar,
-    StackedParamMapping,
-    WeightSpec,
-)
-from ..loader.weight_utils import tensor_shape
-from ..nn import LinearBase, MLPConnector, ParallelLMHead, local_kv_head_count
-from ..nn.decoder import KVCache, MoTDecoderLayer, MoTModel, Segment
+from ..nn.decoder import MoTModel
 from ..nn.diffusion import (
     ScheduleDirection,
     ScheduleShiftDomain,
     TimestepEmbedder,
 )
 from ..nn.diffusion.cfg import CfgRecipe
-from ..nn.quant import (
-    QuantizationConfig,
-    get_current_kv_cache_dtype,
-    kv_cache_bytes_per_token,
-    use_quantization_config,
-)
 from ..nn.vae import AutoEncoder, default_ae_params
 from ..nn.vision import (
     PositionEmbedding,
@@ -88,17 +53,39 @@ from ..nn.vision import (
     get_flattened_position_ids_extrapolate,
     patchify_batch,
 )
-from ..processors.bagel import BAGEL_GEOMETRY
-from ..runtime.kv_pool import PagedKVPool
-from ..runtime.paged_text_cache import PagedTextCache
-from ..runtime.request_state import RequestState
-from ..runtime.residency import (
-    DEFAULT_ENCODER_CACHE_BUDGET,
-    GenResidencySpec,
-    KvCacheSpec,
-    ResidencyManager,
+from ..spec import (
+    CacheSpec,
+    FeatureInjectionSpec,
+    FeatureLayout,
+    FlowBranchSource,
+    FlowConditioningKind,
+    FlowSpec,
+    ImageInputSpec,
+    ImageTowerSpec,
+    InputSpec,
+    LatentLayout,
+    MaterializationKind,
+    ModelSpec,
+    NoiseScaleSpec,
+    OperationSpec,
+    OperationStageCondition,
+    OperationStagePurpose,
+    OperationStageSpec,
+    OperationType,
+    PositionLayout,
+    Rename,
+    RouteOutputKind,
+    RoutePlacement,
+    RouteRowKind,
+    RouteShape,
+    RouteShapeGrouping,
+    RouteSpec,
+    Sidecar,
+    Stack,
+    StrideResizeSpec,
+    UnmatchedWeightPolicy,
+    WeightSpec,
 )
-from .catalog import UniModelBase
 
 __all__ = [
     "LLMConfig",
@@ -106,23 +93,17 @@ __all__ = [
     "BagelForUnifiedGeneration",
 ]
 
-logger = logging.getLogger(__name__)
-
 _BAGEL_RMS_NORM_EPS = 1e-6
 _BAGEL_ROPE_THETA = 1_000_000.0
 _BAGEL_VIT_LAYER_NORM_EPS = 1e-6
 _BAGEL_IMAGE_MARKER_TOKENS = 2
+_BAGEL_VIT_MIN_SIZE = 224
+_BAGEL_VAE_MIN_SIZE = 512
+_BAGEL_VAE_MAX_SIZE = 1024
+_BAGEL_VAE_STRIDE = 16
+_BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
 
-
-def _weights_file(model_dir: str) -> str:
-    for name in ("ema.safetensors", "model.safetensors"):
-        path = os.path.join(model_dir, name)
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"no ema.safetensors or model.safetensors under {model_dir}")
-
-
-@dataclass
+@dataclass(frozen=True, slots=True)
 class LLMConfig:
     """Language-model hyperparameters for the BAGEL stack."""
 
@@ -137,13 +118,14 @@ class LLMConfig:
     qk_norm: bool = True
     bos_token_id: int = 151644
     eos_token_id: int = 151645
+    max_position_embeddings: int = 32768
 
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class BagelConfig:
     """Top-level BAGEL model configuration (LLM, ViT, VAE, and latent settings)."""
 
@@ -188,31 +170,8 @@ class BagelConfig:
         return self.latent_patch_size**2 * self.latent_channel
 
     @classmethod
-    def from_pretrained(cls, model_dir: str) -> "BagelConfig":
-        try:
-            with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
-                raw = json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError) as exc:
-            logger.warning(
-                "BAGEL config.json missing or invalid under %s (%s); "
-                "falling back to default model dimensions",
-                model_dir,
-                exc,
-            )
-            raw = {}
-
-        def side(name: str) -> dict[str, Any]:
-            path = os.path.join(model_dir, name)
-            if not os.path.exists(path):
-                return {}
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-
-        if "llm_config" not in raw:
-            raw = dict(raw)
-            raw["llm_config"] = side("llm_config.json")
-            raw["vit_config"] = side("vit_config.json")
-            raw.setdefault("vae_config", side("vae_config.json"))
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "BagelConfig":
+        """Construct the immutable declaration from loader-resolved config data."""
 
         llm_raw = raw["llm_config"]
         llm = LLMConfig(
@@ -230,17 +189,6 @@ class BagelConfig:
         )
         vae = raw.get("vae_config", {})
         vit = raw.get("vit_config", {})
-        max_latent = raw.get("max_latent_size", 32)
-        try:
-            rows = tensor_shape(_weights_file(model_dir), "latent_pos_embed.pos_embed")[0]
-            max_latent = int(math.isqrt(rows))
-        except Exception as exc:
-            logger.warning(
-                "BAGEL could not infer max_latent_size from latent_pos_embed (%s); "
-                "using configured value %s",
-                exc,
-                max_latent,
-            )
         return cls(
             llm=llm,
             visual_gen=raw.get("visual_gen", True),
@@ -250,7 +198,7 @@ class BagelConfig:
             vae_z_channels=vae.get("z_channels", 16),
             vae_downsample=vae.get("downsample", 8),
             latent_patch_size=raw.get("latent_patch_size", 2),
-            max_latent_size=max_latent,
+            max_latent_size=int(raw.get("max_latent_size", 32)),
             timestep_shift=raw.get("timestep_shift", 1.0),
             vit_hidden_size=vit.get("hidden_size", 1152),
             vit_intermediate_size=vit.get("intermediate_size", 4304),
@@ -267,38 +215,38 @@ class BagelConfig:
 class _BagelGraph(nn.Module):
     """BAGEL neural graph: MoT language model, VAE, ViT, and flow-matching connectors."""
 
-    def __init__(self, cfg: BagelConfig) -> None:
+    def __init__(self, cfg: BagelConfig, *, layer_spec: LayerSpec) -> None:
         super().__init__()
         self.cfg = cfg
         hidden = cfg.llm.hidden_size
-        # Install checkpoint quantization context during layer construction.
-        self._quant_config = QuantizationConfig.from_model_config(cfg)
-        with use_quantization_config(self._quant_config):
-            self.lm = MoTModel(cfg.llm)
-            self.lm_head = ParallelLMHead(hidden, cfg.llm.vocab_size, bias=False)
-            self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden)
-            self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim)
-            self.time_embedder = TimestepEmbedder(hidden)
-            self.latent_pos_embed = PositionEmbedding(
-                cfg.max_latent_size, hidden, init_sincos=False
-            )
-            self.vae = AutoEncoder(default_ae_params())
-            self.vit_model = SiglipNavitEncoder(
-                SiglipNavitConfig(
-                    patch_size=cfg.vit_patch_size,
-                    hidden_size=cfg.vit_hidden_size,
-                    image_size=cfg.vit_image_size,
-                    num_attention_heads=cfg.vit_num_attention_heads,
-                    intermediate_size=cfg.vit_intermediate_size,
-                    num_hidden_layers=cfg.vit_num_hidden_layers,
-                    layer_norm_eps=cfg.vit_layer_norm_eps,
-                )
-            )
-            self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
-            self.vit_pos_embed = PositionEmbedding(
-                cfg.vit_max_num_patch_per_side, hidden, init_sincos=False
-            )
-        self._gen_graph_layouts: dict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
+        self.lm = MoTModel(cfg.llm, spec=layer_spec)
+        self.lm_head = ParallelLMHead(
+            hidden,
+            cfg.llm.vocab_size,
+            spec=layer_spec,
+            bias=False,
+        )
+        self.vae2llm = LinearBase(cfg.patch_latent_dim, hidden, spec=layer_spec)
+        self.llm2vae = LinearBase(hidden, cfg.patch_latent_dim, spec=layer_spec)
+        self.time_embedder = TimestepEmbedder(hidden)
+        self.latent_pos_embed = PositionEmbedding(cfg.max_latent_size, hidden, init_sincos=False)
+        self.vae = AutoEncoder(default_ae_params())
+        self.vit_model = SiglipNavitEncoder(
+            SiglipNavitConfig(
+                patch_size=cfg.vit_patch_size,
+                hidden_size=cfg.vit_hidden_size,
+                image_size=cfg.vit_image_size,
+                num_attention_heads=cfg.vit_num_attention_heads,
+                intermediate_size=cfg.vit_intermediate_size,
+                num_hidden_layers=cfg.vit_num_hidden_layers,
+                layer_norm_eps=cfg.vit_layer_norm_eps,
+            ),
+            spec=layer_spec,
+        )
+        self.connector = MLPConnector(cfg.vit_hidden_size, hidden, cfg.connector_act)
+        self.vit_pos_embed = PositionEmbedding(
+            cfg.vit_max_num_patch_per_side, hidden, init_sincos=False
+        )
 
     @property
     def num_layers(self) -> int:
@@ -308,28 +256,17 @@ class _BagelGraph(nn.Module):
     def device(self) -> torch.device:
         return self.lm_head.weight.device
 
-    def new_cache(self) -> KVCache:
-        return KVCache(self.num_layers)
+    def embed_tokens(self, ids: torch.Tensor, context: ForwardContext) -> torch.Tensor:
+        return self.lm.embed_tokens(ids, context.mesh)
 
-    def embed_tokens(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.lm.embed_tokens(ids)
-
-    def build_und_segment(self, token_ids, start_pos, cache, update=True) -> Segment:
-        ids = torch.as_tensor(token_ids, dtype=torch.long, device=self.device)
-        n_tokens = ids.shape[0]
-        positions = torch.arange(start_pos, start_pos + n_tokens, device=self.device)
-        embeds = self.embed_tokens(ids).to(torch.bfloat16)
-        is_gen = torch.zeros(n_tokens, dtype=torch.bool, device=self.device)
-        return Segment(
-            embeds=embeds,
-            positions=positions,
-            is_gen=is_gen,
-            cache=cache,
-            causal=True,
-            update_cache=update,
-        )
-
-    def gen_segment_embeds(self, num_vae, vae_pos_ids, x_t, timestep) -> torch.Tensor:
+    def gen_segment_embeds(
+        self,
+        num_vae,
+        vae_pos_ids,
+        x_t,
+        timestep,
+        context: ForwardContext,
+    ) -> torch.Tensor:
         """Marker/VAE-latent/timestep embeddings for one gen segment, ``[num_vae+2, hidden]``.
 
         Shared by graph denoise and image-commit paths so marker and latent
@@ -342,9 +279,10 @@ class _BagelGraph(nn.Module):
             dtype=torch.long,
             device=self.device,
         )
-        marker_emb = self.embed_tokens(marker_ids).to(torch.bfloat16)
-        x_t = x_t.to(device=self.device, dtype=torch.bfloat16)
-        timesteps = torch.full((int(num_vae),), float(timestep), device=self.device)
+        marker_emb = self.embed_tokens(marker_ids, context).to(torch.bfloat16)
+        x_t = x_t.to(device=self.device, dtype=torch.bfloat16).reshape(int(num_vae), -1)
+        timestep_value = torch.as_tensor(timestep, device=self.device).reshape(1)
+        timesteps = timestep_value.expand(int(num_vae))
         vae_emb = (
             self.vae2llm(x_t)
             + self.time_embedder(timesteps)
@@ -356,82 +294,29 @@ class _BagelGraph(nn.Module):
         embeds[1 + int(num_vae)] = marker_emb[1]
         return embeds
 
-    def gen_segment_is_gen(self, num_vae) -> torch.Tensor:
-        """Gen-segment modality pattern: markers are text-modality, latents gen."""
-        is_gen = torch.zeros(int(num_vae) + 2, dtype=torch.bool, device=self.device)
-        is_gen[1 : 1 + int(num_vae)] = True
-        return is_gen
-
-    def gen_segment_graph_layout(
+    @torch.no_grad()
+    def logits(
         self,
-        batch_size: int,
-        num_vae: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = int(batch_size)
-        num_vae = int(num_vae)
-        key = (batch_size, num_vae, str(self.device))
-        cached = self._gen_graph_layouts.get(key)
-        if cached is not None:
-            return cached
-        total = num_vae + _BAGEL_IMAGE_MARKER_TOKENS
-        is_gen = self.gen_segment_is_gen(num_vae)
-        row_offsets = torch.arange(batch_size, device=self.device, dtype=torch.long) * total
-        marker_offsets = torch.tensor(
-            [0, total - 1],
-            device=self.device,
-            dtype=torch.long,
-        )
-        text_idx = (row_offsets.unsqueeze(1) + marker_offsets.unsqueeze(0)).reshape(-1)
-        layout = (is_gen, text_idx)
-        self._gen_graph_layouts[key] = layout
-        return layout
-
-    def build_gen_segment(
-        self, num_vae, vae_pos_ids, x_t, timestep, position_id, cache, update=False
-    ) -> Segment:
-        total = int(num_vae) + 2
-        embeds = self.gen_segment_embeds(num_vae, vae_pos_ids, x_t, timestep)
-        positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
-        return Segment(
-            embeds=embeds,
-            positions=positions,
-            is_gen=self.gen_segment_is_gen(num_vae),
-            cache=cache,
-            causal=False,
-            update_cache=update,
-        )
-
-    @torch.no_grad()
-    def run(self, segments) -> list[torch.Tensor]:
-        return self.lm.forward_segments(segments)
-
-    @torch.no_grad()
-    def logits(self, hidden_last_row: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_last_row)
+        hidden_last_row: torch.Tensor,
+        context: ForwardContext,
+    ) -> torch.Tensor:
+        return self.lm_head(hidden_last_row, context.mesh)
 
     @torch.no_grad()
     def velocity_from_hidden(self, hidden, num_vae) -> torch.Tensor:
         return self.llm2vae(hidden[1 : 1 + int(num_vae)].to(torch.bfloat16))
 
-    def latent_position_ids(self, height: int, width: int) -> torch.Tensor:
-        return get_flattened_position_ids_extrapolate(
-            height,
-            width,
-            self.cfg.latent_downsample,
-            self.cfg.max_latent_size,
-        )
-
     def latent_hw(self, height: int, width: int) -> tuple[int, int]:
         return height // self.cfg.latent_downsample, width // self.cfg.latent_downsample
 
     @torch.no_grad()
-    def vit_encode(self, image_tensor: torch.Tensor) -> torch.Tensor:
-        return self.vit_encode_batch(image_tensor.unsqueeze(0))[0]
-
-    @torch.no_grad()
-    def vit_encode_batch(self, image_tensors: torch.Tensor) -> torch.Tensor:
+    def vit_encode_batch(
+        self,
+        image_tensors: torch.Tensor,
+        context: ForwardContext,
+    ) -> torch.Tensor:
         if image_tensors.ndim != 4:
-            raise invalid_descriptor("BAGEL batched ViT encode expects NCHW pixels")
+            raise ValueError("BAGEL batched ViT encode expects NCHW pixels")
         image_tensors = image_tensors.to(self.device)
         batch, _channels, height, width = image_tensors.shape
         patch = self.cfg.vit_patch_size
@@ -461,14 +346,10 @@ class _BagelGraph(nn.Module):
         vit_out = self.vit_model(
             patches,
             {"position_ids": packed_pos_ids, "cu_seqlens": cu_seqlens},
+            context,
         )
         emb = self.connector(vit_out) + self.vit_pos_embed(packed_pos_ids)
         return emb.reshape(batch, tokens_per_image, -1).to(torch.bfloat16)
-
-    @torch.no_grad()
-    def vae_encode_clean(self, image_tensor: torch.Tensor):
-        latents, pos_ids, hw = self.vae_encode_clean_batch(image_tensor.unsqueeze(0))
-        return latents[0], pos_ids, hw
 
     @torch.no_grad()
     def vae_encode_clean_batch(
@@ -476,7 +357,7 @@ class _BagelGraph(nn.Module):
         image_tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
         if image_tensors.ndim != 4:
-            raise invalid_descriptor("BAGEL batched VAE encode expects NCHW pixels")
+            raise ValueError("BAGEL batched VAE encode expects NCHW pixels")
         image_tensors = image_tensors.to(self.device)
         _batch, _channels, height, width = image_tensors.shape
         vae_dtype = next(self.vae.parameters()).dtype
@@ -506,43 +387,21 @@ class _BagelGraph(nn.Module):
         ).to(self.device)
         return latents.to(torch.bfloat16), pos_ids, (h, w)
 
-    def build_und_image_segment(self, vit_embeds, position_id, cache, update=True) -> Segment:
-        n_tokens = vit_embeds.shape[0]
-        hidden = self.cfg.llm.hidden_size
-        marker_ids = torch.tensor(
-            [self.cfg.start_of_image_id, self.cfg.end_of_image_id],
-            dtype=torch.long,
-            device=self.device,
-        )
-        marker_emb = self.embed_tokens(marker_ids).to(torch.bfloat16)
-        total = n_tokens + 2
-        embeds = torch.empty(total, hidden, dtype=torch.bfloat16, device=self.device)
-        embeds[0] = marker_emb[0]
-        embeds[1 : 1 + n_tokens] = vit_embeds.to(self.device)
-        embeds[1 + n_tokens] = marker_emb[1]
-        positions = torch.full((total,), int(position_id), dtype=torch.long, device=self.device)
-        is_gen = torch.zeros(total, dtype=torch.bool, device=self.device)
-        return Segment(
-            embeds=embeds,
-            positions=positions,
-            is_gen=is_gen,
-            cache=cache,
-            causal=False,
-            update_cache=update,
-        )
-
     @torch.no_grad()
-    def vae_decode(self, latent: torch.Tensor, height: int, width: int) -> Image.Image:
+    def vae_decode_batch(
+        self,
+        latents: torch.Tensor,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
         h, w = self.latent_hw(height, width)
         patch = self.cfg.latent_patch_size
         channels = self.cfg.latent_channel
-        latent = latent.reshape(1, h, w, patch, patch, channels)
-        latent = torch.einsum("nhwpqc->nchpwq", latent)
-        latent = latent.reshape(1, channels, h * patch, w * patch)
-        latent = latent.to(next(self.vae.parameters()).dtype)
-        img = self.vae.decode(latent)
-        img = (img * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
-        return Image.fromarray(img.to(torch.uint8).cpu().numpy())
+        latent_images = latents.reshape(-1, h, w, patch, patch, channels)
+        latent_images = torch.einsum("nhwpqc->nchpwq", latent_images)
+        latent_images = latent_images.reshape(-1, channels, h * patch, w * patch)
+        latent_images = latent_images.to(next(self.vae.parameters()).dtype)
+        return (self.vae.decode(latent_images) * 0.5 + 0.5).clamp(0, 1)
 
 
 # Checkpoint tensor names map onto the ``_BagelGraph`` parameter tree through
@@ -553,12 +412,16 @@ _BAGEL_RENAMES = (
     Rename("language_model.model.norm.weight", "lm.norm.weight", exact=True),
     Rename("language_model.model.norm_moe_gen.weight", "lm.norm_moe_gen.weight", exact=True),
     Rename("language_model.lm_head.weight", "lm_head.weight", exact=True),
-    Rename("language_model.model.layers.", "lm.layers.", then=((".self_attn.", "."),)),
+    Rename(
+        "language_model.model.layers.",
+        "lm.layers.",
+        substitutions=((".self_attn.", "."),),
+    ),
     Rename("vit_model.vision_model.embeddings.", "vit_model."),
     Rename(
         "vit_model.vision_model.encoder.",
         "vit_model.encoder.",
-        then=((".mlp.fc1.", ".mlp.0."), (".mlp.fc2.", ".mlp.2.")),
+        substitutions=((".mlp.fc1.", ".mlp.0."), (".mlp.fc2.", ".mlp.2.")),
     ),
     Rename(
         "vit_model.vision_model.post_layernorm.",
@@ -572,193 +435,164 @@ _BAGEL_RENAMES = (
     Rename("latent_pos_embed.", "latent_pos_embed."),
 )
 
-# The ``_moe_gen`` rules precede the base rules: their source fragments contain
-# the base fragments as substrings, and first match wins.
+# Stack declarations bind exact parameter-path segments and preserve the target
+# module's packed projection order.
 _BAGEL_STACKED = (
-    StackedParamMapping("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
-    StackedParamMapping("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
-    StackedParamMapping("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
-    StackedParamMapping("qkv_proj", "q_proj", "q"),
-    StackedParamMapping("qkv_proj", "k_proj", "k"),
-    StackedParamMapping("qkv_proj", "v_proj", "v"),
-    StackedParamMapping("gate_up_proj", "gate_proj", 0),
-    StackedParamMapping("gate_up_proj", "up_proj", 1),
+    Stack("qkv_proj_moe_gen", "q_proj_moe_gen", "q"),
+    Stack("qkv_proj_moe_gen", "k_proj_moe_gen", "k"),
+    Stack("qkv_proj_moe_gen", "v_proj_moe_gen", "v"),
+    Stack("qkv_proj", "q_proj", "q"),
+    Stack("qkv_proj", "k_proj", "k"),
+    Stack("qkv_proj", "v_proj", "v"),
+    Stack("gate_up_proj", "gate_proj", 0),
+    Stack("gate_up_proj", "up_proj", 1),
 )
 
 
-@dataclass(frozen=True)
-class _LoadedBagelRuntime:
-    model: _BagelGraph
-    pool: PagedKVPool
+class BagelForUnifiedGeneration(nn.Module):
+    """Stateless BAGEL neural graph for the declared MoT, ViT, and VAE routes."""
 
-
-# BAGEL's start-of-image marker string (token id 151652 in the Qwen2 vocab).
-# The worker never tokenizes it (encode ops embed the marker directly); the
-# shared text driver takes it as configuration.
-_BAGEL_IMG_START_TOKEN = "<|vision_start|>"
-
-# Scheduler-visible denoise scratch capacity in tokens. Each image stages cond
-# and text-uncond prefixes plus one transient gen span per physical branch. The
-# physical pool also reserves one request-KV-pool-sized region for text rows in
-# shared packed forwards; that staging reserve is not additional denoise
-# admission capacity.
-_BAGEL_SCRATCH_CAPACITY_TOKENS = 65536
-
-
-class BagelForUnifiedGeneration(UniModelBase):
-    """BAGEL unified text/image model with VAE denoise and ViT/VAE encode paths."""
-
-    family = "bagel"
-    architectures = ("BagelForUnifiedGeneration", "BAGEL", "bagel")
-    supported_ops = (
-        "prefill_und",
-        "decode_und",
-        "denoise_gen",
-        "commit_gen",
-        "vit_encode",
-        "vae_encode",
-    )
-    supported_controls = ("free_encoder", "load_lora", "unload_lora")
-    adapter_mode = "engine_wide"
-    resource_plan = ResourcePlan(
-        kv_block=KvBlockResourcePolicy.PER_BLOCK,
-        encoder_output=EncoderResourcePolicy.PER_HANDLE,
-        image_latent=LatentTokens(downsample=16),
-        scratch=PerBranch(),
-        adapter=AdapterResourcePolicy.PER_ADAPTER,
-    )
     weight_spec = WeightSpec(
-        graph=GraphSource(config_cls=BagelConfig, module_cls=_BagelGraph),
-        checkpoint_files=("ema.safetensors", "model.safetensors"),
-        renames=_BAGEL_RENAMES,
-        stacked=_BAGEL_STACKED,
-        unmatched="skip",
+        files=("ema.safetensors", "model.safetensors"),
+        transforms=(*_BAGEL_RENAMES, *_BAGEL_STACKED),
+        adapter_renames=(Rename("base_model.model.", ""),),
+        unmatched=UnmatchedWeightPolicy.SKIP,
         sidecars=(Sidecar(file="ae.safetensors", module="vae", optional_substrings=("reg",)),),
     )
 
-    # Encoder-output cache capacity reported to the host scheduler.
-    ENCODER_CACHE_BUDGET = DEFAULT_ENCODER_CACHE_BUDGET
-
-    # System-provisioned at worker bring-up from ``gen_residency_spec()``.
-    residency: ResidencyManager
-    # System-provisioned at worker bring-up from ``segment_adapter()``.
-    segment_executor: SegmentExecutor
-
-    @classmethod
-    def recognizes(cls, model_path: str | Path) -> bool:
-        root = Path(model_path)
-        return ((root / "ema.safetensors").exists() or (root / "model.safetensors").exists()) and (
-            root / "ae.safetensors"
-        ).exists()
-
     def __init__(
         self,
-        config: Any | None = None,
+        config: BagelConfig,
         *,
-        model: _BagelGraph | None = None,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        kv_token_capacity: int | None = None,
-        attention_backend: str | None = None,
-        device: str = "cuda",
+        layer_spec: LayerSpec,
+        graph: _BagelGraph | None = None,
     ) -> None:
-        self.config = config
-        self.model = model
-        self.block_size = int(block_size)
-        self.kv_token_capacity = int(kv_token_capacity) if kv_token_capacity is not None else None
-        self.attention_backend = attention_backend or "auto"
-        self.device = str(device)
-        self.cfg = (
-            model.cfg
-            if model is not None
-            else (config if isinstance(config, BagelConfig) else BagelConfig())
-        )
-        self.resource_plan = self._build_resource_plan()
-        # Declarative flow semantics; ``model_spec()`` composes this same value
-        # and the denoise path derives its schedule and CFG recipe from it.
-        self._flow = FlowSpec(
+        super().__init__()
+        if graph is not None and graph.cfg != config:
+            raise ValueError("BAGEL graph and root must use the same immutable configuration")
+        self.cfg = config
+        self._parallel = layer_spec.parallel
+        self.model = graph if graph is not None else _BagelGraph(config, layer_spec=layer_spec)
+        self.spec = self._build_spec()
+
+    def _build_spec(self) -> ModelSpec:
+        llm = self.cfg.llm
+        flow = FlowSpec(
             latent_downsample=int(self.cfg.latent_downsample),
             prediction="velocity",
+            prediction_dtype="bfloat16",
             schedule_direction=ScheduleDirection.DESCENDING.value,
             schedule_shift_domain=ScheduleShiftDomain.TIME.value,
+            max_latent_tokens=int(self.cfg.latent_token_capacity),
+            max_vae_grid_tokens=(int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS),
+            commit_marker_tokens=_BAGEL_IMAGE_MARKER_TOKENS,
+            rope_advance=2,
+            max_cfg_branches=3,
+            latent_layout=LatentLayout.PATCH_TOKENS,
+            latent_channels=int(self.cfg.latent_channel),
+            latent_patch_size=int(self.cfg.latent_patch_size),
+            positions=PositionLayout.TEMPORAL,
+            conditioning=FlowConditioningKind.NONE,
+            materialization=MaterializationKind.DECODE_ROUTE,
+            noise_scale=NoiseScaleSpec(),
+            text_unconditional=FlowBranchSource.NEGATIVE_OR_START,
+            image_unconditional=FlowBranchSource.CONDITIONING,
             cfg_recipe=CfgRecipe.IMAGE_OVER_TEXT.value,
             timestep_shift=float(self.cfg.timestep_shift),
         )
-        # Interleaved-text-driver owner surface: per-request driver states plus
-        # the marker/eos ids the driver reads as configuration. BAGEL has no
-        # worker-side tokenizer (the host tokenizes). The scratch pool holds
-        # the denoise CFG-branch prefixes and their transient gen rows.
-        self.tokenizer = None
-        self.scratch_pool: PagedKVPool | None = None
-        self._scratch_blocks = 0
-        self.eos_id = int(self.cfg.llm.eos_token_id)
-        self.img_start_id = int(self.cfg.start_of_image_id)
-        self.img_end_id = int(self.cfg.end_of_image_id)
-        self._shared_text_driver: SequenceExecutor | None = None
-        self.kv_pool: PagedKVPool | None = None
-        self.kv_cache_dtype = get_current_kv_cache_dtype(config)
-        self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
-        if self.model is not None:
-            self.kv_token_capacity = int(
-                derive_runtime_kv_capacity(
-                    device=self.device,
-                    block_size=self.block_size,
-                    kv_token_capacity=self.kv_token_capacity,
-                    bytes_per_token=self.bytes_per_token,
-                    memory_fraction=get_execution_config().kv_memory_fraction,
-                    floor=64,
-                ).token_capacity
-            )
-            self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
-            self._scratch_blocks = self._scratch_num_blocks()
-            self.bytes_per_token = self._kv_bytes_per_token(torch.bfloat16)
-        else:
-            self.num_blocks = derive_num_blocks(self.block_size, self.kv_token_capacity, floor=64)
-
-    def _build_resource_plan(self) -> ResourcePlan:
-        return ResourcePlan(
-            kv_block=KvBlockResourcePolicy.PER_BLOCK,
-            encoder_output=EncoderResourcePolicy.PER_HANDLE,
-            image_latent=LatentTokens(downsample=int(self.cfg.latent_downsample)),
-            scratch=PerBranch(),
-            adapter=AdapterResourcePolicy.PER_ADAPTER,
-        )
-
-    def _denoise_scratch_num_blocks(self, block_size: int | None = None) -> int:
-        return ceil_div(_BAGEL_SCRATCH_CAPACITY_TOKENS, int(block_size or self.block_size))
-
-    def _scratch_num_blocks(self, block_size: int | None = None) -> int:
-        # Every live text token can require one same-pool packed-forward mirror.
-        # Host KV admission bounds their aggregate by ``num_blocks``; adding
-        # that exact capacity preserves the independently admitted denoise
-        # reservation without allowing it to consume text-staging headroom.
-        return self._denoise_scratch_num_blocks(block_size) + int(self.num_blocks)
-
-    def model_spec(self) -> ModelSpec:
-        llm = self.cfg.llm
         return ModelSpec(
-            architecture=self.architectures[0],
+            architecture="BagelForUnifiedGeneration",
             routes=(
                 # Token and flow rows share the MoT backbone in one forward.
                 RouteSpec(
                     name="mot",
-                    op_kinds=("prefill_und", "decode_und", "denoise_gen"),
-                    mixed=True,
+                    row_kinds=(RouteRowKind.TOKEN, RouteRowKind.FLOW),
+                    output_kinds=(RouteOutputKind.TOKEN, RouteOutputKind.FLOW),
+                    mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
                     dtype="bfloat16",
+                    placement=RoutePlacement.PRIMARY,
+                    topology_axes=("tp",),
+                    shape=RouteShape(
+                        max_tokens_per_row=max(
+                            int(llm.max_position_embeddings),
+                            int(self.cfg.latent_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS,
+                        ),
+                        token_multiple=1,
+                    ),
                     graph_eligible=True,
                 ),
                 RouteSpec(
                     name="vae",
-                    op_kinds=("vae_encode", "commit_gen"),
-                    mixed=False,
+                    row_kinds=(RouteRowKind.ENCODE, RouteRowKind.DECODE),
+                    output_kinds=(RouteOutputKind.ENCODE, RouteOutputKind.DECODE),
+                    mixed_combinations=(),
                     dtype="bfloat16",
+                    placement=RoutePlacement.GENERATION,
+                    topology_axes=("tp",),
+                    shape=RouteShape(
+                        max_tokens_per_row=int(self.cfg.latent_token_capacity),
+                        token_multiple=1,
+                        grouping=RouteShapeGrouping.IMAGE_GEOMETRY,
+                    ),
                     graph_eligible=False,
                 ),
                 RouteSpec(
                     name="vit",
-                    op_kinds=("vit_encode",),
-                    mixed=False,
+                    row_kinds=(RouteRowKind.ENCODE,),
+                    output_kinds=(RouteOutputKind.ENCODE,),
+                    mixed_combinations=(),
                     dtype="bfloat16",
+                    placement=RoutePlacement.PRIMARY,
+                    topology_axes=("tp",),
+                    shape=RouteShape(
+                        max_tokens_per_row=int(self.cfg.vit_token_capacity),
+                        token_multiple=1,
+                        grouping=RouteShapeGrouping.INPUT_SHAPE,
+                    ),
                     graph_eligible=False,
+                ),
+            ),
+            operations=(
+                OperationSpec(
+                    OperationType.SEQUENCE_EXTEND, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                ),
+                OperationSpec(
+                    OperationType.SEQUENCE_DECODE, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                ),
+                OperationSpec(
+                    OperationType.SEQUENCE_VERIFY, (OperationStageSpec("mot", RouteRowKind.TOKEN),)
+                ),
+                OperationSpec(OperationType.FLOW, (OperationStageSpec("mot", RouteRowKind.FLOW),)),
+                OperationSpec(
+                    OperationType.ENCODE_VISION,
+                    (
+                        OperationStageSpec("vit", RouteRowKind.ENCODE),
+                        OperationStageSpec("mot", RouteRowKind.TOKEN, OperationStagePurpose.STATE),
+                    ),
+                ),
+                OperationSpec(
+                    OperationType.ENCODE_LATENT,
+                    (
+                        OperationStageSpec("vae", RouteRowKind.ENCODE),
+                        OperationStageSpec("mot", RouteRowKind.FLOW, OperationStagePurpose.STATE),
+                    ),
+                ),
+                OperationSpec(
+                    OperationType.MATERIALIZE_IMAGE,
+                    (
+                        OperationStageSpec("vae", RouteRowKind.DECODE),
+                        OperationStageSpec(
+                            "mot",
+                            RouteRowKind.FLOW,
+                            OperationStagePurpose.STATE,
+                            OperationStageCondition.RETAIN_IMAGE,
+                        ),
+                    ),
+                ),
+                OperationSpec(OperationType.TRANSFER_PRODUCT),
+                OperationSpec(
+                    OperationType.TRANSFER_KV,
+                    (OperationStageSpec("mot", RouteRowKind.FLOW),),
                 ),
             ),
             weights=self.weight_spec,
@@ -768,712 +602,179 @@ class BagelForUnifiedGeneration(UniModelBase):
                 images=ImageInputSpec(
                     vit=ImageTowerSpec(
                         resize=StrideResizeSpec(
-                            max_size=BAGEL_GEOMETRY.vit_max_size,
-                            min_size=BAGEL_GEOMETRY.vit_min_size,
-                            stride=BAGEL_GEOMETRY.vit_stride,
-                            max_pixels=BAGEL_GEOMETRY.max_pixels,
+                            max_size=int(self.cfg.vit_image_size),
+                            min_size=_BAGEL_VIT_MIN_SIZE,
+                            stride=int(self.cfg.vit_patch_size),
+                            max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
                         ),
                         normalization="signed_unit",
                     ),
                     vae=ImageTowerSpec(
                         resize=StrideResizeSpec(
-                            max_size=BAGEL_GEOMETRY.vae_max_size,
-                            min_size=BAGEL_GEOMETRY.vae_min_size,
-                            stride=BAGEL_GEOMETRY.vae_stride,
-                            max_pixels=BAGEL_GEOMETRY.max_pixels,
+                            max_size=_BAGEL_VAE_MAX_SIZE,
+                            min_size=_BAGEL_VAE_MIN_SIZE,
+                            stride=_BAGEL_VAE_STRIDE,
+                            max_pixels=_BAGEL_MAX_IMAGE_PIXELS,
                         ),
                         normalization="signed_unit",
                     ),
+                    feature_injection=FeatureInjectionSpec(
+                        layout=FeatureLayout.FRAMED,
+                        positions=PositionLayout.TEMPORAL,
+                        start_token_id=int(self.cfg.start_of_image_id),
+                        end_token_id=int(self.cfg.end_of_image_id),
+                    ),
                 ),
+                encoder_cache_budget=256,
+                max_vit_grid_tokens=(int(self.cfg.vit_token_capacity) + _BAGEL_IMAGE_MARKER_TOKENS),
             ),
             cache=CacheSpec(
                 num_layers=int(llm.num_hidden_layers),
-                num_kv_heads=local_kv_head_count(int(llm.num_key_value_heads)),
+                num_attention_heads=local_attention_head_count(
+                    int(llm.num_attention_heads),
+                    parallel=self._parallel,
+                ),
+                num_kv_heads=local_kv_head_count(
+                    int(llm.num_key_value_heads),
+                    parallel=self._parallel,
+                ),
                 head_dim=int(llm.head_dim),
                 dtype="bfloat16",
-                store_dtype=self._kv_dtype_name_for(torch.bfloat16),
+                store_dtype="bfloat16",
+                position_layout=PositionLayout.TEMPORAL,
             ),
-            flow=self._flow,
+            flow=flow,
         )
 
-    def gen_residency_spec(self) -> GenResidencySpec | None:
-        # The model declares only geometry/sizing; the system builds and owns
-        # the pools. The scratch pool holds denoise CFG branches and same-pool
-        # text mirrors used by shared packed text/denoise forwards.
-        if self.model is None:
-            return None
-        cfg = self.cfg.llm
-        return GenResidencySpec(
-            kv=KvCacheSpec(
-                num_layers=cfg.num_hidden_layers,
-                num_kv_heads=local_kv_head_count(cfg.num_key_value_heads),
-                head_dim=cfg.head_dim,
-                dtype=torch.bfloat16,
-                store_dtype=self._kv_store_dtype_for(torch.bfloat16),
-            ),
-            num_blocks=self.num_blocks,
-            block_size=self.block_size,
-            device=self.device,
-            scratch_num_blocks=self._scratch_blocks,
-            reserved_tail_blocks=decode_graph_padding_block_count(self.block_size),
-            encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
-        )
+    @torch.inference_mode()
+    def forward(self, batch: ForwardBatch) -> ForwardOutput:
+        if batch.route == "mot":
+            return self._forward_mot(batch)
+        if batch.route == "vit":
+            return self._forward_vit(batch)
+        if batch.route == "vae":
+            return self._forward_vae(batch)
+        raise ValueError(f"BAGEL received unknown route {batch.route!s}")
 
-    def segment_adapter(self) -> SegmentAdapter:
-        return self
-
-    def _caps_descriptor(
-        self,
-        *,
-        block_size: int | None = None,
-        kv_token_capacity: int | None = None,
-    ) -> CapsDescriptor:
-        block = int(block_size or self.block_size)
-        cap = kv_token_capacity if kv_token_capacity is not None else self.kv_token_capacity
-        if self.model is not None:
-            cap = int(cap or self.kv_token_capacity or self.block_size * self.num_blocks)
-            physical_blocks = int(self.num_blocks)
-        else:
-            physical_blocks = derive_num_blocks(block, cap, floor=64)
-        padding_blocks = decode_graph_padding_block_count(block)
-        num_blocks = max(1, physical_blocks - padding_blocks)
-        c = self.cfg.llm
-        # Report only schedulable denoise capacity. The physical pool's separate
-        # text-staging reserve mirrors already-admitted request KV and must not
-        # increase host denoise admission.
-        scratch_blocks = self._denoise_scratch_num_blocks(block)
-        return CapsDescriptor(
-            block_size=block,
-            num_blocks=num_blocks,
-            num_layers=c.num_hidden_layers,
-            scratch_capacity_tokens=int(scratch_blocks * block),
-            max_latent_size=active_latent_capacity_tokens(
-                self.cfg.latent_token_capacity,
-                cap,
-            ),
-            latent_downsample=self.cfg.latent_downsample,
-            max_vae_grid_tokens=(self.cfg.latent_token_capacity + _BAGEL_IMAGE_MARKER_TOKENS),
-            max_vit_grid_tokens=(self.cfg.vit_token_capacity + _BAGEL_IMAGE_MARKER_TOKENS),
-            commit_marker_tokens=_BAGEL_IMAGE_MARKER_TOKENS,
-            gen_rope_advance=2,
-            max_cfg_branches=3,
-            bytes_per_token=self._kv_bytes_per_token(torch.bfloat16),
-            max_batch_ops=DEFAULT_MAX_BATCH_OPS,
-            attention_backend=self.attention_backend,
-            kv_dtype=self._kv_dtype_name_for(torch.bfloat16),
-            encoder_cache_budget=self.ENCODER_CACHE_BUDGET,
-        )
-
-    def _kv_bytes_per_token(self, compute_dtype: torch.dtype) -> int:
-        c = self.cfg.llm
-        return kv_cache_bytes_per_token(
-            num_kv_heads=local_kv_head_count(c.num_key_value_heads),
-            head_dim=c.head_dim,
-            num_layers=c.num_hidden_layers,
-            compute_dtype=compute_dtype,
-            store_dtype=self.kv_cache_dtype,
-        )
-
-    def _record(self, req_id: int) -> Any:
-        product_view = get_forward_context().product_view
-        if product_view is None:
-            raise invalid_descriptor("BAGEL product metadata requires an executor view")
-        return product_view.record(int(req_id))
-
-    def _state(self, req_id: int) -> RequestState:
-        request_states = get_forward_context().request_states
-        if request_states is None:
-            raise invalid_descriptor("BAGEL request state requires an executor-bound forward")
-        return request_states.get(int(req_id))
-
-    # ---- sequence adapter surface ------------------------------------------
-
-    @property
-    def num_layers(self) -> int:
-        return int(self.cfg.llm.num_hidden_layers)
-
-    def _text_driver(self) -> SequenceExecutor:
-        driver = self._shared_text_driver
-        if driver is None:
-            driver = SequenceExecutor(
-                self,
-                image_start_token=_BAGEL_IMG_START_TOKEN,
-            )
-            self._shared_text_driver = driver
-        return driver
-
-    def _extend_cache_blocks(self, cache: SequenceCache, op: dict[str, Any]) -> None:
-        self._text_driver().extend_cache_blocks(cache, op)
-
-    def _ensure_host_cache(self, cache: SequenceCache) -> None:
-        self._text_driver().ensure_host_cache(cache)
-
-    def program_state(self, req_id: int) -> ProgramState:
-        kv_view = get_forward_context().kv_view
-        if kv_view is None:
-            raise invalid_descriptor("BAGEL sequence state requires an executor KV view")
-        return kv_view.program(int(req_id))
-
-    def sequence_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._ensure_loaded().model.embed_tokens(input_ids).to(torch.bfloat16)
-
-    def packed_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._ensure_loaded().model.embed_tokens(input_ids).to(torch.bfloat16)
-
-    def _text_indexes(
-        self,
-        start: int,
-        seq_len: int,
-        *,
-        device: torch.device | str | None = None,
-    ) -> torch.Tensor:
-        target = self.device if device is None else device
-        positions = torch.arange(int(start), int(start) + int(seq_len), device=target)
-        spatial = torch.zeros(int(seq_len), dtype=torch.long, device=target)
-        return torch.stack((positions, spatial, spatial), dim=0)
-
-    def packed_decoder_forward(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        route_indicators: torch.Tensor,
-        indexes: torch.Tensor,
-        forward_stream: Any,
-        kv_view: Any,
-    ) -> torch.Tensor:
-        return self._ensure_loaded().model.lm.forward_packed_visible(
-            input_embeds,
-            route_indicators=route_indicators,
-            indexes=indexes,
-            forward_stream=forward_stream,
-            kv_view=kv_view,
-        )
-
-    def packed_text_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self._ensure_loaded().model.logits(hidden_states)
-
-    def packed_hidden_to_velocity(
-        self,
-        hidden_states: torch.Tensor,
-        t: torch.Tensor,
-        latent: torch.Tensor,
-        *,
-        image_token_num: int,
-        image_size: tuple[int, int] | None,
-    ) -> torch.Tensor:
-        del t, latent, image_size
-        num_vae = int(image_token_num) - _BAGEL_IMAGE_MARKER_TOKENS
-        if num_vae <= 0 or tuple(hidden_states.shape[:2]) != (1, int(image_token_num)):
-            raise invalid_descriptor("BAGEL packed hidden states do not match image geometry")
-        return self._ensure_loaded().model.velocity_from_hidden(hidden_states[0], num_vae)
-
-    def segment_graph_attention(self) -> Any:
-        layers = self._ensure_loaded().model.lm.layers
-        if not layers:
-            raise capability_mismatch("BAGEL packed graph requires at least one decoder layer")
-        return layers[0].attn
-
-    def packed_denoise_indicators(
-        self,
-        step: PreparedFlowStep,
-        q_len: int,
-    ) -> torch.Tensor:
-        generation = step.extra["gs"]
-        indicators, _text_indexes = self._ensure_loaded().model.gen_segment_graph_layout(
-            1,
-            int(generation.num_vae),
-        )
-        if int(indicators.numel()) != int(q_len):
-            raise invalid_descriptor("BAGEL denoise modality mask does not match token geometry")
-        return indicators
-
-    def packed_route_indices(
-        self,
-        forward_stream: Any,
-        *,
-        device: torch.device | str,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        text_indices: list[int] = []
-        gen_indices: list[int] = []
+    def _forward_mot(self, batch: ForwardBatch) -> ForwardOutput:
+        rows: list[TokenRow | FlowRow] = []
+        for row in batch.rows:
+            if not isinstance(row, (TokenRow, FlowRow)):
+                raise TypeError("BAGEL mot route accepts TokenRow and FlowRow values")
+            rows.append(row)
+        chunks: list[torch.Tensor] = []
+        spans: list[tuple[int, int]] = []
         offset = 0
-        for segment in forward_stream.segments:
-            q_len = int(segment.q_len)
-            if q_len <= 0:
-                raise invalid_descriptor("BAGEL packed segments must contain tokens")
-            if segment.modality == "und":
-                text_indices.extend(range(offset, offset + q_len))
-            elif segment.modality == "gen":
-                if q_len <= _BAGEL_IMAGE_MARKER_TOKENS:
-                    raise invalid_descriptor("BAGEL generation segment is missing latent tokens")
-                text_indices.extend((offset, offset + q_len - 1))
-                gen_indices.extend(range(offset + 1, offset + q_len - 1))
-            else:
-                raise invalid_descriptor("BAGEL packed segment has an unsupported modality")
-            offset += q_len
-        return (
-            torch.tensor(text_indices, dtype=torch.long, device=device),
-            torch.tensor(gen_indices, dtype=torch.long, device=device),
-        )
-
-    def sequence_forward(
-        self,
-        input_ids: torch.Tensor | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        indexes: torch.Tensor | None = None,
-        cache_position: torch.Tensor | None = None,
-        attention_mask: Any = None,
-        past_key_values: Any = None,
-        use_cache: bool = True,
-        text_only_rope: bool = False,
-        causal_paged_update: bool = False,
-        return_all_logits: bool = False,
-    ) -> CausalLMOutputWithPast:
-        """Run the MoT understanding expert stack over the shared paged text KV.
-
-        The sequence executor sends strictly-causal token spans here
-        (BAGEL is 1-D rope, so only ``indexes[0]`` is consumed; the spatial rows
-        are zero). Its block-causal / past-visible masks are equivalent to plain
-        causal attention, so ``attention_mask`` is not materialized.
-        """
-        del attention_mask, use_cache, text_only_rope, causal_paged_update
-        m = self._ensure_loaded().model
-        if input_ids is None and inputs_embeds is None:
-            raise invalid_descriptor(
-                "BAGEL sequence forward requires exactly one of input_ids or inputs_embeds"
-            )
-        if input_ids is not None and inputs_embeds is not None:
-            raise invalid_descriptor(
-                "BAGEL sequence forward requires exactly one of input_ids or inputs_embeds"
-            )
-        if indexes is None and cache_position is not None:
-            indexes = cache_position.reshape(1, -1)
-        if indexes is None or past_key_values is None:
-            raise invalid_descriptor("BAGEL sequence forward requires indexes and a paged cache")
-        if inputs_embeds is None:
-            if input_ids is None:
-                raise invalid_descriptor("BAGEL text input ids are missing")
-            inputs_embeds = m.embed_tokens(input_ids).to(torch.bfloat16)
-        batch, seq_len = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
-        if batch > 1:
-            if seq_len != 1:
-                raise invalid_descriptor(
-                    "BAGEL batched sequence forward requires one token per row"
-                )
-            hidden = m.lm.forward_paged_text_batch(
-                inputs_embeds,
-                indexes[0].reshape(-1),
-                past_key_values,
-            )
-        else:
-            hidden = m.lm.forward_paged_text(
-                inputs_embeds.reshape(seq_len, -1),
-                indexes[0].reshape(-1),
-                past_key_values,
-            ).view(batch, seq_len, -1)
-        logits = (
-            m.logits(hidden.reshape(batch * seq_len, -1)).view(batch, seq_len, -1)
-            if return_all_logits
-            else m.logits(hidden[:, -1, :]).unsqueeze(1)
-        )
-        return CausalLMOutputWithPast(
-            logits=cast(Any, logits),
-            past_key_values=past_key_values,
-        )
-
-    def query_geometry(self) -> tuple[int, float, torch.dtype]:
-        """Query-side geometry for the system decode-graph FlashInfer planner.
-
-        KV-side geometry (heads / head dim / page size / dtype) is read off the
-        shared pool by the system adapter; the query side comes from the MoT
-        text expert (tensor-parallel-local head count, softmax scale, and the
-        bf16 dtype ``project_qkv`` emits).
-        """
-        layer = cast(MoTDecoderLayer, self._ensure_loaded().model.lm.layers[0])
-        return int(layer.n_heads), float(layer.scale), torch.bfloat16
-
-    def encode_many(
-        self,
-        rows: Sequence[EncodeRow],
-        *,
-        products: Any = None,
-    ) -> list[dict[str, Any]]:
-        if not rows:
-            return []
-        if products is None:
-            raise invalid_descriptor("BAGEL image encode requires the executor product store")
-        loaded = self._ensure_loaded()
-        m = loaded.model
-        pool = loaded.pool
-        driver = self._text_driver()
-        items: list[dict[str, Any]] = []
-        feature_groups: dict[tuple[str, tuple[int, ...]], list[dict[str, Any]]] = {}
         for row in rows:
-            ctx = row.ctx
-            req_id = ctx.req_id
-            kind = ctx.kind
-            if kind not in {"vae_encode", "vit_encode"}:
-                raise invalid_descriptor(f"unsupported image encode kind: {kind}")
-            if ctx.temporal_index is None:
-                raise invalid_descriptor(
-                    "image encode requires the shared temporal index (cond_pos)"
-                )
-            state = self.program_state(req_id)
-            driver.extend_cache_span(
-                state.cond,
-                req_id=req_id,
-                new_block_ids=ctx.new_block_ids,
-                pos_range=ctx.pos_range,
-            )
-            driver.ensure_host_cache(state.cond)
-            base_len = int(state.cond.past.length)
-            item: dict[str, Any] = {
-                "req_id": req_id,
-                "kind": kind,
-                "state": state,
-                "base_len": base_len,
-                "view": pool.view(state.cond.block_ids, base_len),
-                "rope": int(ctx.temporal_index),
-                "handle": int(ctx.handle),
-            }
-            if row.pixels is not None:
-                if ctx.image_hw is None:
-                    raise invalid_descriptor("image encode pixels require image dimensions")
-                item.update(
-                    {
-                        "image_hw": [int(value) for value in ctx.image_hw],
-                        "tensor": row.pixels,
-                    }
-                )
-                feature_groups.setdefault(
-                    (kind, tuple(int(v) for v in row.pixels.shape)), []
-                ).append(item)
+            if isinstance(row, TokenRow):
+                chunk = self._token_embeddings(row, batch.context)
             else:
-                payload = products.intermediate(ctx.handle)
-                if not isinstance(payload, Mapping) or payload.get("kind") != kind:
-                    raise invalid_descriptor("cached image encode handle is not resident")
-                cached_image_hw = payload.get("image_hw")
-                if (
-                    not isinstance(cached_image_hw, list)
-                    or len(cached_image_hw) != 2
-                    or any(
-                        not isinstance(value, int) or isinstance(value, bool)
-                        for value in cached_image_hw
-                    )
-                ):
-                    raise invalid_descriptor("cached image encode dimensions are invalid")
-                item.update(
-                    {
-                        "image_hw": [int(value) for value in cached_image_hw],
-                        "payload": payload,
-                    }
+                if not isinstance(row.conditioning, NoFlowConditioning):
+                    raise TypeError("BAGEL flow rows do not accept external feature conditioning")
+                latent_tokens = int(row.image_tokens) - _BAGEL_IMAGE_MARKER_TOKENS
+                if latent_tokens < 1 or int(row.latent.shape[-2]) != latent_tokens:
+                    raise ValueError("BAGEL flow latent does not match its image-token geometry")
+                chunk = self.model.gen_segment_embeds(
+                    latent_tokens,
+                    row.positions,
+                    row.latent,
+                    row.timestep,
+                    batch.context,
                 )
-            items.append(item)
-
-        for (kind, _shape), group in feature_groups.items():
-            tensors = torch.stack([item["tensor"] for item in group], dim=0)
-            if kind == "vae_encode":
-                clean_latents, position_ids, _ = m.vae_encode_clean_batch(tensors)
-                for index, item in enumerate(group):
-                    payload = {
-                        "kind": kind,
-                        "clean_lat": clean_latents[index].detach(),
-                        "vpos": position_ids.detach(),
-                        "image_hw": item["image_hw"],
-                    }
-                    item["payload"] = payload
-                    products.put_intermediate(item["handle"], payload)
+            chunk = chunk.reshape(-1, chunk.shape[-1]).to(torch.bfloat16)
+            chunks.append(chunk)
+            spans.append((offset, offset + int(chunk.shape[0])))
+            offset += int(chunk.shape[0])
+        hidden = self.model.lm(torch.cat(chunks, dim=0), batch.context)
+        outputs: list[TokenOutput | FlowOutput] = []
+        for row, (begin, end) in zip(rows, spans, strict=True):
+            row_hidden = hidden[begin:end]
+            if isinstance(row, TokenRow):
+                value: TokenHidden | TokenLogits
+                if row.selection is TokenSelection.HIDDEN:
+                    value = TokenHidden(row_hidden)
+                elif row.selection is TokenSelection.ALL_LOGITS:
+                    value = TokenLogits(self.model.logits(row_hidden, batch.context))
+                else:
+                    value = TokenLogits(self.model.logits(row_hidden[-1:], batch.context))
+                outputs.append(TokenOutput(row.row_id, row.output_slot, value))
             else:
-                embeddings = m.vit_encode_batch(tensors)
-                for index, item in enumerate(group):
-                    payload = {
-                        "kind": kind,
-                        "vemb": embeddings[index].detach(),
-                        "image_hw": item["image_hw"],
-                    }
-                    item["payload"] = payload
-                    products.put_intermediate(item["handle"], payload)
-
-        segments: list[Segment] = []
-        for item in items:
-            kind = item["kind"]
-            payload = item["payload"]
-            if kind == "vae_encode":
-                clean_lat = payload.get("clean_lat")
-                position_ids = payload.get("vpos")
-                if not isinstance(clean_lat, torch.Tensor) or not isinstance(
-                    position_ids, torch.Tensor
-                ):
-                    raise invalid_descriptor("cached VAE output is incomplete")
-                token_count = int(clean_lat.shape[0])
-                segment = m.build_gen_segment(
-                    token_count,
-                    position_ids,
-                    clean_lat,
-                    0.0,
-                    item["rope"],
-                    item["view"],
-                    update=True,
+                prediction = self.model.velocity_from_hidden(
+                    row_hidden,
+                    int(row.image_tokens) - _BAGEL_IMAGE_MARKER_TOKENS,
                 )
-            else:
-                embeddings = payload.get("vemb")
-                if not isinstance(embeddings, torch.Tensor):
-                    raise invalid_descriptor("cached ViT output is incomplete")
-                token_count = int(embeddings.shape[0])
-                segment = m.build_und_image_segment(
-                    embeddings,
-                    item["rope"],
-                    item["view"],
-                    update=True,
-                )
-            item["added"] = token_count + _BAGEL_IMAGE_MARKER_TOKENS
-            segments.append(segment)
+                outputs.append(FlowOutput(row.row_id, row.output_slot, prediction))
+        return ForwardOutput(tuple(outputs))
 
-        hidden_rows = m.run(segments)
-        if len(hidden_rows) != len(items):
-            raise invalid_descriptor("BAGEL batched image encode returned the wrong row count")
-        outputs: list[dict[str, Any]] = []
-        for item, hidden in zip(items, hidden_rows, strict=True):
-            req_id = int(item["req_id"])
-            added = int(item["added"])
-            new_len = int(item["base_len"]) + added
-            self._sync_text_cache_after_image(
-                req_id,
-                length=new_len,
-                last_position=int(item["rope"]),
-            )
-            sampling = self._state(req_id).sampling
-            if (
-                sampling.get("return_prompt_logprobs")
-                or int(sampling.get("n_prompt_logprobs", 0) or 0) > 0
-            ):
-                item["state"].cond.last_logits = m.logits(hidden[-1:]).unsqueeze(0)
-            record = self._record(req_id)
-            record.dimensions = tuple(item["image_hw"])
-            if item["kind"] == "vit_encode":
-                record.context_image_feedback = True
-                record.text_branch_kvlen = new_len
-                record.text_branch_pos = int(item["rope"]) + 1
-            outputs.append(
-                {
-                    "req_id": req_id,
-                    "encoder_handle": int(item["handle"]),
-                    "num_tokens": added,
-                    "image_hw": item["image_hw"],
-                }
-            )
-        return outputs
-
-    def prompt_predecessor_logits(self, req_id: int) -> torch.Tensor | None:
-        return self.program_state(int(req_id)).cond.last_logits
-
-    def encode_image(
+    def _token_embeddings(
         self,
-        pixels: torch.Tensor | None = None,
-        grid: torch.Tensor | None = None,
-        *,
-        ctx: EncodeContext,
-    ) -> Any:
-        return self.encode_many((EncodeRow(ctx=ctx, pixels=pixels, grid=grid),))[0]
-
-    def encode_latents(
-        self,
-        pixels: torch.Tensor | None = None,
-        grid: torch.Tensor | None = None,
-        *,
-        ctx: EncodeContext,
-    ) -> Any:
-        return self.encode_many((EncodeRow(ctx=ctx, pixels=pixels, grid=grid),))[0]
-
-    def run_text_logits_batch(self, ops):
-        """Sequence prefill/decode through the system executor.
-
-        Batching and the one-token decode CUDA graph are system-owned by the
-        driver; BAGEL contributes only the MoT und-expert forward
-        (``sequence_forward``). The host's ``pos_range`` stays authoritative
-        for every op's rope position, since BAGEL's 1-D positions do not
-        advance across image spans the way KV length does; the committed KV
-        length lives on the driver-owned text cache.
-        """
-        self._ensure_loaded()
-        return self._text_driver().run_text_logits_batch(self._prepare_text_logits_batch(ops))
-
-    def try_run_graph_logits_batch(self, ops):
-        """Return text logits only when the shared CUDA graph covers the batch."""
-        self._ensure_loaded()
-        op_list = self._prepare_text_logits_batch(ops)
-        return self._text_driver().try_run_graph_logits_batch(op_list)
-
-    def _prepare_text_logits_batch(self, ops):
-        op_list = [dict(op) for op in ops]
-        for op in op_list:
-            st = self.program_state(int(op["req_id"]))
-            pos_range = op.get("pos_range")
-            if st.cond.past is not None and pos_range:
-                st.cond.t_index = int(pos_range[0]) - 1
-        return op_list
-
-    def run_text_logits(self, op):
-        return self.run_text_logits_batch([dict(op)])[0]
-
-    def gen_latent_layout(self, height: int, width: int) -> tuple[int, torch.Tensor, int]:
-        """``(num_vae, vae_pos_ids, latent_dim)`` for one generated image."""
-        m = self._ensure_loaded().model
-        h, w = m.latent_hw(int(height), int(width))
-        return (
-            int(h * w),
-            m.latent_position_ids(int(height), int(width)).to(self.device),
-            int(m.cfg.patch_latent_dim),
-        )
-
-    def gen_segment_embeds(
-        self,
-        num_vae: int,
-        vae_pos_ids: torch.Tensor,
-        latent: torch.Tensor,
-        timestep: float,
+        row: TokenRow,
+        context: ForwardContext,
     ) -> torch.Tensor:
-        return self._ensure_loaded().model.gen_segment_embeds(
-            int(num_vae),
-            vae_pos_ids,
-            latent,
-            float(timestep),
+        if isinstance(row.inputs, TokenIds):
+            return self.model.embed_tokens(row.inputs.values.reshape(-1), context)
+        if isinstance(row.inputs, TokenEmbeddings):
+            return row.inputs.values.reshape(-1, row.inputs.values.shape[-1])
+        if not isinstance(row.inputs, TokenSegments):
+            raise TypeError("BAGEL token row has an unknown input variant")
+        return torch.cat(
+            tuple(
+                self.model.embed_tokens(segment.values.reshape(-1), context)
+                if isinstance(segment, TokenIds)
+                else segment.values.reshape(-1, segment.values.shape[-1])
+                for segment in row.inputs.values
+            ),
+            dim=0,
         )
 
-    def gen_segment_graph_layout(
-        self,
-        batch_size: int,
-        num_vae: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._ensure_loaded().model.gen_segment_graph_layout(
-            int(batch_size),
-            int(num_vae),
-        )
-
-    def prefill_text_branch(self, token_ids: Sequence[int], cache: PagedTextCache) -> None:
-        """Prefill a CFG text-branch prefix through the paged und-stack forward."""
-        m = self._ensure_loaded().model
-        ids = torch.as_tensor(list(token_ids), dtype=torch.long, device=self.device)
-        m.lm.forward_paged_text(
-            m.embed_tokens(ids).to(torch.bfloat16),
-            torch.arange(int(ids.numel()), device=self.device),
-            cache,
-        )
-
-    def flow_predict_velocity(
-        self,
-        image_embeds: torch.Tensor,
-        indexes: torch.Tensor,
-        attention_mask: Any,
-        cache: Any,
-        t: torch.Tensor,
-        z: torch.Tensor,
-        *,
-        image_token_num: int,
-        image_size: tuple[int, int],
-        return_hidden: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        del attention_mask, t, z, image_size
-        m = self._ensure_loaded().model
-        num_vae = int(image_token_num) - _BAGEL_IMAGE_MARKER_TOKENS
-        if num_vae <= 0:
-            raise invalid_descriptor("BAGEL denoise graph requires latent tokens")
-        if indexes.ndim != 2:
-            raise invalid_descriptor("BAGEL denoise graph positions must be token-by-row")
-        positions = indexes.transpose(0, 1).contiguous()
-        is_gen, text_idx = m.gen_segment_graph_layout(int(image_embeds.shape[0]), num_vae)
-        hidden = m.lm.forward_paged_gen_batch(
-            image_embeds,
-            positions,
-            is_gen,
-            cache,
-            text_idx=text_idx,
-        )
-        velocity = m.llm2vae(hidden[:, 1 : 1 + num_vae].to(torch.bfloat16))
-        if return_hidden:
-            return velocity, hidden
-        return velocity
-
-    def _sync_text_cache_after_image(self, req_id: int, *, length: int, last_position: int) -> None:
-        """Advance the driver's text cache past an image KV span written outside it.
-
-        Encode/commit write image KV through raw pool views; the shared text
-        driver must resume text from the post-image KV length and rope
-        position (block ids are already shared, so only length/position move).
-        """
-        st = self.program_state(int(req_id))
-        self._text_driver().ensure_host_cache(st.cond)
-        st.cond.past.length = int(length)
-        st.cond.t_index = int(last_position)
-
-    def vae_decode(
-        self,
-        latent: Any,
-        *,
-        height: int | None = None,
-        width: int | None = None,
-    ) -> Image.Image:
-        """Neural latent->pixels VAE decode for the executor's materializer."""
-        if height is None or width is None:
-            raise invalid_descriptor("BAGEL VAE decode requires the image height and width")
-        return self._ensure_loaded().model.vae_decode(latent, int(height), int(width))
-
-    def commit_generated_kv(self, req_id: int, gen_state: Any, block_ids: Any) -> int:
-        """Persist the generated latents into the request KV (program continuation).
-
-        The writeback is a forward pass of the unified MoT backbone over the
-        gen segment (``update=True``), so it stays a model neural entry;
-        following text conditions on the image and continues at
-        ``cond_pos + 2`` (gen_rope_advance).
-        """
-        loaded = self._ensure_loaded()
-        m = loaded.model
-        gs = gen_state
-        view = loaded.pool.view(list(block_ids), gs.cond_pos)
-        commit_seg = m.build_gen_segment(
-            gs.num_vae, gs.vae_pos_ids, gs.x_t, 0.0, gs.cond_pos, view, update=True
-        )
-        m.run([commit_seg])
-        self._sync_text_cache_after_image(
-            int(req_id), length=gs.cond_pos + gs.num_vae + 2, last_position=gs.cond_pos + 1
-        )
-        return int(gs.num_vae) + 2
-
-    @torch.no_grad()
-    def forward(self, batch: ForwardBatch) -> Any:
-        self._ensure_loaded()
-        context = get_forward_context()
-        options = context.execution_options
-        if context.request_states is None:
-            raise invalid_descriptor("BAGEL forward requires executor request state")
-        with self._autocast():
-            return self.segment_executor.execute(
-                batch,
-                request_states=context.request_states,
-                defer_text_cpu_results=bool(getattr(options, "defer_text_cpu_results", False)),
+    def _forward_vit(self, batch: ForwardBatch) -> ForwardOutput:
+        rows = tuple(row for row in batch.rows if isinstance(row, EncodeRow))
+        if len(rows) != len(batch.rows) or any(
+            row.kind is not EncodeKind.VISION or not isinstance(row.inputs, TowerInput)
+            for row in rows
+        ):
+            raise TypeError("BAGEL vit route requires tower vision encode rows")
+        pixels = torch.stack(tuple(row.inputs.pixels for row in rows), dim=0)
+        features = self.model.vit_encode_batch(pixels, batch.context)
+        return ForwardOutput(
+            tuple(
+                EncodeOutput(row.row_id, row.output_slot, features[index])
+                for index, row in enumerate(rows)
             )
+        )
 
-    @torch.no_grad()
-    def forward_text(self, batch: ForwardBatch) -> torch.Tensor:
-        self._ensure_loaded()
-        if len(batch.ops) != 1:
-            raise invalid_descriptor("BAGEL tensor text forward requires one operation")
-        with self._autocast():
-            logits = self.run_text_logits(dict(batch.ops[0]))
-        if not isinstance(logits, torch.Tensor):
-            raise invalid_descriptor("BAGEL text forward must return logits")
-        return logits
-
-    def _ensure_loaded(self) -> _LoadedBagelRuntime:
-        model = self.model
-        pool = self.kv_pool
-        if model is None or pool is None:
-            raise capability_mismatch("BAGEL model weights are not loaded")
-        return _LoadedBagelRuntime(model=model, pool=pool)
-
-    def _autocast(self):
-        self._ensure_loaded()
-        device = str(self.device)
-        if device.startswith("cuda"):
-            return torch.autocast("cuda", dtype=torch.bfloat16)
-        return nullcontext()
-
+    def _forward_vae(self, batch: ForwardBatch) -> ForwardOutput:
+        first = batch.rows[0]
+        if isinstance(first, EncodeRow):
+            encode_rows = tuple(row for row in batch.rows if isinstance(row, EncodeRow))
+            if len(encode_rows) != len(batch.rows) or any(
+                row.kind is not EncodeKind.LATENT or not isinstance(row.inputs, TowerInput)
+                for row in encode_rows
+            ):
+                raise TypeError("BAGEL vae encode route requires latent tower rows")
+            pixels = torch.stack(tuple(row.inputs.pixels for row in encode_rows), dim=0)
+            latents, _positions, _shape = self.model.vae_encode_clean_batch(pixels)
+            return ForwardOutput(
+                tuple(
+                    EncodeOutput(row.row_id, row.output_slot, latents[index])
+                    for index, row in enumerate(encode_rows)
+                )
+            )
+        decode_rows = tuple(row for row in batch.rows if isinstance(row, DecodeRow))
+        if len(decode_rows) != len(batch.rows):
+            raise TypeError("BAGEL vae route cannot mix encode and decode rows")
+        geometry = {(row.image_height, row.image_width) for row in decode_rows}
+        if len(geometry) != 1:
+            raise ValueError("BAGEL vae route requires one image geometry")
+        height, width = next(iter(geometry))
+        decoded = self.model.vae_decode_batch(
+            torch.stack(tuple(row.latent for row in decode_rows), dim=0),
+            height,
+            width,
+        )
+        return ForwardOutput(
+            tuple(
+                DecodeOutput(row.row_id, row.output_slot, decoded[index])
+                for index, row in enumerate(decode_rows)
+            )
+        )

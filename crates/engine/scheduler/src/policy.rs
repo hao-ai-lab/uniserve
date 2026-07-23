@@ -1,10 +1,7 @@
-//! Structured scheduling facts + explainable decisions (;
-//!, items 8 & 19).
+//! Structured scheduling facts, explainable decisions, and latency history.
 //!
-//! Read-only telemetry around the EXISTING inline admit/preempt policy — no
-//! scheduling authority moves out of [`crate::Scheduler`]. A future pluggable
-//! policy could consume a [`PolicySnapshot`] (the facts) and emit
-//! [`PolicyDecision`]s (the rationale) without reaching into scheduler internals.
+//! This module provides read-only telemetry around the scheduler's admission
+//! and preemption policy while scheduling authority remains in [`crate::Scheduler`].
 
 use std::collections::HashMap;
 use std::collections::VecDeque;

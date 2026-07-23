@@ -6,6 +6,8 @@ from typing import Protocol
 
 import torch
 
+from ...forward import ForwardContext
+
 __all__ = [
     'AttentionCapabilities',
     'AttentionBackend',
@@ -80,7 +82,7 @@ class AttentionBackend(Protocol):
     """Universal attention-backend contract.
 
     Only the members declared here are mandatory for *every* registered
-    backend (e.g. ``torch_sdpa`` implements just these). The paged- and
+    backend. The paged- and
     varlen-specific entry points are intentionally *not* part of this base
     Protocol because they are optional and capability-gated: a backend
     implements ``forward_paged`` only when it advertises
@@ -104,6 +106,7 @@ class AttentionBackend(Protocol):
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         ...
 
@@ -113,9 +116,7 @@ class PagedAttentionBackend(AttentionBackend, Protocol):
 
     Implemented only by backends reporting ``capabilities().paged_kv`` (e.g.
     ``flash_attn``, ``fa4_cute``, ``flashinfer``, ``sgl_kernel``). ``paged_kv``
-    being ``True`` is the precondition for calling ``forward_paged``; backends
-    such as ``torch_sdpa`` report ``paged_kv=False`` and do not satisfy this
-    Protocol.
+    being ``True`` is the precondition for calling ``forward_paged``.
     """
 
     def forward_paged(
@@ -130,6 +131,7 @@ class PagedAttentionBackend(AttentionBackend, Protocol):
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         ...
 
@@ -138,10 +140,8 @@ class VarlenAttentionBackend(AttentionBackend, Protocol):
     """Backends that support variable-length (cu_seqlens) prefill.
 
     Implemented only by backends reporting ``capabilities().varlen_attention``
-    (e.g. ``flash_attn``, ``flashinfer``, ``sgl_kernel``). ``varlen_attention``
-    being ``True`` is the precondition for calling ``forward_varlen``; backends
-    such as ``torch_sdpa`` and ``fa4_cute`` report ``varlen_attention=False``
-    and do not satisfy this Protocol.
+    ``varlen_attention`` being ``True`` is the precondition for calling
+    ``forward_varlen``.
     """
 
     def forward_varlen(
@@ -157,6 +157,7 @@ class VarlenAttentionBackend(AttentionBackend, Protocol):
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         ...
 
@@ -164,9 +165,8 @@ class VarlenAttentionBackend(AttentionBackend, Protocol):
 class VisibleEndAttentionBackend(AttentionBackend, Protocol):
     """Backends that support the hybrid ``visible_end`` mask path.
 
-    Implemented only by backends reporting ``capabilities().visible_end`` (today
-    ``fa4_cute``). Callers must check the capability before invoking
-    ``forward_visible_end``.
+    Implemented only by backends reporting ``capabilities().visible_end``.
+    Callers must check the capability before invoking ``forward_visible_end``.
 
     ``q`` may be fixed ``[B, L, H, D]`` or varlen ``[total, H, D]``;
     ``visible_end`` is padded ``[B, max_q]`` and indexed locally per sequence.
@@ -188,5 +188,6 @@ class VisibleEndAttentionBackend(AttentionBackend, Protocol):
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         ...

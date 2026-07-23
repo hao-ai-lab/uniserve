@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import torch
 
+from ...forward import ForwardContext
 from .base import AttentionCapabilities
 from .layout import QKVLayout, normalize_kv, normalize_to
-from .registry import register_attention_backend
 
 __all__ = [
     'FlashAttentionBackend',
@@ -32,6 +32,10 @@ class FlashAttentionBackend:
 
     def capabilities(self) -> AttentionCapabilities:
         return AttentionCapabilities(
+            available=any(
+                value is not None
+                for value in (_flash_attn_func, _flash_attn_varlen_func, _flash_attn_with_kvcache)
+            ),
             segment_batched_cfg=False,
             mixed_mode=False,
             paged_kv=_flash_attn_with_kvcache is not None,
@@ -49,7 +53,9 @@ class FlashAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         if _flash_attn_func is None:
             raise RuntimeError("flash-attn backend is not available")
         if attn_mask is not None:
@@ -78,7 +84,9 @@ class FlashAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         if _flash_attn_with_kvcache is None:
             raise RuntimeError("flash-attn paged KV kernel is not available")
         q_blh, restore = normalize_to(q, QKVLayout.BLHD)
@@ -116,7 +124,9 @@ class FlashAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         if _flash_attn_varlen_func is None:
             raise RuntimeError("flash-attn varlen kernel is not available")
         if q.ndim != 3:
@@ -144,7 +154,3 @@ class FlashAttentionBackend:
             causal=causal,
             block_table=block_table,
         )
-
-
-if _flash_attn_func is not None:  # pragma: no cover - availability-specific.
-    register_attention_backend("flash_attn", FlashAttentionBackend())

@@ -19,6 +19,7 @@ from ..foundation.triton_compat import triton_device_supported, triton_fused_lay
 __all__ = [
     'rotate_half',
     'apply_rotary_emb',
+    'qk_norm_rope',
     'try_triton_qk_rms_norm_rope',
     'apply_rotary_pos_emb',
     'RotaryEmbedding',
@@ -482,6 +483,46 @@ def apply_rotary_emb(
     from uniserve_worker import ops
 
     return ops.rope(x, cos, sin)
+
+
+def qk_norm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor | tuple[torch.Tensor, ...],
+    k_weight: torch.Tensor | tuple[torch.Tensor, ...],
+    cos: torch.Tensor | tuple[torch.Tensor, ...],
+    sin: torch.Tensor | tuple[torch.Tensor, ...],
+    eps: float,
+    *,
+    position_ids: torch.Tensor | None = None,
+    unsqueeze_dim: int = 1,
+    axis_dims: tuple[int, ...] | None = None,
+    identity_axes: tuple[int, ...] | None = None,
+    quant: object | None = None,
+    adapters: object | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the shared Q/K normalization and rotary-position equation."""
+
+    from uniserve_worker.ops.providers import qk_norm_rope_dispatcher
+    from uniserve_worker.ops.requests import QKNormRopeReq
+
+    return qk_norm_rope_dispatcher().run(
+        QKNormRopeReq(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            cos,
+            sin,
+            float(eps),
+            position_ids,
+            int(unsqueeze_dim),
+            axis_dims,
+            identity_axes,
+            quant,
+            adapters,
+        )
+    )
 
 
 def try_triton_qk_rms_norm_rope(

@@ -16,10 +16,8 @@ only caller of the transport surface.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 import torch
 
@@ -27,15 +25,15 @@ __all__ = [
     'divide',
     'ReduceOp',
     'AxisTransport',
+    'BroadcastTransport',
+    'CollectiveAxisTransport',
+    'PeerAxisTransport',
     'CollectiveTransport',
     'LocalP2PTransport',
     'DataPlaneTowerTransport',
     'MeshAxis',
     'DeviceMesh',
-    'get_current_mesh',
-    'set_current_mesh',
-    'reset_current_mesh',
-    'use_mesh',
+    'TensorParallelSpec',
 ]
 
 
@@ -65,27 +63,38 @@ class ReduceOp:
 
 @runtime_checkable
 class AxisTransport(Protocol):
-    """How one mesh axis's coordinates communicate.
-
-    The collective and local-peer transports implement the same surface so
-    ``reshard`` is transport-agnostic: a placement transition selects the
-    method, and the bound transport realizes it (NCCL collective vs NVLink
-    peer copy). All methods may assume ``size > 1`` — trivial axes are
-    short-circuited before reaching here.
-    """
+    """Coordinate metadata common to every axis transport."""
 
     @property
     def size(self) -> int: ...
     @property
     def coord(self) -> int: ...
+
+
+@runtime_checkable
+class CollectiveAxisTransport(AxisTransport, Protocol):
+    """Collective operations implemented by a distributed process group."""
+
     def all_reduce(self, t: torch.Tensor, op: str = ReduceOp.SUM) -> torch.Tensor: ...
     def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor: ...
     def reduce_scatter(self, t: torch.Tensor, dim: int, op: str = ReduceOp.SUM) -> torch.Tensor: ...
     def all_to_all(self, t: torch.Tensor, *, in_dim: int, out_dim: int) -> torch.Tensor: ...
+
+
+@runtime_checkable
+class PeerAxisTransport(AxisTransport, Protocol):
+    """Point-to-point movement implemented by an in-process or staged peer axis."""
+
     def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor: ...
-    def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor: ...
     def record_ready(self, coord: int | None = None) -> Any | None: ...
     def wait_ready(self, event: Any | None, coord: int | None = None) -> None: ...
+
+
+@runtime_checkable
+class BroadcastTransport(AxisTransport, Protocol):
+    """One-to-all movement for a transport that defines broadcast semantics."""
+
+    def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor: ...
 
 
 def _torch_reduce_op(op: str):
@@ -163,23 +172,10 @@ class CollectiveTransport:
         torch.distributed.all_to_all(recv, send, group=group)
         return torch.cat(recv, dim=out_dim)
 
-    def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor:
-        # Cross-process tower transport uses point-to-point send/recv (not wired here).
-        raise NotImplementedError(
-            "collective transport copy_to is a cross-process send/recv (not yet wired)"
-        )
-
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
         group = self._require()
         torch.distributed.broadcast(t, src=src, group=group)
         return t
-
-    def record_ready(self, coord: int | None = None) -> Any | None:
-        return None
-
-    def wait_ready(self, event: Any | None, coord: int | None = None) -> None:
-        return None
-
 
 @dataclass(frozen=True)
 class LocalP2PTransport:
@@ -190,8 +186,8 @@ class LocalP2PTransport:
     Movement is a direct device-to-device copy over NVLink; ordering across the
     two device streams is enforced with CUDA events (``record_ready`` /
     ``wait_ready``), which is the readiness-barrier discipline a modality
-    handoff needs. The collective ops are defined for completeness; the tower
-    axis uses ``copy_to`` + events.
+    handoff needs. This transport intentionally exposes no collective surface:
+    a tower axis routes values and cannot silently stand in for a reduction.
     """
 
     axis: str
@@ -213,28 +209,9 @@ class LocalP2PTransport:
     def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor:
         return t.to(self.devices[int(coord)], non_blocking=non_blocking)
 
-    def all_reduce(self, t: torch.Tensor, op: str = ReduceOp.SUM) -> torch.Tensor:
-        acc = t
-        for i in range(self.size):
-            if i == self.coord:
-                continue
-            other = t.to(self.devices[i]) if False else t  # peers hold their own; see note
-            del other
-        # In-process all-reduce across devices is not used by the tower axis
-        # (which routes rather than reduces). Provided as a correctness stub that
-        # reduces local replicas when peers are materialized by the caller.
-        return acc
-
-    def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor:
-        return t
-
-    def reduce_scatter(self, t: torch.Tensor, dim: int, op: str = ReduceOp.SUM) -> torch.Tensor:
-        return t
-
-    def all_to_all(self, t: torch.Tensor, *, in_dim: int, out_dim: int) -> torch.Tensor:
-        return t
-
     def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
+        if int(src) < 0 or int(src) >= self.size:
+            raise ValueError(f"broadcast source {src} is outside axis {self.axis!r}")
         return t.to(self.devices[self.coord]) if t.device != self.devices[self.coord] else t
 
     def record_ready(self, coord: int | None = None) -> Any | None:
@@ -262,8 +239,7 @@ class LocalP2PTransport:
 class DataPlaneTowerTransport:
     """Cross-process tower transport backed by the data plane.
 
-    Same ``AxisTransport`` surface as :class:`LocalP2PTransport`, but the und and
-    gen towers are separate worker processes and the und→gen KV handoff crosses
+    The und and gen towers are separate worker processes and the und→gen KV handoff crosses
     the process boundary over the data plane (``cuda_ipc`` / ``mooncake``) rather
     than an in-process NVLink peer copy. The model still expresses the handoff as
     ``reshard(Pinned(primary) -> Pinned(gen))``; only the bound transport differs.
@@ -301,43 +277,23 @@ class DataPlaneTowerTransport:
     def publish(self, t: torch.Tensor, *, kind: str = "kv_pages") -> Any:
         """Producer side: register ``t`` with the data plane, return its wire locator."""
         if self.data_plane is None:
-            raise NotImplementedError(
-                "cross-process tower transport: data-plane mover not wired "
-                "(inject a TensorStore via the und/gen worker builder)"
-            )
+            raise RuntimeError("cross-process tower transport requires a data-plane mover")
         return self.data_plane.publish(t, kind)
 
     def receive(self, locator: Any, *, like: torch.Tensor | None = None) -> torch.Tensor:
         """Consumer side: materialize the tensor named by ``locator`` locally."""
         if self.data_plane is None:
-            raise NotImplementedError(
-                "cross-process tower transport: data-plane mover not wired "
-                "(inject a TensorStore via the und/gen worker builder)"
-            )
+            raise RuntimeError("cross-process tower transport requires a data-plane mover")
         del like
         return self.data_plane.fetch_locator(locator)
 
     def copy_to(self, t: torch.Tensor, *, coord: int, non_blocking: bool = True) -> torch.Tensor:
-        raise NotImplementedError(
-            "cross-process tower copy_to is a two-sided publish/receive over the "
-            "data plane, not an in-process peer copy; use publish()/receive() "
-            "driven by the StageRouter locator wire"
-        )
-
-    def broadcast(self, t: torch.Tensor, *, src: int) -> torch.Tensor:
-        raise NotImplementedError("cross-process tower broadcast is not defined")
-
-    def all_reduce(self, t: torch.Tensor, op: str = ReduceOp.SUM) -> torch.Tensor:
-        raise NotImplementedError("the tower axis routes; it does not reduce")
-
-    def all_gather(self, t: torch.Tensor, dim: int) -> torch.Tensor:
-        raise NotImplementedError("the tower axis routes; it does not all-gather")
-
-    def reduce_scatter(self, t: torch.Tensor, dim: int, op: str = ReduceOp.SUM) -> torch.Tensor:
-        raise NotImplementedError("the tower axis routes; it does not reduce-scatter")
-
-    def all_to_all(self, t: torch.Tensor, *, in_dim: int, out_dim: int) -> torch.Tensor:
-        raise NotImplementedError("the tower axis routes per worker, not per token here")
+        del non_blocking
+        if int(coord) != self.coord:
+            raise RuntimeError(
+                "cross-process tower values must be transferred before model execution"
+            )
+        return t
 
     def record_ready(self, coord: int | None = None) -> Any | None:
         # Readiness is the host-side StageRouter transfer gate, not a local stream
@@ -460,29 +416,19 @@ class DeviceMesh:
         return DeviceMesh(axes=merged, local_device=self.local_device)
 
 
-_CURRENT_MESH: ContextVar[DeviceMesh] = ContextVar(
-    "uniserve_device_mesh",
-    default=DeviceMesh.trivial(),
-)
+@dataclass(frozen=True, slots=True)
+class TensorParallelSpec:
+    """Transport-free tensor-parallel coordinates used during layer construction."""
 
+    rank: int
+    size: int
 
-def get_current_mesh() -> DeviceMesh:
-    return _CURRENT_MESH.get()
+    def __post_init__(self) -> None:
+        if self.size <= 0:
+            raise ValueError("tensor-parallel size must be positive")
+        if self.rank < 0 or self.rank >= self.size:
+            raise ValueError("tensor-parallel rank must satisfy 0 <= rank < size")
 
-
-def set_current_mesh(mesh: DeviceMesh):
-    """Install the process-wide mesh for subsequently constructed modules."""
-    return _CURRENT_MESH.set(mesh)
-
-
-def reset_current_mesh(token) -> None:
-    _CURRENT_MESH.reset(token)
-
-
-@contextmanager
-def use_mesh(mesh: DeviceMesh) -> Iterator[None]:
-    token = set_current_mesh(mesh)
-    try:
-        yield
-    finally:
-        reset_current_mesh(token)
+    @classmethod
+    def from_mesh(cls, mesh: DeviceMesh) -> "TensorParallelSpec":
+        return cls(rank=mesh.tp_rank, size=mesh.tp_size)

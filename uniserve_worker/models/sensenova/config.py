@@ -1,12 +1,10 @@
 """Loader-owned config objects for checkpoints with custom HF config classes."""
 from __future__ import annotations
 
-from os import PathLike
-from typing import Any, Self
+from typing import Any
 
 from transformers import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
 
 __all__ = [
     'NeoVisionConfig',
@@ -14,9 +12,6 @@ __all__ = [
     'build_neo_llm_config',
     'NeoChatConfig',
 ]
-
-logger = logging.get_logger(__name__)
-
 
 def _vision_stage_scalar(value: Any, field_name: str) -> Any:
     """Normalize a vision config field that may be serialized per stage."""
@@ -32,6 +27,7 @@ def _vision_stage_scalar(value: Any, field_name: str) -> Any:
 # repeated inline in the ``NeoChatConfig`` default-resolution branches.
 _DEFAULT_VISION_ARCHITECTURE = "NEOVisionModel"
 _DEFAULT_LLM_ARCHITECTURE = "Qwen3ForCausalLM"
+_TOKEN_ID_FIELDS = ("bos_token_id", "eos_token_id", "pad_token_id")
 
 
 def _ensure_layer_types(config: PretrainedConfig) -> None:
@@ -84,43 +80,6 @@ class NeoVisionConfig(PretrainedConfig):
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | PathLike[Any],
-        cache_dir: str | PathLike[Any] | None = None,
-        force_download: bool = False,
-        local_files_only: bool = False,
-        token: str | bool | None = None,
-        revision: str = "main",
-        **kwargs: Any,
-    ) -> Self:
-        kwargs.update(
-            cache_dir=cache_dir,
-            force_download=force_download,
-            local_files_only=local_files_only,
-            token=token,
-            revision=revision,
-        )
-        config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
-        if "vision_config" in config_dict:
-            config_dict = config_dict["vision_config"]
-        # If we did not descend into a nested ``vision_config`` we are about to
-        # treat the top-level config dict as the vision config. Validate the
-        # resolved model_type so a mismatched (non-vision) checkpoint surfaces a
-        # warning instead of silently producing a misconfigured object.
-        resolved_type = config_dict.get("model_type")
-        if resolved_type is not None and resolved_type != cls.model_type:
-            logger.warning(
-                "Instantiating %s from a config of type %r (expected %r); "
-                "this checkpoint may not expose a 'vision_config' section.",
-                cls.__name__,
-                resolved_type,
-                cls.model_type,
-            )
-        return cls.from_dict(config_dict, **kwargs)
-
-
 class NeoLlmConfig(Qwen3Config):
     def __init__(
         self,
@@ -165,6 +124,13 @@ class NeoChatConfig(PretrainedConfig):
             vision_config = {"architectures": [_DEFAULT_VISION_ARCHITECTURE]}
         if llm_config is None:
             llm_config = {"architectures": [_DEFAULT_LLM_ARCHITECTURE]}
+        if isinstance(llm_config, dict):
+            llm_config = dict(llm_config)
+            for field_name in _TOKEN_ID_FIELDS:
+                if llm_config.get(field_name) is None:
+                    parent_value = getattr(self, field_name, None)
+                    if parent_value is not None:
+                        llm_config[field_name] = parent_value
         self.vision_config = (
             NeoVisionConfig(**vision_config) if isinstance(vision_config, dict) else vision_config
         )

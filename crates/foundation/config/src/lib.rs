@@ -57,28 +57,20 @@ where
 }
 
 /// Parse an optional boolean environment flag.
-/// Accepted true values are `1`, `true`, `yes`, and `on`; accepted false values
-/// are `0`, `false`, `no`, and `off`. Integer values other than zero are also
-/// treated as true for compatibility with existing UniServe flags.
+/// The only accepted values are `true` and `false`.
 pub fn env_bool(key: &str) -> Result<Option<bool>> {
     let Some(raw) = env::var_os(key) else {
         return Ok(None);
     };
     let value = raw.to_string_lossy().trim().to_ascii_lowercase();
-    if value.is_empty() {
-        return Ok(None);
-    }
     match value.as_str() {
-        "1" | "true" | "yes" | "on" => Ok(Some(true)),
-        "0" | "false" | "no" | "off" => Ok(Some(false)),
-        other => other
-            .parse::<i64>()
-            .map(|number| Some(number != 0))
-            .map_err(|_| ConfigError::InvalidEnv {
-                key: key.to_string(),
-                value: raw.to_string_lossy().into_owned(),
-                message: "expected a boolean flag".to_string(),
-            }),
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        _ => Err(ConfigError::InvalidEnv {
+            key: key.to_string(),
+            value: raw.to_string_lossy().into_owned(),
+            message: "expected true or false".to_string(),
+        }),
     }
 }
 

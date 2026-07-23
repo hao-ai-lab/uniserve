@@ -180,17 +180,17 @@ use uniserve_core::{HashAlgo, RequestId};
 use uniserve_engine_api::{Command, EventTx, FinishReason, GenEvent, GenerationSubmission};
 use uniserve_kv::{BlockManager, EncoderCacheManager};
 use uniserve_worker_wire::{
-    EngineCaps, ForwardBatch, ForwardOp, ForwardResult, NewRequestData, OpKind, ResourceClass,
-    TokenSource, WorkerForwardStats,
+    Admission, Batch, EngineCaps, ExecutionResult, FlowAdmission, KvAllocation, Operation,
+    OperationEnvelope, OperationResult, OperationType, ResourceClass, ResultDelta,
+    SequenceAdmission, SequenceEffect, SequenceInput, SequenceMode, TokenSource,
+    WorkerForwardStats,
 };
 
 use crate::grammar::{GrammarCompiler, GrammarMatcher, grammar_allowed_tokens};
 use crate::image_artifact::validate_png_artifact;
 use crate::queue::{FcfsRequestQueue, PriorityRequestQueue, RequestQueue};
-#[cfg(test)]
-use crate::spec_decode::ngram_draft_one;
 use serde_json::json;
-use uniserve_executor::{ControlOp, Executor, WorkerExecError};
+use uniserve_executor::{ControlOp, Executor, WorkerExecError, WorkerLossError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AssemblyLane {
@@ -208,7 +208,6 @@ const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// be the first to notice). Small enough for prompt death detection, large
 /// enough that the idle engine is effectively asleep.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
-const DECODE_LOOKAHEAD_ENV: &str = "UNISERVE_DECODE_LOOKAHEAD";
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
 const DECODE_TOKEN_BURST_ENV: &str = "UNISERVE_DECODE_TOKEN_BURST";
 
@@ -305,6 +304,7 @@ pub struct ReqState {
     /// Scheduler-owned lifecycle generation and committed worker-session version.
     pub(crate) epoch: u64,
     pub(crate) version: u64,
+    pub(crate) admission_digest: Option<String>,
     pub(crate) context: SchedulerContext,
     pub(crate) event_tx: EventTx,
     pub(crate) cursor: GenerationCursor,
@@ -406,22 +406,15 @@ pub struct Scheduler {
     grammar_compiler: GrammarCompiler,
     reserved_blocks: usize,
     step_id: u64,
-    /// Per-request ops currently in flight (submitted, not yet resolved). A
-    /// request may have multiple queued decode ops when FutureMap-style
-    /// lookahead is safe. Each [`InflightOp`] carries the op's `op_id`, so a
-    /// resolving result is matched to its exact op by `op_id` rather than the
-    /// FIFO submission order; the FIFO
-    /// front is only a fallback when the worker did not echo an op_id.
-    inflight_ops: HashMap<RequestId, VecDeque<InflightOp>>,
+    /// The single submitted-but-unresolved operation for each request. A
+    /// successor is not planned or issued until this lease reaches a terminal
+    /// result, so committed versions and cursor deltas always advance in order.
+    inflight_ops: HashMap<RequestId, InflightOp>,
     /// Finite resident-request cohort whose prompt and image-ingest work is
     /// drained before its first decode service. Membership is frozen when a
     /// ready decode would otherwise overlap another resident prompt, so later
     /// arrivals cannot extend the cohort indefinitely.
     prompt_cohort: Option<HashSet<RequestId>>,
-    /// Decode lookahead toggle. The fast path is additionally gated per request
-    /// to plain text generation whose next logits processors do not depend on
-    /// an unknown sampled token.
-    decode_lookahead: bool,
     /// Sequential denoise timesteps to execute per denoise op. The worker runs
     /// the exact same Euler steps and reports the cumulative step cursor.
     denoise_step_burst: u16,
@@ -473,7 +466,7 @@ pub struct HealthSnapshot {
     pub queue_wait_us_total: u64,
     pub queue_wait_us_max: u64,
     pub fatal: bool,
-    pub supported_ops: Vec<OpKind>,
+    pub supported_operation_types: Vec<OperationType>,
     pub op_latency_us: Vec<(String, u64)>,
 }
 
@@ -518,19 +511,20 @@ fn finish_reason_str(r: &FinishReason) -> &'static str {
     }
 }
 
-/// Stable op-kind label for latency-history keys.
-fn opkind_str(k: OpKind) -> &'static str {
-    match k {
-        OpKind::PrefillUnd => "prefill_und",
-        OpKind::DecodeUnd => "decode_und",
-        OpKind::TargetVerifyUnd => "target_verify_und",
-        OpKind::DenoiseGen => "denoise_gen",
-        OpKind::CommitGen => "commit_gen",
-        OpKind::CommitWriteback => "commit_writeback",
-        OpKind::VaeEncode => "vae_encode",
-        OpKind::VitEncode => "vit_encode",
-        OpKind::Sample => "sample",
-        OpKind::EncodeFrame => "encode_frame",
+/// Stable operation-type label for latency-history keys.
+fn operation_type_str(operation_type: OperationType) -> &'static str {
+    match operation_type {
+        OperationType::SequenceExtend => "sequence_extend",
+        OperationType::SequenceDecode => "sequence_decode",
+        OperationType::SequenceVerify => "sequence_verify",
+        OperationType::SequenceSample => "sequence_sample",
+        OperationType::Flow => "flow",
+        OperationType::EncodeVision => "encode_vision",
+        OperationType::EncodeLatent => "encode_latent",
+        OperationType::MaterializeImage => "materialize_image",
+        OperationType::MaterializeFrame => "materialize_frame",
+        OperationType::TransferProduct => "transfer_product",
+        OperationType::TransferKv => "transfer_kv",
     }
 }
 
@@ -550,9 +544,10 @@ fn ranked_logprobs(
 fn transition_validation_error_str(error: &TransitionValidationError) -> &'static str {
     match error {
         TransitionValidationError::OpIdMismatch { .. } => "op_id_mismatch",
+        TransitionValidationError::SessionMismatch { .. } => "session_mismatch",
         TransitionValidationError::EpochMismatch { .. } => "epoch_mismatch",
         TransitionValidationError::VersionMismatch { .. } => "version_mismatch",
-        TransitionValidationError::OpKindMismatch { .. } => "op_kind_mismatch",
+        TransitionValidationError::ResultTypeMismatch { .. } => "result_type_mismatch",
         TransitionValidationError::MissingDenoiseStep => "missing_denoise_step",
         TransitionValidationError::DenoiseStepMismatch { .. } => "denoise_step_mismatch",
         TransitionValidationError::MissingEncoderHandle => "missing_encoder_handle",
@@ -607,6 +602,7 @@ fn cursor_apply_error_str(error: &CursorApplyError) -> &'static str {
     match error {
         CursorApplyError::MissingOperationId => "missing_operation_id",
         CursorApplyError::DuplicateOperation { .. } => "duplicate_operation",
+        CursorApplyError::ResultTypeMismatch => "result_type_mismatch",
     }
 }
 
@@ -632,15 +628,18 @@ fn behavior_str(request: &GenerationRequest) -> &'static str {
     }
 }
 
-fn assembly_lane_for_kind(kind: OpKind) -> AssemblyLane {
-    match kind {
-        OpKind::PrefillUnd | OpKind::VitEncode | OpKind::VaeEncode => AssemblyLane::Prefill,
-        OpKind::DecodeUnd | OpKind::TargetVerifyUnd => AssemblyLane::Decode,
-        OpKind::DenoiseGen
-        | OpKind::CommitGen
-        | OpKind::CommitWriteback
-        | OpKind::Sample
-        | OpKind::EncodeFrame => AssemblyLane::Other,
+fn assembly_lane(operation_type: OperationType) -> AssemblyLane {
+    match operation_type {
+        OperationType::SequenceExtend
+        | OperationType::EncodeVision
+        | OperationType::EncodeLatent => AssemblyLane::Prefill,
+        OperationType::SequenceDecode | OperationType::SequenceVerify => AssemblyLane::Decode,
+        OperationType::SequenceSample
+        | OperationType::Flow
+        | OperationType::MaterializeImage
+        | OperationType::MaterializeFrame
+        | OperationType::TransferProduct
+        | OperationType::TransferKv => AssemblyLane::Other,
     }
 }
 
@@ -651,32 +650,15 @@ fn policy_str(policy: SchedulingPolicy) -> &'static str {
     }
 }
 
-/// One submitted-but-unresolved op tracked per request. Bundles everything the
-/// resolve path needs so completion can be correlated by `op_id` rather
-/// than by parallel FIFO queues.
+/// One submitted-but-unresolved operation tracked for a request.
 struct InflightOp {
     transition: PlannedTransition,
     /// The op's wire `op_id`, echoed back on its result.
-    op_id: Option<u64>,
+    op_id: u64,
     /// Speculative draft token ids attached to this op (empty when none).
     spec_tokens: Vec<u32>,
-    /// Sequential text decode tokens requested by this op. Projected cursors
-    /// account for the full count while the device relay chains the next op.
-    decode_token_count: u16,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
-}
-
-/// Remove the in-flight op whose `op_id` matches the worker-echoed `op_id`.
-/// Unknown or absent operation identities leave the queue untouched so a
-/// worker result can never resolve a different submission.
-fn take_inflight_by_op_id(
-    queue: &mut VecDeque<InflightOp>,
-    op_id: Option<u64>,
-) -> Option<InflightOp> {
-    let target = op_id?;
-    let pos = queue.iter().position(|op| op.op_id == Some(target))?;
-    queue.remove(pos)
 }
 
 impl Scheduler {
@@ -714,7 +696,7 @@ impl Scheduler {
         mut config: SchedulerConfig,
     ) -> Self {
         let caps = executor.caps();
-        let max_batch_ops = caps.execution_constraints.max_batch_ops as usize;
+        let max_batch_ops = caps.execution_constraints.max_batch_operations as usize;
         if max_batch_ops > 0 {
             config.max_batch = config.max_batch.min(max_batch_ops.max(1));
         }
@@ -748,7 +730,6 @@ impl Scheduler {
         let caps_encoder_budget = caps.encoder_cache_budget as usize;
         let spec_decode = crate::spec_decode::SpecDecodeAccounting::new(Arc::clone(&stats));
         let spec_ngram_max_tokens = spec_decode.max_ngram_tokens();
-        let decode_lookahead = decode_lookahead_from_env();
         let denoise_step_burst = denoise_step_burst_from_env();
         let decode_token_burst = decode_token_burst_from_env();
         let mut trace_sink = crate::bench_trace::SchedulerTraceSink::from_env();
@@ -765,15 +746,14 @@ impl Scheduler {
                     "long_prefill_threshold": config.long_prefill_threshold,
                     "mixed_prefill_tokens": config.mixed_prefill_tokens,
                     "spec_ngram_max_tokens": spec_ngram_max_tokens,
-                    "decode_lookahead": decode_lookahead,
                     "denoise_step_burst": denoise_step_burst,
                     "decode_token_burst": decode_token_burst,
                 },
                 "caps": {
                     "block_size": caps.block_size,
                     "num_blocks": caps.num_blocks,
-                    "supported_ops": &caps.supported_ops,
-                    "max_batch_ops": caps.execution_constraints.max_batch_ops,
+                    "supported_operation_types": &caps.supported_operation_types,
+                    "max_batch_operations": caps.execution_constraints.max_batch_operations,
                     "pipeline_depth": caps.pipeline_depth,
                     "max_latent_size": caps.max_latent_size,
                     "latent_downsample": caps.latent_downsample,
@@ -809,7 +789,6 @@ impl Scheduler {
             step_id: 0,
             inflight_ops: HashMap::new(),
             prompt_cohort: None,
-            decode_lookahead,
             denoise_step_burst,
             decode_token_burst,
             spec_decode,
@@ -958,7 +937,7 @@ impl Scheduler {
                 .load(Ordering::Relaxed),
             queue_wait_us_max: self.stats.timing.queue_wait_us_max.load(Ordering::Relaxed),
             fatal: self.fatal,
-            supported_ops: self.caps.supported_ops.clone(),
+            supported_operation_types: self.caps.supported_operation_types.clone(),
             op_latency_us: self.latency.as_pairs(),
         }
     }
@@ -1196,10 +1175,13 @@ impl Scheduler {
             } => self.begin_prefix_cache_reset(reset_running_requests, reply),
             Command::ResetEncoderCache => self.reset_encoder_cache(),
             Command::LoadLora { id, path } => {
-                self.gated_control(ControlOp::LoadLora { lora_id: id, path });
+                self.gated_control(ControlOp::LoadAdapter {
+                    adapter_id: id,
+                    path,
+                });
             }
             Command::UnloadLora { id } => {
-                self.gated_control(ControlOp::UnloadLora { lora_id: id });
+                self.gated_control(ControlOp::UnloadAdapter { adapter_id: id });
             }
             Command::SetSleeping(s) => self.set_sleeping(s),
             Command::CollectiveRpc { method, reply } => {
@@ -1276,14 +1258,9 @@ impl Scheduler {
         }
     }
 
-    /// Suppress controls not declared in `supported_controls`. An empty
-    /// declared set is treated as unspecified. `drop_request` is never gated.
+    /// Accept only controls declared in the worker capability handshake.
     fn control_allowed(&self, op: &ControlOp) -> bool {
-        if matches!(op, ControlOp::DropRequest(_)) {
-            return true;
-        }
-        let declared = &self.caps.supported_controls;
-        declared.is_empty() || declared.iter().any(|c| c == op.method())
+        self.caps.supported_controls.contains(&op.request_kind())
     }
 
     /// Dispatch a control only if the worker declares support; otherwise drop it
@@ -1355,12 +1332,6 @@ impl Scheduler {
     /// Pause or resume admission.
     fn set_sleeping(&mut self, sleeping: bool) {
         self.sleeping = sleeping;
-        let op = if sleeping {
-            ControlOp::Sleep
-        } else {
-            ControlOp::WakeUp
-        };
-        self.gated_control(op);
     }
     pub fn is_sleeping(&self) -> bool {
         self.sleeping
@@ -1506,6 +1477,7 @@ impl Scheduler {
         let st = ReqState {
             epoch: self.next_epoch,
             version: 0,
+            admission_digest: None,
             cursor: GenerationCursor::new(phase0, worst, reserve_worstcase),
             context,
             event_tx,
@@ -1560,11 +1532,11 @@ impl Scheduler {
     }
 
     fn generation_runtime_capabilities(&self) -> GenerationRuntimeCapabilities {
-        let mut supported_ops = self.caps.supported_ops.clone();
-        supported_ops.sort();
-        supported_ops.dedup();
+        let mut supported_operation_types = self.caps.supported_operation_types.clone();
+        supported_operation_types.sort();
+        supported_operation_types.dedup();
         GenerationRuntimeCapabilities {
-            supported_ops,
+            supported_operation_types,
             max_latent_units: u64::from(self.caps.max_latent_size),
             latent_downsample: self.caps.latent_downsample,
             max_vae_grid_tokens: self.cap_max_vae_grid_tokens() as u32,
@@ -1578,7 +1550,7 @@ impl Scheduler {
         }
     }
 
-    fn missing_required_operation(&self, request: &GenerationRequest) -> Option<OpKind> {
+    fn missing_required_operation(&self, request: &GenerationRequest) -> Option<OperationType> {
         let context_steps = request.context.iter().flat_map(|segment| match segment {
             uniserve_core::ContextSegment::Image { ingest, .. } => ingest.steps.clone(),
             uniserve_core::ContextSegment::UndTokens { .. } => Vec::new(),
@@ -1587,7 +1559,7 @@ impl Scheduler {
             .behavior
             .required_operations(&request.policy, context_steps)
             .into_iter()
-            .find(|operation| !self.caps.supported_ops.contains(operation))
+            .find(|operation| !self.caps.supported_operation_types.contains(operation))
     }
 
     fn worker_tracks_image_latent(&self) -> bool {
@@ -1648,7 +1620,7 @@ impl Scheduler {
     }
 
     fn reserve_transition_resources(&mut self, transition: &PlannedTransition) -> bool {
-        let id = transition.op.req_id;
+        let id = transition.op.session_id;
         let resources = &transition.resources;
         let cached_encoder_key = match transition.delta {
             crate::generation::TransitionDelta::IngestImageStep {
@@ -1662,15 +1634,15 @@ impl Scheduler {
             let Some(handle) = self.enc_cache.acquire(key) else {
                 return false;
             };
-            if transition.image_in != Some(handle) {
+            if transition.validation.expected_encoder_handle != Some(handle) {
                 if let Some(freed) = self.enc_cache.release(key, handle) {
-                    self.gated_control(ControlOp::FreeEncoder(vec![freed]));
+                    self.gated_control(ControlOp::ReleaseProducts(vec![freed]));
                 }
                 return false;
             }
             let Some(st) = self.running.get_mut(&id) else {
                 if let Some(freed) = self.enc_cache.release(key, handle) {
-                    self.gated_control(ControlOp::FreeEncoder(vec![freed]));
+                    self.gated_control(ControlOp::ReleaseProducts(vec![freed]));
                 }
                 return false;
             };
@@ -1692,7 +1664,7 @@ impl Scheduler {
                 if let Some(pin) = pin {
                     debug_assert_eq!(pin.key, key);
                     if let Some(freed) = self.enc_cache.release(pin.key, pin.handle) {
-                        self.gated_control(ControlOp::FreeEncoder(vec![freed]));
+                        self.gated_control(ControlOp::ReleaseProducts(vec![freed]));
                     }
                 }
             }
@@ -1706,11 +1678,11 @@ impl Scheduler {
                 uniserve_worker_wire::LeasePolicy::Pinned,
             );
         }
-        if resources.scratch_units > 0 {
+        if resources.host_scratch_tokens > 0 {
             self.ledger.ensure(
                 id,
                 uniserve_worker_wire::ResourceClass::Scratch,
-                resources.scratch_units,
+                resources.host_scratch_tokens,
                 uniserve_worker_wire::LeasePolicy::PerRequest,
             );
         }
@@ -1719,7 +1691,6 @@ impl Scheduler {
                 .resources
                 .worker_image_latent_units
                 .max(resources.latent_units);
-            st.resources.scratch_units = st.resources.scratch_units.max(resources.scratch_units);
             st.resources.host_scratch_tokens = st
                 .resources
                 .host_scratch_tokens
@@ -1740,7 +1711,6 @@ impl Scheduler {
                 uniserve_worker_wire::ResourceClass::Scratch => {
                     self.bm.release_scratch(id);
                     if let Some(st) = self.running.get_mut(&id) {
-                        st.resources.scratch_units = 0;
                         st.resources.host_scratch_tokens = 0;
                     }
                 }
@@ -1921,56 +1891,19 @@ impl Scheduler {
     /// prompts wait (decode fills the slot) and merge into the next prefill
     /// batch, so bursts cost one sweep instead of one sweep per arrival.
     fn any_prefill_inflight(&self) -> bool {
-        self.inflight_ops.values().any(|items| {
-            items
-                .iter()
-                .any(|op| op.transition.kind == OpKind::PrefillUnd)
-        })
+        self.inflight_ops
+            .values()
+            .any(|op| op.transition.operation_type == OperationType::SequenceExtend)
     }
 
     fn any_denoise_inflight(&self) -> bool {
-        self.inflight_ops.values().any(|items| {
-            items
-                .iter()
-                .any(|op| op.transition.kind == OpKind::DenoiseGen)
-        })
+        self.inflight_ops
+            .values()
+            .any(|op| op.transition.operation_type == OperationType::Flow)
     }
 
     fn has_inflight(&self, id: RequestId) -> bool {
-        self.inflight_ops
-            .get(&id)
-            .is_some_and(|items| !items.is_empty())
-    }
-
-    fn inflight_decode_count(&self, id: RequestId) -> usize {
-        self.inflight_ops
-            .get(&id)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|op| op.transition.kind == OpKind::DecodeUnd)
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
-    fn inflight_has_spec_tokens(&self, id: RequestId) -> bool {
-        self.inflight_ops
-            .get(&id)
-            .is_some_and(|items| items.iter().any(|op| !op.spec_tokens.is_empty()))
-    }
-
-    fn inflight_generated_token_count(&self, id: RequestId) -> usize {
-        self.inflight_ops.get(&id).map_or(0, |items| {
-            items
-                .iter()
-                .map(|op| match op.transition.kind {
-                    OpKind::DecodeUnd => usize::from(op.decode_token_count.max(1)),
-                    OpKind::PrefillUnd => 1,
-                    _ => 0,
-                })
-                .sum()
-        })
+        self.inflight_ops.contains_key(&id)
     }
 
     fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
@@ -1979,54 +1912,47 @@ impl Scheduler {
             .inflight_ops
             .get(&id)
             .into_iter()
-            .flat_map(|items| items.iter().map(|op| &op.transition));
+            .map(|op| &op.transition);
         Some(st.cursor.project(transitions))
     }
 
-    /// Whether any in-flight op for `id` is something other than a plain decode
-    /// (a prefill chunk, an image op, …). Used to gate decode-lookahead.
-    fn inflight_has_non_decode(&self, id: RequestId) -> bool {
-        self.inflight_ops.get(&id).is_some_and(|items| {
-            items
-                .iter()
-                .any(|op| op.transition.kind != OpKind::DecodeUnd)
-        })
-    }
-
     fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
-        let request_id = transition.op.req_id;
+        let request_id = transition.op.session_id;
         let op_id = transition.op.op_id;
-        let spec_tokens = transition.op.spec_token_ids.clone().unwrap_or_default();
-        let decode_token_count = transition.op.decode_token_count.unwrap_or(1).max(1);
-        self.inflight_ops
-            .entry(request_id)
-            .or_default()
-            .push_back(InflightOp {
+        let spec_tokens = operation_draft_tokens(&transition.op);
+        assert!(
+            !self.inflight_ops.contains_key(&request_id),
+            "request {request_id:?} received a successor before its lease became terminal"
+        );
+        self.inflight_ops.insert(
+            request_id,
+            InflightOp {
                 transition,
                 op_id,
                 spec_tokens,
-                decode_token_count,
                 started,
-            });
+            },
+        );
     }
 
     /// Resolve one in-flight op for `id` by the worker's echoed `op_id`.
     fn pop_inflight(
         &mut self,
         id: RequestId,
-        op_id: Option<u64>,
+        op_id: u64,
     ) -> (Option<PlannedTransition>, Vec<u32>, Option<Instant>) {
-        let Some(queue) = self.inflight_ops.get_mut(&id) else {
+        let Some(inflight) = self.inflight_ops.remove(&id) else {
             return (None, Vec::new(), None);
         };
-        let resolved = take_inflight_by_op_id(queue, op_id);
-        if queue.is_empty() {
-            self.inflight_ops.remove(&id);
+        if op_id == 0 || inflight.op_id != op_id {
+            self.inflight_ops.insert(id, inflight);
+            return (None, Vec::new(), None);
         }
-        match resolved {
-            Some(op) => (Some(op.transition), op.spec_tokens, Some(op.started)),
-            None => (None, Vec::new(), None),
-        }
+        (
+            Some(inflight.transition),
+            inflight.spec_tokens,
+            Some(inflight.started),
+        )
     }
 
     /// Failure policy after an executor/worker error.
@@ -2039,8 +1965,13 @@ impl Scheduler {
     /// baseline, but the host *escalates* host-bug classes to fatal even when
     /// the worker marked them non-fatal (a `SCHEDULER_BUG`/`INVARIANT_VIOLATION`
     /// means the control plane can no longer be trusted), and it picks the log
-    /// severity by class so a benign `USER_INPUT_ERROR` does not spam warnings.
+    /// severity by class so a benign `InputError` does not spam warnings.
     fn on_executor_error(&mut self, e: anyhow::Error) {
+        if e.downcast_ref::<WorkerLossError>().is_some() {
+            tracing::warn!("worker state was lost; terminating affected live sessions: {e}");
+            self.fail_all_running(&e.to_string());
+            return;
+        }
         let exec = e.downcast_ref::<WorkerExecError>();
         let worker_fatal = exec.map(|w| w.fatal).unwrap_or(true);
         let code = exec.and_then(|w| w.code.as_deref());
@@ -2057,7 +1988,7 @@ impl Scheduler {
                 "fatal executor error (engine will stop): {e}"
             );
             self.fatal = true;
-        } else if matches!(code, Some("UserInputError")) {
+        } else if matches!(code, Some("InputError")) {
             // A malformed request is the client's fault, not a worker problem:
             // fail just that request at info level instead of warn-spam.
             tracing::info!(?code, "request rejected by worker (failing in-flight): {e}");
@@ -2075,7 +2006,7 @@ impl Scheduler {
         self.fail_all_inflight(&format!("{e}"));
     }
 
-    fn apply_result(&mut self, result: ForwardResult) {
+    fn apply_result(&mut self, result: ExecutionResult) {
         // worker-reported batch compute time (one value per batch).
         let result_step_id = result.step_id;
         let batch_roundtrip_us = self
@@ -2110,43 +2041,50 @@ impl Scheduler {
             .as_ref()
             .map(worker_forward_stats_trace);
         self.record_worker_forward_stats(result.forward_stats.as_ref());
-        let mut resolved_ops = Vec::with_capacity(result.per_seq.len());
-        let mut progress_ops = Vec::with_capacity(result.per_seq.len());
-        let mut to_resolve = Vec::with_capacity(result.per_seq.len());
-        for (seq_index, sr) in result.per_seq.into_iter().enumerate() {
-            let id = sr.req_id;
+        let mut resolved_ops = Vec::with_capacity(result.operations.len());
+        let mut progress_ops = Vec::with_capacity(result.operations.len());
+        let mut to_resolve = Vec::with_capacity(result.operations.len());
+        for (operation_index, operation_result) in result.operations.into_iter().enumerate() {
+            let id = operation_result.session_id;
             // op_id-correlated completion: resolve the exact op the
             // worker echoed, not merely the FIFO-oldest one.
-            let (transition, draft_token_ids, started) = self.pop_inflight(id, sr.op_id);
+            let (transition, draft_token_ids, started) =
+                self.pop_inflight(id, operation_result.op_id);
             if transition.is_none() {
                 self.trace_record(json!({
                     "event": "unknown_result_op_id",
                     "at_s": now(),
                     "request_id": id.0,
-                    "op_id": sr.op_id,
+                    "op_id": operation_result.op_id,
                 }));
                 if self.running.contains_key(&id) {
                     self.finish(id, FinishReason::Error);
                 }
                 continue;
             }
-            let kind = transition.as_ref().map(|transition| transition.kind);
+            let operation_type = transition
+                .as_ref()
+                .map(|transition| transition.operation_type);
             let draft_tokens = draft_token_ids.len();
             // fold this op's host-side round-trip latency into the history.
             let roundtrip_us = started
                 .map(|start| start.elapsed().as_micros() as u64)
                 .unwrap_or(0);
-            if let Some(k) = kind {
-                self.latency.observe(opkind_str(k), roundtrip_us);
+            if let Some(operation_type) = operation_type {
+                self.latency
+                    .observe(operation_type_str(operation_type), roundtrip_us);
             }
             // record the op-resolved lifecycle event (op_id echoed by the
             // worker, host round-trip + worker compute time).
-            let op_id = sr.op_id;
-            let sampled_token_ids_len = sr.sampled_token_ids.as_ref().map_or(0, Vec::len);
-            let sampled_token_ids_last = sr
-                .sampled_token_ids
-                .as_ref()
-                .and_then(|ids| ids.last().copied());
+            let op_id = operation_result.op_id;
+            let sequence_effect = operation_result_sequence_effect(&operation_result);
+            let sampled_token_ids_len = sequence_effect
+                .map(|effect| effect.sampled_token_ids.len())
+                .unwrap_or_default();
+            let sampled_token_ids_last =
+                sequence_effect.and_then(|effect| effect.sampled_token_ids.last().copied());
+            let accepted_draft_tokens =
+                sequence_effect.and_then(|effect| effect.accepted_draft_tokens);
             let transition_delta = transition
                 .as_ref()
                 .map(|transition| transition.delta.as_str());
@@ -2156,9 +2094,9 @@ impl Scheduler {
             let transition_kv_target = transition
                 .as_ref()
                 .and_then(|transition| transition.resources.kv_target_tokens);
-            let transition_scratch_units = transition
+            let transition_scratch_tokens = transition
                 .as_ref()
-                .map(|transition| transition.resources.scratch_units);
+                .map(|transition| transition.resources.host_scratch_tokens);
             let transition_latent_units = transition
                 .as_ref()
                 .map(|transition| transition.resources.latent_units);
@@ -2171,47 +2109,47 @@ impl Scheduler {
             resolved_ops.push(json!({
                 "request_id": id.0,
                 "op_id": op_id,
-                "op_kind": kind.map(opkind_str),
+                "operation_type": operation_type.map(operation_type_str),
                 "transition_delta": transition_delta,
                 "transition_new_blocks": transition_new_blocks,
                 "transition_kv_target": transition_kv_target,
-                "transition_scratch_units": transition_scratch_units,
+                "transition_scratch_tokens": transition_scratch_tokens,
                 "transition_latent_units": transition_latent_units,
                 "transition_encoder_pins": transition_encoder_pins,
                 "transition_replayability": transition_replayability,
                 "roundtrip_us": roundtrip_us,
-                "sampled_token": sr.sampled_token_id.is_some(),
+                "sampled_token": sampled_token_ids_last.is_some(),
                 "sampled_token_ids_len": sampled_token_ids_len,
                 "sampled_token_ids_last": sampled_token_ids_last,
-                "denoise_done": sr.denoise_done,
-                "num_steps_done": sr.num_steps_done,
-                "image_done": sr.image_png_b64.is_some(),
-                "image_hw": sr.image_hw,
-                "num_tokens": sr.num_tokens,
+                "flow_done": operation_flow_delta(&operation_result).map(|delta| delta.done),
+                "steps_completed": operation_flow_delta(&operation_result).map(|delta| delta.steps_completed),
+                "image_done": operation_image(&operation_result).is_some(),
+                "image_hw": operation_image(&operation_result).map(|image| (image.height, image.width)),
+                "kv_tokens": operation_result_kv_tokens(&operation_result),
                 "num_draft_tokens": draft_tokens,
-                "num_accepted_tokens": sr.num_accepted_tokens,
-                "encoder_handle": sr.encoder_handle,
+                "num_accepted_tokens": accepted_draft_tokens,
+                "product_handle": operation_encode_handle(&operation_result),
             }));
             if draft_tokens > 0 {
                 self.spec_decode
-                    .record_acceptance(draft_tokens, sr.num_accepted_tokens);
+                    .record_acceptance(draft_tokens, accepted_draft_tokens);
             }
             if let Some(st) = self.running.get_mut(&id) {
                 let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpResolved);
-                ev.op_id = op_id;
-                ev.op_kind = kind.map(opkind_str);
+                ev.op_id = Some(op_id);
+                ev.op_kind = operation_type.map(operation_type_str);
                 ev.roundtrip_us = roundtrip_us;
                 ev.worker_us = worker_us;
                 st.trace.push(ev);
             }
             if let Some(transition) = transition {
-                if let Err(error) = transition.validate_result(&sr) {
+                if let Err(error) = transition.validate_result(&operation_result) {
                     self.trace_record(json!({
                         "event": "transition_validation_failed",
                         "at_s": now(),
                         "request_id": id.0,
-                        "op_id": transition.op_id,
-                        "op_kind": opkind_str(transition.kind),
+                        "op_id": transition.op.op_id,
+                        "operation_type": operation_type_str(transition.operation_type),
                         "error": transition_validation_error_str(&error),
                     }));
                     if self.running.contains_key(&id) {
@@ -2219,17 +2157,18 @@ impl Scheduler {
                     }
                     continue;
                 }
-                let cursor_result = self
-                    .running
-                    .get_mut(&id)
-                    .map(|state| state.cursor.apply_transition(&transition, &sr));
+                let cursor_result = self.running.get_mut(&id).map(|state| {
+                    state
+                        .cursor
+                        .apply_transition(&transition, &operation_result)
+                });
                 if let Some(Err(error)) = cursor_result {
                     self.trace_record(json!({
                         "event": "cursor_transition_failed",
                         "at_s": now(),
                         "request_id": id.0,
-                        "op_id": transition.op_id,
-                        "op_kind": opkind_str(transition.kind),
+                        "op_id": transition.op.op_id,
+                        "operation_type": operation_type_str(transition.operation_type),
                         "error": cursor_apply_error_str(&error),
                     }));
                     if self.running.contains_key(&id) {
@@ -2238,17 +2177,23 @@ impl Scheduler {
                     continue;
                 }
                 if let Some(state) = self.running.get_mut(&id) {
-                    state.version = sr
-                        .result_version
-                        .expect("validated operation result has a resulting version");
+                    state.version = operation_result.result_version;
                 }
                 self.release_transition_resources(id, &transition);
-                let kind = transition.kind;
-                let priority = match kind {
-                    OpKind::DenoiseGen | OpKind::CommitGen | OpKind::CommitWriteback => 0,
+                let priority = match transition.operation_type {
+                    OperationType::Flow
+                    | OperationType::MaterializeImage
+                    | OperationType::TransferKv => 0,
                     _ => 1,
                 };
-                to_resolve.push((priority, seq_index, id, transition, sr, draft_token_ids));
+                to_resolve.push((
+                    priority,
+                    operation_index,
+                    id,
+                    transition,
+                    operation_result,
+                    draft_token_ids,
+                ));
             }
         }
         to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
@@ -2428,6 +2373,21 @@ impl Scheduler {
                 );
                 self.finish(id, FinishReason::Error);
             }
+        }
+    }
+
+    fn fail_all_running(&mut self, message: &str) {
+        self.inflight_ops.clear();
+        self.batch_started.clear();
+        let ids = self.running.keys().copied().collect::<Vec<_>>();
+        for id in ids {
+            self.emit(
+                id,
+                GenEvent::Error {
+                    message: message.to_string(),
+                },
+            );
+            self.finish(id, FinishReason::Error);
         }
     }
 
@@ -2678,8 +2638,8 @@ impl Scheduler {
 
     /// Assemble the per-step batch: walk the priority order, ask each request for
     /// at most one op, clip prefill chunks to the remaining token budget, and
-    /// pair first-dispatch requests with their `NewRequestData` record.
-    fn assemble(&mut self) -> (Vec<NewRequestData>, Vec<PlannedTransition>) {
+    /// pair first-dispatch requests with their typed admission record.
+    fn assemble(&mut self) -> (Vec<Admission>, Vec<PlannedTransition>) {
         let ids = self.assembly_order();
         self.refresh_prompt_cohort(&ids);
         if let Some(cohort) = self.prompt_cohort.as_ref() {
@@ -2707,28 +2667,27 @@ impl Scheduler {
         if self.running.get(&id).is_none_or(|st| st.cancelled) {
             return false;
         }
-        let prompt_inflight = self.inflight_ops.get(&id).is_some_and(|items| {
-            items
-                .iter()
-                .any(|op| assembly_lane_for_kind(op.transition.kind) == AssemblyLane::Prefill)
-        });
+        let prompt_inflight = self
+            .inflight_ops
+            .get(&id)
+            .is_some_and(|op| assembly_lane(op.transition.operation_type) == AssemblyLane::Prefill);
         prompt_inflight
             || self
-                .peek_next_kind(id)
-                .is_some_and(|kind| assembly_lane_for_kind(kind) == AssemblyLane::Prefill)
+                .peek_next_operation_type(id)
+                .is_some_and(|operation_type| {
+                    assembly_lane(operation_type) == AssemblyLane::Prefill
+                })
     }
 
     fn request_has_ready_decode(&self, id: RequestId) -> bool {
         if self.running.get(&id).is_none_or(|st| st.cancelled)
             || self
-                .peek_next_kind(id)
-                .is_none_or(|kind| assembly_lane_for_kind(kind) != AssemblyLane::Decode)
+                .peek_next_operation_type(id)
+                .is_none_or(|operation_type| assembly_lane(operation_type) != AssemblyLane::Decode)
         {
             return false;
         }
         !self.has_inflight(id)
-            || self.can_decode_lookahead(id)
-            || self.can_prefill_decode_lookahead(id)
     }
 
     fn refresh_prompt_cohort(&mut self, ids: &[RequestId]) {
@@ -2768,8 +2727,8 @@ impl Scheduler {
         &mut self,
         ids: &[RequestId],
         lane: Option<AssemblyLane>,
-    ) -> (Vec<NewRequestData>, Vec<PlannedTransition>) {
-        let mut new_reqs: Vec<NewRequestData> = Vec::new();
+    ) -> (Vec<Admission>, Vec<PlannedTransition>) {
+        let mut admissions: Vec<Admission> = Vec::new();
         let mut ops: Vec<PlannedTransition> = Vec::new();
         let mut selected: HashSet<RequestId> = HashSet::new();
         // vLLM's per-step token budget with the clip rule: the budget, not the
@@ -2796,31 +2755,28 @@ impl Scheduler {
             if budget == 0 {
                 break;
             }
-            if self.has_inflight(id)
-                && !self.can_decode_lookahead(id)
-                && !self.can_prefill_decode_lookahead(id)
-            {
+            if self.has_inflight(id) {
                 continue;
             }
             let cancelled = self.running.get(&id).map(|s| s.cancelled).unwrap_or(true);
             if cancelled {
                 continue;
             }
-            let next_kind = self.peek_next_kind(id);
+            let next_type = self.peek_next_operation_type(id);
             // When a decode pass admits text prefill rows, the worker receives a
             // single mixed forward. There is no `supports_mixed_op_kinds` gate;
             // co-batched rows shift each other's numerics only through inherent
             // batched-kernel FP non-invariance, not structural corruption.
             let mut mixed_prefill = false;
-            if let (Some(target), Some(kind)) = (lane, next_kind)
+            if let (Some(target), Some(operation_type)) = (lane, next_type)
                 && {
-                    let candidate_lane = assembly_lane_for_kind(kind);
+                    let candidate_lane = assembly_lane(operation_type);
                     matches!(candidate_lane, AssemblyLane::Prefill | AssemblyLane::Decode)
                         && candidate_lane != target
                 }
             {
                 mixed_prefill = target == AssemblyLane::Decode
-                    && kind == OpKind::PrefillUnd
+                    && operation_type == OperationType::SequenceExtend
                     && mixed_left > 0
                     && self.running.get(&id).is_some_and(|st| {
                         st.is_replayable_text() && !st.req.sampling.prompt_logprobs_requested()
@@ -2829,7 +2785,7 @@ impl Scheduler {
                     continue;
                 }
             }
-            if next_kind == Some(OpKind::DenoiseGen)
+            if next_type == Some(OperationType::Flow)
                 && (denoise_occupies_decode_pipeline || !self.can_schedule_denoise(id))
             {
                 continue;
@@ -2856,24 +2812,27 @@ impl Scheduler {
                             && !st.resources.worker_registered
                         {
                             st.resources.worker_registered = true;
-                            let neg = (!st.context.negative_prompt_ids.is_empty())
-                                .then(|| st.context.negative_prompt_ids.clone());
-                            new_reqs.push(NewRequestData {
-                                sampling: Some(st.req.sampling.clone()),
-                                image: Some(st.req.image.clone()),
-                                neg_token_ids: neg,
-                                lora_id: st.req.lora_id,
-                                block_ids: std::mem::take(&mut op.new_block_ids),
-                                // Prefix-cache reuse boundary: the committed
-                                // prompt cursor at registration equals the
-                                // admission-time prefix hit (cached blocks x
-                                // block size; 0 cold). Re-registration after
-                                // preemption re-runs the lookup, so the
-                                // current cursor is always the reuse boundary.
-                                prefix_len: st.ingest.prompt_cursor,
-                                group_id: 0,
-                                ..NewRequestData::new(id)
-                            });
+                            let initial_blocks = take_operation_new_blocks(&mut op.op);
+                            let admission = Admission::new(
+                                id,
+                                Some(SequenceAdmission {
+                                    sampling: st.req.sampling.clone(),
+                                    negative_token_ids: st.context.negative_prompt_ids.clone(),
+                                    kv: KvAllocation {
+                                        block_ids: initial_blocks,
+                                        prefix_len: st.ingest.prompt_cursor,
+                                        group_id: 0,
+                                    },
+                                }),
+                                st.req.behavior.gen_output.then(|| FlowAdmission {
+                                    image: st.req.image.clone(),
+                                }),
+                                st.req.lora_id,
+                            )
+                            .expect("validated request produces a valid admission");
+                            st.admission_digest = Some(admission.digest.clone());
+                            op.op.admission_digest = admission.digest.clone();
+                            admissions.push(admission);
                         }
                         if !self.reserve_transition_resources(&op) {
                             tracing::error!(
@@ -2916,29 +2875,23 @@ impl Scheduler {
             }
         }
         ops.extend(mixed_ops);
-        (new_reqs, ops)
+        (admissions, ops)
     }
 
     fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
         let mut decode_ready = false;
-        let mut decode_ready_without_lookahead = false;
         let mut prefill_ready = false;
         for id in ids.iter().copied() {
             if self.running.get(&id).map(|s| s.cancelled).unwrap_or(true) {
                 continue;
             }
-            let Some(kind) = self.peek_next_kind(id) else {
+            let Some(operation_type) = self.peek_next_operation_type(id) else {
                 continue;
             };
-            match assembly_lane_for_kind(kind) {
+            match assembly_lane(operation_type) {
                 AssemblyLane::Decode => {
-                    if self.has_inflight(id) {
-                        if self.can_decode_lookahead(id) || self.can_prefill_decode_lookahead(id) {
-                            decode_ready = true;
-                        }
-                    } else {
+                    if !self.has_inflight(id) {
                         decode_ready = true;
-                        decode_ready_without_lookahead = true;
                     }
                 }
                 AssemblyLane::Prefill => {
@@ -2949,18 +2902,12 @@ impl Scheduler {
                 AssemblyLane::Other => {}
             }
         }
-        if decode_ready_without_lookahead {
-            Some(AssemblyLane::Decode)
-        } else if decode_ready && self.config.mixed_prefill_tokens > 0 {
-            // With mixed batching, prompt work rides inside the decode batch
-            // (sharing its weight sweep) instead of claiming a sweep of its
-            // own; the decode lane wins even when decodes are only
-            // lookahead-ready.
+        if decode_ready {
+            // A ready decode retains its turn when new prompt work arrives.
+            // Mixed prefill, when enabled, may ride in that same decode batch.
             Some(AssemblyLane::Decode)
         } else if prefill_ready && !self.any_prefill_inflight() {
             Some(AssemblyLane::Prefill)
-        } else if decode_ready {
-            Some(AssemblyLane::Decode)
         } else if prefill_ready {
             // a prefill batch is already in flight and no decode can fill the
             // slot: run the waiting prompts anyway rather than idling.
@@ -2977,120 +2924,32 @@ impl Scheduler {
     }
 
     fn assembly_priority(&self, id: RequestId) -> u8 {
-        match self.peek_next_kind(id) {
-            Some(OpKind::VitEncode | OpKind::VaeEncode | OpKind::PrefillUnd) => 0,
+        match self.peek_next_operation_type(id) {
             Some(
-                OpKind::DecodeUnd
-                | OpKind::TargetVerifyUnd
-                | OpKind::CommitGen
-                | OpKind::CommitWriteback,
+                OperationType::EncodeVision
+                | OperationType::EncodeLatent
+                | OperationType::SequenceExtend,
+            ) => 0,
+            Some(
+                OperationType::SequenceDecode
+                | OperationType::SequenceVerify
+                | OperationType::MaterializeImage
+                | OperationType::TransferKv,
             ) => 1,
-            Some(OpKind::DenoiseGen) => 2,
-            // Sample/EncodeFrame are StageRouter-injected stage ops, never produced
-            // by this scheduler's per-request planner; group them with "no op".
-            Some(OpKind::Sample | OpKind::EncodeFrame) | None => 3,
+            Some(OperationType::Flow) => 2,
+            Some(
+                OperationType::SequenceSample
+                | OperationType::MaterializeFrame
+                | OperationType::TransferProduct,
+            )
+            | None => 3,
         }
-    }
-
-    fn can_decode_lookahead(&self, id: RequestId) -> bool {
-        if !self.decode_lookahead || !self.has_inflight(id) {
-            return false;
-        }
-        let Some(st) = self.running.get(&id) else {
-            return false;
-        };
-        if st.cancelled
-            || !st.is_replayable_text()
-            || st.req.behavior.gen_output
-            || st.lifecycle.phase != Phase::DecodeUnd
-            || st.grammar.is_some()
-        {
-            return false;
-        }
-        let depth = self.inflight_decode_count(id);
-        if depth == 0 || self.inflight_has_non_decode(id) || self.inflight_has_spec_tokens(id) {
-            return false;
-        }
-        let sp = &st.req.sampling;
-        let greedy = sp.temperature <= 0.0;
-        let penalties = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        greedy
-            && sp.ignore_eos
-            && st.req.stop_token_ids.is_empty()
-            && st.und.tokens_emitted >= sp.min_tokens
-            && st
-                .und
-                .tokens_emitted
-                .saturating_add(self.inflight_generated_token_count(id))
-                < st.req.max_und_tokens
-            && !sp.generated_logprobs_requested()
-            && sp.bad_words_ids.is_empty()
-            && !penalties
-    }
-
-    /// Cross-boundary async submission (the analog of SGLang's overlap
-    /// scheduler's future-token map): once a request's FINAL prefill chunk is
-    /// in flight, its first decode op may be submitted immediately with
-    /// `token_source = last_sampled`, reading the prefill's sampled token from
-    /// the worker's device-side relay. The first decode step then starts right
-    /// after the prefill step instead of waiting one extra pipeline slot for
-    /// the prefill result's host round-trip.
-    fn can_prefill_decode_lookahead(&self, id: RequestId) -> bool {
-        if !self.decode_lookahead {
-            return false;
-        }
-        let Some(st) = self.running.get(&id) else {
-            return false;
-        };
-        if st.cancelled
-            || !st.is_replayable_text()
-            || st.req.behavior.gen_output
-            || st.lifecycle.phase != Phase::Prefill
-            || st.grammar.is_some()
-        {
-            return false;
-        }
-        // The whole prompt must already be covered by the in-flight prefill
-        // transition, i.e. the final prefill is running.
-        if self
-            .projected_cursor(id)
-            .is_none_or(|cursor| (cursor.prompt_cursor as usize) < st.effective_prompt().len())
-        {
-            return false;
-        }
-        let Some(items) = self.inflight_ops.get(&id) else {
-            return false;
-        };
-        if items.len() != 1
-            || items
-                .iter()
-                .any(|op| op.transition.kind != OpKind::PrefillUnd)
-        {
-            return false;
-        }
-        let sp = &st.req.sampling;
-        let greedy = sp.temperature <= 0.0;
-        let penalties = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        greedy
-            && sp.ignore_eos
-            && st.req.stop_token_ids.is_empty()
-            && st.und.tokens_emitted >= sp.min_tokens
-            && st
-                .und
-                .tokens_emitted
-                .saturating_add(self.inflight_generated_token_count(id))
-                < st.req.max_und_tokens
-            && !sp.generated_logprobs_requested()
-            && sp.bad_words_ids.is_empty()
-            && !penalties
     }
 
     fn supports_spec_decode(&self) -> bool {
-        self.caps.supported_ops.contains(&OpKind::TargetVerifyUnd)
+        self.caps
+            .supported_operation_types
+            .contains(&OperationType::SequenceVerify)
     }
 
     fn decode_burst_plan(
@@ -3120,11 +2979,7 @@ impl Scheduler {
             return (1, None, false);
         }
 
-        let remaining = st
-            .req
-            .max_und_tokens
-            .saturating_sub(st.und.tokens_emitted)
-            .saturating_sub(self.inflight_generated_token_count(id));
+        let remaining = st.req.max_und_tokens.saturating_sub(st.und.tokens_emitted);
         let count = self
             .decode_token_burst
             .min(remaining.min(u16::MAX as usize).max(1) as u16)
@@ -3190,7 +3045,7 @@ impl Scheduler {
         in_allocated.saturating_add(shared_free_blocks.saturating_mul(bs))
     }
 
-    fn peek_next_kind(&self, id: RequestId) -> Option<OpKind> {
+    fn peek_next_operation_type(&self, id: RequestId) -> Option<OperationType> {
         let st = self.running.get(&id)?;
         if st.image_gen.branch_pending {
             return None;
@@ -3205,21 +3060,20 @@ impl Scheduler {
             })
         {
             return st.pending_image_step().map(|step| match step {
-                ImageIngestStep::VaeEncode => OpKind::VaeEncode,
-                ImageIngestStep::VitEncode => OpKind::VitEncode,
+                ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
+                ImageIngestStep::VitEncode => OperationType::EncodeVision,
             });
         }
         Some(match st.lifecycle.phase {
             Phase::Encode => match st.pending_image_step()? {
-                ImageIngestStep::VaeEncode => OpKind::VaeEncode,
-                ImageIngestStep::VitEncode => OpKind::VitEncode,
+                ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
+                ImageIngestStep::VitEncode => OperationType::EncodeVision,
             },
-            Phase::Prefill if self.can_prefill_decode_lookahead(id) => OpKind::DecodeUnd,
-            Phase::Prefill => OpKind::PrefillUnd,
-            Phase::DecodeUnd => OpKind::DecodeUnd,
-            Phase::DenoiseGen => OpKind::DenoiseGen,
-            Phase::CommitGen => OpKind::CommitGen,
-            Phase::CommitWriteback => OpKind::CommitWriteback,
+            Phase::Prefill => OperationType::SequenceExtend,
+            Phase::DecodeUnd => OperationType::SequenceDecode,
+            Phase::DenoiseGen => OperationType::Flow,
+            Phase::CommitGen => OperationType::MaterializeImage,
+            Phase::CommitWriteback => OperationType::TransferKv,
             Phase::FeedbackIngest => {
                 let feedback = st.req.policy.feedback.as_ref()?;
                 let uniserve_core::FeedbackWriteback::Reingest { ingest } = &feedback.writeback
@@ -3227,8 +3081,8 @@ impl Scheduler {
                     return None;
                 };
                 match ingest.steps.get(st.feedback.ingest_step)? {
-                    ImageIngestStep::VaeEncode => OpKind::VaeEncode,
-                    ImageIngestStep::VitEncode => OpKind::VitEncode,
+                    ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
+                    ImageIngestStep::VitEncode => OperationType::EncodeVision,
                 }
             }
         })
@@ -3337,7 +3191,7 @@ impl Scheduler {
             }
         }
         if !free_encoder_handles.is_empty() {
-            self.gated_control(ControlOp::FreeEncoder(free_encoder_handles));
+            self.gated_control(ControlOp::ReleaseProducts(free_encoder_handles));
         }
         self.bm.release(victim);
         // a preempted request is re-queued and re-admitted (which re-issues
@@ -3345,7 +3199,7 @@ impl Scheduler {
         self.ledger.release_request(victim);
         if let Err(error) = self
             .executor
-            .control_wait(ControlOp::DropRequest(victim), None)
+            .control_wait(ControlOp::DropSession(victim), None)
         {
             tracing::warn!(
                 request_id = victim.0,
@@ -3364,6 +3218,7 @@ impl Scheduler {
         st.cursor = GenerationCursor::new(Phase::Prefill, worstcase_blocks, reserve_worstcase);
         st.epoch = self.next_epoch;
         st.version = 0;
+        st.admission_digest = None;
         self.next_epoch = self.next_epoch.saturating_add(1);
         st.replay.generated_ids = generated_ids;
         st.replay.recompute_ids = Some(recompute);
@@ -3395,7 +3250,7 @@ impl Scheduler {
 
     fn submit_batch(
         &mut self,
-        new_reqs: Vec<NewRequestData>,
+        admissions: Vec<Admission>,
         mut transitions: Vec<PlannedTransition>,
     ) {
         let _span =
@@ -3408,8 +3263,15 @@ impl Scheduler {
         for transition in &mut transitions {
             let oid = self.next_op_id;
             self.next_op_id += 1;
-            let request_id = transition.op.req_id;
-            let Some(state) = self.running.get(&request_id) else {
+            let request_id = transition.op.session_id;
+            let Some((epoch, version, admission_digest)) =
+                self.running.get(&request_id).and_then(|state| {
+                    state
+                        .admission_digest
+                        .as_ref()
+                        .map(|digest| (state.epoch, state.version, digest.clone()))
+                })
+            else {
                 tracing::error!(
                     request_id = request_id.0,
                     "planned operation lost its session"
@@ -3417,19 +3279,25 @@ impl Scheduler {
                 self.fatal = true;
                 return;
             };
-            let projected_base = state.version.saturating_add(
-                self.inflight_ops
-                    .get(&request_id)
-                    .map_or(0, |operations| operations.len()) as u64,
-            );
-            transition.assign_envelope(state.epoch, oid, projected_base);
-            let opk = opkind_str(transition.op.kind);
+            if self.has_inflight(request_id) {
+                tracing::error!(
+                    request_id = request_id.0,
+                    "scheduler attempted to issue a successor before the current lease was terminal"
+                );
+                self.fatal = true;
+                return;
+            }
+            transition.op.admission_digest = admission_digest;
+            transition.op.model_spec_digest = self.caps.model_spec_digest.clone();
+            transition.op.weight_digest = self.caps.weight_digest.clone();
+            transition.assign_envelope(epoch, oid, version);
+            let operation_type = operation_type_str(transition.operation_type);
             self.register_inflight(transition.clone(), submit_at);
             if let Some(st) = self.running.get_mut(&request_id) {
                 let mut ev =
                     crate::trace::TraceEvent::at(crate::trace::TraceEventKind::OpSubmitted);
                 ev.op_id = Some(oid);
-                ev.op_kind = Some(opk);
+                ev.op_kind = Some(operation_type);
                 ev.step_id = step;
                 st.trace.push(ev);
             }
@@ -3456,53 +3324,54 @@ impl Scheduler {
             .kv_cache
             .free_blocks
             .store(self.bm.free_blocks(), Ordering::Relaxed);
-        let mixed = transitions
-            .first()
-            .is_some_and(|first| transitions.iter().any(|op| op.kind != first.kind));
-        let op_kinds: Vec<&'static str> =
-            transitions.iter().map(|op| opkind_str(op.kind)).collect();
-        let req_ids: Vec<u64> = transitions.iter().map(|op| op.req_id.0).collect();
+        let mixed = transitions.first().is_some_and(|first| {
+            transitions
+                .iter()
+                .any(|operation| operation.operation_type != first.operation_type)
+        });
+        let operation_types: Vec<&'static str> = transitions
+            .iter()
+            .map(|operation| operation_type_str(operation.operation_type))
+            .collect();
+        let req_ids: Vec<u64> = transitions
+            .iter()
+            .map(|operation| operation.op.session_id.0)
+            .collect();
         let trace_ops: Vec<_> = transitions
             .iter()
-            .map(|op| {
-                let phase = self.running.get(&op.req_id).map(|st| phase_str(st.lifecycle.phase));
+            .map(|transition| {
+                let operation = &transition.op;
+                let phase = self
+                    .running
+                    .get(&operation.session_id)
+                    .map(|state| phase_str(state.lifecycle.phase));
                 json!({
-                    "request_id": op.req_id.0,
-                    "op_id": op.op_id,
-                    "op_kind": opkind_str(op.kind),
+                    "request_id": operation.session_id.0,
+                    "op_id": operation.op_id,
+                    "operation_type": operation_type_str(transition.operation_type),
                     "phase": phase,
-                    "modality": format!("{:?}", op.modality),
-                    "pos_range": op.pos_range,
-                    "token_ids_len": op.token_ids.as_ref().map(|ids| ids.len()).unwrap_or(0),
-                    "token_source": format!("{:?}", op.token_source),
-                    "spec_token_ids_len": op.spec_token_ids.as_ref().map(|ids| ids.len()).unwrap_or(0),
-                    "new_block_ids_len": op.new_block_ids.len(),
-                    "token_cost": planned_op_token_cost(op),
-                    "timestep_idx": op.timestep_idx,
-                    "denoise_step_count": op.denoise_step_count,
-                    "decode_token_count": op.decode_token_count,
-                    "decode_stop_token_ids_len": op.decode_stop_token_ids.as_ref().map(|ids| ids.len()).unwrap_or(0),
-                    "decode_stop_terminal": op.decode_stop_terminal,
-                    "cond_pos": op.cond_pos,
-                    "image_in": op.image_in,
-                    "mm_hash": op.mm_hash,
-                    "transition": op.delta.as_str(),
+                    "operation": operation_trace(operation),
+                    "token_cost": planned_op_token_cost(transition),
+                    "transition": transition.delta.as_str(),
                     "resources": {
-                        "new_blocks": op.resources.new_blocks,
-                        "kv_target_tokens": op.resources.kv_target_tokens,
-                        "scratch_units": op.resources.scratch_units,
-                        "latent_units": op.resources.latent_units,
-                        "encoder_pins": op.resources.encoder_pins,
-                        "replayability_after_apply": op.resources.replayability_after_apply.as_str(),
+                        "new_blocks": transition.resources.new_blocks,
+                        "kv_target_tokens": transition.resources.kv_target_tokens,
+                        "scratch_tokens": transition.resources.host_scratch_tokens,
+                        "latent_units": transition.resources.latent_units,
+                        "encoder_pins": transition.resources.encoder_pins,
+                        "replayability_after_apply": transition.resources.replayability_after_apply.as_str(),
                     },
                     "visibility": {
-                        "und_tokens": format!("{:?}", op.visibility.und_tokens),
-                        "generated_image": op.visibility.generated_image,
+                        "und_tokens": format!("{:?}", transition.visibility.und_tokens),
+                        "generated_image": transition.visibility.generated_image,
                     },
                 })
             })
             .collect();
-        let new_req_ids: Vec<u64> = new_reqs.iter().map(|req| req.req_id.0).collect();
+        let admitted_session_ids: Vec<u64> = admissions
+            .iter()
+            .map(|admission| admission.session_id.0)
+            .collect();
         self.batch_started.insert(step, submit_at);
         self.trace_record(json!({
             "event": "batch_submitted",
@@ -3510,9 +3379,9 @@ impl Scheduler {
             "step_id": step,
             "batch_size": transitions.len(),
             "mixed": mixed,
-            "op_kinds": op_kinds.clone(),
+            "operation_types": operation_types.clone(),
             "request_ids": req_ids.clone(),
-            "new_request_ids": new_req_ids,
+            "admitted_session_ids": admitted_session_ids,
             "ops": trace_ops,
             "scheduler": {
                 "policy": policy_str(self.config.policy),
@@ -3531,7 +3400,7 @@ impl Scheduler {
         if mixed {
             tracing::debug!(
                 step_id = self.step_id,
-                ?op_kinds,
+                ?operation_types,
                 ?req_ids,
                 "submitting mixed forward batch"
             );
@@ -3540,11 +3409,12 @@ impl Scheduler {
             .iter()
             .map(|transition| transition.op.clone())
             .collect();
-        let batch = ForwardBatch::new(self.step_id, new_reqs, wire_ops);
+        let batch = Batch::new(self.step_id, admissions, wire_ops);
         let spec_draft_counts: Vec<usize> = batch
-            .ops
+            .operations
             .iter()
-            .filter_map(|op| op.spec_token_ids.as_ref().map(Vec::len))
+            .map(operation_draft_tokens)
+            .map(|tokens| tokens.len())
             .filter(|count| *count > 0)
             .collect();
         if let Err(e) = self.executor.submit(batch) {
@@ -3701,13 +3571,6 @@ impl Scheduler {
             return None;
         }
         let phase = self.running.get(&id)?.lifecycle.phase;
-        // Final-prefill-in-flight requests build their first decode op early
-        // (cross-boundary lookahead); the committed phase advances at resolve.
-        let phase = if phase == Phase::Prefill && self.can_prefill_decode_lookahead(id) {
-            Phase::DecodeUnd
-        } else {
-            phase
-        };
         match phase {
             Phase::Encode => None,
             Phase::Prefill => {
@@ -3749,39 +3612,25 @@ impl Scheduler {
             }
             Phase::DecodeUnd => {
                 let st = self.running.get(&id)?;
-                let prefill_lookahead = st.lifecycle.phase == Phase::Prefill;
-                let lookahead_depth = self.inflight_decode_count(id);
-                let use_last_sampled = lookahead_depth > 0 || prefill_lookahead;
-                if use_last_sampled
-                    && !self.can_decode_lookahead(id)
-                    && !self.can_prefill_decode_lookahead(id)
-                {
-                    return None;
-                }
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
-                let tok = if use_last_sampled {
-                    0
-                } else {
-                    st.und.next_token
-                };
+                let tok = st.und.next_token;
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
                 let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) =
                     self.decode_burst_plan(id, pos as usize, budget, allowed.as_deref());
-                let spec_token_ids =
-                    if !use_last_sampled && budget > 1 && self.supports_spec_decode() {
-                        self.running.get(&id).and_then(|st| {
-                            self.spec_decode.draft_tokens(
-                                st,
-                                tok,
-                                allowed.as_deref(),
-                                suppress.as_deref(),
-                            )
-                        })
-                    } else {
-                        None
-                    };
+                let spec_token_ids = if budget > 1 && self.supports_spec_decode() {
+                    self.running.get(&id).and_then(|st| {
+                        self.spec_decode.draft_tokens(
+                            st,
+                            tok,
+                            allowed.as_deref(),
+                            suppress.as_deref(),
+                        )
+                    })
+                } else {
+                    None
+                };
                 let spec_len = spec_token_ids.as_ref().map_or(0, Vec::len);
                 let decode_len = if spec_len == 0 {
                     decode_token_count.max(1) as usize
@@ -3800,11 +3649,7 @@ impl Scheduler {
                     TransitionIntent::DecodeUnd {
                         position: pos,
                         token_id: tok,
-                        token_source: if use_last_sampled {
-                            TokenSource::LastSampled
-                        } else {
-                            TokenSource::Wire
-                        },
+                        token_source: TokenSource::Wire,
                         new_blocks,
                         spec_token_ids,
                         token_count: decode_len as u16,
@@ -3833,10 +3678,10 @@ impl Scheduler {
                 let denoise_step_count = self.denoise_step_burst.max(1).min(remaining);
                 let cfg = cfg_params(&st.req.image, cfg_branch_count(&st.req.image));
                 let latent_units = self.worker_image_latent_units_for(st).max(1);
-                let scratch_units = u64::from(cfg.branch_count);
                 let host_scratch_tokens = self.denoise_host_scratch_tokens(st);
                 let image_prompt = Self::image_prompt_for(st);
                 let image_id = st.image_gen.image_id;
+                let conditioning = st.image_gen.conditioning.clone();
                 let projection = self.projected_cursor(id)?;
                 self.plan_intent(
                     id,
@@ -3849,8 +3694,8 @@ impl Scheduler {
                         cfg,
                         image_prompt,
                         latent_units,
-                        scratch_units,
                         host_scratch_tokens,
+                        conditioning,
                     },
                 )
             }
@@ -4184,28 +4029,28 @@ impl Scheduler {
     fn resolve_spec_decode_text(
         &mut self,
         id: RequestId,
-        sr: uniserve_worker_wire::SeqResult,
+        effect: SequenceEffect,
         draft_token_ids: Vec<u32>,
     ) {
         self.bm.activate(id);
-        let accepted = (sr.num_accepted_tokens.unwrap_or(0) as usize).min(draft_token_ids.len());
-        let sampled = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
+        let accepted =
+            (effect.accepted_draft_tokens.unwrap_or(0) as usize).min(draft_token_ids.len());
+        if effect.sampled_token_ids.len() != accepted.saturating_add(1)
+            || effect.sampled_token_ids[..accepted] != draft_token_ids[..accepted]
+        {
+            return self.finish(id, FinishReason::Error);
+        }
         if let Some(st) = self.running.get_mut(&id) {
             st.lifecycle.phase = Phase::DecodeUnd;
         }
-        let mut outputs: Vec<(u32, Option<f32>, bool)> = draft_token_ids
-            .iter()
-            .take(accepted)
-            .map(|token| (*token, None, false))
-            .collect();
-        outputs.push((sampled, sr.sampled_logprob, true));
-
-        for (tok, logprob, is_sampled) in outputs {
+        for (index, tok) in effect.sampled_token_ids.iter().copied().enumerate() {
+            let is_sampled = index == accepted;
+            let logprob = is_sampled.then_some(effect.sampled_logprob).flatten();
             let Some(st) = self.running.get_mut(&id) else {
                 return;
             };
             st.und.tokens_emitted += 1;
-            let top_logprobs = is_sampled.then(|| sr.top_logprobs.clone()).flatten();
+            let top_logprobs = is_sampled.then(|| effect.top_logprobs.clone());
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_sampled) {
                 return;
             }
@@ -4218,7 +4063,7 @@ impl Scheduler {
         }
     }
 
-    fn resolve_decode_text(&mut self, id: RequestId, sr: uniserve_worker_wire::SeqResult) {
+    fn resolve_decode_text(&mut self, id: RequestId, effect: SequenceEffect) {
         self.bm.activate(id);
         if self
             .running
@@ -4235,18 +4080,15 @@ impl Scheduler {
             }
             return self.close_context_round(id, close_token);
         }
-        let burst_result = sr
-            .sampled_token_ids
-            .as_ref()
-            .is_some_and(|ids| !ids.is_empty());
-        let tokens = sr
-            .sampled_token_ids
-            .clone()
-            .filter(|ids| !ids.is_empty())
-            .unwrap_or_else(|| vec![sr.sampled_token_id.unwrap_or(self.ctrl.eos[0])]);
+        let burst_result = effect.sampled_token_ids.len() > 1;
+        let tokens = if effect.sampled_token_ids.is_empty() {
+            vec![self.ctrl.eos[0]]
+        } else {
+            effect.sampled_token_ids.clone()
+        };
         for (idx, tok) in tokens.iter().copied().enumerate() {
             let is_last = idx + 1 == tokens.len();
-            let logprob = is_last.then_some(sr.sampled_logprob).flatten();
+            let logprob = is_last.then_some(effect.sampled_logprob).flatten();
             let is_round_close = self
                 .running
                 .get(&id)
@@ -4283,7 +4125,7 @@ impl Scheduler {
                 self.begin_image(id);
                 return;
             }
-            let top_logprobs = is_last.then(|| sr.top_logprobs.clone()).flatten();
+            let top_logprobs = is_last.then(|| effect.top_logprobs.clone());
             if self.emit_or_finish_und_token(id, tok, logprob, top_logprobs, is_last) {
                 return;
             }
@@ -4312,59 +4154,60 @@ impl Scheduler {
         &mut self,
         id: RequestId,
         transition: PlannedTransition,
-        mut sr: uniserve_worker_wire::SeqResult,
+        operation_result: OperationResult,
         draft_token_ids: Vec<u32>,
     ) {
-        let kind = transition.kind;
-        if let Some(positions) = sr.prompt_logprobs.take() {
+        let operation_type = transition.operation_type;
+        let mut sequence_effect = operation_result_sequence_effect(&operation_result)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(conditioning) = sequence_effect.published_kv.clone()
+            && let Some(state) = self.running.get_mut(&id)
+        {
+            state.image_gen.conditioning = Some(conditioning);
+        }
+        if !sequence_effect.prompt_logprobs.is_empty() {
+            let positions = std::mem::take(&mut sequence_effect.prompt_logprobs);
             self.resolve_prompt_logprobs(id, positions);
         }
-        if kind == OpKind::DecodeUnd && !draft_token_ids.is_empty() {
-            return self.resolve_spec_decode_text(id, sr, draft_token_ids);
+        if operation_type == OperationType::SequenceVerify && !draft_token_ids.is_empty() {
+            return self.resolve_spec_decode_text(id, sequence_effect, draft_token_ids);
         }
-        if kind == OpKind::DecodeUnd {
-            return self.resolve_decode_text(id, sr);
+        if operation_type == OperationType::SequenceDecode {
+            return self.resolve_decode_text(id, sequence_effect);
         }
-        match kind {
-            OpKind::PrefillUnd | OpKind::DecodeUnd => {
+        match operation_type {
+            OperationType::SequenceExtend => {
                 self.bm.activate(id);
                 // chunked prefill: a prefill op may only have consumed part of
                 // the prompt; if so, advance the cursor and stay in Prefill.
-                if kind == OpKind::PrefillUnd {
-                    let (cursor, prompt_len) = {
-                        let st = self.running.get(&id).unwrap();
-                        (
-                            st.ingest.prompt_cursor as usize,
-                            st.effective_prompt().len(),
-                        )
-                    };
-                    if cursor < prompt_len {
-                        return; // still prefilling; ignore the (partial) sampled token
-                    }
-                    if self.running.get(&id).is_some_and(|st| {
-                        st.ingest.mm_cursor < st.context.images.len()
-                            || st.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
-                    }) {
-                        return;
-                    }
+                let (cursor, prompt_len) = {
+                    let st = self.running.get(&id).unwrap();
+                    (
+                        st.ingest.prompt_cursor as usize,
+                        st.effective_prompt().len(),
+                    )
+                };
+                if cursor < prompt_len {
+                    return;
+                }
+                if self.running.get(&id).is_some_and(|st| {
+                    st.ingest.mm_cursor < st.context.images.len()
+                        || st.ingest.prompt_cursor < st.context.prompt_ids.len() as u32
+                }) {
+                    return;
                 }
                 let (starts_gen_after_context, can_open_gen_branch) = {
                     let st = self.running.get_mut(&id).unwrap();
-                    if kind == OpKind::PrefillUnd {
-                        // prompt (possibly prompt++generated on recompute) is done.
-                        // recompute finished: future growth is plain decode again.
-                        st.replay.recompute_ids = None;
-                    }
+                    st.replay.recompute_ids = None;
                     st.und.tokens_emitted += 1;
                     (st.starts_gen_after_context(), st.can_open_gen_branch())
                 };
-                if kind == OpKind::PrefillUnd
-                    && self.running.get(&id).is_some_and(|state| {
-                        state.req.sampling.prompt_logprobs_requested()
-                            && state.ingest.prompt_logprobs_emitted
-                                != state.context.prompt_ids.len().saturating_sub(1)
-                    })
-                {
+                if self.running.get(&id).is_some_and(|state| {
+                    state.req.sampling.prompt_logprobs_requested()
+                        && state.ingest.prompt_logprobs_emitted
+                            != state.context.prompt_ids.len().saturating_sub(1)
+                }) {
                     tracing::error!(
                         request_id = id.0,
                         "prompt logprob scoring ended before every prompt position was resolved"
@@ -4373,25 +4216,27 @@ impl Scheduler {
                 }
                 // the prompt is fully prefilled now — publish its full
                 // blocks to the prefix cache for later requests to reuse.
-                if kind == OpKind::PrefillUnd {
-                    let bs = self.caps.block_size as usize;
-                    if let Some(st) = self.running.get_mut(&id) {
-                        self.prefix_cache.cache_blocks(st, &mut self.bm, bs);
-                    }
+                let bs = self.caps.block_size as usize;
+                if let Some(st) = self.running.get_mut(&id) {
+                    self.prefix_cache.cache_blocks(st, &mut self.bm, bs);
                 }
                 // A dialect-lowered prefix may already end at a branch trigger.
                 // Treat that boundary exactly like a sampled trigger.
-                if kind == OpKind::PrefillUnd && self.prefilled_gen_trigger(id) {
+                if self.prefilled_gen_trigger(id) {
                     self.begin_image(id);
                     return;
                 }
                 // Immediate Gen-only profiles skip Und decode after context prep.
-                if starts_gen_after_context && kind == OpKind::PrefillUnd {
+                if starts_gen_after_context {
                     self.begin_image(id);
                     return;
                 }
-                let tok = sr.sampled_token_id.unwrap_or(self.ctrl.eos[0]);
-                let logprob = sr.sampled_logprob;
+                let tok = sequence_effect
+                    .sampled_token_ids
+                    .last()
+                    .copied()
+                    .unwrap_or(self.ctrl.eos[0]);
+                let logprob = sequence_effect.sampled_logprob;
                 let (images_done, max_images) = {
                     let st = self.running.get(&id).unwrap();
                     (st.image_gen.images_done, st.req.image.max_images as usize)
@@ -4406,7 +4251,13 @@ impl Scheduler {
                     self.begin_image(id);
                     return;
                 }
-                if self.emit_or_finish_und_token(id, tok, logprob, sr.top_logprobs.clone(), true) {
+                if self.emit_or_finish_und_token(
+                    id,
+                    tok,
+                    logprob,
+                    Some(sequence_effect.top_logprobs.clone()),
+                    true,
+                ) {
                     return;
                 }
                 if let Some(st) = self.running.get_mut(&id) {
@@ -4426,7 +4277,7 @@ impl Scheduler {
                     self.begin_image(id);
                 }
             }
-            OpKind::DenoiseGen => {
+            OperationType::Flow => {
                 let (image_id, h, w, steps, prev_sd) = {
                     let st = self.running.get_mut(&id).unwrap();
                     let prev = match transition.delta {
@@ -4462,31 +4313,43 @@ impl Scheduler {
                 for step in prev_sd.saturating_add(1)..=sd {
                     self.emit(id, GenEvent::ImageStep { image_id, step });
                 }
-                if sr.denoise_done
+                if operation_flow_delta(&operation_result).is_some_and(|delta| delta.done)
                     && let Some(st) = self.running.get_mut(&id)
                 {
                     st.lifecycle.phase = Phase::CommitGen;
                 }
             }
-            OpKind::CommitGen | OpKind::CommitWriteback => {
-                if kind == OpKind::CommitWriteback
+            OperationType::MaterializeImage | OperationType::TransferKv => {
+                if operation_type == OperationType::TransferKv
                     && let Some(st) = self.running.get_mut(&id)
                 {
-                    sr.sampled_token_id = sr.sampled_token_id.or(st.feedback.sampled_token.take());
-                    sr.sampled_logprob = sr.sampled_logprob.or(st.feedback.sampled_logprob.take());
-                    sr.top_logprobs = sr.top_logprobs.or(st.feedback.top_logprobs.take());
+                    if sequence_effect.sampled_token_ids.is_empty()
+                        && let Some(token) = st.feedback.sampled_token.take()
+                    {
+                        sequence_effect.sampled_token_ids.push(token);
+                    }
+                    sequence_effect.sampled_logprob = sequence_effect
+                        .sampled_logprob
+                        .or(st.feedback.sampled_logprob.take());
+                    if sequence_effect.top_logprobs.is_empty()
+                        && let Some(top_logprobs) = st.feedback.top_logprobs.take()
+                    {
+                        sequence_effect.top_logprobs = top_logprobs;
+                    }
                 }
-                if kind == OpKind::CommitGen {
+                if operation_type == OperationType::MaterializeImage {
                     let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
                     self.emit(id, GenEvent::ImageCommit { image_id });
                 }
-                if kind == OpKind::CommitGen
+                let image = operation_image(&operation_result).cloned();
+                if operation_type == OperationType::MaterializeImage
                     && self
                         .running
                         .get(&id)
                         .is_some_and(Self::reingests_generated_image)
                 {
-                    let Some(image_b64) = sr.image_png_b64 else {
+                    let Some(image_b64) = image.as_ref().map(|image| image.png_base64.clone())
+                    else {
                         return self.finish(id, FinishReason::Error);
                     };
                     let image_id = self.running.get(&id).map_or(0, |st| st.image_gen.image_id);
@@ -4502,23 +4365,28 @@ impl Scheduler {
                     }
                     return;
                 }
-                if kind == OpKind::CommitGen
+                if operation_type == OperationType::MaterializeImage
                     && self
                         .running
                         .get(&id)
                         .is_some_and(Self::commit_requires_writeback)
                 {
-                    let Some(locator) = sr.locator.clone().filter(|value| !value.is_empty()) else {
+                    let Some(locator) = operation_result_locator(&operation_result)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                    else {
                         return self.finish(id, FinishReason::Error);
                     };
                     if let Some(st) = self.running.get_mut(&id) {
                         st.feedback.locator = Some(locator);
-                        st.feedback.sampled_token = sr.sampled_token_id;
-                        st.feedback.sampled_logprob = sr.sampled_logprob;
-                        st.feedback.top_logprobs = sr.top_logprobs;
+                        st.feedback.sampled_token =
+                            sequence_effect.sampled_token_ids.last().copied();
+                        st.feedback.sampled_logprob = sequence_effect.sampled_logprob;
+                        st.feedback.top_logprobs = (!sequence_effect.top_logprobs.is_empty())
+                            .then(|| sequence_effect.top_logprobs.clone());
                         st.lifecycle.phase = Phase::CommitWriteback;
                     }
-                    if let Some(b64) = sr.image_png_b64 {
+                    if let Some(b64) = image.map(|image| image.png_base64) {
                         let image_id = self
                             .running
                             .get(&id)
@@ -4536,7 +4404,7 @@ impl Scheduler {
                     let st = self.running.get(&id).unwrap();
                     (st.image_gen.image_id, st.continues_after_gen_commit())
                 };
-                if let Some(b64) = sr.image_png_b64 {
+                if let Some(b64) = image.map(|image| image.png_base64) {
                     let Some(event) = image_done_event(image_id, b64) else {
                         return self.finish(id, FinishReason::Error);
                     };
@@ -4551,7 +4419,7 @@ impl Scheduler {
                 // happens in DecodeUnd on a genuine terminal condition (EOS or
                 // max_tokens) or from a commit-side EOS reported by the worker.
                 if continues_after_gen_commit {
-                    if let Some(tok) = sr.sampled_token_id {
+                    if let Some(tok) = sequence_effect.sampled_token_ids.last().copied() {
                         let (can_open_gen_branch, images_done, max_images) = {
                             let st = self.running.get_mut(&id).unwrap();
                             st.und.tokens_emitted += 1;
@@ -4574,8 +4442,8 @@ impl Scheduler {
                         if self.emit_or_finish_und_token(
                             id,
                             tok,
-                            sr.sampled_logprob,
-                            sr.top_logprobs.clone(),
+                            sequence_effect.sampled_logprob,
+                            Some(sequence_effect.top_logprobs.clone()),
                             true,
                         ) {
                             return;
@@ -4611,17 +4479,20 @@ impl Scheduler {
                     self.finish(id, FinishReason::ImageDone);
                 }
             }
-            OpKind::VitEncode | OpKind::VaeEncode => match &transition.delta {
+            OperationType::EncodeVision | OperationType::EncodeLatent => match &transition.delta {
                 crate::generation::TransitionDelta::IngestImageStep {
                     is_final_step,
                     encoder_cache_key,
                     cache_hit,
                     ..
                 } => {
-                    let Some(result_handle) = sr.encoder_handle.filter(|handle| *handle != 0)
-                    else {
+                    let Some(encode) = operation_encode_delta(&operation_result) else {
                         return self.finish(id, FinishReason::Error);
                     };
+                    let result_handle = encode.product_handle;
+                    if result_handle == 0 {
+                        return self.finish(id, FinishReason::Error);
+                    }
                     let mut active_handle = result_handle;
                     let mut free_handles = Vec::new();
                     if !cache_hit {
@@ -4629,7 +4500,7 @@ impl Scheduler {
                             if let Some(freed) = self.enc_cache.insert_output(
                                 *cache_key,
                                 result_handle,
-                                sr.num_tokens.unwrap_or_default(),
+                                encode.kv_tokens,
                             ) {
                                 free_handles.push(freed);
                             }
@@ -4649,7 +4520,7 @@ impl Scheduler {
                     }
                     let bos = self.ctrl.bos;
                     if let Some(st) = self.running.get_mut(&id) {
-                        if let Some((height, width)) = sr.image_hw {
+                        if let Some((height, width)) = encode.image_size {
                             st.image_gen.image_hw = (height, width);
                             st.req.image.height = height;
                             st.req.image.width = width;
@@ -4669,13 +4540,15 @@ impl Scheduler {
                         }
                     }
                     if !free_handles.is_empty() {
-                        self.gated_control(ControlOp::FreeEncoder(free_handles));
+                        self.gated_control(ControlOp::ReleaseProducts(free_handles));
                     }
                 }
                 crate::generation::TransitionDelta::FeedbackIngestStep {
                     is_final_step, ..
                 } => {
-                    let Some(handle) = sr.encoder_handle.filter(|handle| *handle != 0) else {
+                    let Some(handle) =
+                        operation_encode_handle(&operation_result).filter(|handle| *handle != 0)
+                    else {
                         return self.finish(id, FinishReason::Error);
                     };
                     let mut free_handles = Vec::new();
@@ -4689,7 +4562,7 @@ impl Scheduler {
                         }
                     }
                     if !free_handles.is_empty() {
-                        self.gated_control(ControlOp::FreeEncoder(free_handles));
+                        self.gated_control(ControlOp::ReleaseProducts(free_handles));
                     }
                     if !is_final_step {
                         return;
@@ -4707,7 +4580,11 @@ impl Scheduler {
                 }
                 _ => self.finish(id, FinishReason::Error),
             },
-            _ => {}
+            OperationType::SequenceDecode
+            | OperationType::SequenceVerify
+            | OperationType::SequenceSample
+            | OperationType::MaterializeFrame
+            | OperationType::TransferProduct => {}
         }
     }
 
@@ -4971,7 +4848,7 @@ impl Scheduler {
                 }
             }
             if !free_encoder_handles.is_empty() {
-                self.gated_control(ControlOp::FreeEncoder(free_encoder_handles));
+                self.gated_control(ControlOp::ReleaseProducts(free_encoder_handles));
             }
             // close + archive the lifecycle trace (reconstructable post-finish).
             let mut ev = crate::trace::TraceEvent::at(crate::trace::TraceEventKind::Finished);
@@ -5003,7 +4880,7 @@ impl Scheduler {
         // release every lease this request held and assert it leaked none.
         self.ledger.release_request(id);
         self.ledger.assert_released(id);
-        let _ = self.executor.control(ControlOp::DropRequest(id));
+        let _ = self.executor.control(ControlOp::DropSession(id));
     }
 
     /// Clear the encoder cache (`/reset_encoder_cache` / `/reset_mm_cache`)
@@ -5011,7 +4888,7 @@ impl Scheduler {
     fn reset_encoder_cache(&mut self) {
         let freed = self.enc_cache.clear();
         if !freed.is_empty() {
-            self.gated_control(ControlOp::FreeEncoder(freed));
+            self.gated_control(ControlOp::ReleaseProducts(freed));
         }
     }
 
@@ -5075,15 +4952,22 @@ fn ceil_div_u64(value: u64, divisor: u64) -> u64 {
 
 /// Tokens a single op contributes toward the per-step scheduling budget.
 /// Prefill contributes its chunk width; decode one; image ops a nominal one.
-fn op_token_cost(op: &ForwardOp) -> usize {
-    match op.kind {
-        OpKind::PrefillUnd => (op.pos_range.1 - op.pos_range.0) as usize,
-        OpKind::DecodeUnd => {
-            op.decode_token_count.unwrap_or(1).max(1) as usize
-                + op.spec_token_ids.as_ref().map_or(0, Vec::len)
-        }
-        OpKind::DenoiseGen => op.denoise_step_count.unwrap_or(1).max(1) as usize,
-        _ => 1,
+fn op_token_cost(envelope: &OperationEnvelope) -> usize {
+    match &envelope.operation {
+        Operation::Sequence(sequence) => match &sequence.input {
+            SequenceInput::Tokens(input) => match sequence.mode {
+                SequenceMode::Extend => {
+                    sequence.position.1.saturating_sub(sequence.position.0) as usize
+                }
+                SequenceMode::Decode | SequenceMode::Verify => {
+                    usize::from(input.burst_tokens.max(1)) + input.draft_token_ids.len()
+                }
+                SequenceMode::Sample => 1,
+            },
+            SequenceInput::PublishedLogits(_) => 1,
+        },
+        Operation::Flow(flow) => usize::from(flow.step_count.max(1)),
+        Operation::Encode(_) | Operation::Materialize(_) | Operation::Transfer(_) => 1,
     }
 }
 
@@ -5092,31 +4976,155 @@ fn op_token_cost(op: &ForwardOp) -> usize {
 /// timestep, so its cost must use the compiled latent geometry rather than the
 /// scalar wire-op count.
 fn planned_op_token_cost(transition: &PlannedTransition) -> usize {
-    if transition.kind != OpKind::DenoiseGen {
+    let Operation::Flow(flow) = &transition.op.operation else {
         return op_token_cost(&transition.op);
-    }
+    };
     let latent_tokens = usize::try_from(transition.resources.latent_units)
         .unwrap_or(usize::MAX)
         .max(1);
-    let cfg_branches = transition
-        .cfg
-        .as_ref()
-        .map_or(1, |cfg| usize::from(cfg.branch_count.max(1)));
-    let timesteps = usize::from(transition.denoise_step_count.unwrap_or(1).max(1));
+    let cfg_branches = usize::from(flow.guidance.branch_count.max(1));
+    let timesteps = usize::from(flow.step_count.max(1));
     latent_tokens
         .saturating_mul(cfg_branches)
         .saturating_mul(timesteps)
 }
 
-fn decode_lookahead_from_env() -> bool {
-    env::var(DECODE_LOOKAHEAD_ENV)
-        .map(|raw| {
-            !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+fn operation_draft_tokens(envelope: &OperationEnvelope) -> Vec<u32> {
+    let Operation::Sequence(sequence) = &envelope.operation else {
+        return Vec::new();
+    };
+    let SequenceInput::Tokens(input) = &sequence.input else {
+        return Vec::new();
+    };
+    input.draft_token_ids.clone()
+}
+
+fn take_operation_new_blocks(envelope: &mut OperationEnvelope) -> Vec<BlockId> {
+    match &mut envelope.operation {
+        Operation::Sequence(operation) => std::mem::take(&mut operation.lease.new_blocks),
+        Operation::Encode(operation) => std::mem::take(&mut operation.lease.new_blocks),
+        Operation::Materialize(operation) => std::mem::take(&mut operation.lease.new_blocks),
+        Operation::Transfer(operation) => std::mem::take(&mut operation.lease.new_blocks),
+        Operation::Flow(_) => Vec::new(),
+    }
+}
+
+fn operation_result_sequence_effect(result: &OperationResult) -> Option<&SequenceEffect> {
+    match &result.delta {
+        ResultDelta::Sequence(delta) => Some(&delta.effect),
+        ResultDelta::Materialize(delta) => delta.sequence.as_ref(),
+        ResultDelta::Transfer(delta) => delta.sequence.as_ref(),
+        ResultDelta::Flow(_) | ResultDelta::Encode(_) => None,
+    }
+}
+
+fn operation_flow_delta(result: &OperationResult) -> Option<&uniserve_worker_wire::FlowDelta> {
+    let ResultDelta::Flow(delta) = &result.delta else {
+        return None;
+    };
+    Some(delta)
+}
+
+fn operation_encode_delta(result: &OperationResult) -> Option<&uniserve_worker_wire::EncodeDelta> {
+    let ResultDelta::Encode(delta) = &result.delta else {
+        return None;
+    };
+    Some(delta)
+}
+
+fn operation_encode_handle(result: &OperationResult) -> Option<u64> {
+    operation_encode_delta(result).map(|delta| delta.product_handle)
+}
+
+fn operation_image(result: &OperationResult) -> Option<&uniserve_worker_wire::ImageArtifact> {
+    let ResultDelta::Materialize(delta) = &result.delta else {
+        return None;
+    };
+    let uniserve_worker_wire::MaterializedProduct::Image(image) = &delta.product else {
+        return None;
+    };
+    Some(image)
+}
+
+fn operation_result_locator(result: &OperationResult) -> Option<&str> {
+    match &result.delta {
+        ResultDelta::Materialize(delta) => match &delta.product {
+            uniserve_worker_wire::MaterializedProduct::Image(image) => Some(image.locator.as_str()),
+            uniserve_worker_wire::MaterializedProduct::Published(product) => {
+                Some(product.locator.as_str())
+            }
+            uniserve_worker_wire::MaterializedProduct::Frame { .. } => None,
+        },
+        ResultDelta::Transfer(delta) => delta
+            .product
+            .as_ref()
+            .map(|product| product.locator.as_str()),
+        ResultDelta::Sequence(_) | ResultDelta::Flow(_) | ResultDelta::Encode(_) => None,
+    }
+}
+
+fn operation_result_kv_tokens(result: &OperationResult) -> Option<u32> {
+    match &result.delta {
+        ResultDelta::Sequence(delta) => delta.effect.kv_tokens,
+        ResultDelta::Encode(delta) => Some(delta.kv_tokens),
+        ResultDelta::Materialize(delta) => delta.kv_tokens,
+        ResultDelta::Transfer(delta) => delta.kv_tokens,
+        ResultDelta::Flow(_) => None,
+    }
+}
+
+fn operation_trace(envelope: &OperationEnvelope) -> serde_json::Value {
+    match &envelope.operation {
+        Operation::Sequence(sequence) => {
+            let (token_count, draft_count, source, stop_count, stop_terminal) =
+                match &sequence.input {
+                    SequenceInput::Tokens(input) => (
+                        input.token_ids.len(),
+                        input.draft_token_ids.len(),
+                        Some(input.source),
+                        input.stop_token_ids.len(),
+                        input.stop_terminal,
+                    ),
+                    SequenceInput::PublishedLogits(_) => (0, 0, None, 0, false),
+                };
+            json!({
+                "kind": "sequence",
+                "mode": sequence.mode,
+                "position": sequence.position,
+                "token_count": token_count,
+                "draft_count": draft_count,
+                "source": source,
+                "stop_count": stop_count,
+                "stop_terminal": stop_terminal,
+                "new_blocks": sequence.lease.new_blocks.len(),
+            })
+        }
+        Operation::Flow(flow) => json!({
+            "kind": "flow",
+            "position": flow.position,
+            "start_step": flow.start_step,
+            "step_count": flow.step_count,
+            "branch_count": flow.guidance.branch_count,
+        }),
+        Operation::Encode(encode) => json!({
+            "kind": "encode",
+            "encode_kind": encode.kind,
+            "position": encode.position,
+            "new_blocks": encode.lease.new_blocks.len(),
+        }),
+        Operation::Materialize(materialize) => json!({
+            "kind": "materialize",
+            "materialize_kind": materialize.kind,
+            "position": materialize.position,
+            "new_blocks": materialize.lease.new_blocks.len(),
+        }),
+        Operation::Transfer(transfer) => json!({
+            "kind": "transfer",
+            "transfer_kind": transfer.kind,
+            "position": transfer.position,
+            "new_blocks": transfer.lease.new_blocks.len(),
+        }),
+    }
 }
 
 fn denoise_step_burst_from_env() -> u16 {
@@ -5157,2404 +5165,63 @@ fn cfg_branch_count(image: &uniserve_core::ImageParams) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
+    use uniserve_worker_wire::{KvLeaseDelta, SequenceOperation, TokenInput, TokenPolicy};
 
-    fn test_png_b64(width: u32, height: u32) -> String {
-        let mut bytes = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut bytes, width, height);
-            encoder.set_color(png::ColorType::Grayscale);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder.write_header().expect("PNG header");
-            writer
-                .write_image_data(&vec![0; (width * height) as usize])
-                .expect("PNG pixels");
-        }
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    }
-
-    fn request_with_generation_behavior(
-        request: &mut GenerationRequest,
-        constraint: uniserve_core::GenerationConstraint,
-    ) {
-        request.constraint = constraint;
-        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 };
-        request.policy.feedback.get_or_insert({
-            uniserve_core::GeneratedImageFeedbackRecipe {
-                commit: uniserve_core::CommitRecipe::CommitGen,
-                writeback: uniserve_core::FeedbackWriteback::DirectKv,
-                next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
-                logical_positions: 2,
-                physical_kv_tokens: uniserve_core::ImageKvEffect::Bounded { max_tokens: 64 },
-            }
-        });
-        request.behavior =
-            uniserve_core::GenerationBehaviorDescriptor::resolve(constraint, &request.policy);
-        request.resources.generated_feedback_makes_non_replayable =
-            request.behavior.generated_image_feedback;
-    }
-
-    fn inflight(kind: OpKind, op_id: Option<u64>) -> InflightOp {
-        let request = test_request(0, 1);
-        let cursor = CursorProjection {
-            phase: if kind == OpKind::PrefillUnd {
-                Phase::Prefill
-            } else {
-                Phase::DecodeUnd
-            },
-            prompt_cursor: 0,
-            logical_pos: 0,
-            physical_kv_len: 0,
-            replayability: crate::generation::Replayability::Replayable,
-        };
-        let intent = if kind == OpKind::PrefillUnd {
-            TransitionIntent::IngestText {
-                segment_index: 0,
-                prompt_start: 0,
-                token_ids: vec![1],
-                new_blocks: Vec::new(),
-                recent_tokens: None,
-                allowed_tokens: None,
-                suppress_tokens: None,
-            }
-        } else {
-            TransitionIntent::DecodeUnd {
-                position: 0,
-                token_id: 1,
-                token_source: TokenSource::Wire,
-                new_blocks: Vec::new(),
-                spec_token_ids: None,
-                token_count: 1,
-                stop_token_ids: None,
-                stop_terminal: true,
-                recent_tokens: None,
-                allowed_tokens: None,
-                suppress_tokens: None,
-            }
-        };
-        let mut transition = GenerationPlanner::new()
-            .plan(&request, cursor, intent)
-            .expect("plan test transition");
-        if let Some(op_id) = op_id {
-            transition.assign_op_id(op_id);
-        }
-        InflightOp {
-            transition,
-            op_id,
-            spec_tokens: Vec::new(),
-            decode_token_count: 1,
-            started: Instant::now(),
-        }
-    }
-
-    // A result resolves the exact op the worker echoed even when a request's
-    // operations complete out of submission order.
-    #[test]
-    fn take_inflight_resolves_by_op_id_out_of_order() {
-        let mut q = VecDeque::from(vec![
-            inflight(OpKind::PrefillUnd, Some(10)),
-            inflight(OpKind::DecodeUnd, Some(11)),
-            inflight(OpKind::DecodeUnd, Some(12)),
-        ]);
-        // Resolve the middle op first (out of order): it must be removed, not the
-        // FIFO front.
-        let got = take_inflight_by_op_id(&mut q, Some(11)).expect("op 11 present");
-        assert_eq!(got.op_id, Some(11));
-        assert_eq!(q.len(), 2);
-        assert_eq!(q.front().unwrap().op_id, Some(10));
-        // Then the last, then the first — order is driven by op_id, not position.
-        assert_eq!(
-            take_inflight_by_op_id(&mut q, Some(12)).unwrap().op_id,
-            Some(12)
-        );
-        assert_eq!(
-            take_inflight_by_op_id(&mut q, Some(10)).unwrap().op_id,
-            Some(10)
-        );
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn take_inflight_rejects_absent_and_unknown_op_ids() {
-        let mut q = VecDeque::from(vec![
-            inflight(OpKind::DecodeUnd, Some(1)),
-            inflight(OpKind::DecodeUnd, Some(2)),
-        ]);
-
-        assert!(take_inflight_by_op_id(&mut q, None).is_none());
-        assert!(take_inflight_by_op_id(&mut q, Some(999)).is_none());
-        assert_eq!(q.len(), 2);
-        assert_eq!(q.front().and_then(|op| op.op_id), Some(1));
-    }
-
-    #[test]
-    fn decode_op_token_cost_includes_speculative_drafts() {
-        let plain = ForwardOp {
-            kind: OpKind::DecodeUnd,
-            ..Default::default()
-        };
-        let drafted = ForwardOp {
-            kind: OpKind::DecodeUnd,
-            spec_token_ids: Some(vec![11, 12, 13]),
-            ..Default::default()
-        };
-        let prefill = ForwardOp {
-            kind: OpKind::PrefillUnd,
-            pos_range: (4, 9),
-            spec_token_ids: Some(vec![99]),
-            ..Default::default()
-        };
-        let burst_decode = ForwardOp {
-            kind: OpKind::DecodeUnd,
-            decode_token_count: Some(16),
-            ..Default::default()
-        };
-        let denoise = ForwardOp {
-            kind: OpKind::DenoiseGen,
-            denoise_step_count: Some(8),
-            ..Default::default()
-        };
-
-        assert_eq!(op_token_cost(&plain), 1);
-        assert_eq!(op_token_cost(&drafted), 4);
-        assert_eq!(op_token_cost(&prefill), 5);
-        assert_eq!(op_token_cost(&burst_decode), 16);
-        assert_eq!(op_token_cost(&denoise), 8);
-    }
-
-    #[test]
-    fn denoise_step_budget_counts_cfg_latent_transformer_tokens() {
-        let mut sched = test_scheduler();
-        let request_id = RequestId(1);
-        let mut request = test_request(request_id.0, 4);
-        request_with_generation_behavior(
-            &mut request,
-            uniserve_core::GenerationConstraint::Default,
-        );
-        request.image = uniserve_core::ImageParams {
-            height: 1_024,
-            width: 1_024,
-            steps: 50,
-            cfg_img_scale: 1.5,
-            max_images: 1,
-            retain_images: false,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut request);
-        let _events = sched.submit_for_test(request);
-        sched.admit();
-        {
-            let state = sched
-                .running
-                .get_mut(&request_id)
-                .expect("generation request admitted");
-            state.ingest.prompt_cursor = 4;
-            state.und.logical_pos = 4;
-            state.und.physical_kv_len = 4;
-        }
-        sched.begin_image(request_id);
-
-        let transition = sched
-            .next_transition(request_id, 8_192)
-            .expect("denoise transition");
-
-        assert_eq!(transition.kind, OpKind::DenoiseGen);
-        assert_eq!(planned_op_token_cost(&transition), 12_288);
-    }
-
-    #[test]
-    fn ngram_draft_prefers_longest_recent_suffix() {
-        let seq = vec![1, 2, 3, 4, 2, 3, 5, 2, 3];
-        assert_eq!(ngram_draft_one(&seq, 4, None, None), Some(5));
-    }
-
-    #[test]
-    fn ngram_draft_respects_allowed_and_suppressed_masks() {
-        let seq = vec![9, 8, 7, 9, 8];
-        assert_eq!(ngram_draft_one(&seq, 4, Some(&[7]), None), Some(7));
-        assert_eq!(ngram_draft_one(&seq, 4, Some(&[6]), None), None);
-        assert_eq!(ngram_draft_one(&seq, 4, None, Some(&[7])), None);
-    }
-
-    #[test]
-    fn cfg_params_uses_declared_branch_count() {
-        let mut img = uniserve_core::ImageParams {
-            cfg_text_scale: 4.0,
-            cfg_img_scale: 4.0,
-            ..Default::default()
-        };
-        assert_eq!(cfg_params(&img, 1).branch_count, 1);
-        assert_eq!(cfg_params(&img, 3).branch_count, 3);
-        assert_eq!(cfg_params(&img, 0).branch_count, 1);
-        img.cfg_text_scale = 1.0;
-        img.cfg_img_scale = 1.0;
-        assert_eq!(cfg_params(&img, 3).branch_count, 3);
-    }
-
-    #[test]
-    fn cfg_branch_count_tracks_active_guidance_axes() {
-        let mut img = uniserve_core::ImageParams {
-            cfg_text_scale: 4.0,
-            cfg_img_scale: 1.0,
-            ..Default::default()
-        };
-        assert_eq!(cfg_branch_count(&img), 2);
-        img.cfg_text_scale = 1.0;
-        img.cfg_img_scale = 1.0;
-        assert_eq!(cfg_branch_count(&img), 1);
-        img.cfg_text_scale = 3.0;
-        img.cfg_img_scale = 3.0;
-        assert_eq!(cfg_branch_count(&img), 2);
-        img.cfg_text_scale = 4.0;
-        img.cfg_img_scale = 1.5;
-        assert_eq!(cfg_branch_count(&img), 3);
-    }
-
-    #[test]
-    fn denoise_scratch_accounts_for_branch_prefixes_markers_and_block_rounding() {
-        assert_eq!(
-            uniserve_core::denoise_scratch_tokens(4096, 2, 45, 0, 1, 64),
-            4160
-        );
-        assert_eq!(
-            uniserve_core::denoise_scratch_tokens(4096, 2, 45, 0, 2, 64),
-            8320
-        );
-        assert_eq!(
-            uniserve_core::denoise_scratch_tokens(4096, 2, 45, 80, 3, 64),
-            12_608
-        );
-    }
-
-    /// A no-op executor: every submit succeeds, no result ever returns, and
-    /// controls are accepted. Enough to unit-test admission/backpressure/reap.
-    #[derive(Default)]
-    struct NullExecutor {
-        caps: EngineCaps,
-        in_flight: usize,
-    }
-
-    impl Executor for NullExecutor {
-        fn caps(&self) -> EngineCaps {
-            self.caps.clone()
-        }
-        fn pipeline_depth(&self) -> usize {
-            1
-        }
-        fn in_flight(&self) -> usize {
-            self.in_flight
-        }
-        fn generated_image_commit_capabilities(
-            &self,
-        ) -> uniserve_core::GeneratedImageCommitCapabilities {
-            uniserve_core::GeneratedImageCommitCapabilities {
-                inline: true,
-                separate_writeback: true,
-            }
-        }
-        fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
-            let _ = batch;
-            self.in_flight += 1;
-            Ok(())
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
-            Ok(None)
-        }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
-            anyhow::bail!("NullExecutor never returns a result")
-        }
-        fn control(&mut self, _op: ControlOp) -> anyhow::Result<u64> {
-            Ok(0)
-        }
-        fn control_wait(
-            &mut self,
-            _op: ControlOp,
-            _targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<uniserve_executor::ControlAck>> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn test_request(id: u64, prompt_len: usize) -> GenerationRequest {
-        let constraint = uniserve_core::GenerationConstraint::UndOnly;
-        let policy = uniserve_core::GenerationPolicyDescriptor::default();
-        GenerationRequest {
-            request_id: RequestId(id),
-            context: vec![uniserve_core::ContextSegment::UndTokens {
-                token_ids: vec![1u32; prompt_len],
-                visibility: uniserve_core::UndVisibility::Internal,
-            }],
-            negative_context: Vec::new(),
-            constraint,
-            behavior: uniserve_core::GenerationBehaviorDescriptor::resolve(constraint, &policy),
-            sampling: uniserve_core::SamplingParams::default(),
-            image: uniserve_core::ImageParams::default(),
-            max_und_tokens: 16,
-            stop_strings: Vec::new(),
-            stop_token_ids: Vec::new(),
-            priority: 0,
-            lora_id: None,
-            grammar: None,
-            cache: Default::default(),
-            policy,
-            resources: uniserve_core::GenerationResourceBounds {
-                context_tokens: prompt_len,
-                max_kv_tokens: prompt_len + 16,
-                ..Default::default()
-            },
-        }
-    }
-
-    fn test_scheduler() -> Scheduler {
-        let mut caps = EngineCaps::default();
-        caps.supported_ops
-            .extend([OpKind::VitEncode, OpKind::CommitWriteback]);
-        caps.max_latent_size = 65_536;
-        caps.max_vae_grid_tokens = 65_536;
-        caps.max_vit_grid_tokens = 65_536;
-        caps.encoder_cache_budget = 256;
-        Scheduler::new(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            DEFAULT_MAX_BATCH,
-        )
-    }
-
-    fn compile_resources(scheduler: &Scheduler, request: &mut GenerationRequest) {
-        request.resources = uniserve_core::GenerationResourceBounds::conservative(
-            &request.context,
-            &request.negative_context,
-            &request.behavior,
-            &request.policy,
-            &request.image,
-            request.max_und_tokens,
-            &request.cache,
-            &scheduler.generation_runtime_capabilities(),
-        )
-        .expect("test request resources");
-    }
-
-    #[test]
-    fn prefix_reset_without_replay_policy_preserves_active_requests() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        compile_resources(&scheduler, &mut request);
-        scheduler.submit_for_test(request);
-        scheduler.admit();
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-        scheduler.begin_prefix_cache_reset(false, reply_tx);
-
-        assert!(!reply_rx.recv().unwrap().unwrap());
-        assert!(scheduler.running.contains_key(&RequestId(1)));
-        assert!(scheduler.pending_prefix_reset.is_none());
-    }
-
-    #[test]
-    fn prefix_reset_requeues_replayable_request_with_generated_context() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        compile_resources(&scheduler, &mut request);
-        scheduler.submit_for_test(request);
-        scheduler.admit();
-        let state = scheduler.running.get_mut(&RequestId(1)).unwrap();
-        state.replay.generated_ids = vec![7, 8];
-        state.und.tokens_emitted = 2;
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-        scheduler.begin_prefix_cache_reset(true, reply_tx);
-
-        assert!(reply_rx.recv().unwrap().unwrap());
-        assert!(scheduler.running.is_empty());
-        let state = scheduler.pending.pop_request().expect("request requeued");
-        assert_eq!(state.effective_prompt(), &[1, 1, 1, 1, 7, 8]);
-        assert_eq!(state.und.tokens_emitted, 2);
-        assert!(state.replay.preempted);
-        assert_eq!(state.ingest.prompt_cursor, 0);
-    }
-
-    #[test]
-    fn prefix_reset_rejects_non_replayable_running_state() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        compile_resources(&scheduler, &mut request);
-        scheduler.submit_for_test(request);
-        scheduler.admit();
-        scheduler
-            .running
-            .get_mut(&RequestId(1))
-            .unwrap()
-            .replay
-            .replayability = crate::generation::Replayability::NotReplayable;
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-        scheduler.begin_prefix_cache_reset(true, reply_tx);
-
-        assert!(!reply_rx.recv().unwrap().unwrap());
-        assert!(scheduler.running.contains_key(&RequestId(1)));
-    }
-
-    #[test]
-    fn prefix_reset_waits_for_inflight_transition_resolution() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        compile_resources(&scheduler, &mut request);
-        scheduler.submit_for_test(request);
-        scheduler.admit();
-        scheduler.inflight_ops.insert(
-            RequestId(1),
-            VecDeque::from([inflight(OpKind::PrefillUnd, Some(1))]),
-        );
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-
-        scheduler.begin_prefix_cache_reset(true, reply_tx);
-
-        assert!(reply_rx.try_recv().is_err());
-        assert!(scheduler.pending_prefix_reset.is_some());
-        scheduler.inflight_ops.clear();
-        assert!(scheduler.progress_prefix_cache_reset());
-        assert!(reply_rx.recv().unwrap().unwrap());
-    }
-
-    #[test]
-    fn shutdown_resolves_a_pending_prefix_reset_reply() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        compile_resources(&scheduler, &mut request);
-        scheduler.submit_for_test(request);
-        scheduler.admit();
-        scheduler.inflight_ops.insert(
-            RequestId(1),
-            VecDeque::from([inflight(OpKind::PrefillUnd, Some(1))]),
-        );
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        scheduler.begin_prefix_cache_reset(true, reply_tx);
-
-        scheduler.abort_all_requests();
-
-        let error = reply_rx.recv().unwrap().expect_err("reset must fail");
-        assert!(error.contains("scheduler stopped"));
-    }
-
-    #[test]
-    fn prompt_logprobs_are_not_reemitted_after_preemption_recompute() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        request.sampling.return_prompt_logprobs = true;
-        compile_resources(&scheduler, &mut request);
-        let mut events = scheduler.submit_for_test(request);
-        scheduler.admit();
-        let state = scheduler.running.get_mut(&RequestId(1)).unwrap();
-        state.ingest.prompt_logprobs_processed = 2;
-        state.ingest.prompt_logprobs_emitted = 2;
-
-        scheduler.do_preempt(RequestId(1));
-        scheduler.admit();
-        scheduler.resolve_prompt_logprobs(
-            RequestId(1),
-            vec![
-                vec![uniserve_worker_wire::TokenLogprob(1, -0.1, 1)],
-                vec![uniserve_worker_wire::TokenLogprob(1, -0.2, 1)],
-                vec![uniserve_worker_wire::TokenLogprob(1, -0.3, 1)],
-            ],
-        );
-
-        let prompt_events = std::iter::from_fn(|| events.try_recv().ok())
-            .filter_map(|event| match event {
-                GenEvent::PromptLogprobs { positions } => Some(positions),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(prompt_events.len(), 1);
-        assert_eq!(prompt_events[0].len(), 1);
-        assert_eq!(prompt_events[0][0].entries[0].logprob, -0.3);
-    }
-
-    #[test]
-    fn max_token_output_emits_logprobs_before_terminal_event() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        request.max_und_tokens = 1;
-        request.sampling.return_logprobs = true;
-        request.sampling.n_logprobs = 1;
-        compile_resources(&scheduler, &mut request);
-        let mut events = scheduler.submit_for_test(request);
-        scheduler.admit();
-
-        scheduler.resolve_decode_text(
-            RequestId(1),
-            uniserve_worker_wire::SeqResult {
-                req_id: RequestId(1),
-                sampled_token_id: Some(7),
-                sampled_logprob: Some(-0.25),
-                top_logprobs: Some(vec![uniserve_worker_wire::TokenLogprob(7, -0.25, 1)]),
-                ..Default::default()
-            },
-        );
-
-        let kinds = std::iter::from_fn(|| events.try_recv().ok())
-            .filter_map(|event| match event {
-                GenEvent::TextToken { .. } => Some("text"),
-                GenEvent::TokenLogprobs { .. } => Some("logprobs"),
-                GenEvent::Finished { .. } => Some("finished"),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(kinds, ["text", "logprobs", "finished"]);
-    }
-
-    #[test]
-    fn final_prefill_token_obeys_the_output_token_cap() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        request.max_und_tokens = 1;
-        compile_resources(&scheduler, &mut request);
-        let mut events = scheduler.submit_for_test(request);
-        scheduler.admit();
-        let (_, mut transitions) = scheduler.assemble();
-        assert_eq!(transitions.len(), 1);
-        let transition = transitions.pop().expect("prefill transition");
-        assert_eq!(transition.kind, OpKind::PrefillUnd);
-
-        apply_and_resolve(
-            &mut scheduler,
-            RequestId(1),
-            transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: RequestId(1),
-                sampled_token_id: Some(7),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-
-        assert!(!scheduler.running.contains_key(&RequestId(1)));
-        let output = std::iter::from_fn(|| events.try_recv().ok())
-            .filter_map(|event| match event {
-                GenEvent::TextToken { id, .. } => Some(Ok(id)),
-                GenEvent::Finished { reason, .. } => Some(Err(reason)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(output, [Ok(7), Err(FinishReason::MaxTokens)]);
-    }
-
-    #[test]
-    fn post_commit_stop_token_counts_toward_the_minimum() {
-        let mut scheduler = test_scheduler();
-        let mut request = test_request(1, 4);
-        request_with_generation_behavior(
-            &mut request,
-            uniserve_core::GenerationConstraint::Default,
-        );
-        request.sampling.min_tokens = 1;
-        request.stop_token_ids = vec![77];
-        request.image.height = 64;
-        request.image.width = 64;
-        request.image.max_images = 1;
-        compile_resources(&scheduler, &mut request);
-        let mut events = scheduler.submit_for_test(request);
-        scheduler.admit();
-        let id = RequestId(1);
-        if let Some(state) = scheduler.running.get_mut(&id) {
-            state.ingest.prompt_cursor = 4;
-            state.und.logical_pos = 4;
-            state.und.physical_kv_len = 4;
-            state.lifecycle.phase = Phase::CommitGen;
-            state.image_gen.cond_pos = 4;
-            state.image_gen.image_id = 1;
-        }
-        let transition = scheduler.next_transition(id, 8).expect("commit transition");
-        assert_eq!(transition.kind, OpKind::CommitGen);
-
-        apply_and_resolve(
-            &mut scheduler,
-            id,
-            transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(77),
-                image_hw: Some((64, 64)),
-                image_png_b64: Some(test_png_b64(64, 64)),
-                num_tokens: Some(1),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-
-        assert!(!scheduler.running.contains_key(&id));
-        assert!(
-            std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
-                event,
-                GenEvent::Finished {
-                    reason: FinishReason::Stop,
-                    ..
-                }
-            ))
-        );
-    }
-
-    fn add_context_image(request: &mut GenerationRequest, position: usize, dual_encode: bool) {
-        let tokens = request
-            .context
-            .iter()
-            .flat_map(|segment| match segment {
-                uniserve_core::ContextSegment::UndTokens { token_ids, .. } => token_ids.clone(),
-                uniserve_core::ContextSegment::Image { .. } => Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let position = position.min(tokens.len());
-        let ingest = if dual_encode {
-            uniserve_core::ImageIngestRecipe::vae_then_vit(
-                1,
-                uniserve_core::ImageKvEffect::WorkerDefined,
-                uniserve_core::ImageKvEffect::WorkerDefined,
-            )
-        } else {
-            uniserve_core::ImageIngestRecipe::vit_only(
-                1,
-                uniserve_core::ImageKvEffect::WorkerDefined,
-            )
-        };
-        let encoder_cache_keys = ingest.encoder_cache_keys(7);
-        request.context = vec![
-            uniserve_core::ContextSegment::UndTokens {
-                token_ids: tokens[..position].to_vec(),
-                visibility: uniserve_core::UndVisibility::Internal,
-            },
-            uniserve_core::ContextSegment::Image {
-                image: uniserve_core::ImageSegment {
-                    hash: 7,
-                    b64: "aGVsbG8=".to_string(),
-                    placement: uniserve_core::SegmentPlacement::AtToken {
-                        position: position as u32,
-                    },
-                },
-                ingest,
-            },
-            uniserve_core::ContextSegment::UndTokens {
-                token_ids: tokens[position..].to_vec(),
-                visibility: uniserve_core::UndVisibility::Internal,
-            },
-        ];
-        request.resources.encoder_cache_keys = encoder_cache_keys;
-    }
-
-    fn apply_and_resolve(
-        scheduler: &mut Scheduler,
-        id: RequestId,
-        mut transition: PlannedTransition,
-        mut result: uniserve_worker_wire::SeqResult,
+    fn sequence(
+        mode: SequenceMode,
+        position: (u32, u32),
+        burst_tokens: u16,
         draft_token_ids: Vec<u32>,
-    ) {
-        let op_id = transition.op_id.unwrap_or_else(|| {
-            let op_id = scheduler.next_op_id;
-            scheduler.next_op_id = scheduler.next_op_id.saturating_add(1);
-            op_id
-        });
-        let (epoch, base_version) = scheduler
-            .running
-            .get(&id)
-            .map(|state| (state.epoch, state.version))
-            .expect("request running");
-        transition.assign_envelope(epoch, op_id, base_version);
-        result.op_id = Some(op_id);
-        result.epoch = Some(epoch);
-        result.base_version = Some(base_version);
-        result.result_version = Some(base_version.saturating_add(1));
-        result.op_kind = Some(transition.kind);
-        transition
-            .validate_result(&result)
-            .expect("test result validates against transition");
-        let state = scheduler.running.get_mut(&id).expect("request running");
-        state
-            .cursor
-            .apply_transition(&transition, &result)
-            .expect("apply test transition");
-        state.version = base_version.saturating_add(1);
-        scheduler.resolve(id, transition, result, draft_token_ids);
-    }
-
-    #[test]
-    fn plain_decode_burst_marks_stop_tokens_terminal() {
-        let mut sched = test_scheduler();
-        sched.decode_token_burst = 8;
-        let mut req = test_request(1, 5);
-        req.stop_token_ids = vec![77];
-        sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 5;
-            st.und.logical_pos = 5;
-            st.und.next_token = 11;
-        }
-
-        let op = sched.next_transition(id, 8).expect("decode op");
-
-        assert_eq!(op.kind, OpKind::DecodeUnd);
-        assert!(op.decode_token_count.unwrap_or(1) > 1);
-        assert!(
-            op.decode_stop_token_ids
-                .as_ref()
-                .is_some_and(|ids| ids.contains(&77))
-        );
-        assert!(op.decode_stop_terminal);
-    }
-
-    #[test]
-    fn termination_descriptor_controls_eos_and_explicit_stop_tokens() {
-        let mut sched = test_scheduler();
-        let mut req = test_request(1, 5);
-        req.max_und_tokens = 2;
-        req.stop_token_ids = vec![77];
-        req.policy.termination.eos_finishes = false;
-        req.policy.termination.stop_finishes = false;
-        req.behavior =
-            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
-        let mut events = sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 5;
-            st.und.logical_pos = 5;
-            st.und.physical_kv_len = 5;
-        }
-
-        sched.resolve_decode_text(
-            id,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(77),
-                ..Default::default()
-            },
-        );
-        assert!(sched.running.contains_key(&id));
-
-        let eos = sched.ctrl.eos[0];
-        sched.resolve_decode_text(
-            id,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(eos),
-                ..Default::default()
-            },
-        );
-        assert!(!sched.running.contains_key(&id));
-        let mut tokens = Vec::new();
-        let mut terminal = None;
-        while let Ok(event) = events.try_recv() {
-            match event {
-                GenEvent::TextToken { id, .. } => tokens.push(id),
-                GenEvent::Finished { reason, .. } => terminal = Some(reason),
-                _ => {}
-            }
-        }
-        assert_eq!(tokens, vec![77]);
-        assert_eq!(terminal, Some(FinishReason::MaxTokens));
-    }
-
-    #[test]
-    fn termination_descriptor_controls_terminal_stop_token_emission() {
-        let mut sched = test_scheduler();
-        let mut req = test_request(1, 5);
-        req.stop_token_ids = vec![77];
-        req.policy.termination.emit_stop_token = true;
-        req.behavior =
-            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
-        let mut events = sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(state) = sched.running.get_mut(&id) {
-            state.lifecycle.phase = Phase::DecodeUnd;
-            state.ingest.prompt_cursor = 5;
-            state.und.logical_pos = 5;
-            state.und.physical_kv_len = 5;
-        }
-
-        sched.resolve_decode_text(
-            id,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(77),
-                ..Default::default()
-            },
-        );
-
-        assert!(!sched.running.contains_key(&id));
-        let emitted = std::iter::from_fn(|| events.try_recv().ok())
-            .filter_map(|event| match event {
-                GenEvent::TextToken { id, .. } => Some(format!("token:{id}")),
-                GenEvent::Finished { reason, .. } => Some(format!("finish:{reason:?}")),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(emitted, vec!["token:77", "finish:Stop"]);
-    }
-
-    #[test]
-    fn gen_branch_decode_burst_keeps_transition_stops_nonterminal() {
-        let mut sched = test_scheduler();
-        sched.decode_token_burst = 8;
-        let mut req = test_request(1, 5);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        req.image = uniserve_core::ImageParams {
-            max_images: 1,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut req);
-        sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 5;
-            st.und.logical_pos = 5;
-            st.und.next_token = 11;
-            st.image_gen.images_done = 0;
-        }
-
-        let op = sched.next_transition(id, 8).expect("decode op");
-
-        assert_eq!(op.kind, OpKind::DecodeUnd);
-        assert!(op.decode_token_count.unwrap_or(1) > 1);
-        assert!(
-            op.decode_stop_token_ids
-                .as_ref()
-                .is_some_and(|ids| ids.contains(&42))
-        );
-        assert!(!op.decode_stop_terminal);
-    }
-
-    #[test]
-    fn planning_text_prefill_does_not_advance_committed_cursor() {
-        let mut sched = test_scheduler();
-        let req = test_request(1, 5);
-        sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-
-        let op = sched.next_transition(id, 3).expect("prefill op");
-
-        assert_eq!(op.kind, OpKind::PrefillUnd);
-        assert_eq!(op.pos_range, (0, 3));
-        let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.ingest.prompt_cursor, 0);
-        assert_eq!(st.und.logical_pos, 0);
-
-        apply_and_resolve(
-            &mut sched,
-            id,
-            op,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(9),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-        let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.ingest.prompt_cursor, 3);
-        assert_eq!(st.und.logical_pos, 3);
-    }
-
-    #[test]
-    fn planning_context_prefill_does_not_advance_committed_cursor() {
-        let mut sched = test_scheduler();
-        let mut req = test_request(1, 5);
-        add_context_image(&mut req, 2, false);
-        compile_resources(&sched, &mut req);
-        sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-
-        let op = sched.next_transition(id, 64).expect("context prefill op");
-
-        assert_eq!(op.kind, OpKind::PrefillUnd);
-        assert_eq!(op.pos_range, (0, 2));
-        let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.ingest.prompt_cursor, 0);
-        assert_eq!(st.und.logical_pos, 0);
-        assert_eq!(st.und.physical_kv_len, 0);
-
-        apply_and_resolve(
-            &mut sched,
-            id,
-            op,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(9),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-        let st = sched.running.get(&id).expect("request running");
-        assert_eq!(st.ingest.prompt_cursor, 2);
-        assert_eq!(st.und.logical_pos, 2);
-        assert_eq!(st.und.physical_kv_len, 2);
-    }
-
-    #[test]
-    fn explicit_vae_grid_cap_does_not_expand_to_latent_capacity() {
-        let caps = EngineCaps {
-            max_latent_size: 65_536,
-            max_vae_grid_tokens: 4_096,
-            ..Default::default()
-        };
-        let sched = Scheduler::new(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            DEFAULT_MAX_BATCH,
-        );
-
-        assert_eq!(sched.cap_max_vae_grid_tokens(), 4_096);
-    }
-
-    #[test]
-    fn vae_grid_cap_uses_latent_size_when_unspecified() {
-        let caps = EngineCaps {
-            max_latent_size: 65_536,
-            max_vae_grid_tokens: 0,
-            ..Default::default()
-        };
-        let sched = Scheduler::new(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            DEFAULT_MAX_BATCH,
-        );
-
-        assert_eq!(sched.cap_max_vae_grid_tokens(), 65_536);
-    }
-
-    #[test]
-    fn assemble_never_preempts_request_already_staged_in_current_batch() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 4, // block 0 is padding, so only 3 usable KV blocks.
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 16,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let mut receivers = Vec::new();
-        for id in 1..=4 {
-            let req = test_request(id, 4);
-            receivers.push(sched.submit_for_test(req));
-        }
-        sched.admit();
-        assert_eq!(sched.running.len(), 4);
-        assert_eq!(sched.order.len(), 4);
-        assert_eq!(sched.config.max_batch, 4);
-        assert_eq!(sched.config.max_num_batched_tokens, 16);
-        assert_eq!(sched.caps.block_size, 4);
-        assert_eq!(sched.bm.free_blocks(), 3);
-
-        let (_new_reqs, ops) = sched.assemble();
-        let op_ids: Vec<RequestId> = ops.iter().map(|op| op.req_id).collect();
-
-        assert_eq!(
-            op_ids,
-            vec![RequestId(1), RequestId(2), RequestId(3)],
-            "request 4 must wait instead of preempting a request already staged in this batch"
-        );
-        assert!(
-            sched.running.contains_key(&RequestId(3)),
-            "staged request 3 must not be dropped before its op is submitted"
-        );
-        assert!(
-            sched.running.contains_key(&RequestId(4)),
-            "protected requester remains running and retries next scheduler step"
-        );
-        assert_eq!(
-            sched.pending.len(),
-            0,
-            "no staged request should be requeued by preemption"
-        );
-    }
-
-    #[test]
-    fn admission_progresses_while_the_execution_pipeline_is_full() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 1 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let _rx1 = sched.submit_for_test(test_request(1, 4));
-        let _rx2 = sched.submit_for_test(test_request(2, 4));
-
-        sched.step_nonblocking();
-
-        assert_eq!(sched.running.len(), 2);
-        assert_eq!(sched.pending.len(), 0);
-        assert_eq!(sched.executor.in_flight(), 1);
-    }
-
-    #[test]
-    fn image_encode_batch_uses_the_declared_batch_capacity() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 65_536,
-            supported_ops: vec![
-                OpKind::PrefillUnd,
-                OpKind::DecodeUnd,
-                OpKind::VaeEncode,
-                OpKind::VitEncode,
-            ],
-            max_vae_grid_tokens: 4_098,
-            max_vit_grid_tokens: 4_902,
-            encoder_cache_budget: 32,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 8,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 8,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let mut receivers = Vec::new();
-        for id in 1..=8 {
-            let mut request = test_request(id, 4);
-            add_context_image(&mut request, 0, true);
-            compile_resources(&sched, &mut request);
-            receivers.push(sched.submit_for_test(request));
-        }
-        sched.admit();
-        assert_eq!(sched.running.len(), 8);
-
-        let (_new_requests, ops) = sched.assemble();
-
-        assert_eq!(ops.len(), 8);
-        assert!(ops.iter().all(|op| op.kind == OpKind::VaeEncode));
-    }
-
-    #[test]
-    fn assemble_keeps_ready_text_decode_separate_from_prefill() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                // mixing disabled: the decode lane must stay pure.
-                mixed_prefill_tokens: 0,
-                ..Default::default()
-            },
-        );
-        let mut receivers = Vec::new();
-        for id in 1..=2 {
-            let mut req = test_request(id, 4);
-            req.sampling.ignore_eos = true;
-            receivers.push(sched.submit_for_test(req));
-        }
-        sched.admit();
-        assert_eq!(sched.running.len(), 2);
-        assert_eq!(sched.order.len(), 2);
-        let ids = sched.assembly_order();
-        assert_eq!(ids, vec![RequestId(1), RequestId(2)]);
-        assert_eq!(
-            sched.select_assembly_lane(&ids),
-            Some(AssemblyLane::Prefill)
-        );
-        let (_new_reqs, prefill_ops) = sched.assemble();
-        assert_eq!(
-            prefill_ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OpKind::PrefillUnd, OpKind::PrefillUnd]
-        );
-        for op in prefill_ops {
-            let request_id = op.req_id;
-            apply_and_resolve(
-                &mut sched,
-                request_id,
-                op,
-                uniserve_worker_wire::SeqResult {
-                    req_id: request_id,
-                    sampled_token_id: Some(11 + request_id.0 as u32),
-                    ..Default::default()
-                },
-                Vec::new(),
-            );
-        }
-        let mut req = test_request(3, 4);
-        req.sampling.ignore_eos = true;
-        receivers.push(sched.submit_for_test(req));
-        sched.admit();
-        let ids = sched.assembly_order();
-        assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
-
-        let (_new_reqs, ops) = sched.assemble();
-
-        assert_eq!(
-            ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OpKind::DecodeUnd, OpKind::DecodeUnd]
-        );
-        assert!(
-            ops.iter().all(|op| op.req_id != RequestId(3)),
-            "ready decode lane must not mix in a text prefill op: {ops:?}"
-        );
-    }
-
-    #[test]
-    fn assemble_drains_a_resident_prompt_cohort_before_decode() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                mixed_prefill_tokens: 0,
-                ..Default::default()
-            },
-        );
-        let mut req = test_request(1, 4);
-        req.sampling.ignore_eos = true;
-        let _rx1 = sched.submit_for_test(req);
-        sched.admit();
-        let (_new_reqs, ops) = sched.assemble();
-        assert_eq!(ops[0].kind, OpKind::PrefillUnd);
-        sched.register_inflight(ops[0].clone(), Instant::now());
-
-        // A second resident prompt joins the same admission cohort while the
-        // first prompt's final prefill is in flight.
-        let mut req = test_request(2, 4);
-        req.sampling.ignore_eos = true;
-        let _rx2 = sched.submit_for_test(req);
-        sched.admit();
-        let (_new_reqs, ops2) = sched.assemble();
-        assert_eq!(
-            ops2.iter()
-                .map(|op| (op.kind, op.req_id))
-                .collect::<Vec<_>>(),
-            vec![(OpKind::PrefillUnd, RequestId(2))]
-        );
-        sched.register_inflight(ops2[0].clone(), Instant::now());
-
-        // A later arrival cannot extend the frozen cohort. While both cohort
-        // prefills are in flight, no first token is emitted and request 3 waits.
-        let mut req = test_request(3, 4);
-        req.sampling.ignore_eos = true;
-        let _rx3 = sched.submit_for_test(req);
-        sched.admit();
-        let (_new_reqs, ops3) = sched.assemble();
-        assert!(
-            ops3.is_empty(),
-            "unexpected ops while cohort drains: {ops3:?}"
-        );
-
-        for (id, op) in [
-            (RequestId(1), ops[0].clone()),
-            (RequestId(2), ops2[0].clone()),
-        ] {
-            sched.inflight_ops.remove(&id);
-            apply_and_resolve(
-                &mut sched,
-                id,
-                op,
-                uniserve_worker_wire::SeqResult {
-                    req_id: id,
-                    sampled_token_id: Some(10 + id.0 as u32),
-                    ..Default::default()
-                },
-                Vec::new(),
-            );
-        }
-
-        // Completing the cohort guarantees a decode turn; the later prompt did
-        // not extend the cohort that was already in flight.
-        let (_new_reqs, ops4) = sched.assemble();
-        assert_eq!(
-            ops4.iter()
-                .map(|op| (op.kind, op.req_id))
-                .collect::<Vec<_>>(),
-            vec![
-                (OpKind::DecodeUnd, RequestId(1)),
-                (OpKind::DecodeUnd, RequestId(2)),
-            ]
-        );
-    }
-
-    #[test]
-    fn assemble_submits_first_decode_while_final_prefill_inflight() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                mixed_prefill_tokens: 0,
-                ..Default::default()
-            },
-        );
-        let mut req = test_request(1, 4);
-        req.sampling.ignore_eos = true;
-        let _rx = sched.submit_for_test(req);
-        sched.admit();
-
-        // step 1: the whole prompt goes out as the final prefill chunk.
-        let (_new_reqs, ops) = sched.assemble();
-        assert_eq!(
-            ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OpKind::PrefillUnd]
-        );
-        sched.register_inflight(ops[0].clone(), Instant::now());
-
-        // step 2: with the final prefill still in flight, the first decode op
-        // is submitted early, reading its token from the device relay.
-        let (_new_reqs, ops2) = sched.assemble();
-        assert_eq!(
-            ops2.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OpKind::DecodeUnd]
-        );
-        assert_eq!(ops2[0].pos_range, (4, 5));
-        assert_eq!(ops2[0].token_source, TokenSource::LastSampled);
-
-        // both in flight: nothing further until a result resolves.
-        sched.register_inflight(ops2[0].clone(), Instant::now());
-        let (_new_reqs, ops3) = sched.assemble();
-        assert!(ops3.is_empty(), "unexpected extra ops: {ops3:?}");
-    }
-
-    #[test]
-    fn assemble_preserves_decode_bursts_across_the_device_relay() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                mixed_prefill_tokens: 0,
-                ..Default::default()
-            },
-        );
-        sched.decode_lookahead = true;
-        sched.decode_token_burst = 8;
-        let mut req = test_request(1, 4);
-        req.max_und_tokens = 32;
-        req.sampling.ignore_eos = true;
-        compile_resources(&sched, &mut req);
-        let _rx = sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 4;
-            st.und.logical_pos = 4;
-            st.und.physical_kv_len = 4;
-            st.und.tokens_emitted = 1;
-            st.und.next_token = 11;
-        }
-
-        let (_new_reqs, first) = sched.assemble();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].token_source, TokenSource::Wire);
-        assert_eq!(first[0].decode_token_count, Some(8));
-        sched.register_inflight(first[0].clone(), Instant::now());
-
-        let (_new_reqs, relayed) = sched.assemble();
-        assert_eq!(
-            relayed.len(),
-            1,
-            "an in-flight burst must keep the relay pipeline full"
-        );
-        assert_eq!(relayed[0].token_source, TokenSource::LastSampled);
-        assert_eq!(relayed[0].decode_token_count, Some(8));
-        assert_eq!(relayed[0].pos_range, (12, 13));
-    }
-
-    #[test]
-    fn assemble_mixes_small_text_prefill_into_decode_batch() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 64,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                // small budget so the rider's prompt is chunk-clipped to it.
-                mixed_prefill_tokens: 2,
-                ..Default::default()
-            },
-        );
-        let mut receivers = Vec::new();
-        for id in 1..=2 {
-            let mut req = test_request(id, 4);
-            req.sampling.ignore_eos = true;
-            receivers.push(sched.submit_for_test(req));
-        }
-        sched.admit();
-        let (_new_reqs, prefill_ops) = sched.assemble();
-        assert_eq!(prefill_ops.len(), 2);
-        for op in prefill_ops {
-            let request_id = op.req_id;
-            apply_and_resolve(
-                &mut sched,
-                request_id,
-                op,
-                uniserve_worker_wire::SeqResult {
-                    req_id: request_id,
-                    sampled_token_id: Some(11 + request_id.0 as u32),
-                    ..Default::default()
-                },
-                Vec::new(),
-            );
-        }
-        let mut req = test_request(3, 4);
-        req.sampling.ignore_eos = true;
-        receivers.push(sched.submit_for_test(req));
-        sched.admit();
-        let ids = sched.assembly_order();
-        assert_eq!(sched.select_assembly_lane(&ids), Some(AssemblyLane::Decode));
-
-        let (_new_reqs, ops) = sched.assemble();
-
-        // Both ready decodes run, and the new request's prefill rides along —
-        // appended last, its chunk clipped to the mixed budget.
-        assert_eq!(
-            ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
-            vec![OpKind::DecodeUnd, OpKind::DecodeUnd, OpKind::PrefillUnd]
-        );
-        let rider = ops.last().unwrap();
-        assert_eq!(rider.req_id, RequestId(3));
-        assert_eq!(
-            op_token_cost(rider),
-            2,
-            "rider chunk must clip to the mixed budget"
-        );
-    }
-
-    #[test]
-    fn gen_branch_ensures_current_image_capacity_before_first_image() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            latent_downsample: 16,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 16,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        req.max_und_tokens = 8;
-        req.image = uniserve_core::ImageParams {
-            height: 64,
-            width: 64,
-            max_images: 1,
-            retain_images: true,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut req);
-        let _rx = sched.submit_for_test(req);
-        sched.admit();
-
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.und.logical_pos = 4;
-            st.und.tokens_emitted = 1;
-            st.replay.generated_ids.clear();
-        }
-        sched.begin_image(id);
-
-        let (
-            reserve_worstcase,
-            gen_branch_pending,
-            phase,
-            generated_ids,
-            reserved_blocks,
-            allocated_blocks,
-            worstcase_blocks,
-            image_boundary_blocks,
-        ) = {
-            let st = sched.running.get(&id).expect("request remains running");
-            let image_boundary_blocks = st
-                .req
-                .resources
-                .max_kv_tokens
-                .div_ceil(sched.caps.block_size as usize);
-            (
-                st.resources.reserve_worstcase,
-                st.image_gen.branch_pending,
-                st.lifecycle.phase,
-                st.replay.generated_ids.clone(),
-                sched.reserved_blocks,
-                sched.bm.blocks_for(id).len(),
-                st.resources.worstcase_blocks,
-                image_boundary_blocks,
-            )
-        };
-        assert!(reserve_worstcase);
-        assert!(!gen_branch_pending);
-        assert_eq!(reserved_blocks, worstcase_blocks);
-        assert_eq!(allocated_blocks, worstcase_blocks);
-        assert!(allocated_blocks >= image_boundary_blocks);
-        assert_eq!(generated_ids, vec![42]);
-        assert_eq!(phase, Phase::DenoiseGen);
-    }
-
-    #[test]
-    fn deferred_gen_reservation_retry_does_not_advance_image_cursor() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            latent_downsample: 16,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 16,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        req.image = uniserve_core::ImageParams {
-            height: 64,
-            width: 64,
-            max_images: 1,
-            retain_images: true,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut req);
-        let _rx = sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DenoiseGen;
-            st.ingest.prompt_cursor = 4;
-            st.und.logical_pos = 4;
-            st.und.physical_kv_len = 4;
-            st.image_gen.cond_pos = 4;
-            st.image_gen.image_id = 1;
-            st.image_gen.steps_done = 0;
-            st.image_gen.branch_pending = true;
-        }
-
-        let transition = sched.next_transition(id, 8).expect("denoise transition");
-        let st = sched.running.get(&id).expect("request remains running");
-        assert_eq!(transition.kind, OpKind::DenoiseGen);
-        assert_eq!(st.lifecycle.phase, Phase::DenoiseGen);
-        assert_eq!(st.image_gen.cond_pos, 4);
-        assert_eq!(st.image_gen.image_id, 1);
-        assert_eq!(st.image_gen.steps_done, 0);
-        assert!(!st.image_gen.branch_pending);
-    }
-
-    #[test]
-    fn gen_branch_burst_image_trigger_advances_speculative_feed() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            latent_downsample: 16,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 16,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        req.max_und_tokens = 8;
-        req.image = uniserve_core::ImageParams {
-            height: 64,
-            width: 64,
-            max_images: 1,
-            retain_images: true,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut req);
-        let _rx = sched.submit_for_test(req);
-        sched.decode_token_burst = 3;
-        sched.admit();
-
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 4;
-            st.und.logical_pos = 10;
-            st.und.physical_kv_len = 10;
-            st.und.next_token = 77;
-            st.und.tokens_emitted = 0;
-            st.replay.generated_ids.clear();
-        }
-        let transition = sched.next_transition(id, 3).expect("decode transition");
-        let image_trigger = 42;
-        apply_and_resolve(
-            &mut sched,
-            id,
-            transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(image_trigger),
-                sampled_token_ids: Some(vec![5, image_trigger]),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-
-        let st = sched.running.get(&id).expect("request enters image phase");
-        assert_eq!(st.lifecycle.phase, Phase::DenoiseGen);
-        assert_eq!(st.und.logical_pos, 13);
-        assert_eq!(st.image_gen.cond_pos, 13);
-        assert_eq!(st.replay.generated_ids, vec![5, image_trigger]);
-    }
-
-    #[test]
-    fn gen_branch_burst_literal_image_trigger_advances_speculative_feed() {
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 64,
-            latent_downsample: 16,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens {
-                ..Default::default()
-            },
-            SchedulerConfig {
-                max_batch: 4,
-                max_num_batched_tokens: 16,
-                max_num_seqs: 4,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        req.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Suffix {
-            token_ids: vec![21, 22],
-        };
-        req.behavior =
-            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
-        req.max_und_tokens = 8;
-        req.image = uniserve_core::ImageParams {
-            height: 64,
-            width: 64,
-            max_images: 1,
-            retain_images: true,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut req);
-        let _rx = sched.submit_for_test(req);
-        sched.decode_token_burst = 3;
-        sched.admit();
-
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 4;
-            st.und.logical_pos = 10;
-            st.und.physical_kv_len = 10;
-            st.und.next_token = 77;
-            st.und.tokens_emitted = 0;
-            st.replay.generated_ids.clear();
-        }
-        let transition = sched.next_transition(id, 3).expect("decode transition");
-        apply_and_resolve(
-            &mut sched,
-            id,
-            transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(22),
-                sampled_token_ids: Some(vec![21, 22]),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-
-        let st = sched.running.get(&id).expect("request enters image phase");
-        assert_eq!(st.lifecycle.phase, Phase::DenoiseGen);
-        assert_eq!(st.und.logical_pos, 13);
-        assert_eq!(st.image_gen.cond_pos, 13);
-        assert_eq!(st.replay.generated_ids, vec![21, 22]);
-    }
-
-    #[test]
-    fn gen_branch_admission_reserves_full_worstcase_and_never_deadlocks() {
-        let make_scheduler = |num_blocks| {
-            Scheduler::with_config(
-                Box::new(NullExecutor {
-                    caps: EngineCaps {
-                        block_size: 4,
-                        num_blocks,
-                        latent_downsample: 16,
-                        ..Default::default()
-                    },
-                    in_flight: 0,
+    ) -> OperationEnvelope {
+        OperationEnvelope::unsealed(
+            RequestId(1),
+            Operation::Sequence(SequenceOperation {
+                mode,
+                lease: KvLeaseDelta::default(),
+                position,
+                policy: TokenPolicy::default(),
+                input: SequenceInput::Tokens(TokenInput {
+                    token_ids: vec![7],
+                    source: TokenSource::Wire,
+                    draft_token_ids,
+                    burst_tokens,
+                    stop_token_ids: Vec::new(),
+                    stop_terminal: false,
+                    return_all_logits: false,
                 }),
-                ControlTokens::default(),
-                SchedulerConfig {
-                    max_batch: 4,
-                    max_num_batched_tokens: 16,
-                    max_num_seqs: 4,
-                    long_prefill_threshold: 16,
-                    ..Default::default()
-                },
-            )
+            }),
+        )
+    }
+
+    #[test]
+    fn typed_operation_cost_tracks_physical_sequence_work() {
+        assert_eq!(
+            op_token_cost(&sequence(SequenceMode::Extend, (3, 11), 1, Vec::new())),
+            8
+        );
+        assert_eq!(
+            op_token_cost(&sequence(SequenceMode::Decode, (11, 12), 4, Vec::new())),
+            4
+        );
+        assert_eq!(
+            op_token_cost(&sequence(SequenceMode::Verify, (11, 12), 4, vec![8, 9, 10])),
+            7
+        );
+    }
+
+    #[test]
+    fn operation_block_lease_is_consumed_once() {
+        let mut operation = sequence(SequenceMode::Extend, (0, 1), 1, Vec::new());
+        let Operation::Sequence(sequence) = &mut operation.operation else {
+            unreachable!();
         };
-        let make_request = |id| {
-            let mut req = test_request(id, 10);
-            request_with_generation_behavior(
-                &mut req,
-                uniserve_core::GenerationConstraint::Default,
-            );
-            req.max_und_tokens = 16;
-            req.image = uniserve_core::ImageParams {
-                height: 32,
-                width: 32,
-                max_images: 1,
-                retain_images: true,
-                ..Default::default()
-            };
-            req.policy
-                .feedback
-                .as_mut()
-                .expect("feedback recipe")
-                .physical_kv_tokens = uniserve_core::ImageKvEffect::Exact { tokens: 4 };
-            req
-        };
+        sequence.lease.new_blocks = vec![BlockId(4), BlockId(5)];
 
-        let mut sched = make_scheduler(12);
-        let mut first = make_request(1);
-        let mut second = make_request(2);
-        compile_resources(&sched, &mut first);
-        compile_resources(&sched, &mut second);
-        sched.submit_for_test(first);
-        sched.submit_for_test(second);
-        sched.admit();
-
-        let id = RequestId(1);
-        let st = sched.running.get(&id).expect("first request admitted");
-        assert!(st.resources.reserve_worstcase);
-        assert_eq!(st.resources.worstcase_blocks, 8);
         assert_eq!(
-            sched.bm.blocks_for(id).len(),
-            8,
-            "full worst case is physically allocated at admission"
+            take_operation_new_blocks(&mut operation),
+            vec![BlockId(4), BlockId(5)]
         );
-        assert!(
-            !sched.running.contains_key(&RequestId(2)),
-            "second request queues: its worst case does not fit alongside the first"
-        );
-        assert_eq!(sched.pending.len(), 1);
-
-        // The admitted request can decode through its entire text budget from
-        // its own allocation, with the retained-image envelope intact — no
-        // dependency on any other request freeing blocks.
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.und.logical_pos = st.context.prompt_ids.len() as u32;
-            st.ingest.prompt_cursor = st.context.prompt_ids.len() as u32;
-        }
-        let op = sched
-            .next_transition(id, 16)
-            .expect("decode proceeds from the preallocated envelope");
-        assert_eq!(op.kind, OpKind::DecodeUnd);
-        assert_eq!(
-            sched.bm.blocks_for(id).len(),
-            8,
-            "decode does not allocate beyond the admission worst case"
-        );
-        let st = sched.running.get(&id).unwrap();
-        let target = st.req.resources.max_kv_tokens;
-        assert!(sched.bm.blocks_for(id).len() * sched.caps.block_size as usize >= target);
-
-        // Finishing the resident request frees its envelope and unblocks the
-        // queued one — the FIFO drains instead of deadlocking.
-        sched.finish(id, FinishReason::Eos);
-        sched.admit();
-        assert!(
-            sched.running.contains_key(&RequestId(2)),
-            "queued request admits once the envelope is released"
-        );
-        assert_eq!(sched.pending.len(), 0);
-    }
-
-    #[test]
-    fn assemble_interleaves_packed_mixed_and_decode_service() {
-        // A ready text-decode op and image-denoise op share one packed forward.
-        // While that denoise op is in flight, the next pipeline slot services
-        // decode lookahead without admitting another denoise request.
-        let caps = EngineCaps {
-            block_size: 4,
-            num_blocks: 256,
-            latent_downsample: 16,
-            ..Default::default()
-        };
-        let mut sched = Scheduler::with_config(
-            Box::new(NullExecutor { caps, in_flight: 0 }),
-            ControlTokens::default(),
-            SchedulerConfig {
-                max_batch: 8,
-                max_num_batched_tokens: 24,
-                max_num_seqs: 8,
-                long_prefill_threshold: 16,
-                ..Default::default()
-            },
-        );
-
-        // Request 1: a continuation-capable request at an image boundary.
-        let mut gen_req = test_request(1, 4);
-        request_with_generation_behavior(
-            &mut gen_req,
-            uniserve_core::GenerationConstraint::Default,
-        );
-        gen_req.max_und_tokens = 64;
-        gen_req.image = uniserve_core::ImageParams {
-            height: 64,
-            width: 64,
-            max_images: 2,
-            retain_images: true,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut gen_req);
-        let _rx1 = sched.submit_for_test(gen_req);
-        // Request 2: a plain text-decode request -> DecodeUnd.
-        let mut und_req = test_request(2, 4);
-        und_req.max_und_tokens = 64;
-        und_req.sampling.ignore_eos = true;
-        compile_resources(&sched, &mut und_req);
-        let _rx2 = sched.submit_for_test(und_req);
-        // Request 3: another image-denoise request. The token budget admits
-        // one denoise operation per batch, matching large-latent workloads.
-        let mut second_gen_req = test_request(3, 4);
-        request_with_generation_behavior(
-            &mut second_gen_req,
-            uniserve_core::GenerationConstraint::Default,
-        );
-        second_gen_req.max_und_tokens = 64;
-        second_gen_req.image = uniserve_core::ImageParams {
-            height: 64,
-            width: 64,
-            max_images: 2,
-            retain_images: true,
-            ..Default::default()
-        };
-        compile_resources(&sched, &mut second_gen_req);
-        let _rx3 = sched.submit_for_test(second_gen_req);
-        sched.admit();
-        sched.decode_lookahead = true;
-        sched.decode_token_burst = 8;
-
-        if let Some(st) = sched.running.get_mut(&RequestId(1)) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.und.logical_pos = 4;
-            st.ingest.prompt_cursor = 4;
-            st.und.tokens_emitted = 1;
-            st.replay.generated_ids.clear();
-        }
-        sched.begin_image(RequestId(1));
-        if let Some(st) = sched.running.get_mut(&RequestId(3)) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.und.logical_pos = 4;
-            st.ingest.prompt_cursor = 4;
-            st.und.tokens_emitted = 1;
-            st.replay.generated_ids.clear();
-        }
-        sched.begin_image(RequestId(3));
-        assert_eq!(
-            sched.running.get(&RequestId(1)).map(|s| s.lifecycle.phase),
-            Some(Phase::DenoiseGen),
-            "request 1 must be denoising"
-        );
-        assert_eq!(
-            sched.running.get(&RequestId(3)).map(|s| s.lifecycle.phase),
-            Some(Phase::DenoiseGen),
-            "request 3 must be denoising"
-        );
-        if let Some(st) = sched.running.get_mut(&RequestId(2)) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.und.logical_pos = 4;
-            st.ingest.prompt_cursor = 4;
-            st.und.next_token = 7;
-        }
-
-        let (_new, ops) = sched.assemble();
-        let has_gen = ops.iter().any(|o| o.kind == OpKind::DenoiseGen);
-        let has_und_decode = ops.iter().any(|o| o.kind == OpKind::DecodeUnd);
-        assert!(
-            has_gen && has_und_decode,
-            "assemble must co-batch text-decode with image-denoise in one forward: {:?}",
-            ops.iter().map(|o| o.kind).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            ops.iter()
-                .filter(|op| op.kind == OpKind::DenoiseGen)
-                .count(),
-            1,
-            "the token budget should admit one denoise operation"
-        );
-        for op in ops {
-            sched.register_inflight(op, Instant::now());
-        }
-
-        let (_new, lookahead) = sched.assemble();
-        assert!(
-            lookahead.iter().any(|op| op.kind == OpKind::DecodeUnd),
-            "decode lookahead must keep the pipeline full"
-        );
-        assert!(
-            lookahead.iter().all(|op| op.kind != OpKind::DenoiseGen),
-            "a second denoise operation must not occupy the decode service slot: {:?}",
-            lookahead.iter().map(|op| op.kind).collect::<Vec<_>>()
-        );
-    }
-
-    fn drain_text_tokens(rx: &mut tokio::sync::mpsc::UnboundedReceiver<GenEvent>) -> Vec<u32> {
-        let mut tokens = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            if let GenEvent::TextToken { id, .. } = ev {
-                tokens.push(id);
-            }
-        }
-        tokens
-    }
-
-    #[test]
-    fn spec_decode_commits_accepted_and_sampled_tokens() {
-        let mut sched = test_scheduler();
-        let req = test_request(1, 4);
-        let mut rx = sched.submit_for_test(req);
-        sched.admit();
-
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.und.logical_pos = 4;
-            st.ingest.prompt_cursor = 4;
-            st.und.next_token = 10;
-        }
-        let transition = sched
-            .plan_intent(
-                id,
-                sched.projected_cursor(id).expect("cursor projection"),
-                TransitionIntent::DecodeUnd {
-                    position: 4,
-                    token_id: 10,
-                    token_source: TokenSource::Wire,
-                    new_blocks: Vec::new(),
-                    spec_token_ids: Some(vec![11, 12]),
-                    token_count: 1,
-                    stop_token_ids: None,
-                    stop_terminal: true,
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("speculative decode transition");
-        apply_and_resolve(
-            &mut sched,
-            id,
-            transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(13),
-                num_accepted_tokens: Some(2),
-                ..Default::default()
-            },
-            vec![11, 12],
-        );
-
-        let st = sched.running.get(&id).expect("request still running");
-        assert_eq!(st.und.logical_pos, 7);
-        assert_eq!(st.und.tokens_emitted, 3);
-        assert_eq!(st.replay.generated_ids, vec![11, 12, 13]);
-        assert_eq!(st.und.next_token, 13);
-        assert_eq!(drain_text_tokens(&mut rx), vec![11, 12, 13]);
-    }
-
-    // the waiting queue is bounded — submits past `max_num_waiting` are
-    // rejected at enqueue instead of growing the pending queue without bound.
-    #[test]
-    fn enqueue_rejects_when_waiting_queue_is_full() {
-        let mut sched = test_scheduler();
-        sched.set_max_num_waiting(2);
-        // The first two fit the waiting queue (admission is not run here).
-        sched.submit_for_test(test_request(1, 4));
-        sched.submit_for_test(test_request(2, 4));
-        assert_eq!(sched.pending.len(), 2);
-        // The third overflows and must be rejected (not queued).
-        let over = test_request(3, 4);
-        let mut rx = sched.submit_for_test(over);
-        assert_eq!(
-            sched.pending.len(),
-            2,
-            "overflow request must not be queued"
-        );
-        match rx.try_recv() {
-            Ok(GenEvent::Rejected { .. }) => {}
-            other => panic!("expected Rejected event, got {other:?}"),
-        }
-    }
-
-    // a cancelled request with an op still in flight must NOT be finished
-    // (its KV freed) until the op resolves; reaping defers it instead.
-    #[test]
-    fn reap_defers_cancelled_request_with_inflight_op() {
-        let mut sched = test_scheduler();
-        sched.submit_for_test(test_request(1, 4));
-        sched.admit();
-        let id = RequestId(1);
-        assert!(sched.running.contains_key(&id));
-        // Simulate an op in flight for this request.
-        let mut op = sched.next_transition(id, 4).expect("prefill transition");
-        op.assign_op_id(1);
-        sched.register_inflight(op, Instant::now());
-        assert!(sched.has_inflight(id));
-        // Cancel, then reap: the request must survive while its op is in flight.
-        sched.mark_cancelled(id, false);
-        sched.reap_cancellations();
-        assert!(
-            sched.running.contains_key(&id),
-            "cancelled request with an in-flight op must not be reaped yet"
-        );
-        // Once the op drains, the next reap finishes it.
-        let _ = sched.pop_inflight(id, Some(1));
-        assert!(!sched.has_inflight(id));
-        sched.reap_cancellations();
-        assert!(
-            !sched.running.contains_key(&id),
-            "cancelled request must be reaped after its op resolves"
-        );
-    }
-
-    #[test]
-    fn cancellation_defers_cleanup_for_every_transition_class() {
-        #[derive(Clone, Copy, Debug)]
-        enum Case {
-            TextIngest,
-            ImageIngest,
-            UndDecode,
-            GenDenoise,
-            GenCommit,
-            Feedback,
-        }
-
-        for (index, case) in [
-            Case::TextIngest,
-            Case::ImageIngest,
-            Case::UndDecode,
-            Case::GenDenoise,
-            Case::GenCommit,
-            Case::Feedback,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut sched = test_scheduler();
-            let id = RequestId(index as u64 + 1);
-            let mut request = test_request(id.0, 4);
-            if matches!(case, Case::ImageIngest) {
-                add_context_image(&mut request, 2, false);
-            }
-            if matches!(case, Case::GenDenoise | Case::GenCommit | Case::Feedback) {
-                if matches!(case, Case::Feedback) {
-                    request.policy.feedback = Some(uniserve_core::GeneratedImageFeedbackRecipe {
-                        commit: uniserve_core::CommitRecipe::CommitGenThenWriteback,
-                        writeback: uniserve_core::FeedbackWriteback::DirectKv,
-                        next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
-                        logical_positions: 1,
-                        physical_kv_tokens: uniserve_core::ImageKvEffect::Exact { tokens: 1 },
-                    });
-                }
-                request_with_generation_behavior(
-                    &mut request,
-                    uniserve_core::GenerationConstraint::Default,
-                );
-            }
-            compile_resources(&sched, &mut request);
-            let mut events = sched.submit_for_test(request);
-            sched.admit();
-
-            if let Some(state) = sched.running.get_mut(&id) {
-                match case {
-                    Case::TextIngest => {}
-                    Case::ImageIngest => {
-                        state.ingest.prompt_cursor = 2;
-                        state.und.logical_pos = 2;
-                        state.und.physical_kv_len = 2;
-                    }
-                    Case::UndDecode => {
-                        state.ingest.prompt_cursor = 4;
-                        state.und.logical_pos = 4;
-                        state.und.physical_kv_len = 4;
-                        state.lifecycle.phase = Phase::DecodeUnd;
-                    }
-                    Case::GenDenoise => {
-                        state.ingest.prompt_cursor = 4;
-                        state.und.logical_pos = 4;
-                        state.und.physical_kv_len = 4;
-                        state.image_gen.cond_pos = 4;
-                        state.image_gen.image_id = 1;
-                        state.lifecycle.phase = Phase::DenoiseGen;
-                    }
-                    Case::GenCommit => {
-                        state.ingest.prompt_cursor = 4;
-                        state.und.logical_pos = 4;
-                        state.und.physical_kv_len = 4;
-                        state.image_gen.cond_pos = 4;
-                        state.image_gen.image_id = 1;
-                        state.lifecycle.phase = Phase::CommitGen;
-                    }
-                    Case::Feedback => {
-                        state.ingest.prompt_cursor = 4;
-                        state.und.logical_pos = 4;
-                        state.und.physical_kv_len = 4;
-                        state.image_gen.cond_pos = 4;
-                        state.image_gen.image_id = 1;
-                        state.feedback.locator = Some("locator".to_string());
-                        state.lifecycle.phase = Phase::CommitWriteback;
-                    }
-                }
-            }
-
-            let mut transition = sched
-                .next_transition(id, 8)
-                .unwrap_or_else(|| panic!("{case:?} must produce a transition"));
-            transition.assign_op_id(index as u64 + 1);
-            sched.register_inflight(transition, Instant::now());
-            sched.mark_cancelled(id, false);
-            sched.reap_cancellations();
-            assert!(
-                sched.running.contains_key(&id),
-                "{case:?} cancellation released state while its op was in flight"
-            );
-
-            let _ = sched.pop_inflight(id, Some(index as u64 + 1));
-            sched.reap_cancellations();
-            assert!(
-                !sched.running.contains_key(&id),
-                "{case:?} cancellation did not clean up after result ownership ended"
-            );
-            let terminal = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| {
-                if let GenEvent::Finished { reason, .. } = event {
-                    Some(reason)
-                } else {
-                    None
-                }
-            });
-            assert_eq!(terminal, Some(FinishReason::Cancelled), "{case:?}");
-            assert_eq!(sched.ledger.total_active(), 0, "{case:?} leaked leases");
-        }
-    }
-
-    // A context-image decode burst commits every returned token; a burst
-    // that stopped on <|im_end|> closes the round directly (its KV was already
-    // fed by the worker's speculative stop-token forward; no context_round_closing op).
-    #[test]
-    fn context_decode_burst_commits_tokens_and_closes_round_on_eos() {
-        let mut sched = test_scheduler();
-        sched.ctrl.eos = vec![99];
-        let mut req = test_request(1, 4);
-        add_context_image(&mut req, 2, false);
-        req.policy.trigger = uniserve_core::TriggerPolicyDescriptor::RoundCloseThenSuffix {
-            close_token_ids: vec![99],
-            trigger_token_ids: vec![21, 22],
-        };
-        req.behavior =
-            uniserve_core::GenerationBehaviorDescriptor::resolve(req.constraint, &req.policy);
-        req.max_und_tokens = 64;
-        compile_resources(&sched, &mut req);
-        let mut rx = sched.submit_for_test(req);
-        sched.decode_token_burst = 2;
-        sched.admit();
-        let id = RequestId(1);
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.lifecycle.phase = Phase::DecodeUnd;
-            st.ingest.prompt_cursor = 4;
-            st.ingest.mm_cursor = 1;
-            st.und.logical_pos = 10;
-            st.und.physical_kv_len = 10;
-        }
-
-        let decode_transition = sched.next_transition(id, 2).expect("decode transition");
-
-        // Full burst, no stop: every token commits and resolution applies the
-        // full position/KV advance.
-        apply_and_resolve(
-            &mut sched,
-            id,
-            decode_transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(6),
-                sampled_token_ids: Some(vec![5, 6]),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-        {
-            let st = sched.running.get(&id).expect("still running");
-            assert_eq!(st.und.tokens_emitted, 2);
-            assert_eq!(st.und.round_tokens, vec![5, 6]);
-            assert_eq!(st.und.next_token, 6);
-            assert_eq!(st.und.logical_pos, 12);
-            assert_eq!(st.und.physical_kv_len, 12);
-        }
-        assert_eq!(drain_text_tokens(&mut rx), vec![5, 6]);
-
-        // Burst tail hits eos: the committed tokens emit, the round closes
-        // without a context_round_closing hop, and (no image trigger) the request ends.
-        let decode_transition = sched.next_transition(id, 2).expect("decode transition");
-        apply_and_resolve(
-            &mut sched,
-            id,
-            decode_transition,
-            uniserve_worker_wire::SeqResult {
-                req_id: id,
-                sampled_token_id: Some(99),
-                sampled_token_ids: Some(vec![7, 99]),
-                ..Default::default()
-            },
-            Vec::new(),
-        );
-        assert!(
-            !sched.running.contains_key(&id),
-            "eos-terminated burst must finish the request"
-        );
-        assert_eq!(drain_text_tokens(&mut rx), vec![7]);
-    }
-
-    // Context ingest follows the profile recipe exactly; capability validation
-    // rejects a recipe the worker cannot execute.
-    #[test]
-    fn context_encode_respects_vae_capability() {
-        for (has_vae, expected_first) in [(false, OpKind::VitEncode), (true, OpKind::VaeEncode)] {
-            let mut sched = test_scheduler();
-            if has_vae {
-                sched.caps.supported_ops.push(OpKind::VaeEncode);
-            }
-            let mut req = test_request(1, 5);
-            add_context_image(&mut req, 2, has_vae);
-            compile_resources(&sched, &mut req);
-            sched.submit_for_test(req);
-            sched.admit();
-            let id = RequestId(1);
-
-            // Prefill chunks to the image boundary...
-            let op = sched.next_transition(id, 64).expect("prefill op");
-            assert_eq!(op.kind, OpKind::PrefillUnd);
-            assert_eq!(op.pos_range, (0, 2));
-            apply_and_resolve(
-                &mut sched,
-                id,
-                op,
-                uniserve_worker_wire::SeqResult {
-                    req_id: id,
-                    sampled_token_id: Some(9),
-                    ..Default::default()
-                },
-                Vec::new(),
-            );
-            // ...then the encode fires at the in-prompt marker gap.
-            let op = sched.next_transition(id, 64).expect("encode op");
-            assert_eq!(op.kind, expected_first, "has_vae={has_vae}");
-            assert_eq!(op.cond_pos, Some(2));
-            assert_eq!(op.image_b64.as_deref(), Some("aGVsbG8="));
-        }
-    }
-
-    #[test]
-    fn encoder_cache_hit_plans_worker_attach_and_no_store_uses_transient_residency() {
-        let mut cached = test_scheduler();
-        let mut cached_request = test_request(1, 4);
-        add_context_image(&mut cached_request, 2, false);
-        compile_resources(&cached, &mut cached_request);
-        let cache_key = cached_request.resources.encoder_cache_keys[0];
-        cached.enc_cache.insert_output(cache_key, 77, 1);
-        cached.submit_for_test(cached_request);
-        cached.admit();
-        let id = RequestId(1);
-        if let Some(state) = cached.running.get_mut(&id) {
-            state.ingest.prompt_cursor = 2;
-            state.und.logical_pos = 2;
-            state.und.physical_kv_len = 2;
-        }
-
-        let hit = cached.next_transition(id, 64).expect("cached attach");
-        assert_eq!(hit.kind, OpKind::VitEncode);
-        assert_eq!(hit.image_b64, None);
-        assert_eq!(hit.image_in, Some(77));
-        assert_eq!(hit.mm_hash, Some(cache_key));
-        assert!(matches!(
-            hit.delta,
-            crate::generation::TransitionDelta::IngestImageStep {
-                encoder_cache_key: Some(key),
-                cache_hit: true,
-                ..
-            } if key == cache_key
-        ));
-        assert!(cached.reserve_transition_resources(&hit));
-        assert_eq!(
-            cached
-                .running
-                .get(&id)
-                .expect("cached request")
-                .ingest
-                .acquired_encoder_pins,
-            vec![EncoderCachePin {
-                key: cache_key,
-                handle: 77,
-            }]
-        );
-        cached.finish(id, FinishReason::Cancelled);
-
-        let mut transient = test_scheduler();
-        let mut transient_request = test_request(2, 4);
-        add_context_image(&mut transient_request, 2, false);
-        transient_request.cache.read = false;
-        transient_request.cache.write = false;
-        compile_resources(&transient, &mut transient_request);
-        transient.submit_for_test(transient_request);
-        transient.admit();
-        let id = RequestId(2);
-        if let Some(state) = transient.running.get_mut(&id) {
-            state.ingest.prompt_cursor = 2;
-            state.und.logical_pos = 2;
-            state.und.physical_kv_len = 2;
-        }
-
-        let miss = transient.next_transition(id, 64).expect("transient encode");
-        assert_eq!(miss.kind, OpKind::VitEncode);
-        assert!(miss.image_b64.is_some());
-        assert_ne!(miss.mm_hash, Some(cache_key));
-        assert!(matches!(
-            miss.delta,
-            crate::generation::TransitionDelta::IngestImageStep {
-                encoder_cache_key: None,
-                cache_hit: false,
-                ..
-            }
-        ));
-    }
-
-    // generated branch stays resident. Replaying prompt++generated under load is a
-    // performance cliff.
-    #[test]
-    fn gen_branch_is_not_preemptible() {
-        let mut sched = test_scheduler();
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        compile_resources(&sched, &mut req);
-        sched.submit_for_test(req);
-        sched.admit();
-        assert!(sched.running.contains_key(&RequestId(1)));
-        assert!(!sched.preemptible(RequestId(1)));
-    }
-
-    #[test]
-    fn gen_branch_with_generated_output_is_not_preemptible() {
-        let mut sched = test_scheduler();
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        compile_resources(&sched, &mut req);
-        sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        assert!(sched.running.contains_key(&id));
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.replay.generated_ids.push(11);
-        }
-        assert!(!sched.preemptible(id));
-    }
-
-    #[test]
-    fn gen_branch_with_committed_image_is_not_preemptible() {
-        let mut sched = test_scheduler();
-        let mut req = test_request(1, 4);
-        request_with_generation_behavior(&mut req, uniserve_core::GenerationConstraint::Default);
-        compile_resources(&sched, &mut req);
-        sched.submit_for_test(req);
-        sched.admit();
-        let id = RequestId(1);
-        assert!(sched.running.contains_key(&id));
-        if let Some(st) = sched.running.get_mut(&id) {
-            st.image_gen.images_done = 1;
-        }
-        assert!(!sched.preemptible(id));
+        assert!(take_operation_new_blocks(&mut operation).is_empty());
     }
 }

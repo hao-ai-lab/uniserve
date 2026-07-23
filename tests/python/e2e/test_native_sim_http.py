@@ -83,7 +83,6 @@ def sim_server(tmp_path: Path):
     args = [
         str(binary),
         "serve",
-        "--model-path",
         str(model),
         "--served-model-name",
         "SenseNova-U1",

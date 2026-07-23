@@ -205,7 +205,6 @@ def server_command_template(config: dict[str, Any], name: str) -> list[str]:
         [
             launcher_path(config.get("server_bin", "target/debug/uniserve")),
             "serve",
-            "--model-path",
             str(definition["model"]),
             "--served-model-name",
             str(definition["served_model_name"]),

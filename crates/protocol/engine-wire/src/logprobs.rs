@@ -288,7 +288,6 @@ impl WireLogprobs {
                 shape: vec![rows],
                 data: WireArrayData::RawView(token_ranks),
             },
-            cu_num_generated_tokens: None,
         })
     }
 
@@ -299,13 +298,6 @@ impl WireLogprobs {
     where
         Frame: AsRef<[u8]>,
     {
-        if let Some(indices) = self.cu_num_generated_tokens {
-            bail_ext_value_decode!(
-                "{field_prefix}.cu_num_generated_tokens: \
-                 expected None for per-request engine logprobs payload, got {indices:?}"
-            );
-        }
-
         let token_ids = array::decode_array2_token_ids(
             self.logprob_token_ids,
             &format!("{field_prefix}.logprob_token_ids"),

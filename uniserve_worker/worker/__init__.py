@@ -1,5 +1,5 @@
-"""Concrete execution workers hosted by :class:`WorkerServer`."""
+"""Concrete execution workers hosted by the worker server."""
 
-from .protocol import ResultPolicy, Worker, WorkerContract
+from .protocol import Worker, WorkerContract
 
-__all__ = ["ResultPolicy", "Worker", "WorkerContract"]
+__all__ = ["Worker", "WorkerContract"]

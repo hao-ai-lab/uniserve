@@ -1,77 +1,76 @@
-"""Attention backend registry package.
+"""Construction of worker-owned attention implementations."""
 
-Consumers look up concrete backend instances by name, while runtime capability
-selection lives in ``uniserve_worker.ops``. Concrete backend classes are
-deliberately not re-exported here; import the submodule directly if a test needs
-a concrete type. Available backends register themselves as an import side effect.
-"""
-import logging
+from __future__ import annotations
 
-from . import registry
-from . import torch_sdpa as _torch_sdpa  # noqa: F401  # registers the portable default backend
-from .base import AttentionBackend, AttentionCapabilities
-from .registry import (
-    get_attention_backend,
-    has_attention_backend,
-    list_attention_backends,
-    normalize_attention_backend_name,
-    register_attention_backend,
-)
+from collections.abc import Callable
 
-_log = logging.getLogger("uniserve.attention")
-
-
-def _load_optional_backend(module: str, attr: str):
-    """Import an optional attention backend, returning None when its dependency
-    is absent. A genuinely missing optional dependency (ImportError) is silent;
-    any other failure means the backend module exists but is broken/misconfigured,
-    so it is logged at warning level (with traceback) instead of being swallowed."""
-    try:  # pragma: no cover - optional dependency unavailable/misconfigured.
-        mod = __import__(f"{__name__}.{module}", fromlist=[attr])
-        return getattr(mod, attr)
-    except ImportError:  # pragma: no cover - optional dependency simply not installed.
-        return None
-    except Exception:  # pragma: no cover - real misconfiguration; surface it.
-        _log.warning(
-            "Optional attention backend %r failed to import; treating as unavailable.",
-            module,
-            exc_info=True,
-        )
-        return None
-
-
-_OPTIONAL_BACKENDS = (
-    ("trtllm_mha", "TRTLLMMHAAttentionBackend"),
-    ("flashinfer", "FlashInferAttentionBackend"),
-    ("fa4_cute", "Fa4CuteAttentionBackend"),
-    ("flash_attn", "FlashAttentionBackend"),
-    ("sgl_kernel", "SglKernelAttentionBackend"),
-)
-
-
-def init_attention_backends() -> tuple[str, ...]:
-    """Ensure every available attention backend is registered.
-
-    Registration also runs at import time; this entry point is safe to call repeatedly.
-    Returns sorted registered backend names.
-    """
-    for module, attr in _OPTIONAL_BACKENDS:
-        _load_optional_backend(module, attr)
-    return list_attention_backends()
-
-
-# Register every available optional backend as an import side effect; the
-# portable ``torch_sdpa`` default is registered by importing its module above.
-init_attention_backends()
-registry._snapshot_default_backends_for_testing()
+from ...forward import AttentionBackend, AttentionSelection
+from ...foundation.errors import capability_mismatch
+from ...foundation.runtime_config import FlashInferTuningConfig
+from .base import AttentionCapabilities
 
 __all__ = [
     "AttentionBackend",
     "AttentionCapabilities",
-    "get_attention_backend",
-    "has_attention_backend",
-    "init_attention_backends",
-    "list_attention_backends",
-    "normalize_attention_backend_name",
-    "register_attention_backend",
+    "ATTENTION_BACKENDS",
+    "resolve_attention_selection",
 ]
+
+
+ATTENTION_BACKENDS = (
+    "auto",
+    "trtllm_mha",
+    "sgl_kernel",
+    "flashinfer",
+    "flash_attn",
+    "fa4_cute",
+    "torch_sdpa",
+)
+
+
+def _constructors(
+    tuning: FlashInferTuningConfig,
+) -> tuple[tuple[str, Callable[[], AttentionBackend]], ...]:
+    from .fa4_cute import Fa4CuteAttentionBackend
+    from .flash_attn import FlashAttentionBackend
+    from .flashinfer import FlashInferAttentionBackend
+    from .sgl_kernel import SglKernelAttentionBackend
+    from .torch_sdpa import TorchSDPAAttentionBackend
+    from .trtllm_mha import TRTLLMMHAAttentionBackend
+
+    return (
+        ("trtllm_mha", lambda: TRTLLMMHAAttentionBackend(tuning=tuning)),
+        ("sgl_kernel", SglKernelAttentionBackend),
+        ("flashinfer", lambda: FlashInferAttentionBackend(tuning=tuning)),
+        ("flash_attn", FlashAttentionBackend),
+        ("fa4_cute", Fa4CuteAttentionBackend),
+        ("torch_sdpa", TorchSDPAAttentionBackend),
+    )
+
+
+def resolve_attention_selection(
+    name: str,
+    *,
+    tuning: FlashInferTuningConfig,
+    block_size: int,
+) -> AttentionSelection:
+    """Resolve one canonical deployment choice without process-global state."""
+
+    requested = str(name)
+    if requested not in ATTENTION_BACKENDS:
+        raise capability_mismatch(
+            f"unknown attention backend {requested!r}; expected one of {ATTENTION_BACKENDS!r}"
+        )
+    available: list[AttentionBackend] = []
+    for candidate, construct in _constructors(tuning):
+        if requested != "auto" and candidate != requested:
+            continue
+        backend = construct()
+        capabilities = backend.capabilities()
+        multiple = int(getattr(capabilities, "paged_block_size_multiple", 1) or 1)
+        if bool(getattr(capabilities, "available", True)) and int(block_size) % multiple == 0:
+            available.append(backend)
+    if not available:
+        raise capability_mismatch(f"attention backend {requested!r} is unavailable")
+    identity = requested if requested != "auto" else "+".join(value.name for value in available)
+    return AttentionSelection(identity=identity, providers=tuple(available))

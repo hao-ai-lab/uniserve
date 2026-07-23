@@ -1,149 +1,194 @@
-"""Behavioral contracts for ModelSpec composition and the resolved digest."""
+"""Behavioral contracts for immutable model declarations and resolved identity."""
 
 from __future__ import annotations
 
 import dataclasses
+from dataclasses import replace
 
 import pytest
 
-from uniserve_worker.contracts.model_spec import (
-    CacheSpec,
-    DeploymentOverlay,
-    FlowSpec,
-    InputSpec,
+from tests.python.fixtures.model_execution import TEST_DEPLOYMENT, TEST_MODEL_SPEC
+from uniserve_worker.foundation.errors import ErrorCode, WorkerError
+from uniserve_worker.spec import (
     ModelSpec,
+    OperationSpec,
+    OperationStageSpec,
+    OperationType,
+    Rename,
+    RouteOutputKind,
+    RoutePlacement,
+    RouteRowKind,
+    RouteShape,
     RouteSpec,
+    Stack,
+    WeightSpec,
     resolved_digest,
 )
-from uniserve_worker.foundation.errors import ErrorCode, WorkerError
-from uniserve_worker.loader.weight_spec import Rename, StackedParamMapping, WeightSpec
 
 pytestmark = pytest.mark.unit
 
 
-def _text_route(**overrides):
-    values = dict(
-        name="text",
-        op_kinds=("prefill_und", "decode_und"),
-        mixed=True,
-        dtype="bfloat16",
-        graph_eligible=True,
-    )
+def _route(**overrides: object) -> RouteSpec:
+    values: dict[str, object] = {
+        "name": "text",
+        "row_kinds": (RouteRowKind.TOKEN,),
+        "output_kinds": (RouteOutputKind.TOKEN,),
+        "mixed_combinations": (),
+        "dtype": "float32",
+        "placement": RoutePlacement.PRIMARY,
+        "topology_axes": ("tp",),
+        "shape": RouteShape(max_tokens_per_row=128, token_multiple=1),
+        "graph_eligible": True,
+    }
     values.update(overrides)
-    return RouteSpec(**values)
+    return RouteSpec(**values)  # type: ignore[arg-type]
 
 
-def _spec(**overrides):
-    values = dict(
-        architecture="TinyForCausalLM",
-        routes=(_text_route(),),
-        weights=WeightSpec(
-            renames=(Rename("model.", "core."),),
-            stacked=(StackedParamMapping("qkv_proj", "q_proj", "q"),),
+def _spec(**overrides: object) -> ModelSpec:
+    route = _route()
+    values: dict[str, object] = {
+        "architecture": "ConformanceModel",
+        "revision": "revision-a",
+        "routes": (route,),
+        "operations": (
+            OperationSpec(
+                OperationType.SEQUENCE_EXTEND,
+                (OperationStageSpec(route.name, RouteRowKind.TOKEN),),
+            ),
         ),
-        inputs=InputSpec(requires_worker_tokenizer=True),
-        cache=CacheSpec(num_layers=2, num_kv_heads=4, head_dim=64, dtype="bfloat16"),
-        revision="rev-a",
-    )
+        "weights": WeightSpec(
+            transforms=(
+                Rename("model.", "core."),
+                Stack("qkv_proj", "q_proj", "q"),
+            )
+        ),
+        "inputs": TEST_MODEL_SPEC.inputs,
+        "cache": TEST_MODEL_SPEC.cache,
+    }
     values.update(overrides)
-    return ModelSpec(**values)
+    return ModelSpec(**values)  # type: ignore[arg-type]
 
 
-def _overlay(**overrides):
-    values = dict(
-        device="cuda:0",
-        model_scope="whole",
-        tp_rank=0,
-        tp_size=1,
-        block_size=16,
-        kv_token_capacity=4096,
-        generation_kv_capacity_tokens=None,
-        attention_backend="auto",
-        model_dtype="bfloat16",
-        kv_cache_dtype=None,
-    )
-    values.update(overrides)
-    return DeploymentOverlay(**values)
-
-
-def test_model_spec_composition_is_immutable():
+def test_model_declarations_are_immutable():
     spec = _spec()
-    overlay = _overlay()
     with pytest.raises(dataclasses.FrozenInstanceError):
-        spec.architecture = "Other"
+        spec.architecture = "Other"  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
-        spec.routes[0].op_kinds = ("decode_und",)
+        spec.routes[0].dtype = "float16"  # type: ignore[misc]
     with pytest.raises(dataclasses.FrozenInstanceError):
-        overlay.block_size = 32
+        TEST_DEPLOYMENT.block_size = 32  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        spec.weights.transforms[0].source = "other."  # type: ignore[misc,union-attr]
 
 
-def test_route_rejects_unknown_and_repeated_op_kinds():
-    with pytest.raises(WorkerError) as unknown:
-        _text_route(op_kinds=("prefill_und", "no_such_op"))
-    assert unknown.value.code is ErrorCode.INVALID_DESCRIPTOR
-    with pytest.raises(WorkerError):
-        _text_route(op_kinds=("prefill_und", "prefill_und"))
-    with pytest.raises(WorkerError):
-        _text_route(op_kinds=())
-
-
-def test_model_spec_rejects_ambiguous_route_bindings():
-    with pytest.raises(WorkerError) as duplicate_name:
-        _spec(routes=(_text_route(), _text_route(op_kinds=("target_verify_und",))))
-    assert "unique" in duplicate_name.value.message
-    with pytest.raises(WorkerError) as shared_kind:
-        _spec(
-            routes=(
-                _text_route(),
-                _text_route(name="text2", op_kinds=("decode_und", "target_verify_und")),
+def test_weight_spec_rejects_duplicate_stack_sources():
+    with pytest.raises(WorkerError, match="weight stack sources must be unique"):
+        WeightSpec(
+            transforms=(
+                Stack("first", "q_proj", "q"),
+                Stack("second", "q_proj", "q"),
             )
         )
-    assert "exactly one physical route" in shared_kind.value.message
-    with pytest.raises(WorkerError):
-        _spec(routes=())
 
 
-def test_denoise_route_requires_a_flow_spec():
-    denoise_route = _text_route(name="mot", op_kinds=("prefill_und", "denoise_gen"))
-    with pytest.raises(WorkerError) as missing_flow:
-        _spec(routes=(denoise_route,))
-    assert "FlowSpec" in missing_flow.value.message
+def test_route_requires_a_closed_aligned_row_output_vocabulary():
+    with pytest.raises(WorkerError) as repeated:
+        _route(row_kinds=(RouteRowKind.TOKEN, RouteRowKind.TOKEN))
+    assert repeated.value.code is ErrorCode.INVALID_DESCRIPTOR
 
-    spec = _spec(
-        routes=(denoise_route,),
-        flow=FlowSpec(
-            latent_downsample=16,
-            prediction="velocity",
-            schedule_direction="descending",
-            schedule_shift_domain="time",
-        ),
+    with pytest.raises(WorkerError, match="map each row kind"):
+        _route(output_kinds=())
+
+    with pytest.raises(WorkerError, match="mixes a row kind it does not accept"):
+        _route(mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),))
+
+
+def test_model_spec_rejects_ambiguous_or_invalid_operation_routes():
+    route = _route()
+    with pytest.raises(WorkerError, match="route names must be unique"):
+        _spec(routes=(route, route))
+
+    with pytest.raises(WorkerError, match="unknown route"):
+        _spec(
+            operations=(
+                OperationSpec(
+                    OperationType.SEQUENCE_EXTEND,
+                    (OperationStageSpec("missing", RouteRowKind.TOKEN),),
+                ),
+            )
+        )
+
+    with pytest.raises(WorkerError, match="does not accept"):
+        _spec(
+            operations=(
+                OperationSpec(
+                    OperationType.FLOW,
+                    (OperationStageSpec(route.name, RouteRowKind.FLOW),),
+                ),
+            ),
+            flow=TEST_MODEL_SPEC.flow,
+        )
+
+
+def test_flow_operation_requires_a_flow_spec():
+    flow_route = _route(
+        row_kinds=(RouteRowKind.FLOW,),
+        output_kinds=(RouteOutputKind.FLOW,),
     )
-    assert spec.op_kinds() == frozenset({"prefill_und", "denoise_gen"})
+    with pytest.raises(WorkerError, match="declares no FlowSpec"):
+        _spec(
+            routes=(flow_route,),
+            operations=(
+                OperationSpec(
+                    OperationType.FLOW,
+                    (OperationStageSpec(flow_route.name, RouteRowKind.FLOW),),
+                ),
+            ),
+        )
 
 
-def test_resolved_digest_is_stable_for_equal_declarations():
-    first = resolved_digest(_spec(), _overlay())
-    second = resolved_digest(_spec(), _overlay())
-    assert first == second
+def test_resolved_digest_is_stable_and_binds_spec_and_deployment():
+    first = resolved_digest(_spec(), TEST_DEPLOYMENT)
+    assert first == resolved_digest(_spec(), TEST_DEPLOYMENT)
     assert len(first) == 64
     int(first, 16)
 
+    assert resolved_digest(_spec(revision="revision-b"), TEST_DEPLOYMENT) != first
+    assert resolved_digest(_spec(), replace(TEST_DEPLOYMENT, block_size=32)) != first
+    assert resolved_digest(_spec(), replace(TEST_DEPLOYMENT, device="cuda")) != first
 
-def test_resolved_digest_separates_spec_and_overlay_identities():
-    base = resolved_digest(_spec(), _overlay())
-    assert resolved_digest(_spec(revision="rev-b"), _overlay()) != base
-    assert resolved_digest(_spec(), _overlay(block_size=32)) != base
-    assert resolved_digest(_spec(), _overlay(device="cuda:1")) != base
-    assert resolved_digest(_spec(), _overlay(tp_size=2)) != base
-    assert (
-        resolved_digest(_spec(routes=(_text_route(graph_eligible=False),)), _overlay()) != base
+
+def test_resolved_digest_is_shared_by_tensor_parallel_ranks():
+    rank_zero = replace(TEST_DEPLOYMENT, device="cuda:0", tp_rank=0, tp_size=2)
+    rank_one = replace(TEST_DEPLOYMENT, device="cuda:1", tp_rank=1, tp_size=2)
+
+    assert resolved_digest(_spec(), rank_zero) == resolved_digest(_spec(), rank_one)
+    assert resolved_digest(_spec(), rank_zero) != resolved_digest(
+        _spec(), replace(rank_zero, tp_size=4)
     )
 
 
-def test_deployment_overlay_validates_topology():
+def test_deployment_overlay_validates_topology_and_capacity():
     with pytest.raises(WorkerError):
-        _overlay(tp_rank=1, tp_size=1)
+        replace(TEST_DEPLOYMENT, tp_rank=1, tp_size=1)
     with pytest.raises(WorkerError):
-        _overlay(tp_size=0)
+        replace(TEST_DEPLOYMENT, tp_size=0)
     with pytest.raises(WorkerError):
-        _overlay(block_size=0)
+        replace(TEST_DEPLOYMENT, block_size=0)
+
+
+@pytest.mark.parametrize("alias", ["bf16", "fp16", "fp32", "half", "fp8_e4m3"])
+def test_dtype_aliases_are_rejected(alias: str):
+    with pytest.raises(WorkerError):
+        _route(dtype=alias)
+    with pytest.raises(WorkerError):
+        replace(TEST_MODEL_SPEC.cache, dtype=alias)
+    with pytest.raises(WorkerError):
+        replace(TEST_DEPLOYMENT, model_dtype=alias)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32"])
+def test_canonical_float_dtypes_are_accepted(dtype: str):
+    assert _route(dtype=dtype).dtype == dtype
+    assert replace(TEST_MODEL_SPEC.cache, dtype=dtype).dtype == dtype
+    assert replace(TEST_DEPLOYMENT, model_dtype=dtype).model_dtype == dtype

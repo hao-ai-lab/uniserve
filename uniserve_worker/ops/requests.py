@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from ..forward import ForwardContext
+
 
 class AttentionRegime(str, Enum):
     DENSE = "dense"
@@ -86,9 +88,8 @@ class AttentionReq:
     attn_mask: torch.Tensor | None = None
     kv_cache: Any | None = None
     metadata: Any | None = None
-    ctx: Any | None = None
+    ctx: ForwardContext | None = None
     stats: Any | None = None
-    backend: Any | None = None
     block_table: torch.Tensor | None = None
     cache_seqlens: torch.Tensor | None = None
     current_k: torch.Tensor | None = None

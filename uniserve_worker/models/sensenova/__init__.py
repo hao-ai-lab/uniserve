@@ -1,1 +1,1 @@
-"""SenseNova-U1 family adapter and configuration package."""
+"""SenseNova-U1 configuration and neural model."""

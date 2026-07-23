@@ -28,6 +28,7 @@ def mixed_subtask_specs(spec: BenchmarkSpec) -> dict[str, BenchmarkSpec]:
             repetition_penalty=None,
             frequency_penalty=None,
             presence_penalty=None,
+            sampling_seed=None,
             workload_mix={},
             warmup_mix={},
             dataset_path=None,

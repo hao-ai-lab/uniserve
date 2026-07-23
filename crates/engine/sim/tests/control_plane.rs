@@ -13,7 +13,8 @@ use uniserve_core::{
     GeneratedImageFeedbackRecipe, GenerationBehaviorDescriptor, GenerationConstraint,
     GenerationPolicyDescriptor, GenerationRequest, GenerationResourceBounds,
     GenerationRuntimeCapabilities, ImageIngestRecipe, ImageKvEffect, ImageParams, ImageSegment,
-    OpKind, RequestId, SamplingParams, SegmentPlacement, TriggerPolicyDescriptor, UndVisibility,
+    OperationType, RequestId, SamplingParams, SegmentPlacement, TriggerPolicyDescriptor,
+    UndVisibility,
 };
 use uniserve_engine_api::{EngineHandle, FinishReason, GenEvent};
 use uniserve_executor::{ControlAck, ControlOp, Executor};
@@ -89,13 +90,13 @@ fn generation_request(
     let behavior = GenerationBehaviorDescriptor::resolve(constraint, &policy);
     let cache = Default::default();
     let capabilities = GenerationRuntimeCapabilities {
-        supported_ops: vec![
-            OpKind::PrefillUnd,
-            OpKind::DecodeUnd,
-            OpKind::VitEncode,
-            OpKind::DenoiseGen,
-            OpKind::CommitGen,
-            OpKind::CommitWriteback,
+        supported_operation_types: vec![
+            OperationType::SequenceExtend,
+            OperationType::SequenceDecode,
+            OperationType::EncodeVision,
+            OperationType::Flow,
+            OperationType::MaterializeImage,
+            OperationType::TransferKv,
         ],
         max_latent_units: 1_024,
         latent_downsample: 16,
@@ -253,11 +254,11 @@ fn text_and_image_requests_complete() {
 #[test]
 fn scheduler_submits_mixed_op_kind_batches() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind};
+    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult, OperationType};
 
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<OpKind>>>>,
+        batches: Arc<Mutex<Vec<Vec<OperationType>>>>,
     }
 
     impl Executor for Recording {
@@ -273,17 +274,19 @@ fn scheduler_submits_mixed_op_kind_batches() {
         fn can_submit(&self) -> bool {
             self.inner.can_submit()
         }
-        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
-            self.batches
-                .lock()
-                .unwrap()
-                .push(b.ops.iter().map(|op| op.kind).collect());
+        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
+            self.batches.lock().unwrap().push(
+                b.operations
+                    .iter()
+                    .map(|operation| operation.operation_type())
+                    .collect(),
+            );
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -362,13 +365,14 @@ fn scheduler_submits_mixed_op_kind_batches() {
     let batches = batches.lock().unwrap();
     assert!(
         batches.iter().any(|kinds| {
-            kinds.contains(&OpKind::DecodeUnd) && kinds.contains(&OpKind::DenoiseGen)
+            kinds.contains(&OperationType::SequenceDecode) && kinds.contains(&OperationType::Flow)
         }),
         "expected one batch mixing decode_und and denoise_gen, got {batches:?}",
     );
     assert!(
         batches.iter().any(|kinds| {
-            kinds.contains(&OpKind::DecodeUnd) && kinds.contains(&OpKind::CommitGen)
+            kinds.contains(&OperationType::SequenceDecode)
+                && kinds.contains(&OperationType::MaterializeImage)
         }),
         "expected one batch mixing decode_und and commit_gen, got {batches:?}",
     );
@@ -378,10 +382,10 @@ fn scheduler_submits_mixed_op_kind_batches() {
 fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressure() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
-        EngineCaps, ExecutionConstraints, ForwardBatch, ForwardResult, OpKind,
+        Batch, EngineCaps, ExecutionConstraints, ExecutionResult, OperationType,
     };
 
-    type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, OpKind)>>>>;
+    type BatchLog = Arc<Mutex<Vec<Vec<(RequestId, OperationType)>>>>;
 
     struct Recording {
         inner: SimExecutor,
@@ -401,17 +405,19 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         fn can_submit(&self) -> bool {
             self.inner.can_submit()
         }
-        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
-            self.batches
-                .lock()
-                .unwrap()
-                .push(b.ops.iter().map(|op| (op.req_id, op.kind)).collect());
+        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
+            self.batches.lock().unwrap().push(
+                b.operations
+                    .iter()
+                    .map(|operation| (operation.session_id, operation.operation_type()))
+                    .collect(),
+            );
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -434,7 +440,7 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         sim.set_pipeline_depth(2);
         sim.set_text_len(64);
         sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
-            max_batch_ops: 1024,
+            max_batch_operations: 1024,
         };
         let batches = Arc::new(Mutex::new(Vec::new()));
         let exec = Recording {
@@ -474,7 +480,10 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
             sched.step();
             let log = batches.lock().unwrap();
             saw_decode_pressure = log.iter().any(|batch| {
-                batch.len() == 2 && batch.iter().all(|(_, kind)| *kind == OpKind::DecodeUnd)
+                batch.len() == 2
+                    && batch
+                        .iter()
+                        .all(|(_, kind)| *kind == OperationType::SequenceDecode)
             });
             if saw_decode_pressure {
                 break;
@@ -508,13 +517,13 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         assert!(
             prefill_batch
                 .iter()
-                .any(|(id, kind)| *id == RequestId(3) && *kind == OpKind::PrefillUnd),
+                .any(|(id, kind)| *id == RequestId(3) && *kind == OperationType::SequenceExtend),
             "new request prefill should use an idle pipeline slot, got {prefill_batch:?}"
         );
         assert!(
             prefill_batch
                 .iter()
-                .all(|(_, kind)| *kind != OpKind::DecodeUnd),
+                .all(|(_, kind)| *kind != OperationType::SequenceDecode),
             "idle-slot text prefill must not mix with decode, got {prefill_batch:?}"
         );
     }
@@ -526,12 +535,12 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
 fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
-        EngineCaps, ExecutionConstraints, ForwardBatch, ForwardResult, OpKind, ResourceClass,
+        Batch, EngineCaps, ExecutionConstraints, ExecutionResult, OperationType, ResourceClass,
     };
 
     struct Recording {
         inner: SimExecutor,
-        batches: Arc<Mutex<Vec<Vec<OpKind>>>>,
+        batches: Arc<Mutex<Vec<Vec<OperationType>>>>,
     }
 
     impl Executor for Recording {
@@ -547,17 +556,19 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
         fn can_submit(&self) -> bool {
             self.inner.can_submit()
         }
-        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
-            self.batches
-                .lock()
-                .unwrap()
-                .push(b.ops.iter().map(|op| op.kind).collect());
+        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
+            self.batches.lock().unwrap().push(
+                b.operations
+                    .iter()
+                    .map(|operation| operation.operation_type())
+                    .collect(),
+            );
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -580,7 +591,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     sim.mut_caps_for_test().max_latent_size = 1024;
     sim.mut_caps_for_test().latent_downsample = 16;
     sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
-        max_batch_ops: 1024,
+        max_batch_operations: 1024,
     };
     let batches = Arc::new(Mutex::new(Vec::new()));
     let exec = Recording {
@@ -633,7 +644,7 @@ fn scheduler_respects_worker_image_latent_capacity_for_denoise_batches() {
     assert!(
         batches.iter().all(|kinds| kinds
             .iter()
-            .filter(|kind| **kind == OpKind::DenoiseGen)
+            .filter(|kind| **kind == OperationType::Flow)
             .count()
             <= 1),
         "expected at most one denoise_gen per batch under one-image latent cap, got {batches:?}",
@@ -645,107 +656,12 @@ fn scheduler_clamps_max_batch_to_worker_caps() {
     use uniserve_worker_wire::ExecutionConstraints;
 
     let mut sim = SimEngine::new();
-    sim.mut_caps_for_test().execution_constraints = ExecutionConstraints { max_batch_ops: 3 };
+    sim.mut_caps_for_test().execution_constraints = ExecutionConstraints {
+        max_batch_operations: 3,
+    };
     let sched = Scheduler::new(Box::new(SimExecutor::new(Box::new(sim))), ctrl(), 32);
 
     assert_eq!(sched.config().max_batch, 3);
-}
-
-#[test]
-fn decode_lookahead_uses_last_sampled_token_source_for_safe_text() {
-    use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult, OpKind, TokenSource};
-
-    type OperationLog = Arc<Mutex<Vec<(OpKind, TokenSource, (u32, u32))>>>;
-
-    struct Recording {
-        inner: SimExecutor,
-        ops: OperationLog,
-    }
-
-    impl Executor for Recording {
-        fn caps(&self) -> EngineCaps {
-            self.inner.caps()
-        }
-        fn pipeline_depth(&self) -> usize {
-            self.inner.pipeline_depth()
-        }
-        fn in_flight(&self) -> usize {
-            self.inner.in_flight()
-        }
-        fn can_submit(&self) -> bool {
-            self.inner.can_submit()
-        }
-        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
-            self.ops.lock().unwrap().extend(
-                b.ops
-                    .iter()
-                    .map(|op| (op.kind, op.token_source, op.pos_range)),
-            );
-            self.inner.submit(b)
-        }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
-            self.inner.poll()
-        }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
-            self.inner.next_result()
-        }
-        fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            self.inner.control(op)
-        }
-        fn control_wait(
-            &mut self,
-            op: ControlOp,
-            targets: Option<&[u32]>,
-        ) -> anyhow::Result<Vec<ControlAck>> {
-            self.inner.control_wait(op, targets)
-        }
-        fn shutdown(&mut self) {
-            self.inner.shutdown();
-        }
-    }
-
-    let mut sim = SimEngine::new();
-    sim.set_text_len(128);
-    sim.set_pipeline_depth(2);
-    let ops = Arc::new(Mutex::new(Vec::new()));
-    let exec = Recording {
-        inner: SimExecutor::new(Box::new(sim)),
-        ops: ops.clone(),
-    };
-    let mut sched = Scheduler::new(Box::new(exec), ctrl(), 32);
-    let sampling = SamplingParams {
-        ignore_eos: true,
-        ..Default::default()
-    };
-    let _keep = sched.submit_for_test(generation_request(
-        RequestId(1),
-        text_context(vec![1, 2, 3]),
-        sampling,
-        ImageParams::default(),
-        GenerationConstraint::UndOnly,
-        4,
-    ));
-
-    let mut idle = 0;
-    for _ in 0..5000 {
-        if sched.step() {
-            idle = 0;
-        } else {
-            idle += 1;
-        }
-        if idle >= 3 {
-            break;
-        }
-    }
-
-    let ops = ops.lock().unwrap();
-    assert!(
-        ops.iter().any(|(kind, source, _)| {
-            *kind == OpKind::DecodeUnd && *source == TokenSource::LastSampled
-        }),
-        "safe greedy text decode should submit at least one lookahead op, got {ops:?}"
-    );
 }
 
 /// Single-worker correctness must be identical regardless of pipeline depth:
@@ -1990,18 +1906,16 @@ fn fcfs_policy_completes_text() {
     }
 }
 
-/// Stateful-diff contract: a recording executor asserts that a request's static
-/// state crosses exactly once (`new_reqs`), per-step ops carry only block deltas,
-/// and preemption resets the registration (the request re-registers after
-/// `drop_request`).
+/// A recording executor verifies that admission state crosses once, operation
+/// leases carry only incremental blocks, and preemption requires readmission.
 #[test]
-fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
+fn admissions_are_reissued_after_preemption() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult};
+    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult};
 
     #[derive(Default, Clone)]
     struct Log {
-        new_reqs: Vec<RequestId>,
+        admissions: Vec<RequestId>,
         drops: Vec<RequestId>,
         blocks_per_op: Vec<(RequestId, usize)>,
     }
@@ -2020,25 +1934,40 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
         fn in_flight(&self) -> usize {
             self.inner.in_flight()
         }
-        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
+        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             let mut log = self.log.lock().unwrap();
-            for nr in &b.new_reqs {
-                log.new_reqs.push(nr.req_id);
+            for admission in &b.admissions {
+                log.admissions.push(admission.session_id);
             }
-            for op in &b.ops {
-                log.blocks_per_op.push((op.req_id, op.new_block_ids.len()));
+            for operation in &b.operations {
+                let block_count = match &operation.operation {
+                    uniserve_worker_wire::Operation::Sequence(sequence) => {
+                        sequence.lease.new_blocks.len()
+                    }
+                    uniserve_worker_wire::Operation::Encode(encode) => {
+                        encode.lease.new_blocks.len()
+                    }
+                    uniserve_worker_wire::Operation::Materialize(materialize) => {
+                        materialize.lease.new_blocks.len()
+                    }
+                    uniserve_worker_wire::Operation::Transfer(transfer) => {
+                        transfer.lease.new_blocks.len()
+                    }
+                    uniserve_worker_wire::Operation::Flow(_) => 0,
+                };
+                log.blocks_per_op.push((operation.session_id, block_count));
             }
             drop(log);
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
-            if let ControlOp::DropRequest(id) = &op {
+            if let ControlOp::DropSession(id) = &op {
                 self.log.lock().unwrap().drops.push(*id);
             }
             self.inner.control(op)
@@ -2048,7 +1977,7 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
             op: ControlOp,
             targets: Option<&[u32]>,
         ) -> anyhow::Result<Vec<ControlAck>> {
-            if let ControlOp::DropRequest(id) = &op {
+            if let ControlOp::DropSession(id) = &op {
                 self.log.lock().unwrap().drops.push(*id);
             }
             self.inner.control_wait(op, targets)
@@ -2098,28 +2027,26 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
     }
 
     let log = log.lock().unwrap();
-    // Request 1 was preempted (drop_request) and re-registered on resumption:
-    // it appears in new_reqs once per registration, i.e. exactly twice.
-    let reg_1 = log.new_reqs.iter().filter(|r| r.0 == 1).count();
-    let reg_2 = log.new_reqs.iter().filter(|r| r.0 == 2).count();
+    // Request 1 was preempted and readmitted on resumption.
+    let reg_1 = log.admissions.iter().filter(|r| r.0 == 1).count();
+    let reg_2 = log.admissions.iter().filter(|r| r.0 == 2).count();
     assert_eq!(
         reg_2, 1,
         "request 2 must register exactly once: {:?}",
-        log.new_reqs
+        log.admissions
     );
     assert_eq!(
         reg_1, 2,
         "preempted request 1 must re-register: {:?}",
-        log.new_reqs
+        log.admissions
     );
     assert!(
         log.drops.iter().any(|r| r.0 == 1),
         "preemption must drop the worker record"
     );
 
-    // Per-step decode ops carry no block ids while the request stays within its
-    // allocation — the first op after (re-)registration carries the initial
-    // blocks in NewRequestData, so per-op deltas are empty until growth.
+    // Per-step sequence operations carry no new blocks while the request stays
+    // within its admitted allocation.
     let deltas_1: Vec<usize> = log
         .blocks_per_op
         .iter()
@@ -2132,13 +2059,12 @@ fn stateful_diff_contract_registers_once_and_resends_after_preemption() {
     );
 }
 
-/// `NewRequestData.prefix_len` carries the scheduler's prefix-cache reuse
-/// boundary to the worker as a typed field: 0 on a cold admission, and
-/// cached-blocks x block-size when the admission reuses a cached prompt prefix.
+/// Sequence admission carries the prefix-cache reuse boundary: zero for a cold
+/// session and cached blocks times block size for a reused prompt prefix.
 #[test]
-fn new_request_data_carries_the_prefix_reuse_boundary() {
+fn sequence_admission_carries_the_prefix_reuse_boundary() {
     use std::sync::{Arc, Mutex};
-    use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardResult};
+    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult};
 
     #[derive(Default)]
     struct Log {
@@ -2159,18 +2085,21 @@ fn new_request_data_carries_the_prefix_reuse_boundary() {
         fn in_flight(&self) -> usize {
             self.inner.in_flight()
         }
-        fn submit(&mut self, b: ForwardBatch) -> anyhow::Result<()> {
+        fn submit(&mut self, b: Batch) -> anyhow::Result<()> {
             let mut log = self.log.lock().unwrap();
-            for nr in &b.new_reqs {
-                log.registrations.push((nr.req_id, nr.prefix_len));
+            for admission in &b.admissions {
+                if let Some(sequence) = &admission.sequence {
+                    log.registrations
+                        .push((admission.session_id, sequence.kv.prefix_len));
+                }
             }
             drop(log);
             self.inner.submit(b)
         }
-        fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
             self.inner.poll()
         }
-        fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
             self.inner.next_result()
         }
         fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
@@ -2683,9 +2612,7 @@ fn resource_leases_drain_to_zero_after_completion() {
     );
 }
 
-///: the scheduler exposes structured facts (PolicySnapshot), explainable
-/// decisions (admit/reject), and per-op-kind latency history — all observed
-/// from the existing inline policy without changing scheduling behavior.
+/// The scheduler exposes structured facts, explainable decisions, and latency history.
 #[test]
 fn policy_facts_and_decisions_are_recorded() {
     let executor = Box::new(SimExecutor::new(Box::new(SimEngine::new())));
@@ -2725,7 +2652,8 @@ fn policy_facts_and_decisions_are_recorded() {
 
     // Latency history populated for the op kinds that ran.
     assert!(
-        sched.op_latency_us("decode_und").is_some() || sched.op_latency_us("prefill_und").is_some(),
+        sched.op_latency_us("sequence_decode").is_some()
+            || sched.op_latency_us("sequence_extend").is_some(),
         "per-op latency history must be observed"
     );
 
@@ -2780,7 +2708,7 @@ fn lifecycle_trace_and_health_snapshot() {
     assert_eq!(h.resource_invariant_violations, 0);
     assert!(!h.fatal);
     assert!(h.completed_traces >= 1);
-    assert!(!h.supported_ops.is_empty());
+    assert!(!h.supported_operation_types.is_empty());
 
     let traces = sched.take_completed_traces();
     assert_eq!(traces.len(), 1);

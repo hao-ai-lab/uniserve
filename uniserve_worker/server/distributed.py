@@ -2,17 +2,16 @@
 
 Builds the :class:`DeviceMesh` for this worker process from the parallel layout:
 a tensor-parallel (``tp``) axis backed by a ``torch.distributed`` collective, and
-(when a modality split is requested) a ``tower`` axis. The tower axis has two
-forms behind one ``AxisTransport`` surface, so the model code is identical for
-both:
+(when a modality split is requested) a ``tower`` axis. The model sees one bounded
+mesh view while each transport exposes only the operations its axis supports:
 
 * **In-process tower parallel:** one worker, two devices, a
   :class:`LocalP2PTransport` over the worker's devices (``tower_devices``).
 * **Cross-process tower disaggregation:** the und and gen towers are separate
   workers; the tower axis is a :class:`DataPlaneTowerTransport` over the data
   plane (``cuda_ipc`` / ``mooncake``). Each worker builds a tower view at its own
-  coordinate (``tower_coord``); the und→gen KV handoff is a
-  ``reshard(Pinned(primary) -> Pinned(gen))`` over the data plane.
+  coordinate (``tower_coord``), and the stage router transfers cross-coordinate
+  state before model execution.
 
 The degenerate case (tp_size==1, no tower) returns a trivial single-device mesh
 that is byte-identical to a single-rank worker.

@@ -21,18 +21,20 @@ Backends (one chosen per worker via :func:`make_transport`):
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import pickle
 import socket
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..foundation.errors import capability_mismatch, invalid_descriptor
-from ..foundation.runtime_config import get_execution_config
 
 if TYPE_CHECKING:
     import torch
@@ -44,6 +46,7 @@ __all__ = [
     "ShmTransport",
     "CudaIpcTransport",
     "MooncakeTransport",
+    "fetch_locator",
     "make_transport",
     "TransportKind",
     "TRANSPORTS",
@@ -129,6 +132,98 @@ class Locator:
         return Locator.from_wire(value)
 
 
+def fetch_locator(transport: "Transport", locator: Locator) -> "torch.Tensor":
+    """Resolve a live transport locator or its verified durable tensor fallback."""
+
+    try:
+        return transport.fetch(locator)
+    except Exception as transport_error:
+        descriptor = locator.meta.get("durable_snapshot")
+        if not isinstance(descriptor, dict):
+            raise
+        try:
+            return _load_durable_tensor(locator, descriptor)
+        except Exception as snapshot_error:
+            raise invalid_descriptor(
+                "runtime locator and durable snapshot fallback are both unavailable: "
+                f"runtime={transport_error}; snapshot={snapshot_error}"
+            ) from snapshot_error
+
+
+def _load_durable_tensor(locator: Locator, descriptor: dict[str, Any]) -> "torch.Tensor":
+    import torch
+    from safetensors.torch import load_file
+
+    if set(descriptor) != {"format_version", "root", "object", "tensor"}:
+        raise invalid_descriptor("durable locator descriptor has an invalid shape")
+    if descriptor.get("format_version") != 1:
+        raise invalid_descriptor("durable locator format is unsupported")
+    root_text = descriptor.get("root")
+    object_digest = descriptor.get("object")
+    tensor_key = descriptor.get("tensor")
+    if not isinstance(root_text, str) or not Path(root_text).is_absolute():
+        raise invalid_descriptor("durable locator root must be absolute")
+    if not isinstance(object_digest, str) or not _is_sha256(object_digest):
+        raise invalid_descriptor("durable locator object digest is invalid")
+    if not isinstance(tensor_key, str) or not tensor_key.startswith("assets."):
+        raise invalid_descriptor("durable locator tensor key is invalid")
+    object_root = Path(root_text) / "objects" / object_digest
+    manifest_path = object_root / "manifest.json"
+    tensor_path = object_root / "tensors.safetensors"
+    if not object_root.is_dir() or not manifest_path.is_file() or not tensor_path.is_file():
+        raise invalid_descriptor("durable locator object is incomplete")
+    raw_manifest = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(raw_manifest)
+    except json.JSONDecodeError as error:
+        raise invalid_descriptor(f"durable locator manifest is invalid: {error}") from error
+    if not isinstance(manifest, dict) or _canonical_json(manifest) != raw_manifest:
+        raise invalid_descriptor("durable locator manifest is not canonical")
+    if _snapshot_digest(raw_manifest, tensor_path) != object_digest:
+        raise invalid_descriptor("durable locator object failed content verification")
+    assets = manifest.get("assets")
+    if not isinstance(assets, list) or sum(
+        isinstance(asset, dict) and asset.get("tensor") == tensor_key for asset in assets
+    ) != 1:
+        raise invalid_descriptor("durable locator asset is not declared exactly once")
+    tensors = load_file(str(tensor_path), device="cpu")
+    value = tensors.get(tensor_key)
+    if value is None:
+        raise invalid_descriptor("durable locator tensor is missing")
+    expected_dtype = _dtype_from_str(locator.dtype)
+    if (
+        tuple(value.shape) != locator.shape
+        or value.dtype != expected_dtype
+        or _nbytes(value) != locator.nbytes
+    ):
+        raise invalid_descriptor("durable locator tensor metadata does not match its descriptor")
+    return value.to(torch.device(locator.device))
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _snapshot_digest(manifest: bytes, tensor_path: Path) -> str:
+    digest = hashlib.sha256(b"uniserve-worker-snapshot-v1\0")
+    digest.update(len(manifest).to_bytes(8, "little"))
+    digest.update(manifest)
+    with tensor_path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def _dtype_to_str(dtype: "torch.dtype") -> str:
     return str(dtype).removeprefix("torch.")
 
@@ -184,6 +279,10 @@ class LocalTransport(Transport):
         self._table: dict[int, "torch.Tensor"] = {}
         self._next = 0
         self._lock = threading.Lock()
+        self._session = f"local:{uuid.uuid4().hex}"
+
+    def session(self) -> str:
+        return self._session
 
     def publish(self, tensor: "torch.Tensor") -> Locator:
         t = tensor.detach()
@@ -193,7 +292,7 @@ class LocalTransport(Transport):
             self._table[key] = t
         return Locator(
             transport="local",
-            session="local",
+            session=self._session,
             nbytes=_nbytes(t),
             dtype=_dtype_to_str(t.dtype),
             shape=tuple(t.shape),
@@ -202,6 +301,8 @@ class LocalTransport(Transport):
         )
 
     def fetch(self, locator: Locator) -> "torch.Tensor":
+        if locator.session != self._session:
+            raise invalid_descriptor("local locator belongs to another transport session")
         key = int(locator.handle.decode())
         with self._lock:
             t = self._table.get(key)
@@ -210,6 +311,8 @@ class LocalTransport(Transport):
         return t
 
     def push(self, tensor: "torch.Tensor", locator: Locator) -> None:
+        if locator.session != self._session:
+            raise invalid_descriptor("local locator belongs to another transport session")
         key = int(locator.handle.decode())
         with self._lock:
             dst = self._table.get(key)
@@ -218,8 +321,14 @@ class LocalTransport(Transport):
         dst.copy_(tensor)
 
     def release(self, locator: Locator) -> None:
+        if locator.session != self._session:
+            return
         with self._lock:
             self._table.pop(int(locator.handle.decode()), None)
+
+    def close(self) -> None:
+        with self._lock:
+            self._table.clear()
 
 
 class ShmTransport(Transport):
@@ -522,8 +631,6 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     """Select the worker's single Tier-2 transport (mirrors Rust
     ``make_transfer_agent``)."""
     raw_name = (str(name or TransportKind.LOCAL)).strip()
-    if raw_name == "inproc":
-        raw_name = TransportKind.LOCAL.value
     try:
         kind = TransportKind(raw_name)
     except ValueError as exc:
@@ -537,10 +644,9 @@ def make_transport(name: str | TransportKind, **cfg: Any) -> Transport:
     if kind is TransportKind.CUDA_IPC:
         return CudaIpcTransport()
     if kind is TransportKind.MOONCAKE:
-        runtime = get_execution_config()
         return MooncakeTransport(
-            device_name=cfg.get("device_name", runtime.mooncake_device),
-            protocol=cfg.get("protocol", runtime.mooncake_protocol),
+            device_name=str(cfg["device_name"]),
+            protocol=str(cfg["protocol"]),
             hostname=cfg.get("hostname"),
         )
     raise AssertionError(f"unhandled transport kind {kind!r}")

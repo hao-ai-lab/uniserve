@@ -1,62 +1,45 @@
 namespace uniserve.wire;
 
-// There is no standalone `VaeDecode` op (image decode runs via commit_gen ->
-// decode_image). Sample / EncodeFrame are appended after the existing variants
-// so prior ordinals are preserved. Sample: Logits handle -> sampled token
-// (Sampler stage). EncodeFrame: finished image/video frame -> encoded output
-// (PostProcess stage). (Keep comments outside the enum braces — the
-// cross-language contract test parses the brace body verbatim.)
-enum OpKind : ubyte {
-  PrefillUnd,
-  DecodeUnd,
-  DenoiseGen,
-  CommitGen,
-  CommitWriteback,
-  VaeEncode,
-  VitEncode,
-  TargetVerifyUnd,
-  Sample,
-  EncodeFrame
+// Protocol v3 uses the five closed semantic variants below.
+enum OperationKind : ubyte { Sequence, Flow, Encode, Materialize, Transfer }
+enum OperationType : ubyte {
+  SequenceExtend,
+  SequenceDecode,
+  SequenceVerify,
+  SequenceSample,
+  Flow,
+  EncodeVision,
+  EncodeLatent,
+  MaterializeImage,
+  MaterializeFrame,
+  TransferProduct,
+  TransferKv
 }
+enum SequenceMode : ubyte { Extend, Decode, Verify, Sample }
+enum TokenSource : ubyte { Wire, LastSampled }
+enum EncodeKind : ubyte { Vision, Latent }
+enum MaterializeKind : ubyte { Image, Frame }
+enum TransferKind : ubyte { Product, Kv }
 
-enum Modality : ubyte { Und, Gen }
-
-enum TokenSource : ubyte {
-  Wire,
-  LastSampled
-}
-
-// Host-internal request cancellation lives in `engine-api` `Command::Cancel`
-// and reaches the worker as `drop_request`; the worker-wire schema exposes
-// only the supported ReqKind values.
 enum ReqKind : ubyte {
-  GetCaps,
+  GetCapabilities,
   Execute,
-  DropRequest,
+  DropSession,
   Shutdown,
-  CopyBlocks,
-  LoadLora,
-  UnloadLora,
-  FreeEncoder,
+  CopyKv,
+  LoadAdapter,
+  UnloadAdapter,
+  ReleaseProducts,
   ResetPrefixCache,
-  Sleep,
-  WakeUp,
   GetMetrics,
-  GetPressure
+  GetPressure,
+  SnapshotSession,
+  RestoreSession
 }
 
-enum RespKind : ubyte { Caps, Result, Ok, Error, Metrics, Pressure }
-
+enum RespKind : ubyte { Capabilities, Result, Ok, Error, Metrics, Pressure, Snapshot }
 enum AdapterMode : ubyte { None, EngineWide, PerRequest, MultiAdapter }
-
-enum ResourceClass : ubyte {
-  KvBlock,
-  EncoderOutput,
-  ImageLatent,
-  Scratch,
-  Adapter
-}
-
+enum ResourceClass : ubyte { KvBlock, EncoderOutput, ImageLatent, Scratch, Adapter }
 enum LeasePolicy : ubyte { PerRequest, Evictable, Pinned }
 enum ResourceEventKind : ubyte { Issued, Released, Evicted, InvariantViolation }
 enum KvGroupKind : ubyte { Full, SlidingWindow }
@@ -68,6 +51,14 @@ table TokenLogprob { token_id:uint; logprob:float; rank:uint; }
 table PositionLogprobs { entries:[TokenLogprob]; }
 table BlockPair { src:uint; dst:uint; }
 table StringU64Pair { key:string; value:ulong; }
+
+table SnapshotRef {
+  session_id:ulong;
+  epoch:ulong;
+  version:ulong;
+  digest:string;
+  locator:string;
+}
 
 table SamplingParams {
   temperature:float;
@@ -108,10 +99,10 @@ table ImageParams {
   retain_images:bool = true;
 }
 
-table CfgParams {
+table Guidance {
   branch_count:ubyte;
   text_scale:float;
-  img_scale:float;
+  image_scale:float;
   renorm_type:string;
   renorm_min:float;
   interval_lo:float;
@@ -136,13 +127,7 @@ table RankInfo {
   dp_size:uint = 1;
 }
 
-// und/gen mixed-batch single-forward is a non-negotiable model invariant, not a
-// negotiable capability: there is deliberately no `supports_mixed_op_kinds` flag
-// (its mere existence would imply mixing could be disabled). The scheduler mixes
-// unconditionally; any worker receiving a mixed batch processes it in one forward.
-table ExecutionConstraints {
-  max_batch_ops:uint;
-}
+table ExecutionConstraints { max_batch_operations:uint; }
 
 table ResourcePressure {
   class:ResourceClass;
@@ -157,7 +142,7 @@ table EngineCaps {
   num_blocks:uint;
   num_layers:uint;
   scratch_capacity_tokens:ulong;
-  supported_ops:[OpKind];
+  supported_operation_types:[OperationType];
   max_latent_size:uint;
   latent_downsample:uint;
   bytes_per_token:ulong;
@@ -168,6 +153,7 @@ table EngineCaps {
   max_cfg_branches:uint;
   groups:[KvGroupSpec];
   kv_dtype:string;
+  model_dtype:string;
   attention_backend:string;
   quantization:string;
   rank:RankInfo;
@@ -177,119 +163,238 @@ table EngineCaps {
   adapter_mode:AdapterMode;
   execution_constraints:ExecutionConstraints;
   resource_classes:[ResourceClass];
+  model_spec_digest:string;
+  weight_digest:string;
+  restored_sessions:[ulong];
 }
 
-table NewRequestData {
-  req_id:ulong;
-  sampling:SamplingParams;
-  image:ImageParams;
-  neg_token_ids:[uint];
-  lora_id:uint = null;
+table KvAllocation {
   block_ids:[uint];
-  group_id:uint;
-  // Number of leading prompt tokens already resident under the prefix cache
-  // (the scheduler's reuse boundary). Scalar descriptor only; append-only for
-  // FlatBuffers compatibility.
   prefix_len:uint;
+  group_id:uint;
 }
 
-table ForwardOp {
-  req_id:ulong;
-  kind:OpKind;
-  modality:Modality;
-  new_block_ids:[uint];
-  pos_lo:uint;
-  pos_hi:uint;
-  token_ids:[uint];
-  token_source:TokenSource = Wire;
-  timestep_idx:ushort = null;
-  cond_pos:uint = null;
-  cfg:CfgParams;
-  image_in:ulong = null;
-  image_prompt:string;
-  image_b64:string;
+table SequenceAdmission {
+  sampling:SamplingParams;
+  negative_token_ids:[uint];
+  kv:KvAllocation;
+}
+
+table FlowAdmission { image:ImageParams; }
+
+table Admission {
+  session_id:ulong;
+  digest:string;
+  sequence:SequenceAdmission;
+  flow:FlowAdmission;
+  adapter_id:uint = null;
+}
+
+table KvLeaseDelta {
   group_id:uint;
+  new_blocks:[uint];
+}
+
+table TokenPolicy {
   allowed_tokens:[uint];
   suppress_tokens:[uint];
   recent_tokens:[uint];
-  mm_hash:ulong = null;
-  spec_token_ids:[uint];
-  op_id:ulong = null;
-  // Sampler stage: handle to the logits a `sample` op consumes. Scalar id;
-  // routing key.
-  logits_handle:ulong = null;
-  // Data-plane locator the consumer resolves to fetch the input tensor (e.g.
-  // the logits a `sample` op reads). base64 of the opaque Locator bytes — a
-  // small descriptor, like image_b64; the host never parses it.
+  publish_kv:bool;
+  publish_kv_on_tokens:[uint];
+}
+
+table TokenInput {
+  token_ids:[uint];
+  source:TokenSource;
+  draft_token_ids:[uint];
+  burst_tokens:ushort = 1;
+  stop_token_ids:[uint];
+  stop_terminal:bool;
+  return_all_logits:bool;
+}
+
+table PublishedLogits {
+  handle:ulong;
   locator:string;
-  // Number of sequential denoise timesteps this op asks the worker to execute.
-  // Scalar descriptor only; append-only for FlatBuffers compatibility.
-  denoise_step_count:ushort = null;
-  // Number of sequential greedy text decode tokens this op asks the worker to
-  // execute. Scalar descriptor only; append-only for FlatBuffers compatibility.
-  decode_token_count:ushort = null;
-  // Token ids that force a decode burst to stop immediately after sampling.
-  // Small id list only; append-only for FlatBuffers compatibility.
-  decode_stop_token_ids:[uint];
-  // True when a stop-token hit finishes the request and any extra speculative
-  // KV written after the stop will be discarded with that request.
-  // Append-only for FlatBuffers compatibility.
-  decode_stop_terminal:bool = false;
-  // Request all token-position logits for prompt scoring. Append-only.
-  return_all_logits:bool = false;
+}
+
+table PublishedKv {
+  handle:ulong;
+  locators:[string];
+  source_version:ulong;
+  kv_tokens:uint;
+  block_ids:[uint];
+  group_id:uint;
+  position:uint;
+}
+
+union SequenceInput { TokenInput, PublishedLogits }
+
+table SequenceOperation {
+  mode:SequenceMode;
+  lease:KvLeaseDelta;
+  position_start:uint;
+  position_end:uint;
+  policy:TokenPolicy;
+  input:SequenceInput;
+}
+
+table FlowOperation {
+  latent_handle:ulong;
+  position:uint;
+  start_step:ushort;
+  step_count:ushort = 1;
+  conditioning_position:uint;
+  conditioning:PublishedKv;
+  guidance:Guidance;
+  image_prompt:string;
+}
+
+table InlineImage {
+  base64:string;
+  content_hash:ulong;
+}
+
+table StagedProduct {
+  handle:ulong;
+  content_hash:ulong;
+}
+
+table CachedProduct { content_hash:ulong; }
+union EncodeInput { InlineImage, StagedProduct, CachedProduct }
+
+table EncodeOperation {
+  kind:EncodeKind;
+  lease:KvLeaseDelta;
+  position_start:uint;
+  position_end:uint;
+  conditioning_position:uint;
+  input:EncodeInput;
+}
+
+table LatentProduct { handle:ulong; }
+table PublishedProduct { handle:ulong; locator:string; }
+union MaterializeInput { LatentProduct, PublishedProduct }
+
+table MaterializeOperation {
+  kind:MaterializeKind;
+  lease:KvLeaseDelta;
+  position:uint;
+  conditioning_position:uint;
+  policy:TokenPolicy;
+  input:MaterializeInput;
+}
+
+table TransferOperation {
+  kind:TransferKind;
+  lease:KvLeaseDelta;
+  position:uint;
+  conditioning_position:uint;
+  policy:TokenPolicy;
+  source:PublishedProduct;
+}
+
+union Operation {
+  SequenceOperation,
+  FlowOperation,
+  EncodeOperation,
+  MaterializeOperation,
+  TransferOperation
+}
+
+table OperationEnvelope {
+  session_id:ulong;
   epoch:ulong;
+  op_id:ulong;
   base_version:ulong;
   digest:string;
+  admission_digest:string;
+  model_spec_digest:string;
+  weight_digest:string;
+  operation:Operation;
 }
 
-table ForwardBatch {
-  step_id:ulong;
-  new_reqs:[NewRequestData];
-  ops:[ForwardOp];
+table SessionProjection {
+  session_id:ulong;
+  epoch:ulong;
+  version:ulong;
+  last_op_id:ulong;
+  admission_digest:string;
+  source_digest:string;
+  last_sampled_token:uint = null;
+}
+
+table Batch {
   protocol_version:ushort;
+  step_id:ulong;
+  admissions:[Admission];
+  projections:[SessionProjection];
+  operations:[OperationEnvelope];
 }
 
-table SeqResult {
-  req_id:ulong;
-  sampled_token_id:uint = null;
-  denoise_done:bool;
-  num_steps_done:ushort = null;
-  image_png_b64:string;
-  image_hw_w:uint = null;
-  image_hw_h:uint = null;
+table SequenceEffect {
+  sampled_token_ids:[uint];
   sampled_logprob:float = null;
   top_logprobs:[TokenLogprob];
-  encoder_handle:ulong = null;
-  num_tokens:uint = null;
-  num_accepted_tokens:uint = null;
-  op_id:ulong = null;
-  // Sampler stage: handle to the logits this op produced, when sampling is
-  // peeled into a separate Sampler pool. Scalar id; routing key.
-  logits_handle:ulong = null;
-  // Data-plane locator for the tensor this op produced (e.g. published logits
-  // / embedding). base64 of the opaque Locator bytes; the host routes it to the
-  // consumer op verbatim.
-  locator:string;
-  // Tokens sampled by a sequential decode burst. Small id list only; append-only
-  // for FlatBuffers compatibility. `sampled_token_id` remains the last token for
-  // old scalar consumers.
-  sampled_token_ids:[uint];
-  // Echoed operation class for scheduler-side planned-transition validation.
-  // `has_op_kind` distinguishes a real PrefillUnd value from an older payload
-  // whose append-only field is absent.
-  op_kind:OpKind = PrefillUnd;
-  has_op_kind:bool = false;
-  // Ranked candidate sets for prompt positions scored by this prefill chunk.
-  // Append-only; the first prompt token has no entry.
   prompt_logprobs:[PositionLogprobs];
-  epoch:ulong = null;
-  base_version:ulong = null;
-  result_version:ulong = null;
+  accepted_draft_tokens:uint = null;
+  kv_tokens:uint = null;
+  published_logits:PublishedProduct;
+  published_kv:PublishedKv;
 }
 
-table ForwardResult {
+table SequenceDelta { effect:SequenceEffect; }
+table FlowDelta { steps_completed:ushort; done:bool; }
+table EncodeDelta {
+  product_handle:ulong;
+  kv_tokens:uint;
+  height:uint = null;
+  width:uint = null;
+}
+
+table ImageArtifact {
+  png_base64:string;
+  height:uint;
+  width:uint;
+  handle:ulong;
+  locator:string;
+}
+
+table FrameRecord { count:uint; }
+union MaterializedProduct { ImageArtifact, PublishedProduct, FrameRecord }
+
+table MaterializeDelta {
+  product:MaterializedProduct;
+  kv_tokens:uint = null;
+  sequence:SequenceEffect;
+}
+
+table TransferDelta {
+  product:PublishedProduct;
+  kv_tokens:uint = null;
+  sequence:SequenceEffect;
+}
+
+union ResultDelta {
+  SequenceDelta,
+  FlowDelta,
+  EncodeDelta,
+  MaterializeDelta,
+  TransferDelta
+}
+
+table OperationResult {
+  session_id:ulong;
+  epoch:ulong;
+  op_id:ulong;
+  base_version:ulong;
+  result_version:ulong;
+  delta:ResultDelta;
+}
+
+table ExecutionResult {
   step_id:ulong;
-  per_seq:[SeqResult];
+  operations:[OperationResult];
   worker_exec_us:ulong = null;
   forward_stats:WorkerForwardStats;
 }
@@ -329,11 +434,11 @@ table WorkerForwardStats {
 
 table WorkerMetrics {
   executes:ulong;
-  ops_total:ulong;
+  operations_total:ulong;
   exec_us_total:ulong;
   last_exec_us:ulong;
-  op_kind_counts:[StringU64Pair];
-  op_kind_us:[StringU64Pair];
+  operation_counts:[StringU64Pair];
+  operation_us:[StringU64Pair];
   control_ok:[StringU64Pair];
   control_err:[StringU64Pair];
   error_counts:[StringU64Pair];
@@ -350,25 +455,36 @@ table WorkerMetrics {
 table WorkerRequest {
   kind:ReqKind;
   call_id:ulong = null;
-  batch:ForwardBatch;
-  req_id:ulong = null;
+  batch:Batch;
+  session_id:ulong = null;
   copies:[BlockPair];
-  lora_id:uint = null;
-  lora_path:string;
-  free_handles:[ulong];
+  adapter_id:uint = null;
+  adapter_path:string;
+  product_handles:[ulong];
+  snapshot:SnapshotRef;
+}
+
+table ErrorOperationIdentity {
+  session_id:ulong;
+  epoch:ulong;
+  op_id:ulong;
 }
 
 table WorkerResponse {
   kind:RespKind;
   call_id:ulong = null;
-  caps:EngineCaps;
-  result:ForwardResult;
+  capabilities:EngineCaps;
+  result:ExecutionResult;
   metrics:WorkerMetrics;
   pressure:[ResourcePressure];
   message:string;
   code:string;
   retryable:bool = null;
   fatal:bool = null;
+  phase:string;
+  route:string;
+  operations:[ErrorOperationIdentity];
+  snapshot:SnapshotRef;
 }
 
 root_type WorkerRequest;

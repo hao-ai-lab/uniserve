@@ -1,18 +1,4 @@
-"""Typed loader/quant sidecar for parameters and modules.
-
-The weight-loading and quantization seams carry a handful of loose flags on
-``nn.Parameter`` / ``nn.Module`` objects across the offline-load and
-``process_weights_after_loading`` steps.  This module is the single owner of
-those attribute names and the only place that reads/writes them, so the
-producers (linear/parallel/vocab/fp8) and consumers (native checkpoint loader,
-serving-dtype fold) share one typed surface instead of scattered
-``setattr``/``getattr`` calls.
-
-``weight_loader`` deliberately stays a plain attribute on the parameter: it is
-the public loader contract (callers invoke ``param.weight_loader(...)`` and
-``copy_load_state`` carries it forward), so it is read/written here by name
-rather than relocated off the object.
-"""
+"""Typed tensor policies used by the system checkpoint loader and quantizer."""
 from __future__ import annotations
 
 from enum import Enum
@@ -27,18 +13,13 @@ __all__ = [
     'is_optional_checkpoint',
     'set_skip_serving_cast',
     'skip_serving_cast',
-    'set_allow_shape_mismatch',
-    'allow_shape_mismatch',
-    'get_weight_loader',
-    'set_weight_loader',
-    'has_weight_loader',
     'init_fp8_phase',
     'set_fp8_weight_loaded_offline',
     'fp8_weight_loaded_offline',
     'set_fp8_scale_loaded',
     'fp8_scale_loaded',
     'fp8_load_phase',
-    'copy_load_state',
+    'copy_tensor_policy',
     'capture_tensor_policy',
     'restore_tensor_policy',
 ]
@@ -48,28 +29,16 @@ __all__ = [
 # helpers so call sites need no ``# type: ignore`` casts.
 ParamLike = Any
 
-# Loader-state flags carried on params/modules.  These string names are the
-# single source of truth for the loose attrs propagated by the shared layers and
-# the native checkpoint loader (``loader/transformers.py``).
-_ATTR_WEIGHT_LOADER = "weight_loader"
+# Loader-state flags carried on params/modules. These string names are the single source of truth for the immutable tensor policies propagated through materialization.
 _ATTR_OPTIONAL_CHECKPOINT = "_uniserve_optional_checkpoint"
 _ATTR_SKIP_SERVING_CAST = "_uniserve_skip_serving_cast"
-_ATTR_ALLOW_SHAPE_MISMATCH = "_uniserve_allow_shape_mismatch"
 _ATTR_WEIGHT_LOADED_OFFLINE = "_fp8_weight_loaded_offline"
 _ATTR_SCALE_LOADED = "_fp8_scale_loaded"
 
-# Attrs ``copy_load_state`` carries onto a retyped parameter: the loader hook and
-# the typed sharding sidecar (``_uniserve_shard`` is copied directly from
-# parallel.py's accessor).
-_LOADER_COPY_ATTRS = (_ATTR_WEIGHT_LOADER,)
-
-# Policy flags the native checkpoint loader re-attaches after materializing a
-# tensor (the loader hook plus the per-tensor checkpoint-policy flags).
+# Policy flags the native checkpoint loader re-attaches after materializing a tensor.
 _TENSOR_POLICY_ATTRS = (
-    _ATTR_WEIGHT_LOADER,
     _ATTR_OPTIONAL_CHECKPOINT,
     _ATTR_SKIP_SERVING_CAST,
-    _ATTR_ALLOW_SHAPE_MISMATCH,
 )
 
 
@@ -101,29 +70,6 @@ def set_skip_serving_cast(param: ParamLike, value: bool = True) -> None:
 
 def skip_serving_cast(param: ParamLike) -> bool:
     return bool(getattr(param, _ATTR_SKIP_SERVING_CAST, False))
-
-
-def set_allow_shape_mismatch(param: ParamLike, value: bool = True) -> None:
-    setattr(param, _ATTR_ALLOW_SHAPE_MISMATCH, bool(value))
-
-
-def allow_shape_mismatch(param: ParamLike) -> bool:
-    return bool(getattr(param, _ATTR_ALLOW_SHAPE_MISMATCH, False))
-
-
-# --- weight-loader hook -----------------------------------------------------
-
-
-def get_weight_loader(param: ParamLike):
-    return getattr(param, _ATTR_WEIGHT_LOADER, None)
-
-
-def set_weight_loader(param: ParamLike, loader) -> None:
-    setattr(param, _ATTR_WEIGHT_LOADER, loader)
-
-
-def has_weight_loader(param: ParamLike) -> bool:
-    return callable(getattr(param, _ATTR_WEIGHT_LOADER, None))
 
 
 # --- FP8 module lifecycle ---------------------------------------------------
@@ -168,16 +114,11 @@ def fp8_load_phase(module: torch.nn.Module) -> Fp8LoadPhase:
 # --- sidecar copy -----------------------------------------------------------
 
 
-def copy_load_state(src: ParamLike, dst: ParamLike) -> None:
-    """Carry the loader hook (and the typed shard sidecar) onto a retyped param.
-
-    Used when a loader replaces a parameter object in place (e.g. retyping a
-    dense weight to fp8): the new parameter must keep the same ``weight_loader``
-    and ``_uniserve_shard`` plan so subsequent shard placement still works.
-    """
+def copy_tensor_policy(src: ParamLike, dst: ParamLike) -> None:
+    """Carry immutable checkpoint policy and sharding onto a retyped parameter."""
     from ..placement import get_shard_plan, set_shard_plan
 
-    for name in _LOADER_COPY_ATTRS:
+    for name in _TENSOR_POLICY_ATTRS:
         if hasattr(src, name):
             setattr(dst, name, getattr(src, name))
     plan = get_shard_plan(src)
@@ -186,8 +127,7 @@ def copy_load_state(src: ParamLike, dst: ParamLike) -> None:
 
 
 def capture_tensor_policy(tensor: ParamLike) -> dict[str, object]:
-    """Snapshot the loader hook + checkpoint-policy flags before a tensor is
-    re-materialized, so they can be restored onto the replacement tensor."""
+    """Snapshot checkpoint-policy flags before a tensor is materialized."""
     captured = {name: getattr(tensor, name) for name in _TENSOR_POLICY_ATTRS if hasattr(tensor, name)}
     from ..placement import get_shard_plan
 
