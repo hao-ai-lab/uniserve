@@ -460,8 +460,8 @@ def test_sensenova_default_gate_declares_complete_image_lifecycle():
 
     assert workload["expect_images"] == image_config["num_images"]
     assert workload["expect_image_steps"] == image_config["steps"] * image_config["num_images"]
-    assert image_config["steps"] == 200
-    assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 800}}) == 800
+    assert image_config["steps"] == 50
+    assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 200}}) == 200
 
 
 def test_execution_benchmark_locks_only_the_declared_high_load_points():
