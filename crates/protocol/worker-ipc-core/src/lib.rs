@@ -14,7 +14,7 @@ use iceoryx2_bb_elementary_traits::zero_copy_send::ZeroCopySend;
 use uniserve_worker_wire::flat::{
     decode_request, decode_response, encode_request, encode_response,
 };
-use uniserve_worker_wire::{WorkerRequest, WorkerResponse};
+use uniserve_worker_wire::{RequestKind, ResponseKind, WorkerRequest, WorkerResponse};
 
 mod events;
 use events::{ClientEvents, ServerEvents};
@@ -33,22 +33,11 @@ pub use transfer_agent::{
 pub const DEFAULT_SERVICE_PREFIX: &str = "uniserve/worker";
 
 /// Wire protocol version this build emits on every [`Header`].
-pub const WIRE_VERSION: u16 = 3;
-
-/// Oldest wire version this build can still decode.
-///
-/// Frames whose version falls in `MIN_SUPPORTED_WIRE_VERSION..=WIRE_VERSION`
-/// are accepted, giving a compatibility window during which a peer one step
-/// behind (or ahead, up to `WIRE_VERSION`) can interoperate instead of
-/// hard-failing on strict equality. It is currently equal to [`WIRE_VERSION`]
-/// because the flatbuffer decoders in `uniserve_worker_wire` are not yet
-/// version-aware; widening the window safely requires teaching those decoders
-/// to branch on the header version.
-pub const MIN_SUPPORTED_WIRE_VERSION: u16 = WIRE_VERSION;
+pub const WIRE_VERSION: u16 = 4;
 
 /// Whether a peer-advertised wire `version` is one this build can decode.
 pub fn is_supported_wire_version(version: u16) -> bool {
-    (MIN_SUPPORTED_WIRE_VERSION..=WIRE_VERSION).contains(&version)
+    version == WIRE_VERSION
 }
 
 /// Fixed-size IPC frame header sent zero-copy across the worker process
@@ -457,15 +446,15 @@ impl ServerEndpoint {
 /// treating `header.op_id` as identifying every op in the frame.
 pub fn header_for_request(req: &WorkerRequest) -> Header {
     let mut h = Header {
-        kind: request_kind_code(req.kind.as_wire_str()),
+        kind: request_kind_code(req.kind),
         call_id: req.call_id.unwrap_or_default(),
         ..Default::default()
     };
     if let Some(batch) = &req.batch {
         h.step_id = batch.step_id;
         // Hint only: first op's id. See the doc comment above.
-        if let Some(op) = batch.ops.first() {
-            h.op_id = op.op_id.unwrap_or_default();
+        if let Some(operation) = batch.operations.first() {
+            h.op_id = operation.op_id;
         }
     }
     h
@@ -480,15 +469,15 @@ pub fn header_for_request(req: &WorkerRequest) -> Header {
 /// payload to correlate individual sequences.
 pub fn header_for_response(resp: &WorkerResponse) -> Header {
     let mut h = Header {
-        kind: response_kind_code(&resp.kind),
+        kind: response_kind_code(resp.kind),
         call_id: resp.call_id.unwrap_or_default(),
         ..Default::default()
     };
     if let Some(result) = &resp.result {
         h.step_id = result.step_id;
         // Hint only: first seq's op id. See the doc comment above.
-        if let Some(seq) = result.per_seq.first() {
-            h.op_id = seq.op_id.unwrap_or_default();
+        if let Some(operation) = result.operations.first() {
+            h.op_id = operation.op_id;
         }
     }
     h
@@ -497,9 +486,8 @@ pub fn header_for_response(resp: &WorkerResponse) -> Header {
 fn verify_header_len(header: Header, actual: usize) -> anyhow::Result<()> {
     if !is_supported_wire_version(header.version) {
         bail!(
-            "unsupported IPC wire version {}: this build supports {}..={}",
+            "unsupported IPC wire version {}: this build requires {}",
             header.version,
-            MIN_SUPPORTED_WIRE_VERSION,
             WIRE_VERSION
         );
     }
@@ -512,36 +500,34 @@ fn verify_header_len(header: Header, actual: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Diagnostic-only header byte (the authoritative kind travels in the
-// FlatBuffers payload). Request kind codes are contiguous; unknown kinds map to 0.
-fn request_kind_code(kind: &str) -> u8 {
+// Diagnostic-only header byte; the authoritative kind travels in the payload.
+fn request_kind_code(kind: RequestKind) -> u8 {
     match kind {
-        "get_caps" => 1,
-        "execute" => 2,
-        "drop_request" => 3,
-        "shutdown" => 4,
-        "copy_blocks" => 5,
-        "load_lora" => 6,
-        "unload_lora" => 7,
-        "free_encoder" => 8,
-        "reset_prefix_cache" => 9,
-        "sleep" => 10,
-        "wake_up" => 11,
-        "get_metrics" => 12,
-        "get_pressure" => 13,
-        _ => 0,
+        RequestKind::GetCapabilities => 1,
+        RequestKind::Execute => 2,
+        RequestKind::DropSession => 3,
+        RequestKind::Shutdown => 4,
+        RequestKind::CopyKv => 5,
+        RequestKind::LoadAdapter => 6,
+        RequestKind::UnloadAdapter => 7,
+        RequestKind::ReleaseProducts => 8,
+        RequestKind::ResetPrefixCache => 9,
+        RequestKind::GetMetrics => 10,
+        RequestKind::GetPressure => 11,
+        RequestKind::SnapshotSession => 12,
+        RequestKind::RestoreSession => 13,
     }
 }
 
-fn response_kind_code(kind: &str) -> u8 {
+fn response_kind_code(kind: ResponseKind) -> u8 {
     match kind {
-        "caps" => 1,
-        "result" => 2,
-        "ok" => 3,
-        "error" => 4,
-        "metrics" => 5,
-        "pressure" => 6,
-        _ => 0,
+        ResponseKind::Capabilities => 1,
+        ResponseKind::Result => 2,
+        ResponseKind::Ok => 3,
+        ResponseKind::Error => 4,
+        ResponseKind::Metrics => 5,
+        ResponseKind::Pressure => 6,
+        ResponseKind::Snapshot => 7,
     }
 }
 
@@ -551,7 +537,7 @@ mod tests {
 
     #[test]
     fn header_len_matches_encoded_request() {
-        let req = WorkerRequest::get_caps();
+        let req = WorkerRequest::get_capabilities();
         let bytes = encode_request(&req).unwrap();
         let mut h = header_for_request(&req);
         h.len = payload_len_u32(bytes.len()).unwrap();
@@ -562,25 +548,17 @@ mod tests {
 
     #[test]
     fn request_kind_codes_cover_every_wire_kind_uniquely() {
-        // Pin the diagnostic header-byte table against worker-wire so the two
-        // cannot drift. Every canonical kind maps to a unique nonzero code;
-        // unknown kinds collapse to 0.
+        // Every payload kind has a distinct nonzero diagnostic code.
         use std::collections::HashSet;
         let mut seen = HashSet::new();
-        for name in uniserve_worker_wire::flat::request_kind_names() {
-            let code = request_kind_code(name);
-            assert_ne!(code, 0, "request_kind_code missing for {name:?}");
+        for kind in RequestKind::ALL {
+            let code = request_kind_code(kind);
+            assert_ne!(code, 0, "request_kind_code missing for {kind:?}");
             assert!(
                 seen.insert(code),
-                "duplicate request_kind_code for {name:?}"
+                "duplicate request_kind_code for {kind:?}"
             );
         }
-        assert_eq!(
-            request_kind_code("cancel"),
-            0,
-            "cancel must stay absent from ReqKind"
-        );
-        assert_eq!(request_kind_code("bogus"), 0);
     }
 
     #[test]
@@ -595,11 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn wire_version_support_window() {
+    fn wire_version_is_exact() {
         assert!(is_supported_wire_version(WIRE_VERSION));
-        assert!(is_supported_wire_version(MIN_SUPPORTED_WIRE_VERSION));
         assert!(!is_supported_wire_version(WIRE_VERSION + 1));
-        assert!(!is_supported_wire_version(MIN_SUPPORTED_WIRE_VERSION - 1));
+        assert!(!is_supported_wire_version(WIRE_VERSION - 1));
     }
 
     #[test]

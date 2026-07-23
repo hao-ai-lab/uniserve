@@ -21,33 +21,6 @@ SYSTEM_LAYER_SEGMENTS = ("bootstrap", "execution", "runtime", "server", "worker"
 COMPOSITION_ROOT_SEGMENTS = ("bootstrap", "server", "worker")
 GENERIC_PACKAGE_NAMES = ("base", "common", "core", "interfaces", "utils")
 
-# Import edges from models/ into system-layer modules, one (importer, imported) pair per
-# line, sorted. This list may only shrink: an entry is deleted when the importer no longer
-# imports the target, and no new entry may be added. All listed edges are runtime imports;
-# a TYPE_CHECKING-only edge would be marked as such here rather than listed silently.
-MODELS_SYSTEM_LAYER_EDGES = (
-    ("uniserve_worker.models.bagel", "uniserve_worker.execution.flow"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.execution.segment"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.execution.sequence"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.kv_pool"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.paged_text_cache"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.request_state"),
-    ("uniserve_worker.models.bagel", "uniserve_worker.runtime.residency"),
-    ("uniserve_worker.models.qwen3", "uniserve_worker.runtime.compile"),
-    ("uniserve_worker.models.qwen3", "uniserve_worker.runtime.residency"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.execution.flow"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.execution.products"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.execution.segment"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.execution.sequence"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.compile"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.forward_stream"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.kv_pool"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.masks"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.residency"),
-    ("uniserve_worker.models.sensenova.model", "uniserve_worker.runtime.tower_handoff"),
-)
-
-
 def _module_name(path: Path) -> str:
     parts = list(path.relative_to(PACKAGE_ROOT.parent).with_suffix("").parts)
     if parts[-1] == "__init__":
@@ -131,25 +104,15 @@ def test_concrete_models_imported_only_by_composition_roots():
     )
 
 
-def test_models_system_layer_edges_match_declared_list():
-    assert list(MODELS_SYSTEM_LAYER_EDGES) == sorted(set(MODELS_SYSTEM_LAYER_EDGES)), (
-        "MODELS_SYSTEM_LAYER_EDGES must be sorted and duplicate-free"
-    )
-    observed = {
+def test_models_do_not_import_system_layers():
+    violations = sorted(
         edge
         for edge in _import_edges()
         if _segment(edge[0]) == "models" and _segment(edge[1]) in SYSTEM_LAYER_SEGMENTS
-    }
-    declared = set(MODELS_SYSTEM_LAYER_EDGES)
-    undeclared = sorted(observed - declared)
-    assert not undeclared, (
-        f"models/ gained system-layer imports; models/ may depend on PyTorch, nn/, the "
-        f"forward contracts, and spec declarations only: {undeclared}"
     )
-    stale = sorted(declared - observed)
-    assert not stale, (
-        f"declared edges are no longer present; delete them from "
-        f"MODELS_SYSTEM_LAYER_EDGES: {stale}"
+    assert not violations, (
+        "models/ may depend on PyTorch, nn/, forward contracts, and spec declarations "
+        f"only: {violations}"
     )
 
 

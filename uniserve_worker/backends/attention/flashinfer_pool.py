@@ -8,7 +8,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...foundation.runtime_config import get_execution_config
+from ...foundation.runtime_config import FlashInferTuningConfig
 from .flashinfer_plan import (
     _decode_fast_plan_signature,
     _DecodePlanWorkspace,
@@ -81,8 +81,9 @@ class _WrapperPool(PagedAttentionPlanPool):
     device-keyed workspace / plan-workspace allocation.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
         super().__init__()
+        self._tuning = tuning
         self._decode_wrappers: dict[WrapperKey, Any] = {}
         self._prefill_wrappers: dict[WrapperKey, Any] = {}
         self._decode_graph_buffers: dict[
@@ -108,8 +109,9 @@ class _WrapperPool(PagedAttentionPlanPool):
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = get_execution_config().flashinfer.decode_backend
+        backend = self._tuning.decode_backend
         use_tensor_cores = _should_use_tensor_cores(
+            override=self._tuning.use_tensor_core,
             kv_dtype=kv_dtype,
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
@@ -144,8 +146,9 @@ class _WrapperPool(PagedAttentionPlanPool):
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = get_execution_config().flashinfer.decode_backend
+        backend = self._tuning.decode_backend
         use_tensor_cores = _should_use_tensor_cores(
+            override=self._tuning.use_tensor_core,
             kv_dtype=kv_dtype,
             num_q_heads=int(num_q_heads),
             num_kv_heads=int(num_kv_heads),
@@ -187,7 +190,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         from . import flashinfer as _fi
 
         device_key = _device_key(device)
-        backend = get_execution_config().flashinfer.prefill_backend
+        backend = self._tuning.prefill_backend
         key = WrapperKey("prefill", device_key, backend)
         wrapper = self._prefill_wrappers.get(key)
         if wrapper is None:
@@ -224,7 +227,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         batch_size = max(1, int(batch_size))
         max_indices = max(1, int(max_indices))
         device_key = _device_key(device)
-        backend = get_execution_config().flashinfer.prefill_backend
+        backend = self._tuning.prefill_backend
         key = WrapperKey(
             "prefill",
             device_key,
@@ -440,8 +443,8 @@ class _WrapperPool(PagedAttentionPlanPool):
             kv_data_type=kv_data_type,
         )
         return _DecodePlanOptions(
-            fixed_split_size=get_execution_config().flashinfer.decode_split_tile_size,
-            disable_split_kv=get_execution_config().flashinfer.disable_split_kv,
+            fixed_split_size=self._tuning.decode_split_tile_size,
+            disable_split_kv=self._tuning.disable_split_kv,
             signature=signature,
         )
 
@@ -558,7 +561,7 @@ class _WrapperPool(PagedAttentionPlanPool):
     ) -> bool:
         from . import flashinfer as _fi
 
-        if _fi._fast_decode_plan is None or not _fast_decode_plan_enabled():
+        if _fi._fast_decode_plan is None or not self._tuning.fast_decode_plan:
             return False
         if wrapper_key.backend not in {"fa2", "fa3"}:
             return False
@@ -582,7 +585,7 @@ class _WrapperPool(PagedAttentionPlanPool):
         return wrapper_key, wrapper
 
     def _workspace(self, device: torch.device) -> torch.Tensor:
-        return self.workspace(device, _workspace_size(), dtype=torch.uint8)
+        return self.workspace(device, max(1, int(self._tuning.workspace_size)), dtype=torch.uint8)
 
     def _decode_plan_workspace(
         self,
@@ -673,22 +676,13 @@ def _device_key(device: torch.device | str) -> str:
     return str(dev)
 
 
-def _workspace_size() -> int:
-    size = get_execution_config().flashinfer.workspace_size
-    return max(1, size)
-
-
-def _fast_decode_plan_enabled() -> bool:
-    return get_execution_config().flashinfer.fast_decode_plan
-
-
 def _should_use_tensor_cores(
     *,
+    override: bool | None,
     kv_dtype: torch.dtype,
     num_q_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    override = get_execution_config().flashinfer.use_tensor_core
     if override is not None:
         return override
     try:

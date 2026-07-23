@@ -27,7 +27,15 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.nn as nn
 
-from .mesh import DeviceMesh, MeshAxis, ReduceOp
+from .mesh import (
+    BroadcastTransport,
+    CollectiveAxisTransport,
+    DeviceMesh,
+    MeshAxis,
+    PeerAxisTransport,
+    ReduceOp,
+    TensorParallelSpec,
+)
 
 __all__ = [
     # activation placement + reshard
@@ -126,41 +134,70 @@ def _reshard_axis(
     owner: str,
 ) -> torch.Tensor:
     transport = axis.transport
-    if transport is None:
-        raise RuntimeError(
-            f"reshard[{owner}] needs a transport to communicate on non-trivial axis {axis.name!r}"
-        )
     if type(src) is type(dst) and src == dst:
         return t
     # Partial -> Replicate : all-reduce
     if isinstance(src, Partial) and isinstance(dst, Replicate):
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(
+                f"reshard[{owner}] requires collective reduction on axis {axis.name!r}"
+            )
         from ..ops import tp_all_reduce
 
         return tp_all_reduce(t, src.op, axis=axis)
     # Shard -> Replicate : all-gather
     if isinstance(src, Shard) and isinstance(dst, Replicate):
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(
+                f"reshard[{owner}] requires all-gather on axis {axis.name!r}"
+            )
         return transport.all_gather(t, src.dim)
     # Partial -> Shard : reduce-scatter
     if isinstance(src, Partial) and isinstance(dst, Shard):
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(
+                f"reshard[{owner}] requires reduce-scatter on axis {axis.name!r}"
+            )
         return transport.reduce_scatter(t, dst.dim, src.op)
     # Shard(i) -> Shard(j) : all-to-all
     if isinstance(src, Shard) and isinstance(dst, Shard):
         if src.dim == dst.dim:
             return t
+        if not isinstance(transport, CollectiveAxisTransport):
+            raise RuntimeError(
+                f"reshard[{owner}] requires all-to-all on axis {axis.name!r}"
+            )
         return transport.all_to_all(t, in_dim=src.dim, out_dim=dst.dim)
     # Replicate -> Shard : local slice (no communication)
     if isinstance(src, Replicate) and isinstance(dst, Shard):
-        pieces = torch.chunk(t, transport.size, dim=dst.dim)
-        return pieces[transport.coord].contiguous()
+        if t.shape[dst.dim] % axis.size:
+            raise ValueError(
+                f"reshard[{owner}] dimension {dst.dim} is not divisible by axis "
+                f"{axis.name!r} size {axis.size}"
+            )
+        pieces = torch.chunk(t, axis.size, dim=dst.dim)
+        if len(pieces) != axis.size:
+            raise ValueError(
+                f"reshard[{owner}] cannot split dimension {dst.dim} across axis {axis.name!r}"
+            )
+        return pieces[axis.coord].contiguous()
     # Pinned(a) -> Pinned(b) : point-to-point / peer copy
     if isinstance(src, Pinned) and isinstance(dst, Pinned):
         if src.coord == dst.coord:
             return t
+        if not isinstance(transport, PeerAxisTransport):
+            raise RuntimeError(
+                f"reshard[{owner}] requires peer movement on axis {axis.name!r}"
+            )
         return transport.copy_to(t, coord=dst.coord)
     # Pinned(c) -> Replicate : broadcast from c
     if isinstance(src, Pinned) and isinstance(dst, Replicate):
+        if not isinstance(transport, BroadcastTransport):
+            raise RuntimeError(
+                f"reshard[{owner}] requires broadcast on axis {axis.name!r}"
+            )
         return transport.broadcast(t, src=src.coord)
-    raise NotImplementedError(
+    raise ValueError(
         f"reshard[{owner}] has no rule for {type(src).__name__}->{type(dst).__name__} "
         f"on axis {axis.name!r}"
     )
@@ -323,12 +360,12 @@ class ShardPlan:
         return self.slots.get(key)
 
 
-def shard_spec(axis: int, mesh: DeviceMesh, *, mesh_axis: str = "tp", replicated: bool = False) -> ShardSpec:
-    """Resolve a :class:`ShardSpec` for tensor dimension ``axis`` from ``mesh``."""
+def shard_spec(axis: int, parallel: TensorParallelSpec, *, replicated: bool = False) -> ShardSpec:
+    """Resolve a tensor-parallel :class:`ShardSpec` for one parameter dimension."""
     return ShardSpec(
         axis=int(axis),
-        rank=int(mesh.coord(mesh_axis)),
-        size=int(mesh.size(mesh_axis)),
+        rank=int(parallel.rank),
+        size=int(parallel.size),
         replicated=bool(replicated),
     )
 

@@ -1,26 +1,31 @@
+//! Strict FlatBuffers codec for protocol v3.
+
 use std::collections::BTreeMap;
 
 use anyhow::{Context, bail};
 use flatbuffers::FlatBufferBuilder;
-use uniserve_core::{
-    BlockId, CfgParams, ImageParams, KvCacheGroupSpec, KvGroupKind, Modality, RankInfo, RequestId,
-    SamplingParams,
-};
+use uniserve_core::{BlockId, KvCacheGroupSpec, KvGroupKind, RankInfo, RequestId, SamplingParams};
 
-use crate::resources::{ResourceClass, ResourcePressure};
 use crate::schema::uniserve::wire as fbs;
 use crate::{
-    AdapterMode, EngineCaps, ExecutionConstraints, ForwardBatch, ForwardOp, ForwardResult,
-    NewRequestData, OpKind, RequestKind, SeqResult, TokenLogprob, TokenSource, WorkerForwardStats,
-    WorkerMetrics, WorkerRequest, WorkerResponse,
+    AdapterMode, Admission, Batch, EncodeDelta, EncodeInput, EncodeKind, EncodeOperation,
+    EngineCaps, ErrorOperationIdentity, ExecutionConstraints, ExecutionResult, FlowAdmission,
+    FlowDelta, FlowOperation, Guidance, ImageArtifact, KvAllocation, KvLeaseDelta,
+    MaterializeDelta, MaterializeInput, MaterializeKind, MaterializeOperation, MaterializedProduct,
+    Operation, OperationEnvelope, OperationResult, OperationType, PublishedKv, PublishedProduct,
+    RequestKind, ResourceClass, ResourcePressure, ResponseKind, ResultDelta, SequenceAdmission,
+    SequenceDelta, SequenceEffect, SequenceInput, SequenceMode, SequenceOperation,
+    SessionProjection, SnapshotRef, TokenInput, TokenLogprob, TokenPolicy, TokenSource,
+    TransferDelta, TransferKind, TransferOperation, WorkerForwardStats, WorkerMetrics,
+    WorkerRequest, WorkerResponse,
 };
 
-pub fn encode_request(req: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
-    let native = request_to_fb(req)?;
-    let mut fbb = FlatBufferBuilder::new();
-    let root = native.pack(&mut fbb);
-    fbb.finish(root, None);
-    Ok(fbb.finished_data().to_vec())
+pub fn encode_request(request: &WorkerRequest) -> anyhow::Result<Vec<u8>> {
+    let object = request_to_fb(request)?;
+    let mut builder = FlatBufferBuilder::new();
+    let root = object.pack(&mut builder);
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
 }
 
 pub fn decode_request(bytes: &[u8]) -> anyhow::Result<WorkerRequest> {
@@ -28,12 +33,12 @@ pub fn decode_request(bytes: &[u8]) -> anyhow::Result<WorkerRequest> {
     request_from_fb(root.unpack())
 }
 
-pub fn encode_response(resp: &WorkerResponse) -> anyhow::Result<Vec<u8>> {
-    let native = response_to_fb(resp)?;
-    let mut fbb = FlatBufferBuilder::new();
-    let root = native.pack(&mut fbb);
-    fbb.finish(root, None);
-    Ok(fbb.finished_data().to_vec())
+pub fn encode_response(response: &WorkerResponse) -> anyhow::Result<Vec<u8>> {
+    let object = response_to_fb(response)?;
+    let mut builder = FlatBufferBuilder::new();
+    let root = object.pack(&mut builder);
+    builder.finish(root, None);
+    Ok(builder.finished_data().to_vec())
 }
 
 pub fn decode_response(bytes: &[u8]) -> anyhow::Result<WorkerResponse> {
@@ -42,260 +47,899 @@ pub fn decode_response(bytes: &[u8]) -> anyhow::Result<WorkerResponse> {
     response_from_fb(root.unpack())
 }
 
-fn request_to_fb(req: &WorkerRequest) -> anyhow::Result<fbs::WorkerRequestT> {
+fn request_to_fb(request: &WorkerRequest) -> anyhow::Result<fbs::WorkerRequestT> {
     Ok(fbs::WorkerRequestT {
-        kind: req_kind_to_fb(req.kind),
-        call_id: req.call_id,
-        batch: req
+        kind: request_kind_to_fb(request.kind),
+        call_id: request.call_id,
+        batch: request
             .batch
             .as_ref()
             .map(batch_to_fb)
             .transpose()?
             .map(Box::new),
-        req_id: req.req_id.map(|id| id.0),
-        copies: req.copies.as_ref().map(|copies| {
-            copies
+        session_id: request.session_id.map(|id| id.0),
+        copies: request.copies.as_ref().map(|items| {
+            items
                 .iter()
-                .map(|(src, dst)| fbs::BlockPairT {
-                    src: src.0,
-                    dst: dst.0,
+                .map(|(source, destination)| fbs::BlockPairT {
+                    src: source.0,
+                    dst: destination.0,
                 })
                 .collect()
         }),
-        lora_id: req.lora_id,
-        lora_path: req.lora_path.clone(),
-        free_handles: req.free_handles.clone(),
+        adapter_id: request.adapter_id,
+        adapter_path: request.adapter_path.clone(),
+        product_handles: request.product_handles.clone(),
+        snapshot: request.snapshot.as_ref().map(snapshot_to_fb).map(Box::new),
     })
 }
 
-fn request_from_fb(req: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest> {
-    Ok(WorkerRequest {
-        kind: req_kind_from_fb(req.kind)?,
-        call_id: req.call_id,
-        batch: req.batch.map(|b| batch_from_fb(*b)).transpose()?,
-        req_id: req.req_id.map(RequestId),
-        copies: req.copies.map(|copies| {
-            copies
+fn request_from_fb(request: fbs::WorkerRequestT) -> anyhow::Result<WorkerRequest> {
+    let request = WorkerRequest {
+        kind: request_kind_from_fb(request.kind)?,
+        call_id: request.call_id,
+        batch: request
+            .batch
+            .map(|batch| batch_from_fb(*batch))
+            .transpose()?,
+        session_id: request.session_id.map(RequestId),
+        copies: request.copies.map(|items| {
+            items
                 .into_iter()
-                .map(|p| (BlockId(p.src), BlockId(p.dst)))
+                .map(|pair| (BlockId(pair.src), BlockId(pair.dst)))
                 .collect()
         }),
-        lora_id: req.lora_id,
-        lora_path: req.lora_path,
-        free_handles: req.free_handles,
-    })
+        adapter_id: request.adapter_id,
+        adapter_path: request.adapter_path,
+        product_handles: request.product_handles,
+        snapshot: request
+            .snapshot
+            .map(|value| snapshot_from_fb(*value))
+            .transpose()?,
+    };
+    validate_request_shape(&request)?;
+    Ok(request)
 }
 
-fn response_to_fb(resp: &WorkerResponse) -> anyhow::Result<fbs::WorkerResponseT> {
+fn validate_request_shape(request: &WorkerRequest) -> anyhow::Result<()> {
+    let payload_count = usize::from(request.batch.is_some())
+        + usize::from(request.session_id.is_some())
+        + usize::from(request.copies.is_some())
+        + usize::from(request.adapter_id.is_some())
+        + usize::from(request.product_handles.is_some())
+        + usize::from(request.snapshot.is_some());
+    match request.kind {
+        RequestKind::Execute => {
+            let batch = request
+                .batch
+                .as_ref()
+                .context("execute request has no batch")?;
+            anyhow::ensure!(
+                payload_count == 1,
+                "execute request carries unrelated control fields"
+            );
+            batch.validate()?;
+        }
+        RequestKind::DropSession => anyhow::ensure!(
+            request.session_id.is_some() && payload_count == 1,
+            "drop_session requires exactly one session id"
+        ),
+        RequestKind::CopyKv => anyhow::ensure!(
+            request.copies.is_some() && payload_count == 1,
+            "copy_kv requires exactly one block-pair list"
+        ),
+        RequestKind::LoadAdapter => anyhow::ensure!(
+            request.adapter_id.is_some()
+                && request
+                    .adapter_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+                && payload_count == 1,
+            "load_adapter requires an id and path"
+        ),
+        RequestKind::UnloadAdapter => anyhow::ensure!(
+            request.adapter_id.is_some() && request.adapter_path.is_none() && payload_count == 1,
+            "unload_adapter requires exactly one id"
+        ),
+        RequestKind::ReleaseProducts => anyhow::ensure!(
+            request.product_handles.is_some() && payload_count == 1,
+            "release_products requires exactly one handle list"
+        ),
+        RequestKind::SnapshotSession => anyhow::ensure!(
+            request.session_id.is_some() && payload_count == 1,
+            "snapshot_session requires exactly one session id"
+        ),
+        RequestKind::RestoreSession => anyhow::ensure!(
+            request.snapshot.is_some() && payload_count == 1,
+            "restore_session requires exactly one snapshot reference"
+        ),
+        RequestKind::GetCapabilities
+        | RequestKind::Shutdown
+        | RequestKind::ResetPrefixCache
+        | RequestKind::GetMetrics
+        | RequestKind::GetPressure => anyhow::ensure!(
+            payload_count == 0 && request.adapter_path.is_none(),
+            "control request carries an unexpected payload"
+        ),
+    }
+    Ok(())
+}
+
+fn response_to_fb(response: &WorkerResponse) -> anyhow::Result<fbs::WorkerResponseT> {
     Ok(fbs::WorkerResponseT {
-        kind: resp_kind_to_fb(&resp.kind)?,
-        call_id: resp.call_id,
-        caps: resp
-            .caps
+        kind: response_kind_to_fb(response.kind),
+        call_id: response.call_id,
+        capabilities: response
+            .capabilities
             .as_ref()
-            .map(caps_to_fb)
+            .map(capabilities_to_fb)
             .transpose()?
             .map(Box::new),
-        result: resp
+        result: response
             .result
             .as_ref()
-            .map(result_to_fb)
+            .map(execution_result_to_fb)
             .transpose()?
             .map(Box::new),
-        metrics: resp.metrics.as_ref().map(metrics_to_fb).map(Box::new),
-        pressure: resp
+        metrics: response.metrics.as_ref().map(metrics_to_fb).map(Box::new),
+        pressure: response
             .pressure
             .as_ref()
             .map(|items| items.iter().map(pressure_to_fb).collect()),
-        message: resp.message.clone(),
-        code: resp.code.clone(),
-        retryable: resp.retryable,
-        fatal: resp.fatal,
+        message: response.message.clone(),
+        code: response.code.clone(),
+        retryable: response.retryable,
+        fatal: response.fatal,
+        phase: response.phase.clone(),
+        route: response.route.clone(),
+        operations: Some(
+            response
+                .operations
+                .iter()
+                .map(|operation| fbs::ErrorOperationIdentityT {
+                    session_id: operation.session_id,
+                    epoch: operation.epoch,
+                    op_id: operation.op_id,
+                })
+                .collect(),
+        ),
+        snapshot: response.snapshot.as_ref().map(snapshot_to_fb).map(Box::new),
     })
 }
 
-fn response_from_fb(resp: fbs::WorkerResponseT) -> anyhow::Result<WorkerResponse> {
-    Ok(WorkerResponse {
-        kind: resp_kind_from_fb(resp.kind)?.to_string(),
-        call_id: resp.call_id,
-        caps: resp.caps.map(|c| caps_from_fb(*c)).transpose()?,
-        result: resp.result.map(|r| result_from_fb(*r)).transpose()?,
-        metrics: resp.metrics.map(|m| metrics_from_fb(*m)),
-        pressure: resp
+fn response_from_fb(response: fbs::WorkerResponseT) -> anyhow::Result<WorkerResponse> {
+    let response = WorkerResponse {
+        kind: response_kind_from_fb(response.kind)?,
+        call_id: response.call_id,
+        capabilities: response
+            .capabilities
+            .map(|caps| capabilities_from_fb(*caps))
+            .transpose()?,
+        result: response
+            .result
+            .map(|result| execution_result_from_fb(*result))
+            .transpose()?,
+        metrics: response.metrics.map(|metrics| metrics_from_fb(*metrics)),
+        pressure: response
             .pressure
             .map(|items| items.into_iter().map(pressure_from_fb).collect())
             .transpose()?,
-        message: resp.message,
-        code: resp.code,
-        retryable: resp.retryable,
-        fatal: resp.fatal,
-    })
+        message: response.message,
+        code: response.code,
+        retryable: response.retryable,
+        fatal: response.fatal,
+        phase: response.phase,
+        route: response.route,
+        operations: response
+            .operations
+            .unwrap_or_default()
+            .into_iter()
+            .map(|operation| ErrorOperationIdentity {
+                session_id: operation.session_id,
+                epoch: operation.epoch,
+                op_id: operation.op_id,
+            })
+            .collect(),
+        snapshot: response
+            .snapshot
+            .map(|value| snapshot_from_fb(*value))
+            .transpose()?,
+    };
+    validate_response_shape(&response)?;
+    Ok(response)
 }
 
-fn batch_to_fb(batch: &ForwardBatch) -> anyhow::Result<fbs::ForwardBatchT> {
+fn validate_response_shape(response: &WorkerResponse) -> anyhow::Result<()> {
+    let payload_count = usize::from(response.capabilities.is_some())
+        + usize::from(response.result.is_some())
+        + usize::from(response.metrics.is_some())
+        + usize::from(response.pressure.is_some())
+        + usize::from(response.snapshot.is_some());
+    let carries_error = response.message.is_some()
+        || response.code.is_some()
+        || response.retryable.is_some()
+        || response.fatal.is_some()
+        || response.phase.is_some()
+        || response.route.is_some()
+        || !response.operations.is_empty();
+    match response.kind {
+        ResponseKind::Capabilities => anyhow::ensure!(
+            response.capabilities.is_some() && payload_count == 1 && !carries_error,
+            "capabilities response has the wrong payload"
+        ),
+        ResponseKind::Result => anyhow::ensure!(
+            response.result.is_some() && payload_count == 1 && !carries_error,
+            "execution response has the wrong payload"
+        ),
+        ResponseKind::Metrics => anyhow::ensure!(
+            response.metrics.is_some() && payload_count == 1 && !carries_error,
+            "metrics response has the wrong payload"
+        ),
+        ResponseKind::Pressure => anyhow::ensure!(
+            response.pressure.is_some() && payload_count == 1 && !carries_error,
+            "pressure response has the wrong payload"
+        ),
+        ResponseKind::Snapshot => anyhow::ensure!(
+            response.snapshot.is_some() && payload_count == 1 && !carries_error,
+            "snapshot response has the wrong payload"
+        ),
+        ResponseKind::Ok => anyhow::ensure!(
+            payload_count == 0 && !carries_error,
+            "ok response carries an unexpected payload"
+        ),
+        ResponseKind::Error => anyhow::ensure!(
+            payload_count == 0
+                && response
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| !message.is_empty())
+                && response
+                    .code
+                    .as_deref()
+                    .is_some_and(|code| !code.is_empty())
+                && response.retryable.is_some()
+                && response.fatal.is_some(),
+            "error response requires a code, message, retryability, and fatality"
+        ),
+    }
+    Ok(())
+}
+
+fn batch_to_fb(batch: &Batch) -> anyhow::Result<fbs::BatchT> {
     batch.validate()?;
-    Ok(fbs::ForwardBatchT {
+    Ok(fbs::BatchT {
         protocol_version: batch.protocol_version,
         step_id: batch.step_id,
-        new_reqs: Some(
+        admissions: Some(
             batch
-                .new_reqs
+                .admissions
                 .iter()
-                .map(new_request_to_fb)
+                .map(admission_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
-        ops: Some(
+        projections: Some(batch.projections.iter().map(projection_to_fb).collect()),
+        operations: Some(
             batch
-                .ops
+                .operations
                 .iter()
-                .map(op_to_fb)
+                .map(operation_envelope_to_fb)
                 .collect::<anyhow::Result<_>>()?,
         ),
     })
 }
 
-fn batch_from_fb(batch: fbs::ForwardBatchT) -> anyhow::Result<ForwardBatch> {
-    let batch = ForwardBatch {
+fn batch_from_fb(batch: fbs::BatchT) -> anyhow::Result<Batch> {
+    let batch = Batch {
         protocol_version: batch.protocol_version,
         step_id: batch.step_id,
-        new_reqs: batch
-            .new_reqs
+        admissions: batch
+            .admissions
             .unwrap_or_default()
             .into_iter()
-            .map(new_request_from_fb)
+            .map(admission_from_fb)
             .collect::<anyhow::Result<_>>()?,
-        ops: batch
-            .ops
+        projections: batch
+            .projections
             .unwrap_or_default()
             .into_iter()
-            .map(op_from_fb)
+            .map(projection_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        operations: batch
+            .operations
+            .unwrap_or_default()
+            .into_iter()
+            .map(operation_envelope_from_fb)
             .collect::<anyhow::Result<_>>()?,
     };
     batch.validate()?;
     Ok(batch)
 }
 
-fn new_request_to_fb(req: &NewRequestData) -> anyhow::Result<fbs::NewRequestDataT> {
-    Ok(fbs::NewRequestDataT {
-        req_id: req.req_id.0,
-        sampling: req
-            .sampling
-            .as_ref()
-            .map(sampling_to_fb)
-            .transpose()?
-            .map(Box::new),
-        image: req.image.as_ref().map(image_to_fb).map(Box::new),
-        neg_token_ids: req.neg_token_ids.clone(),
-        lora_id: req.lora_id,
-        block_ids: Some(req.block_ids.iter().map(|id| id.0).collect()),
-        prefix_len: req.prefix_len,
-        group_id: req.group_id,
+fn projection_to_fb(projection: &SessionProjection) -> fbs::SessionProjectionT {
+    fbs::SessionProjectionT {
+        session_id: projection.session_id.0,
+        epoch: projection.epoch,
+        version: projection.version,
+        last_op_id: projection.last_op_id,
+        admission_digest: Some(projection.admission_digest.clone()),
+        source_digest: Some(projection.source_digest.clone()),
+        last_sampled_token: projection.last_sampled_token,
+    }
+}
+
+fn projection_from_fb(projection: fbs::SessionProjectionT) -> anyhow::Result<SessionProjection> {
+    Ok(SessionProjection {
+        session_id: RequestId(projection.session_id),
+        epoch: projection.epoch,
+        version: projection.version,
+        last_op_id: projection.last_op_id,
+        admission_digest: required_string(
+            projection.admission_digest,
+            "session projection admission digest",
+        )?,
+        source_digest: required_string(
+            projection.source_digest,
+            "session projection source digest",
+        )?,
+        last_sampled_token: projection.last_sampled_token,
     })
 }
 
-fn new_request_from_fb(req: fbs::NewRequestDataT) -> anyhow::Result<NewRequestData> {
-    Ok(NewRequestData {
-        req_id: RequestId(req.req_id),
-        sampling: req.sampling.map(|s| sampling_from_fb(*s)).transpose()?,
-        image: req.image.map(|i| image_from_fb(*i)),
-        neg_token_ids: req.neg_token_ids,
-        lora_id: req.lora_id,
-        block_ids: req
+fn admission_to_fb(admission: &Admission) -> anyhow::Result<fbs::AdmissionT> {
+    admission.validate(crate::EXECUTION_PROTOCOL_VERSION)?;
+    Ok(fbs::AdmissionT {
+        session_id: admission.session_id.0,
+        digest: Some(admission.digest.clone()),
+        sequence: admission
+            .sequence
+            .as_ref()
+            .map(sequence_admission_to_fb)
+            .transpose()?
+            .map(Box::new),
+        flow: admission
+            .flow
+            .as_ref()
+            .map(flow_admission_to_fb)
+            .map(Box::new),
+        adapter_id: admission.adapter_id,
+    })
+}
+
+fn admission_from_fb(admission: fbs::AdmissionT) -> anyhow::Result<Admission> {
+    let admission = Admission {
+        session_id: RequestId(admission.session_id),
+        digest: required_string(admission.digest, "admission.digest")?,
+        sequence: admission
+            .sequence
+            .map(|sequence| sequence_admission_from_fb(*sequence))
+            .transpose()?,
+        flow: admission
+            .flow
+            .map(|flow| flow_admission_from_fb(*flow))
+            .transpose()?,
+        adapter_id: admission.adapter_id,
+    };
+    admission.validate(crate::EXECUTION_PROTOCOL_VERSION)?;
+    Ok(admission)
+}
+
+fn sequence_admission_to_fb(
+    admission: &SequenceAdmission,
+) -> anyhow::Result<fbs::SequenceAdmissionT> {
+    Ok(fbs::SequenceAdmissionT {
+        sampling: Some(Box::new(sampling_to_fb(&admission.sampling)?)),
+        negative_token_ids: Some(admission.negative_token_ids.clone()),
+        kv: Some(Box::new(kv_allocation_to_fb(&admission.kv))),
+    })
+}
+
+fn sequence_admission_from_fb(
+    admission: fbs::SequenceAdmissionT,
+) -> anyhow::Result<SequenceAdmission> {
+    Ok(SequenceAdmission {
+        sampling: sampling_from_fb(
+            *admission
+                .sampling
+                .context("sequence admission has no sampling spec")?,
+        )?,
+        negative_token_ids: admission.negative_token_ids.unwrap_or_default(),
+        kv: kv_allocation_from_fb(
+            *admission
+                .kv
+                .context("sequence admission has no KV allocation")?,
+        ),
+    })
+}
+
+fn flow_admission_to_fb(admission: &FlowAdmission) -> fbs::FlowAdmissionT {
+    fbs::FlowAdmissionT {
+        image: Some(Box::new(image_to_fb(&admission.image))),
+    }
+}
+
+fn flow_admission_from_fb(admission: fbs::FlowAdmissionT) -> anyhow::Result<FlowAdmission> {
+    Ok(FlowAdmission {
+        image: image_from_fb(
+            *admission
+                .image
+                .context("flow admission has no image spec")?,
+        )?,
+    })
+}
+
+fn kv_allocation_to_fb(allocation: &KvAllocation) -> fbs::KvAllocationT {
+    fbs::KvAllocationT {
+        block_ids: Some(allocation.block_ids.iter().map(|block| block.0).collect()),
+        prefix_len: allocation.prefix_len,
+        group_id: allocation.group_id,
+    }
+}
+
+fn kv_allocation_from_fb(allocation: fbs::KvAllocationT) -> KvAllocation {
+    KvAllocation {
+        block_ids: allocation
             .block_ids
             .unwrap_or_default()
             .into_iter()
             .map(BlockId)
             .collect(),
-        prefix_len: req.prefix_len,
-        group_id: req.group_id,
+        prefix_len: allocation.prefix_len,
+        group_id: allocation.group_id,
+    }
+}
+
+fn operation_envelope_to_fb(
+    envelope: &OperationEnvelope,
+) -> anyhow::Result<fbs::OperationEnvelopeT> {
+    envelope.validate(crate::EXECUTION_PROTOCOL_VERSION)?;
+    Ok(fbs::OperationEnvelopeT {
+        session_id: envelope.session_id.0,
+        epoch: envelope.epoch,
+        op_id: envelope.op_id,
+        base_version: envelope.base_version,
+        digest: Some(envelope.digest.clone()),
+        admission_digest: Some(envelope.admission_digest.clone()),
+        model_spec_digest: Some(envelope.model_spec_digest.clone()),
+        weight_digest: Some(envelope.weight_digest.clone()),
+        operation: operation_to_fb(&envelope.operation),
     })
 }
 
-fn op_to_fb(op: &ForwardOp) -> anyhow::Result<fbs::ForwardOpT> {
-    Ok(fbs::ForwardOpT {
-        req_id: op.req_id.0,
-        epoch: op.epoch,
-        base_version: op.base_version,
-        digest: op.digest.clone(),
-        kind: op_kind_to_fb(op.kind),
-        modality: modality_to_fb(op.modality),
-        new_block_ids: Some(op.new_block_ids.iter().map(|id| id.0).collect()),
-        pos_lo: op.pos_range.0,
-        pos_hi: op.pos_range.1,
-        token_ids: op.token_ids.clone(),
-        token_source: token_source_to_fb(op.token_source),
-        timestep_idx: op.timestep_idx,
-        cond_pos: op.cond_pos,
-        cfg: op.cfg.as_ref().map(cfg_to_fb).map(Box::new),
-        image_in: op.image_in,
-        image_prompt: op.image_prompt.clone(),
-        image_b64: op.image_b64.clone(),
-        group_id: op.group_id,
-        allowed_tokens: op.allowed_tokens.clone(),
-        suppress_tokens: op.suppress_tokens.clone(),
-        recent_tokens: op.recent_tokens.clone(),
-        mm_hash: op.mm_hash,
-        spec_token_ids: op.spec_token_ids.clone(),
-        denoise_step_count: op.denoise_step_count,
-        decode_token_count: op.decode_token_count,
-        decode_stop_token_ids: op.decode_stop_token_ids.clone(),
-        decode_stop_terminal: op.decode_stop_terminal,
-        return_all_logits: op.return_all_logits,
-        op_id: op.op_id,
-        logits_handle: op.logits_handle,
-        locator: op.locator.clone(),
+fn operation_envelope_from_fb(
+    envelope: fbs::OperationEnvelopeT,
+) -> anyhow::Result<OperationEnvelope> {
+    let envelope = OperationEnvelope {
+        session_id: RequestId(envelope.session_id),
+        epoch: envelope.epoch,
+        op_id: envelope.op_id,
+        base_version: envelope.base_version,
+        digest: required_string(envelope.digest, "operation.digest")?,
+        admission_digest: required_string(envelope.admission_digest, "operation.admission_digest")?,
+        model_spec_digest: required_string(
+            envelope.model_spec_digest,
+            "operation.model_spec_digest",
+        )?,
+        weight_digest: required_string(envelope.weight_digest, "operation.weight_digest")?,
+        operation: operation_from_fb(envelope.operation)?,
+    };
+    envelope.validate(crate::EXECUTION_PROTOCOL_VERSION)?;
+    Ok(envelope)
+}
+
+fn operation_to_fb(operation: &Operation) -> fbs::OperationT {
+    match operation {
+        Operation::Sequence(value) => {
+            fbs::OperationT::SequenceOperation(Box::new(sequence_operation_to_fb(value)))
+        }
+        Operation::Flow(value) => {
+            fbs::OperationT::FlowOperation(Box::new(flow_operation_to_fb(value)))
+        }
+        Operation::Encode(value) => {
+            fbs::OperationT::EncodeOperation(Box::new(encode_operation_to_fb(value)))
+        }
+        Operation::Materialize(value) => {
+            fbs::OperationT::MaterializeOperation(Box::new(materialize_operation_to_fb(value)))
+        }
+        Operation::Transfer(value) => {
+            fbs::OperationT::TransferOperation(Box::new(transfer_operation_to_fb(value)))
+        }
+    }
+}
+
+fn operation_from_fb(operation: fbs::OperationT) -> anyhow::Result<Operation> {
+    Ok(match operation {
+        fbs::OperationT::SequenceOperation(value) => {
+            Operation::Sequence(sequence_operation_from_fb(*value)?)
+        }
+        fbs::OperationT::FlowOperation(value) => Operation::Flow(flow_operation_from_fb(*value)?),
+        fbs::OperationT::EncodeOperation(value) => {
+            Operation::Encode(encode_operation_from_fb(*value)?)
+        }
+        fbs::OperationT::MaterializeOperation(value) => {
+            Operation::Materialize(materialize_operation_from_fb(*value)?)
+        }
+        fbs::OperationT::TransferOperation(value) => {
+            Operation::Transfer(transfer_operation_from_fb(*value)?)
+        }
+        fbs::OperationT::NONE => bail!("operation union is empty"),
     })
 }
 
-fn op_from_fb(op: fbs::ForwardOpT) -> anyhow::Result<ForwardOp> {
-    Ok(ForwardOp {
-        req_id: RequestId(op.req_id),
-        epoch: op.epoch,
-        base_version: op.base_version,
-        digest: op.digest,
-        kind: op_kind_from_fb(op.kind)?,
-        modality: modality_from_fb(op.modality)?,
-        new_block_ids: op
-            .new_block_ids
+fn sequence_operation_to_fb(operation: &SequenceOperation) -> fbs::SequenceOperationT {
+    fbs::SequenceOperationT {
+        mode: sequence_mode_to_fb(operation.mode),
+        lease: Some(Box::new(lease_to_fb(&operation.lease))),
+        position_start: operation.position.0,
+        position_end: operation.position.1,
+        policy: Some(Box::new(policy_to_fb(&operation.policy))),
+        input: match &operation.input {
+            SequenceInput::Tokens(input) => {
+                fbs::SequenceInputT::TokenInput(Box::new(token_input_to_fb(input)))
+            }
+            SequenceInput::PublishedLogits(product) => {
+                fbs::SequenceInputT::PublishedLogits(Box::new(fbs::PublishedLogitsT {
+                    handle: product.handle,
+                    locator: Some(product.locator.clone()),
+                }))
+            }
+        },
+    }
+}
+
+fn sequence_operation_from_fb(
+    operation: fbs::SequenceOperationT,
+) -> anyhow::Result<SequenceOperation> {
+    Ok(SequenceOperation {
+        mode: sequence_mode_from_fb(operation.mode)?,
+        lease: operation
+            .lease
+            .map(|lease| lease_from_fb(*lease))
+            .context("sequence operation has no KV lease")?,
+        position: (operation.position_start, operation.position_end),
+        policy: operation
+            .policy
+            .map(|policy| policy_from_fb(*policy))
+            .context("sequence operation has no token policy")?,
+        input: match operation.input {
+            fbs::SequenceInputT::TokenInput(input) => {
+                SequenceInput::Tokens(token_input_from_fb(*input)?)
+            }
+            fbs::SequenceInputT::PublishedLogits(product) => {
+                SequenceInput::PublishedLogits(PublishedProduct {
+                    handle: product.handle,
+                    locator: product.locator.unwrap_or_default(),
+                })
+            }
+            fbs::SequenceInputT::NONE => bail!("sequence input union is empty"),
+        },
+    })
+}
+
+fn token_input_to_fb(input: &TokenInput) -> fbs::TokenInputT {
+    fbs::TokenInputT {
+        token_ids: Some(input.token_ids.clone()),
+        source: token_source_to_fb(input.source),
+        draft_token_ids: Some(input.draft_token_ids.clone()),
+        burst_tokens: input.burst_tokens,
+        stop_token_ids: Some(input.stop_token_ids.clone()),
+        stop_terminal: input.stop_terminal,
+        return_all_logits: input.return_all_logits,
+    }
+}
+
+fn token_input_from_fb(input: fbs::TokenInputT) -> anyhow::Result<TokenInput> {
+    Ok(TokenInput {
+        token_ids: input.token_ids.unwrap_or_default(),
+        source: token_source_from_fb(input.source)?,
+        draft_token_ids: input.draft_token_ids.unwrap_or_default(),
+        burst_tokens: input.burst_tokens,
+        stop_token_ids: input.stop_token_ids.unwrap_or_default(),
+        stop_terminal: input.stop_terminal,
+        return_all_logits: input.return_all_logits,
+    })
+}
+
+fn flow_operation_to_fb(operation: &FlowOperation) -> fbs::FlowOperationT {
+    fbs::FlowOperationT {
+        latent_handle: operation.latent_handle,
+        position: operation.position,
+        start_step: operation.start_step,
+        step_count: operation.step_count,
+        conditioning_position: operation.conditioning_position,
+        conditioning: operation
+            .conditioning
+            .as_ref()
+            .map(published_kv_to_fb)
+            .map(Box::new),
+        guidance: Some(Box::new(guidance_to_fb(&operation.guidance))),
+        image_prompt: Some(operation.image_prompt.clone()),
+    }
+}
+
+fn flow_operation_from_fb(operation: fbs::FlowOperationT) -> anyhow::Result<FlowOperation> {
+    Ok(FlowOperation {
+        latent_handle: operation.latent_handle,
+        position: operation.position,
+        start_step: operation.start_step,
+        step_count: operation.step_count,
+        conditioning_position: operation.conditioning_position,
+        conditioning: operation
+            .conditioning
+            .map(|conditioning| published_kv_from_fb(*conditioning))
+            .transpose()?,
+        guidance: guidance_from_fb(
+            *operation
+                .guidance
+                .context("flow operation has no guidance")?,
+        )?,
+        image_prompt: operation.image_prompt.unwrap_or_default(),
+    })
+}
+
+fn guidance_to_fb(guidance: &Guidance) -> fbs::GuidanceT {
+    fbs::GuidanceT {
+        branch_count: guidance.branch_count,
+        text_scale: guidance.text_scale,
+        image_scale: guidance.image_scale,
+        renorm_type: Some(guidance.renorm_type.clone()),
+        renorm_min: guidance.renorm_min,
+        interval_lo: guidance.interval.0,
+        interval_hi: guidance.interval.1,
+    }
+}
+
+fn guidance_from_fb(guidance: fbs::GuidanceT) -> anyhow::Result<Guidance> {
+    let guidance = Guidance {
+        branch_count: guidance.branch_count,
+        text_scale: guidance.text_scale,
+        image_scale: guidance.image_scale,
+        renorm_type: required_string(guidance.renorm_type, "guidance.renorm_type")?,
+        renorm_min: guidance.renorm_min,
+        interval: (guidance.interval_lo, guidance.interval_hi),
+    };
+    for value in [
+        guidance.text_scale,
+        guidance.image_scale,
+        guidance.renorm_min,
+        guidance.interval.0,
+        guidance.interval.1,
+    ] {
+        anyhow::ensure!(value.is_finite(), "guidance contains a non-finite value");
+    }
+    Ok(guidance)
+}
+
+fn encode_operation_to_fb(operation: &EncodeOperation) -> fbs::EncodeOperationT {
+    fbs::EncodeOperationT {
+        kind: encode_kind_to_fb(operation.kind),
+        lease: Some(Box::new(lease_to_fb(&operation.lease))),
+        position_start: operation.position.0,
+        position_end: operation.position.1,
+        conditioning_position: operation.conditioning_position,
+        input: match &operation.input {
+            EncodeInput::InlineImage {
+                base64,
+                content_hash,
+            } => fbs::EncodeInputT::InlineImage(Box::new(fbs::InlineImageT {
+                base64: Some(base64.clone()),
+                content_hash: *content_hash,
+            })),
+            EncodeInput::StagedProduct {
+                handle,
+                content_hash,
+            } => fbs::EncodeInputT::StagedProduct(Box::new(fbs::StagedProductT {
+                handle: *handle,
+                content_hash: *content_hash,
+            })),
+            EncodeInput::CachedProduct { content_hash } => {
+                fbs::EncodeInputT::CachedProduct(Box::new(fbs::CachedProductT {
+                    content_hash: *content_hash,
+                }))
+            }
+        },
+    }
+}
+
+fn encode_operation_from_fb(operation: fbs::EncodeOperationT) -> anyhow::Result<EncodeOperation> {
+    Ok(EncodeOperation {
+        kind: encode_kind_from_fb(operation.kind)?,
+        lease: operation
+            .lease
+            .map(|lease| lease_from_fb(*lease))
+            .context("encode operation has no KV lease")?,
+        position: (operation.position_start, operation.position_end),
+        conditioning_position: operation.conditioning_position,
+        input: match operation.input {
+            fbs::EncodeInputT::InlineImage(input) => EncodeInput::InlineImage {
+                base64: required_string(input.base64, "inline image")?,
+                content_hash: input.content_hash,
+            },
+            fbs::EncodeInputT::StagedProduct(input) => EncodeInput::StagedProduct {
+                handle: input.handle,
+                content_hash: input.content_hash,
+            },
+            fbs::EncodeInputT::CachedProduct(input) => EncodeInput::CachedProduct {
+                content_hash: input.content_hash,
+            },
+            fbs::EncodeInputT::NONE => bail!("encode input union is empty"),
+        },
+    })
+}
+
+fn materialize_operation_to_fb(operation: &MaterializeOperation) -> fbs::MaterializeOperationT {
+    fbs::MaterializeOperationT {
+        kind: materialize_kind_to_fb(operation.kind),
+        lease: Some(Box::new(lease_to_fb(&operation.lease))),
+        position: operation.position,
+        conditioning_position: operation.conditioning_position,
+        policy: Some(Box::new(policy_to_fb(&operation.policy))),
+        input: match &operation.input {
+            MaterializeInput::Latent { handle } => {
+                fbs::MaterializeInputT::LatentProduct(Box::new(fbs::LatentProductT {
+                    handle: *handle,
+                }))
+            }
+            MaterializeInput::Published(product) => {
+                fbs::MaterializeInputT::PublishedProduct(Box::new(published_to_fb(product)))
+            }
+        },
+    }
+}
+
+fn materialize_operation_from_fb(
+    operation: fbs::MaterializeOperationT,
+) -> anyhow::Result<MaterializeOperation> {
+    Ok(MaterializeOperation {
+        kind: materialize_kind_from_fb(operation.kind)?,
+        lease: operation
+            .lease
+            .map(|lease| lease_from_fb(*lease))
+            .context("materialize operation has no KV lease")?,
+        position: operation.position,
+        conditioning_position: operation.conditioning_position,
+        policy: operation
+            .policy
+            .map(|policy| policy_from_fb(*policy))
+            .context("materialize operation has no token policy")?,
+        input: match operation.input {
+            fbs::MaterializeInputT::LatentProduct(input) => MaterializeInput::Latent {
+                handle: input.handle,
+            },
+            fbs::MaterializeInputT::PublishedProduct(product) => {
+                MaterializeInput::Published(published_from_fb(*product))
+            }
+            fbs::MaterializeInputT::NONE => bail!("materialize input union is empty"),
+        },
+    })
+}
+
+fn transfer_operation_to_fb(operation: &TransferOperation) -> fbs::TransferOperationT {
+    fbs::TransferOperationT {
+        kind: transfer_kind_to_fb(operation.kind),
+        lease: Some(Box::new(lease_to_fb(&operation.lease))),
+        position: operation.position,
+        conditioning_position: operation.conditioning_position,
+        policy: Some(Box::new(policy_to_fb(&operation.policy))),
+        source: Some(Box::new(published_to_fb(&operation.source))),
+    }
+}
+
+fn transfer_operation_from_fb(
+    operation: fbs::TransferOperationT,
+) -> anyhow::Result<TransferOperation> {
+    Ok(TransferOperation {
+        kind: transfer_kind_from_fb(operation.kind)?,
+        lease: operation
+            .lease
+            .map(|lease| lease_from_fb(*lease))
+            .context("transfer operation has no KV lease")?,
+        position: operation.position,
+        conditioning_position: operation.conditioning_position,
+        policy: operation
+            .policy
+            .map(|policy| policy_from_fb(*policy))
+            .context("transfer operation has no token policy")?,
+        source: published_from_fb(
+            *operation
+                .source
+                .context("transfer operation has no source")?,
+        ),
+    })
+}
+
+fn lease_to_fb(lease: &KvLeaseDelta) -> fbs::KvLeaseDeltaT {
+    fbs::KvLeaseDeltaT {
+        group_id: lease.group_id,
+        new_blocks: Some(lease.new_blocks.iter().map(|block| block.0).collect()),
+    }
+}
+
+fn lease_from_fb(lease: fbs::KvLeaseDeltaT) -> KvLeaseDelta {
+    KvLeaseDelta {
+        group_id: lease.group_id,
+        new_blocks: lease
+            .new_blocks
             .unwrap_or_default()
             .into_iter()
             .map(BlockId)
             .collect(),
-        pos_range: (op.pos_lo, op.pos_hi),
-        token_ids: op.token_ids,
-        token_source: token_source_from_fb(op.token_source)?,
-        timestep_idx: op.timestep_idx,
-        cond_pos: op.cond_pos,
-        cfg: op.cfg.map(|cfg| cfg_from_fb(*cfg)).transpose()?,
-        image_in: op.image_in,
-        image_prompt: op.image_prompt,
-        image_b64: op.image_b64,
-        group_id: op.group_id,
-        allowed_tokens: op.allowed_tokens,
-        suppress_tokens: op.suppress_tokens,
-        recent_tokens: op.recent_tokens,
-        mm_hash: op.mm_hash,
-        spec_token_ids: op.spec_token_ids,
-        denoise_step_count: op.denoise_step_count,
-        decode_token_count: op.decode_token_count,
-        decode_stop_token_ids: op.decode_stop_token_ids,
-        decode_stop_terminal: op.decode_stop_terminal,
-        return_all_logits: op.return_all_logits,
-        op_id: op.op_id,
-        logits_handle: op.logits_handle,
-        locator: op.locator,
-    })
+    }
 }
 
-fn result_to_fb(result: &ForwardResult) -> anyhow::Result<fbs::ForwardResultT> {
-    Ok(fbs::ForwardResultT {
+fn policy_to_fb(policy: &TokenPolicy) -> fbs::TokenPolicyT {
+    fbs::TokenPolicyT {
+        allowed_tokens: Some(policy.allowed_tokens.clone()),
+        suppress_tokens: Some(policy.suppress_tokens.clone()),
+        recent_tokens: Some(policy.recent_tokens.clone()),
+        publish_kv: policy.publish_kv,
+        publish_kv_on_tokens: Some(policy.publish_kv_on_tokens.clone()),
+    }
+}
+
+fn policy_from_fb(policy: fbs::TokenPolicyT) -> TokenPolicy {
+    TokenPolicy {
+        allowed_tokens: policy.allowed_tokens.unwrap_or_default(),
+        suppress_tokens: policy.suppress_tokens.unwrap_or_default(),
+        recent_tokens: policy.recent_tokens.unwrap_or_default(),
+        publish_kv: policy.publish_kv,
+        publish_kv_on_tokens: policy.publish_kv_on_tokens.unwrap_or_default(),
+    }
+}
+
+fn published_to_fb(product: &PublishedProduct) -> fbs::PublishedProductT {
+    fbs::PublishedProductT {
+        handle: product.handle,
+        locator: Some(product.locator.clone()),
+    }
+}
+
+fn published_from_fb(product: fbs::PublishedProductT) -> PublishedProduct {
+    PublishedProduct {
+        handle: product.handle,
+        locator: product.locator.unwrap_or_default(),
+    }
+}
+
+fn published_kv_to_fb(snapshot: &PublishedKv) -> fbs::PublishedKvT {
+    fbs::PublishedKvT {
+        handle: snapshot.handle,
+        locators: Some(snapshot.locators.clone()),
+        source_version: snapshot.source_version,
+        kv_tokens: snapshot.kv_tokens,
+        block_ids: Some(snapshot.block_ids.iter().map(|block| block.0).collect()),
+        group_id: snapshot.group_id,
+        position: snapshot.position,
+    }
+}
+
+fn published_kv_from_fb(snapshot: fbs::PublishedKvT) -> anyhow::Result<PublishedKv> {
+    let snapshot = PublishedKv {
+        handle: snapshot.handle,
+        locators: snapshot.locators.unwrap_or_default(),
+        source_version: snapshot.source_version,
+        kv_tokens: snapshot.kv_tokens,
+        block_ids: snapshot
+            .block_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(BlockId)
+            .collect(),
+        group_id: snapshot.group_id,
+        position: snapshot.position,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
+}
+
+fn execution_result_to_fb(result: &ExecutionResult) -> anyhow::Result<fbs::ExecutionResultT> {
+    Ok(fbs::ExecutionResultT {
         step_id: result.step_id,
-        per_seq: Some(
+        operations: Some(
             result
-                .per_seq
+                .operations
                 .iter()
-                .map(seq_result_to_fb)
-                .collect::<anyhow::Result<Vec<_>>>()?,
+                .map(operation_result_to_fb)
+                .collect::<anyhow::Result<_>>()?,
         ),
         worker_exec_us: result.worker_exec_us,
         forward_stats: result
@@ -306,19 +950,574 @@ fn result_to_fb(result: &ForwardResult) -> anyhow::Result<fbs::ForwardResultT> {
     })
 }
 
-fn result_from_fb(result: fbs::ForwardResultT) -> anyhow::Result<ForwardResult> {
-    Ok(ForwardResult {
+fn execution_result_from_fb(result: fbs::ExecutionResultT) -> anyhow::Result<ExecutionResult> {
+    Ok(ExecutionResult {
         step_id: result.step_id,
-        per_seq: result
-            .per_seq
+        operations: result
+            .operations
             .unwrap_or_default()
             .into_iter()
-            .map(seq_result_from_fb)
-            .collect::<anyhow::Result<Vec<_>>>()?,
+            .map(operation_result_from_fb)
+            .collect::<anyhow::Result<_>>()?,
         worker_exec_us: result.worker_exec_us,
         forward_stats: result
             .forward_stats
             .map(|stats| forward_stats_from_fb(*stats)),
+    })
+}
+
+fn operation_result_to_fb(result: &OperationResult) -> anyhow::Result<fbs::OperationResultT> {
+    Ok(fbs::OperationResultT {
+        session_id: result.session_id.0,
+        epoch: result.epoch,
+        op_id: result.op_id,
+        base_version: result.base_version,
+        result_version: result.result_version,
+        delta: result_delta_to_fb(&result.delta)?,
+    })
+}
+
+fn operation_result_from_fb(result: fbs::OperationResultT) -> anyhow::Result<OperationResult> {
+    Ok(OperationResult {
+        session_id: RequestId(result.session_id),
+        epoch: result.epoch,
+        op_id: result.op_id,
+        base_version: result.base_version,
+        result_version: result.result_version,
+        delta: result_delta_from_fb(result.delta)?,
+    })
+}
+
+fn result_delta_to_fb(delta: &ResultDelta) -> anyhow::Result<fbs::ResultDeltaT> {
+    Ok(match delta {
+        ResultDelta::Sequence(delta) => {
+            fbs::ResultDeltaT::SequenceDelta(Box::new(fbs::SequenceDeltaT {
+                effect: Some(Box::new(sequence_effect_to_fb(&delta.effect)?)),
+            }))
+        }
+        ResultDelta::Flow(delta) => fbs::ResultDeltaT::FlowDelta(Box::new(fbs::FlowDeltaT {
+            steps_completed: delta.steps_completed,
+            done: delta.done,
+        })),
+        ResultDelta::Encode(delta) => fbs::ResultDeltaT::EncodeDelta(Box::new(fbs::EncodeDeltaT {
+            product_handle: delta.product_handle,
+            kv_tokens: delta.kv_tokens,
+            height: delta.image_size.map(|size| size.0),
+            width: delta.image_size.map(|size| size.1),
+        })),
+        ResultDelta::Materialize(delta) => {
+            fbs::ResultDeltaT::MaterializeDelta(Box::new(fbs::MaterializeDeltaT {
+                product: materialized_product_to_fb(&delta.product),
+                kv_tokens: delta.kv_tokens,
+                sequence: delta
+                    .sequence
+                    .as_ref()
+                    .map(sequence_effect_to_fb)
+                    .transpose()?
+                    .map(Box::new),
+            }))
+        }
+        ResultDelta::Transfer(delta) => {
+            fbs::ResultDeltaT::TransferDelta(Box::new(fbs::TransferDeltaT {
+                product: delta.product.as_ref().map(published_to_fb).map(Box::new),
+                kv_tokens: delta.kv_tokens,
+                sequence: delta
+                    .sequence
+                    .as_ref()
+                    .map(sequence_effect_to_fb)
+                    .transpose()?
+                    .map(Box::new),
+            }))
+        }
+    })
+}
+
+fn result_delta_from_fb(delta: fbs::ResultDeltaT) -> anyhow::Result<ResultDelta> {
+    Ok(match delta {
+        fbs::ResultDeltaT::SequenceDelta(delta) => ResultDelta::Sequence(SequenceDelta {
+            effect: sequence_effect_from_fb(
+                *delta.effect.context("sequence delta has no effect")?,
+            )?,
+        }),
+        fbs::ResultDeltaT::FlowDelta(delta) => ResultDelta::Flow(FlowDelta {
+            steps_completed: delta.steps_completed,
+            done: delta.done,
+        }),
+        fbs::ResultDeltaT::EncodeDelta(delta) => ResultDelta::Encode(EncodeDelta {
+            product_handle: delta.product_handle,
+            kv_tokens: delta.kv_tokens,
+            image_size: match (delta.height, delta.width) {
+                (Some(height), Some(width)) => Some((height, width)),
+                (None, None) => None,
+                _ => bail!("encode delta image dimensions are incomplete"),
+            },
+        }),
+        fbs::ResultDeltaT::MaterializeDelta(delta) => ResultDelta::Materialize(MaterializeDelta {
+            product: materialized_product_from_fb(delta.product)?,
+            kv_tokens: delta.kv_tokens,
+            sequence: delta
+                .sequence
+                .map(|effect| sequence_effect_from_fb(*effect))
+                .transpose()?,
+        }),
+        fbs::ResultDeltaT::TransferDelta(delta) => ResultDelta::Transfer(TransferDelta {
+            product: delta.product.map(|product| published_from_fb(*product)),
+            kv_tokens: delta.kv_tokens,
+            sequence: delta
+                .sequence
+                .map(|effect| sequence_effect_from_fb(*effect))
+                .transpose()?,
+        }),
+        fbs::ResultDeltaT::NONE => bail!("result delta union is empty"),
+    })
+}
+
+fn sequence_effect_to_fb(effect: &SequenceEffect) -> anyhow::Result<fbs::SequenceEffectT> {
+    validate_sequence_effect(effect)?;
+    Ok(fbs::SequenceEffectT {
+        sampled_token_ids: Some(effect.sampled_token_ids.clone()),
+        sampled_logprob: effect.sampled_logprob,
+        top_logprobs: Some(
+            effect
+                .top_logprobs
+                .iter()
+                .map(token_logprob_to_fb)
+                .collect(),
+        ),
+        prompt_logprobs: Some(
+            effect
+                .prompt_logprobs
+                .iter()
+                .map(|entries| fbs::PositionLogprobsT {
+                    entries: Some(entries.iter().map(token_logprob_to_fb).collect()),
+                })
+                .collect(),
+        ),
+        accepted_draft_tokens: effect.accepted_draft_tokens,
+        kv_tokens: effect.kv_tokens,
+        published_logits: effect
+            .published_logits
+            .as_ref()
+            .map(published_to_fb)
+            .map(Box::new),
+        published_kv: effect
+            .published_kv
+            .as_ref()
+            .map(published_kv_to_fb)
+            .map(Box::new),
+    })
+}
+
+fn sequence_effect_from_fb(effect: fbs::SequenceEffectT) -> anyhow::Result<SequenceEffect> {
+    let effect = SequenceEffect {
+        sampled_token_ids: effect.sampled_token_ids.unwrap_or_default(),
+        sampled_logprob: effect.sampled_logprob,
+        top_logprobs: effect
+            .top_logprobs
+            .unwrap_or_default()
+            .into_iter()
+            .map(token_logprob_from_fb)
+            .collect(),
+        prompt_logprobs: effect
+            .prompt_logprobs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|position| {
+                position
+                    .entries
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(token_logprob_from_fb)
+                    .collect()
+            })
+            .collect(),
+        accepted_draft_tokens: effect.accepted_draft_tokens,
+        kv_tokens: effect.kv_tokens,
+        published_logits: effect
+            .published_logits
+            .map(|product| published_from_fb(*product)),
+        published_kv: effect
+            .published_kv
+            .map(|snapshot| published_kv_from_fb(*snapshot))
+            .transpose()?,
+    };
+    validate_sequence_effect(&effect)?;
+    Ok(effect)
+}
+
+fn validate_sequence_effect(effect: &SequenceEffect) -> anyhow::Result<()> {
+    if let Some(value) = effect.sampled_logprob {
+        anyhow::ensure!(value.is_finite(), "sampled logprob must be finite");
+    }
+    for (position, entries) in std::iter::once(&effect.top_logprobs)
+        .chain(effect.prompt_logprobs.iter())
+        .enumerate()
+    {
+        for (index, entry) in entries.iter().enumerate() {
+            anyhow::ensure!(
+                entry.1.is_finite(),
+                "logprob at {position}:{index} is not finite"
+            );
+            anyhow::ensure!(
+                entry.2 > 0,
+                "logprob rank at {position}:{index} must be positive"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn token_logprob_to_fb(entry: &TokenLogprob) -> fbs::TokenLogprobT {
+    fbs::TokenLogprobT {
+        token_id: entry.0,
+        logprob: entry.1,
+        rank: entry.2,
+    }
+}
+
+fn token_logprob_from_fb(entry: fbs::TokenLogprobT) -> TokenLogprob {
+    TokenLogprob(entry.token_id, entry.logprob, entry.rank)
+}
+
+fn materialized_product_to_fb(product: &MaterializedProduct) -> fbs::MaterializedProductT {
+    match product {
+        MaterializedProduct::Image(image) => {
+            fbs::MaterializedProductT::ImageArtifact(Box::new(fbs::ImageArtifactT {
+                png_base64: Some(image.png_base64.clone()),
+                height: image.height,
+                width: image.width,
+                handle: image.handle,
+                locator: Some(image.locator.clone()),
+            }))
+        }
+        MaterializedProduct::Published(product) => {
+            fbs::MaterializedProductT::PublishedProduct(Box::new(published_to_fb(product)))
+        }
+        MaterializedProduct::Frame { count } => {
+            fbs::MaterializedProductT::FrameRecord(Box::new(fbs::FrameRecordT { count: *count }))
+        }
+    }
+}
+
+fn materialized_product_from_fb(
+    product: fbs::MaterializedProductT,
+) -> anyhow::Result<MaterializedProduct> {
+    Ok(match product {
+        fbs::MaterializedProductT::ImageArtifact(image) => {
+            MaterializedProduct::Image(ImageArtifact {
+                png_base64: required_string(image.png_base64, "image artifact")?,
+                height: image.height,
+                width: image.width,
+                handle: image.handle,
+                locator: image.locator.unwrap_or_default(),
+            })
+        }
+        fbs::MaterializedProductT::PublishedProduct(product) => {
+            MaterializedProduct::Published(published_from_fb(*product))
+        }
+        fbs::MaterializedProductT::FrameRecord(frame) => {
+            MaterializedProduct::Frame { count: frame.count }
+        }
+        fbs::MaterializedProductT::NONE => bail!("materialized product union is empty"),
+    })
+}
+
+fn capabilities_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
+    anyhow::ensure!(
+        !caps.supported_operation_types.is_empty(),
+        "worker capabilities declare no operations"
+    );
+    Ok(fbs::EngineCapsT {
+        block_size: caps.block_size,
+        num_blocks: caps.num_blocks,
+        num_layers: caps.num_layers,
+        scratch_capacity_tokens: caps.scratch_capacity_tokens,
+        supported_operation_types: Some(
+            caps.supported_operation_types
+                .iter()
+                .copied()
+                .map(operation_type_to_fb)
+                .collect(),
+        ),
+        max_latent_size: caps.max_latent_size,
+        latent_downsample: caps.latent_downsample,
+        bytes_per_token: caps.bytes_per_token,
+        max_vae_grid_tokens: caps.max_vae_grid_tokens,
+        max_vit_grid_tokens: caps.max_vit_grid_tokens,
+        commit_marker_tokens: caps.commit_marker_tokens,
+        gen_rope_advance: caps.gen_rope_advance,
+        max_cfg_branches: caps.max_cfg_branches,
+        groups: Some(caps.groups.iter().map(kv_group_to_fb).collect()),
+        kv_dtype: Some(caps.kv_dtype.clone()),
+        model_dtype: Some(caps.model_dtype.clone()),
+        attention_backend: Some(caps.attention_backend.clone()),
+        quantization: caps.quantization.clone(),
+        rank: Some(Box::new(rank_to_fb(caps.rank))),
+        pipeline_depth: caps.pipeline_depth,
+        encoder_cache_budget: caps.encoder_cache_budget,
+        supported_controls: Some(
+            caps.supported_controls
+                .iter()
+                .copied()
+                .map(request_kind_to_fb)
+                .collect(),
+        ),
+        adapter_mode: adapter_mode_to_fb(caps.adapter_mode),
+        execution_constraints: Some(Box::new(fbs::ExecutionConstraintsT {
+            max_batch_operations: caps.execution_constraints.max_batch_operations,
+        })),
+        resource_classes: Some(
+            caps.resource_classes
+                .iter()
+                .copied()
+                .map(resource_class_to_fb)
+                .collect(),
+        ),
+        model_spec_digest: Some(caps.model_spec_digest.clone()),
+        weight_digest: Some(caps.weight_digest.clone()),
+        restored_sessions: Some(
+            caps.restored_sessions
+                .iter()
+                .map(|session| session.0)
+                .collect(),
+        ),
+    })
+}
+
+fn capabilities_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
+    let caps = EngineCaps {
+        block_size: caps.block_size,
+        num_blocks: caps.num_blocks,
+        num_layers: caps.num_layers,
+        scratch_capacity_tokens: caps.scratch_capacity_tokens,
+        supported_operation_types: caps
+            .supported_operation_types
+            .unwrap_or_default()
+            .into_iter()
+            .map(operation_type_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        max_latent_size: caps.max_latent_size,
+        latent_downsample: caps.latent_downsample,
+        bytes_per_token: caps.bytes_per_token,
+        max_vae_grid_tokens: caps.max_vae_grid_tokens,
+        max_vit_grid_tokens: caps.max_vit_grid_tokens,
+        commit_marker_tokens: caps.commit_marker_tokens,
+        gen_rope_advance: caps.gen_rope_advance,
+        max_cfg_branches: caps.max_cfg_branches,
+        groups: caps
+            .groups
+            .unwrap_or_default()
+            .into_iter()
+            .map(kv_group_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        kv_dtype: required_string(caps.kv_dtype, "capabilities.kv_dtype")?,
+        model_dtype: canonical_model_dtype(required_string(
+            caps.model_dtype,
+            "capabilities.model_dtype",
+        )?)?,
+        attention_backend: required_string(
+            caps.attention_backend,
+            "capabilities.attention_backend",
+        )?,
+        quantization: caps.quantization,
+        rank: caps
+            .rank
+            .map(|rank| rank_from_fb(*rank))
+            .context("capabilities have no rank")?,
+        pipeline_depth: caps.pipeline_depth,
+        encoder_cache_budget: caps.encoder_cache_budget,
+        supported_controls: caps
+            .supported_controls
+            .unwrap_or_default()
+            .into_iter()
+            .map(request_kind_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        adapter_mode: adapter_mode_from_fb(caps.adapter_mode)?,
+        execution_constraints: caps
+            .execution_constraints
+            .map(|constraints| ExecutionConstraints {
+                max_batch_operations: constraints.max_batch_operations,
+            })
+            .context("capabilities have no execution constraints")?,
+        resource_classes: caps
+            .resource_classes
+            .unwrap_or_default()
+            .into_iter()
+            .map(resource_class_from_fb)
+            .collect::<anyhow::Result<_>>()?,
+        model_spec_digest: caps
+            .model_spec_digest
+            .context("capabilities.model_spec_digest is missing")?,
+        weight_digest: caps
+            .weight_digest
+            .context("capabilities.weight_digest is missing")?,
+        restored_sessions: caps
+            .restored_sessions
+            .unwrap_or_default()
+            .into_iter()
+            .map(RequestId)
+            .collect(),
+    };
+    anyhow::ensure!(
+        !caps.supported_operation_types.is_empty(),
+        "worker capabilities declare no operations"
+    );
+    anyhow::ensure!(
+        (caps.model_spec_digest.is_empty() && caps.weight_digest.is_empty())
+            || (caps.model_spec_digest.len() == 64 && caps.weight_digest.len() == 64),
+        "worker capability model and weight identities are incomplete"
+    );
+    Ok(caps)
+}
+
+fn canonical_model_dtype(value: String) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        matches!(value.as_str(), "float16" | "bfloat16" | "float32"),
+        "capabilities.model_dtype is not canonical: {value:?}"
+    );
+    Ok(value)
+}
+
+fn sampling_to_fb(sampling: &SamplingParams) -> anyhow::Result<fbs::SamplingParamsT> {
+    validate_sampling(sampling)?;
+    Ok(fbs::SamplingParamsT {
+        temperature: sampling.temperature,
+        top_k: sampling.top_k,
+        top_p: sampling.top_p,
+        ignore_eos: sampling.ignore_eos,
+        seed: sampling.seed,
+        min_p: sampling.min_p,
+        repetition_penalty: sampling.repetition_penalty,
+        frequency_penalty: sampling.frequency_penalty,
+        presence_penalty: sampling.presence_penalty,
+        logit_bias: Some(
+            sampling
+                .logit_bias
+                .iter()
+                .map(|(token_id, bias)| fbs::TokenBiasT {
+                    token_id: *token_id,
+                    bias: *bias,
+                })
+                .collect(),
+        ),
+        min_tokens: sampling.min_tokens as u64,
+        n_logprobs: sampling.n_logprobs,
+        bad_words_ids: Some(
+            sampling
+                .bad_words_ids
+                .iter()
+                .map(|items| fbs::U32ListT {
+                    items: Some(items.clone()),
+                })
+                .collect(),
+        ),
+        allowed_token_ids: sampling.allowed_token_ids.clone(),
+        return_logprobs: sampling.return_logprobs,
+        return_prompt_logprobs: sampling.return_prompt_logprobs,
+        n_prompt_logprobs: sampling.n_prompt_logprobs,
+        logprob_token_ids: Some(sampling.logprob_token_ids.clone()),
+    })
+}
+
+fn sampling_from_fb(sampling: fbs::SamplingParamsT) -> anyhow::Result<SamplingParams> {
+    let sampling = SamplingParams {
+        temperature: sampling.temperature,
+        top_k: sampling.top_k,
+        top_p: sampling.top_p,
+        ignore_eos: sampling.ignore_eos,
+        seed: sampling.seed,
+        min_p: sampling.min_p,
+        repetition_penalty: sampling.repetition_penalty,
+        frequency_penalty: sampling.frequency_penalty,
+        presence_penalty: sampling.presence_penalty,
+        logit_bias: sampling
+            .logit_bias
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (item.token_id, item.bias))
+            .collect(),
+        min_tokens: usize::try_from(sampling.min_tokens)
+            .context("sampling.min_tokens does not fit usize")?,
+        n_logprobs: sampling.n_logprobs,
+        bad_words_ids: sampling
+            .bad_words_ids
+            .unwrap_or_default()
+            .into_iter()
+            .map(|items| items.items.unwrap_or_default())
+            .collect(),
+        allowed_token_ids: sampling.allowed_token_ids,
+        return_logprobs: sampling.return_logprobs,
+        return_prompt_logprobs: sampling.return_prompt_logprobs,
+        n_prompt_logprobs: sampling.n_prompt_logprobs,
+        logprob_token_ids: sampling.logprob_token_ids.unwrap_or_default(),
+    };
+    validate_sampling(&sampling)?;
+    Ok(sampling)
+}
+
+fn validate_sampling(sampling: &SamplingParams) -> anyhow::Result<()> {
+    for value in [
+        sampling.temperature,
+        sampling.top_p,
+        sampling.min_p,
+        sampling.repetition_penalty,
+        sampling.frequency_penalty,
+        sampling.presence_penalty,
+    ] {
+        anyhow::ensure!(value.is_finite(), "sampling parameters must be finite");
+    }
+    for (_, value) in &sampling.logit_bias {
+        anyhow::ensure!(value.is_finite(), "logit bias must be finite");
+    }
+    Ok(())
+}
+
+fn image_to_fb(image: &uniserve_core::ImageParams) -> fbs::ImageParamsT {
+    fbs::ImageParamsT {
+        steps: image.steps,
+        cfg_text_scale: image.cfg_text_scale,
+        cfg_img_scale: image.cfg_img_scale,
+        cfg_renorm_type: Some(image.cfg_renorm_type.clone()),
+        cfg_renorm_min: image.cfg_renorm_min,
+        cfg_interval_lo: image.cfg_interval.0,
+        cfg_interval_hi: image.cfg_interval.1,
+        timestep_shift: image.timestep_shift,
+        height: image.height,
+        width: image.width,
+        seed: image.seed,
+        negative_prompt: Some(image.negative_prompt.clone()),
+        max_images: image.max_images,
+        image_prompts: Some(image.image_prompts.clone()),
+        retain_images: image.retain_images,
+    }
+}
+
+fn image_from_fb(image: fbs::ImageParamsT) -> anyhow::Result<uniserve_core::ImageParams> {
+    for value in [
+        image.cfg_text_scale,
+        image.cfg_img_scale,
+        image.cfg_renorm_min,
+        image.cfg_interval_lo,
+        image.cfg_interval_hi,
+        image.timestep_shift,
+    ] {
+        anyhow::ensure!(value.is_finite(), "image parameters must be finite");
+    }
+    Ok(uniserve_core::ImageParams {
+        steps: image.steps,
+        cfg_text_scale: image.cfg_text_scale,
+        cfg_img_scale: image.cfg_img_scale,
+        cfg_renorm_type: required_string(image.cfg_renorm_type, "image.cfg_renorm_type")?,
+        cfg_renorm_min: image.cfg_renorm_min,
+        cfg_interval: (image.cfg_interval_lo, image.cfg_interval_hi),
+        timestep_shift: image.timestep_shift,
+        height: image.height,
+        width: image.width,
+        seed: image.seed,
+        negative_prompt: image.negative_prompt.unwrap_or_default(),
+        max_images: image.max_images,
+        image_prompts: image.image_prompts.unwrap_or_default(),
+        retain_images: image.retain_images,
     })
 }
 
@@ -327,7 +1526,6 @@ fn forward_stats_to_fb(stats: &WorkerForwardStats) -> fbs::WorkerForwardStatsT {
         mode_counts: Some(map_to_fb(&stats.mode_counts)),
         mode_tokens: Some(map_to_fb(&stats.mode_tokens)),
         mode_us: Some(map_to_fb(&stats.mode_us)),
-        component_us: Some(map_to_fb(&stats.component_us)),
         attention_launches: stats.attention_launches,
         attention_us: stats.attention_us,
         attention_backend_counts: Some(map_to_fb(&stats.attention_backend_counts)),
@@ -354,6 +1552,7 @@ fn forward_stats_to_fb(stats: &WorkerForwardStats) -> fbs::WorkerForwardStatsT {
         spec_verify_rejected_tokens: stats.spec_verify_rejected_tokens,
         spec_verify_committed_tokens: stats.spec_verify_committed_tokens,
         spec_verify_path_counts: Some(map_to_fb(&stats.spec_verify_path_counts)),
+        component_us: Some(map_to_fb(&stats.component_us)),
     }
 }
 
@@ -392,477 +1591,51 @@ fn forward_stats_from_fb(stats: fbs::WorkerForwardStatsT) -> WorkerForwardStats 
     }
 }
 
-fn seq_result_to_fb(sr: &SeqResult) -> anyhow::Result<fbs::SeqResultT> {
-    validate_seq_result_logprobs(sr)?;
-    Ok(fbs::SeqResultT {
-        req_id: sr.req_id.0,
-        sampled_token_id: sr.sampled_token_id,
-        denoise_done: sr.denoise_done,
-        num_steps_done: sr.num_steps_done,
-        image_png_b64: sr.image_png_b64.clone(),
-        // `SeqResult.image_hw` is canonically `(height, width)`; store each
-        // component into the matching schema field so the field names do not lie.
-        image_hw_h: sr.image_hw.map(|(h, _)| h),
-        image_hw_w: sr.image_hw.map(|(_, w)| w),
-        sampled_logprob: sr.sampled_logprob,
-        top_logprobs: sr.top_logprobs.as_ref().map(|items| {
-            items
-                .iter()
-                .map(|item| fbs::TokenLogprobT {
-                    token_id: item.0,
-                    logprob: item.1,
-                    rank: item.2,
-                })
-                .collect()
-        }),
-        prompt_logprobs: sr.prompt_logprobs.as_ref().map(|positions| {
-            positions
-                .iter()
-                .map(|entries| fbs::PositionLogprobsT {
-                    entries: Some(
-                        entries
-                            .iter()
-                            .map(|item| fbs::TokenLogprobT {
-                                token_id: item.0,
-                                logprob: item.1,
-                                rank: item.2,
-                            })
-                            .collect(),
-                    ),
-                })
-                .collect()
-        }),
-        sampled_token_ids: sr.sampled_token_ids.clone(),
-        encoder_handle: sr.encoder_handle,
-        num_tokens: sr.num_tokens,
-        num_accepted_tokens: sr.num_accepted_tokens,
-        op_id: sr.op_id,
-        epoch: sr.epoch,
-        base_version: sr.base_version,
-        result_version: sr.result_version,
-        logits_handle: sr.logits_handle,
-        locator: sr.locator.clone(),
-        op_kind: sr
-            .op_kind
-            .map(op_kind_to_fb)
-            .unwrap_or(fbs::OpKind::PrefillUnd),
-        has_op_kind: sr.op_kind.is_some(),
-    })
-}
-
-fn seq_result_from_fb(sr: fbs::SeqResultT) -> anyhow::Result<SeqResult> {
-    let result = SeqResult {
-        req_id: RequestId(sr.req_id),
-        op_kind: sr
-            .has_op_kind
-            .then(|| op_kind_from_fb(sr.op_kind))
-            .transpose()?,
-        sampled_token_id: sr.sampled_token_id,
-        denoise_done: sr.denoise_done,
-        num_steps_done: sr.num_steps_done,
-        image_png_b64: sr.image_png_b64,
-        // Reassemble the canonical `(height, width)` tuple from the matching fields.
-        image_hw: match (sr.image_hw_h, sr.image_hw_w) {
-            (Some(h), Some(w)) => Some((h, w)),
-            _ => None,
-        },
-        sampled_logprob: sr.sampled_logprob,
-        top_logprobs: sr.top_logprobs.map(|items| {
-            items
-                .into_iter()
-                .map(|item| crate::TokenLogprob(item.token_id, item.logprob, item.rank))
-                .collect()
-        }),
-        prompt_logprobs: sr.prompt_logprobs.map(|positions| {
-            positions
-                .into_iter()
-                .map(|position| {
-                    position
-                        .entries
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|item| crate::TokenLogprob(item.token_id, item.logprob, item.rank))
-                        .collect()
-                })
-                .collect()
-        }),
-        sampled_token_ids: sr.sampled_token_ids,
-        encoder_handle: sr.encoder_handle,
-        num_tokens: sr.num_tokens,
-        num_accepted_tokens: sr.num_accepted_tokens,
-        op_id: sr.op_id,
-        epoch: sr.epoch,
-        base_version: sr.base_version,
-        result_version: sr.result_version,
-        logits_handle: sr.logits_handle,
-        locator: sr.locator,
-    };
-    validate_seq_result_logprobs(&result)?;
-    Ok(result)
-}
-
-fn validate_seq_result_logprobs(result: &SeqResult) -> anyhow::Result<()> {
-    if result
-        .sampled_logprob
-        .is_some_and(|value| !value.is_finite())
-    {
-        bail!("sampled_logprob must be finite");
-    }
-    if let Some(entries) = &result.top_logprobs {
-        for (index, entry) in entries.iter().enumerate() {
-            validate_token_logprob(entry, &format!("top_logprobs[{index}]"))?;
-        }
-    }
-    if let Some(positions) = &result.prompt_logprobs {
-        for (position, entries) in positions.iter().enumerate() {
-            for (index, entry) in entries.iter().enumerate() {
-                validate_token_logprob(entry, &format!("prompt_logprobs[{position}][{index}]"))?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_token_logprob(entry: &TokenLogprob, where_: &str) -> anyhow::Result<()> {
-    if !entry.1.is_finite() {
-        bail!("{where_}.logprob must be finite");
-    }
-    if entry.2 == 0 {
-        bail!("{where_}.rank must be at least 1");
-    }
-    Ok(())
-}
-
-fn token_source_to_fb(source: TokenSource) -> fbs::TokenSource {
-    match source {
-        TokenSource::Wire => fbs::TokenSource::Wire,
-        TokenSource::LastSampled => fbs::TokenSource::LastSampled,
-    }
-}
-
-fn token_source_from_fb(source: fbs::TokenSource) -> anyhow::Result<TokenSource> {
-    Ok(match source {
-        fbs::TokenSource::Wire => TokenSource::Wire,
-        fbs::TokenSource::LastSampled => TokenSource::LastSampled,
-        _ => bail!("unknown TokenSource {:?}", source),
-    })
-}
-
-fn caps_to_fb(caps: &EngineCaps) -> anyhow::Result<fbs::EngineCapsT> {
-    Ok(fbs::EngineCapsT {
-        block_size: caps.block_size,
-        num_blocks: caps.num_blocks,
-        num_layers: caps.num_layers,
-        scratch_capacity_tokens: caps.scratch_capacity_tokens,
-        supported_ops: Some(
-            caps.supported_ops
-                .iter()
-                .copied()
-                .map(op_kind_to_fb)
-                .collect(),
-        ),
-        max_latent_size: caps.max_latent_size,
-        latent_downsample: caps.latent_downsample,
-        max_vae_grid_tokens: caps.max_vae_grid_tokens,
-        max_vit_grid_tokens: caps.max_vit_grid_tokens,
-        commit_marker_tokens: caps.commit_marker_tokens,
-        gen_rope_advance: caps.gen_rope_advance,
-        max_cfg_branches: caps.max_cfg_branches,
-        bytes_per_token: caps.bytes_per_token,
-        groups: Some(caps.groups.iter().map(kv_group_to_fb).collect()),
-        kv_dtype: Some(caps.kv_dtype.clone()),
-        attention_backend: Some(caps.attention_backend.clone()),
-        quantization: caps.quantization.clone(),
-        rank: Some(Box::new(rank_to_fb(caps.rank))),
-        pipeline_depth: caps.pipeline_depth,
-        encoder_cache_budget: caps.encoder_cache_budget,
-        supported_controls: Some(
-            caps.supported_controls
-                .iter()
-                .map(|control| {
-                    RequestKind::from_wire_str(control)
-                        .map(req_kind_to_fb)
-                        .ok_or_else(|| anyhow::anyhow!("unknown control kind {control:?}"))
-                })
-                .collect::<anyhow::Result<_>>()?,
-        ),
-        adapter_mode: adapter_mode_to_fb(caps.adapter_mode),
-        execution_constraints: Some(Box::new(execution_constraints_to_fb(
-            &caps.execution_constraints,
-        ))),
-        resource_classes: Some(
-            caps.resource_classes
-                .iter()
-                .copied()
-                .map(resource_class_to_fb)
-                .collect(),
-        ),
-    })
-}
-
-fn caps_from_fb(caps: fbs::EngineCapsT) -> anyhow::Result<EngineCaps> {
-    Ok(EngineCaps {
-        block_size: caps.block_size,
-        num_blocks: caps.num_blocks,
-        num_layers: caps.num_layers,
-        scratch_capacity_tokens: caps.scratch_capacity_tokens,
-        supported_ops: caps
-            .supported_ops
-            .unwrap_or_default()
-            .into_iter()
-            .map(op_kind_from_fb)
-            .collect::<anyhow::Result<_>>()?,
-        max_latent_size: caps.max_latent_size,
-        latent_downsample: caps.latent_downsample,
-        max_vae_grid_tokens: caps.max_vae_grid_tokens,
-        max_vit_grid_tokens: caps.max_vit_grid_tokens,
-        commit_marker_tokens: if caps.commit_marker_tokens == 0 {
-            2
-        } else {
-            caps.commit_marker_tokens
-        },
-        gen_rope_advance: if caps.gen_rope_advance == 0 {
-            2
-        } else {
-            caps.gen_rope_advance
-        },
-        max_cfg_branches: if caps.max_cfg_branches == 0 {
-            3
-        } else {
-            caps.max_cfg_branches
-        },
-        bytes_per_token: caps.bytes_per_token,
-        groups: caps
-            .groups
-            .unwrap_or_default()
-            .into_iter()
-            .map(kv_group_from_fb)
-            .collect::<anyhow::Result<_>>()?,
-        kv_dtype: caps.kv_dtype.unwrap_or_else(|| "bf16".to_string()),
-        attention_backend: caps
-            .attention_backend
-            .unwrap_or_else(|| "flashinfer".to_string()),
-        quantization: caps.quantization,
-        rank: caps.rank.map(|r| rank_from_fb(*r)).unwrap_or_default(),
-        pipeline_depth: caps.pipeline_depth.max(1),
-        encoder_cache_budget: caps.encoder_cache_budget,
-        supported_controls: caps
-            .supported_controls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|kind| req_kind_from_fb(kind).map(|k| k.as_wire_str().to_string()))
-            .collect::<anyhow::Result<_>>()?,
-        adapter_mode: adapter_mode_from_fb(caps.adapter_mode)?,
-        execution_constraints: caps
-            .execution_constraints
-            .map(|ec| execution_constraints_from_fb(*ec))
-            .unwrap_or_default(),
-        resource_classes: caps
-            .resource_classes
-            .unwrap_or_default()
-            .into_iter()
-            .map(resource_class_from_fb)
-            .collect::<anyhow::Result<_>>()?,
-    })
-}
-
-fn sampling_to_fb(s: &SamplingParams) -> anyhow::Result<fbs::SamplingParamsT> {
-    Ok(fbs::SamplingParamsT {
-        temperature: s.temperature,
-        top_k: s.top_k,
-        top_p: s.top_p,
-        ignore_eos: s.ignore_eos,
-        seed: s.seed,
-        min_p: s.min_p,
-        repetition_penalty: s.repetition_penalty,
-        frequency_penalty: s.frequency_penalty,
-        presence_penalty: s.presence_penalty,
-        logit_bias: Some(
-            s.logit_bias
-                .iter()
-                .map(|(token_id, bias)| fbs::TokenBiasT {
-                    token_id: *token_id,
-                    bias: *bias,
-                })
-                .collect(),
-        ),
-        min_tokens: s.min_tokens as u64,
-        return_logprobs: s.return_logprobs,
-        n_logprobs: s.n_logprobs,
-        return_prompt_logprobs: s.return_prompt_logprobs,
-        n_prompt_logprobs: s.n_prompt_logprobs,
-        logprob_token_ids: Some(s.logprob_token_ids.clone()),
-        bad_words_ids: Some(
-            s.bad_words_ids
-                .iter()
-                .map(|items| fbs::U32ListT {
-                    items: Some(items.clone()),
-                })
-                .collect(),
-        ),
-        allowed_token_ids: s.allowed_token_ids.clone(),
-    })
-}
-
-fn sampling_from_fb(s: fbs::SamplingParamsT) -> anyhow::Result<SamplingParams> {
-    for (name, value) in [
-        ("temperature", s.temperature),
-        ("top_p", s.top_p),
-        ("min_p", s.min_p),
-        ("repetition_penalty", s.repetition_penalty),
-        ("frequency_penalty", s.frequency_penalty),
-        ("presence_penalty", s.presence_penalty),
-    ] {
-        if !value.is_finite() {
-            bail!("non-finite sampling param {name}: {value}");
-        }
-    }
-    Ok(SamplingParams {
-        temperature: s.temperature,
-        top_k: s.top_k,
-        top_p: s.top_p,
-        ignore_eos: s.ignore_eos,
-        seed: s.seed,
-        min_p: s.min_p,
-        repetition_penalty: s.repetition_penalty,
-        frequency_penalty: s.frequency_penalty,
-        presence_penalty: s.presence_penalty,
-        logit_bias: s
-            .logit_bias
-            .unwrap_or_default()
-            .into_iter()
-            .map(|item| (item.token_id, item.bias))
-            .collect(),
-        min_tokens: usize::try_from(s.min_tokens).context("min_tokens does not fit usize")?,
-        return_logprobs: s.return_logprobs,
-        n_logprobs: s.n_logprobs,
-        return_prompt_logprobs: s.return_prompt_logprobs,
-        n_prompt_logprobs: s.n_prompt_logprobs,
-        logprob_token_ids: s.logprob_token_ids.unwrap_or_default(),
-        bad_words_ids: s
-            .bad_words_ids
-            .unwrap_or_default()
-            .into_iter()
-            .map(|items| items.items.unwrap_or_default())
-            .collect(),
-        allowed_token_ids: s.allowed_token_ids,
-    })
-}
-
-fn image_to_fb(i: &ImageParams) -> fbs::ImageParamsT {
-    fbs::ImageParamsT {
-        steps: i.steps,
-        cfg_text_scale: i.cfg_text_scale,
-        cfg_img_scale: i.cfg_img_scale,
-        cfg_renorm_type: Some(i.cfg_renorm_type.clone()),
-        cfg_renorm_min: i.cfg_renorm_min,
-        cfg_interval_lo: i.cfg_interval.0,
-        cfg_interval_hi: i.cfg_interval.1,
-        timestep_shift: i.timestep_shift,
-        height: i.height,
-        width: i.width,
-        seed: i.seed,
-        negative_prompt: Some(i.negative_prompt.clone()),
-        max_images: i.max_images,
-        image_prompts: Some(i.image_prompts.clone()),
-        retain_images: i.retain_images,
-    }
-}
-
-fn image_from_fb(i: fbs::ImageParamsT) -> ImageParams {
-    ImageParams {
-        steps: i.steps,
-        cfg_text_scale: i.cfg_text_scale,
-        cfg_img_scale: i.cfg_img_scale,
-        cfg_renorm_type: i.cfg_renorm_type.unwrap_or_else(|| "global".to_string()),
-        cfg_renorm_min: i.cfg_renorm_min,
-        cfg_interval: (i.cfg_interval_lo, i.cfg_interval_hi),
-        timestep_shift: i.timestep_shift,
-        height: i.height,
-        width: i.width,
-        seed: i.seed,
-        negative_prompt: i.negative_prompt.unwrap_or_default(),
-        max_images: i.max_images,
-        image_prompts: i.image_prompts.unwrap_or_default(),
-        retain_images: i.retain_images,
-    }
-}
-
-fn cfg_to_fb(cfg: &CfgParams) -> fbs::CfgParamsT {
-    fbs::CfgParamsT {
-        branch_count: cfg.branch_count,
-        text_scale: cfg.text_scale,
-        img_scale: cfg.img_scale,
-        renorm_type: Some(cfg.renorm_type.clone()),
-        renorm_min: cfg.renorm_min,
-        interval_lo: cfg.interval.0,
-        interval_hi: cfg.interval.1,
-    }
-}
-
-fn cfg_from_fb(cfg: fbs::CfgParamsT) -> anyhow::Result<CfgParams> {
-    for (name, value) in [
-        ("text_scale", cfg.text_scale),
-        ("img_scale", cfg.img_scale),
-        ("renorm_min", cfg.renorm_min),
-        ("interval_lo", cfg.interval_lo),
-        ("interval_hi", cfg.interval_hi),
-    ] {
-        if !value.is_finite() {
-            bail!("non-finite cfg param {name}: {value}");
-        }
-    }
-    Ok(CfgParams {
-        branch_count: cfg.branch_count,
-        text_scale: cfg.text_scale,
-        img_scale: cfg.img_scale,
-        renorm_type: cfg.renorm_type.unwrap_or_else(|| "global".to_string()),
-        renorm_min: cfg.renorm_min,
-        interval: (cfg.interval_lo, cfg.interval_hi),
-    })
-}
-
-fn metrics_to_fb(m: &WorkerMetrics) -> fbs::WorkerMetricsT {
+fn metrics_to_fb(metrics: &WorkerMetrics) -> fbs::WorkerMetricsT {
     fbs::WorkerMetricsT {
-        executes: m.executes,
-        ops_total: m.ops_total,
-        exec_us_total: m.exec_us_total,
-        last_exec_us: m.last_exec_us,
-        op_kind_counts: Some(map_to_fb(&m.op_kind_counts)),
-        op_kind_us: Some(map_to_fb(&m.op_kind_us)),
-        control_ok: Some(map_to_fb(&m.control_ok)),
-        control_err: Some(map_to_fb(&m.control_err)),
-        error_counts: Some(map_to_fb(&m.error_counts)),
-        cuda_graph_captures: m.cuda_graph_captures,
-        cuda_graph_replays: m.cuda_graph_replays,
-        cuda_graph_misses: m.cuda_graph_misses,
-        cuda_graph_fallbacks: m.cuda_graph_fallbacks,
-        cuda_graph_unpadded_tokens: m.cuda_graph_unpadded_tokens,
-        cuda_graph_padded_tokens: m.cuda_graph_padded_tokens,
-        cuda_graph_runtime_mode_counts: Some(map_to_fb(&m.cuda_graph_runtime_mode_counts)),
-        forward: m.forward.as_ref().map(forward_stats_to_fb).map(Box::new),
+        executes: metrics.executes,
+        operations_total: metrics.operations_total,
+        exec_us_total: metrics.exec_us_total,
+        last_exec_us: metrics.last_exec_us,
+        operation_counts: Some(map_to_fb(&metrics.operation_counts)),
+        operation_us: Some(map_to_fb(&metrics.operation_us)),
+        control_ok: Some(map_to_fb(&metrics.control_ok)),
+        control_err: Some(map_to_fb(&metrics.control_err)),
+        error_counts: Some(map_to_fb(&metrics.error_counts)),
+        cuda_graph_captures: metrics.cuda_graph_captures,
+        cuda_graph_replays: metrics.cuda_graph_replays,
+        cuda_graph_misses: metrics.cuda_graph_misses,
+        cuda_graph_fallbacks: metrics.cuda_graph_fallbacks,
+        cuda_graph_unpadded_tokens: metrics.cuda_graph_unpadded_tokens,
+        cuda_graph_padded_tokens: metrics.cuda_graph_padded_tokens,
+        cuda_graph_runtime_mode_counts: Some(map_to_fb(&metrics.cuda_graph_runtime_mode_counts)),
+        forward: metrics
+            .forward
+            .as_ref()
+            .map(forward_stats_to_fb)
+            .map(Box::new),
     }
 }
 
-fn metrics_from_fb(m: fbs::WorkerMetricsT) -> WorkerMetrics {
+fn metrics_from_fb(metrics: fbs::WorkerMetricsT) -> WorkerMetrics {
     WorkerMetrics {
-        executes: m.executes,
-        ops_total: m.ops_total,
-        exec_us_total: m.exec_us_total,
-        last_exec_us: m.last_exec_us,
-        op_kind_counts: map_from_fb(m.op_kind_counts),
-        op_kind_us: map_from_fb(m.op_kind_us),
-        control_ok: map_from_fb(m.control_ok),
-        control_err: map_from_fb(m.control_err),
-        error_counts: map_from_fb(m.error_counts),
-        cuda_graph_captures: m.cuda_graph_captures,
-        cuda_graph_replays: m.cuda_graph_replays,
-        cuda_graph_misses: m.cuda_graph_misses,
-        cuda_graph_fallbacks: m.cuda_graph_fallbacks,
-        cuda_graph_unpadded_tokens: m.cuda_graph_unpadded_tokens,
-        cuda_graph_padded_tokens: m.cuda_graph_padded_tokens,
-        cuda_graph_runtime_mode_counts: map_from_fb(m.cuda_graph_runtime_mode_counts),
-        forward: m.forward.map(|stats| forward_stats_from_fb(*stats)),
+        executes: metrics.executes,
+        operations_total: metrics.operations_total,
+        exec_us_total: metrics.exec_us_total,
+        last_exec_us: metrics.last_exec_us,
+        operation_counts: map_from_fb(metrics.operation_counts),
+        operation_us: map_from_fb(metrics.operation_us),
+        control_ok: map_from_fb(metrics.control_ok),
+        control_err: map_from_fb(metrics.control_err),
+        error_counts: map_from_fb(metrics.error_counts),
+        cuda_graph_captures: metrics.cuda_graph_captures,
+        cuda_graph_replays: metrics.cuda_graph_replays,
+        cuda_graph_misses: metrics.cuda_graph_misses,
+        cuda_graph_fallbacks: metrics.cuda_graph_fallbacks,
+        cuda_graph_unpadded_tokens: metrics.cuda_graph_unpadded_tokens,
+        cuda_graph_padded_tokens: metrics.cuda_graph_padded_tokens,
+        cuda_graph_runtime_mode_counts: map_from_fb(metrics.cuda_graph_runtime_mode_counts),
+        forward: metrics.forward.map(|stats| forward_stats_from_fb(*stats)),
     }
 }
 
@@ -913,7 +1686,7 @@ fn kv_group_from_fb(group: fbs::KvGroupSpecT) -> anyhow::Result<KvCacheGroupSpec
             sink: group.sink,
         }
     } else {
-        bail!("unknown KV group kind {}", group.kind.0);
+        bail!("unknown KV group kind {}", group.kind.0)
     };
     Ok(KvCacheGroupSpec {
         group_id: group.group_id,
@@ -945,180 +1718,252 @@ fn rank_from_fb(rank: fbs::RankInfoT) -> RankInfo {
     }
 }
 
-fn execution_constraints_to_fb(ec: &ExecutionConstraints) -> fbs::ExecutionConstraintsT {
-    fbs::ExecutionConstraintsT {
-        max_batch_ops: ec.max_batch_ops,
-    }
-}
-
-fn execution_constraints_from_fb(ec: fbs::ExecutionConstraintsT) -> ExecutionConstraints {
-    ExecutionConstraints {
-        max_batch_ops: ec.max_batch_ops,
-    }
-}
-
-fn pressure_to_fb(p: &ResourcePressure) -> fbs::ResourcePressureT {
+fn pressure_to_fb(pressure: &ResourcePressure) -> fbs::ResourcePressureT {
     fbs::ResourcePressureT {
-        class: resource_class_to_fb(p.class),
-        total: p.total,
-        used: p.used,
-        evictable: p.evictable,
-        free: p.free,
+        class: resource_class_to_fb(pressure.class),
+        total: pressure.total,
+        used: pressure.used,
+        evictable: pressure.evictable,
+        free: pressure.free,
     }
 }
 
-fn pressure_from_fb(p: fbs::ResourcePressureT) -> anyhow::Result<ResourcePressure> {
+fn pressure_from_fb(pressure: fbs::ResourcePressureT) -> anyhow::Result<ResourcePressure> {
     Ok(ResourcePressure {
-        class: resource_class_from_fb(p.class)?,
-        total: p.total,
-        used: p.used,
-        evictable: p.evictable,
-        free: p.free,
+        class: resource_class_from_fb(pressure.class)?,
+        total: pressure.total,
+        used: pressure.used,
+        evictable: pressure.evictable,
+        free: pressure.free,
     })
 }
 
-fn op_kind_to_fb(kind: OpKind) -> fbs::OpKind {
-    match kind {
-        OpKind::PrefillUnd => fbs::OpKind::PrefillUnd,
-        OpKind::DecodeUnd => fbs::OpKind::DecodeUnd,
-        OpKind::TargetVerifyUnd => fbs::OpKind::TargetVerifyUnd,
-        OpKind::DenoiseGen => fbs::OpKind::DenoiseGen,
-        OpKind::CommitGen => fbs::OpKind::CommitGen,
-        OpKind::CommitWriteback => fbs::OpKind::CommitWriteback,
-        OpKind::VaeEncode => fbs::OpKind::VaeEncode,
-        OpKind::VitEncode => fbs::OpKind::VitEncode,
-        OpKind::Sample => fbs::OpKind::Sample,
-        OpKind::EncodeFrame => fbs::OpKind::EncodeFrame,
+fn required_string(value: Option<String>, label: &str) -> anyhow::Result<String> {
+    value
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{label} is missing"))
+}
+
+fn snapshot_to_fb(snapshot: &SnapshotRef) -> fbs::SnapshotRefT {
+    fbs::SnapshotRefT {
+        session_id: snapshot.session_id.0,
+        epoch: snapshot.epoch,
+        version: snapshot.version,
+        digest: Some(snapshot.digest.clone()),
+        locator: Some(snapshot.locator.clone()),
     }
 }
 
-fn op_kind_from_fb(kind: fbs::OpKind) -> anyhow::Result<OpKind> {
-    if kind == fbs::OpKind::PrefillUnd {
-        Ok(OpKind::PrefillUnd)
-    } else if kind == fbs::OpKind::DecodeUnd {
-        Ok(OpKind::DecodeUnd)
-    } else if kind == fbs::OpKind::TargetVerifyUnd {
-        Ok(OpKind::TargetVerifyUnd)
-    } else if kind == fbs::OpKind::DenoiseGen {
-        Ok(OpKind::DenoiseGen)
-    } else if kind == fbs::OpKind::CommitGen {
-        Ok(OpKind::CommitGen)
-    } else if kind == fbs::OpKind::CommitWriteback {
-        Ok(OpKind::CommitWriteback)
-    } else if kind == fbs::OpKind::VaeEncode {
-        Ok(OpKind::VaeEncode)
-    } else if kind == fbs::OpKind::VitEncode {
-        Ok(OpKind::VitEncode)
-    } else if kind == fbs::OpKind::Sample {
-        Ok(OpKind::Sample)
-    } else if kind == fbs::OpKind::EncodeFrame {
-        Ok(OpKind::EncodeFrame)
+fn snapshot_from_fb(snapshot: fbs::SnapshotRefT) -> anyhow::Result<SnapshotRef> {
+    let snapshot = SnapshotRef {
+        session_id: RequestId(snapshot.session_id),
+        epoch: snapshot.epoch,
+        version: snapshot.version,
+        digest: required_string(snapshot.digest, "snapshot digest")?,
+        locator: required_string(snapshot.locator, "snapshot locator")?,
+    };
+    anyhow::ensure!(
+        snapshot.digest.len() == 64
+            && snapshot
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "snapshot digest must be a lowercase SHA-256 digest"
+    );
+    anyhow::ensure!(
+        snapshot.locator == snapshot.digest,
+        "snapshot locator must equal its content digest"
+    );
+    Ok(snapshot)
+}
+
+fn operation_type_to_fb(operation_type: OperationType) -> fbs::OperationType {
+    match operation_type {
+        OperationType::SequenceExtend => fbs::OperationType::SequenceExtend,
+        OperationType::SequenceDecode => fbs::OperationType::SequenceDecode,
+        OperationType::SequenceVerify => fbs::OperationType::SequenceVerify,
+        OperationType::SequenceSample => fbs::OperationType::SequenceSample,
+        OperationType::Flow => fbs::OperationType::Flow,
+        OperationType::EncodeVision => fbs::OperationType::EncodeVision,
+        OperationType::EncodeLatent => fbs::OperationType::EncodeLatent,
+        OperationType::MaterializeImage => fbs::OperationType::MaterializeImage,
+        OperationType::MaterializeFrame => fbs::OperationType::MaterializeFrame,
+        OperationType::TransferProduct => fbs::OperationType::TransferProduct,
+        OperationType::TransferKv => fbs::OperationType::TransferKv,
+    }
+}
+
+fn operation_type_from_fb(operation_type: fbs::OperationType) -> anyhow::Result<OperationType> {
+    if operation_type == fbs::OperationType::SequenceExtend {
+        Ok(OperationType::SequenceExtend)
+    } else if operation_type == fbs::OperationType::SequenceDecode {
+        Ok(OperationType::SequenceDecode)
+    } else if operation_type == fbs::OperationType::SequenceVerify {
+        Ok(OperationType::SequenceVerify)
+    } else if operation_type == fbs::OperationType::SequenceSample {
+        Ok(OperationType::SequenceSample)
+    } else if operation_type == fbs::OperationType::Flow {
+        Ok(OperationType::Flow)
+    } else if operation_type == fbs::OperationType::EncodeVision {
+        Ok(OperationType::EncodeVision)
+    } else if operation_type == fbs::OperationType::EncodeLatent {
+        Ok(OperationType::EncodeLatent)
+    } else if operation_type == fbs::OperationType::MaterializeImage {
+        Ok(OperationType::MaterializeImage)
+    } else if operation_type == fbs::OperationType::MaterializeFrame {
+        Ok(OperationType::MaterializeFrame)
+    } else if operation_type == fbs::OperationType::TransferProduct {
+        Ok(OperationType::TransferProduct)
+    } else if operation_type == fbs::OperationType::TransferKv {
+        Ok(OperationType::TransferKv)
     } else {
-        bail!("unknown op kind {}", kind.0)
+        bail!("unknown operation type {}", operation_type.0)
     }
 }
 
-fn modality_to_fb(modality: Modality) -> fbs::Modality {
-    match modality {
-        Modality::Und => fbs::Modality::Und,
-        Modality::Gen => fbs::Modality::Gen,
+fn sequence_mode_to_fb(mode: SequenceMode) -> fbs::SequenceMode {
+    match mode {
+        SequenceMode::Extend => fbs::SequenceMode::Extend,
+        SequenceMode::Decode => fbs::SequenceMode::Decode,
+        SequenceMode::Verify => fbs::SequenceMode::Verify,
+        SequenceMode::Sample => fbs::SequenceMode::Sample,
     }
 }
-
-fn modality_from_fb(modality: fbs::Modality) -> anyhow::Result<Modality> {
-    if modality == fbs::Modality::Und {
-        Ok(Modality::Und)
-    } else if modality == fbs::Modality::Gen {
-        Ok(Modality::Gen)
+fn sequence_mode_from_fb(mode: fbs::SequenceMode) -> anyhow::Result<SequenceMode> {
+    if mode == fbs::SequenceMode::Extend {
+        Ok(SequenceMode::Extend)
+    } else if mode == fbs::SequenceMode::Decode {
+        Ok(SequenceMode::Decode)
+    } else if mode == fbs::SequenceMode::Verify {
+        Ok(SequenceMode::Verify)
+    } else if mode == fbs::SequenceMode::Sample {
+        Ok(SequenceMode::Sample)
     } else {
-        bail!("unknown modality {}", modality.0)
+        bail!("unknown sequence mode {}", mode.0)
+    }
+}
+fn token_source_to_fb(source: TokenSource) -> fbs::TokenSource {
+    match source {
+        TokenSource::Wire => fbs::TokenSource::Wire,
+        TokenSource::LastSampled => fbs::TokenSource::LastSampled,
+    }
+}
+fn token_source_from_fb(source: fbs::TokenSource) -> anyhow::Result<TokenSource> {
+    if source == fbs::TokenSource::Wire {
+        Ok(TokenSource::Wire)
+    } else if source == fbs::TokenSource::LastSampled {
+        Ok(TokenSource::LastSampled)
+    } else {
+        bail!("unknown token source {}", source.0)
+    }
+}
+fn encode_kind_to_fb(kind: EncodeKind) -> fbs::EncodeKind {
+    match kind {
+        EncodeKind::Vision => fbs::EncodeKind::Vision,
+        EncodeKind::Latent => fbs::EncodeKind::Latent,
+    }
+}
+fn encode_kind_from_fb(kind: fbs::EncodeKind) -> anyhow::Result<EncodeKind> {
+    if kind == fbs::EncodeKind::Vision {
+        Ok(EncodeKind::Vision)
+    } else if kind == fbs::EncodeKind::Latent {
+        Ok(EncodeKind::Latent)
+    } else {
+        bail!("unknown encode kind {}", kind.0)
+    }
+}
+fn materialize_kind_to_fb(kind: MaterializeKind) -> fbs::MaterializeKind {
+    match kind {
+        MaterializeKind::Image => fbs::MaterializeKind::Image,
+        MaterializeKind::Frame => fbs::MaterializeKind::Frame,
+    }
+}
+fn materialize_kind_from_fb(kind: fbs::MaterializeKind) -> anyhow::Result<MaterializeKind> {
+    if kind == fbs::MaterializeKind::Image {
+        Ok(MaterializeKind::Image)
+    } else if kind == fbs::MaterializeKind::Frame {
+        Ok(MaterializeKind::Frame)
+    } else {
+        bail!("unknown materialize kind {}", kind.0)
+    }
+}
+fn transfer_kind_to_fb(kind: TransferKind) -> fbs::TransferKind {
+    match kind {
+        TransferKind::Product => fbs::TransferKind::Product,
+        TransferKind::Kv => fbs::TransferKind::Kv,
+    }
+}
+fn transfer_kind_from_fb(kind: fbs::TransferKind) -> anyhow::Result<TransferKind> {
+    if kind == fbs::TransferKind::Product {
+        Ok(TransferKind::Product)
+    } else if kind == fbs::TransferKind::Kv {
+        Ok(TransferKind::Kv)
+    } else {
+        bail!("unknown transfer kind {}", kind.0)
     }
 }
 
-/// Single source of truth for the request-kind `<->` FlatBuffers enum mapping.
-///
-/// The kind taxonomy is centralized in this table so encode/decode cannot drift.
-/// `kind_table_round_trips` (below) pins it against the `request_kind_code` header
-/// byte so no encoding can disagree.
-const REQUEST_KINDS: &[(RequestKind, fbs::ReqKind)] = &[
-    (RequestKind::GetCaps, fbs::ReqKind::GetCaps),
-    (RequestKind::Execute, fbs::ReqKind::Execute),
-    (RequestKind::DropRequest, fbs::ReqKind::DropRequest),
-    (RequestKind::Shutdown, fbs::ReqKind::Shutdown),
-    (RequestKind::CopyBlocks, fbs::ReqKind::CopyBlocks),
-    (RequestKind::LoadLora, fbs::ReqKind::LoadLora),
-    (RequestKind::UnloadLora, fbs::ReqKind::UnloadLora),
-    (RequestKind::FreeEncoder, fbs::ReqKind::FreeEncoder),
-    (
-        RequestKind::ResetPrefixCache,
-        fbs::ReqKind::ResetPrefixCache,
-    ),
-    (RequestKind::Sleep, fbs::ReqKind::Sleep),
-    (RequestKind::WakeUp, fbs::ReqKind::WakeUp),
-    (RequestKind::GetMetrics, fbs::ReqKind::GetMetrics),
-    (RequestKind::GetPressure, fbs::ReqKind::GetPressure),
-];
-
-const RESPONSE_KINDS: &[(&str, fbs::RespKind)] = &[
-    ("caps", fbs::RespKind::Caps),
-    ("result", fbs::RespKind::Result),
-    ("ok", fbs::RespKind::Ok),
-    ("error", fbs::RespKind::Error),
-    ("metrics", fbs::RespKind::Metrics),
-    ("pressure", fbs::RespKind::Pressure),
-];
-
-/// The canonical request-kind names accepted by the wire, in declaration order.
-///
-/// Exposed so the lower-level header codec (`worker-ipc-core`) can pin its own
-/// `request_kind_code` table against this single source rather than maintaining
-/// an independent, drift-prone copy.
-pub fn request_kind_names() -> impl Iterator<Item = &'static str> {
-    REQUEST_KINDS.iter().map(|(kind, _)| kind.as_wire_str())
-}
-
-fn req_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
+fn request_kind_to_fb(kind: RequestKind) -> fbs::ReqKind {
     match kind {
-        RequestKind::GetCaps => fbs::ReqKind::GetCaps,
+        RequestKind::GetCapabilities => fbs::ReqKind::GetCapabilities,
         RequestKind::Execute => fbs::ReqKind::Execute,
-        RequestKind::DropRequest => fbs::ReqKind::DropRequest,
+        RequestKind::DropSession => fbs::ReqKind::DropSession,
         RequestKind::Shutdown => fbs::ReqKind::Shutdown,
-        RequestKind::CopyBlocks => fbs::ReqKind::CopyBlocks,
-        RequestKind::LoadLora => fbs::ReqKind::LoadLora,
-        RequestKind::UnloadLora => fbs::ReqKind::UnloadLora,
-        RequestKind::FreeEncoder => fbs::ReqKind::FreeEncoder,
+        RequestKind::CopyKv => fbs::ReqKind::CopyKv,
+        RequestKind::LoadAdapter => fbs::ReqKind::LoadAdapter,
+        RequestKind::UnloadAdapter => fbs::ReqKind::UnloadAdapter,
+        RequestKind::ReleaseProducts => fbs::ReqKind::ReleaseProducts,
         RequestKind::ResetPrefixCache => fbs::ReqKind::ResetPrefixCache,
-        RequestKind::Sleep => fbs::ReqKind::Sleep,
-        RequestKind::WakeUp => fbs::ReqKind::WakeUp,
         RequestKind::GetMetrics => fbs::ReqKind::GetMetrics,
         RequestKind::GetPressure => fbs::ReqKind::GetPressure,
+        RequestKind::SnapshotSession => fbs::ReqKind::SnapshotSession,
+        RequestKind::RestoreSession => fbs::ReqKind::RestoreSession,
     }
 }
 
-fn req_kind_from_fb(kind: fbs::ReqKind) -> anyhow::Result<RequestKind> {
-    REQUEST_KINDS
-        .iter()
-        .find(|(_, fb)| *fb == kind)
-        .map(|(rk, _)| *rk)
-        .ok_or_else(|| anyhow::anyhow!("unknown request kind {}", kind.0))
+fn request_kind_from_fb(kind: fbs::ReqKind) -> anyhow::Result<RequestKind> {
+    for candidate in RequestKind::ALL {
+        if request_kind_to_fb(candidate) == kind {
+            return Ok(candidate);
+        }
+    }
+    bail!("unknown request kind {}", kind.0)
 }
 
-fn resp_kind_to_fb(kind: &str) -> anyhow::Result<fbs::RespKind> {
-    RESPONSE_KINDS
-        .iter()
-        .find(|(name, _)| *name == kind)
-        .map(|(_, fb)| *fb)
-        .ok_or_else(|| anyhow::anyhow!("unknown response kind {kind:?}"))
+pub fn request_kind_names() -> impl Iterator<Item = &'static str> {
+    RequestKind::ALL.into_iter().map(RequestKind::as_wire_str)
 }
 
-fn resp_kind_from_fb(kind: fbs::RespKind) -> anyhow::Result<&'static str> {
-    RESPONSE_KINDS
-        .iter()
-        .find(|(_, fb)| *fb == kind)
-        .map(|(name, _)| *name)
-        .ok_or_else(|| anyhow::anyhow!("unknown response kind {}", kind.0))
+fn response_kind_to_fb(kind: ResponseKind) -> fbs::RespKind {
+    match kind {
+        ResponseKind::Capabilities => fbs::RespKind::Capabilities,
+        ResponseKind::Result => fbs::RespKind::Result,
+        ResponseKind::Ok => fbs::RespKind::Ok,
+        ResponseKind::Error => fbs::RespKind::Error,
+        ResponseKind::Metrics => fbs::RespKind::Metrics,
+        ResponseKind::Pressure => fbs::RespKind::Pressure,
+        ResponseKind::Snapshot => fbs::RespKind::Snapshot,
+    }
 }
-
+fn response_kind_from_fb(kind: fbs::RespKind) -> anyhow::Result<ResponseKind> {
+    if kind == fbs::RespKind::Capabilities {
+        Ok(ResponseKind::Capabilities)
+    } else if kind == fbs::RespKind::Result {
+        Ok(ResponseKind::Result)
+    } else if kind == fbs::RespKind::Ok {
+        Ok(ResponseKind::Ok)
+    } else if kind == fbs::RespKind::Error {
+        Ok(ResponseKind::Error)
+    } else if kind == fbs::RespKind::Metrics {
+        Ok(ResponseKind::Metrics)
+    } else if kind == fbs::RespKind::Pressure {
+        Ok(ResponseKind::Pressure)
+    } else if kind == fbs::RespKind::Snapshot {
+        Ok(ResponseKind::Snapshot)
+    } else {
+        bail!("unknown response kind {}", kind.0)
+    }
+}
 fn adapter_mode_to_fb(mode: AdapterMode) -> fbs::AdapterMode {
     match mode {
         AdapterMode::None => fbs::AdapterMode::None,
@@ -1127,7 +1972,6 @@ fn adapter_mode_to_fb(mode: AdapterMode) -> fbs::AdapterMode {
         AdapterMode::MultiAdapter => fbs::AdapterMode::MultiAdapter,
     }
 }
-
 fn adapter_mode_from_fb(mode: fbs::AdapterMode) -> anyhow::Result<AdapterMode> {
     if mode == fbs::AdapterMode::None {
         Ok(AdapterMode::None)
@@ -1141,7 +1985,6 @@ fn adapter_mode_from_fb(mode: fbs::AdapterMode) -> anyhow::Result<AdapterMode> {
         bail!("unknown adapter mode {}", mode.0)
     }
 }
-
 fn resource_class_to_fb(class: ResourceClass) -> fbs::ResourceClass {
     match class {
         ResourceClass::KvBlock => fbs::ResourceClass::KvBlock,
@@ -1151,7 +1994,6 @@ fn resource_class_to_fb(class: ResourceClass) -> fbs::ResourceClass {
         ResourceClass::Adapter => fbs::ResourceClass::Adapter,
     }
 }
-
 fn resource_class_from_fb(class: fbs::ResourceClass) -> anyhow::Result<ResourceClass> {
     if class == fbs::ResourceClass::KvBlock {
         Ok(ResourceClass::KvBlock)
@@ -1169,109 +2011,85 @@ fn resource_class_from_fb(class: fbs::ResourceClass) -> anyhow::Result<ResourceC
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::{FlowOperation, Guidance};
 
-    #[test]
-    fn seq_result_image_hw_field_labels_match_height_width() {
-        // `SeqResult.image_hw` is canonically `(height, width)`. Use asymmetric
-        // dims so a height/width swap in either lambda would be caught.
-        let height = 720u32;
-        let width = 1280u32;
-        let native = SeqResult {
-            req_id: RequestId(1),
-            image_hw: Some((height, width)),
-            ..Default::default()
-        };
+    fn identity() -> String {
+        "ab".repeat(32)
+    }
 
-        let fb = seq_result_to_fb(&native).expect("valid sequence result");
-        // The schema field named `image_hw_h` must carry the height component,
-        // and `image_hw_w` the width component.
-        assert_eq!(fb.image_hw_h, Some(height));
-        assert_eq!(fb.image_hw_w, Some(width));
-
-        let back = seq_result_from_fb(fb).expect("valid sequence result");
-        assert_eq!(back.image_hw, Some((height, width)));
+    fn operation() -> OperationEnvelope {
+        let mut operation = OperationEnvelope::unsealed(
+            RequestId(7),
+            Operation::Flow(FlowOperation {
+                latent_handle: 7,
+                position: 3,
+                start_step: 2,
+                step_count: 4,
+                conditioning_position: 3,
+                conditioning: None,
+                guidance: Guidance {
+                    branch_count: 3,
+                    text_scale: 4.0,
+                    image_scale: 1.0,
+                    renorm_type: "global".into(),
+                    renorm_min: 0.0,
+                    interval: (0.0, 1.0),
+                },
+                image_prompt: "mountains".into(),
+            }),
+        );
+        operation.admission_digest = identity();
+        operation.model_spec_digest = identity();
+        operation.weight_digest = identity();
+        operation.seal(2, 9, 4);
+        operation
     }
 
     #[test]
-    fn seq_result_rejects_non_finite_logprobs_and_zero_ranks() {
-        let non_finite = SeqResult {
-            req_id: RequestId(1),
-            sampled_logprob: Some(f32::NAN),
-            ..Default::default()
-        };
-        assert!(seq_result_to_fb(&non_finite).is_err());
-
-        let zero_rank = fbs::SeqResultT {
-            req_id: 1,
-            top_logprobs: Some(vec![fbs::TokenLogprobT {
-                token_id: 7,
-                logprob: -0.5,
-                rank: 0,
-            }]),
-            ..Default::default()
-        };
-        assert!(seq_result_from_fb(zero_rank).is_err());
+    fn request_round_trip_preserves_the_exact_union_variant() {
+        let admission = Admission::new(
+            RequestId(7),
+            None,
+            Some(FlowAdmission {
+                image: uniserve_core::ImageParams::default(),
+            }),
+            None,
+        )
+        .unwrap();
+        let mut operation = operation();
+        operation.admission_digest = admission.digest.clone();
+        operation.refresh_digest();
+        let request = WorkerRequest::execute(Batch::new(11, vec![admission], vec![operation]));
+        let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+        let decoded_operation = &decoded.batch.unwrap().operations[0].operation;
+        assert!(matches!(decoded_operation, Operation::Flow(_)));
     }
 
     #[test]
-    fn kind_tables_round_trip_and_reject_dead_cancel() {
-        // both directions derive from the single REQUEST_KINDS /
-        // RESPONSE_KINDS tables, so a `name -> fb -> name` round-trip over the
-        // whole table catches any drift between the two lookups.
-        for (kind, fb) in REQUEST_KINDS {
-            assert_eq!(req_kind_to_fb(*kind), *fb, "to_fb drift: {kind:?}");
-            assert_eq!(
-                req_kind_from_fb(*fb).unwrap(),
-                *kind,
-                "from_fb drift: {kind:?}"
-            );
-        }
-        for (name, fb) in RESPONSE_KINDS {
-            assert_eq!(resp_kind_to_fb(name).unwrap(), *fb, "to_fb drift: {name}");
-            assert_eq!(
-                resp_kind_from_fb(*fb).unwrap(),
-                *name,
-                "from_fb drift: {name}"
-            );
-        }
-        // the `cancel` request kind is not in the wire vocabulary.
-        assert!(RequestKind::from_wire_str("cancel").is_none());
-    }
-
-    #[test]
-    fn sampling_from_fb_rejects_non_finite_floats() {
-        let s = fbs::SamplingParamsT {
-            temperature: f32::NAN,
-            ..Default::default()
-        };
-        assert!(sampling_from_fb(s).is_err());
-
-        let s = fbs::SamplingParamsT {
-            top_p: f32::INFINITY,
-            ..Default::default()
-        };
-        assert!(sampling_from_fb(s).is_err());
-    }
-
-    #[test]
-    fn cfg_from_fb_rejects_non_finite_floats() {
-        let cfg = fbs::CfgParamsT {
-            text_scale: f32::NAN,
-            ..Default::default()
-        };
-        assert!(cfg_from_fb(cfg).is_err());
-
-        let cfg = fbs::CfgParamsT {
-            interval_hi: f32::NEG_INFINITY,
-            ..Default::default()
-        };
-        assert!(cfg_from_fb(cfg).is_err());
-
-        // A fully-finite cfg still decodes.
-        let cfg = fbs::CfgParamsT::default();
-        assert!(cfg_from_fb(cfg).is_ok());
+    fn response_round_trip_preserves_typed_delta() {
+        let operation = operation();
+        let response = WorkerResponse::result(ExecutionResult {
+            step_id: 5,
+            operations: vec![OperationResult {
+                session_id: operation.session_id,
+                epoch: operation.epoch,
+                op_id: operation.op_id,
+                base_version: operation.base_version,
+                result_version: operation.base_version + 1,
+                delta: ResultDelta::Flow(FlowDelta {
+                    steps_completed: 6,
+                    done: false,
+                }),
+            }],
+            worker_exec_us: Some(10),
+            forward_stats: None,
+        });
+        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+        assert!(matches!(
+            decoded.result.unwrap().operations[0].delta,
+            ResultDelta::Flow(_)
+        ));
     }
 }

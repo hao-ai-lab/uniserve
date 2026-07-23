@@ -1,8 +1,7 @@
 """Typed model-execution configuration.
 
 Bootstrap resolves stable execution settings before model materialization.
-Deep execution modules read this immutable snapshot instead of ambient
-environment variables.
+Bootstrap passes the immutable value into every configured subsystem.
 """
 
 from __future__ import annotations
@@ -20,8 +19,6 @@ __all__ = [
     "TorchCompileRuntimeConfig",
     "ExecutionConfig",
     "execution_config_from_namespace",
-    "get_execution_config",
-    "set_execution_config",
 ]
 
 
@@ -165,22 +162,8 @@ class ExecutionConfig:
     prefill_cuda_graph_warmup_tokens: tuple[int, ...] = DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS
     mixed_text_max_tokens: int = 8192
     varlen_prefill: bool = True
-    green_contexts: bool = False
-    logits_processor_chunk_size: int = 0
     torch_compile: TorchCompileRuntimeConfig = TorchCompileRuntimeConfig()
     flashinfer: FlashInferTuningConfig = FlashInferTuningConfig()
-
-
-_CURRENT_EXECUTION_CONFIG = ExecutionConfig()
-
-
-def get_execution_config() -> ExecutionConfig:
-    return _CURRENT_EXECUTION_CONFIG
-
-
-def set_execution_config(config: ExecutionConfig) -> None:
-    global _CURRENT_EXECUTION_CONFIG
-    _CURRENT_EXECUTION_CONFIG = config
 
 
 def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
@@ -212,11 +195,6 @@ def execution_config_from_namespace(namespace: Any) -> ExecutionConfig:
         ),
         mixed_text_max_tokens=max(0, int(namespace.mixed_text_max_tokens)),
         varlen_prefill=bool(namespace.varlen_prefill),
-        green_contexts=bool(namespace.green_contexts),
-        logits_processor_chunk_size=max(
-            0,
-            int(namespace.logits_processor_chunk_size),
-        ),
         torch_compile=TorchCompileRuntimeConfig(
             enabled=bool(namespace.torch_compile),
             backend=str(namespace.torch_compile_backend),
@@ -248,8 +226,8 @@ def _none_if_empty(value: object | None) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
-    if text == "" or text.lower() in {"none", "null", "auto"}:
-        return None
+    if not text:
+        raise ValueError("an explicitly provided string setting must not be empty")
     return text
 
 
@@ -271,15 +249,15 @@ def _bounded_fraction(value: float, name: str) -> float:
 def _parse_positive_int_csv(raw: object | None, *, default: tuple[int, ...]) -> tuple[int, ...]:
     if raw is None:
         return default
-    values: list[int] = []
-    for part in str(raw).split(","):
-        text = part.strip()
-        if not text:
-            continue
-        value = int(text)
-        if value > 0:
-            values.append(value)
-    return tuple(sorted(set(values))) if values else default
+    parts = tuple(part.strip() for part in str(raw).split(","))
+    if not parts or any(not part for part in parts):
+        raise ValueError("integer bucket lists must contain only non-empty values")
+    values = tuple(int(part) for part in parts)
+    if any(value <= 0 for value in values):
+        raise ValueError("integer bucket lists must contain only positive values")
+    if tuple(sorted(set(values))) != values:
+        raise ValueError("integer bucket lists must be strictly increasing")
+    return values
 
 
 def _parse_optional_bool(value: object | None) -> bool | None:
@@ -288,10 +266,8 @@ def _parse_optional_bool(value: object | None) -> bool | None:
     if isinstance(value, bool):
         return value
     text = str(value).strip().lower()
-    if text in {"", "auto", "none", "null"}:
-        return None
-    if text in {"1", "true", "yes", "on"}:
+    if text == "true":
         return True
-    if text in {"0", "false", "no", "off"}:
+    if text == "false":
         return False
     raise ValueError(f"expected optional bool token, got {value!r}")

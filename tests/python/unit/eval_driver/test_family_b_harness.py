@@ -636,19 +636,9 @@ def test_t2i_task_can_emit_image_only_chat_wire() -> None:
         "cfg_norm": "global",
         "cfg_interval": [0.4, 1.0],
         "timestep_shift": 3.0,
+        "think": False,
+        "t_eps": 0.02,
     }
-    assert request.payload["size"] == "1024x1024"
-    assert request.payload["num_inference_steps"] == 50
-    assert request.payload["num_outputs_per_prompt"] == 1
-    assert request.payload["cfg_scale"] == 4.0
-    assert request.payload["cfg_text_scale"] == 4.0
-    assert request.payload["img_cfg_scale"] == 1.0
-    assert request.payload["cfg_img_scale"] == 1.0
-    assert request.payload["cfg_renorm_type"] == "global"
-    assert request.payload["cfg_interval"] == [0.4, 1.0]
-    assert request.payload["timestep_shift"] == 3.0
-    assert request.payload["think"] is False
-    assert request.payload["t_eps"] == 0.02
 
 
 def test_nonstreaming_i2t_does_not_fabricate_token_timing() -> None:

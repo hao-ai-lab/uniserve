@@ -91,9 +91,10 @@ path = "crates/bin/uniserve/Cargo.toml"
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
 addopts = "-ra"
+pythonpath = ["."]
 markers = [
     "unit: pure local tests without server, GPU, or external model files",
-    "contract: public schema/protocol/API compatibility tests",
+    "contract: canonical public schema and protocol conformance tests",
     "architecture: build-time dependency direction and package layout checks",
     "integration: multi-component tests using fake/simulated backends",
     "e2e: black-box server or worker tests",

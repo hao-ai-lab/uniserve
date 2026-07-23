@@ -1,8 +1,7 @@
 """Shared host->device staging primitives for integer sidecar tensors.
 
-Both H2D staging seams — the text forward-batch stager (int64 token/position
-tensors in :mod:`tensor_staging`) and the paged-cache block-table/seqlen
-staging (int32 tensors in :mod:`paged_text_cache`) — need the same four
+Both H2D staging seams — token/position staging and the `KvStore` block-table
+and sequence-length staging — need the same four
 mechanics: canonical CUDA device resolution, pinned-host buffer acquisition
 (optionally recycled through a stager slot), a bulk CPU fill that avoids
 per-element ATen ``__setitem__`` calls, and a device copy that reuses a slot's
@@ -60,7 +59,7 @@ def cpu_int_staging_buffer(
 ) -> torch.Tensor:
     """Acquire a CPU staging tensor, recycling through ``slot`` when present.
 
-    ``slot`` is a :class:`~uniserve_worker.runtime.cache_protocols.BufferStager`
+    ``slot`` supplies reusable host and device integer buffers.
     (``int_buffer`` for int32; the concrete ``TextTensorStagingSlot`` also
     provides ``long_buffer`` for int64).
     """

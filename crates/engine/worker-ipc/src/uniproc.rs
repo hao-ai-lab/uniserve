@@ -16,7 +16,7 @@ use uniserve_worker_ipc_core::{
     ClientEndpoint, Frame, Pending, event_driven_enabled, service_name,
 };
 use uniserve_worker_wire::{
-    EngineCaps, ForwardBatch, ForwardResult, WorkerRequest, WorkerResponse,
+    Batch, EngineCaps, ExecutionResult, ResponseKind, WorkerRequest, WorkerResponse,
 };
 
 use crate::death_watch::DeathWatcher;
@@ -64,8 +64,6 @@ pub struct WorkerLaunchConfig {
     pub prefill_cuda_graph_warmup_tokens: Option<String>,
     pub mixed_text_max_tokens: u32,
     pub varlen_prefill: bool,
-    pub green_contexts: bool,
-    pub logits_processor_chunk_size: u32,
     pub flashinfer_workspace_size: u64,
     pub flashinfer_use_tensor_core: Option<String>,
     pub flashinfer_decode_backend: String,
@@ -74,6 +72,8 @@ pub struct WorkerLaunchConfig {
     pub flashinfer_prefill_split_tile_size: Option<u32>,
     pub flashinfer_disable_split_kv: bool,
     pub flashinfer_fast_decode_plan: bool,
+    pub snapshot_dir: Option<String>,
+    pub restore_snapshots: bool,
 }
 
 impl Default for WorkerLaunchConfig {
@@ -103,8 +103,6 @@ impl Default for WorkerLaunchConfig {
             prefill_cuda_graph_warmup_tokens: None,
             mixed_text_max_tokens: 8192,
             varlen_prefill: true,
-            green_contexts: false,
-            logits_processor_chunk_size: 0,
             flashinfer_workspace_size: 512 * 1024 * 1024,
             flashinfer_use_tensor_core: None,
             flashinfer_decode_backend: "fa2".to_string(),
@@ -113,6 +111,8 @@ impl Default for WorkerLaunchConfig {
             flashinfer_prefill_split_tile_size: None,
             flashinfer_disable_split_kv: false,
             flashinfer_fast_decode_plan: true,
+            snapshot_dir: None,
+            restore_snapshots: false,
         }
     }
 }
@@ -183,11 +183,6 @@ impl WorkerLaunchConfig {
         if !self.varlen_prefill {
             cmd.arg("--no-varlen-prefill");
         }
-        if self.green_contexts {
-            cmd.arg("--green-contexts");
-        }
-        cmd.arg("--logits-processor-chunk-size")
-            .arg(self.logits_processor_chunk_size.to_string());
         cmd.arg("--flashinfer-workspace-size")
             .arg(self.flashinfer_workspace_size.to_string());
         if let Some(value) = &self.flashinfer_use_tensor_core {
@@ -211,6 +206,12 @@ impl WorkerLaunchConfig {
         if !self.flashinfer_fast_decode_plan {
             cmd.arg("--no-flashinfer-fast-decode-plan");
         }
+        if let Some(value) = &self.snapshot_dir {
+            cmd.arg("--snapshot-dir").arg(value);
+        }
+        if self.restore_snapshots {
+            cmd.arg("--restore-snapshots");
+        }
     }
 }
 
@@ -223,7 +224,7 @@ pub struct UniprocExecutor {
     rank: u32,
     tp_size: u32,
     pending: HashMap<u64, PendingRecord>,
-    ready: VecDeque<ForwardResult>,
+    ready: VecDeque<ExecutionResult>,
     acks: HashMap<u64, ControlAck>,
     awaited: Option<u64>,
     next_call_id: u64,
@@ -494,46 +495,37 @@ impl UniprocExecutor {
             "waiting for worker to load model + report caps..."
         );
         let call_id = self.alloc_call_id();
-        let mut req = WorkerRequest::get_caps();
+        let mut req = WorkerRequest::get_capabilities();
         req.call_id = Some(call_id);
         let pending =
             self.send_request_with_timeout(&req, "caps handshake", WORKER_CONNECT_TIMEOUT)?;
         let resp = self.wait_pending_response(&pending, "caps handshake")?;
         let wr = resp.decode_response()?;
-        let mut caps = match wr.kind.as_str() {
-            "caps" => wr
-                .caps
-                .ok_or_else(|| anyhow::anyhow!("caps response missing caps"))?,
-            "error" => bail!(
+        let caps = match wr.kind {
+            ResponseKind::Capabilities => wr
+                .capabilities
+                .ok_or_else(|| anyhow::anyhow!("capabilities response is missing its payload"))?,
+            ResponseKind::Error => bail!(
                 "worker error during caps: {}",
                 wr.message.unwrap_or_default()
             ),
-            k => bail!("unexpected caps response kind: {k}"),
+            kind => bail!("unexpected capabilities response kind: {kind:?}"),
         };
-        // The host is authoritative for pipeline depth and TP topology: it spawned the
-        // worker with these values on the command line, so we overwrite the worker-echoed
-        // caps with the host's own view. If the worker reports something different it
-        // indicates a launch/version mismatch worth surfacing, but the host value wins.
         let host_depth = self.depth as u32;
-        if caps.pipeline_depth != 0 && caps.pipeline_depth != host_depth {
-            tracing::warn!(
-                worker_declared = caps.pipeline_depth,
-                host_authoritative = host_depth,
-                "worker-declared pipeline_depth disagrees with host; using host value"
-            );
-        }
-        if caps.rank.tp_rank != self.rank || caps.rank.tp_size != self.tp_size {
-            tracing::warn!(
-                worker_tp_rank = caps.rank.tp_rank,
-                worker_tp_size = caps.rank.tp_size,
-                host_tp_rank = self.rank,
-                host_tp_size = self.tp_size,
-                "worker-declared TP rank/size disagrees with host; using host values"
-            );
-        }
-        caps.pipeline_depth = host_depth;
-        caps.rank.tp_rank = self.rank;
-        caps.rank.tp_size = self.tp_size;
+        anyhow::ensure!(
+            caps.pipeline_depth == host_depth,
+            "worker pipeline_depth {} does not match launched depth {}",
+            caps.pipeline_depth,
+            host_depth
+        );
+        anyhow::ensure!(
+            caps.rank.tp_rank == self.rank && caps.rank.tp_size == self.tp_size,
+            "worker TP rank/size ({}/{}) does not match launched topology ({}/{})",
+            caps.rank.tp_rank,
+            caps.rank.tp_size,
+            self.rank,
+            self.tp_size
+        );
         self.caps = caps;
         tracing::info!(?self.caps, "worker ready");
         Ok(())
@@ -637,7 +629,17 @@ impl UniprocExecutor {
         match kind {
             OutstandingKind::Batch { step_id } => self.route_batch(step_id, wr),
             OutstandingKind::Control => {
-                let ok = wr.kind != "error";
+                let (ok, snapshot) = match wr.kind {
+                    ResponseKind::Ok => (true, None),
+                    ResponseKind::Snapshot => (
+                        true,
+                        Some(wr.snapshot.clone().ok_or_else(|| {
+                            anyhow::anyhow!("snapshot response is missing its payload")
+                        })?),
+                    ),
+                    ResponseKind::Error => (false, None),
+                    kind => bail!("unexpected control response kind: {kind:?}"),
+                };
                 if !ok {
                     tracing::error!(
                         call_id,
@@ -652,6 +654,7 @@ impl UniprocExecutor {
                             rank: self.rank,
                             ok,
                             message: wr.message,
+                            snapshot,
                         },
                     );
                 }
@@ -661,8 +664,8 @@ impl UniprocExecutor {
     }
 
     fn route_batch(&mut self, step_id: u64, wr: WorkerResponse) -> anyhow::Result<()> {
-        match wr.kind.as_str() {
-            "result" => {
+        match wr.kind {
+            ResponseKind::Result => {
                 let r = wr.result.ok_or_else(|| anyhow::anyhow!("result missing"))?;
                 if r.step_id != step_id {
                     bail!(
@@ -678,15 +681,25 @@ impl UniprocExecutor {
                 self.ready.insert(pos, r);
                 Ok(())
             }
-            "error" => Err(WorkerExecError {
-                fatal: wr.is_fatal_error(),
-                // Carry the worker's retryability bit; default is non-retryable.
-                retryable: wr.retryable.unwrap_or(false),
-                code: wr.code.clone(),
-                message: wr.message.clone().unwrap_or_default(),
+            ResponseKind::Error => {
+                let fatal = wr
+                    .fatal
+                    .ok_or_else(|| anyhow::anyhow!("error response missing fatality"))?;
+                let retryable = wr
+                    .retryable
+                    .ok_or_else(|| anyhow::anyhow!("error response missing retryability"))?;
+                Err(WorkerExecError {
+                    fatal,
+                    retryable,
+                    code: wr.code.clone(),
+                    message: wr.message.clone().unwrap_or_default(),
+                    phase: wr.phase.clone(),
+                    route: wr.route.clone(),
+                    operations: wr.operations.clone(),
+                }
+                .into())
             }
-            .into()),
-            k => bail!("unexpected execute response kind: {k}"),
+            kind => bail!("unexpected execute response kind: {kind:?}"),
         }
     }
 
@@ -788,7 +801,7 @@ impl Executor for UniprocExecutor {
         Ok(())
     }
 
-    fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
+    fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
         self.drain_ready()?;
         if !self.can_submit() {
             self.ensure_slot()?;
@@ -808,7 +821,7 @@ impl Executor for UniprocExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
         self.drain_ready()?;
         Ok(self.ready.pop_front())
     }
@@ -819,7 +832,10 @@ impl Executor for UniprocExecutor {
         self.check_worker("idle liveness check")
     }
 
-    fn wait_result_timeout(&mut self, timeout: Duration) -> anyhow::Result<Option<ForwardResult>> {
+    fn wait_result_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ExecutionResult>> {
         let Some(deadline) = Instant::now().checked_add(timeout) else {
             self.drain_ready()?;
             return Ok(self.ready.pop_front());
@@ -844,7 +860,7 @@ impl Executor for UniprocExecutor {
         }
     }
 
-    fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+    fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
         loop {
             self.drain_ready()?;
             if let Some(r) = self.ready.pop_front() {
@@ -862,11 +878,11 @@ impl Executor for UniprocExecutor {
     /// ack. In this single-worker transport the value happens to be the genuine wire
     /// call_id the worker echoes, but the multiproc/disagg transports return a private
     /// counter that matches no worker request, so no caller may assume these semantics.
-    /// `0` is returned for no-op ops (empty CopyBlocks/FreeEncoder) that are never sent.
+    /// `0` is returned for empty copy or product-release controls that are never sent.
     fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
         match &op {
-            ControlOp::CopyBlocks(c) if c.is_empty() => return Ok(0),
-            ControlOp::FreeEncoder(h) if h.is_empty() => return Ok(0),
+            ControlOp::CopyKv(copies) if copies.is_empty() => return Ok(0),
+            ControlOp::ReleaseProducts(handles) if handles.is_empty() => return Ok(0),
             _ => {}
         }
         let call_id = self.alloc_call_id();
@@ -959,7 +975,7 @@ impl Drop for UniprocExecutor {
     }
 }
 
-fn nano_id() -> u64 {
+pub(crate) fn nano_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     // Build an id from a wall-clock timestamp in the high bits plus a process-wide

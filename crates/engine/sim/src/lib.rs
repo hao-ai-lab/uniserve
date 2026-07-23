@@ -1,9 +1,12 @@
-//! GPU-free CPU model engine that fabricates text tokens and denoise-step
-//! progress against the same [`ModelEngine`] trait, so the scheduler, lifecycle, block
-//! manager, and frontend can be exercised without a GPU or Python worker.
+//! GPU-free execution engine for scheduler and frontend conformance tests.
+//!
+//! The simulator is a strict peer of the production execution protocol: it
+//! consumes typed admissions and operations, enforces lifecycle/version/replay
+//! invariants, and returns typed deltas without a second simulation-only schema.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
-use std::collections::HashMap;
+
+use std::collections::{BTreeMap, HashMap};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -13,48 +16,31 @@ use uniserve_core::{
     ImageParams, RequestId, SampleOutput, SamplingParams, apply_sampling, score_token_logprobs,
 };
 use uniserve_executor::{ControlAck, ControlOp, Executor, ModelEngine};
-use uniserve_worker_wire::{EngineCaps, ForwardBatch, ForwardOp, ForwardResult, OpKind, SeqResult};
+use uniserve_worker_wire::{
+    Admission, Batch, EncodeDelta, EncodeInput, EngineCaps, ExecutionResult, FlowDelta,
+    ImageArtifact, MaterializeDelta, MaterializedProduct, Operation, OperationEnvelope,
+    OperationResult, OperationType, RequestKind, ResultDelta, SequenceDelta, SequenceEffect,
+    SequenceInput, SequenceMode, TokenLogprob, TransferDelta,
+};
 
-/// Default fabricated-text length before a synthetic EOS (overridable via
-/// [`SimEngine::set_text_len`]).
 const DEFAULT_TEXT_LEN: usize = 8;
-/// Synthetic end-of-sequence token id. Matches Qwen-family `<|im_end|>`
-/// (151645) so fixtures exercising real control tokens line up with the sim.
-const FAKE_EOS_TOKEN: u32 = 151645;
-/// Initial synthetic vocab size: large enough to cover the fabricated token ids
-/// (`1000 + (.. % 5000)`) plus [`FAKE_EOS_TOKEN`] itself. Runtime profile
-/// controls can extend it through [`SimEngine::configure_control_tokens`].
+const FAKE_EOS_TOKEN: u32 = 151_645;
 const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
-/// Denoise steps assumed when a request carries no [`ImageParams::steps`].
 const DEFAULT_DENOISE_STEPS: u16 = 50;
-/// Image dimensions (height, width) assumed when a request carries no
-/// [`ImageParams`] height/width.
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
-fn operation_result(op: &ForwardOp, result: SeqResult) -> SeqResult {
-    SeqResult {
-        req_id: op.req_id,
-        op_kind: Some(op.kind),
-        op_id: op.op_id,
-        epoch: Some(op.epoch),
-        base_version: Some(op.base_version),
-        result_version: Some(op.base_version.saturating_add(1)),
-        ..result
-    }
-}
-
 enum Job {
-    Batch(ForwardBatch),
+    Batch(Batch),
     Drop(RequestId),
     Shutdown,
 }
 
-/// Wraps a synchronous in-process [`ModelEngine`] on its own worker thread.
+/// Runs a synchronous [`ModelEngine`] on a bounded asynchronous executor seam.
 pub struct SimExecutor {
     caps: EngineCaps,
     depth: usize,
     to_worker: Sender<Job>,
-    from_worker: Receiver<anyhow::Result<ForwardResult>>,
+    from_worker: Receiver<anyhow::Result<ExecutionResult>>,
     in_flight: usize,
     next_call_id: u64,
     handle: Option<JoinHandle<()>>,
@@ -62,15 +48,14 @@ pub struct SimExecutor {
 
 impl SimExecutor {
     pub fn new(engine: Box<dyn ModelEngine>) -> Self {
-        let caps = engine.caps();
-        let depth = (caps.pipeline_depth as usize).max(1);
+        let depth = (engine.caps().pipeline_depth as usize).max(1);
         Self::with_depth(engine, depth)
     }
 
     pub fn with_depth(mut engine: Box<dyn ModelEngine>, depth: usize) -> Self {
         let caps = engine.caps();
         let depth = depth.max(1);
-        let (to_worker, jobs) = crossbeam_channel::unbounded::<Job>();
+        let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let handle = std::thread::Builder::new()
             .name("uniserve-sim-executor".into())
@@ -78,13 +63,12 @@ impl SimExecutor {
                 while let Ok(job) = jobs.recv() {
                     match job {
                         Job::Batch(batch) => {
-                            let result = engine.execute(batch);
-                            if results_tx.send(result).is_err() {
+                            if results_tx.send(engine.execute(batch)).is_err() {
                                 break;
                             }
                         }
-                        Job::Drop(id) => {
-                            let _ = engine.drop_request(id);
+                        Job::Drop(session_id) => {
+                            let _ = engine.drop_session(session_id);
                         }
                         Job::Shutdown => break,
                     }
@@ -102,30 +86,30 @@ impl SimExecutor {
         }
     }
 
-    /// Apply a control op against the in-process engine.
-    ///
-    /// Only [`ControlOp::DropRequest`] has observable engine state in the sim:
-    /// it forwards a [`Job::Drop`] so the worker thread evicts the request's
-    /// records (mirroring the real worker's stateful-diff contract). The
-    /// remaining ops address resources the CPU sim does not model — there is no
-    /// real KV pool to copy blocks within, no GPU encoder cache to free, no
-    /// LoRA registry, no prefix cache, and no device to sleep/wake — so they are
-    /// intentional no-ops. The exhaustive match (rather than a single `if let`)
-    /// is deliberate: a newly added `ControlOp` variant fails to compile here,
-    /// forcing a conscious decision instead of silently dropping the op.
-    fn apply_control(&mut self, op: &ControlOp) {
-        match op {
-            ControlOp::DropRequest(id) => {
-                let _ = self.to_worker.send(Job::Drop(*id));
+    fn apply_control(&mut self, operation: &ControlOp) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.caps
+                .supported_controls
+                .contains(&operation.request_kind()),
+            "sim executor does not support control {}",
+            operation.method()
+        );
+        match operation {
+            ControlOp::DropSession(session_id) => {
+                self.to_worker
+                    .send(Job::Drop(*session_id))
+                    .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
             }
-            ControlOp::CopyBlocks(_)
-            | ControlOp::FreeEncoder(_)
-            | ControlOp::LoadLora { .. }
-            | ControlOp::UnloadLora { .. }
-            | ControlOp::ResetPrefixCache
-            | ControlOp::Sleep
-            | ControlOp::WakeUp => {}
+            ControlOp::CopyKv(_)
+            | ControlOp::ReleaseProducts(_)
+            | ControlOp::LoadAdapter { .. }
+            | ControlOp::UnloadAdapter { .. }
+            | ControlOp::ResetPrefixCache => {}
+            ControlOp::SnapshotSession(_) | ControlOp::RestoreSession(_) => {
+                unreachable!("unsupported controls are rejected before dispatch")
+            }
         }
+        Ok(())
     }
 }
 
@@ -151,7 +135,8 @@ impl Executor for SimExecutor {
         }
     }
 
-    fn submit(&mut self, batch: ForwardBatch) -> anyhow::Result<()> {
+    fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+        batch.validate()?;
         self.to_worker
             .send(Job::Batch(batch))
             .map_err(|_| anyhow::anyhow!("sim executor thread gone"))?;
@@ -159,7 +144,7 @@ impl Executor for SimExecutor {
         Ok(())
     }
 
-    fn poll(&mut self) -> anyhow::Result<Option<ForwardResult>> {
+    fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
         match self.from_worker.try_recv() {
             Ok(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -172,7 +157,10 @@ impl Executor for SimExecutor {
         }
     }
 
-    fn wait_result_timeout(&mut self, timeout: Duration) -> anyhow::Result<Option<ForwardResult>> {
+    fn wait_result_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> anyhow::Result<Option<ExecutionResult>> {
         match self.from_worker.recv_timeout(timeout) {
             Ok(result) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -185,7 +173,7 @@ impl Executor for SimExecutor {
         }
     }
 
-    fn next_result(&mut self) -> anyhow::Result<ForwardResult> {
+    fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
         let result = self
             .from_worker
             .recv()
@@ -194,27 +182,24 @@ impl Executor for SimExecutor {
         result
     }
 
-    fn control(&mut self, op: ControlOp) -> anyhow::Result<u64> {
+    fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
         let call_id = self.next_call_id;
-        self.next_call_id += 1;
-        self.apply_control(&op);
+        self.next_call_id = self.next_call_id.saturating_add(1);
+        self.apply_control(&operation)?;
         Ok(call_id)
     }
 
     fn control_wait(
         &mut self,
-        op: ControlOp,
+        operation: ControlOp,
         _targets: Option<&[u32]>,
     ) -> anyhow::Result<Vec<ControlAck>> {
-        // The sim is a single synchronous in-process rank: `apply_control`
-        // runs the op (or no-ops it; see `apply_control`) to completion before
-        // returning, so the rank-0 ack is genuinely satisfied here rather than
-        // optimistically fabricated. `_targets` is meaningless for one rank.
-        self.apply_control(&op);
+        self.apply_control(&operation)?;
         Ok(vec![ControlAck {
             rank: 0,
             ok: true,
             message: None,
+            snapshot: None,
         }])
     }
 
@@ -232,121 +217,317 @@ impl Drop for SimExecutor {
     }
 }
 
-/// Per-request control record seeded by `NewRequestData` (the stateful-diff
-/// contract): the sim mirrors the real worker's statefulness so the contract
-/// is exercised in CI exactly as it is on the GPU path.
-#[derive(Default)]
-struct SimRecord {
-    sampling: Option<SamplingParams>,
-    image: Option<ImageParams>,
+#[derive(Clone)]
+struct RecordedResult {
+    digest: String,
+    result: OperationResult,
 }
 
-/// CPU model engine for deterministic local testing.
+#[derive(Clone)]
+struct SimSession {
+    admission: Admission,
+    epoch: Option<u64>,
+    version: u64,
+    emitted: usize,
+    flow_step: u16,
+    terminal: BTreeMap<u64, RecordedResult>,
+}
+
+impl SimSession {
+    fn new(admission: Admission) -> Self {
+        Self {
+            admission,
+            epoch: None,
+            version: 0,
+            emitted: 0,
+            flow_step: 0,
+            terminal: BTreeMap::new(),
+        }
+    }
+
+    fn sampling(&self) -> Option<&SamplingParams> {
+        self.admission
+            .sequence
+            .as_ref()
+            .map(|sequence| &sequence.sampling)
+    }
+
+    fn image(&self) -> Option<&ImageParams> {
+        self.admission.flow.as_ref().map(|flow| &flow.image)
+    }
+}
+
+/// Deterministic local model engine with protocol-faithful lifecycle state.
 pub struct SimEngine {
     caps: EngineCaps,
     text_len: usize,
     fake_eos: u32,
     vocab: usize,
     commit_token: Option<u32>,
-    emitted: HashMap<RequestId, usize>,
-    steps: HashMap<RequestId, u16>,
-    records: HashMap<RequestId, SimRecord>,
-}
-
-impl SimEngine {
-    /// Synthetic logit distribution for request `r` at generation index `n`.
-    /// The "natural" next token (matching the deterministic fake sampler) gets the
-    /// top logit, two alternatives get descending logits, and EOS dominates once
-    /// `n >= text_len`. The host-side sampling pipeline (bias, penalties, masks,
-    /// min-p/top-k/p) can change the chosen token from the natural argmax.
-    fn synth_logits(&self, r: RequestId, n: usize) -> Vec<f32> {
-        let mut v = vec![0.0f32; self.vocab];
-        let nat = if n >= self.text_len {
-            self.fake_eos
-        } else {
-            1000 + ((r.0 as u32 * 7 + n as u32) % 5000)
-        };
-        v[nat as usize] = 10.0;
-        let alt1 = 1000 + ((r.0 as u32 * 13 + n as u32 + 1) % 5000);
-        let alt2 = 1000 + ((r.0 as u32 * 29 + n as u32 + 2) % 5000);
-        if (alt1 as usize) < self.vocab && alt1 != nat {
-            v[alt1 as usize] = 8.0;
-        }
-        if (alt2 as usize) < self.vocab && alt2 != nat {
-            v[alt2 as usize] = 6.0;
-        }
-        // Once the fabricated sequence reaches its configured length, EOS is a
-        // deterministic control outcome even under stochastic frontend defaults.
-        // Other logits remain finite so min-token suppression can still force
-        // continued generation when the scheduler masks EOS.
-        v[self.fake_eos as usize] = if n >= self.text_len { 100.0 } else { 1.0 };
-        v
-    }
+    sessions: HashMap<RequestId, SimSession>,
 }
 
 impl SimEngine {
     pub fn new() -> Self {
         Self {
             caps: EngineCaps {
-                supported_ops: vec![
-                    OpKind::PrefillUnd,
-                    OpKind::DecodeUnd,
-                    OpKind::DenoiseGen,
-                    OpKind::CommitGen,
-                    OpKind::CommitWriteback,
-                    OpKind::VitEncode,
-                    OpKind::VaeEncode,
+                supported_operation_types: vec![
+                    OperationType::SequenceExtend,
+                    OperationType::SequenceDecode,
+                    OperationType::SequenceVerify,
+                    OperationType::SequenceSample,
+                    OperationType::Flow,
+                    OperationType::EncodeVision,
+                    OperationType::EncodeLatent,
+                    OperationType::MaterializeImage,
+                    OperationType::MaterializeFrame,
+                    OperationType::TransferProduct,
+                    OperationType::TransferKv,
                 ],
                 max_latent_size: 65_536,
+                latent_downsample: 16,
                 max_vae_grid_tokens: 1_024,
                 max_vit_grid_tokens: 64,
                 encoder_cache_budget: 256,
-                ..Default::default()
+                supported_controls: vec![
+                    RequestKind::DropSession,
+                    RequestKind::CopyKv,
+                    RequestKind::ReleaseProducts,
+                    RequestKind::LoadAdapter,
+                    RequestKind::UnloadAdapter,
+                    RequestKind::ResetPrefixCache,
+                ],
+                model_spec_digest: "0".repeat(64),
+                weight_digest: "1".repeat(64),
+                ..EngineCaps::default()
             },
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
             vocab: SYNTH_VOCAB_SIZE,
             commit_token: None,
-            emitted: HashMap::new(),
-            steps: HashMap::new(),
-            records: HashMap::new(),
+            sessions: HashMap::new(),
         }
     }
-}
 
-fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
-    let mut bytes = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut bytes, width, height);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header()?;
-        let row_bytes = width as usize * 3;
-        let mut image = vec![0_u8; row_bytes * height as usize];
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let idx = y * row_bytes + x * 3;
-                image[idx] = ((x * 255) / (width.max(1) as usize)) as u8;
-                image[idx + 1] = ((y * 255) / (height.max(1) as usize)) as u8;
-                image[idx + 2] = 128;
+    fn synth_logits(&self, session_id: RequestId, index: usize) -> Vec<f32> {
+        let mut logits = vec![0.0; self.vocab];
+        let natural = if index >= self.text_len {
+            self.fake_eos
+        } else {
+            1_000 + ((session_id.0 as u32 * 7 + index as u32) % 5_000)
+        };
+        logits[natural as usize] = 10.0;
+        let alternate_one = 1_000 + ((session_id.0 as u32 * 13 + index as u32 + 1) % 5_000);
+        let alternate_two = 1_000 + ((session_id.0 as u32 * 29 + index as u32 + 2) % 5_000);
+        if alternate_one != natural {
+            logits[alternate_one as usize] = 8.0;
+        }
+        if alternate_two != natural {
+            logits[alternate_two as usize] = 6.0;
+        }
+        logits[self.fake_eos as usize] = if index >= self.text_len { 100.0 } else { 1.0 };
+        logits
+    }
+
+    fn sample(
+        &self,
+        session_id: RequestId,
+        session: &SimSession,
+        sequence: &uniserve_worker_wire::SequenceOperation,
+        index: usize,
+    ) -> SampleOutput {
+        let mut logits = self.synth_logits(session_id, index);
+        match session.sampling() {
+            Some(sampling) => apply_sampling(
+                &mut logits,
+                sampling,
+                &sequence.policy.recent_tokens,
+                (!sequence.policy.allowed_tokens.is_empty())
+                    .then_some(sequence.policy.allowed_tokens.as_slice()),
+                (!sequence.policy.suppress_tokens.is_empty())
+                    .then_some(sequence.policy.suppress_tokens.as_slice()),
+                sampling.n_logprobs as usize,
+            ),
+            None => SampleOutput {
+                token: if index >= self.text_len {
+                    self.fake_eos
+                } else {
+                    1_000 + ((session_id.0 as u32 * 7 + index as u32) % 5_000)
+                },
+                logprob: 0.0,
+                top: Vec::new(),
+            },
+        }
+    }
+
+    fn sequence_effect(
+        &self,
+        envelope: &OperationEnvelope,
+        session: &mut SimSession,
+        sequence: &uniserve_worker_wire::SequenceOperation,
+    ) -> anyhow::Result<SequenceEffect> {
+        let SequenceInput::Tokens(input) = &sequence.input else {
+            let output = self.sample(envelope.session_id, session, sequence, session.emitted);
+            return Ok(sample_effect(session.sampling(), output, 1));
+        };
+        let mut effect = SequenceEffect::default();
+        if input.return_all_logits {
+            let sampling = session
+                .sampling()
+                .ok_or_else(|| anyhow::anyhow!("sequence session has no sampling admission"))?;
+            let skip = usize::from(sequence.position.0 == 0);
+            effect.prompt_logprobs = input
+                .token_ids
+                .iter()
+                .enumerate()
+                .skip(skip)
+                .map(|(offset, token)| {
+                    let logits = self.synth_logits(
+                        envelope.session_id,
+                        (sequence.position.0 as usize)
+                            .saturating_add(offset)
+                            .saturating_sub(1),
+                    );
+                    score_token_logprobs(
+                        &logits,
+                        *token,
+                        sampling.n_prompt_logprobs as usize,
+                        &sampling.logprob_token_ids,
+                    )
+                    .into_iter()
+                    .map(|(token, logprob, rank)| TokenLogprob(token, logprob, rank))
+                    .collect()
+                })
+                .collect();
+        }
+        let output = self.sample(envelope.session_id, session, sequence, session.emitted);
+        match sequence.mode {
+            SequenceMode::Extend => {
+                effect = merge_sample(effect, session.sampling(), output);
+                session.emitted = session.emitted.max(1);
             }
+            SequenceMode::Decode => {
+                effect = merge_sample(effect, session.sampling(), output);
+                session.emitted = session.emitted.saturating_add(1);
+            }
+            SequenceMode::Verify => {
+                effect.sampled_token_ids = input.draft_token_ids.clone();
+                effect.sampled_token_ids.push(output.token);
+                effect.accepted_draft_tokens = Some(input.draft_token_ids.len() as u32);
+                effect.sampled_logprob = session
+                    .sampling()
+                    .is_some_and(SamplingParams::generated_logprobs_requested)
+                    .then_some(output.logprob);
+                effect.top_logprobs = output
+                    .top
+                    .into_iter()
+                    .map(|(token, logprob, rank)| TokenLogprob(token, logprob, rank))
+                    .collect();
+                session.emitted = session
+                    .emitted
+                    .saturating_add(effect.sampled_token_ids.len());
+            }
+            SequenceMode::Sample => anyhow::bail!("sample sequence requires published logits"),
         }
-        writer.write_image_data(&image)?;
+        effect.kv_tokens = Some(input.token_ids.len() as u32);
+        Ok(effect)
     }
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
-}
 
-impl SimEngine {
-    /// Advertise a batch-queue depth so the executor keeps that many op-batches
-    /// in flight.
+    fn execute_operation(
+        &self,
+        envelope: &OperationEnvelope,
+        session: &mut SimSession,
+    ) -> anyhow::Result<ResultDelta> {
+        Ok(match &envelope.operation {
+            Operation::Sequence(sequence) => ResultDelta::Sequence(SequenceDelta {
+                effect: self.sequence_effect(envelope, session, sequence)?,
+            }),
+            Operation::Flow(flow) => {
+                let completed = flow.start_step.saturating_add(flow.step_count);
+                session.flow_step = completed;
+                let total = session
+                    .image()
+                    .map(|image| image.steps)
+                    .unwrap_or(DEFAULT_DENOISE_STEPS);
+                ResultDelta::Flow(FlowDelta {
+                    steps_completed: completed,
+                    done: completed >= total,
+                })
+            }
+            Operation::Encode(encode) => {
+                let content_hash = match &encode.input {
+                    EncodeInput::InlineImage { content_hash, .. }
+                    | EncodeInput::StagedProduct { content_hash, .. }
+                    | EncodeInput::CachedProduct { content_hash } => *content_hash,
+                };
+                let handle = content_hash.wrapping_mul(0x9E37_79B1) | 1;
+                ResultDelta::Encode(EncodeDelta {
+                    product_handle: handle,
+                    kv_tokens: 1,
+                    image_size: session.image().map(|image| (image.height, image.width)),
+                })
+            }
+            Operation::Materialize(materialize) => match materialize.kind {
+                uniserve_worker_wire::MaterializeKind::Image => {
+                    session.flow_step = 0;
+                    session.emitted = 0;
+                    let (height, width) = session
+                        .image()
+                        .map(|image| (image.height, image.width))
+                        .unwrap_or(DEFAULT_IMAGE_HW);
+                    let png_base64 = synthetic_png_b64(width, height)?;
+                    let kv_tokens =
+                        session
+                            .image()
+                            .filter(|image| image.retain_images)
+                            .map(|image| {
+                                let downsample = self.caps.latent_downsample.max(1);
+                                (image.height / downsample)
+                                    .saturating_mul(image.width / downsample)
+                                    .saturating_add(self.caps.commit_marker_tokens.max(1))
+                            });
+                    let sequence = self.commit_token.map(|token| SequenceEffect {
+                        sampled_token_ids: vec![token],
+                        sampled_logprob: Some(0.0),
+                        ..SequenceEffect::default()
+                    });
+                    ResultDelta::Materialize(MaterializeDelta {
+                        product: MaterializedProduct::Image(ImageArtifact {
+                            png_base64,
+                            height,
+                            width,
+                            handle: envelope.session_id.0.max(1),
+                            locator: format!("sim-image-{}", envelope.session_id.0),
+                        }),
+                        kv_tokens,
+                        sequence,
+                    })
+                }
+                uniserve_worker_wire::MaterializeKind::Frame => {
+                    ResultDelta::Materialize(MaterializeDelta {
+                        product: MaterializedProduct::Frame { count: 1 },
+                        kv_tokens: None,
+                        sequence: None,
+                    })
+                }
+            },
+            Operation::Transfer(transfer) => ResultDelta::Transfer(TransferDelta {
+                product: (transfer.kind == uniserve_worker_wire::TransferKind::Product)
+                    .then_some(transfer.source.clone()),
+                kv_tokens: (transfer.kind == uniserve_worker_wire::TransferKind::Kv).then_some(1),
+                sequence: None,
+            }),
+        })
+    }
+
     pub fn set_pipeline_depth(&mut self, depth: u32) {
         self.caps.pipeline_depth = depth.max(1);
     }
-    /// Number of fabricated text tokens before a synthetic EOS (test knob).
-    pub fn set_text_len(&mut self, n: usize) {
-        self.text_len = n;
+
+    pub fn set_text_len(&mut self, length: usize) {
+        self.text_len = length;
     }
-    /// Match the simulator's EOS and vocabulary to one resolved model profile.
+
     pub fn configure_control_tokens(&mut self, eos: u32, control_tokens: &[u32]) {
         self.fake_eos = eos;
         let max_token = control_tokens
@@ -361,26 +542,75 @@ impl SimEngine {
                 .saturating_add(1),
         );
     }
-    /// Synthetic sampled token to return from commit_gen (test knob).
+
     pub fn set_commit_token(&mut self, token: Option<u32>) {
         self.commit_token = token;
     }
-    /// Advertise hybrid KV-cache groups at the handshake (test knob).
+
     pub fn set_groups(&mut self, groups: Vec<uniserve_core::KvCacheGroupSpec>) {
         self.caps.groups = groups;
     }
-    /// Shrink the KV pool to force admission/preemption pressure (test knob).
-    pub fn set_num_blocks(&mut self, n: u32) {
-        self.caps.num_blocks = n;
+
+    pub fn set_num_blocks(&mut self, count: u32) {
+        self.caps.num_blocks = count;
     }
-    /// Shrink the block size so growth pressure happens sooner (test knob).
-    pub fn set_block_size(&mut self, n: u32) {
-        self.caps.block_size = n;
+
+    pub fn set_block_size(&mut self, size: u32) {
+        self.caps.block_size = size;
     }
-    /// Test hook for scheduler/worker capability negotiation.
+
     pub fn mut_caps_for_test(&mut self) -> &mut EngineCaps {
         &mut self.caps
     }
+}
+
+fn merge_sample(
+    mut effect: SequenceEffect,
+    sampling: Option<&SamplingParams>,
+    output: SampleOutput,
+) -> SequenceEffect {
+    effect.sampled_token_ids.push(output.token);
+    effect.sampled_logprob = sampling
+        .is_some_and(SamplingParams::generated_logprobs_requested)
+        .then_some(output.logprob);
+    effect.top_logprobs = output
+        .top
+        .into_iter()
+        .map(|(token, logprob, rank)| TokenLogprob(token, logprob, rank))
+        .collect();
+    effect
+}
+
+fn sample_effect(
+    sampling: Option<&SamplingParams>,
+    output: SampleOutput,
+    kv_tokens: u32,
+) -> SequenceEffect {
+    let mut effect = merge_sample(SequenceEffect::default(), sampling, output);
+    effect.kv_tokens = Some(kv_tokens);
+    effect
+}
+
+fn synthetic_png_b64(width: u32, height: u32) -> anyhow::Result<String> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header()?;
+        let row_bytes = width as usize * 3;
+        let mut image = vec![0; row_bytes * height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let index = y * row_bytes + x * 3;
+                image[index] = ((x * 255) / width.max(1) as usize) as u8;
+                image[index + 1] = ((y * 255) / height.max(1) as usize) as u8;
+                image[index + 2] = 128;
+            }
+        }
+        writer.write_image_data(&image)?;
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 impl Default for SimEngine {
@@ -394,218 +624,85 @@ impl ModelEngine for SimEngine {
         self.caps.clone()
     }
 
-    fn execute(&mut self, batch: ForwardBatch) -> anyhow::Result<ForwardResult> {
-        // Seed per-request control records before running ops (the worker's
-        // half of the stateful-diff contract).
-        for nr in &batch.new_reqs {
-            self.records.insert(
-                nr.req_id,
-                SimRecord {
-                    sampling: nr.sampling.clone(),
-                    image: nr.image.clone(),
-                },
-            );
-        }
-        let mut per_seq = Vec::new();
-        for op in batch.ops {
-            let r = op.req_id;
-            match op.kind {
-                OpKind::PrefillUnd | OpKind::DecodeUnd => {
-                    let n = *self.emitted.get(&r).unwrap_or(&0);
-                    // Run the host-side sampling pipeline over synthetic logits so
-                    // the op's params and masks can change the chosen token.
-                    let sampling = self.records.get(&r).and_then(|rec| rec.sampling.clone());
-                    let out: SampleOutput = match &sampling {
-                        Some(sp) => {
-                            let mut logits = self.synth_logits(r, n);
-                            apply_sampling(
-                                &mut logits,
-                                sp,
-                                op.recent_tokens.as_deref().unwrap_or(&[]),
-                                op.allowed_tokens.as_deref(),
-                                op.suppress_tokens.as_deref(),
-                                sp.n_logprobs as usize,
-                            )
-                        }
-                        None => {
-                            let nat = if n >= self.text_len {
-                                self.fake_eos
-                            } else {
-                                1000 + ((r.0 as u32 * 7 + n as u32) % 5000)
-                            };
-                            SampleOutput {
-                                token: nat,
-                                logprob: 0.0,
-                                top: Vec::new(),
-                            }
-                        }
-                    };
-                    // Only decode advances the generation counter — intermediate
-                    // (chunked) prefill ops produce no kept token, matching a real
-                    // model where prefill yields logits only for the last position.
-                    if op.kind == OpKind::DecodeUnd {
-                        self.emitted.insert(r, n + 1);
-                    }
-                    per_seq.push(operation_result(
-                        &op,
-                        SeqResult {
-                            sampled_token_id: Some(out.token),
-                            sampled_logprob: sampling
-                                .as_ref()
-                                .is_some_and(SamplingParams::generated_logprobs_requested)
-                                .then_some(out.logprob),
-                            top_logprobs: if out.top.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    out.top
-                                        .into_iter()
-                                        .map(|(token, logprob, rank)| {
-                                            uniserve_worker_wire::TokenLogprob(token, logprob, rank)
-                                        })
-                                        .collect(),
-                                )
-                            },
-                            prompt_logprobs: sampling.as_ref().and_then(|sampling| {
-                                (op.kind == OpKind::PrefillUnd
-                                    && sampling.prompt_logprobs_requested())
-                                .then(|| {
-                                    let tokens = op.token_ids.as_deref().unwrap_or_default();
-                                    let skip = usize::from(op.pos_range.0 == 0);
-                                    tokens
-                                        .iter()
-                                        .enumerate()
-                                        .skip(skip)
-                                        .map(|(offset, token)| {
-                                            let logits = self.synth_logits(
-                                                r,
-                                                (op.pos_range.0 as usize)
-                                                    .saturating_add(offset)
-                                                    .saturating_sub(1),
-                                            );
-                                            score_token_logprobs(
-                                                &logits,
-                                                *token,
-                                                sampling.n_prompt_logprobs as usize,
-                                                &sampling.logprob_token_ids,
-                                            )
-                                            .into_iter()
-                                            .map(|(token, logprob, rank)| {
-                                                uniserve_worker_wire::TokenLogprob(
-                                                    token, logprob, rank,
-                                                )
-                                            })
-                                            .collect()
-                                        })
-                                        .collect()
-                                })
-                            }),
-                            ..Default::default()
-                        },
-                    ));
+    fn execute(&mut self, batch: Batch) -> anyhow::Result<ExecutionResult> {
+        batch.validate()?;
+        for admission in batch.admissions {
+            match self.sessions.get(&admission.session_id) {
+                Some(session) => anyhow::ensure!(
+                    session.admission == admission,
+                    "session {} was readmitted with a different descriptor",
+                    admission.session_id.0
+                ),
+                None => {
+                    self.sessions
+                        .insert(admission.session_id, SimSession::new(admission));
                 }
-                OpKind::DenoiseGen => {
-                    let s = self
-                        .steps
-                        .get(&r)
-                        .unwrap_or(&0)
-                        .saturating_add(op.denoise_step_count.unwrap_or(1).max(1));
-                    self.steps.insert(r, s);
-                    let total = self
-                        .records
-                        .get(&r)
-                        .and_then(|rec| rec.image.as_ref())
-                        .map(|i| i.steps)
-                        .unwrap_or(DEFAULT_DENOISE_STEPS);
-                    per_seq.push(operation_result(
-                        &op,
-                        SeqResult {
-                            denoise_done: s >= total,
-                            num_steps_done: Some(s),
-                            ..Default::default()
-                        },
-                    ));
-                }
-                OpKind::CommitGen => {
-                    self.steps.remove(&r);
-                    // After committing an image, reset the text counter so a
-                    // round-trip (text → image → text …) generates fresh text.
-                    self.emitted.insert(r, 0);
-                    let hw = self
-                        .records
-                        .get(&r)
-                        .and_then(|rec| rec.image.as_ref())
-                        .map(|i| (i.height, i.width))
-                        .unwrap_or(DEFAULT_IMAGE_HW);
-                    let committed_kv_tokens = self
-                        .records
-                        .get(&r)
-                        .and_then(|rec| rec.image.as_ref())
-                        .filter(|image| image.retain_images)
-                        .map(|image| {
-                            let downsample = self.caps.latent_downsample.max(1);
-                            (image.height / downsample)
-                                .saturating_mul(image.width / downsample)
-                                .saturating_add(self.caps.commit_marker_tokens.max(1))
-                        })
-                        .unwrap_or(0);
-                    let png = synthetic_png_b64(hw.1, hw.0)?;
-                    per_seq.push(operation_result(
-                        &op,
-                        SeqResult {
-                            sampled_token_id: self.commit_token,
-                            sampled_logprob: self.commit_token.map(|_| 0.0),
-                            image_png_b64: Some(png),
-                            image_hw: Some(hw),
-                            num_tokens: Some(committed_kv_tokens),
-                            locator: Some(format!("sim-image-{}", r.0)),
-                            ..Default::default()
-                        },
-                    ));
-                }
-                OpKind::CommitWriteback => {
-                    per_seq.push(operation_result(
-                        &op,
-                        SeqResult {
-                            num_tokens: Some(1),
-                            ..Default::default()
-                        },
-                    ));
-                }
-                OpKind::VitEncode | OpKind::VaeEncode => {
-                    // Fabricate a deterministic worker-side encoder handle from the
-                    // image content hash. The embedding stays on the worker side.
-                    let handle = op.mm_hash.unwrap_or(0).wrapping_mul(0x9E3779B1) | 1;
-                    let image_hw = self
-                        .records
-                        .get(&r)
-                        .and_then(|rec| rec.image.as_ref())
-                        .map(|i| (i.height, i.width));
-                    per_seq.push(operation_result(
-                        &op,
-                        SeqResult {
-                            encoder_handle: Some(handle),
-                            num_tokens: Some(1),
-                            image_hw,
-                            ..Default::default()
-                        },
-                    ));
-                }
-                _ => per_seq.push(operation_result(&op, SeqResult::default())),
             }
         }
-        Ok(ForwardResult {
+
+        let mut results = Vec::with_capacity(batch.operations.len());
+        for envelope in batch.operations {
+            let mut session = self
+                .sessions
+                .get(&envelope.session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("session {} has no admission", envelope.session_id.0)
+                })?;
+            if let Some(recorded) = session.terminal.get(&envelope.op_id) {
+                anyhow::ensure!(
+                    recorded.digest == envelope.digest,
+                    "operation {} digest conflicts with its terminal record",
+                    envelope.op_id
+                );
+                results.push(recorded.result.clone());
+                continue;
+            }
+            match session.epoch {
+                None => session.epoch = Some(envelope.epoch),
+                Some(epoch) => anyhow::ensure!(
+                    epoch == envelope.epoch,
+                    "operation epoch {} does not match session epoch {epoch}",
+                    envelope.epoch
+                ),
+            }
+            anyhow::ensure!(
+                envelope.base_version == session.version,
+                "operation base version {} does not match session version {}",
+                envelope.base_version,
+                session.version
+            );
+            let delta = self.execute_operation(&envelope, &mut session)?;
+            let result = OperationResult {
+                session_id: envelope.session_id,
+                epoch: envelope.epoch,
+                op_id: envelope.op_id,
+                base_version: envelope.base_version,
+                result_version: envelope.base_version.saturating_add(1),
+                delta,
+            };
+            result.validate_for(&envelope)?;
+            session.version = result.result_version;
+            session.terminal.insert(
+                envelope.op_id,
+                RecordedResult {
+                    digest: envelope.digest,
+                    result: result.clone(),
+                },
+            );
+            self.sessions.insert(envelope.session_id, session);
+            results.push(result);
+        }
+        Ok(ExecutionResult {
             step_id: batch.step_id,
-            per_seq,
+            operations: results,
             worker_exec_us: None,
             forward_stats: None,
         })
     }
 
-    fn drop_request(&mut self, id: RequestId) -> anyhow::Result<()> {
-        self.emitted.remove(&id);
-        self.steps.remove(&id);
-        self.records.remove(&id);
+    fn drop_session(&mut self, session_id: RequestId) -> anyhow::Result<()> {
+        self.sessions.remove(&session_id);
         Ok(())
     }
 }
@@ -613,62 +710,86 @@ impl ModelEngine for SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uniserve_core::Modality;
+    use uniserve_worker_wire::{
+        KvAllocation, KvLeaseDelta, SequenceAdmission, SequenceOperation, TokenInput, TokenPolicy,
+        TokenSource,
+    };
 
-    #[test]
-    fn control_wait_acks_every_control_op() {
-        let mut exec = SimExecutor::new(Box::new(SimEngine::new()));
-        // Every op variant must produce exactly one ok ack from the single
-        // simulated rank — none may be silently dropped.
-        for op in [
-            ControlOp::DropRequest(RequestId(1)),
-            ControlOp::CopyBlocks(Vec::new()),
-            ControlOp::FreeEncoder(Vec::new()),
-            ControlOp::LoadLora {
-                lora_id: 7,
-                path: "/tmp/adapter".into(),
-            },
-            ControlOp::UnloadLora { lora_id: 7 },
-            ControlOp::ResetPrefixCache,
-            ControlOp::Sleep,
-            ControlOp::WakeUp,
-        ] {
-            let acks = exec.control_wait(op, None).expect("control_wait");
-            assert_eq!(acks.len(), 1);
-            assert_eq!(acks[0].rank, 0);
-            assert!(acks[0].ok);
-        }
-        exec.shutdown();
+    fn batch(step_id: u64, op_id: u64) -> Batch {
+        let admission = Admission::new(
+            RequestId(9),
+            Some(SequenceAdmission {
+                sampling: SamplingParams::default(),
+                negative_token_ids: Vec::new(),
+                kv: KvAllocation {
+                    block_ids: Vec::new(),
+                    prefix_len: 0,
+                    group_id: 0,
+                },
+            }),
+            None,
+            None,
+        )
+        .expect("admission");
+        let mut operation = OperationEnvelope::unsealed(
+            RequestId(9),
+            Operation::Sequence(SequenceOperation {
+                mode: SequenceMode::Extend,
+                lease: KvLeaseDelta::default(),
+                position: (0, 2),
+                policy: TokenPolicy::default(),
+                input: SequenceInput::Tokens(TokenInput {
+                    token_ids: vec![1, 2],
+                    source: TokenSource::Wire,
+                    draft_token_ids: Vec::new(),
+                    burst_tokens: 1,
+                    stop_token_ids: Vec::new(),
+                    stop_terminal: false,
+                    return_all_logits: false,
+                }),
+            }),
+        );
+        operation.admission_digest = admission.digest.clone();
+        operation.model_spec_digest = "0".repeat(64);
+        operation.weight_digest = "1".repeat(64);
+        operation.seal(3, op_id, 0);
+        Batch::new(step_id, vec![admission], vec![operation])
     }
 
     #[test]
-    fn operation_results_echo_the_version_envelope() {
-        let mut operation = ForwardOp {
-            req_id: RequestId(9),
-            kind: OpKind::PrefillUnd,
-            modality: Modality::Und,
-            token_ids: Some(vec![1, 2]),
-            pos_range: (0, 2),
-            ..Default::default()
-        };
-        operation.seal(3, 17, 11);
+    fn duplicate_operation_replays_one_typed_effect() {
         let mut engine = SimEngine::new();
-        let result = engine
-            .execute(ForwardBatch::new(4, Vec::new(), vec![operation]))
-            .expect("execute versioned operation");
+        let first = engine.execute(batch(4, 17)).expect("first execution");
+        let replay = engine.execute(batch(5, 17)).expect("replay execution");
+        assert_eq!(first.operations, replay.operations);
+    }
 
-        let row = &result.per_seq[0];
-        assert_eq!(row.op_id, Some(17));
-        assert_eq!(row.epoch, Some(3));
-        assert_eq!(row.base_version, Some(11));
-        assert_eq!(row.result_version, Some(12));
+    #[test]
+    fn control_wait_acknowledges_the_closed_control_algebra() {
+        let mut executor = SimExecutor::new(Box::new(SimEngine::new()));
+        for operation in [
+            ControlOp::DropSession(RequestId(1)),
+            ControlOp::CopyKv(Vec::new()),
+            ControlOp::ReleaseProducts(Vec::new()),
+            ControlOp::LoadAdapter {
+                adapter_id: 7,
+                path: "/tmp/adapter".into(),
+            },
+            ControlOp::UnloadAdapter { adapter_id: 7 },
+            ControlOp::ResetPrefixCache,
+        ] {
+            let acknowledgements = executor
+                .control_wait(operation, None)
+                .expect("control acknowledgement");
+            assert_eq!(acknowledgements.len(), 1);
+            assert!(acknowledgements[0].ok);
+        }
     }
 
     #[test]
     fn default_capabilities_admit_public_image_geometry() {
         let caps = SimEngine::new().caps();
         let latent_units = (2_048 / caps.latent_downsample) * (1_152 / caps.latent_downsample);
-
         assert!(latent_units <= caps.max_latent_size);
     }
 }

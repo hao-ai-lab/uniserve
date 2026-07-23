@@ -29,17 +29,6 @@ def call_mask_mod(
     seqlen_info,
     aux_data: AuxData,
 ):
-    # Compatibility shim for pre-aux_scalars mask_mod callables.
-    if const_expr(aux_data.scalars is not None):
-        return mask_mod(
-            batch_idx,
-            head_idx,
-            q_idx,
-            kv_idx,
-            seqlen_info,
-            aux_data.tensors,
-            aux_data.scalars,
-        )
     return mask_mod(
         batch_idx,
         head_idx,
@@ -47,6 +36,7 @@ def call_mask_mod(
         kv_idx,
         seqlen_info,
         aux_data.tensors,
+        aux_data.scalars,
     )
 
 
@@ -1007,8 +997,8 @@ class Sm100MaskEnum(enum.Enum):
     - RESIDUAL_MASK: Residual mask for handling variable sequence lengths
     - WINDOW_MASK: Window mask for attention which also includes causal and no mask
     - WINDOW_MASK_INFERENCE: Same as the window mask, but has the limitation that the end of q is aligned with the end of k
-    - WINDOW_MASK_BWD: Window mask for backward pass
-    - WINDOW_MASK_BWD_INFERENCE: Same as the window mask for backward pass, but has the limitation that the end of q is aligned with the end of k
+    - WINDOW_MASK_BACKWARD: Window mask for backward pass
+    - WINDOW_MASK_BACKWARD_INFERENCE: Same as the window mask for backward pass, but has the limitation that the end of q is aligned with the end of k
     """
 
     NO_MASK = enum.auto()
@@ -1016,10 +1006,10 @@ class Sm100MaskEnum(enum.Enum):
     CAUSAL_MASK = enum.auto()
     WINDOW_MASK = enum.auto()
     WINDOW_MASK_INFERENCE = enum.auto()
-    # Deprecated the following types
-    WINDOW_MASK_BWD = enum.auto()
-    WINDOW_MASK_BWD_INFERENCE = enum.auto()
-    RESIDUAL_MASK_BWD = enum.auto()
+    # Backward-pass mask types
+    WINDOW_MASK_BACKWARD = enum.auto()
+    WINDOW_MASK_BACKWARD_INFERENCE = enum.auto()
+    RESIDUAL_MASK_BACKWARD = enum.auto()
 
 
 class Sm100FusedMask:
@@ -1072,11 +1062,11 @@ class Sm100FusedMask:
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
-        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE):
             offset = seqlen_q - seqlen_k
         if cutlass.const_expr(mask_type == Sm100MaskEnum.RESIDUAL_MASK):
             result = cute.ceil_div(seqlen_k, tile_shape[1])
-        if cutlass.const_expr(mask_type is Sm100MaskEnum.RESIDUAL_MASK_BWD):
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.RESIDUAL_MASK_BACKWARD):
             result = cute.ceil_div(seqlen_q, tile_shape[0])
         if cutlass.const_expr(
             mask_type == Sm100MaskEnum.WINDOW_MASK
@@ -1091,8 +1081,8 @@ class Sm100FusedMask:
                 max_blocks_k = cute.ceil_div(seqlen_k, tile_shape[1])
                 result = dsl_min(max_blocks_k, tmp_blocks_k)
         if cutlass.const_expr(
-            mask_type == Sm100MaskEnum.WINDOW_MASK_BWD
-            or mask_type == Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            mask_type == Sm100MaskEnum.WINDOW_MASK_BACKWARD
+            or mask_type == Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE
         ):
             if cutlass.const_expr(window_size_left is None):
                 result = cute.ceil_div(seqlen_q, tile_shape[0])
@@ -1233,7 +1223,7 @@ class Sm100FusedMask:
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
-        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE):
             offset = seqlen_q - seqlen_k
         if cutlass.const_expr(
             mask_type is Sm100MaskEnum.WINDOW_MASK
@@ -1245,8 +1235,8 @@ class Sm100FusedMask:
                 tmp_blocks_k = idx_k // tile_shape[1]
                 result = max(tmp_blocks_k, result)
         if cutlass.const_expr(
-            mask_type is Sm100MaskEnum.WINDOW_MASK_BWD
-            or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD
+            or mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is not None):
                 min_idx_k = blk_coord[1] * tile_shape[1]
@@ -1289,7 +1279,7 @@ class Sm100FusedMask:
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
-        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE):
             offset = seqlen_q - seqlen_k
         leading_mask_begin = Sm100FusedMask.get_trip_start(
             mask_type,
@@ -1324,8 +1314,8 @@ class Sm100FusedMask:
             else:
                 leading_mask_end = leading_mask_begin - 1
         elif cutlass.const_expr(
-            mask_type is Sm100MaskEnum.WINDOW_MASK_BWD
-            or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD
+            or mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is not None):
                 min_idx_k = (blk_coord[1] + 1) * tile_shape[1] + offset - window_size_right
@@ -1368,7 +1358,7 @@ class Sm100FusedMask:
         offset = 0
         if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE):
             offset = seqlen_k - seqlen_q
-        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+        if cutlass.const_expr(mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE):
             offset = seqlen_q - seqlen_k
         trip_start = Sm100FusedMask.get_trip_start(
             mask_type,
@@ -1459,7 +1449,7 @@ class Sm100FusedMask:
         result = 0
         if cutlass.const_expr(
             mask_type is not Sm100MaskEnum.RESIDUAL_MASK
-            and mask_type is not Sm100MaskEnum.RESIDUAL_MASK_BWD
+            and mask_type is not Sm100MaskEnum.RESIDUAL_MASK_BACKWARD
         ):
             if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 leading_mask_begin, leading_mask_end = Sm100FusedMask.get_leading_mask_id(
@@ -1515,7 +1505,7 @@ class Sm100FusedMask:
 
         if cutlass.const_expr(
             mask_type is not Sm100MaskEnum.RESIDUAL_MASK
-            and mask_type is not Sm100MaskEnum.RESIDUAL_MASK_BWD
+            and mask_type is not Sm100MaskEnum.RESIDUAL_MASK_BACKWARD
         ):
             if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 trailing_mask_begin, trailing_mask_end = Sm100FusedMask.get_trailing_mask_id(
@@ -1661,7 +1651,7 @@ class Sm100FusedMask:
             offset = seqlen_k - seqlen_q
         elif cutlass.const_expr(
             mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE
-            or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            or mask_type is Sm100MaskEnum.WINDOW_MASK_BACKWARD_INFERENCE
         ):
             offset = seqlen_k - seqlen_q
         for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
@@ -1687,7 +1677,7 @@ class Sm100FusedMask:
 
             if cutlass.const_expr(
                 mask_type == Sm100MaskEnum.RESIDUAL_MASK
-                or mask_type == Sm100MaskEnum.RESIDUAL_MASK_BWD
+                or mask_type == Sm100MaskEnum.RESIDUAL_MASK_BACKWARD
             ):
                 if index_k >= seqlen_k or index_q >= seqlen_q:
                     acc_qk[i] = -Float32.inf

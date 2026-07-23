@@ -1,6 +1,7 @@
 """Thin model-facing operator functions."""
 from __future__ import annotations
 
+from ..forward import AttentionSelection
 from .requests import (
     AddRmsNormReq,
     AttentionRegime,
@@ -110,7 +111,6 @@ def _attention_req(
     kv_cache=None,
     metadata=None,
     ctx=None,
-    backend=None,
     block_table=None,
     cache_seqlens=None,
     current_k=None,
@@ -137,7 +137,6 @@ def _attention_req(
         metadata=metadata,
         ctx=ctx,
         stats=getattr(ctx, "stats", None),
-        backend=backend,
         block_table=block_table,
         cache_seqlens=cache_seqlens,
         current_k=current_k,
@@ -166,7 +165,7 @@ def attention(
     kv_cache=None,
     metadata=None,
     ctx=None,
-    backend=None,
+    selection: AttentionSelection,
     block_table=None,
     cache_seqlens=None,
     current_k=None,
@@ -180,9 +179,8 @@ def attention(
     seqused_k=None,
     use_prefix_bounds: bool = False,
     fully_visible: bool = False,
-    override: str | None = None,
 ):
-    from .providers import attention_dispatcher
+    from .providers import run_attention
 
     req = _attention_req(
         q,
@@ -195,7 +193,6 @@ def attention(
         kv_cache=kv_cache,
         metadata=metadata,
         ctx=ctx,
-        backend=backend,
         block_table=block_table,
         cache_seqlens=cache_seqlens,
         current_k=current_k,
@@ -210,7 +207,7 @@ def attention(
         use_prefix_bounds=use_prefix_bounds,
         fully_visible=fully_visible,
     )
-    return attention_dispatcher().run(req, override=override)
+    return run_attention(selection, req)
 
 
 def can_run_attention(
@@ -225,7 +222,7 @@ def can_run_attention(
     kv_cache=None,
     metadata=None,
     ctx=None,
-    backend=None,
+    selection: AttentionSelection,
     block_table=None,
     cache_seqlens=None,
     current_k=None,
@@ -239,9 +236,8 @@ def can_run_attention(
     seqused_k=None,
     use_prefix_bounds: bool = False,
     fully_visible: bool = False,
-    override: str | None = None,
 ) -> bool:
-    from .providers import attention_dispatcher
+    from .providers import can_run_attention as can_run
 
     req = _attention_req(
         q,
@@ -254,7 +250,6 @@ def can_run_attention(
         kv_cache=kv_cache,
         metadata=metadata,
         ctx=ctx,
-        backend=backend,
         block_table=block_table,
         cache_seqlens=cache_seqlens,
         current_k=current_k,
@@ -269,7 +264,7 @@ def can_run_attention(
         use_prefix_bounds=use_prefix_bounds,
         fully_visible=fully_visible,
     )
-    return any(provider.can_run(req) for provider in attention_dispatcher().ordered(override))
+    return can_run(selection, req)
 
 
 def tp_all_reduce(tensor, op: str = "sum", *, axis, override: str | None = None):
@@ -282,9 +277,3 @@ def tp_all_reduce(tensor, op: str = "sum", *, axis, override: str | None = None)
         mesh=axis,
     )
     return dispatcher.combine(handoff, override=override, mesh=axis)
-
-
-def attention_dispatcher():
-    from .providers import attention_dispatcher as get_dispatcher
-
-    return get_dispatcher()

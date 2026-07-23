@@ -70,25 +70,33 @@ def compute_prefix_bounds_varlen(
     seqlens_q = seqlens_q.to(device=visible_end.device, dtype=torch.int32)
     max_tiles = int(num_q_tiles) if num_q_tiles is not None else 0
     if max_tiles <= 0:
-        max_len = int(seqlens_q.max().item()) if batch else 0
-        max_tiles = (max_len + q_tile_size - 1) // q_tile_size
-    out = torch.zeros(
-        (batch, max_tiles, 2),
-        dtype=torch.int32,
-        device=visible_end.device,
-    )
-    for row in range(batch):
-        length = int(seqlens_q[row].item())
-        if length < 0 or length > max_q:
-            raise ValueError(f"invalid query length {length} for visible_end width {max_q}")
-        row_tiles = min(max_tiles, (length + q_tile_size - 1) // q_tile_size)
-        for tile in range(row_tiles):
-            start = tile * q_tile_size
-            end = min(start + q_tile_size, length)
-            values = visible_end[row, start:end]
-            out[row, tile, 0] = values.min()
-            out[row, tile, 1] = values.max()
-    return out.contiguous()
+        max_tiles = (max_q + q_tile_size - 1) // q_tile_size
+    if seqlens_q.device.type == "cpu":
+        lengths = tuple(int(value) for value in seqlens_q.tolist())
+        if any(length < 0 or length > max_q for length in lengths):
+            raise ValueError(f"query lengths must be within visible_end width {max_q}")
+    if batch == 0 or max_tiles == 0:
+        return torch.zeros(
+            (batch, max_tiles, 2),
+            dtype=torch.int32,
+            device=visible_end.device,
+        )
+
+    tiled_width = max_tiles * q_tile_size
+    values = visible_end[:, :tiled_width]
+    if tiled_width > max_q:
+        values = torch.nn.functional.pad(values, (0, tiled_width - max_q))
+    values = values.reshape(batch, max_tiles, q_tile_size)
+    positions = torch.arange(tiled_width, device=visible_end.device, dtype=torch.int32)
+    valid = positions.reshape(1, max_tiles, q_tile_size) < seqlens_q.reshape(batch, 1, 1)
+    has_values = valid.any(dim=-1)
+    minimum = torch.where(valid, values, torch.iinfo(torch.int32).max).amin(dim=-1)
+    maximum = torch.where(valid, values, torch.iinfo(torch.int32).min).amax(dim=-1)
+    zeros = torch.zeros_like(minimum)
+    return torch.stack(
+        (torch.where(has_values, minimum, zeros), torch.where(has_values, maximum, zeros)),
+        dim=-1,
+    ).contiguous()
 
 
 __all__ = ["compute_prefix_bounds", "compute_prefix_bounds_varlen"]

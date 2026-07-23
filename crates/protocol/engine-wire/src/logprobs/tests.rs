@@ -5,7 +5,6 @@ use rmpv::Value;
 
 use super::{Logprobs, PositionLogprobs, TokenLogprob, decode_engine_outputs};
 use crate::EngineCoreFinishReason;
-use crate::error::Error;
 
 fn encode_value(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
@@ -61,7 +60,6 @@ fn inline_logprobs_value() -> Value {
         ndarray_value("<i8", &[2, 3], ids),
         ndarray_value("<f4", &[2, 3], probs),
         ndarray_value("<i8", &[2], ranks),
-        Value::Nil,
     ])
 }
 
@@ -84,7 +82,6 @@ fn inline_prompt_logprobs_value() -> Value {
         ndarray_value("int64", &[2, 3], ids),
         ndarray_value("float32", &[2, 3], probs),
         ndarray_value("int64", &[2], ranks),
-        Value::Nil,
     ])
 }
 
@@ -207,7 +204,6 @@ fn decodes_multipart_new_logprobs() {
                 ndarray_value("<i8", &[2, 3], Value::from(1)),
                 ndarray_value("<f4", &[2, 3], Value::from(2)),
                 ndarray_value("<i8", &[2], Value::from(3)),
-                Value::Nil,
             ])),
             None,
         ))),
@@ -248,51 +244,6 @@ fn decodes_inline_prompt_logprobs() {
     assert_eq!(logprobs, expected_prompt_logprobs());
 }
 
-/// A wire logprobs payload whose `cu_num_generated_tokens` slot is non-`None`
-/// (the batch-level field that per-request engine outputs must omit) is
-/// rejected at decode with `Error::ExtValueDecode`.
-#[test]
-fn rejects_non_none_cu_num_generated_tokens() {
-    let ids = Value::Ext(
-        3,
-        vec![
-            1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0,
-            0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
-        ],
-    );
-    let probs = Value::Ext(
-        3,
-        vec![
-            0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64, 0, 0, 160, 64, 0, 0, 192, 64,
-        ],
-    );
-    let ranks = Value::Ext(3, vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
-    // The 4th tuple slot is `cu_num_generated_tokens`; set it to a non-empty
-    // integer array instead of the required `Value::Nil`.
-    let wire_logprobs = Value::Array(vec![
-        ndarray_value("<i8", &[2, 3], ids),
-        ndarray_value("<f4", &[2, 3], probs),
-        ndarray_value("<i8", &[2], ranks),
-        Value::Array(vec![Value::from(0), Value::from(3)]),
-    ]);
-
-    let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
-        Some(wire_logprobs),
-        None,
-    )))];
-
-    let error = decode_engine_outputs(&frames).unwrap_err();
-    match error {
-        Error::ExtValueDecode { message } => {
-            assert!(
-                message.contains("cu_num_generated_tokens"),
-                "message should name the offending field, got {message:?}"
-            );
-        }
-        other => panic!("expected Error::ExtValueDecode, got {other:?}"),
-    }
-}
-
 #[test]
 fn decodes_big_endian_payloads() {
     let frames = vec![Bytes::from(encode_value(&output_wire_with_custom_fields(
@@ -304,7 +255,6 @@ fn decodes_big_endian_payloads() {
                 Value::Ext(3, vec![63, 128, 0, 0, 64, 0, 0, 0]),
             ),
             ndarray_value(">i4", &[1], Value::Ext(3, vec![0, 0, 0, 3])),
-            Value::Nil,
         ])),
         None,
     )))];

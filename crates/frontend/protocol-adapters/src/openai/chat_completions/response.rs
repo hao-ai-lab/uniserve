@@ -654,23 +654,14 @@ pub fn validate_native_chat_request(
             Some("seed"),
         ));
     }
-    if let Some(config) = &request.image_config {
-        if let Some(image_type) = config.image_type
-            && image_type != ChatImageType::Png
-        {
-            return Err(ApiError::invalid_request(
-                "image_type must be png for image chat completions".to_string(),
-                Some("image_config"),
-            ));
-        }
-        // Both fields alias the profile's resolution-bucket table; the
-        // builder resolves whichever is present and rejects unknown names.
-        if config.aspect_ratio.is_some() && config.image_size.is_some() {
-            return Err(ApiError::invalid_request(
-                "aspect_ratio and image_size are mutually exclusive".to_string(),
-                Some("image_config"),
-            ));
-        }
+    if let Some(config) = &request.image_config
+        && let Some(image_type) = config.image_type
+        && image_type != ChatImageType::Png
+    {
+        return Err(ApiError::invalid_request(
+            "image_type must be png for image chat completions".to_string(),
+            Some("image_config"),
+        ));
     }
     Ok(())
 }
@@ -701,12 +692,7 @@ fn native_image_policy(
 ) -> ImageGenerationPolicy {
     let mut image = ImageGenerationPolicy::default();
     if let Some(config) = config {
-        // `aspect_ratio` and `image_size` are aliases into the profile's
-        // resolution-bucket table (validated as mutually exclusive).
-        image.resolution = config
-            .aspect_ratio
-            .clone()
-            .or_else(|| config.image_size.clone());
+        image.resolution = config.resolution.clone();
         image.width = positive_dimension(config.width);
         image.height = positive_dimension(config.height);
         image.steps = config.steps;

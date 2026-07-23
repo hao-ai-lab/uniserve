@@ -355,9 +355,6 @@ struct TemplateMessage {
     // Developer-role messages may provide message-local tools in the same shape
     // as top-level request tools.
     tools: Option<Vec<TemplateTool>>,
-    // Reasoning-capable HF templates are inconsistent on the exact field name,
-    // so expose both variants for compatibility.
-    reasoning: Option<String>,
     reasoning_content: Option<String>,
     // Function-call-capable templates commonly expect assistant tool calls
     // under this OpenAI-compatible field name.
@@ -431,7 +428,6 @@ fn to_template_message(
             role: "system",
             content: to_template_content(content, content_format, multimodal)?,
             tools: None,
-            reasoning: None,
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -440,7 +436,6 @@ fn to_template_message(
             role: "developer",
             content: to_template_content(content, content_format, multimodal)?,
             tools: tools.as_deref().map(to_template_tools),
-            reasoning: None,
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -449,7 +444,6 @@ fn to_template_message(
             role: "user",
             content: to_template_content(content, content_format, multimodal)?,
             tools: None,
-            reasoning: None,
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -464,8 +458,7 @@ fn to_template_message(
                 role: "assistant",
                 content,
                 tools: None,
-                reasoning: reasoning.clone(),
-                reasoning_content: reasoning,
+                reasoning_content: reasoning.clone(),
                 tool_calls,
                 tool_call_id: None,
             }
@@ -477,7 +470,6 @@ fn to_template_message(
             role: "tool",
             content: to_template_content(content, content_format, multimodal)?,
             tools: None,
-            reasoning: None,
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.clone()),

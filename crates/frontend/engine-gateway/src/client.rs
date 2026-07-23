@@ -5,7 +5,7 @@ use crate::error::{Error, Result};
 use crate::protocol::EngineCoreRequest;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
-use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, OpKind};
+use uniserve_core::{GenerationRuntimeCapabilities, ModelDtype, OperationType};
 
 pub(crate) mod state;
 pub(crate) mod stream;
@@ -334,14 +334,14 @@ impl EngineCoreClient {
             Self::InProcess(c) => c.generation_capabilities(),
             Self::Zmq(c) => c.generation_capabilities(),
             Self::Mock(_) => GenerationRuntimeCapabilities {
-                supported_ops: vec![
-                    OpKind::PrefillUnd,
-                    OpKind::DecodeUnd,
-                    OpKind::VaeEncode,
-                    OpKind::VitEncode,
-                    OpKind::DenoiseGen,
-                    OpKind::CommitGen,
-                    OpKind::CommitWriteback,
+                supported_operation_types: vec![
+                    OperationType::SequenceExtend,
+                    OperationType::SequenceDecode,
+                    OperationType::EncodeLatent,
+                    OperationType::EncodeVision,
+                    OperationType::Flow,
+                    OperationType::MaterializeImage,
+                    OperationType::TransferKv,
                 ],
                 max_latent_units: 1 << 20,
                 latent_downsample: 16,

@@ -86,12 +86,9 @@ class CfgRecipe(Enum):
     IMAGE_OVER_TEXT = "image_over_text"
 
     @classmethod
-    def coerce(cls, value: "CfgRecipe | bool | str") -> "CfgRecipe":
-        # Accept bool or ``image_scale_applies_to_text`` strings: True -> IMAGE_OVER_TEXT.
+    def coerce(cls, value: "CfgRecipe | str") -> "CfgRecipe":
         if isinstance(value, cls):
             return value
-        if isinstance(value, bool):
-            return cls.IMAGE_OVER_TEXT if value else cls.ADDITIVE_DELTAS
         return cls(str(value))
 
 
@@ -112,8 +109,7 @@ class CfgParams:
     def from_mapping(raw: Mapping[str, Any] | None) -> "CfgParams":
         if raw is None:
             return CfgParams()
-        # ``renorm_type`` is canonical; bare ``renorm`` is accepted as a synonym.
-        renorm = raw.get("renorm_type", raw.get("renorm", RenormKind.NONE))
+        renorm = raw.get("renorm_type", RenormKind.NONE)
         if not isinstance(renorm, RenormKind):
             renorm = RenormKind(str(renorm))
         scales = raw.get("scales")
@@ -198,7 +194,7 @@ class CfgPlan:
     branches: tuple[Branch, ...]
     ops: tuple[_CfgCombineOp, ...] = ()
 
-    def combine(self, outputs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    def combine(self, outputs: Mapping[Branch, torch.Tensor]) -> torch.Tensor:
         if not self.ops:
             return outputs[Branch.COND]
         result: torch.Tensor | None = None
@@ -395,11 +391,11 @@ def combine_text_image_cfg(
     cfg_img_scale: float,
     renorm: str | RenormKind = RenormKind.NONE,
     renorm_min: float = 0.0,
-    image_scale_applies_to_text: "CfgRecipe | bool",
+    image_scale_applies_to_text: CfgRecipe,
 ) -> torch.Tensor:
     """Combine three branch predictions using a :class:`CfgPlan`.
 
-    ``image_scale_applies_to_text`` selects the recipe (bool values are coerced).
+    ``image_scale_applies_to_text`` selects the declared recipe.
     """
 
     recipe = CfgRecipe.coerce(image_scale_applies_to_text)
@@ -410,7 +406,7 @@ def combine_text_image_cfg(
         renorm=renorm,
         renorm_min=renorm_min,
     )
-    outputs: dict[str, torch.Tensor] = {Branch.COND: out_cond}
+    outputs: dict[Branch, torch.Tensor] = {Branch.COND: out_cond}
     if out_text_uncond is not None:
         outputs[Branch.TEXT_UNCOND] = out_text_uncond
     if out_img_uncond is not None:

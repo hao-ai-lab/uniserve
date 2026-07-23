@@ -34,7 +34,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use uniserve_core::{
     GenerationBehaviorDescriptor, GenerationConstraint, GenerationRequest,
-    GenerationRuntimeCapabilities, OpKind,
+    GenerationRuntimeCapabilities, OperationType,
 };
 use uniserve_engine_gateway::transport::{GenEvent, GenerationEventStream, GenerationFinishReason};
 use uniserve_engine_gateway::{EngineGateway, EngineGatewaySnapshot, GenerationSubmission};
@@ -2148,20 +2148,25 @@ impl ServingRuntime {
             };
             behavior.required_operations(&dialect.generation_policy, context_steps)
         } else {
-            vec![OpKind::PrefillUnd, OpKind::DecodeUnd]
+            vec![OperationType::SequenceExtend, OperationType::SequenceDecode]
         };
         for operation in required {
             if capabilities.generation_runtime.supports(operation) {
                 continue;
             }
             let capability = match operation {
-                OpKind::PrefillUnd | OpKind::DecodeUnd => "runtime_und_execution",
-                OpKind::VaeEncode => "runtime_vae_encode",
-                OpKind::VitEncode => "runtime_vit_encode",
-                OpKind::DenoiseGen => "runtime_gen_denoise",
-                OpKind::CommitGen => "runtime_gen_commit",
-                OpKind::CommitWriteback => "runtime_commit_writeback",
-                OpKind::TargetVerifyUnd | OpKind::Sample | OpKind::EncodeFrame => {
+                OperationType::SequenceExtend | OperationType::SequenceDecode => {
+                    "runtime_und_execution"
+                }
+                OperationType::EncodeLatent => "runtime_vae_encode",
+                OperationType::EncodeVision => "runtime_vit_encode",
+                OperationType::Flow => "runtime_gen_denoise",
+                OperationType::MaterializeImage => "runtime_gen_commit",
+                OperationType::TransferKv => "runtime_commit_writeback",
+                OperationType::SequenceVerify
+                | OperationType::SequenceSample
+                | OperationType::MaterializeFrame
+                | OperationType::TransferProduct => {
                     unreachable!("request compiler does not require staged worker-only operations")
                 }
             };

@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import torch
 
+from ...forward import ForwardContext
 from .base import AttentionCapabilities
-from .registry import register_attention_backend
 
 __all__ = [
     'SglKernelAttentionBackend',
@@ -30,6 +30,10 @@ class SglKernelAttentionBackend:
 
     def capabilities(self) -> AttentionCapabilities:
         return AttentionCapabilities(
+            available=any(
+                value is not None
+                for value in (_flash_attn_varlen_func, _flash_attn_with_kvcache)
+            ),
             segment_batched_cfg=False,
             mixed_mode=False,
             paged_kv=_flash_attn_with_kvcache is not None,
@@ -47,6 +51,7 @@ class SglKernelAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         if _flash_attn_varlen_func is None:
             raise RuntimeError("sgl_kernel flash attention backend is not available")
@@ -65,6 +70,7 @@ class SglKernelAttentionBackend:
                 max_seqlen_k=total,
                 causal=causal,
                 scale=scale,
+                context=context,
             )
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
             raise ValueError("sgl_kernel flash attention expects q/k/v in [B,H,L,D] or [L,H,D] layout")
@@ -88,6 +94,7 @@ class SglKernelAttentionBackend:
             max_seqlen_k=k_len,
             causal=causal,
             scale=scale,
+            context=context,
         )
         return out.view(batch, q_len, int(q.shape[1]), int(q.shape[3])).transpose(1, 2).contiguous()
 
@@ -103,7 +110,9 @@ class SglKernelAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         if _flash_attn_with_kvcache is None:
             raise RuntimeError("sgl_kernel paged KV attention backend is not available")
         if k_cache.shape != v_cache.shape or k_cache.ndim != 4:
@@ -165,7 +174,9 @@ class SglKernelAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         if _flash_attn_varlen_func is None:
             raise RuntimeError("sgl_kernel flash attention backend is not available")
         if block_table is not None:
@@ -211,7 +222,3 @@ def _kv_to_blh(x: torch.Tensor | None, *, rows: int) -> torch.Tensor | None:
     if rows == int(x.shape[0]):
         return x.unsqueeze(1).contiguous()
     raise ValueError("current K/V rows do not match paged attention rows")
-
-
-if _flash_attn_varlen_func is not None or _flash_attn_with_kvcache is not None:  # pragma: no cover
-    register_attention_backend("sgl_kernel", SglKernelAttentionBackend())

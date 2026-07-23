@@ -6,12 +6,11 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ...contracts.forward_context import get_forward_context
-from ...foundation.runtime_config import get_execution_config
+from ...forward import ForwardContext
+from ...foundation.runtime_config import FlashInferTuningConfig
 from .base import AttentionCapabilities
 from .flashinfer_kernels import _decode_effective_seqlens, _write_decode_token
 from .layout import QKVLayout, normalize_kv, normalize_to
-from .registry import register_attention_backend
 
 _flashinfer: Any | None
 try:  # pragma: no cover - depends on optional CUDA package availability.
@@ -52,8 +51,9 @@ class TRTLLMMHAAttentionBackend:
 
     name = "trtllm_mha"
 
-    def __init__(self) -> None:
+    def __init__(self, *, tuning: FlashInferTuningConfig) -> None:
         self._workspaces: dict[torch.device, torch.Tensor] = {}
+        self._workspace_size = int(tuning.workspace_size)
 
     def capabilities(self) -> AttentionCapabilities:
         available = _trtllm_decode is not None and _trtllm_context is not None
@@ -78,7 +78,9 @@ class TRTLLMMHAAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         raise RuntimeError("trtllm_mha requires paged KV metadata")
 
     def forward_paged(
@@ -93,6 +95,7 @@ class TRTLLMMHAAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         del causal
         if _trtllm_decode is None:
@@ -106,15 +109,19 @@ class TRTLLMMHAAttentionBackend:
             inputs.q,
             k,
             v,
+            None if context is None else context.attention,
         )
-        plan = get_forward_context().attention_plan
+        plan = None if context is None else context.attention
         effective_seqlens = _decode_effective_seqlens(
             inputs.cache_seqlens,
             current_tokens,
             plan,
         )
         page_size = int(k_cache.shape[1])
-        max_seq_len = _metadata_context_len(max(1, int(inputs.block_table.shape[1]) * page_size))
+        max_seq_len = _metadata_context_len(
+            plan,
+            max(1, int(inputs.block_table.shape[1]) * page_size),
+        )
         out = _trtllm_decode(
             query=inputs.q.contiguous(),
             kv_cache=_hnd_kv_cache(k_cache, v_cache),
@@ -143,6 +150,7 @@ class TRTLLMMHAAttentionBackend:
         causal: bool,
         scale: float,
         block_table: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         if _trtllm_context is None:
             raise RuntimeError("FlashInfer TRT-LLM MHA context is not available")
@@ -156,7 +164,10 @@ class TRTLLMMHAAttentionBackend:
             block_tables=inputs.block_table,
             seq_lens=kv_seqlens,
             max_q_len=max(1, int(max_seqlen_q)),
-            max_kv_len=_metadata_context_len(max(1, int(max_seqlen_k))),
+            max_kv_len=_metadata_context_len(
+                None if context is None else context.attention,
+                max(1, int(max_seqlen_k)),
+            ),
             bmm1_scale=float(scale),
             bmm2_scale=1.0,
             batch_size=inputs.batch_size,
@@ -222,6 +233,7 @@ class TRTLLMMHAAttentionBackend:
         q_bhd: torch.Tensor,
         k: torch.Tensor | None,
         v: torch.Tensor | None,
+        plan: object | None,
     ) -> int:
         if k is None and v is None:
             return 0
@@ -235,7 +247,6 @@ class TRTLLMMHAAttentionBackend:
             raise ValueError("current K/V batch size must match q batch size")
         if k_bhd.shape[1:] != k_cache.shape[2:]:
             raise ValueError("current K/V head geometry does not match paged cache")
-        plan = get_forward_context().attention_plan
         _write_decode_token(k_cache, v_cache, block_table, cache_seqlens, k_bhd, v_bhd, plan)
         return 1
 
@@ -244,7 +255,7 @@ class TRTLLMMHAAttentionBackend:
         workspace = self._workspaces.get(resolved)
         if workspace is None:
             workspace = torch.zeros(
-                get_execution_config().flashinfer.workspace_size,
+                self._workspace_size,
                 dtype=torch.uint8,
                 device=resolved,
             )
@@ -275,8 +286,7 @@ def _hnd_kv_cache(
     return k_hnd, v_hnd
 
 
-def _metadata_context_len(default: int) -> int:
-    plan = get_forward_context().attention_plan
+def _metadata_context_len(plan: object | None, default: int) -> int:
     value = getattr(plan, "max_context_len", 0)
     try:
         parsed = int(value)
@@ -305,7 +315,3 @@ def _require_sm100(device: torch.device) -> None:
     major, minor = torch.cuda.get_device_capability(device)
     if (int(major), int(minor)) < (10, 0):
         raise RuntimeError("trtllm_mha requires compute capability 10.0 or newer")
-
-
-if _flashinfer is not None:  # pragma: no cover - availability-specific.
-    register_attention_backend("trtllm_mha", TRTLLMMHAAttentionBackend())

@@ -295,8 +295,8 @@ impl ZmqEngineCoreClient {
         for engine in &self.engines[1..] {
             let caps = &engine.ready_response.generation_capabilities;
             combined
-                .supported_ops
-                .retain(|operation| caps.supported_ops.contains(operation));
+                .supported_operation_types
+                .retain(|operation| caps.supported_operation_types.contains(operation));
             combined.max_latent_units = combined.max_latent_units.min(caps.max_latent_units);
             combined.latent_downsample = combined.latent_downsample.min(caps.latent_downsample);
             combined.max_vae_grid_tokens =
@@ -317,8 +317,8 @@ impl ZmqEngineCoreClient {
             combined.generated_image_commit.separate_writeback &=
                 caps.generated_image_commit.separate_writeback;
         }
-        combined.supported_ops.sort();
-        combined.supported_ops.dedup();
+        combined.supported_operation_types.sort();
+        combined.supported_operation_types.dedup();
         combined
     }
 

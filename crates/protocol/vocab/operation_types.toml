@@ -1,0 +1,70 @@
+# Canonical closed execution-operation vocabulary.
+
+flatbuffers_order = [
+  "SequenceExtend",
+  "SequenceDecode",
+  "SequenceVerify",
+  "SequenceSample",
+  "Flow",
+  "EncodeVision",
+  "EncodeLatent",
+  "MaterializeImage",
+  "MaterializeFrame",
+  "TransferProduct",
+  "TransferKv",
+]
+
+[[operation]]
+wire = "sequence_extend"
+rust = "SequenceExtend"
+kind = "sequence"
+
+[[operation]]
+wire = "sequence_decode"
+rust = "SequenceDecode"
+kind = "sequence"
+
+[[operation]]
+wire = "sequence_verify"
+rust = "SequenceVerify"
+kind = "sequence"
+
+[[operation]]
+wire = "sequence_sample"
+rust = "SequenceSample"
+kind = "sequence"
+
+[[operation]]
+wire = "flow"
+rust = "Flow"
+kind = "flow"
+
+[[operation]]
+wire = "encode_vision"
+rust = "EncodeVision"
+kind = "encode"
+
+[[operation]]
+wire = "encode_latent"
+rust = "EncodeLatent"
+kind = "encode"
+
+[[operation]]
+wire = "materialize_image"
+rust = "MaterializeImage"
+kind = "materialize"
+
+[[operation]]
+wire = "materialize_frame"
+rust = "MaterializeFrame"
+kind = "materialize"
+
+[[operation]]
+wire = "transfer_product"
+rust = "TransferProduct"
+kind = "transfer"
+
+[[operation]]
+wire = "transfer_kv"
+rust = "TransferKv"
+kind = "transfer"

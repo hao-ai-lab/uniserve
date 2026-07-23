@@ -10,7 +10,6 @@ pub struct JsonSchemaFormat {
     #[serde(default)]
     pub description: Option<String>,
     /// The actual JSON schema object.
-    #[serde(alias = "json_schema")]
     pub schema: Value,
     #[serde(default)]
     pub strict: Option<bool>,
@@ -94,22 +93,6 @@ mod tests {
         }
 
         assert_eq!(serde_json::to_value(&format).unwrap(), json);
-    }
-
-    /// `JsonSchemaFormat::schema` accepts the `json_schema` alias as an
-    /// alternative key for the inner schema object.
-    #[test]
-    fn json_schema_format_accepts_schema_alias() {
-        let json = serde_json::json!({
-            "name": "thing",
-            "json_schema": {"type": "string"},
-        });
-
-        let format: JsonSchemaFormat = serde_json::from_value(json).unwrap();
-        assert_eq!(format.name, "thing");
-        assert_eq!(format.schema, serde_json::json!({"type": "string"}));
-        assert_eq!(format.description, None);
-        assert_eq!(format.strict, None);
     }
 
     /// The `structural_tag` variant captures the entire payload (including the

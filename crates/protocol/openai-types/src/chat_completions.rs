@@ -45,10 +45,6 @@ pub struct ChatCompletionRequest {
     #[validate(range(min = -1))]
     pub top_logprobs: Option<i32>,
 
-    /// Compatibility alias for `max_completion_tokens`.
-    #[validate(range(min = 1))]
-    pub max_tokens: Option<u32>,
-
     /// An upper bound for the number of tokens that can be generated for a
     /// completion
     #[validate(range(min = 1))]
@@ -252,7 +248,6 @@ impl Default for ChatCompletionRequest {
             logit_bias: None,
             logprobs: false,
             top_logprobs: None,
-            max_tokens: None,
             max_completion_tokens: None,
             n: None,
             presence_penalty: None,
@@ -324,9 +319,9 @@ fn default_modalities() -> Vec<ChatModality> {
 
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatImageConfig {
-    pub aspect_ratio: Option<String>,
-    pub image_size: Option<String>,
+    pub resolution: Option<String>,
     pub image_type: Option<ChatImageType>,
     pub height: Option<i32>,
     pub width: Option<i32>,
@@ -352,12 +347,6 @@ pub enum ChatImageType {
 impl Normalizable for ChatCompletionRequest {
     /// Normalize the request by applying defaults and field updates.
     fn normalize(&mut self) {
-        // Normalize the compatibility alias onto the canonical field.
-        if self.max_completion_tokens.is_none() && self.max_tokens.is_some() {
-            self.max_completion_tokens = self.max_tokens;
-            self.max_tokens = None;
-        }
-
         // Apply tool_choice defaults
         // If tools is None, leave tool_choice as None (don't set it)
         if self.tool_choice.is_none()
@@ -531,14 +520,6 @@ fn validate_chat_cross_parameters(
     {
         let mut e = validator::ValidationError::new("min_tokens_exceeds_max_completion_tokens");
         e.message = Some("min_tokens cannot be greater than max_completion_tokens".into());
-        return Err(e);
-    }
-
-    if let (Some(min_tokens), Some(max_tokens)) = (req.min_tokens, req.max_tokens)
-        && min_tokens > max_tokens
-    {
-        let mut e = validator::ValidationError::new("min_tokens_exceeds_max_tokens");
-        e.message = Some("min_tokens cannot be greater than max_tokens".into());
         return Err(e);
     }
 

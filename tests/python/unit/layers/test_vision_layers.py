@@ -5,6 +5,18 @@ import pytest
 import torch
 
 import uniserve_worker.nn.vision.encoder as vision_encoder
+from uniserve_worker.backends.attention.torch_sdpa import TorchSDPAAttentionBackend
+from uniserve_worker.forward import (
+    AttentionSelection,
+    EmptyKvView,
+    EmptyLatentView,
+    EmptyMeshView,
+    EmptyOutputView,
+    ForwardContext,
+    NoAttention,
+)
+from uniserve_worker.nn.layer import LayerSpec
+from uniserve_worker.nn.mesh import TensorParallelSpec
 from uniserve_worker.nn.vision import (
     PatchEmbed,
     PositionEmbedding,
@@ -16,6 +28,17 @@ from uniserve_worker.nn.vision import (
 from uniserve_worker.nn.vision.encoder import VisionSelfAttention
 
 pytestmark = pytest.mark.unit
+
+
+def _forward_context() -> ForwardContext:
+    selection = AttentionSelection("torch_sdpa", (TorchSDPAAttentionBackend(),))
+    return ForwardContext(
+        kv=EmptyKvView(),
+        latent=EmptyLatentView(),
+        attention=NoAttention(selection),
+        mesh=EmptyMeshView(),
+        output=EmptyOutputView(),
+    )
 
 
 def test_patch_embed_conv_flatten_shape_and_values():
@@ -51,15 +74,21 @@ def test_position_embedding_supports_bagel_and_sensenova_initialization_modes():
     torch.testing.assert_close(ids, torch.tensor([0, 1, 2, 8, 9, 10]))
 
 
-def test_vision_attention_does_not_require_an_optional_named_provider(monkeypatch):
-    def reject_named_override(*_args, **kwargs):
-        assert kwargs["override"] is None
+def test_vision_attention_uses_portable_fallback_when_selection_cannot_run(monkeypatch):
+    context = _forward_context()
+
+    def reject_selected_backend(*_args, **kwargs):
+        assert kwargs["selection"] is context.attention.backends
         return False
 
-    monkeypatch.setattr(vision_encoder.ops, "can_run_attention", reject_named_override)
-    attention = VisionSelfAttention(hidden_size=8, num_heads=2)
+    monkeypatch.setattr(vision_encoder.ops, "can_run_attention", reject_selected_backend)
+    attention = VisionSelfAttention(
+        hidden_size=8,
+        num_heads=2,
+        spec=LayerSpec(TensorParallelSpec(rank=0, size=1), None),
+    )
     tokens = torch.randn(3, 8)
 
-    output = attention(tokens, torch.tensor([0, 3], dtype=torch.int32))
+    output = attention(tokens, torch.tensor([0, 3], dtype=torch.int32), context)
 
     assert output.shape == tokens.shape

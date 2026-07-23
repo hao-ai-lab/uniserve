@@ -2,9 +2,15 @@ use std::collections::HashSet;
 
 use uniserve_core::{
     BlockId, CfgParams, ContextSegment, GenerationRequest, ImageIngestRecipe, ImageIngestStep,
-    ImageKvEffect, Modality, SegmentPlacement, UndTokenAction,
+    ImageKvEffect, SegmentPlacement, UndTokenAction,
 };
-use uniserve_worker_wire::{ForwardOp, OpKind, ResourceClass, SeqResult, TokenSource};
+use uniserve_worker_wire::{
+    EncodeInput, EncodeKind, EncodeOperation, FlowOperation, Guidance, KvLeaseDelta,
+    MaterializeInput, MaterializeKind, MaterializeOperation, MaterializedProduct, Operation,
+    OperationEnvelope, OperationKind, OperationResult, OperationType, PublishedKv,
+    PublishedProduct, ResourceClass, ResultDelta, SequenceEffect, SequenceInput, SequenceMode,
+    SequenceOperation, TokenInput, TokenPolicy, TokenSource, TransferKind, TransferOperation,
+};
 
 use crate::image_artifact::validate_png_artifact;
 
@@ -167,6 +173,7 @@ impl GenerationCursor {
                 cond_pos: 0,
                 steps_done: 0,
                 image_hw: (0, 0),
+                conditioning: None,
             },
             feedback: FeedbackCursor {
                 locator: None,
@@ -183,7 +190,6 @@ impl GenerationCursor {
                 reserve_worstcase,
                 worstcase_blocks,
                 worker_image_latent_units: 0,
-                scratch_units: 0,
                 host_scratch_tokens: 0,
             },
             replay: ReplayCursor {
@@ -204,11 +210,12 @@ impl GenerationCursor {
     pub(crate) fn apply_transition(
         &mut self,
         transition: &PlannedTransition,
-        result: &SeqResult,
+        result: &OperationResult,
     ) -> Result<(), CursorApplyError> {
-        let op_id = transition
-            .op_id
-            .ok_or(CursorApplyError::MissingOperationId)?;
+        let op_id = transition.op.op_id;
+        if op_id == 0 {
+            return Err(CursorApplyError::MissingOperationId);
+        }
         if !self.applied_op_ids.insert(op_id) {
             return Err(CursorApplyError::DuplicateOperation { op_id });
         }
@@ -238,10 +245,10 @@ impl GenerationCursor {
                 logical_positions,
                 ..
             } => {
-                self.und.physical_kv_len = self
-                    .und
-                    .physical_kv_len
-                    .saturating_add(result.num_tokens.unwrap_or(0));
+                let ResultDelta::Encode(delta) = &result.delta else {
+                    return Err(CursorApplyError::ResultTypeMismatch);
+                };
+                self.und.physical_kv_len = self.und.physical_kv_len.saturating_add(delta.kv_tokens);
                 if is_final_step {
                     self.und.logical_pos = self
                         .und
@@ -263,22 +270,24 @@ impl GenerationCursor {
                 ref stop_token_ids,
                 ..
             } => {
-                let mut actual_count = result
+                let ResultDelta::Sequence(delta) = &result.delta else {
+                    return Err(CursorApplyError::ResultTypeMismatch);
+                };
+                let effect = &delta.effect;
+                let mut actual_count = effect
                     .sampled_token_ids
-                    .as_ref()
-                    .filter(|tokens| !tokens.is_empty())
-                    .map_or(1, Vec::len)
+                    .len()
                     .max(
-                        result
-                            .num_accepted_tokens
+                        effect
+                            .accepted_draft_tokens
                             .map_or(0, |accepted| accepted as usize + 1),
-                    ) as u32;
+                    )
+                    .max(1) as u32;
                 if commits_nonterminal_stop_tail
-                    && result.sampled_token_ids.as_ref().is_some_and(|tokens| {
-                        tokens
-                            .last()
-                            .is_some_and(|token| stop_token_ids.contains(token))
-                    })
+                    && effect
+                        .sampled_token_ids
+                        .last()
+                        .is_some_and(|token| stop_token_ids.contains(token))
                 {
                     actual_count = actual_count.saturating_add(1);
                 }
@@ -296,10 +305,13 @@ impl GenerationCursor {
                 step_count,
                 ..
             } => {
+                let ResultDelta::Flow(delta) = &result.delta else {
+                    return Err(CursorApplyError::ResultTypeMismatch);
+                };
                 self.image_gen.steps_done = self.image_gen.steps_done.max(
-                    result
-                        .num_steps_done
-                        .unwrap_or_else(|| start_step.saturating_add(step_count)),
+                    delta
+                        .steps_completed
+                        .max(start_step.saturating_add(step_count)),
                 );
             }
             TransitionDelta::CommitGen {
@@ -309,8 +321,16 @@ impl GenerationCursor {
                 physical_kv_tokens,
                 ..
             } => {
-                if result.locator.is_none() && physical_kv_tokens.is_some() {
-                    let added = result.num_tokens.unwrap_or(0);
+                let ResultDelta::Materialize(delta) = &result.delta else {
+                    return Err(CursorApplyError::ResultTypeMismatch);
+                };
+                let has_locator = match &delta.product {
+                    MaterializedProduct::Image(image) => !image.locator.is_empty(),
+                    MaterializedProduct::Published(product) => !product.locator.is_empty(),
+                    MaterializedProduct::Frame { .. } => false,
+                };
+                if !has_locator && physical_kv_tokens.is_some() {
+                    let added = delta.kv_tokens.unwrap_or(0);
                     self.und.logical_pos = self
                         .und
                         .logical_pos
@@ -327,7 +347,10 @@ impl GenerationCursor {
                 logical_positions,
                 ..
             } => {
-                let added = result.num_tokens.unwrap_or(0);
+                let ResultDelta::Transfer(delta) = &result.delta else {
+                    return Err(CursorApplyError::ResultTypeMismatch);
+                };
+                let added = delta.kv_tokens.unwrap_or(0);
                 self.und.logical_pos = self
                     .und
                     .logical_pos
@@ -345,10 +368,10 @@ impl GenerationCursor {
                 logical_positions,
                 ..
             } => {
-                self.und.physical_kv_len = self
-                    .und
-                    .physical_kv_len
-                    .saturating_add(result.num_tokens.unwrap_or(0));
+                let ResultDelta::Encode(delta) = &result.delta else {
+                    return Err(CursorApplyError::ResultTypeMismatch);
+                };
+                self.und.physical_kv_len = self.und.physical_kv_len.saturating_add(delta.kv_tokens);
                 if is_final_step {
                     self.und.logical_pos = self
                         .und
@@ -418,6 +441,7 @@ impl GenerationCursor {
 pub(crate) enum CursorApplyError {
     MissingOperationId,
     DuplicateOperation { op_id: u64 },
+    ResultTypeMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +486,7 @@ pub struct GenCursor {
     pub(crate) cond_pos: u32,
     pub(crate) steps_done: u16,
     pub(crate) image_hw: (u32, u32),
+    pub(crate) conditioning: Option<PublishedKv>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -482,7 +507,6 @@ pub struct ResourceCursor {
     pub(crate) reserve_worstcase: bool,
     pub(crate) worstcase_blocks: usize,
     pub(crate) worker_image_latent_units: u64,
-    pub(crate) scratch_units: u64,
     pub(crate) host_scratch_tokens: u64,
 }
 
@@ -660,8 +684,8 @@ pub(crate) enum TransitionIntent {
         cfg: CfgParams,
         image_prompt: Option<String>,
         latent_units: u64,
-        scratch_units: u64,
         host_scratch_tokens: u64,
+        conditioning: Option<PublishedKv>,
     },
     CommitGen {
         image_id: u32,
@@ -712,406 +736,458 @@ impl GenerationPlanner {
     ) -> Result<PlannedTransition, PlanningError> {
         let und_visibility = request.behavior.und_tokens;
         let image_visible = request.behavior.gen_output;
-        let (
-            op,
-            delta,
-            encoder_pins,
-            replayability_after_apply,
-            latent_units,
-            scratch_units,
-            host_scratch_tokens,
-        ) = match intent {
-            TransitionIntent::IngestText {
-                segment_index,
-                prompt_start,
-                token_ids,
-                new_blocks,
-                recent_tokens,
-                allowed_tokens,
-                suppress_tokens,
-            } => {
-                if prompt_start != cursor.prompt_cursor {
-                    return Err(PlanningError::PromptCursorMismatch {
-                        expected: cursor.prompt_cursor,
-                        actual: prompt_start,
-                    });
-                }
-                let token_count = token_ids.len() as u32;
-                let end = prompt_start.saturating_add(token_count);
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind: OpKind::PrefillUnd,
-                        modality: Modality::Und,
-                        new_block_ids: new_blocks,
-                        pos_range: (
-                            cursor.logical_pos,
-                            cursor.logical_pos.saturating_add(token_count),
+        let (op, delta, encoder_pins, replayability_after_apply, latent_units, host_scratch_tokens) =
+            match intent {
+                TransitionIntent::IngestText {
+                    segment_index,
+                    prompt_start,
+                    token_ids,
+                    new_blocks,
+                    recent_tokens,
+                    allowed_tokens,
+                    suppress_tokens,
+                } => {
+                    if prompt_start != cursor.prompt_cursor {
+                        return Err(PlanningError::PromptCursorMismatch {
+                            expected: cursor.prompt_cursor,
+                            actual: prompt_start,
+                        });
+                    }
+                    let token_count = token_ids.len() as u32;
+                    let end = prompt_start.saturating_add(token_count);
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Sequence(SequenceOperation {
+                                mode: SequenceMode::Extend,
+                                lease: kv_lease(new_blocks),
+                                position: (
+                                    cursor.logical_pos,
+                                    cursor.logical_pos.saturating_add(token_count),
+                                ),
+                                policy: token_policy(
+                                    recent_tokens,
+                                    allowed_tokens,
+                                    suppress_tokens,
+                                    request.behavior.gen_output,
+                                    Vec::new(),
+                                ),
+                                input: SequenceInput::Tokens(TokenInput {
+                                    token_ids,
+                                    source: TokenSource::Wire,
+                                    draft_token_ids: Vec::new(),
+                                    burst_tokens: 1,
+                                    stop_token_ids: Vec::new(),
+                                    stop_terminal: false,
+                                    return_all_logits: request.sampling.prompt_logprobs_requested(),
+                                }),
+                            }),
                         ),
-                        token_ids: Some(token_ids),
-                        recent_tokens,
-                        allowed_tokens,
-                        suppress_tokens,
-                        return_all_logits: request.sampling.prompt_logprobs_requested(),
-                        ..Default::default()
-                    },
-                    TransitionDelta::IngestText {
-                        segment_index,
-                        start: prompt_start,
-                        end,
-                        logical_start: cursor.logical_pos,
-                        physical_start: cursor.physical_kv_len,
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::IngestImage {
-                segment_index,
-                step_index,
-                step,
-                is_final_step,
-                position,
-                logical_positions,
-                physical_kv_tokens,
-                worker_hash,
-                encoder_cache_key,
-                cache_hit,
-                image_b64,
-                staged_image,
-                new_blocks,
-            } => {
-                if position != cursor.logical_pos {
-                    return Err(PlanningError::LogicalCursorMismatch {
-                        expected: cursor.logical_pos,
-                        actual: position,
-                    });
-                }
-                let (kind, modality) = match step {
-                    ImageIngestStep::VaeEncode => (OpKind::VaeEncode, Modality::Gen),
-                    ImageIngestStep::VitEncode => (OpKind::VitEncode, Modality::Und),
-                };
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind,
-                        modality,
-                        new_block_ids: new_blocks,
-                        pos_range: (position, position.saturating_add(logical_positions.max(1))),
-                        cond_pos: Some(position),
-                        image_b64: (!cache_hit && !image_b64.is_empty()).then_some(image_b64),
-                        image_in: staged_image,
-                        mm_hash: Some(worker_hash),
-                        ..Default::default()
-                    },
-                    TransitionDelta::IngestImageStep {
-                        segment_index,
-                        step_index,
-                        is_final_step,
-                        position,
-                        physical_start: cursor.physical_kv_len,
-                        logical_positions,
-                        physical_kv_tokens,
-                        encoder_cache_key,
-                        cache_hit,
-                    },
-                    encoder_cache_key.into_iter().collect(),
-                    cursor.replayability,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::DecodeUnd {
-                position,
-                token_id,
-                token_source,
-                new_blocks,
-                spec_token_ids,
-                token_count,
-                stop_token_ids,
-                stop_terminal,
-                recent_tokens,
-                allowed_tokens,
-                suppress_tokens,
-            } => {
-                if position != cursor.logical_pos {
-                    return Err(PlanningError::LogicalCursorMismatch {
-                        expected: cursor.logical_pos,
-                        actual: position,
-                    });
-                }
-                let token_count = token_count.max(1);
-                let transition_stop_token_ids = stop_token_ids.clone().unwrap_or_default();
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind: OpKind::DecodeUnd,
-                        modality: Modality::Und,
-                        new_block_ids: new_blocks,
-                        pos_range: (position, position.saturating_add(1)),
-                        token_ids: Some(vec![token_id]),
-                        token_source,
-                        spec_token_ids,
-                        decode_token_count: (token_count > 1).then_some(token_count),
-                        decode_stop_token_ids: stop_token_ids,
-                        decode_stop_terminal: stop_terminal,
-                        recent_tokens,
-                        allowed_tokens,
-                        suppress_tokens,
-                        ..Default::default()
-                    },
-                    TransitionDelta::DecodeUnd {
-                        logical_position: position,
-                        physical_position: cursor.physical_kv_len,
-                        token_count,
-                        stop_token_ids: transition_stop_token_ids,
-                        commits_nonterminal_stop_tail: token_count > 1 && !stop_terminal,
-                    },
-                    Vec::new(),
-                    cursor.replayability,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::DenoiseGen {
-                image_id,
-                position,
-                start_step,
-                step_count,
-                cfg,
-                image_prompt,
-                latent_units,
-                scratch_units,
-                host_scratch_tokens,
-            } => {
-                if !request.behavior.gen_output {
-                    return Err(PlanningError::GenerationBranchDisabled);
-                }
-                let step_count = step_count.max(1);
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind: OpKind::DenoiseGen,
-                        modality: Modality::Gen,
-                        pos_range: (position, position.saturating_add(1)),
-                        timestep_idx: Some(start_step),
-                        denoise_step_count: Some(step_count),
-                        cond_pos: Some(position),
-                        cfg: Some(cfg),
-                        image_prompt,
-                        ..Default::default()
-                    },
-                    TransitionDelta::DenoiseGen {
-                        image_id,
-                        start_step,
-                        step_count,
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    latent_units,
-                    scratch_units,
-                    host_scratch_tokens,
-                )
-            }
-            TransitionIntent::CommitGen {
-                image_id,
-                position,
-                new_blocks,
-                recent_tokens,
-                allowed_tokens,
-                suppress_tokens,
-            } => {
-                if !request.behavior.gen_output {
-                    return Err(PlanningError::GenerationBranchDisabled);
-                }
-                let feedback = request
-                    .behavior
-                    .generated_image_feedback
-                    .then_some(request.policy.feedback.as_ref())
-                    .flatten()
-                    .filter(|recipe| {
-                        matches!(recipe.writeback, uniserve_core::FeedbackWriteback::DirectKv)
-                    });
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind: OpKind::CommitGen,
-                        modality: Modality::Gen,
-                        new_block_ids: new_blocks,
-                        pos_range: (position, position.saturating_add(1)),
-                        cond_pos: Some(position),
-                        recent_tokens,
-                        allowed_tokens,
-                        suppress_tokens,
-                        ..Default::default()
-                    },
-                    TransitionDelta::CommitGen {
-                        image_id,
-                        logical_position: position,
-                        physical_position: cursor.physical_kv_len,
-                        logical_positions: feedback.map_or(0, |recipe| recipe.logical_positions),
-                        physical_kv_tokens: feedback.map(|recipe| recipe.physical_kv_tokens),
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::Feedback {
-                image_id,
-                position,
-                locator,
-                new_blocks,
-                recent_tokens,
-                allowed_tokens,
-                suppress_tokens,
-            } => {
-                if !request.behavior.generated_image_feedback || request.policy.feedback.is_none() {
-                    return Err(PlanningError::FeedbackDisabled);
-                }
-                if !request.policy.feedback.as_ref().is_some_and(|feedback| {
-                    matches!(
-                        feedback.writeback,
-                        uniserve_core::FeedbackWriteback::DirectKv
+                        TransitionDelta::IngestText {
+                            segment_index,
+                            start: prompt_start,
+                            end,
+                            logical_start: cursor.logical_pos,
+                            physical_start: cursor.physical_kv_len,
+                        },
+                        Vec::new(),
+                        cursor.replayability,
+                        0,
+                        0,
                     )
-                }) {
-                    return Err(PlanningError::FeedbackDisabled);
                 }
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind: OpKind::CommitWriteback,
-                        modality: Modality::Und,
-                        new_block_ids: new_blocks,
-                        pos_range: (position, position.saturating_add(1)),
-                        cond_pos: Some(position),
-                        locator: Some(locator),
-                        recent_tokens,
-                        allowed_tokens,
-                        suppress_tokens,
-                        ..Default::default()
-                    },
-                    TransitionDelta::Feedback {
-                        image_id,
-                        logical_position: position,
-                        physical_position: cursor.physical_kv_len,
-                        logical_positions: request
-                            .policy
-                            .feedback
-                            .as_ref()
-                            .map_or(0, |recipe| recipe.logical_positions),
-                        physical_kv_tokens: request
-                            .policy
-                            .feedback
-                            .as_ref()
-                            .map(|recipe| recipe.physical_kv_tokens),
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    0,
-                    0,
-                    0,
-                )
-            }
-            TransitionIntent::FeedbackIngest {
-                image_id,
-                step_index,
-                step,
-                worker_hash,
-                is_final_step,
-                position,
-                logical_positions,
-                physical_kv_tokens,
-                image_b64,
-                staged_image,
-                new_blocks,
-            } => {
-                let Some(feedback) = request.policy.feedback.as_ref() else {
-                    return Err(PlanningError::FeedbackDisabled);
-                };
-                if !matches!(
-                    feedback.writeback,
-                    uniserve_core::FeedbackWriteback::Reingest { .. }
-                ) {
-                    return Err(PlanningError::FeedbackIngestDisabled);
+                TransitionIntent::IngestImage {
+                    segment_index,
+                    step_index,
+                    step,
+                    is_final_step,
+                    position,
+                    logical_positions,
+                    physical_kv_tokens,
+                    worker_hash,
+                    encoder_cache_key,
+                    cache_hit,
+                    image_b64,
+                    staged_image,
+                    new_blocks,
+                } => {
+                    if position != cursor.logical_pos {
+                        return Err(PlanningError::LogicalCursorMismatch {
+                            expected: cursor.logical_pos,
+                            actual: position,
+                        });
+                    }
+                    let kind = match step {
+                        ImageIngestStep::VaeEncode => EncodeKind::Latent,
+                        ImageIngestStep::VitEncode => EncodeKind::Vision,
+                    };
+                    let input = encode_input(cache_hit, staged_image, image_b64, worker_hash)?;
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Encode(EncodeOperation {
+                                kind,
+                                lease: kv_lease(new_blocks),
+                                position: (
+                                    position,
+                                    position.saturating_add(logical_positions.max(1)),
+                                ),
+                                conditioning_position: position,
+                                input,
+                            }),
+                        ),
+                        TransitionDelta::IngestImageStep {
+                            segment_index,
+                            step_index,
+                            is_final_step,
+                            position,
+                            physical_start: cursor.physical_kv_len,
+                            logical_positions,
+                            physical_kv_tokens,
+                            encoder_cache_key,
+                            cache_hit,
+                            expected_encoder_handle: staged_image,
+                        },
+                        encoder_cache_key.into_iter().collect(),
+                        cursor.replayability,
+                        0,
+                        0,
+                    )
                 }
-                if position != cursor.logical_pos {
-                    return Err(PlanningError::LogicalCursorMismatch {
-                        expected: cursor.logical_pos,
-                        actual: position,
-                    });
+                TransitionIntent::DecodeUnd {
+                    position,
+                    token_id,
+                    token_source,
+                    new_blocks,
+                    spec_token_ids,
+                    token_count,
+                    stop_token_ids,
+                    stop_terminal,
+                    recent_tokens,
+                    allowed_tokens,
+                    suppress_tokens,
+                } => {
+                    if position != cursor.logical_pos {
+                        return Err(PlanningError::LogicalCursorMismatch {
+                            expected: cursor.logical_pos,
+                            actual: position,
+                        });
+                    }
+                    let token_count = token_count.max(1);
+                    let transition_stop_token_ids = stop_token_ids.clone().unwrap_or_default();
+                    let draft_token_ids = spec_token_ids.unwrap_or_default();
+                    let mode = if draft_token_ids.is_empty() {
+                        SequenceMode::Decode
+                    } else {
+                        SequenceMode::Verify
+                    };
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Sequence(SequenceOperation {
+                                mode,
+                                lease: kv_lease(new_blocks),
+                                position: (position, position.saturating_add(1)),
+                                policy: token_policy(
+                                    recent_tokens,
+                                    allowed_tokens,
+                                    suppress_tokens,
+                                    false,
+                                    conditioning_trigger_tokens(request),
+                                ),
+                                input: SequenceInput::Tokens(TokenInput {
+                                    token_ids: vec![token_id],
+                                    source: token_source,
+                                    draft_token_ids,
+                                    burst_tokens: token_count,
+                                    stop_token_ids: stop_token_ids.unwrap_or_default(),
+                                    stop_terminal,
+                                    return_all_logits: false,
+                                }),
+                            }),
+                        ),
+                        TransitionDelta::DecodeUnd {
+                            logical_position: position,
+                            physical_position: cursor.physical_kv_len,
+                            token_count,
+                            stop_token_ids: transition_stop_token_ids,
+                            commits_nonterminal_stop_tail: token_count > 1 && !stop_terminal,
+                        },
+                        Vec::new(),
+                        cursor.replayability,
+                        0,
+                        0,
+                    )
                 }
-                let (kind, modality) = match step {
-                    ImageIngestStep::VaeEncode => (OpKind::VaeEncode, Modality::Gen),
-                    ImageIngestStep::VitEncode => (OpKind::VitEncode, Modality::Und),
-                };
-                (
-                    ForwardOp {
-                        req_id: request.request_id,
-                        kind,
-                        modality,
-                        new_block_ids: new_blocks,
-                        pos_range: (position, position.saturating_add(logical_positions.max(1))),
-                        cond_pos: Some(position),
-                        image_b64: Some(image_b64),
-                        image_in: staged_image,
-                        mm_hash: Some(worker_hash),
-                        ..Default::default()
-                    },
-                    TransitionDelta::FeedbackIngestStep {
-                        image_id,
-                        step_index,
-                        is_final_step,
-                        position,
-                        physical_start: cursor.physical_kv_len,
-                        logical_positions,
-                        physical_kv_tokens,
-                    },
-                    Vec::new(),
-                    Replayability::NotReplayable,
-                    0,
-                    0,
-                    0,
-                )
-            }
-        };
-        let kind = op.kind;
+                TransitionIntent::DenoiseGen {
+                    image_id,
+                    position,
+                    start_step,
+                    step_count,
+                    cfg,
+                    image_prompt,
+                    latent_units,
+                    host_scratch_tokens,
+                    conditioning,
+                } => {
+                    if !request.behavior.gen_output {
+                        return Err(PlanningError::GenerationBranchDisabled);
+                    }
+                    let step_count = step_count.max(1);
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Flow(FlowOperation {
+                                latent_handle: request.request_id.0,
+                                position,
+                                start_step,
+                                step_count,
+                                conditioning_position: position,
+                                conditioning,
+                                guidance: Guidance {
+                                    branch_count: cfg.branch_count,
+                                    text_scale: cfg.text_scale,
+                                    image_scale: cfg.img_scale,
+                                    renorm_type: cfg.renorm_type,
+                                    renorm_min: cfg.renorm_min,
+                                    interval: cfg.interval,
+                                },
+                                image_prompt: image_prompt.unwrap_or_default(),
+                            }),
+                        ),
+                        TransitionDelta::DenoiseGen {
+                            image_id,
+                            start_step,
+                            step_count,
+                        },
+                        Vec::new(),
+                        Replayability::NotReplayable,
+                        latent_units,
+                        host_scratch_tokens,
+                    )
+                }
+                TransitionIntent::CommitGen {
+                    image_id,
+                    position,
+                    new_blocks,
+                    recent_tokens,
+                    allowed_tokens,
+                    suppress_tokens,
+                } => {
+                    if !request.behavior.gen_output {
+                        return Err(PlanningError::GenerationBranchDisabled);
+                    }
+                    let feedback = request
+                        .behavior
+                        .generated_image_feedback
+                        .then_some(request.policy.feedback.as_ref())
+                        .flatten()
+                        .filter(|recipe| {
+                            matches!(recipe.writeback, uniserve_core::FeedbackWriteback::DirectKv)
+                        });
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Materialize(MaterializeOperation {
+                                kind: MaterializeKind::Image,
+                                lease: kv_lease(new_blocks),
+                                position,
+                                conditioning_position: position,
+                                policy: token_policy(
+                                    recent_tokens,
+                                    allowed_tokens,
+                                    suppress_tokens,
+                                    false,
+                                    Vec::new(),
+                                ),
+                                input: MaterializeInput::Latent {
+                                    handle: request.request_id.0,
+                                },
+                            }),
+                        ),
+                        TransitionDelta::CommitGen {
+                            image_id,
+                            logical_position: position,
+                            physical_position: cursor.physical_kv_len,
+                            logical_positions: feedback
+                                .map_or(0, |recipe| recipe.logical_positions),
+                            physical_kv_tokens: feedback.map(|recipe| recipe.physical_kv_tokens),
+                        },
+                        Vec::new(),
+                        Replayability::NotReplayable,
+                        0,
+                        0,
+                    )
+                }
+                TransitionIntent::Feedback {
+                    image_id,
+                    position,
+                    locator,
+                    new_blocks,
+                    recent_tokens,
+                    allowed_tokens,
+                    suppress_tokens,
+                } => {
+                    if !request.behavior.generated_image_feedback
+                        || request.policy.feedback.is_none()
+                    {
+                        return Err(PlanningError::FeedbackDisabled);
+                    }
+                    if !request.policy.feedback.as_ref().is_some_and(|feedback| {
+                        matches!(
+                            feedback.writeback,
+                            uniserve_core::FeedbackWriteback::DirectKv
+                        )
+                    }) {
+                        return Err(PlanningError::FeedbackDisabled);
+                    }
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Transfer(TransferOperation {
+                                kind: TransferKind::Kv,
+                                lease: kv_lease(new_blocks),
+                                position,
+                                conditioning_position: position,
+                                policy: token_policy(
+                                    recent_tokens,
+                                    allowed_tokens,
+                                    suppress_tokens,
+                                    false,
+                                    Vec::new(),
+                                ),
+                                source: PublishedProduct {
+                                    handle: request.request_id.0,
+                                    locator,
+                                },
+                            }),
+                        ),
+                        TransitionDelta::Feedback {
+                            image_id,
+                            logical_position: position,
+                            physical_position: cursor.physical_kv_len,
+                            logical_positions: request
+                                .policy
+                                .feedback
+                                .as_ref()
+                                .map_or(0, |recipe| recipe.logical_positions),
+                            physical_kv_tokens: request
+                                .policy
+                                .feedback
+                                .as_ref()
+                                .map(|recipe| recipe.physical_kv_tokens),
+                        },
+                        Vec::new(),
+                        Replayability::NotReplayable,
+                        0,
+                        0,
+                    )
+                }
+                TransitionIntent::FeedbackIngest {
+                    image_id,
+                    step_index,
+                    step,
+                    worker_hash,
+                    is_final_step,
+                    position,
+                    logical_positions,
+                    physical_kv_tokens,
+                    image_b64,
+                    staged_image,
+                    new_blocks,
+                } => {
+                    let Some(feedback) = request.policy.feedback.as_ref() else {
+                        return Err(PlanningError::FeedbackDisabled);
+                    };
+                    if !matches!(
+                        feedback.writeback,
+                        uniserve_core::FeedbackWriteback::Reingest { .. }
+                    ) {
+                        return Err(PlanningError::FeedbackIngestDisabled);
+                    }
+                    if position != cursor.logical_pos {
+                        return Err(PlanningError::LogicalCursorMismatch {
+                            expected: cursor.logical_pos,
+                            actual: position,
+                        });
+                    }
+                    let kind = match step {
+                        ImageIngestStep::VaeEncode => EncodeKind::Latent,
+                        ImageIngestStep::VitEncode => EncodeKind::Vision,
+                    };
+                    let input = encode_input(false, staged_image, image_b64, worker_hash)?;
+                    (
+                        OperationEnvelope::unsealed(
+                            request.request_id,
+                            Operation::Encode(EncodeOperation {
+                                kind,
+                                lease: kv_lease(new_blocks),
+                                position: (
+                                    position,
+                                    position.saturating_add(logical_positions.max(1)),
+                                ),
+                                conditioning_position: position,
+                                input,
+                            }),
+                        ),
+                        TransitionDelta::FeedbackIngestStep {
+                            image_id,
+                            step_index,
+                            is_final_step,
+                            position,
+                            physical_start: cursor.physical_kv_len,
+                            logical_positions,
+                            physical_kv_tokens,
+                            expected_encoder_handle: staged_image,
+                        },
+                        Vec::new(),
+                        Replayability::NotReplayable,
+                        0,
+                        0,
+                    )
+                }
+            };
+        let operation_type = op.operation_type();
+        let draft_count = sequence_token_input(&op)
+            .map(|input| input.draft_token_ids.len().min(u32::MAX as usize) as u32)
+            .filter(|count| *count > 0);
+        let allowed_text_tokens = operation_policy(&op)
+            .map(|policy| policy.allowed_tokens.clone())
+            .filter(|tokens| !tokens.is_empty());
+        let expected_prompt_token_ids = sequence_token_input(&op)
+            .filter(|input| input.return_all_logits)
+            .map(|input| {
+                let mut tokens = input.token_ids.clone();
+                if matches!(&delta, TransitionDelta::IngestText { start: 0, .. })
+                    && !tokens.is_empty()
+                {
+                    tokens.remove(0);
+                }
+                tokens
+            });
         let kv_target_tokens = transition_kv_target(&delta).or_else(|| {
             transition_may_write_worker_defined_kv(&delta)
                 .then_some(request.resources.max_kv_tokens)
         });
         let resources = TransitionResources {
-            new_blocks: op.new_block_ids.len(),
+            new_blocks: operation_new_block_count(&op),
             kv_target_tokens,
-            scratch_units: if kind == OpKind::DenoiseGen {
-                scratch_units
-            } else {
-                0
-            },
-            host_scratch_tokens: if kind == OpKind::DenoiseGen {
+            host_scratch_tokens: if operation_type == OperationType::Flow {
                 host_scratch_tokens
             } else {
                 0
             },
-            latent_units: if kind == OpKind::DenoiseGen {
+            latent_units: if operation_type == OperationType::Flow {
                 latent_units
             } else {
                 0
             },
             encoder_pins,
             replayability_after_apply,
-            release_on_apply: match kind {
-                OpKind::CommitGen => {
-                    vec![ResourceClass::ImageLatent, ResourceClass::Scratch]
-                }
-                _ => Vec::new(),
+            release_on_apply: if operation_type == OperationType::MaterializeImage {
+                vec![ResourceClass::ImageLatent, ResourceClass::Scratch]
+            } else {
+                Vec::new()
             },
         };
         let validation = TransitionValidation {
@@ -1123,17 +1199,26 @@ impl GenerationPlanner {
                 } => Some(start_step.saturating_add(step_count)),
                 _ => None,
             },
-            expects_encoder_handle: matches!(kind, OpKind::VaeEncode | OpKind::VitEncode),
+            expects_encoder_handle: matches!(
+                operation_type,
+                OperationType::EncodeLatent | OperationType::EncodeVision
+            ),
             expected_encoder_handle: match delta {
                 TransitionDelta::IngestImageStep {
-                    cache_hit: true, ..
-                } => op.image_in,
+                    cache_hit: true,
+                    expected_encoder_handle,
+                    ..
+                }
+                | TransitionDelta::FeedbackIngestStep {
+                    expected_encoder_handle,
+                    ..
+                } => expected_encoder_handle,
                 _ => None,
             },
-            expects_image_artifact: kind == OpKind::CommitGen,
-            expected_image_hw: (kind == OpKind::CommitGen)
+            expects_image_artifact: operation_type == OperationType::MaterializeImage,
+            expected_image_hw: (operation_type == OperationType::MaterializeImage)
                 .then_some((request.image.height, request.image.width)),
-            requires_image_locator: kind == OpKind::CommitGen
+            requires_image_locator: operation_type == OperationType::MaterializeImage
                 && request.behavior.generated_image_feedback
                 && request.policy.feedback.as_ref().is_some_and(|feedback| {
                     feedback.commit == uniserve_core::CommitRecipe::CommitGenThenWriteback
@@ -1168,58 +1253,45 @@ impl GenerationPlanner {
                 _ => None,
             },
             allows_sampled_tokens: matches!(
-                kind,
-                OpKind::PrefillUnd
-                    | OpKind::DecodeUnd
-                    | OpKind::TargetVerifyUnd
-                    | OpKind::CommitGen
-                    | OpKind::CommitWriteback
+                operation_type,
+                OperationType::SequenceExtend
+                    | OperationType::SequenceDecode
+                    | OperationType::SequenceVerify
+                    | OperationType::MaterializeImage
+                    | OperationType::TransferKv
             ),
             expects_sampled_token: matches!(
-                kind,
-                OpKind::PrefillUnd | OpKind::DecodeUnd | OpKind::TargetVerifyUnd
+                operation_type,
+                OperationType::SequenceExtend
+                    | OperationType::SequenceDecode
+                    | OperationType::SequenceVerify
             ),
             expected_text_tokens: match &delta {
                 TransitionDelta::IngestText { .. } => Some(TextTokenCountRange { min: 1, max: 1 }),
                 TransitionDelta::DecodeUnd { token_count, .. } => {
-                    let max = op
-                        .spec_token_ids
-                        .as_ref()
-                        .map_or(u32::from((*token_count).max(1)), |tokens| {
-                            tokens.len().saturating_add(1).min(u32::MAX as usize) as u32
-                        });
+                    let max = draft_count.map_or(u32::from((*token_count).max(1)), |count| {
+                        count.saturating_add(1)
+                    });
                     Some(TextTokenCountRange { min: 1, max })
                 }
                 _ => None,
             },
-            max_accepted_draft_tokens: op
-                .spec_token_ids
-                .as_ref()
-                .map(|tokens| tokens.len().min(u32::MAX as usize) as u32),
-            allowed_text_tokens: op.allowed_tokens.clone(),
+            max_accepted_draft_tokens: draft_count,
+            allowed_text_tokens,
             generated_logprobs_requested: request.sampling.generated_logprobs_requested()
                 && matches!(
-                    kind,
-                    OpKind::PrefillUnd
-                        | OpKind::DecodeUnd
-                        | OpKind::TargetVerifyUnd
-                        | OpKind::CommitGen
-                        | OpKind::CommitWriteback
+                    operation_type,
+                    OperationType::SequenceExtend
+                        | OperationType::SequenceDecode
+                        | OperationType::SequenceVerify
+                        | OperationType::MaterializeImage
+                        | OperationType::TransferKv
                 ),
-            expected_prompt_token_ids: op.return_all_logits.then(|| {
-                let mut tokens = op.token_ids.clone().unwrap_or_default();
-                if matches!(&delta, TransitionDelta::IngestText { start: 0, .. })
-                    && !tokens.is_empty()
-                {
-                    tokens.remove(0);
-                }
-                tokens
-            }),
+            expected_prompt_token_ids,
         };
         Ok(PlannedTransition {
             op,
-            op_id: None,
-            kind,
+            operation_type,
             delta,
             resources,
             validation,
@@ -1229,6 +1301,100 @@ impl GenerationPlanner {
             },
         })
     }
+}
+
+fn kv_lease(new_blocks: Vec<BlockId>) -> KvLeaseDelta {
+    KvLeaseDelta {
+        group_id: 0,
+        new_blocks,
+    }
+}
+
+fn token_policy(
+    recent_tokens: Option<Vec<u32>>,
+    allowed_tokens: Option<Vec<u32>>,
+    suppress_tokens: Option<Vec<u32>>,
+    publish_kv: bool,
+    publish_kv_on_tokens: Vec<u32>,
+) -> TokenPolicy {
+    TokenPolicy {
+        allowed_tokens: allowed_tokens.unwrap_or_default(),
+        suppress_tokens: suppress_tokens.unwrap_or_default(),
+        recent_tokens: recent_tokens.unwrap_or_default(),
+        publish_kv,
+        publish_kv_on_tokens,
+    }
+}
+
+fn conditioning_trigger_tokens(request: &GenerationRequest) -> Vec<u32> {
+    let trigger = &request.policy.trigger;
+    let mut tokens = trigger
+        .generated_suffix()
+        .and_then(|suffix| suffix.last())
+        .copied()
+        .into_iter()
+        .collect::<Vec<_>>();
+    tokens.extend(trigger.round_close_token_ids().iter().copied());
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn encode_input(
+    cached: bool,
+    staged_handle: Option<u64>,
+    base64: String,
+    content_hash: u64,
+) -> Result<EncodeInput, PlanningError> {
+    if cached {
+        return Ok(EncodeInput::CachedProduct { content_hash });
+    }
+    if let Some(handle) = staged_handle {
+        return Ok(EncodeInput::StagedProduct {
+            handle,
+            content_hash,
+        });
+    }
+    if base64.is_empty() {
+        return Err(PlanningError::MissingImageInput);
+    }
+    Ok(EncodeInput::InlineImage {
+        base64,
+        content_hash,
+    })
+}
+
+fn operation_lease(envelope: &OperationEnvelope) -> Option<&KvLeaseDelta> {
+    match &envelope.operation {
+        Operation::Sequence(operation) => Some(&operation.lease),
+        Operation::Encode(operation) => Some(&operation.lease),
+        Operation::Materialize(operation) => Some(&operation.lease),
+        Operation::Transfer(operation) => Some(&operation.lease),
+        Operation::Flow(_) => None,
+    }
+}
+
+fn operation_new_block_count(envelope: &OperationEnvelope) -> usize {
+    operation_lease(envelope).map_or(0, |lease| lease.new_blocks.len())
+}
+
+fn operation_policy(envelope: &OperationEnvelope) -> Option<&TokenPolicy> {
+    match &envelope.operation {
+        Operation::Sequence(operation) => Some(&operation.policy),
+        Operation::Materialize(operation) => Some(&operation.policy),
+        Operation::Transfer(operation) => Some(&operation.policy),
+        Operation::Flow(_) | Operation::Encode(_) => None,
+    }
+}
+
+fn sequence_token_input(envelope: &OperationEnvelope) -> Option<&TokenInput> {
+    let Operation::Sequence(operation) = &envelope.operation else {
+        return None;
+    };
+    let SequenceInput::Tokens(input) = &operation.input else {
+        return None;
+    };
+    Some(input)
 }
 
 fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
@@ -1321,14 +1487,14 @@ pub(crate) enum PlanningError {
     GenerationBranchDisabled,
     FeedbackDisabled,
     FeedbackIngestDisabled,
+    MissingImageInput,
 }
 
 /// Scheduler-local transition associated with one submitted worker op.
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedTransition {
-    pub(crate) op: ForwardOp,
-    pub(crate) op_id: Option<u64>,
-    pub(crate) kind: OpKind,
+    pub(crate) op: OperationEnvelope,
+    pub(crate) operation_type: OperationType,
     pub(crate) delta: TransitionDelta,
     pub(crate) resources: TransitionResources,
     pub(crate) validation: TransitionValidation,
@@ -1337,60 +1503,41 @@ pub(crate) struct PlannedTransition {
 
 impl PlannedTransition {
     pub(crate) fn assign_envelope(&mut self, epoch: u64, op_id: u64, base_version: u64) {
-        self.op_id = Some(op_id);
         self.op.seal(epoch, op_id, base_version);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn assign_op_id(&mut self, op_id: u64) {
-        self.op_id = Some(op_id);
-        self.op.op_id = Some(op_id);
     }
 
     pub(crate) fn validate_result(
         &self,
-        result: &SeqResult,
+        result: &OperationResult,
     ) -> Result<(), TransitionValidationError> {
-        if let Some(expected) = self.op_id
-            && result.op_id != Some(expected)
-        {
+        if result.session_id != self.op.session_id {
+            return Err(TransitionValidationError::SessionMismatch {
+                expected: self.op.session_id.0,
+                actual: result.session_id.0,
+            });
+        }
+        if self.op.op_id == 0 || result.op_id != self.op.op_id {
             return Err(TransitionValidationError::OpIdMismatch {
-                expected,
+                expected: self.op.op_id,
                 actual: result.op_id,
             });
         }
-        if self.op.digest.is_some() {
-            if result.epoch != Some(self.op.epoch) {
-                return Err(TransitionValidationError::EpochMismatch {
-                    expected: self.op.epoch,
-                    actual: result.epoch,
-                });
-            }
-            if result.base_version != Some(self.op.base_version)
-                || result.result_version != Some(self.op.base_version.saturating_add(1))
-            {
-                return Err(TransitionValidationError::VersionMismatch {
-                    expected_base: self.op.base_version,
-                    actual_base: result.base_version,
-                    actual_result: result.result_version,
-                });
-            }
+        if result.epoch != self.op.epoch {
+            return Err(TransitionValidationError::EpochMismatch {
+                expected: self.op.epoch,
+                actual: result.epoch,
+            });
         }
-        self.validation.validate(self.kind, result)
-    }
-}
-
-impl std::ops::Deref for PlannedTransition {
-    type Target = ForwardOp;
-
-    fn deref(&self) -> &Self::Target {
-        &self.op
-    }
-}
-
-impl std::ops::DerefMut for PlannedTransition {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.op
+        if result.base_version != self.op.base_version
+            || result.result_version != self.op.base_version.saturating_add(1)
+        {
+            return Err(TransitionValidationError::VersionMismatch {
+                expected_base: self.op.base_version,
+                actual_base: result.base_version,
+                actual_result: result.result_version,
+            });
+        }
+        self.validation.validate(self.operation_type, result)
     }
 }
 
@@ -1419,6 +1566,7 @@ pub(crate) enum TransitionDelta {
         physical_kv_tokens: ImageKvEffect,
         encoder_cache_key: Option<u64>,
         cache_hit: bool,
+        expected_encoder_handle: Option<u64>,
     },
     DecodeUnd {
         logical_position: u32,
@@ -1454,6 +1602,7 @@ pub(crate) enum TransitionDelta {
         physical_start: u32,
         logical_positions: u32,
         physical_kv_tokens: ImageKvEffect,
+        expected_encoder_handle: Option<u64>,
     },
 }
 
@@ -1475,7 +1624,6 @@ impl TransitionDelta {
 pub(crate) struct TransitionResources {
     pub(crate) new_blocks: usize,
     pub(crate) kv_target_tokens: Option<usize>,
-    pub(crate) scratch_units: u64,
     pub(crate) host_scratch_tokens: u64,
     pub(crate) latent_units: u64,
     pub(crate) encoder_pins: Vec<u64>,
@@ -1523,17 +1671,22 @@ pub(crate) struct TextTokenCountRange {
 }
 
 impl TransitionValidation {
-    fn validate(&self, kind: OpKind, result: &SeqResult) -> Result<(), TransitionValidationError> {
-        if result.op_kind != Some(kind) {
-            return Err(TransitionValidationError::OpKindMismatch {
-                expected: kind,
-                actual: result.op_kind,
+    fn validate(
+        &self,
+        operation_type: OperationType,
+        result: &OperationResult,
+    ) -> Result<(), TransitionValidationError> {
+        if result.delta.kind() != operation_type.kind() {
+            return Err(TransitionValidationError::ResultTypeMismatch {
+                expected: operation_type.kind(),
+                actual: result.delta.kind(),
             });
         }
         if let Some(expected_step) = self.expected_denoise_step {
-            let steps_done = result
-                .num_steps_done
-                .ok_or(TransitionValidationError::MissingDenoiseStep)?;
+            let ResultDelta::Flow(flow) = &result.delta else {
+                return Err(TransitionValidationError::MissingDenoiseStep);
+            };
+            let steps_done = flow.steps_completed;
             if steps_done != expected_step {
                 return Err(TransitionValidationError::DenoiseStepMismatch {
                     expected: expected_step,
@@ -1541,25 +1694,25 @@ impl TransitionValidation {
                 });
             }
         }
-        if self.expects_encoder_handle
-            && result
-                .encoder_handle
-                .filter(|handle| *handle != 0)
-                .is_none()
-        {
+        let encoder_handle = match &result.delta {
+            ResultDelta::Encode(encode) => Some(encode.product_handle),
+            _ => None,
+        };
+        if self.expects_encoder_handle && encoder_handle.filter(|handle| *handle != 0).is_none() {
             return Err(TransitionValidationError::MissingEncoderHandle);
         }
         if let Some(expected) = self.expected_encoder_handle
-            && result.encoder_handle != Some(expected)
+            && encoder_handle != Some(expected)
         {
             return Err(TransitionValidationError::EncoderHandleMismatch {
                 expected,
-                actual: result.encoder_handle,
+                actual: encoder_handle,
             });
         }
+        let image = materialized_image(result);
         if let Some(expected) = self.expected_image_hw {
-            let actual = result
-                .image_hw
+            let actual = image
+                .map(|image| (image.height, image.width))
                 .ok_or(TransitionValidationError::MissingImageDimensions)?;
             if actual != expected {
                 return Err(TransitionValidationError::ImageDimensionsMismatch {
@@ -1569,29 +1722,27 @@ impl TransitionValidation {
             }
         }
         if self.expects_image_artifact {
-            let image = result
-                .image_png_b64
-                .as_deref()
-                .filter(|value| !value.is_empty())
+            let image = image
+                .filter(|image| !image.png_base64.is_empty())
                 .ok_or(TransitionValidationError::MissingImageArtifact)?;
-            let metadata = validate_png_artifact(image, self.expected_image_hw)
+            let metadata = validate_png_artifact(&image.png_base64, self.expected_image_hw)
                 .ok_or(TransitionValidationError::InvalidImageArtifact)?;
-            if result.image_hw != Some((metadata.height, metadata.width)) {
+            let reported = Some((image.height, image.width));
+            if reported != Some((metadata.height, metadata.width)) {
                 return Err(TransitionValidationError::ImageArtifactDimensionsMismatch {
                     artifact: (metadata.height, metadata.width),
-                    reported: result.image_hw,
+                    reported,
                 });
             }
         }
-        if self.requires_image_locator && result.locator.as_deref().is_none_or(str::is_empty) {
+        if self.requires_image_locator && result_locator(result).is_none_or(str::is_empty) {
             return Err(TransitionValidationError::MissingImageLocator);
         }
         if let Some(expected) = self.expected_image_kv
             && !self.requires_image_locator
         {
-            let actual = result
-                .num_tokens
-                .ok_or(TransitionValidationError::MissingImageKvTokens)?;
+            let actual =
+                result_kv_tokens(result).ok_or(TransitionValidationError::MissingImageKvTokens)?;
             match expected {
                 ImageKvEffect::Exact { tokens } if actual != tokens => {
                     return Err(TransitionValidationError::ImageKvMismatch {
@@ -1610,60 +1761,36 @@ impl TransitionValidation {
                 | ImageKvEffect::Bounded { .. } => {}
             }
         }
-        if !self.allows_sampled_tokens
-            && (result.sampled_token_id.is_some()
-                || result
-                    .sampled_token_ids
-                    .as_ref()
-                    .is_some_and(|tokens| !tokens.is_empty()))
-        {
-            return Err(TransitionValidationError::UnexpectedSampledToken { kind });
+        let effect = result_sequence_effect(result);
+        let sampled_tokens = effect
+            .map(|effect| effect.sampled_token_ids.as_slice())
+            .unwrap_or_default();
+        if !self.allows_sampled_tokens && !sampled_tokens.is_empty() {
+            return Err(TransitionValidationError::UnexpectedSampledToken { operation_type });
         }
-        if self.expects_sampled_token
-            && result.sampled_token_id.is_none()
-            && result
-                .sampled_token_ids
-                .as_ref()
-                .is_none_or(|tokens| tokens.is_empty())
-        {
-            return Err(TransitionValidationError::MissingSampledToken { kind });
+        if self.expects_sampled_token && sampled_tokens.is_empty() {
+            return Err(TransitionValidationError::MissingSampledToken { operation_type });
         }
+        let accepted_draft_tokens = effect.and_then(|effect| effect.accepted_draft_tokens);
         if let Some(max_accepted) = self.max_accepted_draft_tokens
-            && result
-                .num_accepted_tokens
-                .is_some_and(|accepted| accepted > max_accepted)
+            && accepted_draft_tokens.is_some_and(|accepted| accepted > max_accepted)
         {
             return Err(TransitionValidationError::AcceptedDraftCountExceeded {
                 max: max_accepted,
-                actual: result.num_accepted_tokens.unwrap_or_default(),
+                actual: accepted_draft_tokens.unwrap_or_default(),
             });
         }
-        if let Some(allowed) = &self.allowed_text_tokens {
-            let returned = result
-                .sampled_token_ids
-                .as_ref()
-                .filter(|tokens| !tokens.is_empty())
-                .cloned()
-                .or_else(|| result.sampled_token_id.map(|token| vec![token]))
-                .unwrap_or_default();
-            if let Some(token_id) = returned
-                .into_iter()
+        if let Some(allowed) = &self.allowed_text_tokens
+            && let Some(token_id) = sampled_tokens
+                .iter()
+                .copied()
                 .find(|token_id| !allowed.contains(token_id))
-            {
-                return Err(TransitionValidationError::SampledTokenNotAllowed { token_id });
-            }
+        {
+            return Err(TransitionValidationError::SampledTokenNotAllowed { token_id });
         }
         if let Some(expected) = self.expected_text_tokens {
-            let listed = result
-                .sampled_token_ids
-                .as_ref()
-                .filter(|tokens| !tokens.is_empty())
-                .map(|tokens| tokens.len() as u32);
-            let scalar = u32::from(result.sampled_token_id.is_some());
-            let accepted = result
-                .num_accepted_tokens
-                .map(|count| count.saturating_add(scalar));
-            if let (Some(listed), Some(accepted)) = (listed, accepted)
+            let listed = sampled_tokens.len().min(u32::MAX as usize) as u32;
+            if let Some(accepted) = accepted_draft_tokens.map(|count| count.saturating_add(1))
                 && listed != accepted
             {
                 return Err(TransitionValidationError::TextTokenCountInconsistent {
@@ -1671,7 +1798,7 @@ impl TransitionValidation {
                     accepted,
                 });
             }
-            let actual = listed.or(accepted).unwrap_or(scalar);
+            let actual = listed;
             if actual < expected.min || actual > expected.max {
                 return Err(TransitionValidationError::TextTokenCountMismatch {
                     min: expected.min,
@@ -1680,19 +1807,19 @@ impl TransitionValidation {
                 });
             }
         }
-        let sampled_token = result
-            .sampled_token_ids
-            .as_ref()
-            .and_then(|tokens| tokens.last().copied())
-            .or(result.sampled_token_id);
-        let generated_candidates = result.top_logprobs.as_deref().unwrap_or_default();
+        let sampled_token = sampled_tokens.last().copied();
+        let generated_candidates = effect
+            .map(|effect| effect.top_logprobs.as_slice())
+            .unwrap_or_default();
         match (
             self.generated_logprobs_requested,
             sampled_token,
             generated_candidates.is_empty(),
         ) {
             (false, _, false) | (true, None, false) => {
-                return Err(TransitionValidationError::UnexpectedGeneratedLogprobs { kind });
+                return Err(TransitionValidationError::UnexpectedGeneratedLogprobs {
+                    operation_type,
+                });
             }
             (true, Some(token_id), true) => {
                 return Err(TransitionValidationError::MissingGeneratedLogprobs { token_id });
@@ -1715,10 +1842,10 @@ impl TransitionValidation {
         }
         match (
             self.expected_prompt_token_ids.as_deref(),
-            result.prompt_logprobs.as_deref(),
+            effect.map(|effect| effect.prompt_logprobs.as_slice()),
         ) {
             (None, Some(positions)) if !positions.is_empty() => {
-                return Err(TransitionValidationError::UnexpectedPromptLogprobs { kind });
+                return Err(TransitionValidationError::UnexpectedPromptLogprobs { operation_type });
             }
             (Some(expected), actual) => {
                 let actual = actual.unwrap_or_default();
@@ -1760,24 +1887,72 @@ impl TransitionValidation {
     }
 }
 
+fn result_sequence_effect(result: &OperationResult) -> Option<&SequenceEffect> {
+    match &result.delta {
+        ResultDelta::Sequence(delta) => Some(&delta.effect),
+        ResultDelta::Materialize(delta) => delta.sequence.as_ref(),
+        ResultDelta::Transfer(delta) => delta.sequence.as_ref(),
+        ResultDelta::Flow(_) | ResultDelta::Encode(_) => None,
+    }
+}
+
+fn materialized_image(result: &OperationResult) -> Option<&uniserve_worker_wire::ImageArtifact> {
+    let ResultDelta::Materialize(delta) = &result.delta else {
+        return None;
+    };
+    let MaterializedProduct::Image(image) = &delta.product else {
+        return None;
+    };
+    Some(image)
+}
+
+fn result_locator(result: &OperationResult) -> Option<&str> {
+    match &result.delta {
+        ResultDelta::Materialize(delta) => match &delta.product {
+            MaterializedProduct::Image(image) => Some(image.locator.as_str()),
+            MaterializedProduct::Published(product) => Some(product.locator.as_str()),
+            MaterializedProduct::Frame { .. } => None,
+        },
+        ResultDelta::Transfer(delta) => delta
+            .product
+            .as_ref()
+            .map(|product| product.locator.as_str()),
+        ResultDelta::Sequence(_) | ResultDelta::Flow(_) | ResultDelta::Encode(_) => None,
+    }
+}
+
+fn result_kv_tokens(result: &OperationResult) -> Option<u32> {
+    match &result.delta {
+        ResultDelta::Sequence(delta) => delta.effect.kv_tokens,
+        ResultDelta::Encode(delta) => Some(delta.kv_tokens),
+        ResultDelta::Materialize(delta) => delta.kv_tokens,
+        ResultDelta::Transfer(delta) => delta.kv_tokens,
+        ResultDelta::Flow(_) => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TransitionValidationError {
+    SessionMismatch {
+        expected: u64,
+        actual: u64,
+    },
     OpIdMismatch {
         expected: u64,
-        actual: Option<u64>,
+        actual: u64,
     },
     EpochMismatch {
         expected: u64,
-        actual: Option<u64>,
+        actual: u64,
     },
     VersionMismatch {
         expected_base: u64,
-        actual_base: Option<u64>,
-        actual_result: Option<u64>,
+        actual_base: u64,
+        actual_result: u64,
     },
-    OpKindMismatch {
-        expected: OpKind,
-        actual: Option<OpKind>,
+    ResultTypeMismatch {
+        expected: OperationKind,
+        actual: OperationKind,
     },
     MissingDenoiseStep,
     DenoiseStepMismatch {
@@ -1807,10 +1982,10 @@ pub(crate) enum TransitionValidationError {
         actual: u32,
     },
     UnexpectedSampledToken {
-        kind: OpKind,
+        operation_type: OperationType,
     },
     MissingSampledToken {
-        kind: OpKind,
+        operation_type: OperationType,
     },
     AcceptedDraftCountExceeded {
         max: u32,
@@ -1829,7 +2004,7 @@ pub(crate) enum TransitionValidationError {
         token_id: u32,
     },
     UnexpectedPromptLogprobs {
-        kind: OpKind,
+        operation_type: OperationType,
     },
     PromptLogprobCountMismatch {
         expected: usize,
@@ -1847,7 +2022,7 @@ pub(crate) enum TransitionValidationError {
         position: usize,
     },
     UnexpectedGeneratedLogprobs {
-        kind: OpKind,
+        operation_type: OperationType,
     },
     MissingGeneratedLogprobs {
         token_id: u32,
@@ -1861,15 +2036,14 @@ pub(crate) enum TransitionValidationError {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
     use uniserve_core::{
         GenerationBehaviorDescriptor, GenerationConstraint, GenerationPolicyDescriptor,
         GenerationResourceBounds, ImageParams, RequestId, SamplingParams, UndVisibility,
     };
+    use uniserve_worker_wire::{SequenceDelta, SequenceEffect};
 
-    fn test_request(id: u64, tokens: Vec<u32>) -> GenerationRequest {
+    fn request(id: u64, tokens: Vec<u32>) -> GenerationRequest {
         let policy = GenerationPolicyDescriptor::default();
         let constraint = GenerationConstraint::UndOnly;
         GenerationRequest {
@@ -1899,483 +2073,10 @@ mod tests {
         }
     }
 
-    fn png_b64(width: u32, height: u32) -> String {
-        let mut bytes = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut bytes, width, height);
-            encoder.set_color(png::ColorType::Grayscale);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder.write_header().expect("PNG header");
-            writer
-                .write_image_data(&vec![0; (width * height) as usize])
-                .expect("PNG pixels");
-        }
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    }
-
-    #[test]
-    fn cursor_exposes_typed_views_without_duplicate_state() {
-        let mut cursor = GenerationCursor::new(GenerationPhase::Prefill, 8, true);
-        cursor.ingest.prompt_cursor = 3;
-        cursor.und.logical_pos = 5;
-        cursor.und.physical_kv_len = 7;
-        cursor.image_gen.image_id = 2;
-
-        assert_eq!(cursor.context().prompt_cursor, 3);
-        assert_eq!(cursor.und().logical_pos, 5);
-        assert_eq!(cursor.und().physical_kv_len, 7);
-        assert_eq!(cursor.gen_cursor().image_id, 2);
-        assert_eq!(cursor.resources().worstcase_blocks, 8);
-        assert_eq!(cursor.replay().generated_ids, Vec::<u32>::new());
-    }
-
-    #[test]
-    fn planned_transition_validates_op_id_and_encoder_handle() {
-        let request = test_request(9, vec![1, 2, 3, 4]);
-        let mut transition = GenerationPlanner::new()
+    fn prefill_transition() -> PlannedTransition {
+        GenerationPlanner::new()
             .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::Encode,
-                    prompt_cursor: 4,
-                    logical_pos: 4,
-                    physical_kv_len: 4,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestImage {
-                    segment_index: 1,
-                    step_index: 0,
-                    step: ImageIngestStep::VitEncode,
-                    is_final_step: true,
-                    position: 4,
-                    logical_positions: 1,
-                    physical_kv_tokens: ImageKvEffect::WorkerDefined,
-                    worker_hash: 123,
-                    encoder_cache_key: Some(123),
-                    cache_hit: false,
-                    image_b64: "aGVsbG8=".to_string(),
-                    staged_image: None,
-                    new_blocks: Vec::new(),
-                },
-            )
-            .expect("plan image ingest");
-        transition.assign_op_id(77);
-
-        assert_eq!(transition.op.kind, OpKind::VitEncode,);
-        assert!(matches!(
-            transition.delta,
-            TransitionDelta::IngestImageStep {
-                position: 4,
-                step_index: 0,
-                is_final_step: true,
-                ..
-            }
-        ));
-        assert_eq!(transition.resources.encoder_pins, vec![123]);
-        assert_eq!(
-            transition.validate_result(&SeqResult {
-                req_id: RequestId(9),
-                op_kind: Some(OpKind::VitEncode),
-                op_id: Some(77),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingEncoderHandle)
-        );
-        assert_eq!(
-            transition.validate_result(&SeqResult {
-                req_id: RequestId(9),
-                op_kind: Some(OpKind::VitEncode),
-                op_id: Some(78),
-                encoder_handle: Some(1),
-                num_tokens: Some(4),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::OpIdMismatch {
-                expected: 77,
-                actual: Some(78)
-            })
-        );
-        assert_eq!(
-            transition.validate_result(&SeqResult {
-                req_id: RequestId(9),
-                op_kind: Some(OpKind::VitEncode),
-                op_id: Some(77),
-                encoder_handle: Some(1),
-                locator: Some("encoder-locator".to_string()),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingImageKvTokens)
-        );
-        assert_eq!(
-            transition.validate_result(&SeqResult {
-                req_id: RequestId(9),
-                op_kind: Some(OpKind::VitEncode),
-                op_id: Some(77),
-                encoder_handle: Some(1),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingImageKvTokens)
-        );
-        assert!(
-            transition
-                .validate_result(&SeqResult {
-                    req_id: RequestId(9),
-                    op_kind: Some(OpKind::VitEncode),
-                    op_id: Some(77),
-                    encoder_handle: Some(1),
-                    num_tokens: Some(4),
-                    ..Default::default()
-                })
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn intermediate_image_ingest_requires_a_bounded_kv_result() {
-        let request = test_request(10, vec![1, 2, 3]);
-        let mut transition = GenerationPlanner::new()
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::Encode,
-                    prompt_cursor: 3,
-                    logical_pos: 3,
-                    physical_kv_len: 3,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::IngestImage {
-                    segment_index: 1,
-                    step_index: 0,
-                    step: ImageIngestStep::VaeEncode,
-                    is_final_step: false,
-                    position: 3,
-                    logical_positions: 1,
-                    physical_kv_tokens: ImageKvEffect::WorkerDefined,
-                    worker_hash: 456,
-                    encoder_cache_key: Some(456),
-                    cache_hit: false,
-                    image_b64: "aGVsbG8=".to_string(),
-                    staged_image: None,
-                    new_blocks: Vec::new(),
-                },
-            )
-            .expect("plan intermediate image ingest");
-        transition.assign_op_id(81);
-
-        assert_eq!(
-            transition.validate_result(&SeqResult {
-                req_id: RequestId(10),
-                op_kind: Some(OpKind::VaeEncode),
-                op_id: Some(81),
-                encoder_handle: Some(2),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingImageKvTokens)
-        );
-        assert!(
-            transition
-                .validate_result(&SeqResult {
-                    req_id: RequestId(10),
-                    op_kind: Some(OpKind::VaeEncode),
-                    op_id: Some(81),
-                    encoder_handle: Some(2),
-                    num_tokens: Some(1),
-                    ..Default::default()
-                })
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn cursor_projection_applies_planned_lifecycle_without_mutating_cursor() {
-        let cursor = GenerationCursor::new(GenerationPhase::Prefill, 8, false);
-        let request = test_request(1, vec![1, 2, 3]);
-        let planner = GenerationPlanner::new();
-        let prefill = planner
-            .plan(
-                &request,
-                cursor.project(std::iter::empty()),
-                TransitionIntent::IngestText {
-                    segment_index: 0,
-                    prompt_start: 0,
-                    token_ids: vec![1, 2, 3],
-                    new_blocks: vec![uniserve_core::BlockId(1), uniserve_core::BlockId(2)],
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("plan prefill");
-        let after_prefill = cursor.project([&prefill]);
-        let decode = planner
-            .plan(
-                &request,
-                after_prefill,
-                TransitionIntent::DecodeUnd {
-                    position: 3,
-                    token_id: 3,
-                    token_source: TokenSource::Wire,
-                    new_blocks: Vec::new(),
-                    spec_token_ids: None,
-                    token_count: 2,
-                    stop_token_ids: None,
-                    stop_terminal: true,
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("plan decode");
-
-        let projected = cursor.project([&prefill, &decode]);
-
-        assert_eq!(cursor.ingest.prompt_cursor, 0);
-        assert_eq!(cursor.und.logical_pos, 0);
-        assert_eq!(projected.prompt_cursor, 3);
-        assert_eq!(projected.logical_pos, 5);
-    }
-
-    #[test]
-    fn validated_transition_applies_exactly_once() {
-        let request = test_request(1, vec![1, 2]);
-        let mut cursor = GenerationCursor::new(GenerationPhase::Prefill, 4, false);
-        let mut transition = GenerationPlanner::new()
-            .plan(
-                &request,
-                cursor.project(std::iter::empty()),
-                TransitionIntent::IngestText {
-                    segment_index: 0,
-                    prompt_start: 0,
-                    token_ids: vec![1, 2],
-                    new_blocks: Vec::new(),
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("plan prefill");
-        transition.assign_op_id(5);
-        let result = SeqResult {
-            req_id: RequestId(1),
-            op_kind: Some(OpKind::PrefillUnd),
-            sampled_token_id: Some(3),
-            op_id: Some(5),
-            ..Default::default()
-        };
-        transition.validate_result(&result).expect("valid result");
-        cursor
-            .apply_transition(&transition, &result)
-            .expect("first application");
-        assert_eq!(cursor.ingest.prompt_cursor, 2);
-        assert_eq!(
-            cursor.apply_transition(&transition, &result),
-            Err(CursorApplyError::DuplicateOperation { op_id: 5 })
-        );
-    }
-
-    #[test]
-    fn decode_and_denoise_results_validate_operation_shape() {
-        let request = test_request(1, vec![1, 2]);
-        let mut decode = GenerationPlanner::new()
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::DecodeUnd,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::DecodeUnd {
-                    position: 2,
-                    token_id: 2,
-                    token_source: TokenSource::Wire,
-                    new_blocks: Vec::new(),
-                    spec_token_ids: None,
-                    token_count: 1,
-                    stop_token_ids: None,
-                    stop_terminal: true,
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("plan decode");
-        decode.assign_op_id(8);
-        assert_eq!(
-            decode.validate_result(&SeqResult {
-                req_id: RequestId(1),
-                op_kind: Some(OpKind::PrefillUnd),
-                op_id: Some(8),
-                sampled_token_id: Some(3),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::OpKindMismatch {
-                expected: OpKind::DecodeUnd,
-                actual: Some(OpKind::PrefillUnd),
-            })
-        );
-        assert_eq!(
-            decode.validate_result(&SeqResult {
-                req_id: RequestId(1),
-                op_kind: Some(OpKind::DecodeUnd),
-                op_id: Some(8),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingSampledToken {
-                kind: OpKind::DecodeUnd,
-            })
-        );
-        assert_eq!(
-            decode.validate_result(&SeqResult {
-                req_id: RequestId(1),
-                op_kind: Some(OpKind::DecodeUnd),
-                op_id: Some(8),
-                sampled_token_id: Some(4),
-                sampled_token_ids: Some(vec![3, 4]),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::TextTokenCountMismatch {
-                min: 1,
-                max: 1,
-                actual: 2,
-            })
-        );
-
-        let mut generation = request;
-        generation.constraint = GenerationConstraint::Default;
-        generation.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 9 };
-        generation.behavior =
-            GenerationBehaviorDescriptor::resolve(generation.constraint, &generation.policy);
-        let mut denoise = GenerationPlanner::new()
-            .plan(
-                &generation,
-                CursorProjection {
-                    phase: GenerationPhase::DenoiseGen,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::DenoiseGen {
-                    image_id: 1,
-                    position: 2,
-                    start_step: 4,
-                    step_count: 3,
-                    cfg: uniserve_core::CfgParams {
-                        branch_count: 3,
-                        text_scale: 4.0,
-                        img_scale: 1.5,
-                        renorm_type: "none".to_string(),
-                        renorm_min: 0.0,
-                        interval: (0.0, 1.0),
-                    },
-                    image_prompt: None,
-                    latent_units: 64,
-                    scratch_units: 3,
-                    host_scratch_tokens: 12,
-                },
-            )
-            .expect("plan denoise");
-        denoise.assign_op_id(9);
-        assert_eq!(denoise.resources.latent_units, 64);
-        assert_eq!(denoise.resources.scratch_units, 3);
-        assert_eq!(denoise.resources.host_scratch_tokens, 12);
-        assert_eq!(
-            denoise.resources.replayability_after_apply,
-            Replayability::NotReplayable
-        );
-        assert_eq!(
-            denoise.validate_result(&SeqResult {
-                req_id: RequestId(1),
-                op_kind: Some(OpKind::DenoiseGen),
-                op_id: Some(9),
-                num_steps_done: Some(6),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::DenoiseStepMismatch {
-                expected: 7,
-                actual: 6,
-            })
-        );
-    }
-
-    #[test]
-    fn generated_logprob_results_must_match_the_sampled_token() {
-        let mut request = test_request(1, vec![1, 2]);
-        request.sampling.return_logprobs = true;
-        request.sampling.n_logprobs = 2;
-        let mut decode = GenerationPlanner::new()
-            .plan(
-                &request,
-                CursorProjection {
-                    phase: GenerationPhase::DecodeUnd,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::DecodeUnd {
-                    position: 2,
-                    token_id: 2,
-                    token_source: TokenSource::Wire,
-                    new_blocks: Vec::new(),
-                    spec_token_ids: None,
-                    token_count: 1,
-                    stop_token_ids: None,
-                    stop_terminal: true,
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("plan decode");
-        decode.assign_op_id(21);
-
-        let result = |top_logprobs| SeqResult {
-            req_id: RequestId(1),
-            op_kind: Some(OpKind::DecodeUnd),
-            op_id: Some(21),
-            sampled_token_id: Some(7),
-            top_logprobs,
-            ..Default::default()
-        };
-        assert_eq!(
-            decode.validate_result(&result(None)),
-            Err(TransitionValidationError::MissingGeneratedLogprobs { token_id: 7 })
-        );
-        assert_eq!(
-            decode.validate_result(&result(Some(vec![uniserve_worker_wire::TokenLogprob(
-                8, -0.1, 1,
-            )]))),
-            Err(TransitionValidationError::GeneratedLogprobTokenMismatch {
-                expected: 7,
-                actual: 8,
-            })
-        );
-        assert_eq!(
-            decode.validate_result(&result(Some(vec![
-                uniserve_worker_wire::TokenLogprob(7, -0.2, 2),
-                uniserve_worker_wire::TokenLogprob(7, -0.1, 1),
-            ]))),
-            Err(TransitionValidationError::InvalidGeneratedLogprobCandidates)
-        );
-        decode
-            .validate_result(&result(Some(vec![
-                uniserve_worker_wire::TokenLogprob(7, -0.2, 1),
-                uniserve_worker_wire::TokenLogprob(8, -0.1, 1),
-            ])))
-            .expect("valid generated candidates with tied vocab ranks");
-    }
-
-    #[test]
-    fn prompt_logprob_plan_scores_exact_prefill_positions() {
-        let mut request = test_request(1, vec![10, 11, 12]);
-        request.sampling.return_prompt_logprobs = true;
-        request.sampling.n_prompt_logprobs = 1;
-        let mut prefill = GenerationPlanner::new()
-            .plan(
-                &request,
+                &request(9, vec![11, 12]),
                 CursorProjection {
                     phase: GenerationPhase::Prefill,
                     prompt_cursor: 0,
@@ -2386,186 +2087,104 @@ mod tests {
                 TransitionIntent::IngestText {
                     segment_index: 0,
                     prompt_start: 0,
-                    token_ids: vec![10, 11, 12],
+                    token_ids: vec![11, 12],
                     new_blocks: Vec::new(),
                     recent_tokens: None,
                     allowed_tokens: None,
                     suppress_tokens: None,
                 },
             )
-            .expect("plan prefill");
-        assert!(prefill.op.return_all_logits);
-        prefill.assign_op_id(22);
-        let valid = SeqResult {
-            req_id: RequestId(1),
-            op_kind: Some(OpKind::PrefillUnd),
-            op_id: Some(22),
-            sampled_token_id: Some(13),
-            prompt_logprobs: Some(vec![
-                vec![uniserve_worker_wire::TokenLogprob(11, -0.2, 1)],
-                vec![uniserve_worker_wire::TokenLogprob(12, -0.3, 1)],
-            ]),
-            ..Default::default()
-        };
-        prefill
-            .validate_result(&valid)
-            .expect("exact prompt positions");
-
-        let mut wrong = valid;
-        wrong.prompt_logprobs.as_mut().expect("positions")[1][0].0 = 99;
-        assert_eq!(
-            prefill.validate_result(&wrong),
-            Err(TransitionValidationError::PromptLogprobTokenMismatch {
-                position: 1,
-                expected: 12,
-                actual: 99,
-            })
-        );
+            .expect("plan sequence extension")
     }
 
     #[test]
-    fn non_replayable_cursor_stays_non_replayable_through_text_decode() {
-        let request = test_request(5, vec![1, 2]);
-        let mut cursor = GenerationCursor::new(GenerationPhase::DecodeUnd, 4, false);
-        cursor.replay.replayability = Replayability::NotReplayable;
-        cursor.und.logical_pos = 2;
-        cursor.und.physical_kv_len = 2;
-        let mut decode = GenerationPlanner::new()
-            .plan(
-                &request,
-                cursor.project(std::iter::empty()),
-                TransitionIntent::DecodeUnd {
-                    position: 2,
-                    token_id: 2,
-                    token_source: TokenSource::Wire,
-                    new_blocks: Vec::new(),
-                    spec_token_ids: None,
-                    token_count: 1,
-                    stop_token_ids: None,
-                    stop_terminal: true,
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
+    fn planner_emits_the_closed_sequence_variant() {
+        let transition = prefill_transition();
+        assert_eq!(transition.operation_type, OperationType::SequenceExtend);
+        let Operation::Sequence(sequence) = transition.op.operation else {
+            panic!("expected sequence operation");
+        };
+        assert_eq!(sequence.mode, SequenceMode::Extend);
+        assert_eq!(sequence.position, (0, 2));
+        let SequenceInput::Tokens(tokens) = sequence.input else {
+            panic!("expected token input");
+        };
+        assert_eq!(tokens.token_ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn transition_accepts_only_the_sealed_typed_result() {
+        let mut transition = prefill_transition();
+        transition.assign_envelope(3, 17, 5);
+        let result = OperationResult {
+            session_id: RequestId(9),
+            epoch: 3,
+            op_id: 17,
+            base_version: 5,
+            result_version: 6,
+            delta: ResultDelta::Sequence(SequenceDelta {
+                effect: SequenceEffect {
+                    kv_tokens: Some(2),
+                    sampled_token_ids: vec![13],
+                    ..SequenceEffect::default()
                 },
-            )
-            .expect("plan decode");
-        assert_eq!(
-            decode.resources.replayability_after_apply,
-            Replayability::NotReplayable
-        );
-        decode.assign_op_id(12);
-        let result = SeqResult {
-            req_id: RequestId(5),
-            op_kind: Some(OpKind::DecodeUnd),
-            op_id: Some(12),
-            sampled_token_id: Some(3),
-            ..Default::default()
+            }),
         };
-        decode.validate_result(&result).expect("validate decode");
-        cursor
-            .apply_transition(&decode, &result)
-            .expect("apply decode");
-        assert_eq!(cursor.replay.replayability, Replayability::NotReplayable);
+        assert_eq!(transition.validate_result(&result), Ok(()));
+
+        let stale = OperationResult {
+            result_version: 7,
+            ..result
+        };
+        assert!(matches!(
+            transition.validate_result(&stale),
+            Err(TransitionValidationError::VersionMismatch { .. })
+        ));
     }
 
     #[test]
-    fn generated_image_commit_validates_dimensions_and_feedback_writeback() {
-        let mut request = test_request(3, vec![1, 2]);
-        request.constraint = GenerationConstraint::Default;
-        request.image.height = 480;
-        request.image.width = 640;
-        request.policy.trigger = uniserve_core::TriggerPolicyDescriptor::Token { token_id: 9 };
-        request.policy.feedback = Some(uniserve_core::GeneratedImageFeedbackRecipe {
-            commit: uniserve_core::CommitRecipe::CommitGenThenWriteback,
-            writeback: uniserve_core::FeedbackWriteback::DirectKv,
-            next_und_token: uniserve_core::FeedbackNextToken::EndOfImage,
-            logical_positions: 1,
-            physical_kv_tokens: ImageKvEffect::Exact { tokens: 1 },
-        });
-        request.behavior =
-            GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
-        let mut commit = GenerationPlanner::new()
+    fn decode_burst_validation_accepts_every_returned_token() {
+        let mut transition = GenerationPlanner::new()
             .plan(
-                &request,
+                &request(9, vec![11, 12]),
                 CursorProjection {
-                    phase: GenerationPhase::CommitGen,
+                    phase: GenerationPhase::DecodeUnd,
                     prompt_cursor: 2,
                     logical_pos: 2,
                     physical_kv_len: 2,
-                    replayability: Replayability::NotReplayable,
+                    replayability: Replayability::Replayable,
                 },
-                TransitionIntent::CommitGen {
-                    image_id: 1,
+                TransitionIntent::DecodeUnd {
                     position: 2,
+                    token_id: 13,
+                    token_source: TokenSource::Wire,
                     new_blocks: Vec::new(),
+                    spec_token_ids: None,
+                    token_count: 8,
+                    stop_token_ids: None,
+                    stop_terminal: false,
                     recent_tokens: None,
                     allowed_tokens: None,
                     suppress_tokens: None,
                 },
             )
-            .expect("plan commit");
-        commit.assign_op_id(10);
-        let valid_png = png_b64(640, 480);
-        assert_eq!(
-            commit.validate_result(&SeqResult {
-                req_id: RequestId(3),
-                op_kind: Some(OpKind::CommitGen),
-                op_id: Some(10),
-                image_hw: Some((640, 480)),
-                image_png_b64: Some(valid_png.clone()),
-                locator: Some("image".to_string()),
-                ..Default::default()
+            .expect("plan decode burst");
+        transition.assign_envelope(3, 18, 6);
+        let result = OperationResult {
+            session_id: RequestId(9),
+            epoch: 3,
+            op_id: 18,
+            base_version: 6,
+            result_version: 7,
+            delta: ResultDelta::Sequence(SequenceDelta {
+                effect: SequenceEffect {
+                    sampled_token_ids: vec![14, 15, 16, 17, 18, 19, 20, 21],
+                    kv_tokens: Some(10),
+                    ..SequenceEffect::default()
+                },
             }),
-            Err(TransitionValidationError::ImageDimensionsMismatch {
-                expected: (480, 640),
-                actual: (640, 480),
-            })
-        );
-        assert_eq!(
-            commit.validate_result(&SeqResult {
-                req_id: RequestId(3),
-                op_kind: Some(OpKind::CommitGen),
-                op_id: Some(10),
-                image_hw: Some((480, 640)),
-                image_png_b64: Some(valid_png.clone()),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingImageLocator)
-        );
-        assert_eq!(
-            commit.validate_result(&SeqResult {
-                req_id: RequestId(3),
-                op_kind: Some(OpKind::CommitGen),
-                op_id: Some(10),
-                image_hw: Some((480, 640)),
-                locator: Some("image".to_string()),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::MissingImageArtifact)
-        );
-        assert_eq!(
-            commit.validate_result(&SeqResult {
-                req_id: RequestId(3),
-                op_kind: Some(OpKind::CommitGen),
-                op_id: Some(10),
-                image_hw: Some((480, 640)),
-                image_png_b64: Some("cG5n".to_string()),
-                locator: Some("image".to_string()),
-                ..Default::default()
-            }),
-            Err(TransitionValidationError::InvalidImageArtifact)
-        );
-        assert_eq!(
-            commit.validate_result(&SeqResult {
-                req_id: RequestId(3),
-                op_kind: Some(OpKind::CommitGen),
-                op_id: Some(10),
-                image_hw: Some((480, 640)),
-                image_png_b64: Some(valid_png),
-                locator: Some("image".to_string()),
-                ..Default::default()
-            }),
-            Ok(())
-        );
+        };
+
+        assert_eq!(transition.validate_result(&result), Ok(()));
     }
 }

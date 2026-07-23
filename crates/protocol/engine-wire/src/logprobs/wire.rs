@@ -21,9 +21,4 @@ pub struct WireLogprobs {
     /// `selected_token_ranks` for prompt logprobs. Rust keeps one neutral field
     /// because both payloads share the same wire representation.
     pub token_ranks: WireNdArray,
-    /// Preserved only for wire compatibility with batch-level Python tensors.
-    /// Scheduler-sliced per-request outputs should emit `None` here, and
-    /// the semantic Rust decoder rejects any other value.
-    #[serde(default)]
-    pub cu_num_generated_tokens: Option<Vec<usize>>,
 }

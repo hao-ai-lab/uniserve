@@ -35,7 +35,7 @@ _NONE_SENTINELS = frozenset({"", "none", "null"})
 # Default backend/dtype strings shared across worker subsystems.
 DEFAULT_ATTENTION_BACKEND = "auto"
 DEFAULT_FALLBACK_BACKEND = "torch_sdpa"
-DEFAULT_KV_DTYPE = "bf16"
+DEFAULT_KV_DTYPE = "bfloat16"
 DEFAULT_COMPILE_BACKEND = "inductor"
 
 

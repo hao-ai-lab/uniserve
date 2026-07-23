@@ -1,348 +1,322 @@
-"""Model-backed worker built around the shared :class:`ModelExecutor`."""
+"""Composition root for one canonical model-backed worker."""
 
 from __future__ import annotations
 
-import inspect
 import logging
-from collections.abc import Mapping
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
 
-from uniserve_worker.execution.runner import ExecutorConfig, ModelExecutor
-from uniserve_worker.execution.segment import SegmentExecutor
+from torch import nn
 
-from ..backends.attention import (
-    get_attention_backend,
-    has_attention_backend,
-    normalize_attention_backend_name,
-)
-from ..contracts.caps import Caps, validate_caps
-from ..contracts.model_family import ModelFamilyDescriptor, ModelLoadScope
-from ..contracts.model_protocols import UniModel
-from ..foundation.env import DEFAULT_ATTENTION_BACKEND
+from ..batch import Batch, ExecutionResult
+from ..capabilities import RequestKind
+from ..execution import ModelExecutor, ModelRunner
+from ..forward import AttentionSelection
 from ..foundation.errors import capability_mismatch
-from ..foundation.sizing import DEFAULT_BLOCK_SIZE
-from ..nn.mesh import get_current_mesh
-from ..processors import build_image_input_stage
+from ..foundation.runtime_config import ExecutionConfig
+from ..nn.mesh import DeviceMesh
 from ..runtime.adapter_store import AdapterStore
+from ..runtime.capabilities import resolve_capabilities
+from ..runtime.execution_trace import ExecutionPhase, ExecutionTrace, OperationTrace
+from ..runtime.graph_store import GraphStore
+from ..runtime.kv_store import KvStore
+from ..runtime.latent_store import LatentStore
+from ..runtime.mesh_store import MeshStore
 from ..runtime.mover import Mover
-from ..runtime.resources import ResourceRuntime
-from .protocol import BaseWorker, ResultPolicy
-
-if TYPE_CHECKING:
-    from ..runtime.residency import ResidencyManager
+from ..runtime.product_store import ProductStore
+from ..runtime.replay import ReplayStore
+from ..runtime.request_session import SessionStore
+from ..runtime.residency import ResidencyStore
+from ..runtime.snapshot_store import SnapshotProvider, SnapshotRef
+from ..spec import DeploymentOverlay, ModelSpec, OperationType, resolved_digest
+from .protocol import WorkerContract
 
 logger = logging.getLogger(__name__)
 
-# Controls the worker serves against system-owned state; a model declares them
-# as capability only and implements no method.
-ADAPTER_CONTROLS = frozenset({"load_lora", "unload_lora"})
-WORKER_SERVED_CONTROLS = ADAPTER_CONTROLS | {
-    "copy_blocks",
-    "free_encoder",
-    "reset_prefix_cache",
-}
 
-
-def free_encoder_handles(products: Any, handles: Any) -> None:
-    """Release intermediate encoder-output products for the given handles."""
-    if products is None:
-        return
-    for handle in handles or []:
-        products.pop_intermediate(int(handle))
-
-
-def bind_model_residency(model: UniModel, residency: "ResidencyManager | None") -> None:
-    """Hand the system-built residency to the model surfaces that read it.
-
-    The manager itself lands on the contract-declared ``model.residency``; the
-    pool aliases land only on the slots the model declares.
-    """
-    if residency is None:
-        return
-    model.residency = residency
-    for name, pool in (
-        ("kv_pool", residency.kv),
-        ("scratch_pool", residency.scratch),
-        ("gen_scratch_pool", residency.gen_scratch),
-    ):
-        if hasattr(model, name):
-            setattr(model, name, pool)
-
-
-def bind_model_segment_execution(model: UniModel, image_stage: Any = None) -> None:
-    """Build the system-owned segment executor over the model's family adapter.
-
-    A model that lowers heterogeneous operations through segment execution
-    declares its adapter surface via ``segment_adapter()``; the executor lands
-    on the contract-declared ``model.segment_executor`` and stages encode-op
-    image inputs through ``image_stage`` ahead of the adapter's neural encode.
-    """
-    adapter = model.segment_adapter()
-    if adapter is None:
-        return
-    model.segment_executor = SegmentExecutor(adapter, image_stage=image_stage)
-
-
-def build_model_adapter_store(model: UniModel) -> AdapterStore | None:
-    """Build the system-owned adapter store over the model's module graph.
-
-    Adapter state is system-owned: the worker serves the load_lora/unload_lora
-    controls against the store, and the store keeps pre-merge copies of only
-    the parameters an adapter touches. A model constructed without loaded
-    weights has no module graph yet and therefore no store; adapter controls
-    against such a worker fail with a capability mismatch.
-    """
-    if model.adapter_mode == "none":
-        return None
-    module = getattr(model, "model", None)
-    if module is None:
-        return None
-    return AdapterStore(module)
-
-
-class ModelWorker(BaseWorker):
-    """Owns one loaded model and its request-to-forward execution runner."""
+class ModelWorker:
+    """Own one ready model and all system authorities around its raw forward."""
 
     def __init__(
         self,
-        model: UniModel,
+        model: nn.Module,
         *,
-        allowed_ops: frozenset[str] | None = None,
-        pipeline_depth: int = 1,
-        result_policy: ResultPolicy = ResultPolicy.DEFER_WHEN_AVAILABLE,
-        block_size: int = DEFAULT_BLOCK_SIZE,
-        kv_token_capacity: int | None = None,
-        attention_backend: str | None = None,
+        mesh: DeviceMesh,
+        model_spec: ModelSpec,
+        deployment: DeploymentOverlay,
+        attention: AttentionSelection,
+        execution: ExecutionConfig,
+        tokenizer: object | None,
+        allowed_operation_types: frozenset[OperationType],
         defer_sampling: bool = False,
         transfer_backend: str = "local",
-        model_scope: ModelLoadScope = ModelLoadScope.WHOLE,
-        family_descriptor: ModelFamilyDescriptor | None = None,
-        simulation: bool = False,
-        spec_digest: str | None = None,
+        mooncake_device: str,
+        mooncake_protocol: str,
+        cross_process: bool = False,
+        model_spec_digest: str | None = None,
+        weight_digest: str | None = None,
+        pipeline_depth: int,
+        snapshot_dir: str | None = None,
+        restore_snapshots: bool = False,
     ) -> None:
-        super().__init__(block_size=block_size)
+        if not isinstance(model, nn.Module) or type(model).forward is nn.Module.forward:
+            raise capability_mismatch("model worker requires nn.Module.forward(ForwardBatch)")
+        if not isinstance(model_spec, ModelSpec) or not isinstance(deployment, DeploymentOverlay):
+            raise capability_mismatch("model worker requires canonical model and deployment specs")
         self.model = model
-        # Resolved ModelSpec + DeploymentOverlay identity from bootstrap; the
-        # caps wire schema carries no spec field yet, so the digest is logged
-        # here and scoped onto the executor's graph store.
-        self.spec_digest = spec_digest
-        if spec_digest is not None:
-            logger.info("model worker serving resolved spec digest=%s", spec_digest)
-        self.attention_backend = attention_backend or DEFAULT_ATTENTION_BACKEND
-        self.defer_sampling = bool(defer_sampling)
-        self.transfer_backend = str(transfer_backend)
-        self.model_scope = model_scope
-        # One transfer authority per worker: the Mover owns the register-once
-        # Transport and selects the und↔gen tower handoff for this deployment
-        # edge (validating the backend against a cross-process edge).
-        self.mover = Mover(
-            transfer_backend=self.transfer_backend,
-            cross_process=self.model_scope is not ModelLoadScope.WHOLE,
+        self.model_spec = model_spec
+        self.deployment = deployment
+        self.adapter_store = AdapterStore(
+            model,
+            weights=model_spec.weights,
+            base_digest=weight_digest,
         )
-        self.family_descriptor = family_descriptor or ModelFamilyDescriptor.from_model_class(
-            type(model)
+        self.weight_digest = self.adapter_store.base.digest
+        self.model_spec_digest = model_spec_digest or resolved_digest(model_spec, deployment)
+        if self.model_spec_digest != resolved_digest(model_spec, deployment):
+            raise capability_mismatch("loaded model-spec digest does not match its declarations")
+        declared = resolve_capabilities(
+            model_spec,
+            deployment,
+            model_spec_digest=self.model_spec_digest,
+            weight_digest=self.weight_digest,
         )
-        self.block_size = self._adjust_block_size(self.block_size)
-        self.kv_token_capacity = kv_token_capacity
-
-        declared_capabilities = self._caps_with_current_rank(
-            validate_caps(
-                self._build_model_capabilities(),
-                owner=f"{type(model).__name__}.ModelWorker",
+        if snapshot_dir is not None:
+            declared = replace(
+                declared,
+                supported_controls=(
+                    *declared.supported_controls,
+                    RequestKind.SNAPSHOT_SESSION,
+                    RequestKind.RESTORE_SESSION,
+                ),
             )
-        )
-        self._validate_declared_controls(declared_capabilities)
-        self._compile_contract(
-            declared_capabilities,
-            allowed_ops=(
-                allowed_ops
-                if allowed_ops is not None
-                else frozenset(declared_capabilities.supported_ops)
+        self._contract = WorkerContract.compile(
+            declared,
+            allowed_operation_types=allowed_operation_types,
+            system_operation_types=frozenset(
+                {OperationType.SEQUENCE_SAMPLE, OperationType.MATERIALIZE_FRAME}
             ),
             pipeline_depth=pipeline_depth,
-            result_policy=result_policy,
+            owner=type(self).__name__,
         )
-        self.model.configure_runtime(
-            block_size=self.block_size,
-            kv_token_capacity=self.kv_token_capacity,
-            caps=self.contract.capabilities.to_wire(),
+        self.residency = ResidencyStore.from_spec(
+            model_spec,
+            self._contract.capabilities,
+            deployment.resources,
+            device=deployment.device,
         )
-
-        tensor_store = None
-        if self.defer_sampling:
-            from ..runtime.tensor_store import TensorStore
-
-            tensor_store = TensorStore(transport=self.mover.transport)
-        resource_runtime = self._create_resource_runtime()
-        residency = self._create_residency_manager(resource_runtime)
-        bind_model_residency(self.model, residency)
-        image_stage = build_image_input_stage(self.model, self.family_descriptor)
-        bind_model_segment_execution(self.model, image_stage)
-        self.adapter_store = build_model_adapter_store(self.model)
-        self.model_executor = ModelExecutor(
-            model,
-            config=ExecutorConfig(simulation=bool(simulation), spec_digest=spec_digest),
-            attention_backend=self.attention_backend,
-            resource_runtime=resource_runtime,
-            image_input_stage=image_stage,
-            defer_sampling=self.defer_sampling,
-            tensor_store=tensor_store,
-            residency=residency,
+        self.kv = KvStore(self.residency.kv, self.residency.scratch)
+        self.sessions = SessionStore()
+        self.latents = LatentStore(
+            capacity_tokens=int(self._contract.capabilities.max_latent_size),
+            downsample=(1 if model_spec.flow is None else int(model_spec.flow.latent_downsample)),
         )
-        self._install_tower_handoff()
-
-    def execute(
-        self,
-        batch: Mapping[str, Any],
-        *,
-        defer_text_cpu_results: bool = False,
-    ) -> dict[str, Any]:
-        return self.model_executor.execute(
-            dict(batch),
-            defer_text_cpu_results=defer_text_cpu_results,
+        self.products = ProductStore(encoder_cache_budget=model_spec.inputs.encoder_cache_budget)
+        self.replay = ReplayStore()
+        self.mover = Mover(
+            transfer_backend=transfer_backend,
+            mooncake_device=mooncake_device,
+            mooncake_protocol=mooncake_protocol,
+            cross_process=bool(cross_process),
         )
+        self.graphs = GraphStore(
+            enabled=execution.cuda_graph,
+            prefill_enabled=execution.prefill_cuda_graph,
+            cache=model_spec.cache,
+            block_size=deployment.block_size,
+            spec_digest=self.model_spec_digest,
+        )
+        self.trace = ExecutionTrace(self.model_spec_digest)
+        self.executor = ModelExecutor(
+            spec=model_spec,
+            deployment=deployment,
+            runner=ModelRunner(model, self.graphs, self.trace),
+            attention=attention,
+            sessions=self.sessions,
+            kv=self.kv,
+            latents=self.latents,
+            products=self.products,
+            replay=self.replay,
+            adapters=self.adapter_store,
+            mesh=MeshStore(mesh),
+            transport=self.mover.transport,
+            tokenizer=tokenizer,
+            model_spec_digest=self.model_spec_digest,
+            weight_digest=self.weight_digest,
+            allowed_operation_types=frozenset(
+                self._contract.capabilities.supported_operation_types
+            ),
+            trace=self.trace,
+            defer_sampling=defer_sampling,
+        )
+        self.snapshot_provider: SnapshotProvider | None = None
+        if snapshot_dir is not None:
+            caps = self._contract.capabilities
+            self.snapshot_provider = SnapshotProvider(
+                snapshot_dir,
+                model_spec_digest=self.model_spec_digest,
+                weight_digest=self.weight_digest,
+                topology={
+                    "rank": caps.rank.to_wire(),
+                    "model_scope": deployment.model_scope,
+                    "block_size": caps.block_size,
+                    "num_blocks": caps.num_blocks,
+                    "num_layers": caps.num_layers,
+                },
+                device=deployment.device,
+                sessions=self.sessions,
+                kv=self.kv,
+                latents=self.latents,
+                products=self.products,
+                replay=self.replay,
+                adapters=self.adapter_store,
+                transport=self.mover.transport,
+            )
+            restored = (
+                self.snapshot_provider.restore_latest() if restore_snapshots else ()
+            )
+            self._contract = replace(
+                self._contract,
+                capabilities=replace(
+                    self._contract.capabilities,
+                    restored_sessions=tuple(
+                        sorted(reference.session_id for reference in restored)
+                    ),
+                ),
+            )
+            logger.info("restored %d durable worker sessions", len(restored))
 
-    def drop_request(self, request_id: int) -> None:
-        self.model_executor.drop_request(int(request_id))
+    @property
+    def contract(self) -> WorkerContract:
+        return self._contract
 
-    def copy_blocks(self, copies: Any) -> None:
-        del copies
+    def execute(self, batch: Batch) -> ExecutionResult:
+        result = self.executor.execute(batch)
+        if self.snapshot_provider is not None:
+            result = self.snapshot_provider.snapshot_execution(
+                {operation.session_id for operation in batch.operations},
+                result,
+            )
+        return result
 
-    def load_lora(self, lora_id: int, lora_path: str) -> None:
-        count = self._require_adapter_store().load(lora_id, lora_path)
-        logger.info("merged LoRA adapter %s into %d parameters", lora_id, count)
+    def drop_session(self, session_id: int) -> None:
+        session_id = int(session_id)
+        session = self.sessions.peek(session_id)
+        self._release_records(self.products.session_records(session_id))
+        self.products.drop(session_id)
+        self.latents.drop_session(session_id)
+        self.replay.drop_session(session_id)
+        self.kv.drop(session_id)
+        self.sessions.drop(session_id)
+        if self.snapshot_provider is not None:
+            self.snapshot_provider.drop_session(session_id)
+        if session is not None:
+            self.trace.emit(
+                ExecutionPhase.CLEANUP,
+                (
+                    OperationTrace(
+                        session_id=session.session_id,
+                        epoch=session.epoch,
+                        op_id=0 if session.last_op_id is None else session.last_op_id,
+                        version=session.version,
+                    ),
+                ),
+            )
 
-    def unload_lora(self, lora_id: int) -> None:
-        count = self._require_adapter_store().unload(lora_id)
-        if count:
-            logger.info("unmerged LoRA adapter %s", lora_id)
+    def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None:
+        self.kv.copy(copies)
+        if self.snapshot_provider is not None:
+            session_ids = set(self.sessions.session_ids())
+            if session_ids:
+                self.snapshot_provider.snapshot_sessions(session_ids)
 
-    def free_encoder(self, handles: Any) -> None:
-        free_encoder_handles(self.model_executor.product_store, handles)
+    def load_adapter(self, adapter_id: int, adapter_path: str) -> None:
+        if self.deployment.adapter_mode == "none":
+            raise capability_mismatch("this worker does not declare adapter controls")
+        if self.sessions.session_ids():
+            raise capability_mismatch("adapter changes require no live sessions")
+        count = self.adapter_store.load(int(adapter_id), str(adapter_path))
+        if self.snapshot_provider is not None:
+            self.snapshot_provider.snapshot_global()
+        logger.info("loaded adapter %s with %d parameter overrides", adapter_id, count)
+
+    def unload_adapter(self, adapter_id: int) -> None:
+        if self.deployment.adapter_mode == "none":
+            raise capability_mismatch("this worker does not declare adapter controls")
+        if self.sessions.session_ids():
+            raise capability_mismatch("adapter changes require no live sessions")
+        self.adapter_store.unload(int(adapter_id))
+        if self.snapshot_provider is not None:
+            self.snapshot_provider.snapshot_global()
+
+    def release_products(self, handles: tuple[int, ...]) -> None:
+        records = tuple(
+            record for handle in handles if (record := self.products.get(int(handle))) is not None
+        )
+        self._release_records(records)
+        self.products.release(tuple(int(handle) for handle in handles))
+        affected = self.sessions.discard_product_handles({int(handle) for handle in handles})
+        if self.snapshot_provider is not None and affected:
+            self.snapshot_provider.snapshot_sessions(affected)
 
     def reset_prefix_cache(self) -> None:
-        pass
+        return None
 
-    def sleep(self) -> None:
-        sleep = getattr(self.model, "sleep")
-        sleep()
+    def snapshot_session(self, session_id: int) -> SnapshotRef:
+        if self.snapshot_provider is None:
+            raise capability_mismatch("this worker has no configured snapshot provider")
+        return self.snapshot_provider.snapshot_session(int(session_id))
 
-    def wake_up(self) -> None:
-        wake_up = getattr(self.model, "wake_up")
-        wake_up()
+    def restore_session(self, reference: SnapshotRef) -> None:
+        if self.snapshot_provider is None:
+            raise capability_mismatch("this worker has no configured snapshot provider")
+        self.snapshot_provider.restore(reference)
 
-    def resource_pressure(self) -> list[dict[str, Any]]:
-        return self.model_executor.resource_runtime.pressure()
-
-    def _build_model_capabilities(self) -> Caps:
-        arguments = {
-            "block_size": self.block_size,
-            "kv_token_capacity": self.kv_token_capacity,
+    def resource_pressure(self) -> list[dict[str, object]]:
+        caps = self._contract.capabilities
+        counts = {
+            "kv_block": self.kv.resident_block_count(),
+            "scratch": self.kv.scratch_token_count(),
+            "image_latent": self.latents.resident_token_count(),
+            "encoder_output": self.products.encoder_output_count(),
+            "adapter": self.adapter_store.loaded_count(),
         }
-        signature = inspect.signature(self.model.caps)
-        accepts_kwargs = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-        supported_arguments = (
-            arguments
-            if accepts_kwargs
-            else {key: value for key, value in arguments.items() if key in signature.parameters}
-        )
-        capabilities = self.model.caps(**supported_arguments)
-        if isinstance(capabilities, Caps):
-            return capabilities
-        raise capability_mismatch(f"{type(self.model).__name__}.caps() must return Caps")
-
-    @staticmethod
-    def _caps_with_current_rank(capabilities: Caps) -> Caps:
-        mesh = get_current_mesh()
-        return replace(
-            capabilities,
-            tp_rank=int(mesh.tp_rank),
-            tp_size=int(mesh.tp_size),
-        )
-
-    def _create_residency_manager(
-        self, resource_runtime: ResourceRuntime
-    ) -> "ResidencyManager | None":
-        from ..runtime.residency import ResidencyManager
-
-        generation_spec = self.model.gen_residency_spec()
-        if generation_spec is not None:
-            return ResidencyManager.build_gen(generation_spec, ledger=resource_runtime)
-        specification = self.model.kv_cache_spec()
-        if specification is None:
-            return None
-        capabilities = self.contract.capabilities
-        device = str(getattr(self.model, "device", "cuda") or "cuda")
-        return ResidencyManager.build(
-            specification,
-            num_blocks=int(capabilities.num_blocks),
-            block_size=int(capabilities.block_size),
-            device=device,
-            ledger=resource_runtime,
-        )
-
-    def _create_resource_runtime(self) -> ResourceRuntime:
-        capabilities = self.contract.capabilities
         totals = {
-            "kv_block": int(capabilities.num_blocks),
-            "scratch": int(capabilities.scratch_capacity_tokens),
-            "image_latent": int(capabilities.max_latent_size),
-            "encoder_output": int(capabilities.encoder_cache_budget or 0),
-            "adapter": 0,
+            "kv_block": int(caps.num_blocks),
+            "scratch": int(caps.scratch_capacity_tokens),
+            "image_latent": int(caps.max_latent_size),
+            "encoder_output": int(caps.encoder_cache_budget),
+            "adapter": 1,
         }
-        return ResourceRuntime(
-            capabilities.resource_classes or ("kv_block",),
-            totals=totals,
+        return [
+            _pressure(value.value, counts[value.value], totals[value.value])
+            for value in caps.resource_classes
+        ]
+
+    def close(self) -> None:
+        self.graphs.close()
+        self.mover.close()
+
+    def _release_records(self, records: tuple[object, ...]) -> None:
+        from ..runtime.product_store import ProductRecord
+        from ..runtime.transfer import Locator
+
+        for record in records:
+            if isinstance(record, ProductRecord) and record.locator:
+                self.mover.transport.release(Locator.from_wire_json(record.locator))
+
+
+def _pressure(resource_class: str, used: int, total: int) -> dict[str, object]:
+    if used < 0 or total < 0 or used > total:
+        raise RuntimeError(
+            f"resource pressure invariant failed for {resource_class}: used={used}, total={total}"
         )
+    return {
+        "class": resource_class,
+        "total": total,
+        "used": used,
+        "evictable": 0,
+        "free": total - used,
+    }
 
-    def _require_adapter_store(self) -> AdapterStore:
-        if self.adapter_store is None:
-            raise capability_mismatch("adapter controls require loaded model weights")
-        return self.adapter_store
 
-    def _validate_declared_controls(self, capabilities: Caps) -> None:
-        for control in capabilities.supported_controls:
-            name = str(control)
-            if name in WORKER_SERVED_CONTROLS:
-                if name in ADAPTER_CONTROLS and capabilities.adapter_mode == "none":
-                    raise capability_mismatch(
-                        f"control {name!r} is served by the worker adapter store and "
-                        "requires a non-'none' adapter_mode"
-                    )
-                continue
-            if not callable(getattr(self.model, name, None)):
-                raise capability_mismatch(
-                    f"model declares control {control!r} but does not implement it"
-                )
-
-    def _adjust_block_size(self, block_size: int) -> int:
-        backend_name = normalize_attention_backend_name(self.attention_backend)
-        if backend_name == "auto" or not has_attention_backend(backend_name):
-            return block_size
-        multiple = get_attention_backend(backend_name).capabilities().paged_block_size_multiple
-        if multiple <= 1 or block_size % multiple == 0:
-            return block_size
-        adjusted = ((block_size + multiple - 1) // multiple) * multiple
-        logger.warning(
-            "%s requires block_size to be a multiple of %d; adjusting %d to %d",
-            backend_name,
-            multiple,
-            block_size,
-            adjusted,
-        )
-        return adjusted
-
-    def _install_tower_handoff(self) -> None:
-        """Hand the Mover-selected und↔gen crossing to the family transfer session.
-
-        The model contributes only its tower geometry declaration through the
-        session; it never sees transport objects.
-        """
-        session = getattr(self.model, "tower_session", None)
-        if session is None:
-            return
-        session.use_tower_handoff(self.mover.tower_handoff(session.tower_binding))
+__all__ = ["ModelWorker"]

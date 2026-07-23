@@ -17,7 +17,6 @@ from .core import (
 from .facade import (
     add_rms_norm,
     attention,
-    attention_dispatcher,
     can_run_attention,
     qk_norm,
     qk_norm_packed_rope,
@@ -59,7 +58,6 @@ __all__ = [
     "TpAllReduceReq",
     "add_rms_norm",
     "attention",
-    "attention_dispatcher",
     "can_run_attention",
     "qk_norm",
     "qk_norm_packed_rope",

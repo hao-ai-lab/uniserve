@@ -5,7 +5,6 @@ from typing import Any
 
 import torch
 
-from ...contracts.forward_context import get_forward_context
 from ...foundation.env import env_optional_flag
 from ...foundation.triton_compat import triton_device_supported, triton_fused_layers_enabled
 from ..paged_kv_math import decode_write_locations, paged_kv_write
@@ -203,9 +202,6 @@ def _triton_decode_indices_enabled(device: torch.device | str) -> bool:
     return triton_fused_layers_enabled() and triton_device_supported(device)
 
 
-_USE_FORWARD_CONTEXT_PLAN = object()
-
-
 def _write_decode_token(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -213,9 +209,9 @@ def _write_decode_token(
     cache_seqlens: torch.Tensor,
     k_current: torch.Tensor,
     v_current: torch.Tensor,
-    plan: Any = _USE_FORWARD_CONTEXT_PLAN,
+    plan: Any,
 ) -> None:
-    page_ids, offsets = _decode_write_locations_from_context(
+    page_ids, offsets = _decode_write_locations_from_plan(
         block_table,
         cache_seqlens,
         int(k_cache.shape[1]),
@@ -249,20 +245,15 @@ def _decode_effective_seqlens(
     return cache_seqlens + current_tokens
 
 
-def _decode_write_locations_from_context(
+def _decode_write_locations_from_plan(
     block_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_size: int,
     *,
     batch_size: int,
     device: torch.device,
-    plan: Any = _USE_FORWARD_CONTEXT_PLAN,
+    plan: Any,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Callers on the forward path pass ``plan`` explicitly; the sentinel
-    # default falls back to the active forward context so direct callers keep
-    # the original global-reach behavior.
-    if plan is _USE_FORWARD_CONTEXT_PLAN:
-        plan = getattr(get_forward_context(), "attention_plan", None)
     page_ids = getattr(plan, "decode_page_ids", None)
     offsets = getattr(plan, "decode_page_offsets", None)
     if (

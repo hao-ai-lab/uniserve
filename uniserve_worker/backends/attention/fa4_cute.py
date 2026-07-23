@@ -13,12 +13,11 @@ from typing import Any, Protocol
 
 import torch
 
-from ...contracts.forward_context import get_forward_context
+from ...forward import ForwardContext
 from ...foundation.sizing import ceil_div
 from ..paged_kv_math import paged_kv_write, write_locations
 from .base import AttentionCapabilities
 from .layout import QKVLayout, normalize_kv, normalize_to
-from .registry import register_attention_backend
 
 __all__ = [
     'Fa4CuteAttentionBackend',
@@ -114,7 +113,9 @@ class Fa4CuteAttentionBackend:
         causal: bool,
         scale: float,
         attn_mask: torch.Tensor | None = None,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
+        del context
         if attn_mask is not None:
             raise RuntimeError("fa4_cute backend does not accept explicit dense masks")
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -146,6 +147,7 @@ class Fa4CuteAttentionBackend:
         v: torch.Tensor | None = None,
         causal: bool,
         scale: float,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         q_blh, restore = normalize_to(q, QKVLayout.BLHD)
         _validate_unified_trunk_geometry(
@@ -167,7 +169,10 @@ class Fa4CuteAttentionBackend:
                 raise ValueError("current paged K/V must match q batch and each other")
             _write_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, k_blh, v_blh)
             live_seqlens += int(k_blh.shape[1])
-        max_seqlen_k = _metadata_context_len(0)
+        max_seqlen_k = _metadata_context_len(
+            None if context is None else context.attention,
+            0,
+        )
         if max_seqlen_k <= 0:
             max_seqlen_k = int(live_seqlens.max().item()) if live_seqlens.numel() else 0
 
@@ -204,6 +209,7 @@ class Fa4CuteAttentionBackend:
         scale: float | None = None,
         use_prefix_bounds: bool = False,
         fully_visible: bool = False,
+        context: ForwardContext | None = None,
     ) -> torch.Tensor:
         """Run the hybrid ``visible_end`` mask path.
 
@@ -211,9 +217,12 @@ class Fa4CuteAttentionBackend:
         always padded [B,max_q] and indexed locally per sequence.
         """
 
+        del context
         _validate_unified_trunk_geometry(q.shape[-1], k.shape[-1], v.shape[-1], scale=scale)
         _require_fa4()
         visible_end = visible_end.to(device=q.device, dtype=torch.int32).contiguous()
+        setattr(visible_end, "__leading_dim__", 1)
+        setattr(visible_end, "__assumed_align__", 4)
         kwargs: dict[str, Any] = {
             "cu_seqlens_q": cu_seqlens_q,
             "cu_seqlens_k": cu_seqlens_k,
@@ -386,14 +395,10 @@ def _write_paged_kv_cache(
     paged_kv_write(k_cache, v_cache, page_ids, offsets, k_current, v_current)
 
 
-def _metadata_context_len(default: int) -> int:
-    plan = get_forward_context().attention_plan
+def _metadata_context_len(plan: object | None, default: int) -> int:
     value = getattr(plan, "max_context_len", 0)
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = 0
     return max(0, parsed if parsed > 0 else int(default))
-
-
-register_attention_backend("fa4_cute", Fa4CuteAttentionBackend())

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::Context as _;
-use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, RequestId};
+use uniserve_core::{GenerationRequest, GenerationRuntimeCapabilities, ModelDtype, RequestId};
 use uniserve_engine_api::{EngineHandle, EventRx};
 use uniserve_executor::{Executor, TransferSpec, WorkerKind, WorkersSpec};
 use uniserve_scheduler::{
@@ -16,7 +16,7 @@ use uniserve_scheduler::{
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_NUM_SEQS, DEFAULT_MIXED_PREFILL_TOKENS, SchedStats,
     Scheduler, SchedulingPolicy,
 };
-use uniserve_worker_ipc::{MultiprocExecutor, StageRouter, UniprocExecutor, WorkerLaunchConfig};
+use uniserve_worker_ipc::{MultiprocExecutor, StageRouter, WorkerLaunchConfig};
 use uniserve_worker_wire::EngineCaps;
 
 /// Which forward-only worker the engine drives.
@@ -160,6 +160,7 @@ pub struct EngineCore {
     caps: EngineCaps,
     stats: Arc<SchedStats>,
     model_name: String,
+    model_dtype: ModelDtype,
     max_model_len: u32,
     generated_image_commit: uniserve_core::GeneratedImageCommitCapabilities,
     sleeping: Arc<AtomicBool>,
@@ -175,7 +176,7 @@ impl EngineCore {
     /// scheduler owner thread.
     ///
     /// Blocks until the worker has loaded the model and answered the
-    /// `get_caps` handshake — for the real worker this can take minutes.
+    /// capability handshake — for the real worker this can take minutes.
     ///
     /// Only [`EngineBackend::Worker`] is constructible here: the `Sim` backend
     /// has no spawnable process, so a `Sim` config must instead supply its
@@ -211,10 +212,11 @@ impl EngineCore {
             .context("failed to spawn forward-only worker ranks")?;
             Ok(Box::new(workers))
         } else {
-            let worker = UniprocExecutor::spawn_with_config(
+            let worker = MultiprocExecutor::spawn_with_config(
                 &config.worker_python,
                 &config.model,
                 &config.device,
+                1,
                 config.pipeline_depth,
                 config.req_slot_cap,
                 config.resp_slot_cap,
@@ -231,7 +233,7 @@ impl EngineCore {
     /// Compose a `StageRouter` over the heterogeneous pools of a staged topology.
     /// Each pool instance is a (tp-sized) `MultiprocExecutor` spawned with its
     /// `--worker-kind`; the router fans the scheduler's batch across them by
-    /// `OpKind` and merges the results.
+    /// exact operation type and merges the results.
     #[allow(clippy::too_many_arguments)]
     fn spawn_staged(
         config: &EngineCoreConfig,
@@ -292,6 +294,17 @@ impl EngineCore {
                     config.device.clone()
                 };
                 next_gpu += pool.tp.max(1);
+                let mut pool_worker_launch = config.worker_launch.clone();
+                if let Some(root) = &config.worker_launch.snapshot_dir {
+                    pool_worker_launch.snapshot_dir = Some(
+                        std::path::PathBuf::from(root)
+                            .join("pools")
+                            .join(pool.kind.as_str())
+                            .join(instance.to_string())
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
                 let exec = MultiprocExecutor::spawn_staged_with_config(
                     &config.worker_python,
                     &config.model,
@@ -306,7 +319,7 @@ impl EngineCore {
                     pool.kind.as_str(),
                     backend.as_deref(),
                     defer_sampling,
-                    &config.worker_launch,
+                    &pool_worker_launch,
                 )
                 .with_context(|| {
                     format!(
@@ -356,6 +369,12 @@ impl EngineCore {
             },
         );
         let caps = sched.caps().clone();
+        let model_dtype = ModelDtype::parse(&caps.model_dtype).ok_or_else(|| {
+            anyhow::anyhow!(
+                "executor reported non-canonical model dtype {:?}",
+                caps.model_dtype
+            )
+        })?;
         let stats = sched.stats_handle();
 
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
@@ -379,6 +398,7 @@ impl EngineCore {
             caps,
             stats,
             model_name: config.model,
+            model_dtype,
             max_model_len: config.max_model_len,
             generated_image_commit,
             sleeping: Arc::new(AtomicBool::new(false)),
@@ -401,11 +421,11 @@ impl EngineCore {
     /// Serving-facing projection of post-load worker limits.
     pub fn generation_capabilities(&self) -> GenerationRuntimeCapabilities {
         let caps = &self.caps;
-        let mut supported_ops = caps.supported_ops.clone();
-        supported_ops.sort();
-        supported_ops.dedup();
+        let mut supported_operation_types = caps.supported_operation_types.clone();
+        supported_operation_types.sort();
+        supported_operation_types.dedup();
         GenerationRuntimeCapabilities {
-            supported_ops,
+            supported_operation_types,
             max_latent_units: u64::from(caps.max_latent_size),
             latent_downsample: caps.latent_downsample,
             max_vae_grid_tokens: if caps.max_vae_grid_tokens > 0 {
@@ -430,6 +450,10 @@ impl EngineCore {
 
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    pub fn model_dtype(&self) -> ModelDtype {
+        self.model_dtype
     }
 
     pub fn max_model_len(&self) -> u32 {

@@ -5,15 +5,27 @@ import weakref
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import torch
 
 from ...foundation.sizing import ceil_div
 
 if TYPE_CHECKING:
-    from ...contracts.forward_context import ForwardStats
     from .flashinfer_pool import WrapperKey
+
+
+class _PlanStats(Protocol):
+    flashinfer_decode_plan_calls: int
+    flashinfer_decode_plan_rows: int
+    flashinfer_decode_plan_indices: int
+    flashinfer_decode_graph_plan_calls: int
+    flashinfer_decode_plan_reuses: int
+    flashinfer_decode_graph_plan_reuses: int
+    flashinfer_prefill_plan_calls: int
+    flashinfer_prefill_plan_rows: int
+    flashinfer_prefill_plan_indices: int
+    flashinfer_prefill_plan_reuses: int
 
 
 @dataclass
@@ -123,7 +135,7 @@ class _PlanCache:
         wrapper_key: "WrapperKey",
         plan_key: tuple[Any, ...],
         binding: Any,
-        stats: "ForwardStats | None",
+        stats: _PlanStats | None,
         rows: int,
         build: Callable[[], int],
     ) -> None:
@@ -687,7 +699,7 @@ def _weakref_or_none(obj: Any) -> weakref.ReferenceType[Any] | None:
 
 
 def _record_decode_plan_stats(
-    stats: "ForwardStats | None",
+    stats: _PlanStats | None,
     *,
     planned: bool,
     graph: bool,
@@ -709,7 +721,7 @@ def _record_decode_plan_stats(
 
 
 def _record_prefill_plan_stats(
-    stats: "ForwardStats | None",
+    stats: _PlanStats | None,
     *,
     planned: bool,
     rows: int,

@@ -1,61 +1,60 @@
-"""Execution interface hosted by the worker IPC server."""
+"""Typed process-boundary contract implemented by assembled workers."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
-from ..contracts.caps import Caps, ExecutionConstraints
+from ..batch import Batch, ExecutionResult
+from ..capabilities import (
+    AdapterMode,
+    EngineCaps,
+    ExecutionConstraints,
+    RankInfo,
+    RequestKind,
+    ResourceClass,
+)
 from ..foundation.errors import capability_mismatch
-from ..foundation.sizing import DEFAULT_BLOCK_SIZE, DEFAULT_MAX_BATCH_OPS
-
-__all__ = [
-    "BaseWorker",
-    "ResultPolicy",
-    "Worker",
-    "WorkerContract",
-    "model_free_capabilities",
-]
+from ..runtime.snapshot_store import SnapshotRef
+from ..spec import OperationType
 
 
-class ResultPolicy(StrEnum):
-    """When the serve loop may defer device-to-host result materialization."""
-
-    DEFER_WHEN_AVAILABLE = "defer_when_available"
-    SYNCHRONOUS = "synchronous"
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WorkerContract:
-    """Immutable capabilities and delivery semantics of an assembled worker."""
-
-    capabilities: Caps
-    result_policy: ResultPolicy
+    capabilities: EngineCaps
 
     @classmethod
     def compile(
         cls,
-        declared_capabilities: Caps,
+        declared_capabilities: EngineCaps,
         *,
-        allowed_ops: frozenset[str],
+        allowed_operation_types: frozenset[OperationType],
+        system_operation_types: frozenset[OperationType] = frozenset(),
         pipeline_depth: int,
-        result_policy: ResultPolicy,
         owner: str,
-    ) -> "WorkerContract":
-        effective_ops = tuple(op for op in declared_capabilities.supported_ops if op in allowed_ops)
-        if not effective_ops:
-            raise capability_mismatch(
-                f"{owner} implements none of the requested operations {sorted(allowed_ops)!r}"
-            )
-        capabilities = replace(
-            declared_capabilities,
-            supported_ops=effective_ops,
-            pipeline_depth=max(1, int(pipeline_depth)),
+    ) -> WorkerContract:
+        if int(pipeline_depth) <= 0:
+            raise capability_mismatch("worker pipeline depth must be positive")
+        implemented = frozenset(declared_capabilities.supported_operation_types) | frozenset(
+            system_operation_types
         )
-        return cls(capabilities=capabilities, result_policy=result_policy)
+        effective = tuple(
+            operation_type
+            for operation_type in OperationType
+            if operation_type in allowed_operation_types and operation_type in implemented
+        )
+        if not effective:
+            raise capability_mismatch(
+                f"{owner} implements none of the requested operation types "
+                f"{sorted(value.value for value in allowed_operation_types)!r}"
+            )
+        return cls(
+            capabilities=replace(
+                declared_capabilities,
+                supported_operation_types=effective,
+                pipeline_depth=int(pipeline_depth),
+            ),
+        )
 
 
 @runtime_checkable
@@ -63,96 +62,79 @@ class Worker(Protocol):
     @property
     def contract(self) -> WorkerContract: ...
 
-    def caps(self) -> Caps: ...
+    def execute(self, batch: Batch) -> ExecutionResult: ...
 
-    def execute(
-        self,
-        batch: Mapping[str, Any],
-        *,
-        defer_text_cpu_results: bool = False,
-    ) -> dict[str, Any]: ...
+    def drop_session(self, session_id: int) -> None: ...
 
-    def drop_request(self, request_id: int) -> None: ...
+    def copy_kv(self, copies: tuple[tuple[int, int], ...]) -> None: ...
 
-    def resource_pressure(self) -> list[dict[str, Any]]: ...
+    def load_adapter(self, adapter_id: int, adapter_path: str) -> None: ...
 
+    def unload_adapter(self, adapter_id: int) -> None: ...
 
-class BaseWorker(ABC):
-    """Shared contract storage for concrete worker implementations."""
+    def release_products(self, handles: tuple[int, ...]) -> None: ...
 
-    def __init__(self, *, block_size: int = DEFAULT_BLOCK_SIZE) -> None:
-        self.block_size = int(block_size)
-        self._contract: WorkerContract | None = None
+    def reset_prefix_cache(self) -> None: ...
 
-    @property
-    def contract(self) -> WorkerContract:
-        if self._contract is None:
-            raise RuntimeError(f"{type(self).__name__} contract is not initialized")
-        return self._contract
+    def resource_pressure(self) -> list[dict[str, object]]: ...
 
-    def caps(self) -> Caps:
-        return replace(self.contract.capabilities)
+    def snapshot_session(self, session_id: int) -> SnapshotRef: ...
 
-    def resource_pressure(self) -> list[dict[str, Any]]:
-        return []
-
-    def _compile_contract(
-        self,
-        declared_capabilities: Caps,
-        *,
-        allowed_ops: frozenset[str],
-        pipeline_depth: int,
-        result_policy: ResultPolicy,
-    ) -> None:
-        self._contract = WorkerContract.compile(
-            declared_capabilities,
-            allowed_ops=allowed_ops,
-            pipeline_depth=pipeline_depth,
-            result_policy=result_policy,
-            owner=type(self).__name__,
-        )
-
-    @abstractmethod
-    def execute(
-        self,
-        batch: Mapping[str, Any],
-        *,
-        defer_text_cpu_results: bool = False,
-    ) -> dict[str, Any]: ...
-
-    @abstractmethod
-    def drop_request(self, request_id: int) -> None: ...
+    def restore_session(self, reference: SnapshotRef) -> None: ...
 
 
 def model_free_capabilities(
     *,
     block_size: int,
-    supported_ops: tuple[str, ...],
-    supported_controls: tuple[str, ...] = (),
+    supported_operation_types: tuple[OperationType, ...],
+    supported_controls: tuple[RequestKind, ...] = (),
     num_layers: int = 1,
+    num_blocks: int = 1,
+    scratch_capacity_tokens: int = 0,
     max_latent_size: int = 0,
     latent_downsample: int = 1,
-    encoder_cache_budget: int | None = None,
-    resource_classes: tuple[str, ...] = ("kv_block",),
-    **overrides: Any,
-) -> Caps:
-    """Build the minimum wire-compatible capability record for a model-free worker."""
-
-    return Caps(
-        block_size=int(block_size),
-        num_blocks=int(overrides.pop("num_blocks", 1)),
-        num_layers=int(num_layers),
-        scratch_capacity_tokens=int(overrides.pop("scratch_capacity_tokens", 0)),
-        supported_ops=tuple(supported_ops),
-        max_latent_size=int(max_latent_size),
-        latent_downsample=int(latent_downsample),
-        bytes_per_token=int(overrides.pop("bytes_per_token", 1)),
-        supported_controls=tuple(supported_controls),
-        adapter_mode=str(overrides.pop("adapter_mode", "none")),
-        execution_constraints=ExecutionConstraints(
-            max_batch_ops=int(overrides.pop("max_batch_ops", DEFAULT_MAX_BATCH_OPS))
-        ),
-        resource_classes=tuple(resource_classes),
+    encoder_cache_budget: int = 0,
+    resource_classes: tuple[ResourceClass, ...] = (ResourceClass.KV_BLOCK,),
+    adapter_mode: AdapterMode = AdapterMode.NONE,
+    max_batch_operations: int = 1024,
+    pipeline_depth: int,
+    bytes_per_token: int = 1,
+    model_spec_digest: str = "",
+    weight_digest: str = "",
+) -> EngineCaps:
+    return EngineCaps(
+        block_size=block_size,
+        num_blocks=num_blocks,
+        num_layers=num_layers,
+        scratch_capacity_tokens=scratch_capacity_tokens,
+        supported_operation_types=supported_operation_types,
+        max_latent_size=max_latent_size,
+        latent_downsample=latent_downsample,
+        max_vae_grid_tokens=0,
+        max_vit_grid_tokens=0,
+        commit_marker_tokens=2,
+        gen_rope_advance=2,
+        max_cfg_branches=1,
+        bytes_per_token=bytes_per_token,
+        groups=(),
+        kv_dtype="bfloat16",
+        model_dtype="bfloat16",
+        attention_backend="auto",
+        quantization=None,
+        rank=RankInfo(),
+        pipeline_depth=int(pipeline_depth),
         encoder_cache_budget=encoder_cache_budget,
-        **overrides,
+        supported_controls=supported_controls,
+        adapter_mode=adapter_mode,
+        execution_constraints=ExecutionConstraints(max_batch_operations),
+        resource_classes=resource_classes,
+        model_spec_digest=model_spec_digest,
+        weight_digest=weight_digest,
     )
+
+
+__all__ = [
+    "Worker",
+    "WorkerContract",
+    "model_free_capabilities",
+]

@@ -153,13 +153,6 @@ class Dispatcher(Generic[Req, Res]):
 
     def _observe(self, provider: Provider[Req, Res], req: Req) -> Res:
         stats = getattr(req, "stats", None)
-        if stats is None:
-            try:
-                from ..contracts.forward_context import get_forward_context
-
-                stats = getattr(get_forward_context(), "stats", None)
-            except Exception:
-                stats = None
         if stats is None or _torch_is_compiling():
             return provider.run(req)
         start = time.perf_counter_ns()

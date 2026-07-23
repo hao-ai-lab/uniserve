@@ -6,20 +6,7 @@ from .base import BenchmarkTask, TaskRequest
 
 
 class T2ITask(BenchmarkTask):
-    """Text-to-image, dual-wire.
-
-    * ``"images_generations"`` — OpenAI-style ``/v1/images/generations``
-      (non-streaming). Request body carries ``prompt`` plus optional
-      ``size="WxH"`` and a seed, with the step count under both accepted
-      spellings — ``steps`` (UniServe) and ``num_inference_steps``
-      (vLLM-Omni) — since each server ignores the other's field. The
-      response is a single JSON ``{"data": [{"b64_json", ...}]}`` object
-      either way.
-    * ``"openai_chat_json"`` — OpenAI chat completions with
-      ``modalities: ["image"]`` and ``image_config`` (the official LightLLM
-      V2 chat shape), one non-streamed JSON response; generated images
-      arrive in ``message.images``.
-    """
+    """Text-to-image requests through one declared wire shape."""
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
         width = item.get("width", self.spec.width)
@@ -48,6 +35,10 @@ class T2ITask(BenchmarkTask):
                 image_config["cfg_interval"] = list(self.spec.cfg_interval)
             if self.spec.timestep_shift is not None:
                 image_config["timestep_shift"] = self.spec.timestep_shift
+            if self.spec.image_think is not None:
+                image_config["think"] = self.spec.image_think
+            if self.spec.image_t_eps is not None:
+                image_config["t_eps"] = self.spec.image_t_eps
             payload: dict[str, Any] = {
                 "model": self.spec.model,
                 "modalities": ["image"],
@@ -57,52 +48,6 @@ class T2ITask(BenchmarkTask):
                 "ignore_eos": self.spec.ignore_eos,
                 "image_config": image_config,
             }
-            # The public chat implementations expose the same image semantics
-            # through different accepted field names. Emit the complete alias
-            # set in one shared request so each model adapter consumes its
-            # native names while ``image_config`` remains the canonical
-            # UniServe/OpenAI-facing representation.
-            if width is not None and height is not None:
-                payload.update(
-                    {
-                        "width": int(width),
-                        "height": int(height),
-                        "size": f"{int(width)}x{int(height)}",
-                    }
-                )
-            if steps is not None:
-                payload["num_inference_steps"] = int(steps)
-            if seed is not None:
-                payload["seed"] = int(seed)
-            if self.spec.max_images is not None:
-                payload["num_outputs_per_prompt"] = int(self.spec.max_images)
-            if self.spec.guidance_scale is not None:
-                payload.update(
-                    {
-                        "guidance_scale": self.spec.guidance_scale,
-                        "cfg_scale": self.spec.guidance_scale,
-                        "cfg_text_scale": self.spec.guidance_scale,
-                    }
-                )
-            if self.spec.image_guidance_scale is not None:
-                payload.update(
-                    {
-                        "image_guidance_scale": self.spec.image_guidance_scale,
-                        "img_cfg_scale": self.spec.image_guidance_scale,
-                        "cfg_img_scale": self.spec.image_guidance_scale,
-                    }
-                )
-            if self.spec.cfg_norm is not None:
-                payload["cfg_norm"] = self.spec.cfg_norm
-                payload["cfg_renorm_type"] = self.spec.cfg_norm
-            if self.spec.cfg_interval is not None:
-                payload["cfg_interval"] = list(self.spec.cfg_interval)
-            if self.spec.timestep_shift is not None:
-                payload["timestep_shift"] = self.spec.timestep_shift
-            if self.spec.image_think is not None:
-                payload["think"] = self.spec.image_think
-            if self.spec.image_t_eps is not None:
-                payload["t_eps"] = self.spec.image_t_eps
             if self.spec.extra_request_body:
                 payload.update(self.spec.extra_request_body)
             return TaskRequest(
@@ -114,7 +59,6 @@ class T2ITask(BenchmarkTask):
             payload["size"] = f"{width}x{height}"
         if steps is not None:
             payload["steps"] = int(steps)
-            payload["num_inference_steps"] = int(steps)
         if seed is not None:
             payload["seed"] = int(seed)
         if self.spec.max_images is not None:

@@ -1,31 +1,25 @@
-"""Pure compilation of a deployment role into a Python worker plan."""
+"""Pure compilation of a deployment role into one worker plan."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
 
-from ..contracts.model_family import ModelLoadScope
 from ..server.worker_kind import WorkerKind
-from ..worker.protocol import ResultPolicy
+from ..spec import ModelLoadScope, OperationType
 
 
 class WorkerImplementation(StrEnum):
     MODEL = "model"
-    ENCODER = "encoder"
-    SAMPLER = "sampler"
-    FRAME_ACCUMULATOR = "frame_accumulator"
+    SYSTEM = "system"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WorkerPlan:
-    """Resolved implementation choices for one worker process."""
-
     worker_kind: WorkerKind
     implementation: WorkerImplementation
     model_scope: ModelLoadScope | None
-    allowed_ops: frozenset[str]
-    result_policy: ResultPolicy
+    allowed_operation_types: frozenset[OperationType]
 
     @property
     def requires_model(self) -> bool:
@@ -33,44 +27,26 @@ class WorkerPlan:
 
 
 def resolve_worker_plan(worker_kind: WorkerKind) -> WorkerPlan:
-    """Resolve all role-sensitive Python choices in one place."""
-
-    if worker_kind in {
-        WorkerKind.FULL,
-        WorkerKind.PREFILL,
-        WorkerKind.DECODE,
-    }:
+    if worker_kind in {WorkerKind.FULL, WorkerKind.PREFILL, WorkerKind.DECODE, WorkerKind.ENCODER}:
+        scope = ModelLoadScope.WHOLE
         implementation = WorkerImplementation.MODEL
-        model_scope = ModelLoadScope.WHOLE
     elif worker_kind is WorkerKind.UND:
+        scope = ModelLoadScope.UNDERSTANDING
         implementation = WorkerImplementation.MODEL
-        model_scope = ModelLoadScope.UNDERSTANDING
     elif worker_kind is WorkerKind.GEN:
+        scope = ModelLoadScope.GENERATION
         implementation = WorkerImplementation.MODEL
-        model_scope = ModelLoadScope.GENERATION
-    elif worker_kind is WorkerKind.ENCODER:
-        implementation = WorkerImplementation.ENCODER
-        # SenseNova's encode path extends the language-model KV state, so an
-        # encoder-only weight slice is not a valid general contract today.
-        model_scope = ModelLoadScope.WHOLE
-    elif worker_kind is WorkerKind.SAMPLER:
-        implementation = WorkerImplementation.SAMPLER
-        model_scope = None
-    elif worker_kind is WorkerKind.POSTPROCESS:
-        implementation = WorkerImplementation.FRAME_ACCUMULATOR
-        model_scope = None
-    else:  # pragma: no cover - exhaustive over WorkerKind
+    elif worker_kind in {WorkerKind.SAMPLER, WorkerKind.POSTPROCESS}:
+        scope = None
+        implementation = WorkerImplementation.SYSTEM
+    else:
         raise AssertionError(f"unhandled worker kind {worker_kind!r}")
-
-    result_policy = (
-        ResultPolicy.SYNCHRONOUS
-        if worker_kind is WorkerKind.UND
-        else ResultPolicy.DEFER_WHEN_AVAILABLE
-    )
     return WorkerPlan(
         worker_kind=worker_kind,
         implementation=implementation,
-        model_scope=model_scope,
-        allowed_ops=worker_kind.supported_ops,
-        result_policy=result_policy,
+        model_scope=scope,
+        allowed_operation_types=worker_kind.supported_operation_types,
     )
+
+
+__all__ = ["WorkerImplementation", "WorkerPlan", "resolve_worker_plan"]

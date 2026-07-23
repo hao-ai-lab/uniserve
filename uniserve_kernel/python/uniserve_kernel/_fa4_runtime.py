@@ -5,26 +5,20 @@ from importlib import metadata
 from pathlib import Path
 
 
-def _append_package_path(package_path: object, path: str, *, prepend: bool = False) -> None:
+def _ordered_package_paths(package_path: object, overlay_path: str, provider_path: str) -> list[str]:
     try:
-        present = path in package_path
-    except TypeError:
-        present = False
-    if present:
-        return
-    insert = getattr(package_path, "insert", None)
-    if prepend and callable(insert):
-        insert(0, path)
-        return
-    append = getattr(package_path, "append", None)
-    if callable(append):
-        append(path)
-        return
-    raise ImportError("flash_attn package path cannot be extended for flash_attn.cute")
+        existing = [str(path) for path in package_path]
+    except TypeError as exc:
+        raise ImportError("flash_attn package path cannot resolve flash_attn.cute") from exc
+    ordered = [overlay_path]
+    ordered.extend(path for path in existing if path != overlay_path)
+    if provider_path not in ordered:
+        ordered.append(provider_path)
+    return ordered
 
 
 def _install_flash_attn_4_cute_path() -> None:
-    """Expose ``flash-attn-4``'s CUTE subpackage under legacy ``flash_attn``.
+    """Resolve ``flash-attn-4``'s CUTE provider package.
 
     Some deployment images also install FA2 as a regular ``flash_attn`` package
     in system site-packages. ``flash-attn-4`` contributes ``flash_attn/cute`` as
@@ -60,10 +54,10 @@ def _install_flash_attn_4_cute_path() -> None:
         raise ImportError("flash_attn is not a package and cannot expose flash_attn.cute")
     overlay_root = Path(__file__).resolve().parent / "_fa4_overlay" / "flash_attn"
     overlay_path = str(overlay_root)
-    if overlay_root.exists():
-        _append_package_path(package_path, overlay_path, prepend=True)
+    if not overlay_root.exists():  # pragma: no cover
+        raise ImportError("UniServe FlashAttention CUTE overlay is unavailable")
     provider_path = str(provider_root)
-    _append_package_path(package_path, provider_path)
+    flash_attn_pkg.__path__ = _ordered_package_paths(package_path, overlay_path, provider_path)
 
 
 try:  # pragma: no cover - optional runtime dependency.
@@ -75,6 +69,6 @@ except Exception as exc:  # pragma: no cover
         "with its CUTE runtime dependencies."
     ) from exc
 
-from ._visible_end_mask import hybrid_multimodal_mask
+from ._visible_end_mask import hybrid_multimodal_mask  # noqa: E402
 
 __all__ = ["flash_attn_fwd", "hybrid_multimodal_mask"]
