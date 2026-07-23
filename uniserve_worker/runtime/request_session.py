@@ -6,9 +6,6 @@ import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence
 
-import torch
-
-from ..contracts.operation import OperationClass
 from ..foundation.errors import invalid_descriptor
 from .kv_store import KvStore
 from .request_state import (
@@ -113,14 +110,6 @@ class RequestSession:
     def finish_generation(self, *, committed: bool) -> None:
         self.state.clear_generation_state(reset_cursor=bool(committed))
 
-    def device_rng(
-        self,
-        device: torch.device | str,
-        *,
-        stream: str = "model",
-    ) -> torch.Generator:
-        return self.state.device_rng(device, stream=stream)
-
     def mark_active(self) -> None:
         self.state.lifecycle = RequestLifecycle.ACTIVE
 
@@ -202,8 +191,6 @@ class SessionStore(_RequestStateTable):
 class _SessionSnapshot:
     existed: bool
     state: RequestState | None
-    rng_state: torch.Tensor | None
-    device_rng_states: dict[str, torch.Tensor]
 
 
 class StepTxn:
@@ -223,12 +210,8 @@ class StepTxn:
         self.step_id = int(step_id)
         self.operations = operations
         self.request_ids = {operation.session_id for operation in operations}
-        operations_by_request = {
-            operation.session_id: operation for operation in operations
-        }
         self._snapshots = {
-            request_id: self._snapshot(request_id, operations_by_request[request_id])
-            for request_id in self.request_ids
+            request_id: self._snapshot(request_id) for request_id in self.request_ids
         }
         self._resource_snapshot = resources.snapshot_requests(self.request_ids)
         self._store_snapshots = [
@@ -261,25 +244,15 @@ class StepTxn:
             if snapshot.state is None:
                 raise RuntimeError("existing session snapshot is missing state")
             self.sessions._states[request_id] = snapshot.state
-            if snapshot.state.rng is not None and snapshot.rng_state is not None:
-                snapshot.state.rng.set_state(snapshot.rng_state)
-            for key, rng_state in snapshot.device_rng_states.items():
-                rng = snapshot.state.device_rngs.get(key)
-                if rng is not None:
-                    rng.set_state(rng_state)
         self.resources.restore_requests(self.request_ids, self._resource_snapshot)
         for store, snapshot in self._store_snapshots:
             store.restore_requests(self.request_ids, snapshot)
         self._closed = True
 
-    def _snapshot(
-        self,
-        request_id: int,
-        operation: "OperationEnvelope",
-    ) -> _SessionSnapshot:
+    def _snapshot(self, request_id: int) -> _SessionSnapshot:
         state = self.sessions._states.get(request_id)
         if state is None:
-            return _SessionSnapshot(False, None, None, {})
+            return _SessionSnapshot(False, None)
         snapshot = copy.copy(state)
         # ``state.kv`` (block table, prefix reference, lane lengths) stays
         # shared with the snapshot on purpose: the KvStore in the transaction's
@@ -289,29 +262,17 @@ class StepTxn:
         snapshot.image = dict(state.image)
         snapshot.neg_token_ids = list(state.neg_token_ids)
         snapshot.resident_block_ids = set(state.resident_block_ids)
+        # The cached device generators are reseeded from semantic coordinates
+        # immediately before every draw (sampling) and every flow noise sample,
+        # so no operation reads their carried-over state: a rolled-back
+        # operation reproduces its randomness on retry with no generator-state
+        # snapshot. Only the dict container is copied, to keep the snapshot's
+        # membership independent of the live entry.
         snapshot.device_rngs = dict(state.device_rngs)
         snapshot.residency = copy.copy(state.residency)
         snapshot.decode_relay = copy.copy(state.decode_relay)
         snapshot.cfg_geometry = dict(state.cfg_geometry) if state.cfg_geometry is not None else None
-        # Sequence-op token draws are counter-seeded from (request seed, token
-        # position), so replaying a rolled-back sequence op reproduces its
-        # randomness without restoring generator state. Flow and image ops
-        # still advance stateful request generators and keep the snapshot.
-        snapshots_rng = operation.operation is not OperationClass.SEQUENCE
-        rng_state = (
-            state.rng.get_state().clone()
-            if snapshots_rng and state.rng is not None
-            else None
-        )
-        device_rng_states = (
-            {
-                key: generator.get_state().clone()
-                for key, generator in state.device_rngs.items()
-            }
-            if snapshots_rng
-            else {}
-        )
-        return _SessionSnapshot(True, snapshot, rng_state, device_rng_states)
+        return _SessionSnapshot(True, snapshot)
 
     def _require_open(self) -> None:
         if self._closed:

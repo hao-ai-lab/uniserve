@@ -2550,7 +2550,7 @@ def test_sensenova_text_decode_batch_delegates_to_scalar_text_stepper(monkeypatc
     states = RequestStateTable()
     for req_id, block_id in ((11, 0), (12, 1)):
         states.create_or_update(req_id, {"req_id": req_id, "block_ids": [block_id]})
-    kv_store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
+    kv_store = FlowBranchStore(states, SimpleNamespace())
     context = ForwardContext(kv_view=kv_store.view((11, 12)))
     with use_forward_context(context):
         for req_id, length in ((11, 3), (12, 5)):
@@ -2625,7 +2625,7 @@ def test_request_drop_releases_segment_staging():
 
     states = RequestStateTable()
     states.create_or_update(3, {"req_id": 3})
-    store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
+    store = FlowBranchStore(states, SimpleNamespace())
     program = store.program(3)
     caches = [object(), object(), object()]
     program.cond.past, program.tu.past, program.iu.past = caches
@@ -2652,7 +2652,7 @@ def test_flow_kv_view_bounds_program_access_to_the_batch():
     states = RequestStateTable()
     states.create_or_update(3, {"req_id": 3})
     states.create_or_update(4, {"req_id": 4})
-    store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
+    store = FlowBranchStore(states, SimpleNamespace())
     view = store.view([3])
 
     assert view.program(3) is store.program(3)
@@ -2670,7 +2670,7 @@ def test_duplicate_new_request_preserves_live_interleaved_cache():
         6,
         {"req_id": 6, "block_ids": [10, 11], "sampling": {"temperature": 0.0}},
     )
-    store = FlowBranchStore(states, SimpleNamespace(), rng_device="cpu")
+    store = FlowBranchStore(states, SimpleNamespace())
     image_state = store.program(6)
     sentinel_past = object()
     image_state.cond.block_ids = [10, 11, 12, 13, 14]

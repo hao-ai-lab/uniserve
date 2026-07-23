@@ -52,6 +52,7 @@ from uniserve_worker.runtime.paged_text_cache import (
     PagedTextCache,
     copy_paged_text_cache_span,
 )
+from uniserve_worker.runtime.request_state import flow_noise_seed
 
 # ---------------------
 # Flow-step graph runner
@@ -771,7 +772,9 @@ class ProgramState:
     cond: SequenceCache = field(default_factory=SequenceCache)
     tu: SequenceCache = field(default_factory=SequenceCache)
     iu: SequenceCache = field(default_factory=SequenceCache)
-    rng: torch.Generator | None = None
+    # The request's session seed, one coordinate of the counter-based initial
+    # noise; there is no per-request generator stream on the flow path.
+    seed: int | None = None
     _image_state: FlowState | None = field(default=None, repr=False)
     _latent_store: Any = field(default=None, init=False, repr=False)
     _request_id: int | None = field(default=None, init=False, repr=False)
@@ -821,10 +824,9 @@ class FlowBranchStore:
     table of every touched request unchanged.
     """
 
-    def __init__(self, sessions: Any, latents: Any, *, rng_device: Any) -> None:
+    def __init__(self, sessions: Any, latents: Any) -> None:
         self.sessions = sessions
         self.latents = latents
-        self.rng_device = rng_device
         self._programs: dict[int, ProgramState] = {}
 
     def program(self, request_id: int) -> ProgramState:
@@ -836,7 +838,7 @@ class FlowBranchStore:
                 sampling=dict(session.sampling or {}),
                 image=dict(session.image or {}),
                 neg_token_ids=list(session.neg_token_ids or []),
-                rng=session.device_rng(self.rng_device),
+                seed=session.seed,
             )
             program.cond.block_ids = session.block_ids
             program.bind_latent(self.latents, request_id)
@@ -1165,7 +1167,8 @@ class FlowExecution:
             device=device,
         )
 
-        x_t = self._init_latent(st, params, device, noise_scale)
+        op_id = int(op["op_id"]) if op and "op_id" in op else 0
+        x_t = self._init_latent(st, params, device, noise_scale, op_id)
         cond_cache = self._stage_denoise_cache(cond.past)
         tu_cache = self._stage_denoise_cache(st.tu.past)
         iu_cache = self._stage_denoise_cache(st.iu.past)
@@ -1292,18 +1295,21 @@ class FlowExecution:
         params: _ImageParams,
         device: Any,
         noise_scale: float,
+        op_id: int,
     ) -> torch.Tensor:
-        if st.rng is None:
-            seed = params.seed
-            st.rng = torch.Generator(device=device).manual_seed(
-                int(seed if seed is not None else 0)
-            )
         if st.cond.last_logits is None:
             raise model_execution_error("image denoise requires conditional text logits")
         dtype = st.cond.last_logits.dtype
+        # A fresh generator seeded from the operation's semantic coordinates,
+        # not a persistent per-request stream: retrying this denoise operation
+        # (same session seed, same op id) reproduces the identical initial
+        # latent, and sibling images differ only through their distinct op ids.
+        rng = torch.Generator(device=device).manual_seed(
+            flow_noise_seed(int(st.seed or 0), int(op_id))
+        )
         return init_latent(
             (1, 3, params.height, params.width),
-            rng=st.rng,
+            rng=rng,
             device=device,
             dtype=dtype,
             scale=noise_scale,
@@ -1760,7 +1766,13 @@ class PagedGenFlowExecution:
         *,
         seed: int | None,
     ) -> torch.Tensor:
-        """Sample the request-private CPU-FP32 initial-noise stream."""
+        """Sample the CPU-FP32 initial noise for one generation.
+
+        ``seed`` is the counter-derived generator seed for this operation (see
+        :func:`flow_noise_seed`); a fresh generator is seeded from it per call,
+        so the sampled noise is a pure function of the operation's coordinates
+        and carries no state between generations.
+        """
         effective_seed = int(seed if seed is not None else 0)
         return init_latent(
             shape,
@@ -1791,9 +1803,12 @@ class PagedGenFlowExecution:
         height = int(params.height)
         width = int(params.width)
         num_vae, vae_pos_ids, latent_dim = self.adapter.gen_latent_layout(height, width)
+        # Counter-based initial noise: the session seed already folds in any
+        # per-image seed at admission, and the op id makes each generation's
+        # noise distinct while staying stable across retries of this operation.
         x_t = self._init_generation_noise(
             (int(num_vae), int(latent_dim)),
-            seed=params.seed if params.seed is not None else state.seed,
+            seed=flow_noise_seed(int(state.seed or 0), int(op["op_id"])),
         )
         if rec.context_image_feedback:
             raise capability_mismatch(

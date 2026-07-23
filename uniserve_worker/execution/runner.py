@@ -808,11 +808,9 @@ class ModelExecutor:
         if kv_pool is not None:
             self.kv_store.bind_block_size(int(kv_pool.block_size))
         if state_residency is not None and segment_executor is not None:
-            rng_device = getattr(model, "gen_device", getattr(model, "device", "cpu"))
             self.flow_store: FlowBranchStore | None = FlowBranchStore(
                 self.sessions,
                 state_residency.latent,
-                rng_device=rng_device,
             )
             self.latent_store = state_residency.latent
             self.product_store: ProductStore | None = ProductStore(
