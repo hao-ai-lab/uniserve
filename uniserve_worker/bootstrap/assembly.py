@@ -159,7 +159,12 @@ def run_worker(config: WorkerLaunchConfig) -> None:
             "worker_kind": config.worker_kind.value,
         },
     )
-    WorkerServer(assemble_worker(config), endpoint).serve()
+    worker = assemble_worker(config)
+    # Pay first-use attention-kernel JIT before the worker becomes reachable, so
+    # the first served request is warm rather than absorbing tens of seconds of
+    # CUTLASS compilation.
+    worker.warmup()
+    WorkerServer(worker, endpoint).serve()
 
 
 __all__ = ["assemble_worker", "run_worker"]

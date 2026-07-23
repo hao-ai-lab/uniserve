@@ -198,6 +198,173 @@ class ModelWorker:
             )
         return result
 
+    def warmup(self) -> None:
+        """Pay first-use kernel JIT before the worker is reachable.
+
+        The ``fa4_cute`` attention backend JIT-compiles its CUTLASS kernels the
+        first time each variant runs (prefill/varlen, paged decode, and the
+        flow packed path), costing tens of seconds on the first real request.
+        Running one representative prefill + decode (and, for image models, one
+        flow step) through the real execution path here moves that compilation
+        ahead of readiness, so the first served request is warm. Every failure
+        is swallowed: a warmup problem must never block serving.
+        """
+
+        import torch
+
+        if torch.device(self.deployment.device).type != "cuda":
+            return
+        try:
+            self._warmup_sequence()
+        except Exception:  # noqa: BLE001 - warmup must never block serving.
+            logger.warning("sequence warmup failed; first request stays cold", exc_info=True)
+        try:
+            self._warmup_flow()
+        except Exception:  # noqa: BLE001 - warmup must never block serving.
+            logger.warning("flow warmup failed; first flow step stays cold", exc_info=True)
+
+    def _warmup_sequence(self) -> None:
+        from ..batch import (
+            Admission,
+            Batch,
+            KvAllocation,
+            KvLeaseDelta,
+            OperationEnvelope,
+            SamplingParams,
+            SequenceAdmission,
+            SequenceMode,
+            SequenceOperation,
+            TokenInput,
+            TokenPolicy,
+        )
+
+        types = self._contract.capabilities.supported_operation_types
+        if OperationType.SEQUENCE_EXTEND not in types:
+            return
+        block_size = int(self.deployment.block_size)
+        prefill = block_size  # one full page of prompt tokens
+        # Blocks 0..(prefill/block_size) inclusive: the trailing page holds the
+        # single decode token appended at ``prefill``.
+        blocks = tuple(range(prefill // block_size + 1))
+        if len(blocks) > int(self.kv.pool.schedulable_num_blocks):
+            return
+        session_id = 1
+        admission = Admission.create(
+            session_id,
+            sequence=SequenceAdmission(
+                sampling=SamplingParams(),
+                kv=KvAllocation(block_ids=blocks, prefix_len=0, group_id=0),
+            ),
+        )
+        extend = SequenceOperation(
+            SequenceMode.EXTEND,
+            KvLeaseDelta(),
+            (0, prefill),
+            TokenPolicy(),
+            TokenInput(tuple(0 for _ in range(prefill))),
+        )
+        self.execute(
+            Batch(
+                1,
+                (admission,),
+                (),
+                (
+                    OperationEnvelope.create(
+                        session_id=session_id,
+                        epoch=1,
+                        op_id=1,
+                        base_version=0,
+                        admission_digest=admission.digest,
+                        model_spec_digest=self.model_spec_digest,
+                        weight_digest=self.weight_digest,
+                        operation=extend,
+                    ),
+                ),
+            )
+        )
+        if OperationType.SEQUENCE_DECODE in types:
+            decode = SequenceOperation(
+                SequenceMode.DECODE,
+                KvLeaseDelta(),
+                (prefill, prefill + 1),
+                TokenPolicy(),
+                TokenInput((0,)),
+            )
+            self.execute(
+                Batch(
+                    2,
+                    (),
+                    (),
+                    (
+                        OperationEnvelope.create(
+                            session_id=session_id,
+                            epoch=1,
+                            op_id=2,
+                            base_version=1,
+                            admission_digest=admission.digest,
+                            model_spec_digest=self.model_spec_digest,
+                            weight_digest=self.weight_digest,
+                            operation=decode,
+                        ),
+                    ),
+                )
+            )
+        self.drop_session(session_id)
+
+    def _warmup_flow(self) -> None:
+        from ..batch import (
+            Admission,
+            Batch,
+            FlowAdmission,
+            FlowOperation,
+            Guidance,
+            ImageParams,
+            OperationEnvelope,
+        )
+
+        if (
+            OperationType.FLOW not in self._contract.capabilities.supported_operation_types
+            or self.model_spec.flow is None
+        ):
+            return
+        session_id = 2
+        admission = Admission.create(
+            session_id,
+            flow=FlowAdmission(ImageParams(steps=50, height=2048, width=1152, seed=0)),
+        )
+        flow = FlowOperation(
+            latent_handle=1,
+            position=0,
+            start_step=0,
+            step_count=1,
+            conditioning_position=0,
+            conditioning=None,
+            guidance=Guidance(
+                int(self.model_spec.flow.max_cfg_branches), 4.0, 1.0, "global", 0.0, (0.0, 1.0)
+            ),
+            image_prompt="",
+        )
+        self.execute(
+            Batch(
+                3,
+                (admission,),
+                (),
+                (
+                    OperationEnvelope.create(
+                        session_id=session_id,
+                        epoch=1,
+                        op_id=1,
+                        base_version=0,
+                        admission_digest=admission.digest,
+                        model_spec_digest=self.model_spec_digest,
+                        weight_digest=self.weight_digest,
+                        operation=flow,
+                    ),
+                ),
+            )
+        )
+        self.drop_session(session_id)
+
     def drop_session(self, session_id: int) -> None:
         session_id = int(session_id)
         session = self.sessions.peek(session_id)
