@@ -127,6 +127,16 @@ class GraphStore:
                     return forward(batch), "graph_fallback"
                 self._warmed.discard(state_key)
                 self._states[state_key] = state
+                # Do not return the capture-pass output. Tensors produced while
+                # the stream is capturing can reflect capture-time pool
+                # bootstrapping rather than the real result, so the first
+                # multimodal decode step would otherwise emit a garbage token
+                # even though every later replay of the same graph is correct.
+                # Replay the freshly captured graph against the live batch to
+                # produce a clean result, identical to every subsequent replay.
+                _copy_batch_tensors(state.batch, batch)
+                self._prepare_attention(state.batch, batch, capture=False)
+                state.graph.replay()
                 return _fresh_output(state.output, batch), "graph_capture"
             try:
                 _copy_batch_tensors(state.batch, batch)

@@ -58,7 +58,13 @@ class NeoVitEncoder(nn.Module):
         # single owner; dim is hidden//2 because the head is split into x/y halves.
         self.rope = RotaryEmbedding(dim=hidden // 2, theta=theta)
 
-    def forward(self, pixels: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        pixels: torch.Tensor,
+        grid_hw: torch.Tensor,
+        *,
+        grid_hint: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
         if pixels.ndim == 2:
             pixels = pixels.view(-1, self.num_channels, self.patch_size, self.patch_size)
         if pixels.ndim != 4:
@@ -72,10 +78,14 @@ class NeoVitEncoder(nn.Module):
             )
         patch_embeds = self.gelu(self.patch_embedding(pixels)).view(-1, self.patch_embedding.out_channels)
         patch_embeds = self._apply_2d_rope(patch_embeds.float(), grid_hw).to(dtype=patch_embeds.dtype)
-        return self._dense_downsample(patch_embeds, grid_hw)
+        return self._dense_downsample(patch_embeds, grid_hw, grid_hint=grid_hint)
 
     def _apply_2d_rope(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
-        abs_x, abs_y = build_abs_positions_from_grid_hw(grid_hw, device=patch_embeds.device)
+        # ``patch_embeds.shape[0]`` is the total patch count as a static tensor
+        # shape, so passing it avoids a host sync and keeps this capturable.
+        abs_x, abs_y = build_abs_positions_from_grid_hw(
+            grid_hw, device=patch_embeds.device, total=int(patch_embeds.shape[0])
+        )
         half = patch_embeds.shape[-1] // 2
         x_cos, x_sin = self.rope.cos_sin_1d(abs_x)
         y_cos, y_sin = self.rope.cos_sin_1d(abs_y)
@@ -93,7 +103,26 @@ class NeoVitEncoder(nn.Module):
         )
         return torch.cat([x_part, y_part], dim=-1)
 
-    def _dense_downsample(self, patch_embeds: torch.Tensor, grid_hw: torch.Tensor) -> torch.Tensor:
+    def _dense_downsample(
+        self,
+        patch_embeds: torch.Tensor,
+        grid_hw: torch.Tensor,
+        *,
+        grid_hint: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        if grid_hint is not None:
+            # Every image shares this (h, w) grid (the flow/CFG case). Using the
+            # host-supplied dims avoids reading ``grid_hw`` back to the host, so
+            # the batched conv stays inside a CUDA graph capture. Bit-identical
+            # to the equal-grid branch below.
+            h0, w0 = int(grid_hint[0]), int(grid_hint[1])
+            total = int(patch_embeds.shape[0])
+            if h0 < 1 or w0 < 1 or total % (h0 * w0) != 0:
+                raise ValueError("grid hint does not cover all NEO-ViT patch embeddings")
+            n = total // (h0 * w0)
+            image = patch_embeds.view(n, h0, w0, -1).permute(0, 3, 1, 2)
+            dense = self.dense_embedding(image).permute(0, 2, 3, 1)
+            return dense.reshape(-1, self.dense_embedding.out_channels)
         shapes = grid_hw.tolist()
         if not shapes:
             return patch_embeds.new_empty((0, self.dense_embedding.out_channels))
