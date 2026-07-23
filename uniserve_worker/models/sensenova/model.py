@@ -242,8 +242,14 @@ class _VisionModel(nn.Module):
             )
         )
 
-    def forward(self, pixels: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
-        return self.embeddings(pixels, grid)
+    def forward(
+        self,
+        pixels: torch.Tensor,
+        grid: torch.Tensor,
+        *,
+        grid_hint: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        return self.embeddings(pixels, grid, grid_hint=grid_hint)
 
 
 class _SenseAttention(nn.Module):
@@ -847,7 +853,18 @@ class NEOChatModel(nn.Module):
         local_grids = context.mesh.dispatch(grids, "tower", _FLOW_COORDINATE)
         tower = self.fm_modules["vision_model_mot_gen"]
         feature_dtype = next(tower.parameters()).dtype
-        features = tower(local_pixels.to(dtype=feature_dtype), local_grids)
+        # All flow rows in one forward share an image size (CFG branches of one
+        # image), so the vision patch grid (height/patch, width/patch) is known
+        # on the host. Passing it lets the tower avoid reading the grid tensor
+        # back to the host, keeping the flow forward capturable in a CUDA graph.
+        patch = self._patch_size
+        hints = {
+            (int(row.image_height) // patch, int(row.image_width) // patch) for row in rows
+        }
+        grid_hint = next(iter(hints)) if len(hints) == 1 else None
+        features = tower(
+            local_pixels.to(dtype=feature_dtype), local_grids, grid_hint=grid_hint
+        )
         if not isinstance(features, torch.Tensor):
             raise TypeError("SenseNova flow vision tower must return a tensor")
         features = context.mesh.combine(
