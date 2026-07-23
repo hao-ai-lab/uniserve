@@ -20,10 +20,14 @@ class RecordingVelocityModel(UniModel):
         self.branches: list[str] = []
         self.latents: list[torch.Tensor] = []
 
+    fail: bool = False
+
     def predict_velocity(self, ctx, t, latent, branch):
         del ctx, t
         self.branches.append(branch)
         self.latents.append(latent.detach().clone())
+        if self.fail:
+            raise RuntimeError("injected denoise failure")
         return torch.full_like(latent, float(branch.rsplit("_", 1)[-1]))
 
 
@@ -110,3 +114,35 @@ def test_denoise_batch_preserves_wire_order_and_per_request_completion():
     assert [row["denoise_done"] for row in result["per_seq"]] == [True, True]
     assert [row["num_steps_done"] for row in result["per_seq"]] == [1, 1]
     assert model.branches == ["branch_0", "branch_1", "branch_0", "branch_1"]
+
+
+def test_generic_denoise_retry_after_rollback_reuses_identical_initial_latent():
+    # The model-neutral flow-matching path derives its initial latent from the
+    # counter coordinates (session seed, op_id) rather than a stateful stream,
+    # so a failed-and-rolled-back step retries to the identical latent with no
+    # generator-state snapshot in the transaction. The op id is pinned so the
+    # retry re-sends the same operation identity the scheduler would.
+    op_id = (1 << 32) + 1
+    model = RecordingVelocityModel()
+    runner = _runner(model)
+
+    model.fail = True
+    with pytest.raises(RuntimeError, match="injected denoise failure"):
+        runner.execute(
+            seal_batch(
+                1,
+                [{"req_id": 5, "kind": "denoise_gen", "op_id": op_id}],
+                new_reqs=[_new_request(5, seed=17)],
+            )
+        )
+    failed_initial = model.latents[0].clone()
+    model.fail = False
+
+    runner.execute(
+        seal_batch(
+            2,
+            [{"req_id": 5, "kind": "denoise_gen", "op_id": op_id}],
+            new_reqs=[_new_request(5, seed=17)],
+        )
+    )
+    assert torch.equal(model.latents[1], failed_initial)

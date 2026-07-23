@@ -14,7 +14,7 @@ from uniserve_worker.execution.flow import (
 from uniserve_worker.models.bagel import _BagelGraph
 from uniserve_worker.nn.diffusion import FlowMatchSchedule, ScheduleDirection, euler_step
 from uniserve_worker.nn.diffusion.noise import init_latent
-from uniserve_worker.runtime.request_state import RequestState
+from uniserve_worker.runtime.request_state import RequestState, flow_noise_seed
 from uniserve_worker.runtime.residency import LatentStore
 
 pytestmark = pytest.mark.unit
@@ -109,6 +109,35 @@ def test_gen_flow_initial_noise_keeps_exact_cpu_float32_values():
 
     assert actual.dtype == torch.float32
     assert torch.equal(actual, expected)
+
+
+def test_flow_noise_seed_is_a_pure_function_of_session_seed_and_op_id():
+    # Deterministic in its coordinates.
+    assert flow_noise_seed(11, 5) == flow_noise_seed(11, 5)
+    # A different op id (a different image/generation of the same session) and a
+    # different session seed each decorrelate the stream.
+    assert flow_noise_seed(11, 5) != flow_noise_seed(11, 6)
+    assert flow_noise_seed(11, 5) != flow_noise_seed(12, 5)
+    # Neighboring op ids are decorrelated by the finalizer, and every seed is a
+    # 64-bit unsigned integer torch.Generator.manual_seed accepts.
+    assert flow_noise_seed(11, 5) != flow_noise_seed(11, 4)
+    for coord in ((0, 0), (11, 5), (2**63, 2**40 + 7)):
+        assert 0 <= flow_noise_seed(*coord) <= 0xFFFFFFFFFFFFFFFF
+
+
+def test_gen_flow_noise_is_counter_derived_and_invariant_to_draw_history():
+    driver = _gen_flow_driver("cpu")
+    session_seed = 4242
+    op_a, op_b = 0x100, 0x200
+
+    first_a = driver._init_generation_noise((6, 64), seed=flow_noise_seed(session_seed, op_a))
+    # Sampling an unrelated operation in between must not perturb op_a: the
+    # generator is reseeded per operation, so nothing carries between draws.
+    noise_b = driver._init_generation_noise((6, 64), seed=flow_noise_seed(session_seed, op_b))
+    second_a = driver._init_generation_noise((6, 64), seed=flow_noise_seed(session_seed, op_a))
+
+    assert torch.equal(first_a, second_a)  # retry / batch-position invariance
+    assert not torch.equal(first_a, noise_b)  # distinct op ids -> distinct noise
 
 
 @pytest.mark.parametrize(

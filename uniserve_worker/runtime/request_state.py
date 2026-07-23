@@ -14,6 +14,7 @@ from .kv_store import KvEntry, KvStore, append_new_block_ids
 __all__ = [
     "request_seed",
     "sampling_draw_seed",
+    "flow_noise_seed",
     "RequestLifecycle",
     "ResidencyFlags",
     "DecodeRelay",
@@ -35,6 +36,25 @@ def sampling_draw_seed(seed: int, position: int) -> int:
     timing, batch composition, draw history, and retry count cannot change it.
     """
     x = (int(seed) + (int(position) + 1) * _SPLITMIX64_GAMMA) & _U64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64
+    return (x ^ (x >> 31)) & _U64
+
+
+def flow_noise_seed(session_seed: int, op_id: int) -> int:
+    """Counter-based generator seed for one flow operation's initial noise.
+
+    The coordinates are semantic: the session seed and the flow operation's
+    stable identity (``op_id``). The op id selects the element of a SplitMix64
+    stream and the finalizer decorrelates neighboring coordinates, so a flow
+    operation's initial noise is a pure function of ``(session_seed, op_id)``.
+    An ``op_id`` is assigned once per operation and preserved across retries,
+    and it is independent of batch position, thread timing, and graph-cache
+    outcome — so retrying a flow operation reproduces its noise with no
+    generator-state snapshot, and sibling operations never perturb it. This is
+    the flow twin of :func:`sampling_draw_seed`.
+    """
+    x = (int(session_seed) + (int(op_id) + 1) * _SPLITMIX64_GAMMA) & _U64
     x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64
     x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64
     return (x ^ (x >> 31)) & _U64
@@ -100,7 +120,6 @@ class RequestState:
     seed: int | None = None
     schedule_cursor: int = 0
     latent: Any = None
-    rng: Any = None
     device_rngs: dict[str, torch.Generator] = field(default_factory=dict)
     residency: ResidencyFlags = field(default_factory=ResidencyFlags)
     decode_relay: DecodeRelay = field(default_factory=DecodeRelay)
@@ -212,10 +231,7 @@ class RequestStateTable:
         if state is None:
             state = RequestState()
             self._states[req_id] = state
-            seed = request_seed(new_req, req_id)
-            state.seed = seed
-            state.rng = torch.Generator(device="cpu")
-            state.rng.manual_seed(seed)
+            state.seed = request_seed(new_req, req_id)
         state.sampling = dict(new_req.get("sampling") or {})
         state.lifecycle = RequestLifecycle.ACTIVE
         state.image = dict(new_req.get("image") or {})

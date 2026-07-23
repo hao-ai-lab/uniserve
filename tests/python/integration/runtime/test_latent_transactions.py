@@ -1,6 +1,8 @@
 """Latent transaction conformance for executor-driven denoise steps.
 
 A failed denoise step must leave every touched request's committed flow latent and schedule cursor unchanged, whether the failure lands in a sibling operation of the same step or midway through a multi-step denoise burst, and retrying the same operations must reproduce the uninterrupted trajectory bit for bit. The success path commits the accepted update tensor itself into the system latent store without an extra copy.
+
+The initial latent noise is counter-based: it is a pure function of the request's session seed and the denoise operation's stable ``op_id`` (see ``flow_noise_seed``), so it is invariant to batch position and reproduces exactly on retry with no generator-state snapshot in the step transaction.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ from uniserve_worker.contracts.resource_plan import ResourcePlan
 from uniserve_worker.execution import ExecutorConfig, ModelExecutor
 from uniserve_worker.execution.flow import GenState, GuidePlan, PreparedFlowStep
 from uniserve_worker.nn.diffusion import FlowMatchSchedule, ScheduleDirection
+from uniserve_worker.nn.diffusion.noise import init_latent
+from uniserve_worker.runtime.request_state import flow_noise_seed
 from uniserve_worker.runtime.residency import KvCacheSpec, ResidencyManager
 from uniserve_worker.runtime.resources import ResourceRuntime
 
@@ -38,6 +42,9 @@ class HandleLatentFlowDriver:
         self.fail_predict: set[tuple[int, int]] = set()
         self.fail_accept: set[tuple[int, int]] = set()
         self.accepted: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Initial noise recorded per op_id, so a test can compare the noise a
+        # given operation produced across batch positions and retries.
+        self.initial_noise: dict[int, torch.Tensor] = {}
 
     def prepare_flow_step(self, req_id: int, state: Any, op: Any) -> PreparedFlowStep:
         req_id = int(req_id)
@@ -63,11 +70,19 @@ class HandleLatentFlowDriver:
                 cfg_interval=(0.0, 1.0),
                 cond_pos=0,
             )
-            generation_state.x_t = torch.randn(
+            # Counter-based initial noise: seeded from the session seed and the
+            # operation's stable op_id, exactly as the production flow drivers.
+            op_id = int(op.get("op_id") or 0)
+            noise = init_latent(
                 _LATENT_SHAPE,
-                generator=torch.Generator(device="cpu").manual_seed(req_id),
+                rng=torch.Generator(device="cpu").manual_seed(
+                    flow_noise_seed(int(getattr(state, "seed", 0) or 0), op_id)
+                ),
+                device="cpu",
                 dtype=torch.float32,
             )
+            self.initial_noise[op_id] = noise.clone()
+            generation_state.x_t = noise
             latent_view.set_state(req_id, generation_state)
         assert generation_state is not None
         t, t_next = generation_state.schedule.pair(step_index, device="cpu")
@@ -172,8 +187,28 @@ def _burst_batch(
     )
 
 
-def _new_reqs(req_ids: list[int]) -> list[dict[str, Any]]:
-    return [{"req_id": req_id, "block_ids": []} for req_id in req_ids]
+def _new_reqs(req_ids: list[int], *, seed: int = 0) -> list[dict[str, Any]]:
+    return [{"req_id": req_id, "block_ids": [], "seed": seed} for req_id in req_ids]
+
+
+def _denoise_batch_opids(
+    step_id: int, specs: list[tuple[int, int]], **kwargs: Any
+) -> dict[str, Any]:
+    """A denoise batch whose rows carry explicit, scheduler-stable op ids.
+
+    ``specs`` pairs each request id with the op id the scheduler assigns its
+    denoise operation; pinning the op id lets a test hold an operation's
+    identity fixed while its batch position, siblings, or step id vary.
+    """
+    return seal_batch(
+        step_id,
+        [{"req_id": req_id, "kind": "denoise_gen", "op_id": op_id} for req_id, op_id in specs],
+        **kwargs,
+    )
+
+
+def _seeded_new_reqs(pairs: list[tuple[int, int]]) -> list[dict[str, Any]]:
+    return [{"req_id": req_id, "block_ids": [], "seed": seed} for req_id, seed in pairs]
 
 
 def test_failed_sibling_denoise_step_restores_latent_and_schedule_cursor():
@@ -264,3 +299,73 @@ def test_denoise_success_path_commits_the_accepted_tensor_without_copies():
     # leaves the prior step's tensor storage untouched.
     assert second is not first
     assert torch.equal(first, first_snapshot)
+
+
+def test_failed_noise_init_step_retries_to_identical_noise_without_rng_snapshot():
+    driver, executor = _fresh()
+    control_driver, control = _fresh()
+    # The scheduler-stable op id of this generation's first denoise step; it is
+    # the sole coordinate (with the session seed) of the initial noise.
+    op_id = (7 << 40) + 3
+
+    control.execute(_denoise_batch_opids(1, [(8, op_id)], new_reqs=_new_reqs([8], seed=321)))
+    clean_noise = control_driver.initial_noise[op_id].clone()
+
+    # The first denoise step samples its initial noise, then fails and rolls the
+    # freshly admitted request all the way back. The step transaction keeps no
+    # generator-state snapshot.
+    driver.fail_predict.add((8, 0))
+    with pytest.raises(RuntimeError, match="injected failure"):
+        executor.execute(_denoise_batch_opids(1, [(8, op_id)], new_reqs=_new_reqs([8], seed=321)))
+    failed_attempt_noise = driver.initial_noise[op_id].clone()
+    driver.fail_predict.clear()
+    assert 8 not in executor.sessions
+
+    # Re-admitting and retrying the same operation reproduces the noise the
+    # failed attempt sampled — bit for bit — and matches an uninterrupted run,
+    # purely from the counter coordinates.
+    executor.execute(_denoise_batch_opids(2, [(8, op_id)], new_reqs=_new_reqs([8], seed=321)))
+    assert torch.equal(driver.initial_noise[op_id], failed_attempt_noise)
+    assert torch.equal(driver.initial_noise[op_id], clean_noise)
+
+
+def test_initial_noise_is_invariant_to_batch_position_and_across_runs():
+    op_a = 0xA1
+    solo_driver, solo = _fresh()
+    solo.execute(_denoise_batch_opids(1, [(3, op_a)], new_reqs=_new_reqs([3], seed=99)))
+
+    # The same operation (req 3, op id ``op_a``, seed 99) now runs as the second
+    # row of a two-request batch, behind a sibling with a different op id.
+    batched_driver, batched = _fresh()
+    batched.execute(
+        _denoise_batch_opids(
+            1,
+            [(4, 0xB2), (3, op_a)],
+            new_reqs=_seeded_new_reqs([(4, 7), (3, 99)]),
+        )
+    )
+
+    # Batch position, batch composition, and a separate executor run leave the
+    # operation's initial noise unchanged.
+    assert torch.equal(solo_driver.initial_noise[op_a], batched_driver.initial_noise[op_a])
+    # A distinct op id in the same batch draws independently.
+    assert not torch.equal(batched_driver.initial_noise[op_a], batched_driver.initial_noise[0xB2])
+
+
+def test_distinct_ops_in_one_session_seed_get_distinct_initial_noise():
+    driver, executor = _fresh()
+    # The SenseNova travel workload's four images share one session seed and are
+    # separated only by their distinct op ids; the four initial noises differ.
+    op_ids = [0x100, 0x200, 0x300, 0x400]
+    executor.execute(
+        _denoise_batch_opids(
+            1,
+            [(60 + index, op_id) for index, op_id in enumerate(op_ids)],
+            new_reqs=_seeded_new_reqs([(60 + index, 4242) for index in range(len(op_ids))]),
+        )
+    )
+
+    noises = [driver.initial_noise[op_id] for op_id in op_ids]
+    for i in range(len(noises)):
+        for j in range(i + 1, len(noises)):
+            assert not torch.equal(noises[i], noises[j])

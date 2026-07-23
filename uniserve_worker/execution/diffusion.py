@@ -31,7 +31,7 @@ from uniserve_worker.nn.diffusion import (
     x_pred_to_velocity,
 )
 from uniserve_worker.runtime.image_params import required_image_height, required_image_width
-from uniserve_worker.runtime.request_state import RequestState
+from uniserve_worker.runtime.request_state import RequestState, flow_noise_seed
 
 from .flow import (
     PreparedFlowStep,
@@ -547,15 +547,18 @@ class _DiffusionRuntime:
             )
             shape = (channels, max(1, h // downsample), max(1, w // downsample))
         shape_tuple = tuple(int(v) for v in shape)
-        if state.rng is None:
-            # The generator must live on the same device as the sampled latent;
-            # ``torch.randn(generator=rng, device=...)`` requires rng.device to
-            # match. Building a CPU generator while sampling on CUDA raises.
-            state.rng = torch.Generator(device=self.device)
-            state.rng.manual_seed(int(image.get("seed", 0) or 0))
+        # Counter-based initial noise from the operation's semantic coordinates
+        # (session seed, op id), matching the family flow drivers: retrying this
+        # denoise operation reproduces the identical latent with no generator
+        # snapshot. The generator must live on the sampled latent's device —
+        # ``torch.randn(generator=rng, device=...)`` requires rng.device to
+        # match — so it is seeded fresh on ``self.device`` each call.
+        rng = torch.Generator(device=self.device).manual_seed(
+            flow_noise_seed(int(state.seed or 0), int(op.get("op_id") or 0))
+        )
         state.latent = init_latent(
             shape_tuple,
-            rng=state.rng,
+            rng=rng,
             device=self.device,
             dtype=self.dtype,
             scale=float(image.get("latent_scale", 1.0) or 1.0),
