@@ -68,9 +68,10 @@ class WorkerLaunchConfig:
     def from_namespace(cls, namespace: argparse.Namespace) -> "WorkerLaunchConfig":
         worker_kind = WorkerKind(str(namespace.worker_kind))
         plan = resolve_worker_plan(worker_kind)
+        device = _normalize_device(namespace.device)
         tower_devices, generation_kv_capacity_tokens = _parse_mesh(
             str(namespace.mesh or ""),
-            device=str(namespace.device),
+            device=device,
         )
         backend = _normalize_transfer_backend(namespace.transfer_backend)
         use_stub_model = bool(namespace.no_model)
@@ -104,7 +105,7 @@ class WorkerLaunchConfig:
                 pipeline_depth=int(namespace.pipeline_depth),
             ),
             placement=WorkerPlacement(
-                device=str(namespace.device),
+                device=device,
                 tp_rank=int(namespace.tp_rank),
                 tp_size=int(namespace.tp_size),
                 tp_backend=_optional_text(namespace.tp_backend),
@@ -234,6 +235,26 @@ def _parse_tower_placement(value: str, *, device: str) -> tuple[str, str]:
     if torch.device(understanding_device) == torch.device(generation_device):
         raise ValueError("tower text and gen devices must be different")
     return understanding_device, generation_device
+
+
+def _normalize_device(value: object) -> str:
+    """Pin an unindexed CUDA device to the concrete index the rank owns.
+
+    The frontend launches single-GPU (tp=1) workers with ``--device cuda`` while
+    the model materializes tensors on ``cuda:0``. Downstream validation compares
+    ``torch.device`` objects, and ``torch.device("cuda")`` (index ``None``) does
+    not equal ``torch.device("cuda:0")`` — so an unindexed device would reject
+    every forward. Each worker process sees its GPU as device 0 under
+    ``CUDA_VISIBLE_DEVICES``, so an unindexed CUDA device resolves to ``cuda:0``
+    (this mirrors the tower-placement normalization above).
+    """
+
+    import torch
+
+    device = torch.device(str(value))
+    if device.type == "cuda" and device.index is None:
+        return "cuda:0"
+    return str(value)
 
 
 def _normalize_transfer_backend(value: object) -> str:
