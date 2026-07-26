@@ -154,9 +154,6 @@ pub struct TokenInput {
     pub token_ids: Vec<u32>,
     pub source: TokenSource,
     pub draft_token_ids: Vec<u32>,
-    pub burst_tokens: u16,
-    pub stop_token_ids: Vec<u32>,
-    pub stop_terminal: bool,
     pub return_all_logits: bool,
 }
 
@@ -363,7 +360,6 @@ impl Operation {
                             !input.token_ids.is_empty(),
                             "model sequence requires at least one token id"
                         );
-                        anyhow::ensure!(input.burst_tokens > 0, "sequence burst must be positive");
                         match operation.mode {
                             SequenceMode::Extend => {
                                 anyhow::ensure!(
@@ -371,8 +367,8 @@ impl Operation {
                                     "sequence extend requires wire token input"
                                 );
                                 anyhow::ensure!(
-                                    input.draft_token_ids.is_empty() && input.burst_tokens == 1,
-                                    "sequence extend cannot carry draft or burst work"
+                                    input.draft_token_ids.is_empty(),
+                                    "sequence extend cannot carry draft work"
                                 );
                             }
                             SequenceMode::Decode => {
@@ -1407,9 +1403,6 @@ impl CanonicalDigest {
                             TokenSource::LastSampled => 1,
                         });
                         self.u32s(input.draft_token_ids.iter().copied());
-                        self.u16(input.burst_tokens);
-                        self.u32s(input.stop_token_ids.iter().copied());
-                        self.bool(input.stop_terminal);
                         self.bool(input.return_all_logits);
                     }
                     SequenceInput::PublishedLogits(product) => {
@@ -1530,9 +1523,6 @@ mod tests {
                     token_ids: vec![9],
                     source: TokenSource::Wire,
                     draft_token_ids: Vec::new(),
-                    burst_tokens: 1,
-                    stop_token_ids: Vec::new(),
-                    stop_terminal: false,
                     return_all_logits: false,
                 }),
             }),

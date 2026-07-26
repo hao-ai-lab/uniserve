@@ -620,9 +620,6 @@ fn token_input_to_fb(input: &TokenInput) -> fbs::TokenInputT {
         token_ids: Some(input.token_ids.clone()),
         source: token_source_to_fb(input.source),
         draft_token_ids: Some(input.draft_token_ids.clone()),
-        burst_tokens: input.burst_tokens,
-        stop_token_ids: Some(input.stop_token_ids.clone()),
-        stop_terminal: input.stop_terminal,
         return_all_logits: input.return_all_logits,
     }
 }
@@ -632,9 +629,6 @@ fn token_input_from_fb(input: fbs::TokenInputT) -> anyhow::Result<TokenInput> {
         token_ids: input.token_ids.unwrap_or_default(),
         source: token_source_from_fb(input.source)?,
         draft_token_ids: input.draft_token_ids.unwrap_or_default(),
-        burst_tokens: input.burst_tokens,
-        stop_token_ids: input.stop_token_ids.unwrap_or_default(),
-        stop_terminal: input.stop_terminal,
         return_all_logits: input.return_all_logits,
     })
 }

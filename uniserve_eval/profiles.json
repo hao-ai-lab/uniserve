@@ -15,9 +15,6 @@
     "benchmark/server/_uniserve-multimodal-base": {
       "host": "127.0.0.1",
       "cuda_visible_devices": "0",
-      "env": {
-        "UNISERVE_DECODE_TOKEN_BURST": "8"
-      },
       "serve_args": [
         "--max-running-requests",
         "32",
@@ -42,9 +39,6 @@
     "gate/server/_uniserve-base": {
       "host": "127.0.0.1",
       "cuda_visible_devices": "0",
-      "env": {
-        "UNISERVE_DECODE_TOKEN_BURST": "8"
-      },
       "serve_args": [
         "--max-total-tokens",
         "65536",

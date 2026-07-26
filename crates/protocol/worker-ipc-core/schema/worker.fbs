@@ -207,9 +207,6 @@ table TokenInput {
   token_ids:[uint];
   source:TokenSource;
   draft_token_ids:[uint];
-  burst_tokens:ushort = 1;
-  stop_token_ids:[uint];
-  stop_terminal:bool;
   return_all_logits:bool;
 }
 

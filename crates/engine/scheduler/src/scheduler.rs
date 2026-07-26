@@ -45,7 +45,6 @@ pub const DEFAULT_LONG_PREFILL_THRESHOLD: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS
 /// prefill and decode in separate batches.
 pub const DEFAULT_MIXED_PREFILL_TOKENS: usize = 0;
 pub const DEFAULT_DENOISE_STEP_BURST: u16 = 1;
-pub const DEFAULT_DECODE_TOKEN_BURST: u16 = 1;
 /// Default admission backpressure bound: maximum waiting requests buffered
 /// before new submits are rejected at enqueue.
 pub const DEFAULT_MAX_NUM_WAITING: usize = 4096;
@@ -209,7 +208,9 @@ const SCHEDULER_WAIT_SLICE: Duration = Duration::from_millis(1);
 /// enough that the idle engine is effectively asleep.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
 const DENOISE_STEP_BURST_ENV: &str = "UNISERVE_DENOISE_STEP_BURST";
-const DECODE_TOKEN_BURST_ENV: &str = "UNISERVE_DECODE_TOKEN_BURST";
+/// Diagnostic: give a denoise step a batch of its own instead of letting text
+/// rows ride along in the same forward.
+const FLOW_EXCLUSIVE_BATCH_ENV: &str = "UNISERVE_FLOW_EXCLUSIVE_BATCH";
 
 fn image_done_event(image_id: u32, pixels_png_b64: String) -> Option<GenEvent> {
     let metadata = validate_png_artifact(&pixels_png_b64, None)?;
@@ -418,9 +419,8 @@ pub struct Scheduler {
     /// Sequential denoise timesteps to execute per denoise op. The worker runs
     /// the exact same Euler steps and reports the cumulative step cursor.
     denoise_step_burst: u16,
-    /// Sequential greedy text decode tokens to execute per decode op when the
-    /// request has token-independent sampling/masking constraints.
-    decode_token_burst: u16,
+    /// Diagnostic: keep denoise steps out of batches that carry text rows.
+    flow_exclusive_batch: bool,
     /// Default-off n-gram drafter and per-position acceptance accounting. The
     /// worker target-verifies the drafts and resolve commits only the accepted
     /// prefix.
@@ -731,7 +731,8 @@ impl Scheduler {
         let spec_decode = crate::spec_decode::SpecDecodeAccounting::new(Arc::clone(&stats));
         let spec_ngram_max_tokens = spec_decode.max_ngram_tokens();
         let denoise_step_burst = denoise_step_burst_from_env();
-        let decode_token_burst = decode_token_burst_from_env();
+        let flow_exclusive_batch = env::var(FLOW_EXCLUSIVE_BATCH_ENV)
+            .is_ok_and(|raw| matches!(raw.trim(), "1" | "true" | "TRUE"));
         let mut trace_sink = crate::bench_trace::SchedulerTraceSink::from_env();
         if let Some(sink) = trace_sink.as_mut() {
             sink.record(&json!({
@@ -747,7 +748,6 @@ impl Scheduler {
                     "mixed_prefill_tokens": config.mixed_prefill_tokens,
                     "spec_ngram_max_tokens": spec_ngram_max_tokens,
                     "denoise_step_burst": denoise_step_burst,
-                    "decode_token_burst": decode_token_burst,
                 },
                 "caps": {
                     "block_size": caps.block_size,
@@ -790,7 +790,7 @@ impl Scheduler {
             inflight_ops: HashMap::new(),
             prompt_cohort: None,
             denoise_step_burst,
-            decode_token_burst,
+            flow_exclusive_batch,
             spec_decode,
             fatal: false,
             ledger: crate::resources::ResourceLedger::new(),
@@ -1719,14 +1719,10 @@ impl Scheduler {
         }
     }
 
-    fn decode_capacity_target(
-        &self,
-        _id: RequestId,
-        pos: usize,
-        decode_len: usize,
-        spec_len: usize,
-    ) -> usize {
-        pos.saturating_add(decode_len).saturating_add(spec_len)
+    /// KV tokens a decode op must have room for: the sampled token plus any
+    /// speculative draft the worker verifies alongside it.
+    fn decode_capacity_target(&self, pos: usize, spec_len: usize) -> usize {
+        pos.saturating_add(1).saturating_add(spec_len)
     }
 
     fn image_prompt_for(st: &ReqState) -> Option<String> {
@@ -2790,6 +2786,16 @@ impl Scheduler {
             {
                 continue;
             }
+            // Diagnostic: a denoise step and text rows in one forward take the
+            // packed route, which costs more than running each on its own. When
+            // the flag is set a flow op only opens an empty batch, and the loop
+            // below closes the batch as soon as one is placed.
+            if self.flow_exclusive_batch
+                && next_type == Some(OperationType::Flow)
+                && !(ops.is_empty() && mixed_ops.is_empty())
+            {
+                continue;
+            }
             // Build an op; on a block-budget miss, preempt a budgeted victim
             // and retry — else skip this request for the step.
             let mut tries = 0usize;
@@ -2843,10 +2849,14 @@ impl Scheduler {
                             break;
                         }
                         selected.insert(id);
+                        let placed_flow = op.operation_type == OperationType::Flow;
                         if mixed_prefill {
                             mixed_ops.push(op);
                         } else {
                             ops.push(op);
+                        }
+                        if self.flow_exclusive_batch && placed_flow {
+                            budget = 0;
                         }
                         break;
                     }
@@ -2950,99 +2960,6 @@ impl Scheduler {
         self.caps
             .supported_operation_types
             .contains(&OperationType::SequenceVerify)
-    }
-
-    fn decode_burst_plan(
-        &self,
-        id: RequestId,
-        pos: usize,
-        budget: usize,
-        allowed: Option<&[u32]>,
-    ) -> (u16, Option<Vec<u32>>, bool) {
-        let Some(st) = self.running.get(&id) else {
-            return (1, None, false);
-        };
-        if self.decode_token_burst <= 1 || budget <= 1 || st.grammar.is_some() || allowed.is_some()
-        {
-            return (1, None, false);
-        }
-        let sp = &st.req.sampling;
-        let penalties = sp.repetition_penalty != 1.0
-            || sp.frequency_penalty != 0.0
-            || sp.presence_penalty != 0.0;
-        if sp.temperature > 0.0
-            || sp.generated_logprobs_requested()
-            || !sp.bad_words_ids.is_empty()
-            || penalties
-            || st.und.tokens_emitted < sp.min_tokens
-        {
-            return (1, None, false);
-        }
-
-        let remaining = st.req.max_und_tokens.saturating_sub(st.und.tokens_emitted);
-        let count = self
-            .decode_token_burst
-            .min(remaining.min(u16::MAX as usize).max(1) as u16)
-            .min(budget.min(u16::MAX as usize) as u16)
-            .min(
-                self.decode_burst_kv_cap(id, pos)
-                    .min(u16::MAX as usize)
-                    .max(1) as u16,
-            )
-            .max(1);
-        if count <= 1 {
-            return (1, None, false);
-        }
-
-        let mut stop_ids = Vec::new();
-        if !sp.ignore_eos && st.req.policy.termination.eos_finishes {
-            stop_ids.extend(self.ctrl.eos.iter().copied());
-        }
-        if st.req.policy.termination.stop_finishes {
-            stop_ids.extend(st.req.stop_token_ids.iter().copied());
-        }
-        stop_ids.extend(st.req.policy.trigger.round_close_token_ids());
-        if st.can_open_gen_branch() {
-            // Multi-token triggers are host-detected by suffix.
-            // Stopping on any member is conservative: it may shorten a burst,
-            // but it cannot decode past a trigger that the host would need to
-            // observe before scheduling the image phase.
-            if let Some(trigger) = st.req.policy.trigger.generated_suffix() {
-                stop_ids.extend(trigger.iter().copied());
-            }
-        }
-        stop_ids.sort_unstable();
-        stop_ids.dedup();
-        let terminal = !stop_ids.is_empty()
-            && !st.can_open_gen_branch()
-            && st.req.policy.termination.eos_finishes
-            && st.req.policy.termination.stop_finishes;
-        (count, (!stop_ids.is_empty()).then_some(stop_ids), terminal)
-    }
-
-    fn decode_burst_kv_cap(&self, id: RequestId, pos: usize) -> usize {
-        let Some(st) = self.running.get(&id) else {
-            return 1;
-        };
-        if !st.continues_after_gen_commit() {
-            return usize::MAX;
-        }
-        let bs = self.caps.block_size as usize;
-        let allocated_token_cap = self.bm.blocks_for(id).len().saturating_mul(bs);
-        let in_allocated = allocated_token_cap.saturating_sub(pos);
-        let decode_waiters = self
-            .running
-            .values()
-            .filter(|candidate| {
-                candidate.continues_after_gen_commit()
-                    && candidate.lifecycle.phase == Phase::DecodeUnd
-                    && !candidate.image_gen.branch_pending
-                    && !candidate.cancelled
-            })
-            .count()
-            .max(1);
-        let shared_free_blocks = self.bm.free_blocks() / decode_waiters;
-        in_allocated.saturating_add(shared_free_blocks.saturating_mul(bs))
     }
 
     fn peek_next_operation_type(&self, id: RequestId) -> Option<OperationType> {
@@ -3617,8 +3534,6 @@ impl Scheduler {
                 let tok = st.und.next_token;
                 let recent = self.recent_tokens(id);
                 let (allowed, suppress) = self.token_masks(id);
-                let (decode_token_count, decode_stop_token_ids, decode_stop_terminal) =
-                    self.decode_burst_plan(id, pos as usize, budget, allowed.as_deref());
                 let spec_token_ids = if budget > 1 && self.supports_spec_decode() {
                     self.running.get(&id).and_then(|st| {
                         self.spec_decode.draft_tokens(
@@ -3632,13 +3547,7 @@ impl Scheduler {
                     None
                 };
                 let spec_len = spec_token_ids.as_ref().map_or(0, Vec::len);
-                let decode_len = if spec_len == 0 {
-                    decode_token_count.max(1) as usize
-                } else {
-                    1
-                };
-                let capacity_target =
-                    self.decode_capacity_target(id, pos as usize, decode_len, spec_len);
+                let capacity_target = self.decode_capacity_target(pos as usize, spec_len);
                 if !self.bm.ensure_capacity(id, capacity_target) {
                     return None;
                 }
@@ -3652,9 +3561,6 @@ impl Scheduler {
                         token_source: TokenSource::Wire,
                         new_blocks,
                         spec_token_ids,
-                        token_count: decode_len as u16,
-                        stop_token_ids: decode_stop_token_ids,
-                        stop_terminal: decode_stop_terminal,
                         recent_tokens: recent,
                         allowed_tokens: allowed,
                         suppress_tokens: suppress,
@@ -4959,9 +4865,7 @@ fn op_token_cost(envelope: &OperationEnvelope) -> usize {
                 SequenceMode::Extend => {
                     sequence.position.1.saturating_sub(sequence.position.0) as usize
                 }
-                SequenceMode::Decode | SequenceMode::Verify => {
-                    usize::from(input.burst_tokens.max(1)) + input.draft_token_ids.len()
-                }
+                SequenceMode::Decode | SequenceMode::Verify => 1 + input.draft_token_ids.len(),
                 SequenceMode::Sample => 1,
             },
             SequenceInput::PublishedLogits(_) => 1,
@@ -5076,17 +4980,14 @@ fn operation_result_kv_tokens(result: &OperationResult) -> Option<u32> {
 fn operation_trace(envelope: &OperationEnvelope) -> serde_json::Value {
     match &envelope.operation {
         Operation::Sequence(sequence) => {
-            let (token_count, draft_count, source, stop_count, stop_terminal) =
-                match &sequence.input {
-                    SequenceInput::Tokens(input) => (
-                        input.token_ids.len(),
-                        input.draft_token_ids.len(),
-                        Some(input.source),
-                        input.stop_token_ids.len(),
-                        input.stop_terminal,
-                    ),
-                    SequenceInput::PublishedLogits(_) => (0, 0, None, 0, false),
-                };
+            let (token_count, draft_count, source) = match &sequence.input {
+                SequenceInput::Tokens(input) => (
+                    input.token_ids.len(),
+                    input.draft_token_ids.len(),
+                    Some(input.source),
+                ),
+                SequenceInput::PublishedLogits(_) => (0, 0, None),
+            };
             json!({
                 "kind": "sequence",
                 "mode": sequence.mode,
@@ -5094,8 +4995,6 @@ fn operation_trace(envelope: &OperationEnvelope) -> serde_json::Value {
                 "token_count": token_count,
                 "draft_count": draft_count,
                 "source": source,
-                "stop_count": stop_count,
-                "stop_terminal": stop_terminal,
                 "new_blocks": sequence.lease.new_blocks.len(),
             })
         }
@@ -5135,14 +5034,6 @@ fn denoise_step_burst_from_env() -> u16 {
         .unwrap_or(DEFAULT_DENOISE_STEP_BURST)
 }
 
-fn decode_token_burst_from_env() -> u16 {
-    env::var(DECODE_TOKEN_BURST_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_DECODE_TOKEN_BURST)
-}
-
 /// Build the wire [`CfgParams`] for a denoise op.
 ///
 /// The exact text/image CFG branch set is derived by the worker-side CFG plan.
@@ -5171,7 +5062,6 @@ mod tests {
     fn sequence(
         mode: SequenceMode,
         position: (u32, u32),
-        burst_tokens: u16,
         draft_token_ids: Vec<u32>,
     ) -> OperationEnvelope {
         OperationEnvelope::unsealed(
@@ -5185,9 +5075,6 @@ mod tests {
                     token_ids: vec![7],
                     source: TokenSource::Wire,
                     draft_token_ids,
-                    burst_tokens,
-                    stop_token_ids: Vec::new(),
-                    stop_terminal: false,
                     return_all_logits: false,
                 }),
             }),
@@ -5197,22 +5084,22 @@ mod tests {
     #[test]
     fn typed_operation_cost_tracks_physical_sequence_work() {
         assert_eq!(
-            op_token_cost(&sequence(SequenceMode::Extend, (3, 11), 1, Vec::new())),
+            op_token_cost(&sequence(SequenceMode::Extend, (3, 11), Vec::new())),
             8
         );
         assert_eq!(
-            op_token_cost(&sequence(SequenceMode::Decode, (11, 12), 4, Vec::new())),
-            4
+            op_token_cost(&sequence(SequenceMode::Decode, (11, 12), Vec::new())),
+            1
         );
         assert_eq!(
-            op_token_cost(&sequence(SequenceMode::Verify, (11, 12), 4, vec![8, 9, 10])),
-            7
+            op_token_cost(&sequence(SequenceMode::Verify, (11, 12), vec![8, 9, 10])),
+            4
         );
     }
 
     #[test]
     fn operation_block_lease_is_consumed_once() {
-        let mut operation = sequence(SequenceMode::Extend, (0, 1), 1, Vec::new());
+        let mut operation = sequence(SequenceMode::Extend, (0, 1), Vec::new());
         let Operation::Sequence(sequence) = &mut operation.operation else {
             unreachable!();
         };

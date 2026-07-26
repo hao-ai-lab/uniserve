@@ -1003,82 +1003,44 @@ class ModelExecutor:
         start, end = operation.position
         if end - start != 1:
             raise invalid_descriptor("sequence decode must cover exactly one logical position")
-        samples: list[Any] = []
-        stop = frozenset(int(value) for value in inputs.stop_token_ids)
-        stopped_at: int | None = None
-        for index in range(int(inputs.burst_tokens)):
-            task = self._token_task(
+        task = self._token_task(
+            envelope,
+            (current,),
+            (start,),
+            TokenSelection.LAST_LOGITS,
+            scope,
+        )
+        outputs = yield (task,)
+        logits = _token_logits(outputs[0])[-1]
+        self._commit_task_kv(task, 1, scope)
+        if self.defer_sampling:
+            published = self._publish_logits(
                 envelope,
-                (current,),
-                (start + index,),
-                TokenSelection.LAST_LOGITS,
+                logits,
+                SequenceMode.DECODE,
                 scope,
             )
-            outputs = yield (task,)
-            logits = _token_logits(outputs[0])[-1]
-            self._commit_task_kv(task, 1, scope)
-            if self.defer_sampling and inputs.burst_tokens == 1 and not stop:
-                published = self._publish_logits(
-                    envelope,
-                    logits,
-                    SequenceMode.DECODE,
-                    scope,
-                )
-                return SequenceDelta(
-                    SequenceEffect(
-                        kv_tokens=self.kv.get(envelope.session_id).length,
-                        published_logits=published,
-                        published_kv=self._publish_kv_if_requested(
-                            envelope,
-                            operation,
-                            (),
-                            scope,
-                        ),
-                    )
-                )
-            sampled = self._sample(
-                logits,
-                session,
-                operation,
-                position=start + index + 1,
-                generated=tuple(value.token_id for value in samples),
-            )
-            samples.append(sampled)
-            session.rng_counter += 1
-            current = sampled.token_id
-            if stopped_at is None and sampled.token_id in stop:
-                stopped_at = len(samples) - 1
-                if not inputs.stop_terminal:
-                    tail = self._token_task(
+            return SequenceDelta(
+                SequenceEffect(
+                    kv_tokens=self.kv.get(envelope.session_id).length,
+                    published_logits=published,
+                    published_kv=self._publish_kv_if_requested(
                         envelope,
-                        (sampled.token_id,),
-                        (start + index + 1,),
-                        TokenSelection.LAST_LOGITS,
-                        scope,
-                    )
-                    tail_outputs = yield (tail,)
-                    tail_logits = _token_logits(tail_outputs[0])[-1]
-                    self._commit_task_kv(tail, 1, scope)
-                    self._sample(
-                        tail_logits,
-                        session,
                         operation,
-                        position=start + index + 2,
-                        generated=tuple(value.token_id for value in samples),
-                    )
-                    session.rng_counter += 1
-                    break
-        reported = samples if stopped_at is None else samples[: stopped_at + 1]
-        if not reported:
-            raise RuntimeError("decode produced no token result")
-        session.last_sampled_token = int(reported[-1].token_id)
-        first = reported[0]
-        token_ids = tuple(int(value.token_id) for value in reported)
+                        (),
+                        scope,
+                    ),
+                )
+            )
+        sampled = self._sample(logits, session, operation, position=start + 1)
+        session.rng_counter += 1
+        session.last_sampled_token = int(sampled.token_id)
+        token_ids = (int(sampled.token_id),)
         return SequenceDelta(
             SequenceEffect(
                 sampled_token_ids=token_ids,
-                sampled_logprob=first.logprob,
-                top_logprobs=_token_logprobs(first.top_logprobs),
+                sampled_logprob=sampled.logprob,
+                top_logprobs=_token_logprobs(sampled.top_logprobs),
                 kv_tokens=self.kv.get(envelope.session_id).length,
                 published_kv=self._publish_kv_if_requested(
                     envelope,
@@ -1233,14 +1195,12 @@ class ModelExecutor:
         operation: SequenceOperation,
         *,
         position: int,
-        generated: tuple[int, ...] = (),
     ) -> Any:
         return self._sample_policy(
             logits,
             session,
             operation.policy,
             position=position,
-            generated=generated,
         )
 
     def _sample_policy(
@@ -1250,7 +1210,6 @@ class ModelExecutor:
         policy: TokenPolicy,
         *,
         position: int,
-        generated: tuple[int, ...] = (),
     ) -> Any:
         sampling = _require_sampling(session)
         generator = torch.Generator(device=logits.device)
@@ -1258,7 +1217,7 @@ class ModelExecutor:
         return _sample_one_from_logits(
             logits,
             sampling,
-            recent=[*policy.recent_tokens, *generated],
+            recent=list(policy.recent_tokens),
             allowed=(policy.allowed_tokens or sampling.allowed_token_ids),
             suppress=policy.suppress_tokens or None,
             n_logprobs=int(sampling.n_logprobs),
