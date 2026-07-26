@@ -30,6 +30,7 @@ from uniserve_worker.batch import (
 )
 from uniserve_worker.forward import FlowRow, ForwardBatch, ForwardOutput
 from uniserve_worker.foundation.errors import WorkerError
+from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.server.stub import StubModel
 
 pytestmark = pytest.mark.integration
@@ -42,10 +43,12 @@ class _ObservedModel(nn.Module):
         self.spec = self.neural.spec
         self.calls: list[tuple[str, tuple[str, ...]]] = []
         self.flow_inputs: list[torch.Tensor] = []
+        self.attention_plans: list[object] = []
         self.fault: str | None = None
 
     def forward(self, batch: ForwardBatch) -> ForwardOutput:
         self.calls.append((str(batch.route), tuple(type(row).__name__ for row in batch.rows)))
+        self.attention_plans.append(batch.context.attention)
         self.flow_inputs.extend(
             row.latent.detach().clone() for row in batch.rows if isinstance(row, FlowRow)
         )
@@ -159,6 +162,26 @@ def test_mixed_token_and_flow_match_homogeneous_projection_in_one_forward():
     assert observation is not None
     assert observation.model_forward_calls == 1
     assert observation.row_kind_counts == (("flow", 1), ("token", 1))
+
+
+def test_packed_query_bound_matches_the_visible_end_width_it_sizes():
+    # The attention kernel checks visible_end against max_seqlen_q, so a bucketed
+    # bound with an exact-width tensor aborts capture and drops the shape to the
+    # eager path for the rest of the process.
+    model = _ObservedModel()
+    worker = execution_worker(model)
+    sequence_admission = _sequence_admission(31, 0)
+    flow_admission = _flow_admission(32)
+    sequence = _envelope(worker, sequence_admission, _sequence((3, 4, 5)), op_id=41)
+    flow = _envelope(worker, flow_admission, _flow(42), op_id=42)
+
+    worker.execute(Batch(1, (sequence_admission, flow_admission), (), (sequence, flow)))
+
+    plan = model.attention_plans[0]
+    visible_end = plan.visible_end
+    assert visible_end.shape[1] == plan.max_seqlen_q
+    assert plan.max_seqlen_q == bucketed_length(plan.max_seqlen_q)
+    assert plan.max_seqlen_q >= 3
 
 
 def test_replay_is_one_effect_and_conflicts_or_stale_work_do_not_mutate_state():

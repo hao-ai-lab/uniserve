@@ -93,6 +93,7 @@ from uniserve_worker.foundation.errors import (
     invalid_descriptor,
     unsupported_operation,
 )
+from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
 from uniserve_worker.nn.diffusion.integrator import euler_step
@@ -754,7 +755,12 @@ class ModelExecutor:
         query_lens = tuple(task.query_tokens for task in tasks)
         base_lens = view.base_lens
         key_lens = tuple(base + query for base, query in zip(base_lens, query_lens, strict=True))
-        max_query = max(query_lens)
+        # The kernel checks ``visible_end`` against ``max_seqlen_q``, so the query
+        # bound and the tensor it sizes are bucketed together: one executable then
+        # serves a range of chunk widths instead of one per exact width. Positions
+        # past a row's own query length stay zero, the padding this plan already
+        # uses for rows shorter than the widest one.
+        max_query = bucketed_length(max(query_lens))
         visible = torch.zeros((len(tasks), max_query), dtype=torch.int32, device=device)
         index_parts: list[torch.Tensor] = []
         route_parts: list[torch.Tensor] = []
