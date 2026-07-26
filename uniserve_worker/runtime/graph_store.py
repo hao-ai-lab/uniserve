@@ -364,10 +364,15 @@ def _graph_batch(batch: ForwardBatch, binding_identity: int) -> ForwardBatch:
     if isinstance(attention, NoAttention):
         graph_attention = replace(attention, backends=selection)
     else:
-        graph_attention = replace(
-            attention,
-            backends=selection,
-            binding=GraphBinding(int(binding_identity)),
+        graph_attention = cast(
+            Any,
+            _plan_with_bucketed_bounds(
+                replace(
+                    attention,
+                    backends=selection,
+                    binding=GraphBinding(int(binding_identity)),
+                )
+            ),
         )
     return replace(cloned, context=replace(cloned.context, attention=graph_attention))
 
@@ -448,13 +453,44 @@ def _copy_batch_tensors(target: ForwardBatch, source: ForwardBatch) -> None:
         destination.copy_(value, non_blocking=True)
 
 
+# Sequence-length bounds an attention plan carries as host scalars. A capture
+# bakes them into its kernel launch, so an executable is only reusable for
+# lengths at or below the bound it was captured with. Capturing at a bucket
+# ceiling makes one executable serve every length inside that bucket, which is
+# what keeps a growing conversation from capturing a new graph per step.
+_PLAN_LENGTH_BOUNDS = frozenset({"max_seqlen_q", "max_seqlen_k"})
+
+
+def _bucketed_length(value: object) -> object:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 1:
+        return value
+    return 1 << (int(value) - 1).bit_length()
+
+
+def _plan_with_bucketed_bounds(plan: object) -> object:
+    if not is_dataclass(plan) or isinstance(plan, type):
+        return plan
+    updates = {
+        field.name: _bucketed_length(getattr(plan, field.name))
+        for field in fields(plan)
+        if field.name in _PLAN_LENGTH_BOUNDS
+    }
+    if not updates:
+        return plan
+    return replace(cast(Any, plan), **updates)
+
+
 def _live_attention(static: object, live: object) -> object:
     if not is_dataclass(static) or not is_dataclass(live):
         raise _GraphMiss("attention plan is not immutable data")
     updates: dict[str, object] = {}
     for field in fields(static):
         static_value = getattr(static, field.name)
-        if isinstance(static_value, torch.Tensor) or field.name in {"binding", "backends"}:
+        if (
+            isinstance(static_value, torch.Tensor)
+            or field.name in {"binding", "backends"}
+            or field.name in _PLAN_LENGTH_BOUNDS
+        ):
             updates[field.name] = static_value
         else:
             updates[field.name] = getattr(live, field.name)
@@ -497,6 +533,8 @@ def _attention_signature(plan: object) -> tuple[object, ...]:
             values.append((field.name, value.identity))
         elif field.name.endswith("_cpu"):
             values.append((field.name, len(value)))
+        elif field.name in _PLAN_LENGTH_BOUNDS:
+            values.append((field.name, _bucketed_length(value)))
         else:
             values.append((field.name, _semantic_signature(value)))
     return tuple(values)
