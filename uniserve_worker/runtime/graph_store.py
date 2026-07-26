@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterator
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
@@ -61,6 +62,12 @@ class GraphStore:
     structural signature. Every replay copies live tensors into capture-owned
     buffers, refreshes graph-scoped attention plans, and returns fresh output
     tensors so callers can retain results across later replays.
+
+    Retained executables hold device memory for their whole lifetime, so the
+    store keeps its own residency inside ``memory_budget_bytes`` and releases
+    least-recently-replayed captures to stay there. Workloads whose batch
+    geometry keeps changing therefore run the surplus shapes eagerly instead of
+    accumulating executables until the device is exhausted.
     """
 
     def __init__(
@@ -71,21 +78,34 @@ class GraphStore:
         cache: CacheSpec,
         block_size: int,
         spec_digest: str,
+        memory_budget_bytes: int,
     ) -> None:
         if not spec_digest:
             raise ValueError("graph store requires a resolved spec digest")
         if int(block_size) < 1:
             raise ValueError("graph store block size must be positive")
+        if int(memory_budget_bytes) < 0:
+            raise ValueError("graph store memory budget must not be negative")
         self.enabled = bool(enabled)
         self.prefill_enabled = bool(prefill_enabled)
         self.cache = cache
         self.block_size = int(block_size)
         self.spec_digest = str(spec_digest)
-        self._states: dict[tuple[Hashable, tuple[object, ...]], _GraphState] = {}
+        self.memory_budget_bytes = int(memory_budget_bytes)
+        self.captures = 0
+        self.evictions = 0
+        self._device: torch.device | None = None
+        self._states: OrderedDict[tuple[Hashable, tuple[object, ...]], _GraphState] = OrderedDict()
         self._warmed: set[tuple[Hashable, tuple[object, ...]]] = set()
         self._disabled: set[tuple[Hashable, tuple[object, ...]]] = set()
         self._bindings = itertools.count(1)
         self._lock = RLock()
+
+    @property
+    def resident_bytes(self) -> int:
+        """Device memory the allocator currently holds in graph private pools."""
+
+        return _private_pool_bytes(self._device)
 
     def execute(
         self,
@@ -114,6 +134,8 @@ class GraphStore:
                     output = forward(batch)
                     self._warmed.add(state_key)
                     return output, "graph_fallback"
+                if not self._room_for_capture():
+                    return forward(batch), "graph_fallback"
                 try:
                     state = self._capture(batch, forward)
                 except _GraphMiss:
@@ -127,6 +149,14 @@ class GraphStore:
                     return forward(batch), "graph_fallback"
                 self._warmed.discard(state_key)
                 self._states[state_key] = state
+                self.captures += 1
+                logger.debug(
+                    "graph residency %d/%d MiB across %d executables after capture %d",
+                    self.resident_bytes >> 20,
+                    self.memory_budget_bytes >> 20,
+                    len(self._states),
+                    self.captures,
+                )
                 # Do not return the capture-pass output. Tensors produced while
                 # the stream is capturing can reflect capture-time pool
                 # bootstrapping rather than the real result, so the first
@@ -142,6 +172,7 @@ class GraphStore:
                 _copy_batch_tensors(state.batch, batch)
                 self._prepare_attention(state.batch, batch, capture=False)
                 state.graph.replay()
+                self._states.move_to_end(state_key)
                 return _fresh_output(state.output, batch), "graph_replay"
             except Exception as error:
                 logger.warning("CUDA graph replay failed for an exact shape", exc_info=error)
@@ -159,11 +190,35 @@ class GraphStore:
         for state in states:
             _release_state(state)
 
+    def _room_for_capture(self) -> bool:
+        """Free least-recently-replayed executables until one more pool fits."""
+
+        resident = self.resident_bytes
+        while resident > self.memory_budget_bytes and self._states:
+            _key, state = self._states.popitem(last=False)
+            _release_state(state)
+            self.evictions += 1
+            if self.evictions == 1:
+                logger.info(
+                    "graph residency reached its %d MiB budget; "
+                    "releasing least-recently-replayed executables",
+                    self.memory_budget_bytes >> 20,
+                )
+            released = self.resident_bytes
+            if released >= resident:
+                # The allocator kept the released pool, so freeing more
+                # executables would surrender replay speed without recovering
+                # device memory. Serve this shape eagerly instead.
+                return False
+            resident = released
+        return resident <= self.memory_budget_bytes
+
     def _capture(
         self,
         batch: ForwardBatch,
         forward: Callable[[ForwardBatch], ForwardOutput],
     ) -> _GraphState:
+        self._device = _batch_device(batch)
         static = _graph_batch(batch, next(self._bindings))
         releases = self._prepare_attention(static, batch, capture=True)
         graph = torch.cuda.CUDAGraph()
@@ -265,6 +320,33 @@ class GraphStore:
             and all(value.device.type == "cuda" for value in tensors)
             and len({value.device for value in tensors}) == 1
         )
+
+
+def _private_pool_bytes(device: torch.device | None) -> int:
+    """Allocator segments held in CUDA graph private pools on one device.
+
+    Captured executables own their pool for as long as they are retained, and
+    that memory serves no other allocation, so it is what the store's residency
+    budget governs.
+    """
+
+    if device is None or not torch.cuda.is_available():
+        return 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    total = 0
+    for segment in torch.cuda.memory_snapshot():
+        if segment.get("device") != index:
+            continue
+        pool_id = segment.get("segment_pool_id")
+        if isinstance(pool_id, tuple) and any(pool_id):
+            total += int(segment.get("total_size", 0))
+    return total
+
+
+def _batch_device(batch: ForwardBatch) -> torch.device:
+    for tensor in _tensor_leaves(batch):
+        return tensor.device
+    raise _GraphMiss("forward batch carries no device tensors")
 
 
 def _graph_batch(batch: ForwardBatch, binding_identity: int) -> ForwardBatch:

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest, input_image_data_url
+from .base import (
+    BenchmarkTask,
+    TaskRequest,
+    apply_chat_image_contract,
+    input_image_data_url,
+)
 
 
 class I2ITask(BenchmarkTask):
@@ -49,8 +54,8 @@ class I2ITask(BenchmarkTask):
             "temperature": self.spec.temperature,
             "top_p": self.spec.top_p,
             "ignore_eos": self.spec.ignore_eos,
-            "image_config": image_config,
         }
+        apply_chat_image_contract(payload, image_config)
         if self.spec.extra_request_body:
             payload.update(self.spec.extra_request_body)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat_json")

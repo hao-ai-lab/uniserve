@@ -10,7 +10,11 @@ from ..capabilities import (
     RequestKind,
     ResourceClass,
 )
-from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity
+from ..foundation.runtime_config import (
+    decode_graph_padding_block_count,
+    graph_memory_budget_bytes,
+)
+from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
 from ..spec import DeploymentOverlay, ModelSpec, active_latent_capacity_tokens
 
 __all__ = ["resolve_capabilities"]
@@ -27,13 +31,6 @@ def resolve_capabilities(
 
     resources = deployment.resources
     bytes_per_token = _kv_bytes_per_token(spec, deployment)
-    capacity = derive_runtime_kv_capacity(
-        block_size=int(deployment.block_size),
-        kv_token_capacity=deployment.kv_token_capacity,
-        bytes_per_token=bytes_per_token,
-        device=deployment.device,
-        memory_fraction=float(deployment.kv_memory_fraction),
-    )
     flow = spec.flow
     max_latent_size = (
         active_latent_capacity_tokens(
@@ -42,6 +39,20 @@ def resolve_capabilities(
         )
         if flow is not None
         else 0
+    )
+    resident_copies, co_resident_blocks = _kv_residency_shape(
+        deployment,
+        max_latent_size=max_latent_size,
+        bytes_per_token=bytes_per_token,
+    )
+    capacity = derive_runtime_kv_capacity(
+        block_size=int(deployment.block_size),
+        kv_token_capacity=deployment.kv_token_capacity,
+        bytes_per_token=bytes_per_token,
+        device=deployment.device,
+        memory_fraction=float(deployment.kv_memory_fraction),
+        resident_copies=resident_copies,
+        co_resident_blocks=co_resident_blocks,
     )
     scratch_capacity = _scratch_capacity_tokens(
         deployment,
@@ -109,6 +120,42 @@ def _kv_bytes_per_token(spec: ModelSpec, deployment: DeploymentOverlay) -> int:
         * int(cache.num_layers)
         * int(cache.num_kv_heads)
         * int(cache.head_dim)
+    )
+
+
+def _kv_residency_shape(
+    deployment: DeploymentOverlay,
+    *,
+    max_latent_size: int,
+    bytes_per_token: int,
+) -> tuple[int, int]:
+    """Describe every KV pool that shares the deployment memory budget.
+
+    The first element counts the copies of the request pool held resident at
+    once; the second counts the additional blocks provisioned alongside them.
+    Together they let capacity sizing reserve room for the scratch residency
+    that :func:`_scratch_capacity_tokens` goes on to declare.
+    """
+
+    block_size = int(deployment.block_size)
+    padding_blocks = decode_graph_padding_block_count(block_size)
+    # Captured executables are held for the worker's lifetime, so they occupy
+    # the same static budget as the KV pools and are reserved before the
+    # request pool is sized.
+    graph_blocks = ceil_div(
+        graph_memory_budget_bytes(device_total_bytes(deployment.device)),
+        block_size * max(1, int(bytes_per_token)),
+    )
+    scratch = deployment.resources.scratch
+    if scratch is None:
+        return 1, padding_blocks + graph_blocks
+    fixed_blocks = ceil_div(int(scratch.fixed_tokens), block_size)
+    latent_blocks = ceil_div(max_latent_size * int(scratch.latent_copies), block_size)
+    return (
+        2 if scratch.mirror_kv else 1,
+        2 * padding_blocks
+        + graph_blocks
+        + max(int(scratch.minimum_blocks), fixed_blocks + latent_blocks),
     )
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest
+from .base import BenchmarkTask, TaskRequest, apply_chat_image_contract
 
 
 class T2ITask(BenchmarkTask):
@@ -35,10 +35,11 @@ class T2ITask(BenchmarkTask):
                 image_config["cfg_interval"] = list(self.spec.cfg_interval)
             if self.spec.timestep_shift is not None:
                 image_config["timestep_shift"] = self.spec.timestep_shift
+            root_parameters: dict[str, Any] = {}
             if self.spec.image_think is not None:
-                image_config["think"] = self.spec.image_think
+                root_parameters["think"] = self.spec.image_think
             if self.spec.image_t_eps is not None:
-                image_config["t_eps"] = self.spec.image_t_eps
+                root_parameters["t_eps"] = self.spec.image_t_eps
             payload: dict[str, Any] = {
                 "model": self.spec.model,
                 "modalities": ["image"],
@@ -46,8 +47,8 @@ class T2ITask(BenchmarkTask):
                 "temperature": self.spec.temperature,
                 "top_p": self.spec.top_p,
                 "ignore_eos": self.spec.ignore_eos,
-                "image_config": image_config,
             }
+            apply_chat_image_contract(payload, image_config, root_parameters=root_parameters)
             if self.spec.extra_request_body:
                 payload.update(self.spec.extra_request_body)
             return TaskRequest(

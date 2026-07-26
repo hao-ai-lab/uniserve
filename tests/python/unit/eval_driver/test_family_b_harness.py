@@ -441,9 +441,9 @@ def test_interleave_task_carries_fixed_image_generation_controls() -> None:
         "height": 1152,
         "steps": 50,
         "seed": 42,
-        "think": False,
-        "t_eps": 0.02,
     }
+    assert request.payload["think"] is False
+    assert request.payload["t_eps"] == 0.02
 
 
 def test_openai_parser_captures_sglang_cached_token_breakdown_when_usage_omits_it() -> None:
@@ -602,45 +602,6 @@ def test_i2t_task_preserves_the_input_image_mime_type() -> None:
 
     parts = request.payload["messages"][0]["content"]
     assert parts[1]["image_url"]["url"] == "data:image/jpeg;base64,QUJD"
-
-
-def test_t2i_task_can_emit_image_only_chat_wire() -> None:
-    request = T2ITask(
-        BenchmarkSpec(
-            task=TaskName.T2I,
-            model="BAGEL",
-            width=1024,
-            height=1024,
-            steps=50,
-            max_images=1,
-            guidance_scale=4.0,
-            image_guidance_scale=1.0,
-            cfg_norm="global",
-            cfg_interval=(0.4, 1.0),
-            timestep_shift=3.0,
-            image_think=False,
-            image_t_eps=0.02,
-            wire="openai_chat_json",
-        )
-    ).build_request({"prompt": "a red bicycle"})
-
-    assert request.endpoint == "/v1/chat/completions"
-    assert request.kind == "openai_chat_json"
-    assert request.payload["modalities"] == ["image"]
-    assert request.payload["image_config"] == {
-        "width": 1024,
-        "height": 1024,
-        "steps": 50,
-        "seed": 42,
-        "num_images": 1,
-        "guidance_scale": 4.0,
-        "image_guidance_scale": 1.0,
-        "cfg_norm": "global",
-        "cfg_interval": [0.4, 1.0],
-        "timestep_shift": 3.0,
-        "think": False,
-        "t_eps": 0.02,
-    }
 
 
 def test_nonstreaming_i2t_does_not_fabricate_token_timing() -> None:

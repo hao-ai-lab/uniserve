@@ -447,6 +447,14 @@ impl UniprocExecutor {
                 uniserve_worker_ipc_core::EVENT_DRIVEN_ENV,
                 if event_driven { "1" } else { "0" },
             );
+        // Serving batches change shape continuously, and fixed-size cached
+        // segments strand device memory that later shapes cannot use.
+        // Expandable segments let the allocator resize its mapping instead, so
+        // the worker keeps serving instead of exhausting the device on a
+        // workload whose geometry keeps moving.
+        if std::env::var_os("PYTORCH_CUDA_ALLOC_CONF").is_none() {
+            cmd.env("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True");
+        }
         if tp_size > 1
             && let Some(init_method) = tp_init_method
         {
