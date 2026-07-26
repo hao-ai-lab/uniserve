@@ -12,7 +12,8 @@ from ..capabilities import RequestKind
 from ..execution import ModelExecutor, ModelRunner
 from ..forward import AttentionSelection
 from ..foundation.errors import capability_mismatch
-from ..foundation.runtime_config import ExecutionConfig
+from ..foundation.runtime_config import ExecutionConfig, graph_memory_budget_bytes
+from ..foundation.sizing import device_total_bytes
 from ..nn.mesh import DeviceMesh
 from ..runtime.adapter_store import AdapterStore
 from ..runtime.capabilities import resolve_capabilities
@@ -124,6 +125,7 @@ class ModelWorker:
             cache=model_spec.cache,
             block_size=deployment.block_size,
             spec_digest=self.model_spec_digest,
+            memory_budget_bytes=graph_memory_budget_bytes(device_total_bytes(deployment.device)),
         )
         self.trace = ExecutionTrace(self.model_spec_digest)
         self.executor = ModelExecutor(

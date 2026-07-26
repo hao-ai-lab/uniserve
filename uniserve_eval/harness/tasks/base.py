@@ -45,6 +45,55 @@ def apply_text_sampling_contract(payload: dict[str, Any], spec: BenchmarkSpec) -
         payload["chat_template_kwargs"] = dict(spec.chat_template_kwargs)
 
 
+# Chat image parameters that served backends read from the request root, keyed
+# by their declared name. Width and height also carry the combined ``size``
+# spelling and are handled alongside these.
+_CHAT_IMAGE_ROOT_NAMES: dict[str, tuple[str, ...]] = {
+    "steps": ("num_inference_steps",),
+    "seed": ("seed",),
+    "num_images": ("num_outputs_per_prompt",),
+    "guidance_scale": ("guidance_scale", "cfg_scale", "cfg_text_scale"),
+    "image_guidance_scale": ("image_guidance_scale", "img_cfg_scale", "cfg_img_scale"),
+    "cfg_norm": ("cfg_norm", "cfg_renorm_type"),
+    "cfg_interval": ("cfg_interval",),
+    "timestep_shift": ("timestep_shift",),
+    "think": ("think",),
+    "t_eps": ("t_eps",),
+}
+
+
+def apply_chat_image_contract(
+    payload: dict[str, Any],
+    image_config: dict[str, Any],
+    *,
+    root_parameters: dict[str, Any] | None = None,
+) -> None:
+    """Carry one declared image parameter set under every spelling a server reads.
+
+    ``image_config`` is the canonical chat representation and holds the
+    parameters that shape belongs to. ``root_parameters`` holds declared knobs
+    that chat implementations only accept at the request root. Chat
+    implementations also resolve the canonical parameters from the root under
+    their own field names, so every declared value is emitted under all of them
+    and each server runs the same declared operating point.
+    """
+
+    payload["image_config"] = image_config
+    declared = {**image_config, **(root_parameters or {})}
+    width = declared.get("width")
+    height = declared.get("height")
+    if width is not None and height is not None:
+        payload["width"] = int(width)
+        payload["height"] = int(height)
+        payload["size"] = f"{int(width)}x{int(height)}"
+    for name, root_names in _CHAT_IMAGE_ROOT_NAMES.items():
+        if name not in declared:
+            continue
+        value = declared[name]
+        for root_name in root_names:
+            payload[root_name] = list(value) if isinstance(value, list) else value
+
+
 def input_image_data_url(item: dict[str, Any]) -> str:
     image_b64 = item.get("input_image_b64")
     if not isinstance(image_b64, str) or not image_b64:

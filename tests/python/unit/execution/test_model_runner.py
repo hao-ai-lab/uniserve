@@ -40,7 +40,7 @@ from uniserve_worker.forward import (
 from uniserve_worker.foundation.errors import ComputeError, InputError
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.runtime.execution_trace import ExecutionTrace
-from uniserve_worker.runtime.graph_store import GraphStore
+from uniserve_worker.runtime.graph_store import GraphStore, _GraphState
 
 pytestmark = pytest.mark.unit
 
@@ -98,12 +98,13 @@ def _plan(
     *,
     device: str = "cpu",
     flow_output_dtype: str = "float32",
+    tokens: int = 2,
 ) -> ForwardPlan:
     rows = (
         TokenRow(
             row_id=0,
-            inputs=TokenIds(torch.tensor([3, 4], dtype=torch.long)),
-            positions=torch.tensor([0, 1], dtype=torch.long),
+            inputs=TokenIds(torch.arange(3, 3 + tokens, dtype=torch.long)),
+            positions=torch.arange(tokens, dtype=torch.long),
             output_slot=0,
             selection=TokenSelection.HIDDEN,
         ),
@@ -143,13 +144,28 @@ def _plan(
     )
 
 
-def _graph_store(*, enabled: bool) -> GraphStore:
+def _fake_capture():
+    """Stand in for a real capture, without touching the device."""
+
+    def capture(batch, forward):
+        return _GraphState(
+            graph=SimpleNamespace(replay=lambda: None, reset=lambda: None),
+            batch=batch,
+            output=forward(batch),
+            releases=(),
+        )
+
+    return capture
+
+
+def _graph_store(*, enabled: bool, memory_budget_bytes: int = 1 << 34) -> GraphStore:
     return GraphStore(
         enabled=enabled,
         prefill_enabled=False,
         cache=TEST_MODEL_SPEC.cache,
         block_size=16,
         spec_digest="d" * 64,
+        memory_budget_bytes=memory_budget_bytes,
     )
 
 
@@ -196,15 +212,7 @@ def test_graph_capture_follows_one_exact_shape_warmup(monkeypatch):
     graph = _graph_store(enabled=True)
     monkeypatch.setattr(graph, "_cuda_batch", lambda _batch: True)
 
-    def capture(batch, forward):
-        return SimpleNamespace(
-            graph=SimpleNamespace(replay=lambda: None),
-            batch=batch,
-            output=forward(batch),
-            releases=(),
-        )
-
-    monkeypatch.setattr(graph, "_capture", capture)
+    monkeypatch.setattr(graph, "_capture", _fake_capture())
     runner = ModelRunner(model, graph, ExecutionTrace("d" * 64))
 
     runner.run(_plan(model))
@@ -215,6 +223,40 @@ def test_graph_capture_follows_one_exact_shape_warmup(monkeypatch):
     assert runner.last_observation is not None
     assert runner.last_observation.path is RunPath.GRAPH_CAPTURE
     assert len(model.calls) == 2
+
+    runner.run(_plan(model))
+    assert runner.last_observation is not None
+    assert runner.last_observation.path is RunPath.GRAPH_REPLAY
+
+
+def test_graph_residency_stops_growing_with_batch_shape_diversity(monkeypatch):
+    capture_bytes = 1 << 20
+    model = _MixedModel()
+    graph = _graph_store(enabled=True, memory_budget_bytes=2 * capture_bytes)
+    monkeypatch.setattr(graph, "_cuda_batch", lambda _batch: True)
+    monkeypatch.setattr(graph, "_capture", _fake_capture())
+    # Stand in for the allocator: every retained executable holds one pool.
+    monkeypatch.setattr(
+        GraphStore,
+        "resident_bytes",
+        property(lambda store: len(store._states) * capture_bytes),
+    )
+    runner = ModelRunner(model, graph, ExecutionTrace("d" * 64))
+
+    def run_widths(widths):
+        for width in widths:
+            for _ in range(2):
+                runner.run(_plan(model, tokens=width))
+
+    run_widths(range(1, 5))
+    retained = len(graph._states)
+    run_widths(range(5, 13))
+
+    # The budget holds two executables; a third may be captured before the
+    # next capture attempt frees room, and nothing beyond that accumulates.
+    assert retained <= 3
+    assert len(graph._states) == retained
+    assert graph.evictions > 0
 
 
 def test_runner_normalizes_staging_and_output_failures():

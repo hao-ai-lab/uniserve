@@ -13,8 +13,10 @@ from .env import DEFAULT_ATTENTION_BACKEND, DEFAULT_COMPILE_BACKEND
 
 __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
+    "DEFAULT_GRAPH_MEMORY_FRACTION",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
     "decode_graph_padding_block_count",
+    "graph_memory_budget_bytes",
     "FlashInferTuningConfig",
     "TorchCompileRuntimeConfig",
     "ExecutionConfig",
@@ -119,6 +121,18 @@ def decode_graph_padding_block_count(block_size: int) -> int:
     block_size = max(1, int(block_size))
     max_padding_rows = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
     return (max_padding_rows + block_size - 1) // block_size
+
+
+# Captured graphs hold their memory for as long as they are retained, so the
+# executable set owns a fixed share of the device rather than growing with the
+# shape diversity a workload happens to present.
+DEFAULT_GRAPH_MEMORY_FRACTION = 0.10
+
+
+def graph_memory_budget_bytes(total_device_bytes: int) -> int:
+    """Device memory the retained graph executables may hold at once."""
+
+    return max(0, int(float(max(0, int(total_device_bytes))) * DEFAULT_GRAPH_MEMORY_FRACTION))
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ __all__ = [
     'CudaKVCapacity',
     'RuntimeKVCapacity',
     'ceil_div',
+    'device_total_bytes',
     'derive_cuda_kv_capacity',
     'derive_num_blocks',
     'derive_runtime_kv_capacity',
@@ -81,6 +82,28 @@ def derive_num_blocks(
     return max(min_blocks, blocks)
 
 
+def device_total_bytes(device: Any) -> int:
+    """Total memory of one device, or zero when it exposes no CUDA memory."""
+
+    try:
+        import torch
+    except Exception:
+        return 0
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        target = torch.device(device)
+    except Exception:
+        return 0
+    if target.type != "cuda":
+        return 0
+    try:
+        _free, total = torch.cuda.mem_get_info(target)
+    except Exception:
+        return 0
+    return int(total)
+
+
 def derive_cuda_kv_capacity(
     *,
     device: Any,
@@ -88,13 +111,24 @@ def derive_cuda_kv_capacity(
     bytes_per_token: int,
     memory_fraction: float,
     floor: int = 1,
+    resident_copies: int = 1,
+    co_resident_blocks: int = 0,
 ) -> CudaKVCapacity | None:
-    """Derive KV token/block capacity from currently free CUDA memory.
+    """Derive KV token/block capacity from the device static-memory budget.
 
     CUDA visibility and free-memory accounting are deployment concerns, so model
     classes call this helper instead of reaching into ``torch.cuda`` directly.
     ``None`` means CUDA sizing is unavailable and callers should use their
     non-CUDA capacity policy.
+
+    ``memory_fraction`` is the share of total device memory that static
+    residency may hold: the memory already resident when sizing runs, such as
+    model weights, plus every KV pool provisioned from the derived capacity.
+    Whatever the fraction leaves stays available for activations, graph pools,
+    and other transient allocations. A deployment that keeps ``resident_copies``
+    copies of the derived pool resident at once, plus ``co_resident_blocks`` of
+    fixed KV storage, receives a block count that satisfies
+    ``resident_copies * num_blocks + co_resident_blocks`` within the budget.
     """
 
     try:
@@ -119,9 +153,12 @@ def derive_cuda_kv_capacity(
     except Exception:
         return None
     fraction = float(memory_fraction)
-    usable_bytes = max(0, int(float(free_bytes) * fraction))
-    raw_token_capacity = usable_bytes // token_bytes
-    num_blocks = max(max(1, int(floor)), int(raw_token_capacity) // block)
+    resident_bytes = max(0, int(total_bytes) - int(free_bytes))
+    usable_bytes = max(0, int(float(total_bytes) * fraction) - resident_bytes)
+    budget_blocks = (usable_bytes // token_bytes) // block
+    copies = max(1, int(resident_copies))
+    request_blocks = (budget_blocks - max(0, int(co_resident_blocks))) // copies
+    num_blocks = max(max(1, int(floor)), request_blocks)
     return CudaKVCapacity(
         device=str(cuda_device),
         free_bytes=int(free_bytes),
@@ -143,11 +180,15 @@ def derive_runtime_kv_capacity(
     memory_fraction: float = 1.0,
     floor: int = 1,
     default_blocks: int | None = None,
+    resident_copies: int = 1,
+    co_resident_blocks: int = 0,
 ) -> RuntimeKVCapacity:
     """Resolve the worker-facing KV capacity policy in one place.
 
     Explicit token capacity wins. Otherwise CUDA free-memory sizing is used
-    when available. CPU/unavailable-CUDA paths fall back to
+    when available, with ``resident_copies`` and ``co_resident_blocks``
+    describing the KV storage that shares the memory-fraction budget with the
+    request pool. CPU/unavailable-CUDA paths fall back to
     :func:`derive_num_blocks`' shared default block policy.
     """
 
@@ -169,6 +210,8 @@ def derive_runtime_kv_capacity(
         bytes_per_token=token_bytes,
         memory_fraction=memory_fraction,
         floor=floor,
+        resident_copies=resident_copies,
+        co_resident_blocks=co_resident_blocks,
     )
     if cuda is not None:
         return RuntimeKVCapacity(

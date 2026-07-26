@@ -53,6 +53,8 @@ Capacity and scheduling settings are declared explicitly on both sides of every 
 
 32 is the matrix's maximum offered client concurrency and also the measured request count of every multimodal point, so no server admits fewer requests than its load case offers. The text budget of 16384 is the value SGLang derives automatically for this GPU class, so both text servers run at the reference's own operating point.
 
+On both text servers the static memory fraction bounds long-lived device memory as a share of the device total and leaves the remainder for transient work. UniServe counts resident weights, every KV pool, and its captured graph executables inside that share; SGLang counts weights and its KV pool. Both therefore size KV capacity from the same declared share of the same device, and both land far above the residency 32 concurrent ShareGPT requests occupy, so the accounting difference does not bind at any point in this matrix.
+
 Both runtimes select their own attention backends from their own capability checks. UniServe supplies no backend override and neither reference server pins one, so each runtime uses the kernel it considers best for the model and device.
 
 Where a reference runtime has no equivalent knob, the mismatch is explicit rather than silently absent. `vllm serve --omni` derives KV capacity from a memory fraction rather than a token count, its diffusion stages expose no memory-fraction field, and it accepts no KV-cache dtype for those stages. The SenseNova-U1 endpoint resolves to a single diffusion stage whose scheduler admits one request at a time unless `--max-num-seqs` is supplied, so that flag is a required part of the reference launch rather than an optional tuning choice.
@@ -75,7 +77,9 @@ SGLang requires an explicit `--reasoning-parser qwen3` to separate thinking outp
 
 ## Multimodal semantics
 
-SenseNova T2I fixes seed 42, non-thinking mode, `t_eps=0.02`, 50 denoising updates, text guidance 4.0, image guidance 1.0, no guidance renormalization, guidance interval `[0.0,1.0]`, and timestep shift 3.0.
+SenseNova T2I fixes seed 42, non-thinking mode, `t_eps=0.02`, 50 denoising updates, text guidance 4.0, image guidance 1.0, no guidance renormalization, guidance interval `[0.0,1.0]`, and timestep shift 3.0. Each request states these controls under both the canonical `image_config` object and the request-root field names the reference chat implementation reads, so one declared operating point reaches either server.
+
+`t_eps` is the clamp applied when converting an x-prediction into a velocity at the end of the denoising schedule. vLLM-Omni applies the declared value; UniServe applies its own numerical floor and exposes no request-level control, so the two runtimes differ in the terminal step of an otherwise identical schedule. The difference changes generated image content, not the amount of work per request, so latency and throughput stay comparable while image content is not expected to match across runtimes.
 
 BAGEL T2I fixes seed 42 in both autoregressive and diffusion stages, non-thinking mode, 50 effective denoising updates, text guidance 4.0, image guidance 1.5, global guidance renormalization, guidance interval `[0.4,1.0]`, and timestep shift 3.0. The vLLM-Omni profile supplies 51 schedule points because its pinned scheduler removes the terminal point before performing 50 updates.
 

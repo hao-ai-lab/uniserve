@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import BenchmarkTask, TaskRequest, apply_text_sampling_contract
+from .base import (
+    BenchmarkTask,
+    TaskRequest,
+    apply_chat_image_contract,
+    apply_text_sampling_contract,
+)
 
 
 class InterleaveTask(BenchmarkTask):
@@ -31,10 +36,11 @@ class InterleaveTask(BenchmarkTask):
             image["cfg_interval"] = list(self.spec.cfg_interval)
         if self.spec.timestep_shift is not None:
             image["timestep_shift"] = self.spec.timestep_shift
+        root_parameters: dict[str, Any] = {}
         if self.spec.image_think is not None:
-            image["think"] = self.spec.image_think
+            root_parameters["think"] = self.spec.image_think
         if self.spec.image_t_eps is not None:
-            image["t_eps"] = self.spec.image_t_eps
+            root_parameters["t_eps"] = self.spec.image_t_eps
         max_tokens = item.get("max_tokens", self.spec.max_tokens or 512)
 
         image_config = dict(image)
@@ -50,8 +56,8 @@ class InterleaveTask(BenchmarkTask):
             "temperature": self.spec.temperature,
             "top_p": self.spec.top_p,
             "ignore_eos": self.spec.ignore_eos,
-            "image_config": image_config,
         }
+        apply_chat_image_contract(payload, image_config, root_parameters=root_parameters)
         if self.spec.extra_request_body:
             extra = dict(self.spec.extra_request_body)
             extra_image = extra.pop("image_config", None)
