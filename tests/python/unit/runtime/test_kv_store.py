@@ -127,3 +127,43 @@ def test_snapshot_import_rejects_another_sessions_partial_page() -> None:
 
     with pytest.raises(WorkerError, match="writable KV block 1 held by another session"):
         store.import_snapshot(2, snapshot, transport)
+
+
+def _published_store() -> tuple[KvStore, LocalTransport]:
+    pool = PagedKVPool(
+        num_layers=2,
+        num_blocks=4,
+        block_size=2,
+        num_kv_heads=1,
+        head_dim=1,
+        device="cpu",
+        dtype=torch.float32,
+    )
+    store = KvStore(pool)
+    store.admit(
+        Admission.create(
+            1,
+            sequence=SequenceAdmission(kv=KvAllocation(block_ids=(0, 1), prefix_len=2)),
+        )
+    )
+    return store, LocalTransport()
+
+
+def test_a_new_publication_returns_the_copies_the_previous_one_holds() -> None:
+    store, transport = _published_store()
+
+    first = store.publish(1, source_version=1, position=2, transport=transport)
+    second = store.publish(1, source_version=2, position=2, transport=transport)
+
+    assert first.locators and second.locators
+    assert len(transport._table) == len(second.locators)
+
+
+def test_dropping_a_session_returns_the_copies_its_publication_holds() -> None:
+    store, transport = _published_store()
+    store.publish(1, source_version=1, position=2, transport=transport)
+    assert transport._table
+
+    store.drop(1)
+
+    assert not transport._table

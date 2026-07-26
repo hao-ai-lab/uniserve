@@ -14,7 +14,7 @@ from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import ceil_div
 from .host_staging import copy_cpu_to_device, cpu_int_staging_buffer, fill_cpu_ints, is_pinned
 from .kv_pool import PagedKVPool
-from .transfer import Transport
+from .transfer import Locator, Transport
 
 
 @dataclass(slots=True)
@@ -498,6 +498,7 @@ class KvStore:
         self._entries: dict[int, KvEntry] = {}
         self._branches: dict[tuple[int, int, str], KvEntry] = {}
         self._holders: dict[int, set[int]] = {}
+        self._published: dict[int, tuple[tuple[str, ...], object]] = {}
         self._lock = RLock()
 
     def bind_pool(self, pool: PagedKVPool) -> None:
@@ -725,6 +726,10 @@ class KvStore:
                     raise RuntimeError("published KV span is incomplete")
                 locators.append(publish(key.contiguous()).to_wire_json())
                 locators.append(publish(value.contiguous()).to_wire_json())
+            # A session's newest publication is the one its consumers resolve,
+            # so the copies the previous publication handed the transport are
+            # unreachable and their device memory returns here.
+            self._retain_published(session_id, tuple(locators), transport)
         return PublishedKv(
             handle=int(session_id),
             locators=tuple(locators),
@@ -734,6 +739,31 @@ class KvStore:
             group_id=entry.group_id,
             position=int(position),
         )
+
+    def _retain_published(
+        self,
+        session_id: int,
+        locators: tuple[str, ...],
+        transport: object,
+    ) -> None:
+        self.release_published(session_id)
+        if locators:
+            with self._lock:
+                self._published[int(session_id)] = (locators, transport)
+
+    def release_published(self, session_id: int) -> None:
+        """Return the device copies one session handed the transport."""
+
+        with self._lock:
+            retained = self._published.pop(int(session_id), None)
+        if retained is None:
+            return
+        locators, transport = retained
+        release = getattr(transport, "release", None)
+        if not callable(release):
+            return
+        for encoded in locators:
+            release(Locator.from_wire_json(encoded))
 
     def import_snapshot(self, session_id: int, snapshot: PublishedKv, transport: Transport) -> None:
         """Install a complete transferred snapshot without exposing partial state.
@@ -853,6 +883,7 @@ class KvStore:
                         value[:, target].copy_(value[:, source])
 
     def drop(self, session_id: int) -> None:
+        self.release_published(session_id)
         with self._lock:
             entry = self._entries.pop(int(session_id), None)
             if entry is None:

@@ -135,6 +135,10 @@ class GraphStore:
                     self._warmed.add(state_key)
                     return output, "graph_fallback"
                 if not self._room_for_capture():
+                    # The retained set already fills its budget, so this shape
+                    # serves eagerly from here on rather than re-measuring the
+                    # allocator every time it reappears.
+                    self._disabled.add(state_key)
                     return forward(batch), "graph_fallback"
                 try:
                     state = self._capture(batch, forward)
@@ -150,13 +154,14 @@ class GraphStore:
                 self._warmed.discard(state_key)
                 self._states[state_key] = state
                 self.captures += 1
-                logger.debug(
-                    "graph residency %d/%d MiB across %d executables after capture %d",
-                    self.resident_bytes >> 20,
-                    self.memory_budget_bytes >> 20,
-                    len(self._states),
-                    self.captures,
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "graph residency %d/%d MiB across %d executables after capture %d",
+                        self.resident_bytes >> 20,
+                        self.memory_budget_bytes >> 20,
+                        len(self._states),
+                        self.captures,
+                    )
                 # Do not return the capture-pass output. Tensors produced while
                 # the stream is capturing can reflect capture-time pool
                 # bootstrapping rather than the real result, so the first

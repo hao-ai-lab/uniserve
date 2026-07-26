@@ -313,6 +313,24 @@ class ModelWorker:
             )
         self.drop_session(session_id)
 
+    def _warmup_image_geometry(self) -> tuple[int, int]:
+        """Largest square image whose latent grid fits the declared capacity.
+
+        Warmup exercises the real denoise path, so its geometry has to obey the
+        same latent limits a served request does. Deriving it from the resolved
+        capabilities keeps one warmup valid for every image model.
+        """
+
+        import math
+
+        caps = self._contract.capabilities
+        downsample = max(1, int(caps.latent_downsample))
+        capacity = int(caps.max_latent_size)
+        if int(caps.max_vae_grid_tokens) > 0:
+            capacity = min(capacity, int(caps.max_vae_grid_tokens))
+        side = max(1, math.isqrt(max(1, capacity)))
+        return side * downsample, side * downsample
+
     def _warmup_flow(self) -> None:
         from ..batch import (
             Admission,
@@ -330,9 +348,10 @@ class ModelWorker:
         ):
             return
         session_id = 2
+        height, width = self._warmup_image_geometry()
         admission = Admission.create(
             session_id,
-            flow=FlowAdmission(ImageParams(steps=50, height=2048, width=1152, seed=0)),
+            flow=FlowAdmission(ImageParams(steps=50, height=height, width=width, seed=0)),
         )
         flow = FlowOperation(
             latent_handle=1,

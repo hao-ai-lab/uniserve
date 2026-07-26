@@ -22,7 +22,7 @@
         "--max-running-requests",
         "32",
         "--max-num-batched-tokens",
-        "4096",
+        "8192",
         "--page-size",
         "64",
         "--mem-fraction-static",
@@ -224,12 +224,16 @@
         "--omni",
         "--deploy-config",
         "uniserve_eval/configs/vllm_omni/bagel.yaml",
+        "--attention-config",
+        "{\"backend\": \"TRITON_ATTN\"}",
+        "--mm-encoder-attn-backend",
+        "TORCH_SDPA",
         "--host",
         "127.0.0.1",
         "--port",
         "8092"
       ],
-      "description": "vllm-omni BAGEL-7B-MoT benchmark server. Attention backends are left to the runtime's own capability-based selection; VLLM_TUNED_CONFIG_FOLDER supplies the GB200 MoT GEMM tile configurations so the reference runs its tuned kernels."
+      "description": "vllm-omni BAGEL-7B-MoT benchmark server. Both attention backends are pinned to the kernels that build on this accelerator: the CUTLASS flash-attention path the runtime would otherwise select fails to compile for the language model and for the vision encoder. VLLM_TUNED_CONFIG_FOLDER supplies the GB200 MoT GEMM tile configurations so the reference runs its tuned kernels."
     },
     "gate/server/sensenova": {
       "model": "${UNISERVE_SENSENOVA_MODEL}",
@@ -475,12 +479,12 @@
           {"id": "r8", "request_rate": 8},
           {"id": "r16", "request_rate": 16}
         ],
-        "interleave_arrival": [
-          {"id": "r0.1", "request_rate": 0.1},
-          {"id": "r0.2", "request_rate": 0.2},
-          {"id": "r0.4", "request_rate": 0.4},
-          {"id": "r0.8", "request_rate": 0.8},
-          {"id": "r1", "request_rate": 1}
+        "interleave_concurrency": [
+          {"id": "c1", "request_rate": "inf", "max_concurrency": 1},
+          {"id": "c2", "request_rate": "inf", "max_concurrency": 2},
+          {"id": "c4", "request_rate": "inf", "max_concurrency": 4},
+          {"id": "c8", "request_rate": "inf", "max_concurrency": 8},
+          {"id": "c16", "request_rate": "inf", "max_concurrency": 16}
         ],
         "image_concurrency": [
           {"id": "c1", "request_rate": "inf", "max_concurrency": 1},
@@ -664,7 +668,7 @@
           }
         },
         "sensenova_ueval_interleave_uniserve": {
-          "load_case_set": "interleave_arrival",
+          "load_case_set": "interleave_concurrency",
           "name": "sensenova-uniserve-interleave-{load_id}",
           "output": "sensenova_ueval_interleave/uniserve_{load_id}",
           "harness": {
@@ -688,7 +692,6 @@
             "width": 2048,
             "height": 1152,
             "wire": "openai_chat",
-            "max_images": 1,
             "guidance_scale": 4.0,
             "image_guidance_scale": 1.0,
             "cfg_norm": "none",
