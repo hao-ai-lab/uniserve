@@ -292,7 +292,6 @@ def test_sensenova_benchmark_uses_equal_single_gpu_graph_execution():
     benchmark = server_spec(config, "benchmark/server/sensenova-uniserve")
     benchmark_cmd = uniserve_eval.backends.build_serve_cmd(config, benchmark)
     assert benchmark["cuda_visible_devices"] == "0"
-    assert benchmark["env"]["UNISERVE_DECODE_TOKEN_BURST"] == "8"
     assert "--tp-size" not in benchmark_cmd
     assert benchmark_cmd[benchmark_cmd.index("--prefill-cuda-graph") + 1] == "true"
 
@@ -1075,9 +1074,7 @@ def test_server_execution_must_derive_from_profile_and_link_model_input(tmp_path
         model_revision_contract=None,
     )
     performance_config = deepcopy(config)
-    performance_config["servers"]["benchmark/server/test"]["env"] = {
-        "UNISERVE_DECODE_TOKEN_BURST": "8"
-    }
+    performance_config["servers"]["benchmark/server/test"]["env"] = {"OMP_NUM_THREADS": "8"}
     assert not server_execution_matches_profile(
         performance_config,
         "benchmark/server/test",
@@ -1087,7 +1084,7 @@ def test_server_execution_must_derive_from_profile_and_link_model_input(tmp_path
     )
     declared_execution = execution_provenance(
         server_command_template(performance_config, "benchmark/server/test"),
-        {**environment, "UNISERVE_DECODE_TOKEN_BURST": "8"},
+        {**environment, "OMP_NUM_THREADS": "8"},
         cwd=ROOT,
         workspace_root=ROOT,
     )
@@ -1827,13 +1824,13 @@ def test_performance_environment_does_not_persist_asset_paths() -> None:
         {
             "UNISERVE_QWEN3_MODEL": "/private/model/path",
             "UNISERVE_SHAREGPT_PATH": "/private/dataset/path",
-            "UNISERVE_DECODE_TOKEN_BURST": "8",
+            "OMP_NUM_THREADS": "8",
             "VLLM_OMNI_USE_QUACK_FP8": "0",
         }
     )
 
     assert persisted == {
-        "UNISERVE_DECODE_TOKEN_BURST": "8",
+        "OMP_NUM_THREADS": "8",
         "VLLM_OMNI_USE_QUACK_FP8": "0",
     }
 

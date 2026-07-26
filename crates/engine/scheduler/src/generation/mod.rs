@@ -266,15 +266,12 @@ impl GenerationCursor {
             TransitionDelta::DecodeUnd {
                 logical_position,
                 physical_position,
-                commits_nonterminal_stop_tail,
-                ref stop_token_ids,
-                ..
             } => {
                 let ResultDelta::Sequence(delta) = &result.delta else {
                     return Err(CursorApplyError::ResultTypeMismatch);
                 };
                 let effect = &delta.effect;
-                let mut actual_count = effect
+                let actual_count = effect
                     .sampled_token_ids
                     .len()
                     .max(
@@ -283,14 +280,6 @@ impl GenerationCursor {
                             .map_or(0, |accepted| accepted as usize + 1),
                     )
                     .max(1) as u32;
-                if commits_nonterminal_stop_tail
-                    && effect
-                        .sampled_token_ids
-                        .last()
-                        .is_some_and(|token| stop_token_ids.contains(token))
-                {
-                    actual_count = actual_count.saturating_add(1);
-                }
                 self.und.logical_pos = self
                     .und
                     .logical_pos
@@ -569,15 +558,11 @@ impl CursorProjection {
             TransitionDelta::DecodeUnd {
                 logical_position,
                 physical_position,
-                token_count,
-                ..
             } => {
-                let count = u32::from(token_count.max(1));
-                let end = logical_position.saturating_add(count);
-                self.logical_pos = self.logical_pos.max(end);
+                self.logical_pos = self.logical_pos.max(logical_position.saturating_add(1));
                 self.physical_kv_len = self
                     .physical_kv_len
-                    .max(physical_position.saturating_add(count));
+                    .max(physical_position.saturating_add(1));
             }
             TransitionDelta::DenoiseGen { .. } => {}
             TransitionDelta::CommitGen {
@@ -669,9 +654,6 @@ pub(crate) enum TransitionIntent {
         token_source: TokenSource,
         new_blocks: Vec<BlockId>,
         spec_token_ids: Option<Vec<u32>>,
-        token_count: u16,
-        stop_token_ids: Option<Vec<u32>>,
-        stop_terminal: bool,
         recent_tokens: Option<Vec<u32>>,
         allowed_tokens: Option<Vec<u32>>,
         suppress_tokens: Option<Vec<u32>>,
@@ -776,9 +758,6 @@ impl GenerationPlanner {
                                     token_ids,
                                     source: TokenSource::Wire,
                                     draft_token_ids: Vec::new(),
-                                    burst_tokens: 1,
-                                    stop_token_ids: Vec::new(),
-                                    stop_terminal: false,
                                     return_all_logits: request.sampling.prompt_logprobs_requested(),
                                 }),
                             }),
@@ -860,9 +839,6 @@ impl GenerationPlanner {
                     token_source,
                     new_blocks,
                     spec_token_ids,
-                    token_count,
-                    stop_token_ids,
-                    stop_terminal,
                     recent_tokens,
                     allowed_tokens,
                     suppress_tokens,
@@ -873,8 +849,6 @@ impl GenerationPlanner {
                             actual: position,
                         });
                     }
-                    let token_count = token_count.max(1);
-                    let transition_stop_token_ids = stop_token_ids.clone().unwrap_or_default();
                     let draft_token_ids = spec_token_ids.unwrap_or_default();
                     let mode = if draft_token_ids.is_empty() {
                         SequenceMode::Decode
@@ -899,9 +873,6 @@ impl GenerationPlanner {
                                     token_ids: vec![token_id],
                                     source: token_source,
                                     draft_token_ids,
-                                    burst_tokens: token_count,
-                                    stop_token_ids: stop_token_ids.unwrap_or_default(),
-                                    stop_terminal,
                                     return_all_logits: false,
                                 }),
                             }),
@@ -909,9 +880,6 @@ impl GenerationPlanner {
                         TransitionDelta::DecodeUnd {
                             logical_position: position,
                             physical_position: cursor.physical_kv_len,
-                            token_count,
-                            stop_token_ids: transition_stop_token_ids,
-                            commits_nonterminal_stop_tail: token_count > 1 && !stop_terminal,
                         },
                         Vec::new(),
                         cursor.replayability,
@@ -1268,10 +1236,8 @@ impl GenerationPlanner {
             ),
             expected_text_tokens: match &delta {
                 TransitionDelta::IngestText { .. } => Some(TextTokenCountRange { min: 1, max: 1 }),
-                TransitionDelta::DecodeUnd { token_count, .. } => {
-                    let max = draft_count.map_or(u32::from((*token_count).max(1)), |count| {
-                        count.saturating_add(1)
-                    });
+                TransitionDelta::DecodeUnd { .. } => {
+                    let max = draft_count.map_or(1, |count| count.saturating_add(1));
                     Some(TextTokenCountRange { min: 1, max })
                 }
                 _ => None,
@@ -1424,10 +1390,8 @@ fn transition_kv_target(delta: &TransitionDelta) -> Option<usize> {
             ImageKvEffect::WorkerDefined => return None,
         }),
         TransitionDelta::DecodeUnd {
-            physical_position,
-            token_count,
-            ..
-        } => physical_position.saturating_add(u32::from((*token_count).max(1))),
+            physical_position, ..
+        } => physical_position.saturating_add(1),
         TransitionDelta::CommitGen {
             physical_position,
             physical_kv_tokens: Some(effect),
@@ -1571,9 +1535,6 @@ pub(crate) enum TransitionDelta {
     DecodeUnd {
         logical_position: u32,
         physical_position: u32,
-        token_count: u16,
-        stop_token_ids: Vec<u32>,
-        commits_nonterminal_stop_tail: bool,
     },
     DenoiseGen {
         image_id: u32,
@@ -2140,51 +2101,5 @@ mod tests {
             transition.validate_result(&stale),
             Err(TransitionValidationError::VersionMismatch { .. })
         ));
-    }
-
-    #[test]
-    fn decode_burst_validation_accepts_every_returned_token() {
-        let mut transition = GenerationPlanner::new()
-            .plan(
-                &request(9, vec![11, 12]),
-                CursorProjection {
-                    phase: GenerationPhase::DecodeUnd,
-                    prompt_cursor: 2,
-                    logical_pos: 2,
-                    physical_kv_len: 2,
-                    replayability: Replayability::Replayable,
-                },
-                TransitionIntent::DecodeUnd {
-                    position: 2,
-                    token_id: 13,
-                    token_source: TokenSource::Wire,
-                    new_blocks: Vec::new(),
-                    spec_token_ids: None,
-                    token_count: 8,
-                    stop_token_ids: None,
-                    stop_terminal: false,
-                    recent_tokens: None,
-                    allowed_tokens: None,
-                    suppress_tokens: None,
-                },
-            )
-            .expect("plan decode burst");
-        transition.assign_envelope(3, 18, 6);
-        let result = OperationResult {
-            session_id: RequestId(9),
-            epoch: 3,
-            op_id: 18,
-            base_version: 6,
-            result_version: 7,
-            delta: ResultDelta::Sequence(SequenceDelta {
-                effect: SequenceEffect {
-                    sampled_token_ids: vec![14, 15, 16, 17, 18, 19, 20, 21],
-                    kv_tokens: Some(10),
-                    ..SequenceEffect::default()
-                },
-            }),
-        };
-
-        assert_eq!(transition.validate_result(&result), Ok(()));
     }
 }

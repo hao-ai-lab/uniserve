@@ -483,16 +483,11 @@ class TokenInput:
     token_ids: tuple[int, ...]
     source: TokenSource = TokenSource.WIRE
     draft_token_ids: tuple[int, ...] = ()
-    burst_tokens: int = 1
-    stop_token_ids: tuple[int, ...] = ()
-    stop_terminal: bool = False
     return_all_logits: bool = False
 
     def __post_init__(self) -> None:
         if not self.token_ids:
             raise invalid_descriptor("model sequence requires at least one token id")
-        if self.burst_tokens < 1:
-            raise invalid_descriptor("sequence burst must be positive")
 
     @classmethod
     def from_wire(cls, value: object, where: str = "token input") -> TokenInput:
@@ -501,9 +496,6 @@ class TokenInput:
             token_ids=_uints(data.get("token_ids", ()), f"{where}.token_ids"),
             source=_enum(TokenSource, data.get("source"), f"{where}.source"),
             draft_token_ids=_uints(data.get("draft_token_ids", ()), f"{where}.draft_token_ids"),
-            burst_tokens=_uint(data.get("burst_tokens", 1), f"{where}.burst_tokens"),
-            stop_token_ids=_uints(data.get("stop_token_ids", ()), f"{where}.stop_token_ids"),
-            stop_terminal=_bool(data.get("stop_terminal", False), f"{where}.stop_terminal"),
             return_all_logits=_bool(
                 data.get("return_all_logits", False), f"{where}.return_all_logits"
             ),
@@ -514,9 +506,6 @@ class TokenInput:
             "token_ids": list(self.token_ids),
             "source": self.source.value,
             "draft_token_ids": list(self.draft_token_ids),
-            "burst_tokens": self.burst_tokens,
-            "stop_token_ids": list(self.stop_token_ids),
-            "stop_terminal": self.stop_terminal,
             "return_all_logits": self.return_all_logits,
         }
 
@@ -633,8 +622,8 @@ class SequenceOperation:
             if self.mode is SequenceMode.EXTEND:
                 if token_input.source is not TokenSource.WIRE:
                     raise invalid_descriptor("sequence extend requires wire token input")
-                if token_input.draft_token_ids or token_input.burst_tokens != 1:
-                    raise invalid_descriptor("sequence extend cannot carry draft or burst work")
+                if token_input.draft_token_ids:
+                    raise invalid_descriptor("sequence extend cannot carry draft work")
             elif self.mode is SequenceMode.DECODE:
                 if len(token_input.token_ids) != 1 or token_input.draft_token_ids:
                     raise invalid_descriptor(
@@ -1428,9 +1417,6 @@ def _digest_operation(digest: _Digest, value: Operation) -> None:
             digest.u32s(value.input.token_ids)
             digest.u8(list(TokenSource).index(value.input.source))
             digest.u32s(value.input.draft_token_ids)
-            digest.u16(value.input.burst_tokens)
-            digest.u32s(value.input.stop_token_ids)
-            digest.boolean(value.input.stop_terminal)
             digest.boolean(value.input.return_all_logits)
         else:
             digest.u8(1)
