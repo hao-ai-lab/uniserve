@@ -10,6 +10,7 @@ __all__ = [
     'DEFAULT_BLOCK_SIZE',
     'CudaKVCapacity',
     'RuntimeKVCapacity',
+    'bucketed_page_count',
     'ceil_div',
     'device_total_bytes',
     'derive_cuda_kv_capacity',
@@ -55,6 +56,22 @@ def ceil_div(value: int, divisor: int) -> int:
     """
     divisor = max(1, int(divisor))
     return (int(value) + divisor - 1) // divisor
+
+
+def bucketed_page_count(pages: int) -> int:
+    """Round a page-table width up to a power of two.
+
+    A KV page table gains a column for every block a sequence occupies, so an
+    exact width changes as a conversation grows and every width is a distinct
+    executable shape. Bucketing the width to a power of two keeps one shape
+    serving a whole range of lengths. Attention reads each row only to its own
+    ``seqused_k``, so the surplus columns carry no work.
+    """
+
+    count = int(pages)
+    if count <= 1:
+        return max(0, count)
+    return 1 << (count - 1).bit_length()
 
 
 def derive_num_blocks(

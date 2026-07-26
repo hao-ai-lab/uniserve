@@ -11,7 +11,7 @@ import torch
 from ..backends.paged_kv_math import paged_kv_write
 from ..batch import Admission, KvLeaseDelta, PublishedKv
 from ..foundation.errors import invalid_descriptor
-from ..foundation.sizing import ceil_div
+from ..foundation.sizing import bucketed_page_count, ceil_div
 from .host_staging import copy_cpu_to_device, cpu_int_staging_buffer, fill_cpu_ints, is_pinned
 from .kv_pool import PagedKVPool
 from .transfer import Locator, Transport
@@ -100,7 +100,7 @@ class KvBatchView:
         self._query_lens = None if query_lens is None else tuple(int(value) for value in query_lens)
         if self._query_lens is not None and len(self._query_lens) != len(base_lens):
             raise invalid_descriptor("packed KV query lengths do not match cache rows")
-        self._block_table_width = max(len(ids) for ids in self._block_ids)
+        self._block_table_width = bucketed_page_count(max(len(ids) for ids in self._block_ids))
         self._block_tables: dict[torch.device, torch.Tensor] = {}
         self._cache_lengths: dict[torch.device, torch.Tensor] = {}
         self._append_plan: _VarlenAppendPlan | None = None
@@ -442,7 +442,9 @@ class _PackedKvView:
             offset = end
 
     def block_table(self, device: torch.device) -> torch.Tensor:
-        width = max(len(entry.block_ids) for entry, _query, _write in self._rows)
+        width = bucketed_page_count(
+            max(len(entry.block_ids) for entry, _query, _write in self._rows)
+        )
         result = torch.zeros((len(self._rows), width), dtype=torch.int32, device=device)
         for index, (entry, _query, _write) in enumerate(self._rows):
             if entry.block_ids:
