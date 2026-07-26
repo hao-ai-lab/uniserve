@@ -7,9 +7,9 @@ sections:
               explicit ``command``); specs support ``extends`` with deep-merge
               so variants stay single-source.
   workloads — what to run against a compatible server (``verify`` correctness
-              gates, ``perf`` harness points, or generic ``script`` runs).
+              gates or generic ``script`` runs).
   suites    — ordered workload names for a broader pass; either a plain list or
-              ``{"workloads": [...], "compare": [[baseline, candidate, ...]]}``.
+              ``{"workloads": [...]}``.
 
 Everything path-like resolves against the repository root; artifacts land under
 the config's ``artifact_root`` (``servers/<name>`` and ``workloads/<name>``).
@@ -29,13 +29,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "profiles.json"
 ENV_REF_RE = re.compile(
     r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
-_LOAD_CASE_HARNESS_FIELDS = frozenset(
-    {
-        "workload_mix",
-        "warmup_mix",
-        "acceptance_min_images_per_success",
-    }
-)
+_LOAD_CASE_HARNESS_FIELDS = frozenset({"acceptance_min_images_per_success"})
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -807,11 +801,9 @@ def benchmark_matrix_definition_matches(
     if dataset_ref is not None:
         datasets = benchmark.get("datasets")
         dataset = datasets.get(dataset_ref) if isinstance(datasets, dict) else None
-        revision_field = (
-            "i2t_dataset_revision" if actual_spec.get("task") == "mixed" else "dataset_revision"
-        )
         if not (
-            isinstance(dataset, dict) and dataset.get("revision") == actual_spec.get(revision_field)
+            isinstance(dataset, dict)
+            and dataset.get("revision") == actual_spec.get("dataset_revision")
         ):
             return False
     return True
@@ -997,10 +989,10 @@ def workload_spec(config: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 def suite_spec(config: dict[str, Any], name: str) -> dict[str, Any]:
-    """Resolve a suite to its dict form: ``{"workloads": [...], "compare": [...]}``.
+    """Resolve a suite to its dict form: ``{"workloads": [...]}``.
 
-    Plain-list suites remain valid and resolve to ``{"workloads": [...],
-    "compare": []}``.
+    A suite may be written either as a plain list of workload names or as the
+    dict form.
     """
     suites = config.get("suites", {})
     if name not in suites:
@@ -1008,10 +1000,8 @@ def suite_spec(config: dict[str, Any], name: str) -> dict[str, Any]:
         raise SystemExit(f"unknown suite {name!r}; known suites: {known}")
     raw = suites[name]
     if isinstance(raw, list):
-        return {"workloads": list(raw), "compare": []}
-    workloads = list(raw.get("workloads", []))
-    compare_groups = [list(group) for group in raw.get("compare", [])]
-    return {"workloads": workloads, "compare": compare_groups}
+        return {"workloads": list(raw)}
+    return {"workloads": list(raw.get("workloads", []))}
 
 
 def spec_env(spec: dict[str, Any]) -> dict[str, str]:

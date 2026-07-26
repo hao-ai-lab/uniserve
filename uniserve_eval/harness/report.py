@@ -16,8 +16,8 @@ from .image_outputs import (
     image_output_mismatch,
     inspect_image_bytes,
 )
-from .metrics import RequestRecord, summarize_image, summarize_mixed, summarize_stream
-from .spec import BenchmarkSpec, TaskName
+from .metrics import RequestRecord, summarize_image, summarize_stream
+from .spec import IMAGE_TASKS, BenchmarkSpec, TaskName
 
 
 def spec_to_dict(spec: BenchmarkSpec) -> dict[str, Any]:
@@ -447,10 +447,6 @@ def plan_summary(spec: BenchmarkSpec) -> dict[str, Any]:
             "dataset": spec.dataset,
             "preprocessing": spec.preprocessing,
             "prompt_source": spec.dataset_path or spec.dataset,
-            "workload_mix": spec.workload_mix,
-            "warmup_mix": spec.warmup_mix,
-            "t2i_dataset_revision": spec.t2i_dataset_revision,
-            "i2t_dataset_revision": spec.i2t_dataset_revision,
         },
         "generation": {
             "output_constraint": spec.output_constraint,
@@ -512,34 +508,20 @@ def artifact_contract(
     if plan_evidence_valid and expected_plan_source == "declared_contract":
         plan_evidence_valid = isinstance(plan, dict)
     elif plan_evidence_valid and expected_plan_source == "runtime_inspection":
-        if spec.task == TaskName.MIXED:
-            plan_evidence_valid = _mixed_plan_evidence_matches_contract(
-                plan_evidence,
-                spec,
-                source="runtime_inspection",
-            )
-        else:
-            request = plan_evidence.get("request")
-            plan_evidence_valid = (
-                isinstance(plan, dict)
-                and isinstance(request, dict)
-                and _reference_request_matches_contract(request, spec)
-                and _runtime_plan_matches_declared_contract(plan, spec, request=request)
-            )
+        request = plan_evidence.get("request")
+        plan_evidence_valid = (
+            isinstance(plan, dict)
+            and isinstance(request, dict)
+            and _reference_request_matches_contract(request, spec)
+            and _runtime_plan_matches_declared_contract(plan, spec, request=request)
+        )
     elif plan_evidence_valid and expected_plan_source == "reference_protocol":
-        if spec.task == TaskName.MIXED:
-            plan_evidence_valid = _mixed_plan_evidence_matches_contract(
-                plan_evidence,
-                spec,
-                source="reference_protocol",
-            )
-        else:
-            request = plan_evidence.get("request")
-            plan_evidence_valid = (
-                isinstance(request, dict)
-                and plan == plan_summary(spec)
-                and _reference_request_matches_contract(request, spec)
-            )
+        request = plan_evidence.get("request")
+        plan_evidence_valid = (
+            isinstance(request, dict)
+            and plan == plan_summary(spec)
+            and _reference_request_matches_contract(request, spec)
+        )
     checks = {
         "declared_request_count": request_count == spec.num_prompts,
         "minimum_successful_requests": ok_count >= spec.acceptance_min_success,
@@ -570,47 +552,6 @@ def artifact_contract(
         "contract": contract,
         "generation_conformance": generation_conformance,
     }
-
-
-def _mixed_plan_evidence_matches_contract(
-    evidence: dict[str, Any],
-    spec: BenchmarkSpec,
-    *,
-    source: str,
-) -> bool:
-    from .tasks.mixed import mixed_subtask_specs
-
-    workloads = evidence.get("workloads")
-    aggregate = evidence.get("plan")
-    subtask_specs = mixed_subtask_specs(spec)
-    expected_tasks = set(subtask_specs)
-    if not isinstance(workloads, dict) or set(workloads) != expected_tasks:
-        return False
-    expected_aggregate: dict[str, Any] = {"workloads": {}}
-    for task_name, subtask_spec in subtask_specs.items():
-        entry = workloads.get(task_name)
-        if not isinstance(entry, dict):
-            return False
-        plan = entry.get("plan")
-        request = entry.get("request")
-        if not isinstance(plan, dict) or not isinstance(request, dict):
-            return False
-        if not _reference_request_matches_contract(request, subtask_spec):
-            return False
-        if source == "runtime_inspection":
-            if not _runtime_plan_matches_declared_contract(
-                plan,
-                subtask_spec,
-                request=request,
-            ):
-                return False
-        elif source == "reference_protocol":
-            if plan != plan_summary(subtask_spec):
-                return False
-        else:
-            return False
-        expected_aggregate["workloads"][task_name] = plan
-    return aggregate == expected_aggregate
 
 
 def _runtime_plan_matches_declared_contract(
@@ -833,10 +774,7 @@ def build_summary(
     for record in records:
         classifiers[record.classifier] = classifiers.get(record.classifier, 0) + 1
 
-    if spec.task == TaskName.MIXED:
-        family = "mixed"
-        metrics = summarize_mixed(records, dur_s)
-    elif spec.is_stream_task:
+    if spec.is_stream_task:
         family = "stream"
         metrics = summarize_stream(records, dur_s, tokenizer=tokenizer)
     else:
@@ -904,9 +842,6 @@ def build_summary(
 def _completed_images(family: str, metrics: dict[str, Any]) -> int:
     if family == "image":
         return int(metrics.get("completed_images", 0))
-    if family == "mixed":
-        image = metrics.get("t2i")
-        return int(image.get("completed_images", 0)) if isinstance(image, dict) else 0
     images = metrics.get("images")
     return int(images.get("total_images", 0)) if isinstance(images, dict) else 0
 
@@ -915,31 +850,9 @@ def _generation_conformance(
     spec: BenchmarkSpec,
     records: list[RequestRecord],
 ) -> dict[str, Any]:
-    if spec.task == TaskName.MIXED:
-        image_records = [record for record in records if record.task == TaskName.T2I.value]
-        text_records = [record for record in records if record.task == TaskName.I2T.value]
-        image = _image_generation_conformance(spec, image_records)
-        text = _text_generation_conformance(spec, text_records)
-        counts_match = (
-            len(image_records) == spec.workload_mix[TaskName.T2I.value]
-            and len(text_records) == spec.workload_mix[TaskName.I2T.value]
-        )
-        return {
-            "schema_version": 1,
-            "policy": "per_task_declared_work",
-            "successful_requests": sum(record.success for record in records),
-            "checked_requests": len(records),
-            "mismatch_count": image["mismatch_count"] + text["mismatch_count"],
-            "mismatched_request_ids": image["mismatched_request_ids"]
-            + text["mismatched_request_ids"],
-            "components": {"t2i": image, "i2t": text},
-            "task_counts_match": counts_match,
-            "valid": image["valid"] is True and text["valid"] is True and counts_match,
-        }
     if spec.task == TaskName.INTERLEAVE:
         return _interleave_generation_conformance(spec, records)
-    image_output_required = spec.task.value in {"t2i", "i2i", "default"}
-    if image_output_required:
+    if spec.task in IMAGE_TASKS:
         return _image_generation_conformance(spec, records)
     return _text_generation_conformance(spec, records)
 
@@ -955,7 +868,7 @@ def _image_generation_conformance(
         "schema_version": 1,
         "policy": (
             "decoded_image_within_declared_cap"
-            if spec.task.value in {"default", "interleave"}
+            if spec.task == TaskName.INTERLEAVE
             else "decoded_image_exact_declared_work"
         ),
         "successful_requests": len(successful),
@@ -1004,9 +917,7 @@ def _text_generation_conformance(
     spec: BenchmarkSpec, records: list[RequestRecord]
 ) -> dict[str, Any]:
     successful = [record for record in records if record.success]
-    exact_length_required = spec.task.value in {"text", "i2t"} and spec.ignore_eos
-    if spec.task == TaskName.MIXED:
-        exact_length_required = spec.ignore_eos
+    exact_length_required = spec.task in {TaskName.TEXT, TaskName.I2T} and spec.ignore_eos
     checked = [record for record in successful if record.requested_output_len > 0]
     mismatches = [
         record.request_id
@@ -1079,8 +990,6 @@ def render_markdown(summary: dict[str, Any]) -> str:
     metrics = summary["metrics"]
     if summary["metric_family"] == "stream":
         lines += _stream_markdown(metrics)
-    elif summary["metric_family"] == "mixed":
-        lines += _mixed_markdown(metrics)
     else:
         lines += _image_markdown(metrics)
     return "\n".join(lines) + "\n"
@@ -1152,7 +1061,7 @@ def _stream_markdown(metrics: dict[str, Any]) -> list[str]:
         img = metrics["images"]["image_latency_ms"]
         lines += [
             "",
-            f"- default-task images: {metrics['images']['total_images']} total, "
+            f"- in-response images: {metrics['images']['total_images']} total, "
             f"{_fmt(metrics['images']['images_per_second'])} img/s, "
             f"image E2E p50/p99 = {_fmt(img['p50'])}/{_fmt(img['p99'])} ms",
         ]
@@ -1178,16 +1087,3 @@ def _image_markdown(metrics: dict[str, Any]) -> list[str]:
         sps = metrics["steps_per_second"]
         lines.append(f"- steps/s p50 = {_fmt(sps['p50'])}")
     return lines
-
-
-def _mixed_markdown(metrics: dict[str, Any]) -> list[str]:
-    image = metrics["t2i"]
-    text = metrics["i2t"]
-    overlap = metrics["client_cross_task_overlap"]
-    return [
-        f"- mixed request throughput: {_fmt(metrics['mixed_request_throughput'])} req/s",
-        f"- T2I: {image['completed_images']} images, {_fmt(image['images_per_minute'])} images/min",
-        f"- I2T: {text['total_output_tokens']} output tokens, {_fmt(text['output_throughput'])} tok/s",
-        f"- client cross-task overlap: {_fmt(overlap['duration_s'])}s "
-        f"({_fmt(100.0 * overlap['timed_region_fraction'])}% of timed region)",
-    ]

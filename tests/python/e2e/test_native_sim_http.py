@@ -213,7 +213,7 @@ def test_sim_http_native_contracts_and_benchmark_smoke(tmp_path: Path):
         )
         spec = BenchmarkSpec(
             name="sim_default_smoke",
-            task=TaskName.DEFAULT,
+            task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
             dataset="trace",
             dataset_path=str(trace_path),

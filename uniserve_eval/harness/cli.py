@@ -82,8 +82,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrencies", help="comma-separated concurrency sweep")
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--workload-mix", type=_json_object, default={})
-    parser.add_argument("--warmup-mix", type=_json_object, default={})
 
     parser.add_argument("--max-tokens", type=int, help="output token cap")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -119,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-images",
         type=int,
         default=None,
-        help="default-task image cap; omit to leave image count uncapped",
+        help="per-response image cap; omit to leave image count uncapped",
     )
     parser.add_argument(
         "--wire",
@@ -138,8 +136,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--sharegpt-output-len", type=int)
     parser.add_argument("--sharegpt-context-len", type=int)
-    parser.add_argument("--t2i-dataset-revision")
-    parser.add_argument("--i2t-dataset-revision")
 
     parser.add_argument("--runtime-profile-id", default="unspecified")
     parser.add_argument("--measurement-interface", default="public_protocol_adapter")
@@ -198,8 +194,6 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         max_concurrency=concurrency,
         warmup_requests=0 if args.smoke else args.warmup_requests,
         seed=args.seed,
-        workload_mix=args.workload_mix,
-        warmup_mix=args.warmup_mix,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -231,8 +225,6 @@ def _make_spec(args: argparse.Namespace, rate: float, concurrency: int | None) -
         sharegpt_context_len=args.sharegpt_context_len,
         dataset_path=args.dataset_path,
         dataset_revision=args.dataset_revision,
-        t2i_dataset_revision=args.t2i_dataset_revision,
-        i2t_dataset_revision=args.i2t_dataset_revision,
         runtime_profile_id=args.runtime_profile_id,
         measurement_interface=args.measurement_interface,
         cache_read_policy=args.cache_read_policy,

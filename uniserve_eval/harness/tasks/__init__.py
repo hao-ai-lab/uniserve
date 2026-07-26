@@ -1,7 +1,6 @@
-from .default import DefaultTask, InterleaveTask
 from .i2i import I2ITask
 from .i2t import I2TTask
-from .mixed import MixedTask
+from .interleave import InterleaveTask
 from .t2i import T2ITask
 from .text import TextTask
 
@@ -10,18 +9,14 @@ TASKS = {
     "t2i": T2ITask,
     "i2i": I2ITask,
     "i2t": I2TTask,
-    "mixed": MixedTask,
     "interleave": InterleaveTask,
-    "default": DefaultTask,
 }
 
 __all__ = [
     "TASKS",
     "I2ITask",
     "I2TTask",
-    "MixedTask",
     "InterleaveTask",
-    "DefaultTask",
     "T2ITask",
     "TextTask",
 ]
