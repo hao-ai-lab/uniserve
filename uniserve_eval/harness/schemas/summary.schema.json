@@ -16,7 +16,7 @@
   ],
   "properties": {
     "harness_status": {"type": "string"},
-    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "i2t", "mixed", "default"]},
+    "task": {"type": "string", "enum": ["text", "t2i", "i2i", "i2t", "interleave"]},
     "dataset": {"type": "string"},
     "endpoint": {"type": "string"},
     "model": {"type": "string"},
@@ -40,7 +40,7 @@
     "ok_count": {"type": "integer", "minimum": 0},
     "failed_count": {"type": "integer", "minimum": 0},
     "classifiers": {"type": "object"},
-    "metric_family": {"type": "string", "enum": ["stream", "image", "mixed"]},
+    "metric_family": {"type": "string", "enum": ["stream", "image"]},
     "metrics": {"type": "object"},
     "artifact": {
       "type": "object",

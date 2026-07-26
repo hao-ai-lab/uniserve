@@ -5,8 +5,8 @@ from typing import Any
 from .base import BenchmarkTask, TaskRequest, apply_text_sampling_contract
 
 
-class DefaultTask(BenchmarkTask):
-    """Default text+image generation through streamed chat completions."""
+class InterleaveTask(BenchmarkTask):
+    """Stream one response whose visible output alternates between text and images."""
 
     def build_request(self, item: dict[str, Any]) -> TaskRequest:
         image: dict[str, Any] = {}
@@ -60,7 +60,3 @@ class DefaultTask(BenchmarkTask):
             payload.update(extra)
         apply_text_sampling_contract(payload, self.spec)
         return TaskRequest(endpoint=self.spec.endpoint, payload=payload, kind="openai_chat")
-
-
-class InterleaveTask(DefaultTask):
-    """Stream one response whose visible output alternates between text and images."""

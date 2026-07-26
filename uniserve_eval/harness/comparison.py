@@ -15,7 +15,7 @@ from .text_parity import (
     evaluate_text_work_conformance,
 )
 
-_IMAGE_TASKS = frozenset({"default", "i2i", "t2i"})
+_IMAGE_TASKS = frozenset({"i2i", "t2i"})
 
 _MetricSpec = tuple[str, tuple[str, ...], str]
 
@@ -118,14 +118,6 @@ def compare_pair(
             }
             if not work["passed"]:
                 failures.append("work_mismatch")
-    elif task == "mixed":
-        work = {
-            "passed": bool(
-                reference.get("generation_conformance") and candidate.get("generation_conformance")
-            )
-        }
-        if not work["passed"]:
-            failures.append("work_mismatch")
     elif task in _IMAGE_TASKS:
         work = {
             "passed": bool(
@@ -385,19 +377,6 @@ def _comparison_metric_specs(task: Any, load_case: Any) -> tuple[_MetricSpec, ..
         )
     if task == "i2t":
         return (("output_throughput", ("output_throughput",), "maximize"),)
-    if task == "mixed":
-        return (
-            ("mixed_request_throughput", ("mixed_request_throughput",), "maximize"),
-            ("i2t.output_throughput", ("i2t", "output_throughput"), "maximize"),
-            ("i2t.mean_ttft_ms", ("i2t", "mean_ttft_ms"), "minimize"),
-            ("i2t.mean_tpot_ms", ("i2t", "mean_tpot_ms"), "minimize"),
-            ("t2i.images_per_second", ("t2i", "images_per_second"), "maximize"),
-            (
-                "t2i.image_latency_ms.mean",
-                ("t2i", "image_latency_ms", "mean"),
-                "minimize",
-            ),
-        )
     if task in _IMAGE_TASKS and load_case == "c1":
         return (("image_latency_ms.mean", ("image_latency_ms", "mean"), "minimize"),)
     if task in _IMAGE_TASKS:

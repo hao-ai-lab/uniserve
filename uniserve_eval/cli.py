@@ -1,21 +1,20 @@
-"""Profile-driven serving evaluation: launch, verify, benchmark, and compare.
+"""Profile-driven serving evaluation: launch servers and run correctness gates.
 
 Concepts:
   server   = how to launch one serving backend topology
   workload = what to run against a compatible launched server
              (verify = correctness gates over public chat completions,
-              perf = a measurement point through the shared harness with
-              optional metric floors/ceilings,
               script = a generic repo-script escape hatch)
-  suite    = ordered workload names for a broader pass, optionally with
-             compare groups evaluated after the workloads
+  suite    = ordered workload names for a broader pass
 
 Examples:
   uniserve-eval list
   uniserve-eval launch gate/server/sensenova
   uniserve-eval verify gate/sensenova/default-travel
-  uniserve-eval perf perf/tripwire/bagel/i2t
   uniserve-eval run gate/all --manage-servers
+
+Benchmark measurement points are a separate path: see
+``scripts/run_benchmarks.py`` and ``docs/benchmark-protocol.md``.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
-from . import backends, compare, perf, verify
+from . import backends, verify
 from .profiles import (
     DEFAULT_CONFIG,
     ROOT,
@@ -77,8 +76,6 @@ def _run_workload(args: argparse.Namespace, workload_name: str) -> None:
     kind = workload.get("type")
     if kind == "verify":
         verify.verify(sub)
-    elif kind == "perf":
-        perf.perf(sub)
     elif kind == "script":
         run_script_workload(sub)
     else:
@@ -92,7 +89,7 @@ def run_suite(args: argparse.Namespace) -> None:
         workload = workload_spec(config, workload_name)
         manage_server = bool(args.manage_servers or workload.get("manage_server"))
         server_name = None
-        if workload.get("type") in {"verify", "perf"}:
+        if workload.get("type") == "verify":
             server_name, _ = resolve_server_for_workload(config, workload, args.server)
         if manage_server and server_name:
             _clean_server_for_suite(args.config, server_name, args.clean_grace_s)
@@ -103,8 +100,6 @@ def run_suite(args: argparse.Namespace) -> None:
                 _clean_server_for_suite(args.config, server_name, args.clean_grace_s)
         else:
             _run_workload(args, workload_name)
-    for group in suite["compare"]:
-        compare.compare_workloads(config, list(group))
 
 
 def list_items(args: argparse.Namespace) -> None:
@@ -130,10 +125,7 @@ def list_items(args: argparse.Namespace) -> None:
         elif section == "suites":
             for name in sorted(config.get("suites", {})):
                 suite = suite_spec(config, name)
-                line = f"{name}\t{','.join(suite['workloads'])}"
-                for group in suite["compare"]:
-                    line += f"\n\tcompare: {' vs '.join(group)}"
-                print(line)
+                print(f"{name}\t{','.join(suite['workloads'])}")
         else:
             raise SystemExit(f"unknown list section {section!r}")
 
@@ -159,20 +151,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--server", help="override workload server")
     p.set_defaults(func=verify.verify)
 
-    p = sub.add_parser("perf")
-    p.add_argument("workload")
-    p.add_argument("--server", help="override workload server")
-    p.set_defaults(func=perf.perf)
-
     p = sub.add_parser("script")
     p.add_argument("workload")
     p.add_argument("--server", help="accepted for CLI symmetry; script workloads own their target")
     p.set_defaults(func=run_script_workload)
-
-    p = sub.add_parser("compare")
-    p.add_argument("workloads", nargs="+", help="two or more perf workloads; the first is the baseline")
-    p.add_argument("--name", help="comparison artifact name (default: joined workload names)")
-    p.set_defaults(func=compare.compare)
 
     p = sub.add_parser("run")
     p.add_argument("suite")

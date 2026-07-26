@@ -4,7 +4,7 @@
 
 ## Benchmark entry
 
-Run the configured 42-point matrix through one command:
+Run the configured 43-point matrix through one command:
 
 ```bash
 .venv/bin/python scripts/run_benchmarks.py \
@@ -28,7 +28,7 @@ The runner writes `COMMANDS.md`, point-local artifacts, server logs and snapshot
 | --- | --- |
 | `shared` | Environment-variable descriptions |
 | `servers` | UniServe and reference launch specifications |
-| `workloads` | Correctness and small regression workloads |
+| `workloads` | Correctness gates |
 | `suites` | Ordered workload collections |
 | `benchmarks` | Workload points, backend roles, named load cases, datasets, and hardware requirements |
 
@@ -51,13 +51,12 @@ Only complete canonical artifacts are included in `results.json`. Interrupted, f
 
 ## Focused checks
 
-The `uniserve-eval` command runs focused correctness and regression workloads:
+The `uniserve-eval` command runs focused correctness gates:
 
 ```bash
 uniserve-eval list
 uniserve-eval launch gate/server/sensenova
 uniserve-eval verify gate/sensenova/default-travel
-uniserve-eval perf perf/tripwire/bagel/i2t
 uniserve-eval run gate/all --manage-servers
 ```
 

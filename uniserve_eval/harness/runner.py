@@ -35,10 +35,9 @@ from .report import (
     spec_to_dict,
     write_summary_artifacts,
 )
-from .spec import BenchmarkSpec, TaskName
+from .spec import BenchmarkSpec
 from .tasks import TASKS
 from .tasks.base import TaskRequest
-from .tasks.mixed import mixed_subtask_specs
 
 
 @dataclass
@@ -223,38 +222,6 @@ class BenchmarkRunner:
                 "source": policy,
                 "plan": None,
                 "error": "the dataset produced no request for plan inspection",
-            }
-        if self.spec.task == TaskName.MIXED:
-            workloads: dict[str, dict[str, Any]] = {}
-            subtask_specs = mixed_subtask_specs(self.spec)
-            for task_name in sorted(self.spec.workload_mix):
-                row = next(
-                    (candidate for candidate in rows if candidate.get("task") == task_name),
-                    None,
-                )
-                if row is None:
-                    workloads[task_name] = {
-                        "plan": None,
-                        "error": "the dataset produced no representative request",
-                    }
-                    continue
-                request = self.task.build_request(row)
-                if policy == "reference_protocol":
-                    workloads[task_name] = {
-                        "plan": plan_summary(subtask_specs[task_name]),
-                        "request": reference_request_summary(request),
-                    }
-                else:
-                    workloads[task_name] = await self._inspect_runtime_plan(client, request)
-            return {
-                "source": policy,
-                "plan": {
-                    "workloads": {
-                        task_name: evidence.get("plan")
-                        for task_name, evidence in workloads.items()
-                    }
-                },
-                "workloads": workloads,
             }
         request = self.task.build_request(rows[0])
         if policy == "reference_protocol":

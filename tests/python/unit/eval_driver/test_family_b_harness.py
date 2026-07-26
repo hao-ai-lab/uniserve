@@ -68,10 +68,9 @@ from uniserve_eval.harness.sse import (
     aiter_sse_events_from_text,
     iter_sse_events,
 )
-from uniserve_eval.harness.tasks.default import DefaultTask, InterleaveTask
 from uniserve_eval.harness.tasks.i2i import I2ITask
 from uniserve_eval.harness.tasks.i2t import I2TTask
-from uniserve_eval.harness.tasks.mixed import MixedTask, mixed_subtask_specs
+from uniserve_eval.harness.tasks.interleave import InterleaveTask
 from uniserve_eval.harness.tasks.t2i import T2ITask
 from uniserve_eval.harness.tasks.text import TextTask
 
@@ -390,29 +389,32 @@ def test_interleave_summary_requires_visible_text_image_transition() -> None:
     assert conformance["mismatched_request_ids"] == ["interleave-1"]
 
 
-def test_interleave_dataset_uses_deterministic_mjhq_prompt_transform(
+def test_interleave_dataset_serves_ueval_prompts_verbatim(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         datasets_module,
-        "load_mjhq",
-        lambda *_args, **_kwargs: [{"id": "mjhq-1", "prompt": "a glass greenhouse"}],
+        "load_ueval",
+        lambda *_args, **_kwargs: [
+            {
+                "id": "ueval-000000",
+                "task": "interleave",
+                "prompt": "How to draw a cartoon cat? Show each step visually and textually.",
+            }
+        ],
     )
     spec = BenchmarkSpec(
         task=TaskName.INTERLEAVE,
         model="SenseNova-U1",
-        dataset="mjhq",
         num_prompts=1,
     )
 
+    assert spec.dataset == "ueval"
     assert load_dataset_rows(spec) == [
         {
-            "id": "mjhq-1",
-            "prompt": (
-                "Create a short illustrated response about the following scene. "
-                "Write one introductory sentence, generate one image, then write one closing "
-                "sentence. Scene: a glass greenhouse"
-            ),
+            "id": "ueval-000000",
+            "task": "interleave",
+            "prompt": "How to draw a cartoon cat? Show each step visually and textually.",
         }
     ]
 
@@ -472,10 +474,10 @@ def test_openai_parser_captures_sglang_cached_token_breakdown_when_usage_omits_i
     assert record.record_dict()["cached_prompt_tokens"] == 7
 
 
-def test_default_task_omits_image_cap_unless_explicit() -> None:
-    uncapped = DefaultTask(
+def test_interleave_task_omits_image_cap_unless_explicit() -> None:
+    uncapped = InterleaveTask(
         BenchmarkSpec(
-            task=TaskName.DEFAULT,
+            task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
             max_tokens=8192,
             width=2048,
@@ -491,9 +493,9 @@ def test_default_task_omits_image_cap_unless_explicit() -> None:
         "seed": 42,
     }
 
-    capped = DefaultTask(
+    capped = InterleaveTask(
         BenchmarkSpec(
-            task=TaskName.DEFAULT,
+            task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
             max_tokens=8192,
             max_images=8,
@@ -506,10 +508,10 @@ def test_default_task_omits_image_cap_unless_explicit() -> None:
     assert capped.payload["image_config"]["num_images"] == 8
 
 
-def test_default_task_can_emit_openai_chat_wire() -> None:
-    request = DefaultTask(
+def test_interleave_task_can_emit_openai_chat_wire() -> None:
+    request = InterleaveTask(
         BenchmarkSpec(
-            task=TaskName.DEFAULT,
+            task=TaskName.INTERLEAVE,
             model="SenseNova-U1",
             max_tokens=8192,
             max_images=4,
@@ -672,7 +674,6 @@ def test_nonstreaming_i2t_does_not_fabricate_token_timing() -> None:
 @pytest.mark.parametrize(
     ("task_class", "task", "wire", "item"),
     [
-        (DefaultTask, TaskName.DEFAULT, "openai_chat", {"prompt": "p"}),
         (InterleaveTask, TaskName.INTERLEAVE, "openai_chat", {"prompt": "p"}),
         (
             I2ITask,
@@ -724,10 +725,10 @@ def test_chat_task_builders_preserve_declared_sampling_contract(
         assert request.payload["chat_template_kwargs"] == {"enable_thinking": True}
 
 
-def test_default_task_emits_declared_sampling_seed() -> None:
-    request = DefaultTask(
+def test_interleave_task_emits_declared_sampling_seed() -> None:
+    request = InterleaveTask(
         BenchmarkSpec(
-            task=TaskName.DEFAULT,
+            task=TaskName.INTERLEAVE,
             model="M",
             sampling_seed=42,
         )
@@ -1010,7 +1011,7 @@ def test_load_ueval_local_jsonl_shapes_rows(tmp_path: Path) -> None:
     rows = load_ueval(str(path), num_requests=2, seed=7)
 
     assert len(rows) == 2
-    assert all(row["task"] == "default" for row in rows)
+    assert all(row["task"] == "interleave" for row in rows)
     assert [row["id"] for row in rows] == ["ueval-000000", "ueval-000001"]
     # All sampled prompts come from the source set (sampling, not invention).
     source = {f"ueval prompt {i}" for i in range(4)}
@@ -1168,7 +1169,7 @@ def test_build_summary_emits_documented_schema_for_image_task() -> None:
 
 
 def test_build_summary_reports_observed_endpoint_for_single_wire() -> None:
-    spec = BenchmarkSpec(task=TaskName.DEFAULT, model="M", num_prompts=1)
+    spec = BenchmarkSpec(task=TaskName.INTERLEAVE, model="M", num_prompts=1)
     records = [
         RequestRecord(
             request_id="a",
@@ -1277,183 +1278,6 @@ def test_runtime_plan_evidence_is_required_and_preserved() -> None:
     )
     assert wrong_policy["artifact"]["checks"]["plan_evidence"] is False
     assert wrong_policy["artifact"]["valid"] is False
-
-
-def test_mixed_runtime_plan_evidence_requires_t2i_and_i2t_contracts(tmp_path) -> None:
-    spec = BenchmarkSpec(
-        task=TaskName.MIXED,
-        model="M",
-        num_prompts=2,
-        warmup_requests=0,
-        workload_mix={"t2i": 1, "i2t": 1},
-        warmup_mix={"t2i": 0, "i2t": 0},
-        dataset_path=str(tmp_path),
-        runtime_profile_id="dialect",
-        plan_evidence_policy="runtime_inspection",
-        output_constraint="mixed_image_text",
-        max_tokens=256,
-        temperature=0.0,
-        top_p=1.0,
-        top_k=1,
-        min_p=0.0,
-        repetition_penalty=1.0,
-        frequency_penalty=0.0,
-        presence_penalty=0.0,
-        sampling_seed=42,
-        ignore_eos=False,
-        width=2,
-        height=3,
-        steps=50,
-        max_images=1,
-        guidance_scale=4.0,
-        image_guidance_scale=1.0,
-        cfg_norm="none",
-        cfg_interval=(0.0, 1.0),
-        timestep_shift=3.0,
-        acceptance_min_success=2,
-        acceptance_min_images_per_success=0.5,
-    )
-    mixed_task = MixedTask(spec)
-    subtask_specs = mixed_subtask_specs(spec)
-    rows = {
-        "t2i": {"task": "t2i", "prompt": "draw"},
-        "i2t": {
-            "task": "i2t",
-            "prompt": "describe",
-            "input_image_b64": base64.b64encode(_png_bytes()).decode("ascii"),
-            "input_image_mime": "image/png",
-        },
-    }
-
-    def runtime_plan(task_name: str) -> dict:
-        subtask = subtask_specs[task_name]
-        generation = {
-            "constraint": subtask.output_constraint,
-            "max_tokens": 0 if task_name == "t2i" else subtask.max_tokens,
-            "temperature": subtask.temperature,
-            "top_p": subtask.top_p,
-            "top_k": 0 if subtask.top_k is None else subtask.top_k,
-            "min_p": 0.0 if subtask.min_p is None else subtask.min_p,
-            "repetition_penalty": 1.0
-            if subtask.repetition_penalty is None
-            else subtask.repetition_penalty,
-            "frequency_penalty": 0.0
-            if subtask.frequency_penalty is None
-            else subtask.frequency_penalty,
-            "presence_penalty": 0.0
-            if subtask.presence_penalty is None
-            else subtask.presence_penalty,
-            "seed": subtask.sampling_seed,
-            "ignore_eos": subtask.ignore_eos,
-        }
-        if task_name == "t2i":
-            generation["image"] = {
-                "width": subtask.width,
-                "height": subtask.height,
-                "steps": subtask.steps,
-                "max_images": subtask.max_images,
-                "seed": subtask.seed,
-                "cfg_renorm_type": subtask.cfg_norm,
-                "cfg_text_scale": subtask.guidance_scale,
-                "cfg_img_scale": subtask.image_guidance_scale,
-                "cfg_interval": list(subtask.cfg_interval or ()),
-                "timestep_shift": subtask.timestep_shift,
-            }
-        return {
-            "profile_id": "profile",
-            "dialect_id": "dialect",
-            "generation": generation,
-            "cache": {"read_enabled": True, "write_enabled": True},
-            "adapter": "Base",
-        }
-
-    workloads = {}
-    for task_name, row in rows.items():
-        plan = runtime_plan(task_name)
-        workloads[task_name] = {
-            "plan": plan,
-            "request": reference_request_summary(mixed_task.build_request(row)),
-        }
-    evidence = {
-        "source": "runtime_inspection",
-        "plan": {
-            "workloads": {
-                task_name: entry["plan"] for task_name, entry in workloads.items()
-            }
-        },
-        "workloads": workloads,
-    }
-    records = [
-        _successful_image_record("t2i", width=2, height=3),
-        RequestRecord(
-            request_id="i2t",
-            task="i2t",
-            success=True,
-            classifier="ok",
-            finish_reason="length",
-            prompt_len=16,
-            output_len=256,
-            requested_output_len=256,
-            prompt_len_source="server_usage",
-            output_len_source="server_usage",
-            generated_text="description",
-        ),
-    ]
-
-    summary = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence=evidence,
-        contract=benchmark_contract(spec, [{"id": "t2i"}, {"id": "i2t"}]),
-        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
-    )
-
-    assert summary["artifact"]["checks"]["plan_evidence"] is True
-    missing_i2t = {**evidence, "workloads": {"t2i": workloads["t2i"]}}
-    invalid = build_summary(
-        spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence=missing_i2t,
-        contract=benchmark_contract(spec, [{"id": "t2i"}, {"id": "i2t"}]),
-        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
-    )
-    assert invalid["artifact"]["checks"]["plan_evidence"] is False
-
-    reference_workloads = {
-        task_name: {
-            "plan": plan_summary(subtask_specs[task_name]),
-            "request": entry["request"],
-        }
-        for task_name, entry in workloads.items()
-    }
-    reference_spec = dataclasses.replace(spec, plan_evidence_policy="reference_protocol")
-    reference_evidence = {
-        "source": "reference_protocol",
-        "plan": {
-            "workloads": {
-                task_name: entry["plan"]
-                for task_name, entry in reference_workloads.items()
-            }
-        },
-        "workloads": reference_workloads,
-    }
-    reference = build_summary(
-        reference_spec,
-        "http://x",
-        records,
-        dur_s=1.0,
-        plan_evidence=reference_evidence,
-        contract=benchmark_contract(
-            reference_spec,
-            [{"id": "t2i"}, {"id": "i2t"}],
-        ),
-        server_info={"source_endpoint": "/version", "payload": {"version": "test"}},
-    )
-    assert reference["artifact"]["checks"]["plan_evidence"] is True
 
 
 def test_text_artifact_requires_server_reported_exact_generation_work() -> None:

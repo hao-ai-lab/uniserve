@@ -231,64 +231,6 @@ def test_run_summary_keeps_each_ratio_and_reports_geometric_mean() -> None:
     ]
 
 
-def _mixed_point(directory: Path, *, role: str, scale: float) -> None:
-    directory.mkdir()
-    summary = {
-        "task": "mixed",
-        "request_count": 32,
-        "ok_count": 32,
-        "failed_count": 0,
-        "elapsed_s": 64.0 / scale,
-        "metrics": {
-            "mixed_request_throughput": 0.5 * scale,
-            "i2t": {
-                "output_throughput": 100.0 * scale,
-                "mean_ttft_ms": 400.0 / scale,
-                "mean_tpot_ms": 20.0 / scale,
-            },
-            "t2i": {
-                "images_per_second": 0.125 * scale,
-                "image_latency_ms": {"mean": 8000.0 / scale},
-            },
-        },
-        "artifact": {
-            "valid": True,
-            "valid_marker": "canonical-valid-v2",
-            "generation_conformance": {"valid": True},
-            "matrix_contract": {
-                "comparison_role": role,
-                "parity_group": "mixed_pair",
-                "benchmark_definition": {"load_case_id": "balanced"},
-                "parity_contract": {"fingerprint": _PARITY_FINGERPRINT},
-            },
-        },
-    }
-    (directory / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
-
-
-def test_mixed_comparison_reports_aggregate_and_per_task_tradeoffs(tmp_path: Path) -> None:
-    reference = tmp_path / "reference"
-    candidate = tmp_path / "candidate"
-    _mixed_point(reference, role="reference", scale=1.0)
-    _mixed_point(candidate, role="candidate", scale=2.0)
-
-    result = compare_pair(reference, candidate)
-
-    assert result["valid"] is True
-    metrics = {metric["name"]: metric for metric in result["metrics"]}
-    assert set(metrics) == {
-        "mixed_request_throughput",
-        "i2t.output_throughput",
-        "i2t.mean_ttft_ms",
-        "i2t.mean_tpot_ms",
-        "t2i.images_per_second",
-        "t2i.image_latency_ms.mean",
-    }
-    assert metrics["mixed_request_throughput"]["candidate_over_reference"] == 2.0
-    assert metrics["i2t.mean_ttft_ms"]["candidate_over_reference"] == 0.5
-    assert metrics["t2i.image_latency_ms.mean"]["candidate_over_reference"] == 0.5
-
-
 def _image_point(
     directory: Path,
     *,

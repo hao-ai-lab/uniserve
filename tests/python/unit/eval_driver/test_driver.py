@@ -43,7 +43,6 @@ from uniserve_eval.harness.report import (
 )
 from uniserve_eval.harness.runner import BenchmarkRunner
 from uniserve_eval.harness.spec import BenchmarkSpec, TaskName
-from uniserve_eval.harness.tasks.base import TaskRequest
 from uniserve_eval.profiles import (
     DEFAULT_CONFIG,
     benchmark_matrix_definition_contract,
@@ -60,76 +59,6 @@ from uniserve_eval.profiles import (
 pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parents[4]
-
-
-def test_mixed_runtime_plan_evidence_inspects_each_semantic_workload(tmp_path):
-    spec = BenchmarkSpec(
-        task=TaskName.MIXED,
-        model="M",
-        num_prompts=2,
-        warmup_requests=0,
-        workload_mix={"t2i": 1, "i2t": 1},
-        warmup_mix={"t2i": 0, "i2t": 0},
-        dataset_path=str(tmp_path),
-        runtime_profile_id="dialect",
-        plan_evidence_policy="runtime_inspection",
-        output_constraint="mixed_image_text",
-    )
-    runner = BenchmarkRunner("http://127.0.0.1:8000", spec, tmp_path / "out")
-
-    class _Task:
-        def build_request(self, row):
-            task = row["task"]
-            return TaskRequest(
-                endpoint="/v1/chat/completions",
-                kind="openai_chat_json" if task == "t2i" else "openai_chat",
-                semantic_task=task,
-                payload={
-                    "model": "M",
-                    "modalities": ["image" if task == "t2i" else "text"],
-                    "messages": [],
-                },
-            )
-
-    class _Response:
-        status_code = 200
-
-        def __init__(self, task):
-            self.task = task
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"profile_id": f"profile-{self.task}"}
-
-    class _Client:
-        def __init__(self):
-            self.tasks = []
-
-        async def post(self, _url, *, json, headers, timeout):
-            del headers, timeout
-            task = "t2i" if json["modalities"] == ["image"] else "i2t"
-            self.tasks.append(task)
-            return _Response(task)
-
-    runner.task = _Task()
-    client = _Client()
-    evidence = asyncio.run(
-        runner._collect_plan_evidence(
-            client,
-            [{"task": "t2i"}, {"task": "i2t"}],
-        )
-    )
-
-    assert client.tasks == ["i2t", "t2i"]
-    assert set(evidence["workloads"]) == {"t2i", "i2t"}
-    assert evidence["plan"] == {
-        "workloads": {
-            "i2t": {"profile_id": "profile-i2t"},
-            "t2i": {"profile_id": "profile-t2i"},
-        }
-    }
 
 
 def test_benchmark_parity_excludes_backend_identity_but_pins_protocol_and_rows():
@@ -382,11 +311,11 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
         harness = points[name]["harness"]
         assert harness["image_think"] is False
         assert harness["image_t_eps"] == 0.02
-    interleave = points["sensenova_mjhq_interleave_uniserve"]["harness"]
+    interleave = points["sensenova_ueval_interleave_uniserve"]["harness"]
     assert interleave["image_think"] is False
     assert interleave["image_t_eps"] == 0.02
     assert interleave["max_images"] == 1
-    assert interleave["max_tokens"] == 4096
+    assert interleave["max_tokens"] == 8192
     assert interleave["disable_ignore_eos"] is True
     for name in ("bagel_mjhq_t2i_uniserve", "bagel_mjhq_t2i_omni"):
         harness = points[name]["harness"]
@@ -423,19 +352,11 @@ def test_main_benchmark_declares_every_runtime_comparison_pair() -> None:
             "candidate": "benchmark/server/sensenova-uniserve",
             "reference": "benchmark/server/sensenova-omni",
         },
-        "sensenova_mixed_image_text": {
-            "candidate": "benchmark/server/sensenova-uniserve",
-            "reference": "benchmark/server/sensenova-omni",
-        },
         "bagel_mjhq_t2i": {
             "candidate": "benchmark/server/bagel-uniserve",
             "reference": "benchmark/server/bagel-omni",
         },
         "bagel_beans_i2t": {
-            "candidate": "benchmark/server/bagel-uniserve",
-            "reference": "benchmark/server/bagel-omni",
-        },
-        "bagel_mixed_image_text": {
             "candidate": "benchmark/server/bagel-uniserve",
             "reference": "benchmark/server/bagel-omni",
         },
@@ -463,34 +384,6 @@ def test_sensenova_default_gate_declares_complete_image_lifecycle():
     assert image_config["steps"] == 50
     assert uniserve_eval.verify.usage_image_steps({"usage": {"image_steps": 200}}) == 200
 
-
-def test_execution_benchmark_locks_only_the_declared_high_load_points():
-    benchmark = load_config(DEFAULT_CONFIG)["benchmarks"]["execution"]
-
-    assert set(benchmark["points"]) == {
-        "qwen3_sharegpt_r16",
-        "sensenova_t2i_c32",
-        "sensenova_i2t_r16",
-    }
-    assert benchmark["load_cases"] == {
-        "text_r16": [{"id": "r16", "request_rate": 16}],
-        "image_c32": [{"id": "c32", "request_rate": "inf", "max_concurrency": 32}],
-    }
-    assert benchmark["acceptance"] == {
-        "baseline_measurements": 1,
-        "candidate_measurements": 1,
-        "throughput_minimum_ratio": 0.95,
-        "latency_maximum_ratio": 1.05,
-        "points": {
-            "qwen3_sharegpt_r16": [
-                "output_tokens_per_second",
-                "mean_ttft_ms",
-                "mean_tpot_ms",
-            ],
-            "sensenova_t2i_c32": ["images_per_second"],
-            "sensenova_i2t_r16": ["output_tokens_per_second"],
-        },
-    }
 
 
 def test_verify_reference_evidence_uses_exact_transport_and_rgb_bytes(tmp_path):
@@ -557,7 +450,7 @@ def test_benchmark_runner_forwards_wire(tmp_path):
         output_dir=tmp_path,
         defaults={},
         harness={
-            "task": "default",
+            "task": "interleave",
             "model": "SenseNova-U1",
             "dataset": "ueval",
             "num_prompts": 1,
@@ -613,7 +506,7 @@ def test_benchmark_runner_applies_concurrency_load_case(tmp_path):
     assert spec.max_concurrency == 32
 
 
-def test_benchmark_runner_binds_mixed_ratio_to_the_load_case(tmp_path):
+def test_benchmark_runner_binds_load_case_harness_overrides(tmp_path):
     run_benchmarks = _load_run_benchmarks()
     cmd = run_benchmarks.harness_command(
         python="python",
@@ -621,28 +514,20 @@ def test_benchmark_runner_binds_mixed_ratio_to_the_load_case(tmp_path):
         output_dir=tmp_path,
         defaults={},
         harness={
-            "task": "mixed",
-            "model": "multimodal-model",
-            "dataset_path": str(tmp_path),
+            "task": "t2i",
+            "model": "image-model",
             "num_prompts": 32,
-            "warmup_requests": 4,
         },
         load_case={
-            "id": "balanced",
+            "id": "c32",
             "request_rate": "inf",
             "max_concurrency": 32,
-            "harness": {
-                "workload_mix": {"t2i": 16, "i2t": 16},
-                "warmup_mix": {"t2i": 2, "i2t": 2},
-                "acceptance_min_images_per_success": 0.5,
-            },
+            "harness": {"acceptance_min_images_per_success": 0.5},
         },
         datasets={},
     )
 
     spec = run_benchmarks.spec_from_harness_command(cmd)
-    assert spec.workload_mix == {"t2i": 16, "i2t": 16}
-    assert spec.warmup_mix == {"t2i": 2, "i2t": 2}
     assert spec.max_concurrency == 32
     assert spec.acceptance_min_images_per_success == 0.5
 
@@ -1372,22 +1257,22 @@ def test_matrix_definition_binds_active_point_semantics_load_case_dataset_and_ha
     assert not benchmark_matrix_definition_matches(matrix, changed_config)
 
 
-def test_matrix_definition_binds_load_case_harness_overrides() -> None:
+def test_matrix_definition_distinguishes_load_cases_of_one_point() -> None:
     config = load_config(DEFAULT_CONFIG)
 
     contracts = [
         benchmark_matrix_definition_contract(
             config,
             "main",
-            group_name="sensenova-mixed-uniserve",
-            point_name="sensenova_mixed_uniserve",
-            load_case_set="mixed_concurrency",
+            group_name="sensenova-uniserve",
+            point_name="sensenova_mjhq_t2i_uniserve",
+            load_case_set="image_concurrency",
             load_case_id=load_case,
         )
-        for load_case in ("image_light", "balanced", "image_heavy")
+        for load_case in ("c1", "c32")
     ]
 
-    assert len({contract["declared_semantics_sha256"] for contract in contracts}) == 3
+    assert len({contract["declared_semantics_sha256"] for contract in contracts}) == 2
 
 
 def test_formal_execution_rejects_noncanonical_profile_config(tmp_path: Path) -> None:

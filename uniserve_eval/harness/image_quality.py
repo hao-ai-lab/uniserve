@@ -41,7 +41,7 @@ UINT8_MAE_MAXIMUM = 12.0
 COSINE_SIMILARITY_MINIMUM = 0.98
 RELATIVE_L2_MAXIMUM = 0.20
 LPIPS_SIZE = (256, 256)
-_IMAGE_TASKS = frozenset({"default", "i2i", "t2i"})
+_IMAGE_TASKS = frozenset({"i2i", "t2i"})
 _POINT_SUPPORT_FILES = frozenset(
     {"command.txt", "preflight.txt", "postflight.txt", "run.json", "run.log"}
 )

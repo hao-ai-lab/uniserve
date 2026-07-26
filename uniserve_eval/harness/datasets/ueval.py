@@ -1,4 +1,4 @@
-"""UEval prompt loader for default text+image generation benchmarking.
+"""UEval prompt loader for interleaved text+image generation benchmarking.
 
 UEval (``zlab-princeton/UEval``) has 1,000
 expert-curated prompts across 8 real-world domains that require both text and
@@ -45,7 +45,7 @@ def load_ueval(
             "JSONL of {'prompt': ...} rows if the HF schema differs"
         )
     return [
-        {"id": f"ueval-{idx:06d}", "task": "default", "prompt": prompt}
+        {"id": f"ueval-{idx:06d}", "task": "interleave", "prompt": prompt}
         for idx, prompt in enumerate(prompts)
     ]
 
