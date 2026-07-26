@@ -314,9 +314,15 @@ def test_multimodal_benchmark_profiles_pin_quality_relevant_generation_modes() -
     interleave = points["sensenova_ueval_interleave_uniserve"]["harness"]
     assert interleave["image_think"] is False
     assert interleave["image_t_eps"] == 0.02
-    assert interleave["max_images"] == 1
     assert interleave["max_tokens"] == 8192
     assert interleave["disable_ignore_eos"] is True
+    # The answer decides how many images it needs, so the point states none and
+    # measures the image work the model actually performs.
+    assert "max_images" not in interleave
+    interleave_loads = benchmark["load_cases"][
+        points["sensenova_ueval_interleave_uniserve"]["load_case_set"]
+    ]
+    assert [case["max_concurrency"] for case in interleave_loads] == [1, 2, 4, 8, 16]
     for name in ("bagel_mjhq_t2i_uniserve", "bagel_mjhq_t2i_omni"):
         harness = points[name]["harness"]
         assert harness["image_think"] is False

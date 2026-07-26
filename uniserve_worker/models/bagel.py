@@ -511,7 +511,8 @@ class BagelForUnifiedGeneration(nn.Module):
                     mixed_combinations=((RouteRowKind.TOKEN, RouteRowKind.FLOW),),
                     dtype="bfloat16",
                     placement=RoutePlacement.PRIMARY,
-                    topology_axes=("tp",),
+                    # The MoT backbone stages every sublayer on the tower axis.
+                    topology_axes=("tp", "tower"),
                     shape=RouteShape(
                         max_tokens_per_row=max(
                             int(llm.max_position_embeddings),
