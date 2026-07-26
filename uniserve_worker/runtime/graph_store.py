@@ -32,6 +32,7 @@ from uniserve_worker.forward import (
     TokenLogits,
     TokenOutput,
 )
+from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.spec import CacheSpec
 
 __all__ = ["GraphExecutionError", "GraphStore"]
@@ -464,7 +465,7 @@ _PLAN_LENGTH_BOUNDS = frozenset({"max_seqlen_q", "max_seqlen_k"})
 def _bucketed_length(value: object) -> object:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 1:
         return value
-    return 1 << (int(value) - 1).bit_length()
+    return bucketed_length(value)
 
 
 def _plan_with_bucketed_bounds(plan: object) -> object:

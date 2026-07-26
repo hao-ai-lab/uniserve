@@ -10,6 +10,7 @@ __all__ = [
     'DEFAULT_BLOCK_SIZE',
     'CudaKVCapacity',
     'RuntimeKVCapacity',
+    'bucketed_length',
     'bucketed_page_count',
     'ceil_div',
     'device_total_bytes',
@@ -58,20 +59,32 @@ def ceil_div(value: int, divisor: int) -> int:
     return (int(value) + divisor - 1) // divisor
 
 
+def bucketed_length(value: int) -> int:
+    """Round a shape length up to a power of two.
+
+    Executable identity is exact-shape, so a length that tracks a sequence as it
+    grows makes every length its own captured graph. Bucketing to a power of two
+    keeps one shape serving a whole range of lengths. Every bucketed length must
+    stay consistent with the tensors indexed by it: a bound and the tensor whose
+    width the kernel checks against that bound have to be bucketed together.
+    """
+
+    count = int(value)
+    if count <= 1:
+        return max(0, count)
+    return 1 << (count - 1).bit_length()
+
+
 def bucketed_page_count(pages: int) -> int:
     """Round a page-table width up to a power of two.
 
     A KV page table gains a column for every block a sequence occupies, so an
     exact width changes as a conversation grows and every width is a distinct
-    executable shape. Bucketing the width to a power of two keeps one shape
-    serving a whole range of lengths. Attention reads each row only to its own
-    ``seqused_k``, so the surplus columns carry no work.
+    executable shape. Attention reads each row only to its own ``seqused_k``, so
+    the surplus columns carry no work.
     """
 
-    count = int(pages)
-    if count <= 1:
-        return max(0, count)
-    return 1 << (count - 1).bit_length()
+    return bucketed_length(pages)
 
 
 def derive_num_blocks(
