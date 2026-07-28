@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ from ..forward import (
     ForwardContext,
     ForwardOutput,
     NoFlowConditioning,
+    PagedDecodePlan,
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
@@ -29,6 +30,7 @@ from ..forward import (
     TokenSegments,
     TokenSelection,
     TowerInput,
+    packed_token_positions,
 )
 from ..nn import (
     LayerSpec,
@@ -102,6 +104,7 @@ _BAGEL_VAE_MIN_SIZE = 512
 _BAGEL_VAE_MAX_SIZE = 1024
 _BAGEL_VAE_STRIDE = 16
 _BAGEL_MAX_IMAGE_PIXELS = 14 * 14 * 9 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class LLMConfig:
@@ -663,6 +666,17 @@ class BagelForUnifiedGeneration(nn.Module):
             if not isinstance(row, (TokenRow, FlowRow)):
                 raise TypeError("BAGEL mot route accepts TokenRow and FlowRow values")
             rows.append(row)
+        decode_positions: torch.Tensor | None = None
+        if isinstance(batch.context.attention, PagedDecodePlan):
+            if any(not isinstance(row, TokenRow) for row in rows):
+                raise TypeError("BAGEL paged decode accepts token rows only")
+            token_rows = tuple(row for row in rows if isinstance(row, TokenRow))
+            decode_positions = packed_token_positions(token_rows)
+            if decode_positions is None:
+                decode_positions = torch.cat(
+                    tuple(row.positions.reshape(-1) for row in token_rows),
+                    dim=0,
+                )
         chunks: list[torch.Tensor] = []
         spans: list[tuple[int, int]] = []
         offset = 0
@@ -686,22 +700,62 @@ class BagelForUnifiedGeneration(nn.Module):
             chunks.append(chunk)
             spans.append((offset, offset + int(chunk.shape[0])))
             offset += int(chunk.shape[0])
-        hidden = self.model.lm(torch.cat(chunks, dim=0), batch.context)
+        hidden = self.model.lm(
+            torch.cat(chunks, dim=0),
+            batch.context,
+            positions=decode_positions,
+        )
+        row_hidden = tuple(hidden[begin:end] for begin, end in spans)
+        projected_rows = tuple(
+            index
+            for index, row in enumerate(rows)
+            if isinstance(row, TokenRow) and row.selection is not TokenSelection.HIDDEN
+        )
+        projected: torch.Tensor | None = None
+        if projected_rows:
+            if (
+                len(projected_rows) == len(rows)
+                and all(
+                    isinstance(row, TokenRow) and row.selection is TokenSelection.LAST_LOGITS
+                    for row in rows
+                )
+                and all(int(value.shape[0]) == 1 for value in row_hidden)
+            ):
+                selected = hidden
+            else:
+                selected_rows = tuple(
+                    row_hidden[index]
+                    if cast(TokenRow, rows[index]).selection is TokenSelection.ALL_LOGITS
+                    else row_hidden[index][-1:]
+                    for index in projected_rows
+                )
+                selected = (
+                    selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
+                )
+            projected = self.model.logits(selected, batch.context)
+
         outputs: list[TokenOutput | FlowOutput] = []
-        for row, (begin, end) in zip(rows, spans, strict=True):
-            row_hidden = hidden[begin:end]
+        projected_offset = 0
+        for index, row in enumerate(rows):
+            value_hidden = row_hidden[index]
             if isinstance(row, TokenRow):
                 value: TokenHidden | TokenLogits
                 if row.selection is TokenSelection.HIDDEN:
-                    value = TokenHidden(row_hidden)
-                elif row.selection is TokenSelection.ALL_LOGITS:
-                    value = TokenLogits(self.model.logits(row_hidden, batch.context))
+                    value = TokenHidden(value_hidden)
                 else:
-                    value = TokenLogits(self.model.logits(row_hidden[-1:], batch.context))
+                    if projected is None:
+                        raise RuntimeError("BAGEL projected output buffer is missing")
+                    count = (
+                        int(value_hidden.shape[0])
+                        if row.selection is TokenSelection.ALL_LOGITS
+                        else 1
+                    )
+                    value = TokenLogits(projected[projected_offset : projected_offset + count])
+                    projected_offset += count
                 outputs.append(TokenOutput(row.row_id, row.output_slot, value))
             else:
                 prediction = self.model.velocity_from_hidden(
-                    row_hidden,
+                    value_hidden,
                     int(row.image_tokens) - _BAGEL_IMAGE_MARKER_TOKENS,
                 )
                 outputs.append(FlowOutput(row.row_id, row.output_slot, prediction))

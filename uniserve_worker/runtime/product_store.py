@@ -140,6 +140,14 @@ class ProductRecord:
 
 
 class ProductStore:
+    """Own session products and scheduler-managed encoder-cache products.
+
+    Encoder feature handles belong to the scheduler's cross-session encoder
+    cache once published. They remain resident across session cleanup and are
+    reclaimed only through ``release``. Every other product follows its
+    originating session's lifetime.
+    """
+
     def __init__(self, *, encoder_cache_budget: int = 0) -> None:
         self.encoder_cache_budget = int(encoder_cache_budget)
         self._records: dict[int, ProductRecord] = {}
@@ -198,6 +206,12 @@ class ProductStore:
         with self._lock:
             handles = self._session_handles.pop(int(session_id), set())
             for handle in handles:
+                record = self._records.get(handle)
+                if record is not None and isinstance(
+                    record.payload,
+                    (VisionFeatureProduct, LatentFeatureProduct),
+                ):
+                    continue
                 self._records.pop(handle, None)
                 self._revisions[handle] = self._revision()
 

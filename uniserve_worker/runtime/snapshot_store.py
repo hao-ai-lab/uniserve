@@ -48,7 +48,7 @@ from .product_store import (
     VisionFeatureProduct,
 )
 from .replay import ReplayRecord, ReplayStore
-from .request_session import RequestSession, SessionStore
+from .request_session import RequestSession, SampledTokenRelay, SessionStore
 from .transfer import Locator, Transport, fetch_locator
 
 SNAPSHOT_FORMAT_VERSION = 1
@@ -670,7 +670,7 @@ class SnapshotProvider:
             "latent_handle": session.latent_handle,
             "product_handles": sorted(session.product_handles),
             "prompt_logits_handle": session.prompt_logits_handle,
-            "last_sampled_token": session.last_sampled_token,
+            "last_sampled_token": _host_token(session.last_sampled_token),
             "flow_step": session.flow_step,
             "rng_counter": session.rng_counter,
             "last_op_id": session.last_op_id,
@@ -1325,6 +1325,16 @@ def _uint(value: object, where: str) -> int:
 
 def _optional_uint(value: object, where: str) -> int | None:
     return None if value is None else _uint(value, where)
+
+
+def _host_token(value: int | SampledTokenRelay | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, SampledTokenRelay):
+        if value.tensor.numel() != 1:
+            raise invalid_descriptor("session sampled-token relay must contain one token")
+        return int(value.tensor.reshape(-1)[0].item())
+    return int(value)
 
 
 def _uint_tuple(value: object, where: str) -> tuple[int, ...]:

@@ -8,6 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from importlib import import_module
 from typing import Any, TypeAlias, cast
 
 import torch
@@ -84,6 +85,7 @@ from uniserve_worker.forward import (
     TokenRow,
     TokenSegments,
     TokenSelection,
+    packed_tensor_views,
 )
 from uniserve_worker.forward import (
     EncodeKind as ForwardEncodeKind,
@@ -94,6 +96,7 @@ from uniserve_worker.foundation.errors import (
     unsupported_operation,
 )
 from uniserve_worker.foundation.sizing import bucketed_length
+from uniserve_worker.foundation.triton_compat import triton_device_supported
 from uniserve_worker.loader.weight_set import WeightSet
 from uniserve_worker.nn.diffusion.cfg import Branch, CfgRecipe, build_flow_cfg_plan
 from uniserve_worker.nn.diffusion.integrator import euler_step
@@ -110,6 +113,14 @@ from uniserve_worker.runtime.execution_trace import (
     ExecutionPhase,
     ExecutionTrace,
     OperationTrace,
+)
+from uniserve_worker.runtime.host_staging import (
+    TensorStager,
+    TensorStagingSlot,
+    copy_cpu_to_device,
+    cpu_int_staging_buffer,
+    fill_cpu_ints,
+    is_pinned,
 )
 from uniserve_worker.runtime.image_utils import tensor_to_png_b64
 from uniserve_worker.runtime.kv_store import KvEntry, KvStore, KvTxn
@@ -130,7 +141,12 @@ from uniserve_worker.runtime.product_store import (
     encoder_handle_from_content_hash,
 )
 from uniserve_worker.runtime.replay import ReplayStore
-from uniserve_worker.runtime.request_session import RequestSession, SessionStore, StepTxn
+from uniserve_worker.runtime.request_session import (
+    RequestSession,
+    SampledTokenRelay,
+    SessionStore,
+    StepTxn,
+)
 from uniserve_worker.runtime.rng import (
     flow_noise_seed,
     normal_noise,
@@ -185,8 +201,6 @@ class _ForwardTask:
     causal: bool = True
     attention_indexes: torch.Tensor | None = None
     text_local_indices: tuple[int, ...] = ()
-    promote: bool = False
-    temporary_generation: int | None = None
 
     @property
     def query_tokens(self) -> int:
@@ -207,8 +221,146 @@ class _ForwardTask:
         return RouteRowKind.DECODE
 
 
-_TaskResult: TypeAlias = tuple[ForwardRowOutput, ...]
-_Driver: TypeAlias = Generator[tuple[_ForwardTask, ...], _TaskResult, ResultDelta]
+@dataclass(frozen=True, slots=True)
+class _SamplingRow:
+    parameters: SamplingParams
+    recent_counts: tuple[tuple[int, int], ...]
+    allowed: tuple[int, ...] | None
+    suppress: tuple[int, ...]
+    draw_seed: int
+    n_logprobs: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleTask:
+    envelope: OperationEnvelope
+    logits: torch.Tensor
+    rows: tuple[_SamplingRow, ...]
+    noise: torch.Tensor | None
+    penalty_token_ids: torch.Tensor | None
+    penalty_counts: torch.Tensor | None
+    parameter_values: torch.Tensor | None
+    defer_host_token: bool = False
+    draft_token_ids: tuple[int, ...] = ()
+    acceptance_uniforms: torch.Tensor | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleResult:
+    token_id: int | _DeferredToken
+    device_token: torch.Tensor | None
+    logprob: float | None
+    top_logprobs: tuple[tuple[int, float, int], ...] | None
+    num_accepted_tokens: int = 0
+
+
+class _DeferredTokenBatch:
+    """One device token vector with one asynchronous pinned-host mirror."""
+
+    __slots__ = ("device_tokens", "host_tokens", "event", "count", "_values")
+
+    def __init__(
+        self,
+        device_tokens: torch.Tensor,
+        host_tokens: torch.Tensor,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        self.device_tokens = device_tokens
+        self.host_tokens = host_tokens
+        self.event = event
+        self.count = int(device_tokens.numel())
+        self._values: tuple[int, ...] | None = None
+
+    def ready(self) -> bool:
+        return self._values is not None or self.event is None or bool(self.event.query())
+
+    def finalize(self) -> tuple[int, ...]:
+        if self._values is None:
+            if self.event is not None:
+                self.event.synchronize()
+            self._values = tuple(int(value) for value in self.host_tokens[: self.count].tolist())
+        return self._values
+
+
+class _DeferredToken:
+    """A protocol integer finalized only when the worker serializes its result."""
+
+    __slots__ = ("batch", "index")
+
+    def __init__(self, batch: _DeferredTokenBatch, index: int) -> None:
+        self.batch = batch
+        self.index = int(index)
+
+    def ready(self) -> bool:
+        return self.batch.ready()
+
+    def finalize(self) -> int:
+        return self.batch.finalize()[self.index]
+
+    def __int__(self) -> int:
+        return self.finalize()
+
+    def __index__(self) -> int:
+        return self.finalize()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _DeferredToken):
+            return self.finalize() == other.finalize()
+        if isinstance(other, int):
+            return self.finalize() == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.finalize())
+
+
+class _PinnedTokenRing:
+    """Bounded pinned mirrors matched to the worker execution pipeline depth."""
+
+    def __init__(self, depth: int, capacity: int) -> None:
+        self.depth = max(1, int(depth))
+        self.capacity = max(1, int(capacity))
+        self._slots: dict[
+            str, list[tuple[torch.Tensor, torch.cuda.Event, _DeferredTokenBatch | None]]
+        ] = {}
+        self._next: dict[str, int] = {}
+
+    def capture(self, tokens: torch.Tensor) -> _DeferredTokenBatch:
+        flat = tokens.reshape(-1)
+        if flat.device.type != "cuda":
+            host = flat.to(device="cpu")
+            return _DeferredTokenBatch(flat, host, None)
+        key = str(flat.device)
+        slots = self._slots.get(key)
+        if slots is None:
+            slots = [
+                (
+                    torch.empty(self.capacity, dtype=torch.long, device="cpu", pin_memory=True),
+                    torch.cuda.Event(blocking=False),
+                    None,
+                )
+                for _ in range(self.depth)
+            ]
+            self._slots[key] = slots
+            self._next[key] = 0
+        index = self._next[key]
+        host, event, owner = slots[index]
+        if owner is not None:
+            owner.finalize()
+        count = int(flat.numel())
+        if count > int(host.numel()):
+            raise RuntimeError("sampled-token mirror capacity is smaller than the sampling batch")
+        host[:count].copy_(flat, non_blocking=True)
+        event.record(torch.cuda.current_stream(flat.device))
+        captured = _DeferredTokenBatch(flat, host, event)
+        slots[index] = (host, event, captured)
+        self._next[key] = (index + 1) % self.depth
+        return captured
+
+
+_ExecutorTask: TypeAlias = _ForwardTask | _SampleTask
+_TaskResult: TypeAlias = tuple[Any, ...]
+_Driver: TypeAlias = Generator[tuple[_ExecutorTask, ...], _TaskResult, ResultDelta]
 
 
 @dataclass(slots=True)
@@ -221,6 +373,7 @@ class _ExecutionScope:
     product_view: ProductView
     published: list[Locator] = field(default_factory=list)
     observations: list[RunObservation] = field(default_factory=list)
+    component_us: dict[str, int] = field(default_factory=dict)
     next_row_id: int = 0
 
     def row_id(self) -> int:
@@ -258,6 +411,7 @@ class ModelExecutor:
         weight_digest: str | None,
         allowed_operation_types: frozenset[OperationType],
         trace: ExecutionTrace,
+        pipeline_depth: int = 1,
         defer_sampling: bool = False,
     ) -> None:
         if not allowed_operation_types:
@@ -303,6 +457,9 @@ class ModelExecutor:
         self.allowed_operation_types = allowed_operation_types
         self.trace = trace
         self.defer_sampling = bool(defer_sampling)
+        max_operations = 1024 if deployment is None else int(deployment.max_batch_operations)
+        self._token_mirrors = _PinnedTokenRing(pipeline_depth, max_operations)
+        self._tensor_stager = TensorStager(ring_depth=pipeline_depth)
         self._routes = {} if spec is None else {route.name: route for route in spec.routes}
 
     def execute(self, batch: Batch) -> ExecutionResult:
@@ -380,8 +537,7 @@ class ModelExecutor:
             for admission in batch.admissions:
                 self.kv.admit(admission)
             self._apply_leases_and_imports(batch, scope)
-            drivers = tuple(self._driver(operation, scope) for operation in batch.operations)
-            deltas = self._drive(drivers, scope)
+            deltas = self._execute_operations(batch.operations, scope)
             self.trace.emit(
                 ExecutionPhase.POSTPROCESS,
                 operations,
@@ -395,7 +551,7 @@ class ModelExecutor:
                 step_id=batch.step_id,
                 operations=result_operations,
                 worker_exec_us=(time.perf_counter_ns() - started) // 1000,
-                forward_stats=_forward_stats(scope.observations),
+                forward_stats=_forward_stats(scope.observations, scope.component_us),
             )
             result.validate_for(batch)
             self.replay.commit_atomic(
@@ -468,10 +624,145 @@ class ModelExecutor:
             return self._materialize_driver(envelope, operation, scope)
         return self._transfer_driver(envelope, operation, scope)
 
+    def _execute_operations(
+        self,
+        envelopes: tuple[OperationEnvelope, ...],
+        scope: _ExecutionScope,
+    ) -> tuple[ResultDelta, ...]:
+        if all(
+            isinstance(envelope.operation, SequenceOperation)
+            and envelope.operation.mode is SequenceMode.DECODE
+            for envelope in envelopes
+        ):
+            return self._decode_batch(envelopes, scope)
+        drivers = tuple(self._driver(envelope, scope) for envelope in envelopes)
+        return self._drive(drivers, scope)
+
+    def _decode_batch(
+        self,
+        envelopes: tuple[OperationEnvelope, ...],
+        scope: _ExecutionScope,
+    ) -> tuple[ResultDelta, ...]:
+        build_started = time.perf_counter_ns()
+        operations: list[SequenceOperation] = []
+        sessions: list[RequestSession] = []
+        tasks: list[_ForwardTask] = []
+        for envelope in envelopes:
+            operation = cast(SequenceOperation, envelope.operation)
+            if not isinstance(operation.input, WireTokenInput):
+                raise invalid_descriptor("sequence decode requires inline token input")
+            session = self.sessions.get(envelope.session_id)
+            if session.sampling is None:
+                raise invalid_descriptor("sequence operation has no admitted sampling state")
+            current = self._resolve_decode_token(operation.input, session)
+            start, end = operation.position
+            if end - start != 1:
+                raise invalid_descriptor("sequence decode must cover exactly one logical position")
+            operations.append(operation)
+            sessions.append(session)
+            tasks.append(
+                self._token_task(
+                    envelope,
+                    (current,),
+                    (start,),
+                    TokenSelection.LAST_LOGITS,
+                    scope,
+                )
+            )
+
+        _record_component(scope, "text_build_batch", build_started)
+        forward_started = time.perf_counter_ns()
+        outputs = self._run_wave(tuple(tasks), scope)
+        _record_component(scope, "text_model_forward", forward_started)
+        logits: list[torch.Tensor] = []
+        for task, output in zip(tasks, outputs, strict=True):
+            logits.append(_token_logits(output)[-1])
+            self._commit_task_kv(task, 1, scope)
+
+        if self.defer_sampling:
+            deferred: list[ResultDelta] = []
+            for envelope, operation, row_logits in zip(
+                envelopes,
+                operations,
+                logits,
+                strict=True,
+            ):
+                published = self._publish_logits(
+                    envelope,
+                    row_logits,
+                    SequenceMode.DECODE,
+                    scope,
+                )
+                deferred.append(
+                    SequenceDelta(
+                        SequenceEffect(
+                            kv_tokens=self.kv.get(envelope.session_id).length,
+                            published_logits=published,
+                            published_kv=self._publish_kv_if_requested(
+                                envelope,
+                                operation,
+                                (),
+                                scope,
+                            ),
+                        )
+                    )
+                )
+            return tuple(deferred)
+
+        sample_started = time.perf_counter_ns()
+        sample_tasks = tuple(
+            self._sample_task(
+                envelope,
+                row_logits,
+                session,
+                operation.policy,
+                positions=(operation.position[0] + 1,),
+            )
+            for envelope, operation, session, row_logits in zip(
+                envelopes,
+                operations,
+                sessions,
+                logits,
+                strict=True,
+            )
+        )
+        samples = _sample_task_batch(sample_tasks, self._token_mirrors)
+        _record_component(scope, "text_sample", sample_started)
+        finalize_started = time.perf_counter_ns()
+        deltas: list[ResultDelta] = []
+        for envelope, operation, session, sampled in zip(
+            envelopes,
+            operations,
+            sessions,
+            samples,
+            strict=True,
+        ):
+            session.rng_counter += 1
+            session.last_sampled_token = _sample_relay_token(sampled)
+            token_ids = cast(tuple[int, ...], (sampled.token_id,))
+            deltas.append(
+                SequenceDelta(
+                    SequenceEffect(
+                        sampled_token_ids=token_ids,
+                        sampled_logprob=sampled.logprob,
+                        top_logprobs=_token_logprobs(sampled.top_logprobs),
+                        kv_tokens=self.kv.get(envelope.session_id).length,
+                        published_kv=self._publish_kv_if_requested(
+                            envelope,
+                            operation,
+                            token_ids,
+                            scope,
+                        ),
+                    )
+                )
+            )
+        _record_component(scope, "text_finalize", finalize_started)
+        return tuple(deltas)
+
     def _drive(
         self, drivers: tuple[_Driver, ...], scope: _ExecutionScope
     ) -> tuple[ResultDelta, ...]:
-        active: dict[int, tuple[_Driver, tuple[_ForwardTask, ...]]] = {}
+        active: dict[int, tuple[_Driver, tuple[_ExecutorTask, ...]]] = {}
         completed: dict[int, ResultDelta] = {}
         for index, driver in enumerate(drivers):
             try:
@@ -479,27 +770,62 @@ class ModelExecutor:
             except StopIteration as done:
                 completed[index] = done.value
         while active:
-            flat: list[tuple[int, int, _ForwardTask]] = []
+            flat: list[tuple[int, int, _ExecutorTask]] = []
             for driver_index, (_driver, tasks) in active.items():
                 for task_index, task in enumerate(tasks):
                     flat.append((driver_index, task_index, task))
             if not flat:
-                raise RuntimeError("execution driver yielded an empty forward wave")
-            outputs = self._run_wave(tuple(task for _driver, _task, task in flat), scope)
-            by_driver: dict[int, list[ForwardRowOutput | None]] = {
+                raise RuntimeError("execution driver yielded an empty task wave")
+            outputs = self._run_task_wave(
+                tuple(task for _driver, _task, task in flat),
+                scope,
+            )
+            by_driver: dict[int, list[Any | None]] = {
                 index: [None] * len(tasks) for index, (_driver, tasks) in active.items()
             }
             for (driver_index, task_index, _task), output in zip(flat, outputs, strict=True):
                 by_driver[driver_index][task_index] = output
-            next_active: dict[int, tuple[_Driver, tuple[_ForwardTask, ...]]] = {}
+            next_active: dict[int, tuple[_Driver, tuple[_ExecutorTask, ...]]] = {}
             for driver_index, (driver, _tasks) in active.items():
-                aligned = tuple(cast(ForwardRowOutput, value) for value in by_driver[driver_index])
+                aligned = tuple(by_driver[driver_index])
                 try:
                     next_active[driver_index] = (driver, driver.send(aligned))
                 except StopIteration as done:
                     completed[driver_index] = done.value
             active = next_active
         return tuple(completed[index] for index in range(len(drivers)))
+
+    def _run_task_wave(
+        self,
+        tasks: tuple[_ExecutorTask, ...],
+        scope: _ExecutionScope,
+    ) -> _TaskResult:
+        result: list[Any | None] = [None] * len(tasks)
+        forward = tuple(
+            (index, task) for index, task in enumerate(tasks) if isinstance(task, _ForwardTask)
+        )
+        if forward:
+            indexes, forward_tasks = zip(*forward, strict=True)
+            for index, forward_output in zip(
+                indexes,
+                self._run_wave(tuple(forward_tasks), scope),
+                strict=True,
+            ):
+                result[index] = forward_output
+        sampling = tuple(
+            (index, task) for index, task in enumerate(tasks) if isinstance(task, _SampleTask)
+        )
+        if sampling:
+            indexes, sample_tasks = zip(*sampling, strict=True)
+            for index, sample_output in zip(
+                indexes,
+                _sample_task_batch(tuple(sample_tasks), self._token_mirrors),
+                strict=True,
+            ):
+                result[index] = sample_output
+        if any(value is None for value in result):
+            raise RuntimeError("executor task wave contains an unknown task type")
+        return tuple(result)
 
     def _run_wave(
         self,
@@ -559,6 +885,8 @@ class ModelExecutor:
     ) -> ForwardPlan:
         route = tasks[0].route
         device = self._route_device(route)
+        target = torch.device(device)
+        staging_slot = self._tensor_stager.acquire(target)
         weights = self._weights(self.sessions.get(tasks[0].envelope.session_id))
         if any(
             self._weights(self.sessions.get(task.envelope.session_id)) is not weights
@@ -577,11 +905,20 @@ class ModelExecutor:
             raise invalid_descriptor("one physical route cannot mix KV and non-KV rows")
         kv_view: KvView | EmptyKvView
         attention: AttnPlan
-        if kv_tasks:
-            kv_view, attention = self._attention_plan(tasks, scope, torch.device(device))
-        else:
-            kv_view = EmptyKvView()
-            attention = NoAttention(backends=self._attention_selection())
+        try:
+            if kv_tasks:
+                kv_view, attention = self._attention_plan(
+                    tasks,
+                    scope,
+                    target,
+                    staging_slot,
+                )
+            else:
+                kv_view = EmptyKvView()
+                attention = NoAttention(backends=self._attention_selection())
+        except BaseException:
+            self._tensor_stager.mark_submitted(staging_slot, target)
+            raise
         mesh = EmptyMeshView() if self.mesh is None else self.mesh.view(route.topology_axes)
         context = ForwardContext(
             kv=kv_view,
@@ -592,7 +929,7 @@ class ModelExecutor:
             mesh=mesh,
             output=EmptyOutputView(),
         )
-        graph_shape = self._graph_shape(tasks)
+        graph_shape = self._hard_shape_key(route, tasks[0].row)
         graph_key = GraphKey(
             model_revision=cast(ModelSpec, self.spec).revision or cast(str, self.weight_digest),
             spec_digest=cast(str, self.model_spec_digest),
@@ -635,6 +972,7 @@ class ModelExecutor:
             graph_eligible=route.graph_eligible,
             device=device,
             weights=weights,
+            staging_slot=staging_slot,
         )
         row_counts: dict[str, int] = {}
         for task in tasks:
@@ -653,15 +991,19 @@ class ModelExecutor:
         tasks: tuple[_ForwardTask, ...],
         scope: _ExecutionScope,
         device: torch.device,
+        staging_slot: TensorStagingSlot,
     ) -> tuple[KvView, PagedDecodePlan | PagedVarlenPlan | PackedAttentionPlan]:
         route = tasks[0].route
-        if RouteRowKind.FLOW in route.row_kinds:
-            return self._packed_attention_plan(tasks, scope, device)
+        pure_token_decode = all(
+            isinstance(task.row, TokenRow) and task.query_tokens == 1 for task in tasks
+        )
+        if RouteRowKind.FLOW in route.row_kinds and not pure_token_decode:
+            return self._packed_attention_plan(tasks, scope, device, staging_slot)
         sessions = tuple(task.envelope.session_id for task in tasks)
         query_lens = tuple(task.query_tokens for task in tasks)
         view = scope.kv.view(sessions, query_lens=query_lens)
-        block_table = view.block_table(device)
-        cache_seqlens = view.cache_seqlens(device)
+        block_table = view.block_table(device, slot=staging_slot)
+        cache_seqlens = view.cache_seqlens(device, slot=staging_slot)
         kv_lens = tuple(
             base + query for base, query in zip(view.base_lens, query_lens, strict=True)
         )
@@ -672,26 +1014,42 @@ class ModelExecutor:
         causal = causal_values.pop()
         binding = GraphBinding(_binding_identity(tasks))
         if all(query == 1 for query in query_lens):
-            page_ids = torch.tensor(
-                [
+            page_ids = _stage_ints(
+                tuple(
                     task.entry.block_ids[task.entry.length // view.block_size]
                     for task in tasks
                     if task.entry is not None
-                ],
+                ),
                 dtype=torch.int32,
                 device=device,
+                slot=staging_slot,
+                name="decode_page_ids",
             )
-            page_offsets = torch.tensor(
-                [cast(KvEntry, task.entry).length % view.block_size for task in tasks],
+            page_offsets = _stage_ints(
+                tuple(cast(KvEntry, task.entry).length % view.block_size for task in tasks),
                 dtype=torch.int32,
                 device=device,
+                slot=staging_slot,
+                name="decode_page_offsets",
             )
             decode_attention = PagedDecodePlan(
                 backends=self._attention_selection(),
                 block_table=block_table,
                 cache_seqlens=cache_seqlens,
-                kv_seqlens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
-                query_lens=torch.ones(len(tasks), dtype=torch.int32, device=device),
+                kv_seqlens=_stage_ints(
+                    kv_lens,
+                    dtype=torch.int32,
+                    device=device,
+                    slot=staging_slot,
+                    name="kv_lengths",
+                ),
+                query_lens=_stage_ints(
+                    (1,) * len(tasks),
+                    dtype=torch.int32,
+                    device=device,
+                    slot=staging_slot,
+                    name="query_lengths",
+                ),
                 cache_seqlens_cpu=tuple(view.base_lens),
                 kv_seqlens_cpu=kv_lens,
                 query_lens_cpu=query_lens,
@@ -702,16 +1060,45 @@ class ModelExecutor:
                 binding=binding,
             )
             return view, decode_attention
-        cu_q = _cumulative(query_lens, device)
-        cu_k = _cumulative(kv_lens, device)
+        cu_q = _cumulative(
+            query_lens,
+            device,
+            slot=staging_slot,
+            name="query_offsets",
+        )
+        cu_k = _cumulative(
+            kv_lens,
+            device,
+            slot=staging_slot,
+            name="kv_offsets",
+        )
         varlen_attention = PagedVarlenPlan(
             backends=self._attention_selection(),
             block_table=block_table,
             cache_seqlens=cache_seqlens,
-            query_lens=torch.tensor(query_lens, dtype=torch.int32, device=device),
-            kv_seqlens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+            query_lens=_stage_ints(
+                query_lens,
+                dtype=torch.int32,
+                device=device,
+                slot=staging_slot,
+                name="query_lengths",
+            ),
+            kv_seqlens=_stage_ints(
+                kv_lens,
+                dtype=torch.int32,
+                device=device,
+                slot=staging_slot,
+                name="kv_lengths",
+            ),
             cu_seqlens_q=cu_q,
             cu_seqlens_k=cu_k,
+            output_indices=_stage_ints(
+                tuple(sum(query_lens[: index + 1]) - 1 for index in range(len(query_lens))),
+                dtype=torch.int64,
+                device=device,
+                slot=staging_slot,
+                name="output_indices",
+            ),
             cache_seqlens_cpu=tuple(view.base_lens),
             query_lens_cpu=query_lens,
             kv_seqlens_cpu=kv_lens,
@@ -728,30 +1115,12 @@ class ModelExecutor:
         tasks: tuple[_ForwardTask, ...],
         scope: _ExecutionScope,
         device: torch.device,
+        staging_slot: TensorStagingSlot,
     ) -> tuple[KvView, PackedAttentionPlan]:
-        uses_scratch = any(task.scratch for task in tasks)
-        if uses_scratch:
-            for task in tasks:
-                if task.scratch:
-                    continue
-                source = self.kv.get(task.envelope.session_id)
-                generation = -int(task.envelope.op_id)
-                entry, _created = scope.kv.scratch_entry(
-                    task.envelope.session_id,
-                    generation,
-                    f"mixed-{task.row.row_id}",
-                    capacity_tokens=source.length + task.query_tokens,
-                    copy_conditioning=True,
-                )
-                task.entry = entry
-                task.scratch = True
-                task.promote = True
-                task.temporary_generation = generation
-                scope.kv.release_generation(task.envelope.session_id, generation)
         rows = tuple(
             (cast(KvEntry, task.entry), task.query_tokens, task.write_kv) for task in tasks
         )
-        view = scope.kv.packed_view(rows, scratch=uses_scratch)
+        view = scope.kv.packed_view(rows)
         query_lens = tuple(task.query_tokens for task in tasks)
         base_lens = view.base_lens
         key_lens = tuple(base + query for base, query in zip(base_lens, query_lens, strict=True))
@@ -804,7 +1173,12 @@ class ModelExecutor:
                 for task in tasks
             ),
             visible_end=visible,
-            cu_seqlens_q=_cumulative(query_lens, device),
+            cu_seqlens_q=_cumulative(
+                query_lens,
+                device,
+                slot=staging_slot,
+                name="packed_query_offsets",
+            ),
             page_table=page_table,
             seqused_k=torch.tensor(key_lens, dtype=torch.int32, device=device),
             write_page_ids=write_page_ids,
@@ -888,15 +1262,6 @@ class ModelExecutor:
             return (_token_input_length(row),)
         return _row_tensor_shape(row)
 
-    def _graph_shape(self, tasks: tuple[_ForwardTask, ...]) -> tuple[int, ...]:
-        counts = [0, 0, 0, 0]
-        tokens: list[int] = []
-        order = (RouteRowKind.TOKEN, RouteRowKind.FLOW, RouteRowKind.ENCODE, RouteRowKind.DECODE)
-        for task in tasks:
-            counts[order.index(task.row_kind)] += 1
-            tokens.append(task.query_tokens or _row_element_count(task.row))
-        return (*counts, *tokens)
-
     def _release_locators(self, locators: Iterable[Locator]) -> None:
         if self.transport is None:
             return
@@ -915,17 +1280,20 @@ class ModelExecutor:
         if operation.mode is SequenceMode.SAMPLE:
             source = cast(PublishedProduct, operation.input)
             logits = self._fetch_logits(source, scope)
-            sample = self._sample(
+            task = self._sample_task(
+                envelope,
                 logits.reshape(-1, logits.shape[-1])[-1],
                 session,
-                operation,
-                position=operation.position[1],
+                operation.policy,
+                positions=(operation.position[1],),
             )
-            session.last_sampled_token = sample.token_id
+            outputs = yield (task,)
+            sample = _sample_result(outputs[0])
+            session.last_sampled_token = _sample_relay_token(sample)
             session.rng_counter += 1
             return SequenceDelta(
                 SequenceEffect(
-                    sampled_token_ids=(sample.token_id,),
+                    sampled_token_ids=cast(tuple[int, ...], (sample.token_id,)),
                     sampled_logprob=sample.logprob,
                     top_logprobs=_token_logprobs(sample.top_logprobs),
                     kv_tokens=self.kv.get(envelope.session_id).length,
@@ -952,9 +1320,7 @@ class ModelExecutor:
         if end - start != len(tokens):
             raise invalid_descriptor("sequence extend positions do not align with its tokens")
         sampling = _require_sampling(session)
-        wants_prompt = bool(
-            inputs.return_all_logits or sampling.return_prompt_logprobs
-        )
+        wants_prompt = bool(inputs.return_all_logits or sampling.return_prompt_logprobs)
         selection = TokenSelection.ALL_LOGITS if wants_prompt else TokenSelection.LAST_LOGITS
         task = self._token_task(
             envelope,
@@ -973,11 +1339,18 @@ class ModelExecutor:
             scope,
             enabled=wants_prompt,
         )
-        sample = self._sample(logits[-1], session, operation, position=end)
-        session.last_sampled_token = sample.token_id
+        sample_task = self._sample_task(
+            envelope,
+            logits[-1],
+            session,
+            operation.policy,
+            positions=(end,),
+        )
+        sample = _sample_result((yield (sample_task,))[0])
+        session.last_sampled_token = _sample_relay_token(sample)
         session.rng_counter += 1
         effect = SequenceEffect(
-            sampled_token_ids=(sample.token_id,),
+            sampled_token_ids=cast(tuple[int, ...], (sample.token_id,)),
             sampled_logprob=sample.logprob,
             top_logprobs=_token_logprobs(sample.top_logprobs),
             prompt_logprobs=prompt,
@@ -985,7 +1358,7 @@ class ModelExecutor:
             published_kv=self._publish_kv_if_requested(
                 envelope,
                 operation,
-                (sample.token_id,),
+                cast(tuple[int, ...], (sample.token_id,)),
                 scope,
             ),
         )
@@ -1032,10 +1405,17 @@ class ModelExecutor:
                     ),
                 )
             )
-        sampled = self._sample(logits, session, operation, position=start + 1)
+        sample_task = self._sample_task(
+            envelope,
+            logits,
+            session,
+            operation.policy,
+            positions=(start + 1,),
+        )
+        sampled = _sample_result((yield (sample_task,))[0])
         session.rng_counter += 1
-        session.last_sampled_token = int(sampled.token_id)
-        token_ids = (int(sampled.token_id),)
+        session.last_sampled_token = _sample_relay_token(sampled)
+        token_ids = cast(tuple[int, ...], (sampled.token_id,))
         return SequenceDelta(
             SequenceEffect(
                 sampled_token_ids=token_ids,
@@ -1081,42 +1461,29 @@ class ModelExecutor:
             seed=sampling_draw_seed(seed, start),
             device=logits.device,
         )
-        final_coin = uniform_samples(
-            (1,),
-            seed=sampling_draw_seed(seed, start + len(draft) + 1),
-            device=logits.device,
-        )
-        sampled = _speculative_sample_target_only(
+        sample_task = self._sample_task(
+            envelope,
             logits,
-            draft,
-            sampling,
-            recent=operation.policy.recent_tokens,
-            allowed=self._allowed_tokens(session, operation),
-            suppress=operation.policy.suppress_tokens,
-            uniform_samples=coins,
-            uniform_sample_for_final=final_coin,
+            session,
+            operation.policy,
+            positions=tuple(range(start + 1, start + len(draft) + 2)),
+            draft_token_ids=draft,
+            acceptance_uniforms=coins,
         )
+        sampled = _sample_result((yield (sample_task,))[0])
         committed = 1 + int(sampled.num_accepted_tokens)
         self._commit_task_kv(task, committed, scope)
         sampled_ids = (
             *draft[: sampled.num_accepted_tokens],
-            int(sampled.sampled_token_id),
+            int(sampled.token_id),
         )
-        detail_row = int(sampled.num_accepted_tokens)
-        details = _score_prompt_token_logprobs(
-            logits[detail_row : detail_row + 1],
-            (sampled.sampled_token_id,),
-            n_logprobs=int(sampling.n_logprobs),
-            logprob_token_ids=sampling.logprob_token_ids,
-        )[0]
-        session.last_sampled_token = int(sampled.sampled_token_id)
+        session.last_sampled_token = _sample_relay_token(sampled)
         session.rng_counter += len(draft) + 1
-        actual = details[0]
         return SequenceDelta(
             SequenceEffect(
                 sampled_token_ids=tuple(sampled_ids),
-                sampled_logprob=float(actual[1]),
-                top_logprobs=tuple(TokenLogprob(*entry) for entry in details),
+                sampled_logprob=sampled.logprob,
+                top_logprobs=_token_logprobs(sampled.top_logprobs),
                 accepted_draft_tokens=int(sampled.num_accepted_tokens),
                 kv_tokens=self.kv.get(envelope.session_id).length,
                 published_kv=self._publish_kv_if_requested(
@@ -1131,7 +1498,7 @@ class ModelExecutor:
     def _token_task(
         self,
         envelope: OperationEnvelope,
-        token_ids: tuple[int, ...],
+        token_ids: tuple[int | torch.Tensor, ...],
         positions: tuple[int, ...],
         selection: TokenSelection,
         scope: _ExecutionScope,
@@ -1141,10 +1508,17 @@ class ModelExecutor:
             raise invalid_descriptor("sequence operation primary stage is not a token row")
         if len(token_ids) != len(positions) or not token_ids:
             raise invalid_descriptor("token task ids and positions must align")
+        if len(token_ids) == 1 and isinstance(token_ids[0], torch.Tensor):
+            token_values = token_ids[0].reshape(1).to(dtype=torch.long)
+        else:
+            token_values = torch.tensor(
+                tuple(int(value) for value in token_ids),
+                dtype=torch.long,
+            )
         row_id = scope.row_id()
         row = TokenRow(
             row_id=row_id,
-            inputs=TokenIds(torch.tensor(token_ids, dtype=torch.long)),
+            inputs=TokenIds(token_values),
             positions=torch.tensor(positions, dtype=torch.long),
             output_slot=row_id,
             selection=selection,
@@ -1170,10 +1544,8 @@ class ModelExecutor:
             raise RuntimeError("KV commit count is outside the task query span")
         if count == 0:
             return
-        if task.promote:
-            scope.kv.promote_scratch(task.envelope.session_id, cast(KvEntry, task.entry), count)
-        elif task.scratch:
-            scope.kv.advance_entry(cast(KvEntry, task.entry), count, scratch=True)
+        if task.scratch:
+            scope.kv.advance_entry(cast(KvEntry, task.entry), count)
         else:
             scope.kv.advance(task.envelope.session_id, count)
 
@@ -1181,57 +1553,78 @@ class ModelExecutor:
         self,
         inputs: WireTokenInput,
         session: RequestSession,
-    ) -> int:
+    ) -> int | torch.Tensor:
         if inputs.source is TokenSource.WIRE:
             return int(inputs.token_ids[0])
         if session.last_sampled_token is None:
             raise invalid_descriptor("last-sampled token source has no committed token")
+        if isinstance(session.last_sampled_token, SampledTokenRelay):
+            return session.last_sampled_token.tensor
         return int(session.last_sampled_token)
 
-    def _sample(
+    def _sample_task(
         self,
-        logits: torch.Tensor,
-        session: RequestSession,
-        operation: SequenceOperation,
-        *,
-        position: int,
-    ) -> Any:
-        return self._sample_policy(
-            logits,
-            session,
-            operation.policy,
-            position=position,
-        )
-
-    def _sample_policy(
-        self,
+        envelope: OperationEnvelope,
         logits: torch.Tensor,
         session: RequestSession,
         policy: TokenPolicy,
         *,
-        position: int,
-    ) -> Any:
+        positions: tuple[int, ...],
+        draft_token_ids: tuple[int, ...] = (),
+        acceptance_uniforms: torch.Tensor | None = None,
+    ) -> _SampleTask:
         sampling = _require_sampling(session)
-        generator = torch.Generator(device=logits.device)
-        generator.manual_seed(sampling_draw_seed(int(sampling.seed or 0), int(position)))
-        return _sample_one_from_logits(
-            logits,
-            sampling,
-            recent=list(policy.recent_tokens),
-            allowed=(policy.allowed_tokens or sampling.allowed_token_ids),
-            suppress=policy.suppress_tokens or None,
-            n_logprobs=int(sampling.n_logprobs),
-            generator=generator,
+        rows = logits.reshape(1, -1) if logits.ndim == 1 else logits
+        if rows.ndim != 2 or int(rows.shape[0]) != len(positions):
+            raise invalid_descriptor("sampling task positions do not align with its logits")
+        allowed = policy.allowed_tokens or sampling.allowed_token_ids
+        recent_counts = _recent_token_counts(policy.recent_tokens)
+        descriptors = tuple(
+            _SamplingRow(
+                parameters=sampling,
+                recent_counts=recent_counts,
+                allowed=None if allowed is None else tuple(int(value) for value in allowed),
+                suppress=tuple(int(value) for value in policy.suppress_tokens),
+                draw_seed=sampling_draw_seed(
+                    int(sampling.seed or 0),
+                    int(position),
+                ),
+                n_logprobs=int(sampling.n_logprobs),
+            )
+            for position in positions
         )
-
-    @staticmethod
-    def _allowed_tokens(
-        session: RequestSession,
-        operation: SequenceOperation,
-    ) -> tuple[int, ...] | None:
-        if operation.policy.allowed_tokens:
-            return operation.policy.allowed_tokens
-        return _require_sampling(session).allowed_token_ids
+        plain_greedy = not draft_token_ids and all(_plain_greedy_row(row) for row in descriptors)
+        defer_host_token = (
+            plain_greedy and not policy.publish_kv and not policy.publish_kv_on_tokens
+        )
+        if plain_greedy:
+            noise = None
+            penalty_token_ids = None
+            penalty_counts = None
+            parameter_values = None
+        else:
+            noise = _semantic_sampling_noise(
+                descriptors,
+                vocab=int(rows.shape[1]),
+                device=rows.device,
+            )
+            penalty_token_ids, penalty_counts, parameter_values = _sampling_task_tensors(
+                descriptors,
+                vocab=int(rows.shape[1]),
+                device=rows.device,
+            )
+        return _SampleTask(
+            envelope=envelope,
+            logits=rows,
+            rows=descriptors,
+            noise=noise,
+            penalty_token_ids=penalty_token_ids,
+            penalty_counts=penalty_counts,
+            parameter_values=parameter_values,
+            defer_host_token=defer_host_token,
+            draft_token_ids=tuple(int(value) for value in draft_token_ids),
+            acceptance_uniforms=acceptance_uniforms,
+        )
 
     def _prompt_logprobs(
         self,
@@ -1329,8 +1722,10 @@ class ModelExecutor:
         scope: _ExecutionScope,
     ) -> Any:
         policy = operation.policy
-        if not policy.publish_kv and not (set(sampled) & set(policy.publish_kv_on_tokens)):
-            return None
+        if not policy.publish_kv:
+            triggers = policy.publish_kv_on_tokens
+            if not triggers or not (set(sampled) & set(triggers)):
+                return None
         published = self.kv.publish(
             envelope.session_id,
             source_version=envelope.base_version + 1,
@@ -2125,7 +2520,7 @@ class ModelExecutor:
         policy: TokenPolicy | None = None,
         close_image: bool = False,
         retain_image: bool,
-    ) -> Generator[tuple[_ForwardTask, ...], _TaskResult, _StateOutcome]:
+    ) -> Generator[tuple[_ExecutorTask, ...], _TaskResult, _StateOutcome]:
         total = 0
         sequence: SequenceEffect | None = None
         for stage in self._state_stages(operation_type, retain_image=retain_image):
@@ -2171,17 +2566,21 @@ class ModelExecutor:
                         raise invalid_descriptor("image state token stage did not return logits")
                     session = self.sessions.get(envelope.session_id)
                     flow_spec = cast(ModelSpec, self.spec).flow
-                    sampled = self._sample_policy(
+                    sample_task = self._sample_task(
+                        envelope,
                         value[-1],
                         session,
                         policy,
-                        position=conditioning_position
-                        + max(
-                            1,
-                            1 if flow_spec is None else flow_spec.rope_advance,
+                        positions=(
+                            conditioning_position
+                            + max(
+                                1,
+                                1 if flow_spec is None else flow_spec.rope_advance,
+                            ),
                         ),
                     )
-                    session.last_sampled_token = int(sampled.token_id)
+                    sampled = _sample_result((yield (sample_task,))[0])
+                    session.last_sampled_token = _sample_relay_token(sampled)
                     session.rng_counter += 1
                     sequence = SequenceEffect(
                         sampled_token_ids=(int(sampled.token_id),),
@@ -2525,14 +2924,48 @@ def _three_axis_positions(row: ForwardRow, query: int) -> torch.Tensor:
     raise invalid_descriptor("row positions cannot be lowered to three-axis attention indexes")
 
 
-def _cumulative(lengths: Sequence[int], device: torch.device) -> torch.Tensor:
-    result = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=device)
-    if lengths:
-        result[1:] = torch.cumsum(
-            torch.tensor(tuple(int(value) for value in lengths), dtype=torch.int32, device=device),
-            dim=0,
-        )
-    return result
+def _stage_ints(
+    values: Sequence[int],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    slot: TensorStagingSlot,
+    name: str,
+) -> torch.Tensor:
+    cpu = cpu_int_staging_buffer(
+        len(values),
+        dtype=dtype,
+        pin=device.type == "cuda",
+        slot=slot,
+        name=name,
+    )
+    fill_cpu_ints(cpu, tuple(int(value) for value in values))
+    return copy_cpu_to_device(
+        cpu,
+        device=device,
+        non_blocking=device.type == "cuda" and is_pinned(cpu),
+        slot=slot,
+        name=name,
+    )
+
+
+def _cumulative(
+    lengths: Sequence[int],
+    device: torch.device,
+    *,
+    slot: TensorStagingSlot,
+    name: str,
+) -> torch.Tensor:
+    values = [0]
+    for length in lengths:
+        values.append(values[-1] + int(length))
+    return _stage_ints(
+        values,
+        dtype=torch.int32,
+        device=device,
+        slot=slot,
+        name=name,
+    )
 
 
 def _output_kind(row: ForwardRow) -> OutputKind:
@@ -2568,7 +3001,15 @@ def _trace_envelopes(
     )
 
 
-def _forward_stats(observations: Sequence[RunObservation]) -> WorkerForwardStats:
+def _record_component(scope: _ExecutionScope, name: str, started_ns: int) -> None:
+    elapsed_us = max(0, (time.perf_counter_ns() - int(started_ns)) // 1000)
+    scope.component_us[name] = scope.component_us.get(name, 0) + elapsed_us
+
+
+def _forward_stats(
+    observations: Sequence[RunObservation],
+    component_us: Mapping[str, int] | None = None,
+) -> WorkerForwardStats:
     route_counts: dict[str, int] = {}
     route_rows: dict[str, int] = {}
     route_us: dict[str, int] = {}
@@ -2576,6 +3017,8 @@ def _forward_stats(observations: Sequence[RunObservation]) -> WorkerForwardStats
     captures = 0
     replays = 0
     fallbacks = 0
+    graph_unpadded_tokens = 0
+    graph_padded_tokens = 0
     for observation in observations:
         route_counts[observation.route] = route_counts.get(observation.route, 0) + 1
         route_rows[observation.route] = route_rows.get(observation.route, 0) + int(
@@ -2588,15 +3031,22 @@ def _forward_stats(observations: Sequence[RunObservation]) -> WorkerForwardStats
         captures += observation.path is RunPath.GRAPH_CAPTURE
         replays += observation.path is RunPath.GRAPH_REPLAY
         fallbacks += observation.path is RunPath.GRAPH_FALLBACK
+        graph_unpadded_tokens += int(observation.graph_unpadded_tokens)
+        graph_padded_tokens += int(observation.graph_padded_tokens)
+    components = {"forward": sum(route_us.values())}
+    for name, value in (component_us or {}).items():
+        components[str(name)] = components.get(str(name), 0) + max(0, int(value))
     return WorkerForwardStats(
         mode_counts=route_counts,
         mode_tokens=route_rows,
         mode_us=route_us,
-        component_us={"forward": sum(route_us.values())},
+        component_us=components,
         cuda_graph_captures=int(captures),
         cuda_graph_replays=int(replays),
         cuda_graph_misses=int(fallbacks),
         cuda_graph_fallbacks=int(fallbacks),
+        cuda_graph_unpadded_tokens=graph_unpadded_tokens,
+        cuda_graph_padded_tokens=graph_padded_tokens,
         cuda_graph_runtime_mode_counts=path_counts,
     )
 
@@ -2661,267 +3111,828 @@ def _token_logprobs(
     return tuple(result)
 
 
-@dataclass(frozen=True, slots=True)
-class _TokenSample:
-    token_id: int
-    logprob: float | None
-    top_logprobs: list[list[float | int]] | None
+def _sample_result(value: object) -> _SampleResult:
+    if not isinstance(value, _SampleResult):
+        raise RuntimeError("sampling task returned an invalid result")
+    return value
 
 
-def _sample_one_from_logits(
-    logits: torch.Tensor,
-    parameters: SamplingParams,
+def _sample_relay_token(sample: _SampleResult) -> int | SampledTokenRelay:
+    if sample.device_token is not None:
+        return SampledTokenRelay(sample.device_token)
+    return int(sample.token_id)
+
+
+def _recent_token_counts(values: Sequence[int]) -> tuple[tuple[int, int], ...]:
+    counts: dict[int, int] = {}
+    for value in values:
+        token_id = int(value)
+        counts[token_id] = counts.get(token_id, 0) + 1
+    return tuple(counts.items())
+
+
+def _sampling_task_tensors(
+    rows: Sequence[_SamplingRow],
     *,
-    recent: Sequence[int],
-    allowed: Sequence[int] | None,
-    suppress: Sequence[int] | None,
-    n_logprobs: int,
-    generator: torch.Generator,
-) -> _TokenSample:
-    """Apply the canonical single-row sampling policy with an explicit RNG."""
-
-    if logits.ndim != 1 or not logits.is_floating_point() or int(logits.numel()) < 1:
-        raise invalid_descriptor("sampling logits must be a non-empty floating vector")
-    wants_logprobs_out = (
-        parameters.return_logprobs
-        or int(n_logprobs) > 0
-        or bool(parameters.logprob_token_ids)
+    vocab: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    first = rows[0]
+    parameters = first.parameters
+    uses_penalties = (
+        parameters.repetition_penalty != 1.0
+        or parameters.frequency_penalty != 0.0
+        or parameters.presence_penalty != 0.0
     )
-    greedy_unshaped = (
-        parameters.temperature <= 0.0
-        and not allowed
-        and not suppress
+    recent = (
+        tuple((token_id, count) for token_id, count in first.recent_counts if 0 <= token_id < vocab)
+        if uses_penalties
+        else ()
+    )
+    width = min(vocab, bucketed_length(len(recent)))
+    used = {token_id for token_id, _count in recent}
+    padding: list[int] = []
+    candidate = vocab - 1
+    while len(recent) + len(padding) < width:
+        if candidate not in used:
+            padding.append(candidate)
+        candidate -= 1
+    token_ids = torch.tensor(
+        (*[token_id for token_id, _count in recent], *padding),
+        dtype=torch.long,
+        device=device,
+    ).reshape(1, width)
+    counts = torch.tensor(
+        (*[count for _token_id, count in recent], *([0] * len(padding))),
+        dtype=torch.float32,
+        device=device,
+    ).reshape(1, width)
+    row_count = len(rows)
+    parameter_values = torch.tensor(
+        [
+            (
+                float(row.parameters.temperature),
+                float(row.parameters.top_p),
+                float(row.parameters.min_p),
+                float(row.parameters.repetition_penalty),
+                float(row.parameters.frequency_penalty),
+                float(row.parameters.presence_penalty),
+            )
+            for row in rows
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    return (
+        token_ids.expand(row_count, width),
+        counts.expand(row_count, width),
+        parameter_values,
+    )
+
+
+def _plain_greedy_row(row: _SamplingRow) -> bool:
+    parameters = row.parameters
+    return (
+        float(parameters.temperature) <= 0.0
+        and not parameters.return_logprobs
+        and int(row.n_logprobs) == 0
+        and not parameters.logprob_token_ids
+        and row.allowed is None
+        and not row.suppress
         and not parameters.logit_bias
         and parameters.repetition_penalty == 1.0
         and parameters.frequency_penalty == 0.0
         and parameters.presence_penalty == 0.0
     )
-    if greedy_unshaped and not wants_logprobs_out:
-        # Pure-greedy fast path. With temperature<=0 and no biasing/penalty/
-        # masking policy, the shaping chain leaves the argmax unchanged
-        # (top-k/top-p/min-p never mask the maximum), so skip the full-vocab
-        # float clone and reduction chain -- including its per-token host-sync
-        # NaN guard -- and read the argmax directly. This is the dominant
-        # temperature-0 decode path (e.g. the travel workflow's text spans).
-        return _TokenSample(int(torch.argmax(logits).item()), None, None)
-    work = logits.float().clone()
-    vocab = int(work.numel())
-    temperature = _shape_sampling_logits(
-        work,
-        parameters,
-        recent=recent,
-        allowed=allowed,
-        suppress=suppress,
+
+
+@torch.inference_mode()
+def _sample_task_batch(
+    tasks: Sequence[_SampleTask],
+    token_mirrors: _PinnedTokenRing | None = None,
+) -> tuple[_SampleResult, ...]:
+    """Shape and draw every compatible sampling row in each device batch."""
+
+    mirrors = token_mirrors or _PinnedTokenRing(1, max(1, len(tasks)))
+    grouped: dict[tuple[torch.device, int, int, int], list[tuple[int, _SampleTask]]] = defaultdict(
+        list
     )
-    if temperature <= 0.0:
-        token_id = int(torch.argmax(work).item())
-    else:
-        token_id = int(
-            torch.multinomial(torch.softmax(work, dim=-1), 1, generator=generator).item()
-        )
-    requested_ids = tuple(
-        dict.fromkeys(
-            int(value) for value in parameters.logprob_token_ids if 0 <= int(value) < vocab
-        )
-    )
-    count = min(max(0, int(n_logprobs)), vocab)
-    wants_logprobs = (
-        parameters.return_logprobs or count > 0 or bool(requested_ids)
-    )
-    if not wants_logprobs:
-        return _TokenSample(token_id, None, None)
-    logprobs = torch.log_softmax(work, dim=-1)
-    selected = float(logprobs[token_id].item())
-    entries: list[list[float | int]] = [
-        [token_id, selected, int((logprobs > logprobs[token_id]).sum().item()) + 1]
-    ]
-    seen = {token_id}
-    if count:
-        values, indexes = torch.topk(logprobs, count)
-        for index, value in zip(indexes.tolist(), values.tolist(), strict=True):
-            candidate = int(index)
-            if candidate not in seen:
-                entries.append(
-                    [
-                        candidate,
-                        float(value),
-                        int((logprobs > logprobs[candidate]).sum().item()) + 1,
-                    ]
+    for index, task in enumerate(tasks):
+        if (
+            task.logits.ndim != 2
+            or not task.logits.is_floating_point()
+            or int(task.logits.shape[0]) < 1
+            or int(task.logits.shape[1]) < 1
+            or int(task.logits.shape[0]) != len(task.rows)
+        ):
+            raise invalid_descriptor("sampling task logits must be shaped [rows, vocab]")
+        plain_greedy = not task.draft_token_ids and all(_plain_greedy_row(row) for row in task.rows)
+        if plain_greedy:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        task.noise,
+                        task.penalty_token_ids,
+                        task.penalty_counts,
+                        task.parameter_values,
+                    )
                 )
-                seen.add(candidate)
-    for candidate in requested_ids:
-        if candidate not in seen:
+                or task.draft_token_ids
+                or len(task.rows) != 1
+            ):
+                raise invalid_descriptor("greedy sampling task has shaped metadata")
+        else:
+            noise = cast(torch.Tensor, task.noise)
+            penalty_token_ids = cast(torch.Tensor, task.penalty_token_ids)
+            penalty_counts = cast(torch.Tensor, task.penalty_counts)
+            parameter_values = cast(torch.Tensor, task.parameter_values)
+            if (
+                noise.device != task.logits.device
+                or tuple(noise.shape) != tuple(task.logits.shape)
+                or not noise.is_floating_point()
+            ):
+                raise invalid_descriptor("sampling task noise must align with its logits")
+            if (
+                penalty_token_ids.device != task.logits.device
+                or penalty_counts.device != task.logits.device
+                or penalty_token_ids.ndim != 2
+                or penalty_counts.shape != penalty_token_ids.shape
+                or int(penalty_token_ids.shape[0]) != len(task.rows)
+            ):
+                raise invalid_descriptor("sampling task penalty tensors do not align")
+            if parameter_values.device != task.logits.device or parameter_values.shape != (
+                len(task.rows),
+                6,
+            ):
+                raise invalid_descriptor("sampling task parameter vectors do not align")
+        if task.draft_token_ids:
+            if len(task.rows) != len(task.draft_token_ids) + 1:
+                raise invalid_descriptor("speculative sampling rows do not cover the draft chain")
+            if task.acceptance_uniforms is None or tuple(task.acceptance_uniforms.shape) != (
+                len(task.draft_token_ids),
+            ):
+                raise invalid_descriptor(
+                    "speculative acceptance RNG shape does not match the draft"
+                )
+        elif task.acceptance_uniforms is not None or len(task.rows) != 1:
+            raise invalid_descriptor("ordinary sampling tasks must contain exactly one row")
+        vocab = int(task.logits.shape[1])
+        if any(value < 0 or value >= vocab for value in task.draft_token_ids):
+            raise invalid_descriptor("speculative draft token is outside the model vocabulary")
+        sampling_path = -1 if plain_greedy else _fused_top_k(task, vocab)
+        penalty_width = (
+            int(cast(torch.Tensor, task.penalty_token_ids).shape[1]) if sampling_path > 0 else 0
+        )
+        grouped[(task.logits.device, vocab, sampling_path, penalty_width)].append((index, task))
+
+    result: list[_SampleResult | None] = [None] * len(tasks)
+    for (_device, _vocab, sampling_path, _penalty_width), compatible in grouped.items():
+        indexes, group = zip(*compatible, strict=True)
+        if sampling_path == -1:
+            sampled_group = _sample_plain_greedy_group(tuple(group), mirrors)
+        elif sampling_path > 0:
+            sampled_group = _sample_fused_top_k_group(tuple(group), sampling_path)
+        else:
+            sampled_group = _sample_task_group(tuple(group))
+        for index, sampled in zip(indexes, sampled_group, strict=True):
+            result[index] = sampled
+    return tuple(cast(_SampleResult, value) for value in result)
+
+
+def _sample_plain_greedy_group(
+    tasks: tuple[_SampleTask, ...],
+    token_mirrors: _PinnedTokenRing,
+) -> tuple[_SampleResult, ...]:
+    logits = packed_tensor_views(tuple(task.logits for task in tasks))
+    if logits is None:
+        logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
+    else:
+        logits = logits.reshape(len(tasks), -1)
+    device_tokens = torch.argmax(logits, dim=-1)
+    mirror = token_mirrors.capture(device_tokens)
+    host_tokens = mirror.finalize() if any(not task.defer_host_token for task in tasks) else None
+    return tuple(
+        _SampleResult(
+            token_id=(
+                _DeferredToken(mirror, index)
+                if task.defer_host_token
+                else cast(tuple[int, ...], host_tokens)[index]
+            ),
+            device_token=device_tokens[index : index + 1],
+            logprob=None,
+            top_logprobs=None,
+        )
+        for index, task in enumerate(tasks)
+    )
+
+
+def _fused_top_k(task: _SampleTask, vocab: int) -> int:
+    if task.logits.device.type != "cuda":
+        return 0
+    if task.draft_token_ids:
+        return 0
+    row = task.rows[0]
+    parameters = row.parameters
+    top_k = int(parameters.top_k)
+    wants_logprobs = (
+        parameters.return_logprobs or int(row.n_logprobs) > 0 or bool(parameters.logprob_token_ids)
+    )
+    if (
+        wants_logprobs
+        or row.allowed is not None
+        or row.suppress
+        or parameters.logit_bias
+        or top_k <= 0
+        or top_k > 128
+        or top_k >= vocab
+    ):
+        return 0
+    return top_k
+
+
+def _sample_fused_top_k_group(
+    tasks: tuple[_SampleTask, ...],
+    top_k: int,
+) -> tuple[_SampleResult, ...]:
+    rows = tuple(task.rows[0] for task in tasks)
+    logits = torch.cat(tuple(task.logits for task in tasks), dim=0)
+    noise = torch.cat(tuple(cast(torch.Tensor, task.noise) for task in tasks), dim=0)
+    penalty_token_ids = torch.cat(
+        tuple(cast(torch.Tensor, task.penalty_token_ids) for task in tasks), dim=0
+    )
+    penalty_counts = torch.cat(
+        tuple(cast(torch.Tensor, task.penalty_counts) for task in tasks), dim=0
+    )
+    parameters = torch.cat(
+        tuple(cast(torch.Tensor, task.parameter_values) for task in tasks), dim=0
+    )
+    tokens, valid = _run_fused_top_k_sampling(
+        logits,
+        noise,
+        penalty_token_ids,
+        penalty_counts,
+        parameters,
+        top_k,
+    )
+    metadata = torch.cat((valid.to(torch.long), tokens)).cpu().tolist()
+    row_count = len(rows)
+    if not all(bool(value) for value in metadata[:row_count]):
+        raise invalid_descriptor("sampling policy masked every vocabulary entry")
+    return tuple(_SampleResult(int(token), None, None, None) for token in metadata[row_count:])
+
+
+def _run_fused_top_k_sampling(
+    logits: torch.Tensor,
+    noise: torch.Tensor,
+    penalty_token_ids: torch.Tensor,
+    penalty_counts: torch.Tensor,
+    parameters: torch.Tensor,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not triton_device_supported(logits.device):
+        raise capability_mismatch("fused sampling requires a supported Triton toolchain")
+    provider = import_module("uniserve_kernel.sampling")
+    result = provider.sample_top_k(
+        logits,
+        noise,
+        penalty_token_ids,
+        penalty_counts,
+        parameters,
+        int(top_k),
+    )
+    if (
+        not isinstance(result, tuple)
+        or len(result) != 2
+        or not all(isinstance(value, torch.Tensor) for value in result)
+    ):
+        raise RuntimeError("sampling provider returned an invalid result")
+    return result
+
+
+def _sample_task_group(tasks: tuple[_SampleTask, ...]) -> tuple[_SampleResult, ...]:
+    device = tasks[0].logits.device
+    vocab = int(tasks[0].logits.shape[1])
+    offsets: list[int] = []
+    offset = 0
+    for task in tasks:
+        offsets.append(offset)
+        offset += len(task.rows)
+    rows = tuple(row for task in tasks for row in task.rows)
+    logits = torch.cat(tuple(task.logits.float() for task in tasks), dim=0)
+    noise = torch.cat(tuple(cast(torch.Tensor, task.noise) for task in tasks), dim=0)
+    work, valid = _shape_sampling_logits_batch(logits, rows)
+
+    acceptance_rows: list[int] = []
+    acceptance_tokens: list[int] = []
+    acceptance_parts: list[torch.Tensor] = []
+    acceptance_spans: dict[int, tuple[int, int]] = {}
+    acceptance_offset = 0
+    for task_index, (task, row_offset) in enumerate(zip(tasks, offsets, strict=True)):
+        count = len(task.draft_token_ids)
+        if not count:
+            continue
+        acceptance_rows.extend(range(row_offset, row_offset + count))
+        acceptance_tokens.extend(task.draft_token_ids)
+        acceptance_parts.append(cast(torch.Tensor, task.acceptance_uniforms))
+        acceptance_spans[task_index] = (acceptance_offset, count)
+        acceptance_offset += count
+
+    accepted_flags: torch.Tensor | None = None
+    if acceptance_rows:
+        acceptance_indexes = torch.tensor(
+            acceptance_rows,
+            dtype=torch.long,
+            device=device,
+        )
+        target_indexes = torch.tensor(
+            acceptance_tokens,
+            dtype=torch.long,
+            device=device,
+        )
+        target_probabilities = torch.softmax(
+            work.index_select(0, acceptance_indexes),
+            dim=-1,
+        ).gather(1, target_indexes.unsqueeze(1))[:, 0]
+        coins = torch.cat(
+            tuple(
+                value.to(device=device, dtype=target_probabilities.dtype)
+                for value in acceptance_parts
+            ),
+            dim=0,
+        )
+        accepted_flags = (coins <= target_probabilities) | (target_probabilities >= 1.0)
+
+    accepted_counts: list[torch.Tensor] = []
+    output_rows: list[torch.Tensor] = []
+    for task_index, row_offset in enumerate(offsets):
+        span = acceptance_spans.get(task_index)
+        if span is None:
+            accepted = torch.zeros((), dtype=torch.long, device=device)
+        else:
+            start, count = span
+            flags = cast(torch.Tensor, accepted_flags)[start : start + count]
+            accepted = torch.cumprod(flags.to(torch.long), dim=0).sum()
+        accepted_counts.append(accepted)
+        output_rows.append(accepted + row_offset)
+
+    sample_work = work
+    if acceptance_rows:
+        sample_work = work.clone()
+        flat_exclusions = torch.tensor(
+            [
+                row * vocab + token
+                for row, token in zip(
+                    acceptance_rows,
+                    acceptance_tokens,
+                    strict=True,
+                )
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        sample_work.reshape(-1).index_fill_(0, flat_exclusions, float("-inf"))
+        has_residual = torch.isfinite(sample_work).any(dim=-1)
+        sample_work = torch.where(has_residual.unsqueeze(1), sample_work, work)
+
+    temperatures = torch.tensor(
+        [float(row.parameters.temperature) for row in rows],
+        dtype=work.dtype,
+        device=device,
+    )
+    gumbel = -torch.log(-torch.log(noise))
+    semantic_noise = torch.where(
+        temperatures.unsqueeze(1) > 0.0,
+        gumbel,
+        torch.zeros((), dtype=work.dtype, device=device),
+    )
+    row_tokens = torch.argmax(sample_work + semantic_noise, dim=-1)
+    output_indexes = torch.stack(output_rows)
+    task_tokens = row_tokens.index_select(0, output_indexes)
+    counts = torch.stack(accepted_counts)
+
+    metadata = torch.cat((valid.to(torch.long), task_tokens, counts)).cpu().tolist()
+    row_count = len(rows)
+    task_count = len(tasks)
+    if not all(bool(value) for value in metadata[:row_count]):
+        raise invalid_descriptor("sampling policy masked every vocabulary entry")
+    token_values = tuple(int(value) for value in metadata[row_count : row_count + task_count])
+    accepted_values = tuple(int(value) for value in metadata[row_count + task_count :])
+    details = _sample_logprob_details(
+        sample_work,
+        output_indexes,
+        task_tokens,
+        tuple(task.rows[0] for task in tasks),
+    )
+    return tuple(
+        _SampleResult(
+            token_id=token,
+            device_token=None,
+            logprob=None if index not in details else details[index][0],
+            top_logprobs=None if index not in details else details[index][1],
+            num_accepted_tokens=accepted,
+        )
+        for index, (token, accepted) in enumerate(zip(token_values, accepted_values, strict=True))
+    )
+
+
+def _semantic_sampling_noise(
+    rows: Sequence[_SamplingRow],
+    *,
+    vocab: int,
+    device: torch.device,
+) -> torch.Tensor:
+    stochastic = tuple(
+        index for index, row in enumerate(rows) if float(row.parameters.temperature) > 0.0
+    )
+    if len(stochastic) == len(rows):
+        return torch.stack(
+            tuple(
+                uniform_samples(
+                    (vocab,),
+                    seed=row.draw_seed,
+                    device=device,
+                )
+                for row in rows
+            ),
+            dim=0,
+        )
+    noise = torch.zeros((len(rows), vocab), dtype=torch.float32, device=device)
+    if stochastic:
+        indexes = torch.tensor(stochastic, dtype=torch.long, device=device)
+        draws = torch.stack(
+            tuple(
+                uniform_samples(
+                    (vocab,),
+                    seed=rows[index].draw_seed,
+                    device=device,
+                )
+                for index in stochastic
+            ),
+            dim=0,
+        )
+        noise.index_copy_(0, indexes, draws)
+    return noise
+
+
+def _shape_sampling_logits_batch(
+    logits: torch.Tensor,
+    rows: Sequence[_SamplingRow],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the canonical shaping and truncation order to a logits matrix."""
+
+    work = logits.to(dtype=torch.float32, copy=True)
+    row_count, vocab = (int(value) for value in work.shape)
+    if row_count != len(rows):
+        raise invalid_descriptor("sampling parameters do not align with logits rows")
+
+    allowed_rows: list[int] = []
+    allowed_flat: list[int] = []
+    for row_index, row in enumerate(rows):
+        if row.allowed is None:
+            continue
+        allowed = tuple(
+            dict.fromkeys(int(value) for value in row.allowed if 0 <= int(value) < vocab)
+        )
+        if not allowed:
+            raise invalid_descriptor("sampling allowed-token set has no vocabulary entries")
+        allowed_rows.append(row_index)
+        allowed_flat.extend(row_index * vocab + value for value in allowed)
+    if allowed_rows:
+        mask = torch.ones_like(work, dtype=torch.bool)
+        mask.index_fill_(
+            0,
+            torch.tensor(allowed_rows, dtype=torch.long, device=work.device),
+            False,
+        )
+        mask.reshape(-1)[torch.tensor(allowed_flat, dtype=torch.long, device=work.device)] = True
+        work.masked_fill_(~mask, float("-inf"))
+
+    suppressed_flat = tuple(
+        row_index * vocab + value
+        for row_index, row in enumerate(rows)
+        for value in dict.fromkeys(int(token) for token in row.suppress if 0 <= int(token) < vocab)
+    )
+    if suppressed_flat:
+        work.reshape(-1).index_fill_(
+            0,
+            torch.tensor(suppressed_flat, dtype=torch.long, device=work.device),
+            float("-inf"),
+        )
+
+    bias_indexes: list[int] = []
+    bias_values: list[float] = []
+    for row_index, row in enumerate(rows):
+        for token_id, bias in row.parameters.logit_bias:
+            index = int(token_id)
+            if 0 <= index < vocab:
+                bias_indexes.append(row_index * vocab + index)
+                bias_values.append(float(bias))
+    if bias_indexes:
+        work.reshape(-1).index_put_(
+            (
+                torch.tensor(
+                    bias_indexes,
+                    dtype=torch.long,
+                    device=work.device,
+                ),
+            ),
+            torch.tensor(bias_values, dtype=work.dtype, device=work.device),
+            accumulate=True,
+        )
+
+    penalty_indexes: list[int] = []
+    repetitions: list[float] = []
+    frequencies: list[float] = []
+    presences: list[float] = []
+    occurrences: list[int] = []
+    for row_index, row in enumerate(rows):
+        parameters = row.parameters
+        if (
+            parameters.repetition_penalty == 1.0
+            and parameters.frequency_penalty == 0.0
+            and parameters.presence_penalty == 0.0
+        ):
+            continue
+        for token_id, count in row.recent_counts:
+            if 0 <= token_id < vocab:
+                penalty_indexes.append(row_index * vocab + token_id)
+                repetitions.append(float(parameters.repetition_penalty))
+                frequencies.append(float(parameters.frequency_penalty))
+                presences.append(float(parameters.presence_penalty))
+                occurrences.append(count)
+    if penalty_indexes:
+        indexes = torch.tensor(
+            penalty_indexes,
+            dtype=torch.long,
+            device=work.device,
+        )
+        penalty_values = torch.tensor(
+            tuple(zip(repetitions, frequencies, presences, occurrences, strict=True)),
+            dtype=work.dtype,
+            device=work.device,
+        )
+        values = work.reshape(-1).index_select(0, indexes)
+        repetition = penalty_values[:, 0]
+        repeated = torch.where(
+            values > 0.0,
+            values / repetition,
+            values * repetition,
+        )
+        adjusted = repeated - penalty_values[:, 1] * penalty_values[:, 3] - penalty_values[:, 2]
+        work.reshape(-1).index_copy_(
+            0,
+            indexes,
+            torch.where(torch.isneginf(values), values, adjusted),
+        )
+
+    parameter_values = torch.tensor(
+        [
+            (
+                float(row.parameters.temperature),
+                float(row.parameters.min_p),
+                float(row.parameters.top_p),
+            )
+            for row in rows
+        ],
+        dtype=work.dtype,
+        device=work.device,
+    )
+    temperatures = parameter_values[:, 0]
+    divisors = torch.where(
+        temperatures > 0.0,
+        temperatures,
+        torch.ones((), dtype=work.dtype, device=work.device),
+    )
+    work.div_(divisors.unsqueeze(1))
+
+    min_p_rows = tuple(index for index, row in enumerate(rows) if float(row.parameters.min_p) > 0.0)
+    if min_p_rows:
+        indexes = torch.tensor(min_p_rows, dtype=torch.long, device=work.device)
+        subset = work.index_select(0, indexes)
+        min_p = parameter_values.index_select(0, indexes)[:, 1]
+        min_threshold = subset.max(dim=-1).values + torch.log(min_p)
+        subset.masked_fill_(subset < min_threshold.unsqueeze(1), float("-inf"))
+        work.index_copy_(0, indexes, subset)
+
+    top_k_groups: dict[int, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        top_k = int(row.parameters.top_k)
+        if 0 < top_k < vocab:
+            top_k_groups[top_k].append(index)
+    for top_k, row_indexes in top_k_groups.items():
+        indexes = torch.tensor(row_indexes, dtype=torch.long, device=work.device)
+        subset = work.index_select(0, indexes)
+        values, token_indexes = torch.topk(
+            subset,
+            top_k,
+            dim=-1,
+            sorted=False,
+        )
+        ordered, order = torch.sort(values, dim=-1, descending=True)
+        token_indexes = token_indexes.gather(1, order)
+        top_p = parameter_values.index_select(0, indexes)[:, 2]
+        cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
+        over = cumulative > top_p.unsqueeze(1)
+        drop = torch.cat(
+            (
+                torch.zeros(
+                    (len(row_indexes), 1),
+                    dtype=torch.bool,
+                    device=work.device,
+                ),
+                over[:, :-1],
+            ),
+            dim=1,
+        )
+        ordered.masked_fill_(drop, float("-inf"))
+        truncated = torch.full_like(subset, float("-inf"))
+        truncated.scatter_(1, token_indexes, ordered)
+        work.index_copy_(0, indexes, truncated)
+
+    top_p_rows = tuple(
+        index
+        for index, row in enumerate(rows)
+        if (0.0 < float(row.parameters.top_p) < 1.0 and not 0 < int(row.parameters.top_k) < vocab)
+    )
+    if top_p_rows:
+        indexes = torch.tensor(top_p_rows, dtype=torch.long, device=work.device)
+        subset = work.index_select(0, indexes)
+        ordered, token_indexes = torch.sort(subset, dim=-1, descending=True)
+        top_p = parameter_values.index_select(0, indexes)[:, 2]
+        cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
+        over = cumulative > top_p.unsqueeze(1)
+        drop = torch.cat(
+            (
+                torch.zeros(
+                    (len(top_p_rows), 1),
+                    dtype=torch.bool,
+                    device=work.device,
+                ),
+                over[:, :-1],
+            ),
+            dim=1,
+        )
+        ordered.masked_fill_(drop, float("-inf"))
+        truncated = torch.full_like(subset, float("-inf"))
+        truncated.scatter_(1, token_indexes, ordered)
+        work.index_copy_(0, indexes, truncated)
+
+    valid = ~torch.isnan(work).any(dim=-1) & torch.isfinite(work).any(dim=-1)
+    return work, valid
+
+
+def _sample_logprob_details(
+    work: torch.Tensor,
+    output_rows: torch.Tensor,
+    output_tokens: torch.Tensor,
+    rows: Sequence[_SamplingRow],
+) -> dict[int, tuple[float, tuple[tuple[int, float, int], ...]]]:
+    vocab = int(work.shape[1])
+    requested_rows = tuple(
+        index
+        for index, row in enumerate(rows)
+        if row.parameters.return_logprobs
+        or int(row.n_logprobs) > 0
+        or bool(row.parameters.logprob_token_ids)
+    )
+    if not requested_rows:
+        return {}
+    request_indexes = torch.tensor(
+        requested_rows,
+        dtype=torch.long,
+        device=work.device,
+    )
+    score_rows = output_rows.index_select(0, request_indexes)
+    selected_tokens = output_tokens.index_select(0, request_indexes)
+    scores = torch.log_softmax(work.index_select(0, score_rows), dim=-1)
+    selected_values = scores.gather(1, selected_tokens.unsqueeze(1))[:, 0]
+    selected_ranks = (scores > selected_values.unsqueeze(1)).sum(dim=-1, dtype=torch.long) + 1
+
+    counts = tuple(min(max(0, int(rows[index].n_logprobs)), vocab) for index in requested_rows)
+    max_count = max(counts, default=0)
+    if max_count:
+        top_values, top_indexes = torch.topk(scores, max_count, dim=-1, sorted=True)
+        positions = torch.arange(
+            1,
+            max_count + 1,
+            dtype=torch.long,
+            device=work.device,
+        ).unsqueeze(0)
+        starts = torch.cat(
+            (
+                torch.ones(
+                    (len(requested_rows), 1),
+                    dtype=torch.bool,
+                    device=work.device,
+                ),
+                top_values[:, 1:] < top_values[:, :-1],
+            ),
+            dim=1,
+        )
+        top_ranks = torch.where(starts, positions, 0).cummax(dim=1).values
+    else:
+        top_values = torch.empty(
+            (len(requested_rows), 0),
+            dtype=scores.dtype,
+            device=work.device,
+        )
+        top_indexes = torch.empty(
+            (len(requested_rows), 0),
+            dtype=torch.long,
+            device=work.device,
+        )
+        top_ranks = torch.empty_like(top_indexes)
+
+    requested_ids = tuple(
+        tuple(
+            dict.fromkeys(
+                int(value)
+                for value in rows[index].parameters.logprob_token_ids
+                if 0 <= int(value) < vocab
+            )
+        )
+        for index in requested_rows
+    )
+    max_requested = max((len(value) for value in requested_ids), default=0)
+    if max_requested:
+        candidate_indexes = torch.zeros(
+            (len(requested_rows), max_requested),
+            dtype=torch.long,
+            device=work.device,
+        )
+        for row_index, values in enumerate(requested_ids):
+            if values:
+                candidate_indexes[row_index, : len(values)] = torch.tensor(
+                    values,
+                    dtype=torch.long,
+                    device=work.device,
+                )
+        candidate_values = scores.gather(1, candidate_indexes)
+        candidate_ranks = torch.stack(
+            tuple(
+                (scores > candidate_values[:, index].unsqueeze(1)).sum(dim=-1, dtype=torch.long) + 1
+                for index in range(max_requested)
+            ),
+            dim=1,
+        )
+    else:
+        candidate_values = torch.empty(
+            (len(requested_rows), 0),
+            dtype=scores.dtype,
+            device=work.device,
+        )
+        candidate_ranks = torch.empty(
+            (len(requested_rows), 0),
+            dtype=torch.long,
+            device=work.device,
+        )
+
+    selected_value_list = selected_values.cpu().tolist()
+    selected_rank_list = selected_ranks.cpu().tolist()
+    selected_token_list = selected_tokens.cpu().tolist()
+    top_value_list = top_values.cpu().tolist()
+    top_index_list = top_indexes.cpu().tolist()
+    top_rank_list = top_ranks.cpu().tolist()
+    candidate_value_list = candidate_values.cpu().tolist()
+    candidate_rank_list = candidate_ranks.cpu().tolist()
+    result: dict[int, tuple[float, tuple[tuple[int, float, int], ...]]] = {}
+    for local_index, result_index in enumerate(requested_rows):
+        selected = int(selected_token_list[local_index])
+        selected_value = float(selected_value_list[local_index])
+        entries: list[tuple[int, float, int]] = [
+            (
+                selected,
+                selected_value,
+                int(selected_rank_list[local_index]),
+            )
+        ]
+        seen = {selected}
+        for top_index in range(counts[local_index]):
+            candidate = int(top_index_list[local_index][top_index])
+            if candidate in seen:
+                continue
             entries.append(
-                [
+                (
                     candidate,
-                    float(logprobs[candidate].item()),
-                    int((logprobs > logprobs[candidate]).sum().item()) + 1,
-                ]
+                    float(top_value_list[local_index][top_index]),
+                    int(top_rank_list[local_index][top_index]),
+                )
             )
             seen.add(candidate)
-    return _TokenSample(token_id, selected, entries)
-
-
-def _shape_sampling_logits(
-    work: torch.Tensor,
-    parameters: SamplingParams,
-    *,
-    recent: Sequence[int],
-    allowed: Sequence[int] | None,
-    suppress: Sequence[int] | None,
-) -> float:
-    """Apply the one canonical logits-shaping order in place."""
-
-    vocab = int(work.numel())
-    if allowed is not None:
-        allowed_indexes = tuple(
-            dict.fromkeys(int(value) for value in allowed if 0 <= int(value) < vocab)
-        )
-        if not allowed_indexes:
-            raise invalid_descriptor("sampling allowed-token set has no vocabulary entries")
-        selected = torch.tensor(allowed_indexes, dtype=torch.long, device=work.device)
-        masked = torch.full_like(work, float("-inf"))
-        masked[selected] = work[selected]
-        work.copy_(masked)
-    if suppress:
-        suppressed_indexes = tuple(
-            dict.fromkeys(int(value) for value in suppress if 0 <= int(value) < vocab)
-        )
-        if suppressed_indexes:
-            work.index_fill_(
-                0,
-                torch.tensor(suppressed_indexes, dtype=torch.long, device=work.device),
-                float("-inf"),
+        for requested_index, candidate in enumerate(requested_ids[local_index]):
+            if candidate in seen:
+                continue
+            entries.append(
+                (
+                    candidate,
+                    float(candidate_value_list[local_index][requested_index]),
+                    int(candidate_rank_list[local_index][requested_index]),
+                )
             )
-    for token_id, bias in parameters.logit_bias:
-        index = int(token_id)
-        if 0 <= index < vocab and not bool(torch.isneginf(work[index])):
-            work[index] += float(bias)
-
-    repetition = parameters.repetition_penalty
-    frequency = parameters.frequency_penalty
-    presence = parameters.presence_penalty
-    counts: dict[int, int] = {}
-    for value in recent:
-        token_id = int(value)
-        if 0 <= token_id < vocab:
-            counts[token_id] = counts.get(token_id, 0) + 1
-    if counts and (repetition != 1.0 or frequency != 0.0 or presence != 0.0):
-        recent_indexes = torch.tensor(tuple(counts), dtype=torch.long, device=work.device)
-        recent_values = work[recent_indexes]
-        if repetition != 1.0:
-            recent_values = torch.where(
-                recent_values > 0,
-                recent_values / repetition,
-                recent_values * repetition,
-            )
-        occurrences = torch.tensor(
-            tuple(counts[index] for index in counts), dtype=work.dtype, device=work.device
-        )
-        adjusted = recent_values - frequency * occurrences - presence
-        work[recent_indexes] = torch.where(
-            torch.isneginf(recent_values), recent_values, adjusted
-        )
-
-    temperature = parameters.temperature
-    if temperature > 0.0:
-        work.div_(temperature)
-    min_p = parameters.min_p
-    if min_p > 0.0:
-        probabilities = torch.softmax(work, dim=-1)
-        work.masked_fill_(probabilities < min_p * probabilities.max(), float("-inf"))
-    top_k = parameters.top_k
-    if 0 < top_k < vocab:
-        top_values, top_indexes = torch.topk(work, top_k, sorted=False)
-        masked = torch.full_like(work, float("-inf"))
-        masked.scatter_(0, top_indexes, top_values)
-        work.copy_(masked)
-    top_p = parameters.top_p
-    if 0.0 < top_p < 1.0:
-        ordered, ordered_indexes = torch.sort(work, descending=True)
-        cumulative = torch.softmax(ordered, dim=-1).cumsum(dim=-1)
-        drop = cumulative > top_p
-        drop[1:] = drop[:-1].clone()
-        drop[0] = False
-        work[ordered_indexes[drop]] = float("-inf")
-    if bool(torch.isnan(work).any()) or not bool(torch.isfinite(work).any()):
-        raise invalid_descriptor("sampling policy masked every vocabulary entry")
-    return temperature
-
-
-@dataclass(frozen=True, slots=True)
-class _SpeculativeSample:
-    sampled_token_id: int
-    num_accepted_tokens: int
-
-
-def _speculative_sample_target_only(
-    logits: torch.Tensor,
-    draft_token_ids: Sequence[int],
-    parameters: SamplingParams,
-    *,
-    recent: Sequence[int],
-    allowed: Sequence[int] | None,
-    suppress: Sequence[int] | None,
-    uniform_samples: torch.Tensor,
-    uniform_sample_for_final: torch.Tensor,
-) -> _SpeculativeSample:
-    """Apply target-only acceptance to one explicit linear draft chain."""
-
-    draft = tuple(int(value) for value in draft_token_ids)
-    rows = len(draft) + 1
-    if logits.ndim != 2 or int(logits.shape[0]) < rows or int(logits.shape[1]) < 1:
-        raise invalid_descriptor("speculative verification logits do not cover the draft chain")
-    vocab = int(logits.shape[1])
-    if any(value < 0 or value >= vocab for value in draft):
-        raise invalid_descriptor("speculative draft token is outside the model vocabulary")
-    if tuple(uniform_samples.shape) != (len(draft),):
-        raise invalid_descriptor("speculative acceptance RNG shape does not match the draft")
-    if tuple(uniform_sample_for_final.shape) != (1,):
-        raise invalid_descriptor("speculative final RNG must contain exactly one coordinate")
-
-    work = logits[:rows].float().clone()
-    for row in work:
-        _shape_sampling_logits(
-            row,
-            parameters,
-            recent=recent,
-            allowed=allowed,
-            suppress=suppress,
-        )
-    probabilities = torch.softmax(work, dim=-1)
-    accepted = 0
-    for index, token_id in enumerate(draft):
-        target_probability = probabilities[index, token_id]
-        coin = uniform_samples[index].to(
-            device=probabilities.device,
-            dtype=probabilities.dtype,
-        )
-        if bool((coin <= target_probability).item()) or bool((target_probability >= 1.0).item()):
-            accepted += 1
-            continue
-        break
-    sample_probabilities = probabilities[accepted].clone()
-    if accepted < len(draft):
-        sample_probabilities[draft[accepted]] = 0.0
-    total = sample_probabilities.sum()
-    if not bool((total > 0).item()):
-        sample_probabilities = probabilities[accepted]
-        total = sample_probabilities.sum()
-    coin = (
-        uniform_sample_for_final[0]
-        .to(
-            device=probabilities.device,
-            dtype=probabilities.dtype,
-        )
-        .clamp(0.0, 1.0)
-    )
-    token = torch.searchsorted(
-        torch.cumsum(sample_probabilities, dim=-1),
-        coin * total,
-        right=False,
-    ).clamp(max=vocab - 1)
-    return _SpeculativeSample(int(token.item()), accepted)
+            seen.add(candidate)
+        result[result_index] = (selected_value, tuple(entries))
+    return result
 
 
 def _score_prompt_token_logprobs(

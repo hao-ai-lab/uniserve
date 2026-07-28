@@ -96,6 +96,7 @@ class SystemWorker:
             weight_digest=None,
             allowed_operation_types=allowed_operation_types,
             trace=self.trace,
+            pipeline_depth=pipeline_depth,
         )
         self.snapshot_provider: SnapshotProvider | None = None
         if snapshot_dir is not None:

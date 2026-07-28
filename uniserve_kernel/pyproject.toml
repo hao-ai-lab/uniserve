@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
   "flash-attn-4[cu13]>=4.0.0b20",
   "nvidia-cutlass-dsl[cu13]==4.6.0.dev0",
+  "torch>=2.8.0a0,<2.12",
 ]
 
 [tool.setuptools]

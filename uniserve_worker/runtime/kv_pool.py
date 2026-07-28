@@ -1,7 +1,7 @@
 """Physical paged KV storage owned and bounded by ``KvStore``."""
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 
@@ -13,6 +13,7 @@ from ..nn.quant.kv_cache import (
     resolve_kv_store_dtype,
     scale_for_fp8_block,
 )
+from .block_allocator import BlockFreeList
 
 __all__ = [
     'PagedKVPool',
@@ -20,7 +21,16 @@ __all__ = [
 
 
 class PagedKVPool:
-    """Layer-major paged KV storage indexed by host-issued block ids."""
+    """Layer-major paged KV storage indexed by host-issued block ids.
+
+    One pool holds every span attention can address in a single forward. Its
+    block ids partition into three ranges: the host leases ``[0,
+    leasable_num_blocks)`` to sessions, the worker allocates branch blocks for
+    transaction-scoped spans immediately above that, and the tail is reserved
+    headroom for padded graph rows. A batch that mixes a session's committed
+    span with a branch span therefore builds one page table over one storage
+    tensor, so no span has to be relocated to be attended to alongside another.
+    """
 
     def __init__(
         self,
@@ -34,6 +44,7 @@ class PagedKVPool:
         store_dtype: torch.dtype | str | None = None,
         tower_coord: int | None = None,
         reserved_tail_blocks: int = 0,
+        branch_blocks: int = 0,
     ) -> None:
         self.num_layers = int(num_layers)
         self.num_blocks = int(num_blocks)
@@ -43,6 +54,7 @@ class PagedKVPool:
         self.dtype = dtype
         self.store_dtype = resolve_kv_store_dtype(dtype, store_dtype)
         self.reserved_tail_blocks = int(reserved_tail_blocks)
+        self.branch_num_blocks = int(branch_blocks)
         # The tower coordinate this pool's storage is Pinned to (``None`` == the
         # primary/shared coordinate). The KV cache as a placed tensor: a gen-tower
         # scratch pool records ``tower_coord=gen`` so the snapshot reshard knows
@@ -63,6 +75,11 @@ class PagedKVPool:
             raise invalid_descriptor(
                 "PagedKVPool reserved tail blocks must leave at least one schedulable block"
             )
+        if self.branch_num_blocks < 0:
+            raise invalid_descriptor("PagedKVPool branch blocks must not be negative")
+        if self.leasable_num_blocks < 1:
+            raise invalid_descriptor("PagedKVPool must leave at least one leasable block")
+        self._branch_free = BlockFreeList(self.branch_num_blocks)
         # Layer-major storage makes a single layer's page table contiguous for
         # flash-attn's paged-kv kernel: [num_blocks, page, kv_heads, head_dim].
         shape = (self.num_layers, self.num_blocks, self.block_size, self.n_kv, self.head_dim)
@@ -93,12 +110,64 @@ class PagedKVPool:
         )
 
     @property
-    def schedulable_num_blocks(self) -> int:
-        return self.num_blocks - self.reserved_tail_blocks
+    def leasable_num_blocks(self) -> int:
+        """Block ids the host may lease to a session."""
+
+        return self.num_blocks - self.reserved_tail_blocks - self.branch_num_blocks
 
     @property
     def reserved_block_ids(self) -> tuple[int, ...]:
-        return tuple(range(self.schedulable_num_blocks, self.num_blocks))
+        """Tail block ids dedicated to graph-padding rows."""
+
+        start = self.leasable_num_blocks + self.branch_num_blocks
+        return tuple(range(start, self.num_blocks))
+
+    @property
+    def branch_blocks_available(self) -> int:
+        return self._branch_free.available
+
+    def allocate_branch_blocks(self, count: int) -> list[int]:
+        """Take ``count`` transaction-branch blocks from this pool's own range."""
+
+        base = self.leasable_num_blocks
+        return [
+            base + value
+            for value in self._branch_free.allocate(int(count), label="branch KV blocks")
+        ]
+
+    def release_branch_blocks(self, block_ids: Iterable[int]) -> None:
+        base = self.leasable_num_blocks
+        values = [int(value) for value in block_ids]
+        if any(value < base or value >= base + self.branch_num_blocks for value in values):
+            raise invalid_descriptor("branch KV block id is outside this pool's branch range")
+        self._branch_free.release(value - base for value in values)
+
+    def copy_pages(
+        self,
+        source_blocks: Sequence[int],
+        target_blocks: Sequence[int],
+    ) -> None:
+        """Duplicate whole pages within this pool, one gather-scatter per store.
+
+        Page granularity keeps the transfer independent of how many tokens the
+        span holds within its last page, and it carries any per-page quantization
+        scale along with the page it describes.
+        """
+
+        if len(source_blocks) != len(target_blocks):
+            raise invalid_descriptor("paged KV page copy needs one target page per source page")
+        if not source_blocks:
+            return
+        device = self.k.device
+        source = torch.tensor(
+            self.validate_block_ids(source_blocks), dtype=torch.long, device=device
+        )
+        target = torch.tensor(
+            self.validate_block_ids(target_blocks), dtype=torch.long, device=device
+        )
+        for store in (self.k, self.v, self.k_scale, self.v_scale, self.k_scale_set, self.v_scale_set):
+            if store is not None:
+                store.index_copy_(1, target, store.index_select(1, source))
 
     def validate_block_ids(self, block_ids: Iterable[int]) -> list[int]:
         ids = [int(block_id) for block_id in block_ids]

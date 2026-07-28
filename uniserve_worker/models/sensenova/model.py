@@ -22,6 +22,7 @@ from ...forward import (
     ForwardContext,
     ForwardOutput,
     PackedAttentionPlan,
+    PagedDecodePlan,
     PatchInput,
     TokenEmbeddings,
     TokenHidden,
@@ -31,6 +32,7 @@ from ...forward import (
     TokenRow,
     TokenSegments,
     TokenSelection,
+    packed_token_positions,
 )
 from ...nn.attention import RadixAttention
 from ...nn.decoder.qwen import Qwen3MLP
@@ -142,13 +144,22 @@ def _module_tensor(
 def _route_tensor(
     value: torch.Tensor,
     *,
-    plan: PackedAttentionPlan,
+    plan: PackedAttentionPlan | None,
     text_module: nn.Module,
     flow_module: nn.Module,
     context: ForwardContext,
     call: Callable[[nn.Module, torch.Tensor, ForwardContext], torch.Tensor],
 ) -> torch.Tensor:
     target = value.device
+    if plan is None:
+        return _module_tensor(
+            text_module,
+            value,
+            context=context,
+            coordinate=_TEXT_COORDINATE,
+            target=target,
+            call=call,
+        )
     if plan.has_text and plan.has_flow:
         result = _module_tensor(
             flow_module,
@@ -413,10 +424,10 @@ class _SenseAttention(nn.Module):
         hidden: torch.Tensor,
         *,
         context: ForwardContext,
-        plan: PackedAttentionPlan,
+        plan: PackedAttentionPlan | None,
         rope: _PackedRope,
     ) -> torch.Tensor:
-        if plan.has_text and plan.has_flow:
+        if plan is not None and plan.has_text and plan.has_flow:
             query, key, value = self._project(
                 hidden,
                 rope,
@@ -437,7 +448,7 @@ class _SenseAttention(nn.Module):
             query, key, value = self._project(
                 hidden,
                 rope,
-                generation=plan.has_flow,
+                generation=plan is not None and plan.has_flow,
                 context=context,
             )
         attended = self.attention(
@@ -445,7 +456,7 @@ class _SenseAttention(nn.Module):
             key,
             value,
             context,
-            causal=False,
+            causal=plan is None,
             scale=self.scaling,
         ).reshape(hidden.shape[0], -1)
         return _route_tensor(
@@ -490,7 +501,7 @@ class _SenseLayer(nn.Module):
         hidden: torch.Tensor,
         *,
         context: ForwardContext,
-        plan: PackedAttentionPlan,
+        plan: PackedAttentionPlan | None,
         rope: _PackedRope,
     ) -> torch.Tensor:
         normalized = _route_tensor(
@@ -551,28 +562,46 @@ class _SenseDecoder(nn.Module):
         self,
         inputs: torch.Tensor,
         context: ForwardContext,
+        *,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        plan = context.attention
-        if not isinstance(plan, PackedAttentionPlan):
-            raise ValueError("SenseNova decoder requires a packed attention plan")
         if inputs.ndim != 2:
             raise ValueError("SenseNova decoder inputs must have shape [tokens, hidden]")
         token_count = int(inputs.shape[0])
-        if tuple(plan.route_indicators.shape) != (token_count,):
-            raise ValueError("SenseNova route indicators must align with decoder inputs")
-        if tuple(plan.indexes.shape) != (3, token_count):
-            raise ValueError("SenseNova positions must have shape [3, tokens]")
-        if plan.text_indices.ndim != 1:
-            raise ValueError("SenseNova text indices must be one-dimensional")
-        if plan.has_text != (int(plan.text_indices.numel()) > 0):
-            raise ValueError("SenseNova text presence does not match its static indices")
-        if not plan.has_text and not plan.has_flow:
-            raise ValueError("SenseNova decoder plan contains no tokens")
+        attention = context.attention
+        plan: PackedAttentionPlan | None
+        indexes: torch.Tensor
+        if isinstance(attention, PackedAttentionPlan):
+            plan = attention
+            if tuple(plan.route_indicators.shape) != (token_count,):
+                raise ValueError("SenseNova route indicators must align with decoder inputs")
+            if tuple(plan.indexes.shape) != (3, token_count):
+                raise ValueError("SenseNova positions must have shape [3, tokens]")
+            if plan.text_indices.ndim != 1:
+                raise ValueError("SenseNova text indices must be one-dimensional")
+            if plan.has_text != (int(plan.text_indices.numel()) > 0):
+                raise ValueError("SenseNova text presence does not match its static indices")
+            if not plan.has_text and not plan.has_flow:
+                raise ValueError("SenseNova decoder plan contains no tokens")
+            indexes = plan.indexes
+        elif isinstance(attention, PagedDecodePlan):
+            plan = None
+            if positions is None or tuple(positions.shape) != (token_count,):
+                raise ValueError("SenseNova paged decode positions must align with text tokens")
+            indexes = torch.stack(
+                (
+                    positions,
+                    torch.zeros_like(positions),
+                    torch.zeros_like(positions),
+                )
+            )
+        else:
+            raise ValueError("SenseNova decoder requires packed attention or paged decode")
         if not self.layers:
             raise ValueError("SenseNova decoder requires at least one layer")
 
         first = cast(_SenseLayer, self.layers[0])
-        rope = first.self_attn.rope(plan.indexes)
+        rope = first.self_attn.rope(indexes)
         hidden = inputs
         for layer_module in self.layers:
             layer = cast(_SenseLayer, layer_module)
@@ -662,9 +691,7 @@ class NEOChatModel(nn.Module):
         vision = config.vision_config
         max_text = int(getattr(llm, "max_position_embeddings", 32768))
         max_image = max(1, int(getattr(config, "max_image_seq_len", 4096)))
-        latent_downsample = int(
-            int(vision.patch_size) * round(1 / float(config.downsample_ratio))
-        )
+        latent_downsample = int(int(vision.patch_size) * round(1 / float(config.downsample_ratio)))
         flow = FlowSpec(
             latent_downsample=latent_downsample,
             prediction="velocity",
@@ -693,9 +720,7 @@ class NEOChatModel(nn.Module):
                         )
                     )
                 ),
-                base_image_tokens=float(
-                    getattr(config, "noise_scale_base_image_seq_len", 1.0)
-                ),
+                base_image_tokens=float(getattr(config, "noise_scale_base_image_seq_len", 1.0)),
                 maximum=float(getattr(config, "noise_scale_max_value", 1.0)),
             ),
             text_unconditional=FlowBranchSource.NEGATIVE_OR_START,
@@ -858,13 +883,9 @@ class NEOChatModel(nn.Module):
         # on the host. Passing it lets the tower avoid reading the grid tensor
         # back to the host, keeping the flow forward capturable in a CUDA graph.
         patch = self._patch_size
-        hints = {
-            (int(row.image_height) // patch, int(row.image_width) // patch) for row in rows
-        }
+        hints = {(int(row.image_height) // patch, int(row.image_width) // patch) for row in rows}
         grid_hint = next(iter(hints)) if len(hints) == 1 else None
-        features = tower(
-            local_pixels.to(dtype=feature_dtype), local_grids, grid_hint=grid_hint
-        )
+        features = tower(local_pixels.to(dtype=feature_dtype), local_grids, grid_hint=grid_hint)
         if not isinstance(features, torch.Tensor):
             raise TypeError("SenseNova flow vision tower must return a tensor")
         features = context.mesh.combine(
@@ -922,6 +943,18 @@ class NEOChatModel(nn.Module):
             if not isinstance(row, (TokenRow, FlowRow)):
                 raise TypeError("SenseNova mot route accepts token and flow rows")
             rows.append(row)
+        attention = batch.context.attention
+        decode_positions: torch.Tensor | None = None
+        if isinstance(attention, PagedDecodePlan):
+            if any(not isinstance(row, TokenRow) for row in rows):
+                raise TypeError("SenseNova paged decode accepts token rows only")
+            token_rows = cast(tuple[TokenRow, ...], tuple(rows))
+            decode_positions = packed_token_positions(token_rows)
+            if decode_positions is None:
+                decode_positions = torch.cat(
+                    tuple(row.positions.reshape(-1) for row in token_rows),
+                    dim=0,
+                )
         flow_rows = tuple(row for row in rows if isinstance(row, FlowRow))
         flow_embeddings = self._flow_embeddings(flow_rows, batch.context) if flow_rows else {}
         chunks: list[torch.Tensor] = []
@@ -939,24 +972,67 @@ class NEOChatModel(nn.Module):
         hidden = self.language_model.model(
             torch.cat(chunks, dim=0),
             batch.context,
+            positions=decode_positions,
         )
+        return self._mot_outputs(hidden, tuple(rows), tuple(spans), batch.context)
+
+    def _mot_outputs(
+        self,
+        hidden: torch.Tensor,
+        rows: tuple[TokenRow | FlowRow, ...],
+        spans: tuple[tuple[int, int], ...],
+        context: ForwardContext,
+    ) -> ForwardOutput:
+        row_hidden = tuple(hidden[begin:end] for begin, end in spans)
+        projected_rows = tuple(
+            index
+            for index, row in enumerate(rows)
+            if isinstance(row, TokenRow) and row.selection is not TokenSelection.HIDDEN
+        )
+        projected: torch.Tensor | None = None
+        if projected_rows:
+            if (
+                len(projected_rows) == len(rows)
+                and all(
+                    isinstance(row, TokenRow) and row.selection is TokenSelection.LAST_LOGITS
+                    for row in rows
+                )
+                and all(int(value.shape[0]) == 1 for value in row_hidden)
+            ):
+                selected = hidden
+            else:
+                selected_rows = tuple(
+                    row_hidden[index]
+                    if cast(TokenRow, rows[index]).selection is TokenSelection.ALL_LOGITS
+                    else row_hidden[index][-1:]
+                    for index in projected_rows
+                )
+                selected = (
+                    selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
+                )
+            projected = self.language_model.lm_head(selected, context.mesh)
 
         outputs: list[TokenOutput | FlowOutput] = []
-        for row, (begin, end) in zip(rows, spans, strict=True):
-            row_hidden = hidden[begin:end]
+        projected_offset = 0
+        for index, row in enumerate(rows):
+            value_hidden = row_hidden[index]
             if isinstance(row, TokenRow):
                 value: TokenHidden | TokenLogits
                 if row.selection is TokenSelection.HIDDEN:
-                    value = TokenHidden(row_hidden)
-                elif row.selection is TokenSelection.ALL_LOGITS:
-                    value = TokenLogits(self.language_model.lm_head(row_hidden, batch.context.mesh))
+                    value = TokenHidden(value_hidden)
                 else:
-                    value = TokenLogits(
-                        self.language_model.lm_head(row_hidden[-1:], batch.context.mesh)
+                    if projected is None:
+                        raise RuntimeError("SenseNova projected output buffer is missing")
+                    count = (
+                        int(value_hidden.shape[0])
+                        if row.selection is TokenSelection.ALL_LOGITS
+                        else 1
                     )
+                    value = TokenLogits(projected[projected_offset : projected_offset + count])
+                    projected_offset += count
                 outputs.append(TokenOutput(row.row_id, row.output_slot, value))
             else:
-                prediction = self._velocity(row_hidden, row, batch.context)
+                prediction = self._velocity(value_hidden, row, context)
                 outputs.append(FlowOutput(row.row_id, row.output_slot, prediction))
         return ForwardOutput(tuple(outputs))
 

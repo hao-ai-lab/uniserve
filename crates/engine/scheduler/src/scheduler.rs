@@ -407,14 +407,17 @@ pub struct Scheduler {
     grammar_compiler: GrammarCompiler,
     reserved_blocks: usize,
     step_id: u64,
-    /// The single submitted-but-unresolved operation for each request. A
-    /// successor is not planned or issued until this lease reaches a terminal
-    /// result, so committed versions and cursor deltas always advance in order.
-    inflight_ops: HashMap<RequestId, InflightOp>,
-    /// Finite resident-request cohort whose prompt and image-ingest work is
-    /// drained before its first decode service. Membership is frozen when a
-    /// ready decode would otherwise overlap another resident prompt, so later
-    /// arrivals cannot extend the cohort indefinitely.
+    /// Ordered submitted-but-unresolved operations for each request. The front
+    /// owns the committed lease; later entries are bounded projected successors
+    /// whose versions and cursor deltas are resolved strictly in order.
+    inflight_ops: HashMap<RequestId, VecDeque<InflightOp>>,
+    /// Terminal outcomes whose projected successors still own worker-visible
+    /// request state. The scheduler retains all leases until those successors
+    /// drain, then publishes the terminal event exactly once.
+    pending_finishes: HashMap<RequestId, PendingFinish>,
+    /// Finite set of resident prompts coalesced behind active decode work.
+    /// Membership is frozen until every member's prompt work drains, so later
+    /// arrivals cannot indefinitely delay the cohort's first decode service.
     prompt_cohort: Option<HashSet<RequestId>>,
     /// Sequential denoise timesteps to execute per denoise op. The worker runs
     /// the exact same Euler steps and reports the cumulative step cursor.
@@ -650,7 +653,7 @@ fn policy_str(policy: SchedulingPolicy) -> &'static str {
     }
 }
 
-/// One submitted-but-unresolved operation tracked for a request.
+/// One submitted-but-unresolved operation tracked in a request's ordered queue.
 struct InflightOp {
     transition: PlannedTransition,
     /// The op's wire `op_id`, echoed back on its result.
@@ -659,6 +662,11 @@ struct InflightOp {
     spec_tokens: Vec<u32>,
     /// Submit timestamp, for the op's host round-trip latency history.
     started: Instant,
+}
+
+struct PendingFinish {
+    reason: FinishReason,
+    stop_reason: Option<String>,
 }
 
 impl Scheduler {
@@ -788,6 +796,7 @@ impl Scheduler {
             reserved_blocks: 0,
             step_id: 0,
             inflight_ops: HashMap::new(),
+            pending_finishes: HashMap::new(),
             prompt_cohort: None,
             denoise_step_burst,
             flow_exclusive_batch,
@@ -1343,6 +1352,10 @@ impl Scheduler {
         }
     }
 
+    fn trace_enabled(&self) -> bool {
+        self.trace_sink.is_some()
+    }
+
     fn trace_request_queued(&mut self, st: &ReqState, queue: &'static str) {
         self.trace_record(json!({
             "event": "request_queued",
@@ -1762,8 +1775,12 @@ impl Scheduler {
     /// slots, but leaves any blocking result wait to `run`.
     fn step_nonblocking(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.step").entered();
-        // 1. resolve any completed batches (non-blocking).
-        let mut progressed = self.drain_results();
+        // 1. Resolve one completed batch. Refilling immediately after one
+        // completion preserves an occupied execution slot when multiple
+        // responses become ready together at pipeline depth greater than one.
+        // The owner loop returns here without parking while progress is being
+        // made, so subsequent ready completions are handled on successive turns.
+        let mut progressed = self.poll_one_result();
 
         // 2. reap cancellations before assembling.
         self.reap_cancellations();
@@ -1861,25 +1878,21 @@ impl Scheduler {
             .store(self.ledger.stats.invariant_violations, Ordering::Relaxed);
     }
 
-    /// Drain every ready result and resolve it. Returns true if any resolved.
-    fn drain_results(&mut self) -> bool {
-        let _span = tracing::trace_span!("scheduler.drain_results").entered();
-        let mut any = false;
-        loop {
-            match self.executor.poll() {
-                Ok(Some(r)) => {
-                    self.apply_result(r);
-                    any = true;
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    self.on_executor_error(e);
-                    any = true;
-                    break;
-                }
+    /// Resolve at most one ready result so assembly can refill the freed slot
+    /// before another completion is consumed.
+    fn poll_one_result(&mut self) -> bool {
+        let _span = tracing::trace_span!("scheduler.poll_one_result").entered();
+        match self.executor.poll() {
+            Ok(Some(result)) => {
+                self.apply_result(result);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.on_executor_error(error);
+                true
             }
         }
-        any
     }
 
     /// Whether any request currently has a prefill op in flight. Prompt work
@@ -1889,17 +1902,25 @@ impl Scheduler {
     fn any_prefill_inflight(&self) -> bool {
         self.inflight_ops
             .values()
+            .flatten()
             .any(|op| op.transition.operation_type == OperationType::SequenceExtend)
     }
 
     fn any_denoise_inflight(&self) -> bool {
         self.inflight_ops
             .values()
+            .flatten()
             .any(|op| op.transition.operation_type == OperationType::Flow)
     }
 
     fn has_inflight(&self, id: RequestId) -> bool {
-        self.inflight_ops.contains_key(&id)
+        self.inflight_ops
+            .get(&id)
+            .is_some_and(|queue| !queue.is_empty())
+    }
+
+    fn inflight_len(&self, id: RequestId) -> usize {
+        self.inflight_ops.get(&id).map_or(0, VecDeque::len)
     }
 
     fn projected_cursor(&self, id: RequestId) -> Option<CursorProjection> {
@@ -1908,47 +1929,126 @@ impl Scheduler {
             .inflight_ops
             .get(&id)
             .into_iter()
+            .flatten()
             .map(|op| &op.transition);
         Some(st.cursor.project(transitions))
+    }
+
+    fn projected_version(&self, id: RequestId) -> Option<u64> {
+        let state = self.running.get(&id)?;
+        Some(state.version.saturating_add(self.inflight_len(id) as u64))
+    }
+
+    /// A successor may depend on worker-local sampled-token state only when
+    /// committing one token cannot change host control flow. This is the
+    /// deterministic text-decode subset whose future transition is identical
+    /// before and after the predecessor result becomes host-visible.
+    fn can_queue_decode_successor(&self, id: RequestId) -> bool {
+        let Some(state) = self.running.get(&id) else {
+            return false;
+        };
+        let Some(queue) = self.inflight_ops.get(&id).filter(|queue| !queue.is_empty()) else {
+            return false;
+        };
+        if queue.len() >= self.executor.pipeline_depth().max(1)
+            || state.cancelled
+            || self.pending_finishes.contains_key(&id)
+            || !state.is_replayable_text()
+            || !Self::device_token_relay_eligible(state)
+        {
+            return false;
+        }
+        if matches!(
+            state.req.policy.trigger,
+            uniserve_core::TriggerPolicyDescriptor::RoundCloseThenSuffix { .. }
+        ) {
+            return false;
+        }
+        if queue.iter().any(|op| {
+            !matches!(
+                op.transition.operation_type,
+                OperationType::SequenceExtend | OperationType::SequenceDecode
+            ) || !op.spec_tokens.is_empty()
+        }) {
+            return false;
+        }
+        let Some(projected) = self.projected_cursor(id) else {
+            return false;
+        };
+        projected.prompt_cursor as usize >= state.effective_prompt().len()
+            && state.ingest.mm_cursor >= state.context.images.len()
+            && state.und.tokens_emitted.saturating_add(queue.len()) < state.req.max_und_tokens
+    }
+
+    fn device_token_relay_eligible(state: &ReqState) -> bool {
+        let sampling = &state.req.sampling;
+        !state.req.behavior.gen_output
+            && state.grammar.is_none()
+            && state.req.stop_strings.is_empty()
+            && state.req.stop_token_ids.is_empty()
+            && sampling.temperature <= 0.0
+            && sampling.min_tokens == 0
+            && !sampling.generated_logprobs_requested()
+            && sampling.bad_words_ids.is_empty()
+            && sampling.allowed_token_ids.is_none()
+            && sampling.repetition_penalty == 1.0
+            && sampling.frequency_penalty == 0.0
+            && sampling.presence_penalty == 0.0
+            && sampling.logit_bias.is_empty()
+    }
+
+    fn can_reuse_committed_token_relay(&self, id: RequestId) -> bool {
+        self.running.get(&id).is_some_and(|state| {
+            state.resources.worker_registered
+                && state.und.tokens_emitted > 0
+                && state.is_replayable_text()
+                && Self::device_token_relay_eligible(state)
+        })
+    }
+
+    fn can_schedule_next(&self, id: RequestId) -> bool {
+        !self.pending_finishes.contains_key(&id)
+            && (!self.has_inflight(id) || self.can_queue_decode_successor(id))
     }
 
     fn register_inflight(&mut self, transition: PlannedTransition, started: Instant) {
         let request_id = transition.op.session_id;
         let op_id = transition.op.op_id;
         let spec_tokens = operation_draft_tokens(&transition.op);
-        assert!(
-            !self.inflight_ops.contains_key(&request_id),
-            "request {request_id:?} received a successor before its lease became terminal"
-        );
-        self.inflight_ops.insert(
-            request_id,
-            InflightOp {
+        self.inflight_ops
+            .entry(request_id)
+            .or_default()
+            .push_back(InflightOp {
                 transition,
                 op_id,
                 spec_tokens,
                 started,
-            },
-        );
+            });
     }
 
-    /// Resolve one in-flight op for `id` by the worker's echoed `op_id`.
+    /// Resolve the front in-flight op for `id` by the worker's echoed `op_id`.
     fn pop_inflight(
         &mut self,
         id: RequestId,
         op_id: u64,
     ) -> (Option<PlannedTransition>, Vec<u32>, Option<Instant>) {
-        let Some(inflight) = self.inflight_ops.remove(&id) else {
+        let Some(queue) = self.inflight_ops.get_mut(&id) else {
             return (None, Vec::new(), None);
         };
-        if op_id == 0 || inflight.op_id != op_id {
-            self.inflight_ops.insert(id, inflight);
+        if op_id == 0 || queue.front().is_none_or(|inflight| inflight.op_id != op_id) {
             return (None, Vec::new(), None);
         }
-        (
+        let inflight = queue.pop_front().expect("front checked above");
+        let empty = queue.is_empty();
+        let result = (
             Some(inflight.transition),
             inflight.spec_tokens,
             Some(inflight.started),
-        )
+        );
+        if empty {
+            self.inflight_ops.remove(&id);
+        }
+        result
     }
 
     /// Failure policy after an executor/worker error.
@@ -2032,13 +2132,20 @@ impl Scheduler {
             .timing
             .batch_timing_count
             .fetch_add(1, Ordering::Relaxed);
-        let forward_stats_trace = result
-            .forward_stats
-            .as_ref()
-            .map(worker_forward_stats_trace);
+        let trace_enabled = self.trace_enabled();
+        let forward_stats_trace = trace_enabled
+            .then(|| {
+                result
+                    .forward_stats
+                    .as_ref()
+                    .map(worker_forward_stats_trace)
+            })
+            .flatten();
         self.record_worker_forward_stats(result.forward_stats.as_ref());
-        let mut resolved_ops = Vec::with_capacity(result.operations.len());
-        let mut progress_ops = Vec::with_capacity(result.operations.len());
+        let mut resolved_ops =
+            trace_enabled.then(|| Vec::with_capacity(result.operations.len()));
+        let mut progress_ops =
+            trace_enabled.then(|| Vec::with_capacity(result.operations.len()));
         let mut to_resolve = Vec::with_capacity(result.operations.len());
         for (operation_index, operation_result) in result.operations.into_iter().enumerate() {
             let id = operation_result.session_id;
@@ -2102,30 +2209,32 @@ impl Scheduler {
             let transition_replayability = transition
                 .as_ref()
                 .map(|transition| transition.resources.replayability_after_apply.as_str());
-            resolved_ops.push(json!({
-                "request_id": id.0,
-                "op_id": op_id,
-                "operation_type": operation_type.map(operation_type_str),
-                "transition_delta": transition_delta,
-                "transition_new_blocks": transition_new_blocks,
-                "transition_kv_target": transition_kv_target,
-                "transition_scratch_tokens": transition_scratch_tokens,
-                "transition_latent_units": transition_latent_units,
-                "transition_encoder_pins": transition_encoder_pins,
-                "transition_replayability": transition_replayability,
-                "roundtrip_us": roundtrip_us,
-                "sampled_token": sampled_token_ids_last.is_some(),
-                "sampled_token_ids_len": sampled_token_ids_len,
-                "sampled_token_ids_last": sampled_token_ids_last,
-                "flow_done": operation_flow_delta(&operation_result).map(|delta| delta.done),
-                "steps_completed": operation_flow_delta(&operation_result).map(|delta| delta.steps_completed),
-                "image_done": operation_image(&operation_result).is_some(),
-                "image_hw": operation_image(&operation_result).map(|image| (image.height, image.width)),
-                "kv_tokens": operation_result_kv_tokens(&operation_result),
-                "num_draft_tokens": draft_tokens,
-                "num_accepted_tokens": accepted_draft_tokens,
-                "product_handle": operation_encode_handle(&operation_result),
-            }));
+            if let Some(resolved_ops) = resolved_ops.as_mut() {
+                resolved_ops.push(json!({
+                    "request_id": id.0,
+                    "op_id": op_id,
+                    "operation_type": operation_type.map(operation_type_str),
+                    "transition_delta": transition_delta,
+                    "transition_new_blocks": transition_new_blocks,
+                    "transition_kv_target": transition_kv_target,
+                    "transition_scratch_tokens": transition_scratch_tokens,
+                    "transition_latent_units": transition_latent_units,
+                    "transition_encoder_pins": transition_encoder_pins,
+                    "transition_replayability": transition_replayability,
+                    "roundtrip_us": roundtrip_us,
+                    "sampled_token": sampled_token_ids_last.is_some(),
+                    "sampled_token_ids_len": sampled_token_ids_len,
+                    "sampled_token_ids_last": sampled_token_ids_last,
+                    "flow_done": operation_flow_delta(&operation_result).map(|delta| delta.done),
+                    "steps_completed": operation_flow_delta(&operation_result).map(|delta| delta.steps_completed),
+                    "image_done": operation_image(&operation_result).is_some(),
+                    "image_hw": operation_image(&operation_result).map(|image| (image.height, image.width)),
+                    "kv_tokens": operation_result_kv_tokens(&operation_result),
+                    "num_draft_tokens": draft_tokens,
+                    "num_accepted_tokens": accepted_draft_tokens,
+                    "product_handle": operation_encode_handle(&operation_result),
+                }));
+            }
             if draft_tokens > 0 {
                 self.spec_decode
                     .record_acceptance(draft_tokens, accepted_draft_tokens);
@@ -2149,7 +2258,7 @@ impl Scheduler {
                         "error": transition_validation_error_str(&error),
                     }));
                     if self.running.contains_key(&id) {
-                        self.finish(id, FinishReason::Error);
+                        self.finish_after_inflight(id, FinishReason::Error, None);
                     }
                     continue;
                 }
@@ -2168,7 +2277,7 @@ impl Scheduler {
                         "error": cursor_apply_error_str(&error),
                     }));
                     if self.running.contains_key(&id) {
-                        self.finish(id, FinishReason::Error);
+                        self.finish_after_inflight(id, FinishReason::Error, None);
                     }
                     continue;
                 }
@@ -2194,10 +2303,13 @@ impl Scheduler {
         }
         to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
         for (_priority, _seq_index, id, transition, sr, draft_token_ids) in to_resolve {
-            if self.running.contains_key(&id) {
+            if self.running.contains_key(&id) && !self.pending_finishes.contains_key(&id) {
                 self.resolve(id, transition, sr, draft_token_ids);
             }
-            if let Some(st) = self.running.get(&id) {
+            self.finish_pending_if_idle(id);
+            if let (Some(st), Some(progress_ops)) =
+                (self.running.get(&id), progress_ops.as_mut())
+            {
                 progress_ops.push(json!({
                     "request_id": id.0,
                     "phase": phase_str(st.lifecycle.phase),
@@ -2214,20 +2326,22 @@ impl Scheduler {
                 }));
             }
         }
-        self.trace_record(json!({
-            "event": "batch_resolved",
-            "at_s": now(),
-            "step_id": result_step_id,
-            "worker_exec_us": worker_us,
-            "host_roundtrip_us": batch_roundtrip_us,
-            "forward_stats": forward_stats_trace,
-            "batch_size": resolved_ops.len(),
-            "ops": resolved_ops,
-            "progress": progress_ops,
-            "running": self.running.len(),
-            "pending": self.pending.len(),
-            "in_flight": self.executor.in_flight(),
-        }));
+        if let (Some(resolved_ops), Some(progress_ops)) = (resolved_ops, progress_ops) {
+            self.trace_record(json!({
+                "event": "batch_resolved",
+                "at_s": now(),
+                "step_id": result_step_id,
+                "worker_exec_us": worker_us,
+                "host_roundtrip_us": batch_roundtrip_us,
+                "forward_stats": forward_stats_trace,
+                "batch_size": resolved_ops.len(),
+                "ops": resolved_ops,
+                "progress": progress_ops,
+                "running": self.running.len(),
+                "pending": self.pending.len(),
+                "in_flight": self.executor.in_flight(),
+            }));
+        }
     }
 
     fn record_worker_forward_stats(&self, stats: Option<&WorkerForwardStats>) {
@@ -2660,14 +2774,14 @@ impl Scheduler {
     }
 
     fn request_has_prompt_work(&self, id: RequestId) -> bool {
-        if self.running.get(&id).is_none_or(|st| st.cancelled) {
+        if self.running.get(&id).is_none_or(|state| state.cancelled) {
             return false;
         }
-        let prompt_inflight = self
-            .inflight_ops
+        self.inflight_ops
             .get(&id)
-            .is_some_and(|op| assembly_lane(op.transition.operation_type) == AssemblyLane::Prefill);
-        prompt_inflight
+            .into_iter()
+            .flatten()
+            .any(|op| assembly_lane(op.transition.operation_type) == AssemblyLane::Prefill)
             || self
                 .peek_next_operation_type(id)
                 .is_some_and(|operation_type| {
@@ -2676,14 +2790,11 @@ impl Scheduler {
     }
 
     fn request_has_ready_decode(&self, id: RequestId) -> bool {
-        if self.running.get(&id).is_none_or(|st| st.cancelled)
-            || self
+        self.running.get(&id).is_some_and(|state| !state.cancelled)
+            && self
                 .peek_next_operation_type(id)
-                .is_none_or(|operation_type| assembly_lane(operation_type) != AssemblyLane::Decode)
-        {
-            return false;
-        }
-        !self.has_inflight(id)
+                .is_some_and(|operation_type| assembly_lane(operation_type) == AssemblyLane::Decode)
+            && self.can_schedule_next(id)
     }
 
     fn refresh_prompt_cohort(&mut self, ids: &[RequestId]) {
@@ -2697,8 +2808,8 @@ impl Scheduler {
             return;
         }
         if self.prompt_cohort.take().is_some() {
-            // The first scheduling turn after a cohort drains remains available
-            // to ready decodes before another finite cohort may open.
+            // The first scheduling turn after a cohort drains belongs to ready
+            // decode work before another finite prompt cohort may open.
             return;
         }
 
@@ -2710,11 +2821,11 @@ impl Scheduler {
         if prompt_ids.len() < 2 {
             return;
         }
-        let has_cross_request_conflict = ids.iter().copied().any(|decode_id| {
+        let overlaps_decode = ids.iter().copied().any(|decode_id| {
             self.request_has_ready_decode(decode_id)
                 && prompt_ids.iter().any(|prompt_id| *prompt_id != decode_id)
         });
-        if has_cross_request_conflict {
+        if overlaps_decode {
             self.prompt_cohort = Some(prompt_ids);
         }
     }
@@ -2751,7 +2862,7 @@ impl Scheduler {
             if budget == 0 {
                 break;
             }
-            if self.has_inflight(id) {
+            if !self.can_schedule_next(id) {
                 continue;
             }
             let cancelled = self.running.get(&id).map(|s| s.cancelled).unwrap_or(true);
@@ -2889,7 +3000,8 @@ impl Scheduler {
     }
 
     fn select_assembly_lane(&self, ids: &[RequestId]) -> Option<AssemblyLane> {
-        let mut decode_ready = false;
+        let mut projected_decode_ready = false;
+        let mut committed_decode_ready = false;
         let mut prefill_ready = false;
         for id in ids.iter().copied() {
             if self.running.get(&id).map(|s| s.cancelled).unwrap_or(true) {
@@ -2900,27 +3012,31 @@ impl Scheduler {
             };
             match assembly_lane(operation_type) {
                 AssemblyLane::Decode => {
-                    if !self.has_inflight(id) {
-                        decode_ready = true;
+                    if self.can_schedule_next(id) {
+                        if self.has_inflight(id) {
+                            projected_decode_ready = true;
+                        } else {
+                            committed_decode_ready = true;
+                        }
                     }
                 }
                 AssemblyLane::Prefill => {
-                    if !self.has_inflight(id) {
+                    if self.can_schedule_next(id) {
                         prefill_ready = true;
                     }
                 }
                 AssemblyLane::Other => {}
             }
         }
-        if decode_ready {
-            // A ready decode retains its turn when new prompt work arrives.
-            // Mixed prefill, when enabled, may ride in that same decode batch.
-            Some(AssemblyLane::Decode)
-        } else if prefill_ready && !self.any_prefill_inflight() {
+        if prefill_ready && !self.any_prefill_inflight() {
             Some(AssemblyLane::Prefill)
+        } else if committed_decode_ready {
+            Some(AssemblyLane::Decode)
+        } else if projected_decode_ready && self.config.mixed_prefill_tokens > 0 {
+            Some(AssemblyLane::Decode)
+        } else if projected_decode_ready {
+            Some(AssemblyLane::Decode)
         } else if prefill_ready {
-            // a prefill batch is already in flight and no decode can fill the
-            // slot: run the waiting prompts anyway rather than idling.
             Some(AssemblyLane::Prefill)
         } else {
             None
@@ -2986,6 +3102,15 @@ impl Scheduler {
                 ImageIngestStep::VaeEncode => OperationType::EncodeLatent,
                 ImageIngestStep::VitEncode => OperationType::EncodeVision,
             },
+            Phase::Prefill
+                if self.has_inflight(id)
+                    && self.can_queue_decode_successor(id)
+                    && self.projected_cursor(id).is_some_and(|cursor| {
+                        cursor.prompt_cursor as usize >= st.effective_prompt().len()
+                    }) =>
+            {
+                OperationType::SequenceDecode
+            }
             Phase::Prefill => OperationType::SequenceExtend,
             Phase::DecodeUnd => OperationType::SequenceDecode,
             Phase::DenoiseGen => OperationType::Flow,
@@ -3181,14 +3306,12 @@ impl Scheduler {
             let oid = self.next_op_id;
             self.next_op_id += 1;
             let request_id = transition.op.session_id;
-            let Some((epoch, version, admission_digest)) =
-                self.running.get(&request_id).and_then(|state| {
-                    state
-                        .admission_digest
-                        .as_ref()
-                        .map(|digest| (state.epoch, state.version, digest.clone()))
-                })
-            else {
+            let Some((epoch, admission_digest)) = self.running.get(&request_id).and_then(|state| {
+                state
+                    .admission_digest
+                    .as_ref()
+                    .map(|digest| (state.epoch, digest.clone()))
+            }) else {
                 tracing::error!(
                     request_id = request_id.0,
                     "planned operation lost its session"
@@ -3196,14 +3319,18 @@ impl Scheduler {
                 self.fatal = true;
                 return;
             };
-            if self.has_inflight(request_id) {
+            if self.has_inflight(request_id) && !self.can_queue_decode_successor(request_id) {
                 tracing::error!(
                     request_id = request_id.0,
-                    "scheduler attempted to issue a successor before the current lease was terminal"
+                    "scheduler attempted to issue an unsafe projected successor"
                 );
                 self.fatal = true;
                 return;
             }
+            let Some(version) = self.projected_version(request_id) else {
+                self.fatal = true;
+                return;
+            };
             transition.op.admission_digest = admission_digest;
             transition.op.model_spec_digest = self.caps.model_spec_digest.clone();
             transition.op.weight_digest = self.caps.weight_digest.clone();
@@ -3246,75 +3373,85 @@ impl Scheduler {
                 .iter()
                 .any(|operation| operation.operation_type != first.operation_type)
         });
-        let operation_types: Vec<&'static str> = transitions
-            .iter()
-            .map(|operation| operation_type_str(operation.operation_type))
-            .collect();
-        let req_ids: Vec<u64> = transitions
-            .iter()
-            .map(|operation| operation.op.session_id.0)
-            .collect();
-        let trace_ops: Vec<_> = transitions
-            .iter()
-            .map(|transition| {
-                let operation = &transition.op;
-                let phase = self
-                    .running
-                    .get(&operation.session_id)
-                    .map(|state| phase_str(state.lifecycle.phase));
-                json!({
-                    "request_id": operation.session_id.0,
-                    "op_id": operation.op_id,
-                    "operation_type": operation_type_str(transition.operation_type),
-                    "phase": phase,
-                    "operation": operation_trace(operation),
-                    "token_cost": planned_op_token_cost(transition),
-                    "transition": transition.delta.as_str(),
-                    "resources": {
-                        "new_blocks": transition.resources.new_blocks,
-                        "kv_target_tokens": transition.resources.kv_target_tokens,
-                        "scratch_tokens": transition.resources.host_scratch_tokens,
-                        "latent_units": transition.resources.latent_units,
-                        "encoder_pins": transition.resources.encoder_pins,
-                        "replayability_after_apply": transition.resources.replayability_after_apply.as_str(),
-                    },
-                    "visibility": {
-                        "und_tokens": format!("{:?}", transition.visibility.und_tokens),
-                        "generated_image": transition.visibility.generated_image,
-                    },
-                })
-            })
-            .collect();
-        let admitted_session_ids: Vec<u64> = admissions
-            .iter()
-            .map(|admission| admission.session_id.0)
-            .collect();
         self.batch_started.insert(step, submit_at);
-        self.trace_record(json!({
-            "event": "batch_submitted",
-            "at_s": now(),
-            "step_id": step,
-            "batch_size": transitions.len(),
-            "mixed": mixed,
-            "operation_types": operation_types.clone(),
-            "request_ids": req_ids.clone(),
-            "admitted_session_ids": admitted_session_ids,
-            "ops": trace_ops,
-            "scheduler": {
-                "policy": policy_str(self.config.policy),
-                "max_batch": self.config.max_batch,
-                "max_num_batched_tokens": self.config.max_num_batched_tokens,
-            },
-            "running": self.running.len(),
-            "pending": self.pending.len(),
-            "skipped_waiting": self.skipped_waiting.len(),
-            "in_flight_before_submit": self.executor.in_flight(),
-            "free_blocks": self.bm.free_blocks(),
-            "reserved_blocks": self.reserved_blocks,
-            "worker_image_latent_active": self.worker_image_latent_used(),
-            "worker_image_latent_capacity": self.caps.max_latent_size,
-        }));
+        if self.trace_enabled() {
+            let operation_types: Vec<&'static str> = transitions
+                .iter()
+                .map(|operation| operation_type_str(operation.operation_type))
+                .collect();
+            let req_ids: Vec<u64> = transitions
+                .iter()
+                .map(|operation| operation.op.session_id.0)
+                .collect();
+            let trace_ops: Vec<_> = transitions
+                .iter()
+                .map(|transition| {
+                    let operation = &transition.op;
+                    let phase = self
+                        .running
+                        .get(&operation.session_id)
+                        .map(|state| phase_str(state.lifecycle.phase));
+                    json!({
+                        "request_id": operation.session_id.0,
+                        "op_id": operation.op_id,
+                        "operation_type": operation_type_str(transition.operation_type),
+                        "phase": phase,
+                        "operation": operation_trace(operation),
+                        "token_cost": planned_op_token_cost(transition),
+                        "transition": transition.delta.as_str(),
+                        "resources": {
+                            "new_blocks": transition.resources.new_blocks,
+                            "kv_target_tokens": transition.resources.kv_target_tokens,
+                            "scratch_tokens": transition.resources.host_scratch_tokens,
+                            "latent_units": transition.resources.latent_units,
+                            "encoder_pins": transition.resources.encoder_pins,
+                            "replayability_after_apply": transition.resources.replayability_after_apply.as_str(),
+                        },
+                        "visibility": {
+                            "und_tokens": format!("{:?}", transition.visibility.und_tokens),
+                            "generated_image": transition.visibility.generated_image,
+                        },
+                    })
+                })
+                .collect();
+            let admitted_session_ids: Vec<u64> = admissions
+                .iter()
+                .map(|admission| admission.session_id.0)
+                .collect();
+            self.trace_record(json!({
+                "event": "batch_submitted",
+                "at_s": now(),
+                "step_id": step,
+                "batch_size": transitions.len(),
+                "mixed": mixed,
+                "operation_types": operation_types,
+                "request_ids": req_ids,
+                "admitted_session_ids": admitted_session_ids,
+                "ops": trace_ops,
+                "scheduler": {
+                    "policy": policy_str(self.config.policy),
+                    "max_batch": self.config.max_batch,
+                    "max_num_batched_tokens": self.config.max_num_batched_tokens,
+                },
+                "running": self.running.len(),
+                "pending": self.pending.len(),
+                "skipped_waiting": self.skipped_waiting.len(),
+                "in_flight_before_submit": self.executor.in_flight(),
+                "free_blocks": self.bm.free_blocks(),
+                "reserved_blocks": self.reserved_blocks,
+                "worker_image_latent_active": self.worker_image_latent_used(),
+                "worker_image_latent_capacity": self.caps.max_latent_size,
+            }));
+        }
         if mixed {
+            let operation_types: Vec<&'static str> = transitions
+                .iter()
+                .map(|operation| operation_type_str(operation.operation_type))
+                .collect();
+            let req_ids: Vec<u64> = transitions
+                .iter()
+                .map(|operation| operation.op.session_id.0)
+                .collect();
             tracing::debug!(
                 step_id = self.step_id,
                 ?operation_types,
@@ -3487,7 +3624,16 @@ impl Scheduler {
         {
             return None;
         }
-        let phase = self.running.get(&id)?.lifecycle.phase;
+        let committed_phase = self.running.get(&id)?.lifecycle.phase;
+        let phase = if committed_phase == Phase::Prefill
+            && self.has_inflight(id)
+            && self.can_queue_decode_successor(id)
+            && projection.prompt_cursor as usize >= self.running.get(&id)?.effective_prompt().len()
+        {
+            Phase::DecodeUnd
+        } else {
+            committed_phase
+        };
         match phase {
             Phase::Encode => None,
             Phase::Prefill => {
@@ -3531,21 +3677,30 @@ impl Scheduler {
                 let st = self.running.get(&id)?;
                 let projection = self.projected_cursor(id)?;
                 let pos = projection.logical_pos;
-                let tok = st.und.next_token;
-                let recent = self.recent_tokens(id);
-                let (allowed, suppress) = self.token_masks(id);
-                let spec_token_ids = if budget > 1 && self.supports_spec_decode() {
-                    self.running.get(&id).and_then(|st| {
-                        self.spec_decode.draft_tokens(
-                            st,
-                            tok,
-                            allowed.as_deref(),
-                            suppress.as_deref(),
-                        )
-                    })
+                let projected_successor = self.has_inflight(id);
+                let relay_input = projected_successor || self.can_reuse_committed_token_relay(id);
+                let tok = if relay_input { 0 } else { st.und.next_token };
+                let recent = (!projected_successor)
+                    .then(|| self.recent_tokens(id))
+                    .flatten();
+                let (allowed, suppress) = if projected_successor {
+                    (None, None)
                 } else {
-                    None
+                    self.token_masks(id)
                 };
+                let spec_token_ids =
+                    if !projected_successor && budget > 1 && self.supports_spec_decode() {
+                        self.running.get(&id).and_then(|st| {
+                            self.spec_decode.draft_tokens(
+                                st,
+                                tok,
+                                allowed.as_deref(),
+                                suppress.as_deref(),
+                            )
+                        })
+                    } else {
+                        None
+                    };
                 let spec_len = spec_token_ids.as_ref().map_or(0, Vec::len);
                 let capacity_target = self.decode_capacity_target(pos as usize, spec_len);
                 if !self.bm.ensure_capacity(id, capacity_target) {
@@ -3558,7 +3713,11 @@ impl Scheduler {
                     TransitionIntent::DecodeUnd {
                         position: pos,
                         token_id: tok,
-                        token_source: TokenSource::Wire,
+                        token_source: if relay_input {
+                            TokenSource::LastSampled
+                        } else {
+                            TokenSource::Wire
+                        },
                         new_blocks,
                         spec_token_ids,
                         recent_tokens: recent,
@@ -4682,7 +4841,11 @@ impl Scheduler {
 
         if stop_hit {
             self.emit_terminal_stop_token(id, token_id, logprob, top_logprobs);
-            self.finish_with(id, FinishReason::Stop, Some(format!("token:{token_id}")));
+            self.finish_after_inflight(
+                id,
+                FinishReason::Stop,
+                Some(format!("token:{token_id}")),
+            );
             return true;
         }
         if eos_hit || max_hit {
@@ -4693,13 +4856,14 @@ impl Scheduler {
                     self.emit_text(id, token_id, logprob);
                 }
             }
-            self.finish(
+            self.finish_after_inflight(
                 id,
                 if max_hit {
                     FinishReason::MaxTokens
                 } else {
                     FinishReason::Eos
                 },
+                None,
             );
             return true;
         }
@@ -4721,7 +4885,38 @@ impl Scheduler {
         self.finish_with(id, reason, None);
     }
 
+    fn finish_after_inflight(
+        &mut self,
+        id: RequestId,
+        reason: FinishReason,
+        stop_reason: Option<String>,
+    ) {
+        if !self.has_inflight(id) {
+            self.finish_with(id, reason, stop_reason);
+            return;
+        }
+        if !self.pending_finishes.contains_key(&id) || matches!(reason, FinishReason::Error) {
+            self.pending_finishes.insert(
+                id,
+                PendingFinish {
+                    reason,
+                    stop_reason,
+                },
+            );
+        }
+    }
+
+    fn finish_pending_if_idle(&mut self, id: RequestId) {
+        if self.has_inflight(id) {
+            return;
+        }
+        if let Some(pending) = self.pending_finishes.remove(&id) {
+            self.finish_with(id, pending.reason, pending.stop_reason);
+        }
+    }
+
     fn finish_with(&mut self, id: RequestId, reason: FinishReason, stop_reason: Option<String>) {
+        self.pending_finishes.remove(&id);
         if reason == FinishReason::Error
             && let Some(state) = self.running.get(&id)
         {

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import RLock
-from typing import Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Protocol, TypeAlias, cast
+
+if TYPE_CHECKING:
+    import torch
 
 from ..batch import (
     Admission,
@@ -42,6 +45,17 @@ class ScratchStore(Protocol):
 TransactionalStore: TypeAlias = SnapshotStore | ScratchStore
 
 
+@dataclass(frozen=True, slots=True)
+class SampledTokenRelay:
+    """Immutable device-resident token shared by transactional session snapshots."""
+
+    tensor: torch.Tensor
+
+    def __deepcopy__(self, memo: dict[int, object]) -> SampledTokenRelay:
+        memo[id(self)] = self
+        return self
+
+
 @dataclass(slots=True)
 class RequestSession:
     """All worker-owned scalar state and logical handles for one request."""
@@ -57,12 +71,17 @@ class RequestSession:
     latent_handle: int | None = None
     product_handles: set[int] = field(default_factory=set)
     prompt_logits_handle: int | None = None
-    last_sampled_token: int | None = None
+    last_sampled_token: int | SampledTokenRelay | None = None
     flow_step: int = 0
     rng_counter: int = 0
     last_op_id: int | None = None
     last_digest: str | None = None
     last_step_id: int | None = None
+
+    def rollback_snapshot(self) -> RequestSession:
+        """Copy mutable session-owned state while sharing immutable declarations."""
+
+        return replace(self, product_handles=set(self.product_handles))
 
 
 class SessionStore:
@@ -367,7 +386,7 @@ class StepTxn:
         session = self.sessions.peek(session_id)
         return _SessionSnapshot(
             existed=session is not None,
-            value=None if session is None else copy.deepcopy(session),
+            value=None if session is None else session.rollback_snapshot(),
         )
 
     def _close(self) -> None:
@@ -386,4 +405,10 @@ def cast_snapshot_store(value: object) -> SnapshotStore:
     return cast(SnapshotStore, value)
 
 
-__all__ = ["RequestSession", "SessionStore", "StepTxn", "TransactionalStore"]
+__all__ = [
+    "RequestSession",
+    "SampledTokenRelay",
+    "SessionStore",
+    "StepTxn",
+    "TransactionalStore",
+]

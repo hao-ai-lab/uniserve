@@ -7,6 +7,7 @@ from enum import StrEnum
 
 from uniserve_worker.forward import ForwardContext, ForwardRow, RouteId
 from uniserve_worker.loader.weight_set import WeightSet
+from uniserve_worker.runtime.host_staging import TensorStagingSlot
 
 
 class OutputKind(StrEnum):
@@ -75,6 +76,7 @@ class ForwardPlan:
     graph_eligible: bool
     device: str
     weights: WeightSet
+    staging_slot: TensorStagingSlot | None = None
 
     def __post_init__(self) -> None:
         if not self.rows:

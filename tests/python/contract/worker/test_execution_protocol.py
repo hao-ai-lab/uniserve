@@ -144,6 +144,17 @@ def test_closed_operation_union_round_trips_exactly():
     assert Batch.from_wire(batch.to_wire()) == batch
 
 
+def test_native_validation_annotation_survives_worker_materialization():
+    wire = _batch().to_wire()
+    wire["_native_envelope_validated"] = True
+
+    batch = Batch.from_wire(wire)
+
+    assert batch.native_envelope_validated
+    assert batch.to_wire() == _batch().to_wire()
+    batch.validate()
+
+
 def test_worker_response_variants_project_the_complete_typed_schema():
     worker = execution_worker()
     capabilities = dispatch(worker, {"kind": "get_capabilities"})

@@ -9,7 +9,7 @@ from typing import Protocol, cast
 import torch
 import torch.nn as nn
 
-from ...forward import ForwardContext, PackedAttentionPlan
+from ...forward import ForwardContext, PackedAttentionPlan, PagedDecodePlan
 from ..attention import RadixAttention
 from ..layer import LayerSpec
 from ..linear import (
@@ -305,22 +305,29 @@ class MoTDecoderLayer(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         context: ForwardContext,
-        plan: PackedAttentionPlan,
+        plan: PackedAttentionPlan | None,
     ) -> torch.Tensor:
-        """Apply both experts and one shared packed attention operation."""
+        """Apply the selected experts and one shared attention operation."""
 
-        text_indices = plan.text_indices
+        if plan is None:
+            text_indices = hidden.new_empty((0,), dtype=torch.long)
+            has_text = True
+            has_flow = False
+        else:
+            text_indices = plan.text_indices
+            has_text = plan.has_text
+            has_flow = plan.has_flow
         normalized = _route(
             hidden,
             text_indices=text_indices,
-            has_text=plan.has_text,
-            has_flow=plan.has_flow,
+            has_text=has_text,
+            has_flow=has_flow,
             text_module=self._text.input_norm,
             flow_module=self._flow.input_norm,
             context=context,
             call=_plain_call,
         )
-        if plan.has_text and plan.has_flow:
+        if has_text and has_flow:
             query, key, value = self._project(self._flow, normalized, cos, sin, context)
             text_query, text_key, text_value = self._project(
                 self._text,
@@ -333,7 +340,7 @@ class MoTDecoderLayer(nn.Module):
             key.index_copy_(0, text_indices, text_key)
             value.index_copy_(0, text_indices, text_value)
         else:
-            expert = self._flow if plan.has_flow else self._text
+            expert = self._flow if has_flow else self._text
             query, key, value = self._project(expert, normalized, cos, sin, context)
 
         self.attention.layer_id = int(layer)
@@ -342,14 +349,14 @@ class MoTDecoderLayer(nn.Module):
             key,
             value,
             context,
-            causal=False,
+            causal=plan is None,
             scale=self.scale,
         ).reshape(hidden.shape[0], self.query_size)
         projected = _route(
             attended,
             text_indices=text_indices,
-            has_text=plan.has_text,
-            has_flow=plan.has_flow,
+            has_text=has_text,
+            has_flow=has_flow,
             text_module=self._text.output,
             flow_module=self._flow.output,
             context=context,
@@ -359,8 +366,8 @@ class MoTDecoderLayer(nn.Module):
         normalized = _route(
             residual,
             text_indices=text_indices,
-            has_text=plan.has_text,
-            has_flow=plan.has_flow,
+            has_text=has_text,
+            has_flow=has_flow,
             text_module=self._text.post_norm,
             flow_module=self._flow.post_norm,
             context=context,
@@ -369,8 +376,8 @@ class MoTDecoderLayer(nn.Module):
         feed_forward = _route(
             normalized,
             text_indices=text_indices,
-            has_text=plan.has_text,
-            has_flow=plan.has_flow,
+            has_text=has_text,
+            has_flow=has_flow,
             text_module=self._text.mlp,
             flow_module=self._flow.mlp,
             context=context,
@@ -401,27 +408,39 @@ class MoTModel(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         context: ForwardContext,
+        *,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run one packed decoder sweep described by the explicit attention plan."""
+        """Run one decoder sweep described by the explicit attention plan."""
 
-        plan = context.attention
-        if not isinstance(plan, PackedAttentionPlan):
-            raise ValueError("MoT forward requires a packed attention plan")
         if inputs_embeds.ndim != 2:
             raise ValueError("MoT inputs must have shape [tokens, hidden]")
         token_count = int(inputs_embeds.shape[0])
-        if tuple(plan.route_indicators.shape) != (token_count,):
-            raise ValueError("MoT route indicators must align with input tokens")
-        if plan.indexes.ndim != 2 or int(plan.indexes.shape[1]) != token_count:
-            raise ValueError("MoT positions must align with input tokens")
-        if plan.text_indices.ndim != 1:
-            raise ValueError("MoT text indices must be one-dimensional")
-        if not plan.has_text and int(plan.text_indices.numel()) != 0:
-            raise ValueError("MoT plan without text cannot contain text indices")
-        if not plan.has_text and not plan.has_flow:
-            raise ValueError("MoT plan must contain text or flow tokens")
+        attention = context.attention
+        plan: PackedAttentionPlan | None
+        temporal_positions: torch.Tensor
+        if isinstance(attention, PackedAttentionPlan):
+            plan = attention
+            if tuple(plan.route_indicators.shape) != (token_count,):
+                raise ValueError("MoT route indicators must align with input tokens")
+            if plan.indexes.ndim != 2 or int(plan.indexes.shape[1]) != token_count:
+                raise ValueError("MoT positions must align with input tokens")
+            if plan.text_indices.ndim != 1:
+                raise ValueError("MoT text indices must be one-dimensional")
+            if not plan.has_text and int(plan.text_indices.numel()) != 0:
+                raise ValueError("MoT plan without text cannot contain text indices")
+            if not plan.has_text and not plan.has_flow:
+                raise ValueError("MoT plan must contain text or flow tokens")
+            temporal_positions = plan.indexes[0].reshape(-1)
+        elif isinstance(attention, PagedDecodePlan):
+            plan = None
+            if positions is None or tuple(positions.shape) != (token_count,):
+                raise ValueError("MoT paged decode positions must align with text tokens")
+            temporal_positions = positions
+        else:
+            raise ValueError("MoT forward requires packed attention or paged decode")
 
-        cos, sin = self.rotary.cos_sin_1d(plan.indexes[0].reshape(-1))
+        cos, sin = self.rotary.cos_sin_1d(temporal_positions)
         hidden = inputs_embeds
         for layer_index, layer_module in enumerate(self.layers):
             layer = cast(MoTDecoderLayer, layer_module)
@@ -433,11 +452,14 @@ class MoTModel(nn.Module):
                 context=context,
                 plan=plan,
             )
+        text_indices = (
+            hidden.new_empty((0,), dtype=torch.long) if plan is None else plan.text_indices
+        )
         return _route(
             hidden,
-            text_indices=plan.text_indices,
-            has_text=plan.has_text,
-            has_flow=plan.has_flow,
+            text_indices=text_indices,
+            has_text=True if plan is None else plan.has_text,
+            has_flow=False if plan is None else plan.has_flow,
             text_module=self.norm,
             flow_module=self.norm_moe_gen,
             context=context,

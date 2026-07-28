@@ -14,6 +14,7 @@ from ..forward import (
     ForwardBatch,
     ForwardOutput,
     PackedAttentionPlan,
+    PagedDecodePlan,
     PatchInput,
     TokenEmbeddings,
     TokenHidden,
@@ -253,16 +254,21 @@ class StubModel(nn.Module):
             device=_row_device(rows[0]),
         )
         plan = batch.context.attention
-        if not isinstance(plan, PackedAttentionPlan):
-            raise TypeError("stub sequence/flow route requires packed attention")
-        batch.context.kv.append_packed(
-            0,
-            zeros,
-            zeros,
-            page_ids=plan.write_page_ids,
-            page_offsets=plan.write_page_offsets,
-            token_indices=plan.write_token_indices,
-        )
+        if isinstance(plan, PagedDecodePlan):
+            if any(not isinstance(row, TokenRow) or _row_token_count(row) != 1 for row in rows):
+                raise TypeError("stub paged decode requires one token per row")
+            batch.context.kv.append(0, zeros.unsqueeze(1), zeros.unsqueeze(1))
+        elif isinstance(plan, PackedAttentionPlan):
+            batch.context.kv.append_packed(
+                0,
+                zeros,
+                zeros,
+                page_ids=plan.write_page_ids,
+                page_offsets=plan.write_page_offsets,
+                token_indices=plan.write_token_indices,
+            )
+        else:
+            raise TypeError("stub sequence/flow route requires a paged attention plan")
         outputs: list[TokenOutput | FlowOutput] = []
         for row in rows:
             if isinstance(row, TokenRow):
@@ -299,9 +305,7 @@ class StubModel(nn.Module):
     @staticmethod
     def _hidden(row: TokenRow) -> torch.Tensor:
         positions = (
-            row.positions.reshape(-1)
-            if row.positions.ndim == 1
-            else row.positions[0].reshape(-1)
+            row.positions.reshape(-1) if row.positions.ndim == 1 else row.positions[0].reshape(-1)
         ).to(torch.bfloat16)
         return torch.stack(
             (

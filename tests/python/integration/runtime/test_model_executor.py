@@ -28,7 +28,12 @@ from uniserve_worker.batch import (
     TokenInput,
     TokenPolicy,
 )
-from uniserve_worker.forward import FlowRow, ForwardBatch, ForwardOutput
+from uniserve_worker.forward import (
+    FlowRow,
+    ForwardBatch,
+    ForwardOutput,
+    PagedDecodePlan,
+)
 from uniserve_worker.foundation.errors import WorkerError
 from uniserve_worker.foundation.sizing import bucketed_length
 from uniserve_worker.server.stub import StubModel
@@ -184,6 +189,64 @@ def test_packed_query_bound_matches_the_visible_end_width_it_sizes():
     assert plan.max_seqlen_q >= 3
 
 
+def test_mot_token_decode_uses_the_homogeneous_paged_plan():
+    model = _ObservedModel()
+    worker = execution_worker(model)
+    admissions = (
+        _sequence_admission(41, 0),
+        _sequence_admission(42, 1),
+    )
+    prefill = tuple(
+        _envelope(
+            worker,
+            admission,
+            _sequence((3, 4)),
+            op_id=50 + index,
+        )
+        for index, admission in enumerate(admissions)
+    )
+    worker.execute(Batch(1, admissions, (), prefill))
+    decode = tuple(
+        _envelope(
+            worker,
+            admission,
+            _decode(1000 + index, 2),
+            op_id=60 + index,
+            base_version=1,
+        )
+        for index, admission in enumerate(admissions)
+    )
+
+    worker.execute(Batch(2, (), (), decode))
+
+    plan = model.attention_plans[-1]
+    assert isinstance(plan, PagedDecodePlan)
+    assert tuple(plan.query_lens.tolist()) == (1, 1)
+
+
+def test_a_mixed_batch_attends_a_leased_span_and_a_branch_span_in_one_page_table():
+    # Leased and branch capacity are ranges of one pool, so a token row that
+    # shares a forward with a flow row keeps the span it already owns and its
+    # cost stays independent of how much context that span holds.
+    model = _ObservedModel()
+    worker = execution_worker(model)
+    sequence_admission = _sequence_admission(51, 0)
+    flow_admission = _flow_admission(52)
+    sequence = _envelope(worker, sequence_admission, _sequence((3, 4)), op_id=61)
+    flow = _envelope(worker, flow_admission, _flow(62), op_id=62)
+
+    worker.execute(Batch(1, (sequence_admission, flow_admission), (), (sequence, flow)))
+
+    leased = tuple(worker.kv.get(51).block_ids)
+    boundary = worker.kv.pool.leasable_num_blocks
+    table = model.attention_plans[0].page_table.tolist()
+    token_rows = [row for row in table if row[0] < boundary]
+    branch_rows = [row for row in table if row[0] >= boundary]
+    assert len(token_rows) == 1 and len(branch_rows) == 1
+    assert tuple(token_rows[0][: len(leased)]) == leased
+    assert worker.kv.get(51).length == 2
+
+
 def test_replay_is_one_effect_and_conflicts_or_stale_work_do_not_mutate_state():
     model = _ObservedModel()
     worker = execution_worker(model)
@@ -229,7 +292,12 @@ def test_replay_is_one_effect_and_conflicts_or_stale_work_do_not_mutate_state():
     current = worker.sessions.get(3)
     assert current == committed
     current_kv = worker.kv.get(3)
-    assert (tuple(current_kv.block_ids), current_kv.prefix_len, current_kv.length, current_kv.group_id) == committed_kv
+    assert (
+        tuple(current_kv.block_ids),
+        current_kv.prefix_len,
+        current_kv.length,
+        current_kv.group_id,
+    ) == committed_kv
     assert len(model.calls) == 1
 
 
