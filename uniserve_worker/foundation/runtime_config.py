@@ -15,7 +15,7 @@ __all__ = [
     "DEFAULT_DECODE_GRAPH_BATCH_SIZES",
     "DEFAULT_GRAPH_MEMORY_FRACTION",
     "DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS",
-    "decode_graph_padding_block_count",
+    "graph_padding_block_count",
     "graph_memory_budget_bytes",
     "FlashInferTuningConfig",
     "TorchCompileRuntimeConfig",
@@ -37,9 +37,13 @@ DEFAULT_DECODE_GRAPH_BATCH_SIZES = (
     48,
     56,
     64,
+    72,
     80,
+    88,
     96,
+    104,
     112,
+    120,
     128,
 )
 
@@ -58,9 +62,13 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
     96,
     112,
     128,
+    144,
     160,
+    176,
     192,
+    208,
     224,
+    240,
     256,
     288,
     320,
@@ -117,10 +125,19 @@ DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS = (
 )
 
 
-def decode_graph_padding_block_count(block_size: int) -> int:
+def graph_padding_block_count(block_size: int) -> int:
     block_size = max(1, int(block_size))
-    max_padding_rows = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
-    return (max_padding_rows + block_size - 1) // block_size
+    decode_tokens = max(DEFAULT_DECODE_GRAPH_BATCH_SIZES) - 1
+    prefill_tokens = max(
+        current - previous
+        for previous, current in zip(
+            (0, *DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS[:-1]),
+            DEFAULT_PREFILL_GRAPH_TOKEN_BUCKETS,
+            strict=True,
+        )
+    )
+    max_padding_tokens = max(decode_tokens, prefill_tokens)
+    return (max_padding_tokens + block_size - 1) // block_size
 
 
 # Captured graphs hold their memory for as long as they are retained, so the

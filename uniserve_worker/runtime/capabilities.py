@@ -11,8 +11,8 @@ from ..capabilities import (
     ResourceClass,
 )
 from ..foundation.runtime_config import (
-    decode_graph_padding_block_count,
     graph_memory_budget_bytes,
+    graph_padding_block_count,
 )
 from ..foundation.sizing import ceil_div, derive_runtime_kv_capacity, device_total_bytes
 from ..spec import DeploymentOverlay, ModelSpec, active_latent_capacity_tokens
@@ -138,7 +138,7 @@ def _kv_residency_shape(
     """
 
     block_size = int(deployment.block_size)
-    padding_blocks = decode_graph_padding_block_count(block_size)
+    padding_blocks = graph_padding_block_count(block_size)
     # Captured executables are held for the worker's lifetime, so they occupy
     # the same static budget as the KV pools and are reserved before the
     # request pool is sized.

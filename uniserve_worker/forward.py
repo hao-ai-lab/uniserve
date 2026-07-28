@@ -293,6 +293,7 @@ class PagedVarlenPlan:
     kv_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
+    output_indices: torch.Tensor
     cache_seqlens_cpu: tuple[int, ...]
     query_lens_cpu: tuple[int, ...]
     kv_seqlens_cpu: tuple[int, ...]
@@ -396,6 +397,45 @@ class TokenRow:
         _validate_row(self.row_id, self.output_slot)
         if self.positions.dtype not in (torch.int32, torch.int64):
             raise ValueError("token positions must use an integer dtype")
+
+
+def packed_token_ids(rows: Sequence[TokenRow]) -> torch.Tensor | None:
+    """Return the shared contiguous token-id storage behind aligned row views."""
+
+    if not rows or any(not isinstance(row.inputs, TokenIds) for row in rows):
+        return None
+    return packed_tensor_views(
+        tuple(row.inputs.values for row in rows if isinstance(row.inputs, TokenIds))
+    )
+
+
+def packed_token_positions(rows: Sequence[TokenRow]) -> torch.Tensor | None:
+    """Return the shared contiguous position storage behind aligned row views."""
+
+    return packed_tensor_views(tuple(row.positions for row in rows))
+
+
+def packed_tensor_views(values: Sequence[torch.Tensor]) -> torch.Tensor | None:
+    """Recover one tensor from ordered contiguous views without copying."""
+
+    if not values:
+        return None
+    flat = tuple(value.reshape(-1) for value in values)
+    first = flat[0]
+    if (
+        not first.is_contiguous()
+        or any(not value.is_contiguous() for value in flat)
+        or any(value.dtype != first.dtype or value.device != first.device for value in flat)
+    ):
+        return None
+    storage = first.untyped_storage().data_ptr()
+    offset = int(first.storage_offset())
+    expected = offset
+    for value in flat:
+        if value.untyped_storage().data_ptr() != storage or int(value.storage_offset()) != expected:
+            return None
+        expected += int(value.numel())
+    return first.as_strided((expected - offset,), (1,), storage_offset=offset)
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,4 +678,7 @@ __all__ = [
     "TokenSelection",
     "TowerInput",
     "WrittenRange",
+    "packed_tensor_views",
+    "packed_token_ids",
+    "packed_token_positions",
 ]

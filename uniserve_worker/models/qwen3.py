@@ -22,6 +22,7 @@ from ..forward import (
     ForwardBatch,
     ForwardContext,
     ForwardOutput,
+    PagedVarlenPlan,
     TokenEmbeddings,
     TokenHidden,
     TokenIds,
@@ -30,6 +31,8 @@ from ..forward import (
     TokenRow,
     TokenSegments,
     TokenSelection,
+    packed_token_ids,
+    packed_token_positions,
 )
 
 __all__ = [
@@ -379,9 +382,7 @@ class Qwen3MoE(nn.Module):
         num_experts = cfg.num_experts
         top_k = cfg.num_experts_per_tok
         self.gate = LinearBase(cfg.hidden_size, num_experts, spec=spec, bias=False)
-        expert_intermediate = int(
-            cfg.moe_intermediate_size or cfg.intermediate_size
-        )
+        expert_intermediate = int(cfg.moe_intermediate_size or cfg.intermediate_size)
         self.experts = FusedMoE(
             [
                 Qwen3MLP(_expert_cfg(cfg, expert_intermediate), spec=spec)
@@ -401,11 +402,7 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(self, cfg: _QwenConfig, layer_id: int, *, spec: LayerSpec) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(cfg, layer_id, spec=spec)
-        self.mlp = (
-            Qwen3MoE(cfg, spec=spec)
-            if cfg.num_experts > 0
-            else Qwen3MLP(cfg, spec=spec)
-        )
+        self.mlp = Qwen3MoE(cfg, spec=spec) if cfg.num_experts > 0 else Qwen3MLP(cfg, spec=spec)
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
 
@@ -566,12 +563,16 @@ class Qwen3ForCausalLM(nn.Module):
         if any(not isinstance(row, TokenRow) for row in batch.rows):
             raise TypeError("Qwen3 text route accepts TokenRow values only")
         rows = cast(tuple[TokenRow, ...], batch.rows)
-        positions = torch.cat(tuple(row.positions.reshape(-1) for row in rows), dim=0)
+        positions = packed_token_positions(rows)
+        if positions is None:
+            positions = torch.cat(tuple(row.positions.reshape(-1) for row in rows), dim=0)
         if all(isinstance(row.inputs, TokenIds) for row in rows):
-            input_ids = torch.cat(
-                tuple(cast(TokenIds, row.inputs).values.reshape(-1) for row in rows),
-                dim=0,
-            )
+            input_ids = packed_token_ids(rows)
+            if input_ids is None:
+                input_ids = torch.cat(
+                    tuple(cast(TokenIds, row.inputs).values.reshape(-1) for row in rows),
+                    dim=0,
+                )
             hidden = self.model(input_ids, positions, batch.context)
         else:
             embeddings = tuple(self._row_embeddings(row, batch.context) for row in rows)
@@ -583,21 +584,79 @@ class Qwen3ForCausalLM(nn.Module):
                 batch.context,
                 input_embeds=inputs,
             )
-        outputs: list[TokenOutput] = []
+        return self._outputs(hidden, rows, batch.context)
+
+    def _outputs(
+        self,
+        hidden: torch.Tensor,
+        rows: tuple[TokenRow, ...],
+        context: ForwardContext,
+    ) -> ForwardOutput:
+        attention = getattr(context, "attention", None)
+        dynamic_last = (
+            attention.output_indices
+            if isinstance(attention, PagedVarlenPlan)
+            and all(row.selection is TokenSelection.LAST_LOGITS for row in rows)
+            else None
+        )
+        if dynamic_last is not None:
+            selected = hidden.index_select(0, dynamic_last.to(dtype=torch.long))
+            dynamic_projected = self.logits(self.lm_head(selected, context.mesh))
+            return ForwardOutput(
+                tuple(
+                    TokenOutput(
+                        row.row_id,
+                        row.output_slot,
+                        TokenLogits(dynamic_projected[index : index + 1]),
+                    )
+                    for index, row in enumerate(rows)
+                )
+            )
+        row_hidden: list[torch.Tensor] = []
         begin = 0
         for row in rows:
             count = int(row.positions.numel())
-            row_hidden = hidden[begin : begin + count]
+            row_hidden.append(hidden[begin : begin + count])
             begin += count
+        projected_rows = tuple(
+            index for index, row in enumerate(rows) if row.selection is not TokenSelection.HIDDEN
+        )
+        projected: torch.Tensor | None = None
+        if projected_rows:
+            if (
+                len(projected_rows) == len(rows)
+                and all(row.selection is TokenSelection.LAST_LOGITS for row in rows)
+                and all(int(value.shape[0]) == 1 for value in row_hidden)
+            ):
+                selected = hidden
+            else:
+                selected_rows = tuple(
+                    row_hidden[index]
+                    if rows[index].selection is TokenSelection.ALL_LOGITS
+                    else row_hidden[index][-1:]
+                    for index in projected_rows
+                )
+                selected = (
+                    selected_rows[0] if len(selected_rows) == 1 else torch.cat(selected_rows, dim=0)
+                )
+            projected = self.logits(self.lm_head(selected, context.mesh))
+
+        outputs: list[TokenOutput] = []
+        projected_offset = 0
+        for index, row in enumerate(rows):
             value: TokenHidden | TokenLogits
             if row.selection is TokenSelection.HIDDEN:
-                value = TokenHidden(row_hidden)
-            elif row.selection is TokenSelection.ALL_LOGITS:
-                value = TokenLogits(self.logits(self.lm_head(row_hidden, batch.context.mesh)))
+                value = TokenHidden(row_hidden[index])
             else:
-                value = TokenLogits(
-                    self.logits(self.lm_head(row_hidden[-1:].contiguous(), batch.context.mesh))
+                if projected is None:
+                    raise RuntimeError("Qwen3 projected output buffer is missing")
+                count = (
+                    int(row_hidden[index].shape[0])
+                    if row.selection is TokenSelection.ALL_LOGITS
+                    else 1
                 )
+                value = TokenLogits(projected[projected_offset : projected_offset + count])
+                projected_offset += count
             outputs.append(TokenOutput(row.row_id, row.output_slot, value))
         return ForwardOutput(tuple(outputs))
 

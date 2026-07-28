@@ -7,7 +7,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from ..batch import Batch
+from ..batch import Batch, ExecutionResult
 from ..capabilities import RequestKind, ResponseKind
 from ..foundation.env import env_int
 from ..foundation.errors import (
@@ -154,7 +154,49 @@ def _execute(worker: Worker, request: Mapping[str, Any], metrics: MetricsService
     operation_types = [value.operation_type.value for value in batch.operations]
     metrics.record_execute(duration, operation_types)
     metrics.record_forward_stats(result.forward_stats)
-    return _response(ResponseKind.RESULT, result=result.to_wire())
+    return _response(
+        ResponseKind.RESULT,
+        result=result if _result_has_deferred_tokens(result) else result.to_wire(),
+    )
+
+
+def _result_deferred_tokens(result: ExecutionResult) -> tuple[object, ...]:
+    tokens: list[object] = []
+    for operation in result.operations:
+        delta = operation.delta
+        effect = getattr(delta, "effect", None)
+        if effect is None:
+            effect = getattr(delta, "sequence", None)
+        if effect is not None:
+            tokens.extend(
+                token
+                for token in effect.sampled_token_ids
+                if callable(getattr(token, "finalize", None))
+            )
+    return tuple(tokens)
+
+
+def _result_has_deferred_tokens(result: ExecutionResult) -> bool:
+    return bool(_result_deferred_tokens(result))
+
+
+def _response_ready(response: Mapping[str, Any]) -> bool:
+    result = response.get("result")
+    if not isinstance(result, ExecutionResult):
+        return True
+    return all(
+        bool(ready())
+        for token in _result_deferred_tokens(result)
+        if callable(ready := getattr(token, "ready", None))
+    )
+
+
+def _finalize_response(response: Mapping[str, Any]) -> dict[str, Any]:
+    finalized = dict(response)
+    result = finalized.get("result")
+    if isinstance(result, ExecutionResult):
+        finalized["result"] = result.to_wire()
+    return finalized
 
 
 def _control(
@@ -231,6 +273,7 @@ class WorkerServer:
         self.profiler = WorkerProfiler.from_env()
         self._execute_count = 0
         self._terminate_after = env_int("UNISERVE_STUB_DIE_AFTER", default=0)
+        self.pipeline_depth = max(1, int(worker.contract.capabilities.pipeline_depth))
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         raw_kind = request.get("kind")
@@ -310,7 +353,7 @@ class WorkerServer:
         if self.ipc_endpoint is None:
             raise RuntimeError("worker server has no IPC endpoint")
         started = self.metrics.now_ns()
-        self.ipc_endpoint.respond(response)
+        self.ipc_endpoint.respond(_finalize_response(response))
         self.metrics.record_pipeline("send", self.metrics.now_ns() - started)
 
     def serve(self) -> None:

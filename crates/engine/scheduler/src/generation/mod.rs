@@ -1293,6 +1293,9 @@ fn token_policy(
 }
 
 fn conditioning_trigger_tokens(request: &GenerationRequest) -> Vec<u32> {
+    if !request.behavior.gen_output {
+        return Vec::new();
+    }
     let trigger = &request.policy.trigger;
     let mut tokens = trigger
         .generated_suffix()
@@ -2071,6 +2074,59 @@ mod tests {
             panic!("expected token input");
         };
         assert_eq!(tokens.token_ids, vec![11, 12]);
+    }
+
+    #[test]
+    fn decode_conditioning_policy_matches_the_resolved_branch_capability() {
+        let policy = GenerationPolicyDescriptor {
+            trigger: uniserve_core::TriggerPolicyDescriptor::Token { token_id: 42 },
+            ..GenerationPolicyDescriptor::default()
+        };
+        let mut requests = [request(10, vec![11, 12]), request(11, vec![11, 12])];
+        requests[0].constraint = GenerationConstraint::UndOnly;
+        requests[1].constraint = GenerationConstraint::Default;
+        for request in &mut requests {
+            request.policy = policy.clone();
+            request.behavior =
+                GenerationBehaviorDescriptor::resolve(request.constraint, &request.policy);
+        }
+
+        for request in &requests {
+            let transition = GenerationPlanner::new()
+                .plan(
+                    request,
+                    CursorProjection {
+                        phase: GenerationPhase::DecodeUnd,
+                        prompt_cursor: 2,
+                        logical_pos: 2,
+                        physical_kv_len: 2,
+                        replayability: Replayability::Replayable,
+                    },
+                    TransitionIntent::DecodeUnd {
+                        position: 2,
+                        token_id: 12,
+                        token_source: TokenSource::Wire,
+                        new_blocks: Vec::new(),
+                        spec_token_ids: None,
+                        recent_tokens: None,
+                        allowed_tokens: None,
+                        suppress_tokens: None,
+                    },
+                )
+                .expect("plan sequence decode");
+            let Operation::Sequence(sequence) = transition.op.operation else {
+                panic!("expected sequence operation");
+            };
+            assert_eq!(
+                sequence.policy.publish_kv_on_tokens,
+                request
+                    .behavior
+                    .gen_output
+                    .then_some(42)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

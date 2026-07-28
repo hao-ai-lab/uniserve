@@ -6,8 +6,8 @@ import pytest
 
 from tests.python.fixtures.model_execution import TEST_DEPLOYMENT
 from uniserve_worker.foundation.runtime_config import (
-    decode_graph_padding_block_count,
     graph_memory_budget_bytes,
+    graph_padding_block_count,
 )
 from uniserve_worker.foundation.sizing import ceil_div, derive_runtime_kv_capacity
 from uniserve_worker.runtime import capabilities as capabilities_module
@@ -49,7 +49,7 @@ def _shape(deployment):
 
 def _kv_blocks(deployment, num_blocks: int) -> int:
     """Blocks the residency store provisions for one derived request capacity."""
-    padding = decode_graph_padding_block_count(BLOCK_SIZE)
+    padding = graph_padding_block_count(BLOCK_SIZE)
     total = num_blocks + padding
     if deployment.resources.scratch is not None:
         scratch_tokens = _scratch_capacity_tokens(

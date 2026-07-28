@@ -28,7 +28,7 @@ from ..runtime.replay import ReplayStore
 from ..runtime.request_session import SessionStore
 from ..runtime.residency import ResidencyStore
 from ..runtime.snapshot_store import SnapshotProvider, SnapshotRef
-from ..spec import DeploymentOverlay, ModelSpec, OperationType, resolved_digest
+from ..spec import DeploymentOverlay, ModelSpec, OperationType, RouteRowKind, resolved_digest
 from .protocol import WorkerContract
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class ModelWorker:
             deployment.resources,
             device=deployment.device,
         )
-        self.kv = KvStore(self.residency.kv, self.residency.scratch)
+        self.kv = KvStore(self.residency.kv)
         self.sessions = SessionStore()
         self.latents = LatentStore(
             capacity_tokens=int(self._contract.capabilities.max_latent_size),
@@ -126,7 +126,11 @@ class ModelWorker:
             block_size=deployment.block_size,
             spec_digest=self.model_spec_digest,
             memory_budget_bytes=graph_memory_budget_bytes(device_total_bytes(deployment.device)),
+            decode_batch_sizes=execution.cuda_graph_warmup_batches,
+            decode_context_blocks=self._decode_context_blocks(),
+            prefill_token_sizes=execution.prefill_cuda_graph_warmup_tokens,
         )
+        self._execution = execution
         self.trace = ExecutionTrace(self.model_spec_digest)
         self.executor = ModelExecutor(
             spec=model_spec,
@@ -148,6 +152,7 @@ class ModelWorker:
                 self._contract.capabilities.supported_operation_types
             ),
             trace=self.trace,
+            pipeline_depth=pipeline_depth,
             defer_sampling=defer_sampling,
         )
         self.snapshot_provider: SnapshotProvider | None = None
@@ -190,6 +195,25 @@ class ModelWorker:
     @property
     def contract(self) -> WorkerContract:
         return self._contract
+
+    def _decode_context_blocks(self) -> int:
+        pool = self.kv.pool
+        if pool is None:
+            return 0
+        max_tokens = max(
+            (
+                int(route.shape.max_tokens_per_row)
+                for route in self.model_spec.routes
+                if RouteRowKind.TOKEN in route.row_kinds
+            ),
+            default=0,
+        )
+        if max_tokens < 1:
+            return 0
+        blocks = (max_tokens + int(self.deployment.block_size) - 1) // int(
+            self.deployment.block_size
+        )
+        return min(blocks, int(pool.leasable_num_blocks))
 
     def execute(self, batch: Batch) -> ExecutionResult:
         result = self.executor.execute(batch)
@@ -238,80 +262,228 @@ class ModelWorker:
             SequenceOperation,
             TokenInput,
             TokenPolicy,
+            TokenSource,
         )
 
         types = self._contract.capabilities.supported_operation_types
         if OperationType.SEQUENCE_EXTEND not in types:
             return
-        block_size = int(self.deployment.block_size)
-        prefill = block_size  # one full page of prompt tokens
-        # Blocks 0..(prefill/block_size) inclusive: the trailing page holds the
-        # single decode token appended at ``prefill``.
-        blocks = tuple(range(prefill // block_size + 1))
-        if len(blocks) > int(self.kv.pool.schedulable_num_blocks):
+        pool = self.kv.pool
+        if pool is None or self.sessions.session_ids():
             return
-        session_id = 1
-        admission = Admission.create(
-            session_id,
-            sequence=SequenceAdmission(
-                sampling=SamplingParams(),
-                kv=KvAllocation(block_ids=blocks, prefix_len=0, group_id=0),
-            ),
+        if (
+            self._execution.cuda_graph
+            and self._execution.prefill_cuda_graph
+            and self._execution.prefill_cuda_graph_warmup
+        ):
+            self._warmup_prefill_graphs()
+        configured = (
+            self._execution.cuda_graph_warmup_batches
+            if (
+                self._execution.cuda_graph
+                and self._execution.cuda_graph_warmup
+                and OperationType.SEQUENCE_DECODE in types
+            )
+            else (1,)
         )
+        batch_sizes = tuple(
+            sorted(
+                {
+                    int(value)
+                    for value in configured
+                    if 0 < int(value) <= int(pool.leasable_num_blocks)
+                },
+                reverse=True,
+            )
+        )
+        if not batch_sizes:
+            return
+        session_ids = tuple(range(1, max(batch_sizes) + 1))
+        admissions = tuple(
+            Admission.create(
+                session_id,
+                sequence=SequenceAdmission(
+                    sampling=SamplingParams(temperature=0.0, ignore_eos=True),
+                    kv=KvAllocation(block_ids=(block_id,), prefix_len=0, group_id=0),
+                ),
+            )
+            for block_id, session_id in enumerate(session_ids)
+        )
+        by_session = {admission.session_id: admission for admission in admissions}
         extend = SequenceOperation(
             SequenceMode.EXTEND,
             KvLeaseDelta(),
-            (0, prefill),
+            (0, 1),
             TokenPolicy(),
-            TokenInput(tuple(0 for _ in range(prefill))),
+            TokenInput((0,)),
         )
-        self.execute(
-            Batch(
-                1,
-                (admission,),
-                (),
-                (
-                    OperationEnvelope.create(
-                        session_id=session_id,
-                        epoch=1,
-                        op_id=1,
-                        base_version=0,
-                        admission_digest=admission.digest,
-                        model_spec_digest=self.model_spec_digest,
-                        weight_digest=self.weight_digest,
-                        operation=extend,
-                    ),
-                ),
-            )
-        )
-        if OperationType.SEQUENCE_DECODE in types:
-            decode = SequenceOperation(
-                SequenceMode.DECODE,
-                KvLeaseDelta(),
-                (prefill, prefill + 1),
-                TokenPolicy(),
-                TokenInput((0,)),
-            )
-            self.execute(
+        step_id = 1
+        versions = {session_id: 0 for session_id in session_ids}
+        try:
+            self.executor.execute(
                 Batch(
-                    2,
+                    step_id,
+                    admissions,
                     (),
-                    (),
-                    (
+                    tuple(
                         OperationEnvelope.create(
                             session_id=session_id,
                             epoch=1,
-                            op_id=2,
-                            base_version=1,
-                            admission_digest=admission.digest,
+                            op_id=1,
+                            base_version=0,
+                            admission_digest=by_session[session_id].digest,
                             model_spec_digest=self.model_spec_digest,
                             weight_digest=self.weight_digest,
-                            operation=decode,
-                        ),
+                            operation=extend,
+                        )
+                        for session_id in session_ids
                     ),
                 )
             )
-        self.drop_session(session_id)
+            for session_id in session_ids:
+                versions[session_id] = 1
+            if OperationType.SEQUENCE_DECODE not in types:
+                return
+            repeats = 2 if self._execution.cuda_graph and self._execution.cuda_graph_warmup else 1
+            decode = SequenceOperation(
+                SequenceMode.DECODE,
+                KvLeaseDelta(),
+                (1, 2),
+                TokenPolicy(),
+                TokenInput((0,), source=TokenSource.LAST_SAMPLED),
+            )
+            for batch_size in batch_sizes:
+                selected = session_ids[:batch_size]
+                for _ in range(repeats):
+                    step_id += 1
+                    operations = []
+                    for session_id in selected:
+                        version = versions[session_id]
+                        position = version
+                        operations.append(
+                            OperationEnvelope.create(
+                                session_id=session_id,
+                                epoch=1,
+                                op_id=version + 1,
+                                base_version=version,
+                                admission_digest=by_session[session_id].digest,
+                                model_spec_digest=self.model_spec_digest,
+                                weight_digest=self.weight_digest,
+                                operation=replace(
+                                    decode,
+                                    position=(position, position + 1),
+                                ),
+                            )
+                        )
+                    self.executor.execute(Batch(step_id, (), (), tuple(operations)))
+                    for session_id in selected:
+                        versions[session_id] += 1
+        finally:
+            import torch
+
+            device = torch.device(self.deployment.device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            for session_id in session_ids:
+                if self.sessions.peek(session_id) is not None:
+                    self.drop_session(session_id)
+
+    def _warmup_prefill_graphs(self) -> None:
+        import torch
+
+        from ..batch import (
+            Admission,
+            Batch,
+            KvAllocation,
+            KvLeaseDelta,
+            OperationEnvelope,
+            SamplingParams,
+            SequenceAdmission,
+            SequenceMode,
+            SequenceOperation,
+            TokenInput,
+            TokenPolicy,
+        )
+
+        pool = self.kv.pool
+        if pool is None or self.sessions.session_ids():
+            return
+        max_route_tokens = max(
+            (
+                int(route.shape.max_tokens_per_row)
+                for route in self.model_spec.routes
+                if RouteRowKind.TOKEN in route.row_kinds
+            ),
+            default=0,
+        )
+        capacity = min(
+            max_route_tokens,
+            int(pool.leasable_num_blocks) * int(pool.block_size),
+        )
+        token_buckets = tuple(
+            sorted(
+                {
+                    int(value)
+                    for value in self._execution.prefill_cuda_graph_warmup_tokens
+                    if 0 < int(value) <= capacity
+                },
+                reverse=True,
+            )
+        )
+        if not token_buckets:
+            return
+        logger.info("warming %d paged-prefill CUDA graph token buckets", len(token_buckets))
+        session_id = 1
+        step_id = 0
+        device = torch.device(self.deployment.device)
+        for token_count in token_buckets:
+            block_count = (token_count + int(pool.block_size) - 1) // int(pool.block_size)
+            allocation = KvAllocation(
+                block_ids=tuple(range(block_count)),
+                prefix_len=0,
+                group_id=0,
+            )
+            operation = SequenceOperation(
+                SequenceMode.EXTEND,
+                KvLeaseDelta(),
+                (0, token_count),
+                TokenPolicy(),
+                TokenInput((0,) * token_count),
+            )
+            for _ in range(2):
+                admission = Admission.create(
+                    session_id,
+                    sequence=SequenceAdmission(
+                        sampling=SamplingParams(temperature=0.0, ignore_eos=True),
+                        kv=allocation,
+                    ),
+                )
+                step_id += 1
+                try:
+                    self.executor.execute(
+                        Batch(
+                            step_id,
+                            (admission,),
+                            (),
+                            (
+                                OperationEnvelope.create(
+                                    session_id=session_id,
+                                    epoch=1,
+                                    op_id=1,
+                                    base_version=0,
+                                    admission_digest=admission.digest,
+                                    model_spec_digest=self.model_spec_digest,
+                                    weight_digest=self.weight_digest,
+                                    operation=operation,
+                                ),
+                            ),
+                        )
+                    )
+                    if device.type == "cuda":
+                        torch.cuda.synchronize(device)
+                finally:
+                    if self.sessions.peek(session_id) is not None:
+                        self.drop_session(session_id)
 
     def _warmup_image_geometry(self) -> tuple[int, int]:
         """Largest square image whose latent grid fits the declared capacity.

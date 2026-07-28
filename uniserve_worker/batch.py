@@ -808,7 +808,13 @@ class OperationEnvelope:
         return replace(value, digest=value.payload_digest())
 
     @classmethod
-    def from_wire(cls, value: object, where: str = "operation") -> OperationEnvelope:
+    def from_wire(
+        cls,
+        value: object,
+        where: str = "operation",
+        *,
+        validate: bool = True,
+    ) -> OperationEnvelope:
         data = _map(value, where)
         envelope = cls(
             session_id=_uint(data.get("session_id"), f"{where}.session_id"),
@@ -821,7 +827,8 @@ class OperationEnvelope:
             weight_digest=_str(data.get("weight_digest"), f"{where}.weight_digest"),
             operation=_parse_operation(data.get("operation"), f"{where}.operation"),
         )
-        envelope.validate()
+        if validate:
+            envelope.validate()
         return envelope
 
     def validate(self) -> None:
@@ -919,6 +926,7 @@ class Batch:
     projections: tuple[SessionProjection, ...]
     operations: tuple[OperationEnvelope, ...]
     protocol_version: int = EXECUTION_PROTOCOL_VERSION
+    native_envelope_validated: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -930,8 +938,9 @@ class Batch:
             )
         if not self.operations:
             raise invalid_descriptor("execution batch must contain an operation")
-        for operation in self.operations:
-            operation.validate()
+        if not self.native_envelope_validated:
+            for operation in self.operations:
+                operation.validate()
         sessions = tuple(value.session_id for value in self.operations)
         if len(set(sessions)) != len(sessions):
             raise invalid_descriptor("execution batch contains multiple operations for one session")
@@ -961,8 +970,13 @@ class Batch:
     def from_wire(cls, value: object) -> Batch:
         data = _map(value, "execute batch")
         protocol_version = _uint(data.get("protocol_version"), "execute batch.protocol_version")
+        native_envelope_validated = _bool(
+            data.get("_native_envelope_validated", False),
+            "execute batch._native_envelope_validated",
+        )
         return cls(
             protocol_version=protocol_version,
+            native_envelope_validated=native_envelope_validated,
             step_id=_uint(data.get("step_id"), "execute batch.step_id"),
             admissions=tuple(
                 Admission.from_wire(item, f"execute batch.admissions[{index}]")
@@ -977,7 +991,11 @@ class Batch:
                 )
             ),
             operations=tuple(
-                OperationEnvelope.from_wire(item, f"execute batch.operations[{index}]")
+                OperationEnvelope.from_wire(
+                    item,
+                    f"execute batch.operations[{index}]",
+                    validate=not native_envelope_validated,
+                )
                 for index, item in enumerate(
                     _seq(data.get("operations", ()), "execute batch.operations")
                 )
@@ -1075,7 +1093,7 @@ class SequenceEffect:
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "sampled_token_ids": list(self.sampled_token_ids),
+            "sampled_token_ids": [int(value) for value in self.sampled_token_ids],
             "sampled_logprob": self.sampled_logprob,
             "top_logprobs": [value.to_wire() for value in self.top_logprobs],
             "prompt_logprobs": [[entry.to_wire() for entry in row] for row in self.prompt_logprobs],

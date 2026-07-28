@@ -10,6 +10,8 @@ so a regression in the batch shapes is caught without a GPU.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from tests.python.fixtures.execution_worker import execution_worker
@@ -50,3 +52,27 @@ def test_warmup_sequence_runs_and_cleans_up() -> None:
     worker._warmup_sequence()
     # The warmup owns session id 1 transiently and must drop it before serving.
     assert 1 not in worker.sessions.session_ids()
+
+
+def test_prefill_graph_warmup_runs_each_bucket_and_cleans_up(monkeypatch) -> None:
+    worker = execution_worker()
+    worker._execution = replace(
+        worker._execution,
+        prefill_cuda_graph_warmup_tokens=(4, 8),
+    )
+    token_counts: list[int] = []
+    execute = worker.executor.execute
+
+    def observe(batch):
+        token_counts.extend(
+            envelope.operation.position[1] - envelope.operation.position[0]
+            for envelope in batch.operations
+        )
+        return execute(batch)
+
+    monkeypatch.setattr(worker.executor, "execute", observe)
+
+    worker._warmup_prefill_graphs()
+
+    assert token_counts == [8, 8, 4, 4]
+    assert worker.sessions.session_ids() == ()

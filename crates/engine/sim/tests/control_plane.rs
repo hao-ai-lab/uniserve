@@ -379,7 +379,7 @@ fn scheduler_submits_mixed_op_kind_batches() {
 }
 
 #[test]
-fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressure() {
+fn scheduler_services_a_ready_prompt_at_the_next_available_slot() {
     use std::sync::{Arc, Mutex};
     use uniserve_worker_wire::{
         Batch, EngineCaps, ExecutionConstraints, ExecutionResult, OperationType,
@@ -458,10 +458,15 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
             },
         );
 
+        let greedy_lookahead = SamplingParams {
+            temperature: 0.0,
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
         let _rx1 = sched.submit_for_test(generation_request(
             RequestId(1),
             text_context(vec![1, 2, 3]),
-            SamplingParams::default(),
+            greedy_lookahead.clone(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
@@ -469,7 +474,7 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         let _rx2 = sched.submit_for_test(generation_request(
             RequestId(2),
             text_context(vec![4, 5, 6]),
-            SamplingParams::default(),
+            greedy_lookahead.clone(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
@@ -498,7 +503,7 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         let _rx3 = sched.submit_for_test(generation_request(
             RequestId(3),
             text_context(vec![7, 8, 9]),
-            SamplingParams::default(),
+            greedy_lookahead.clone(),
             ImageParams::default(),
             GenerationConstraint::UndOnly,
             64,
@@ -512,19 +517,20 @@ fn scheduler_uses_idle_pipeline_slot_for_prefill_without_decode_lookahead_pressu
         }
         let log = batches.lock().unwrap();
         let prefill_batch = log.get(before).unwrap_or_else(|| {
-            panic!("expected a prefill batch after admitting request 3: {log:?}")
+            panic!("expected the ready prompt at the next available slot: {log:?}")
         });
         assert!(
             prefill_batch
                 .iter()
-                .any(|(id, kind)| *id == RequestId(3) && *kind == OperationType::SequenceExtend),
-            "new request prefill should use an idle pipeline slot, got {prefill_batch:?}"
+                .any(|(id, kind)| *id == RequestId(3)
+                    && *kind == OperationType::SequenceExtend),
+            "the ready prompt should receive prefill service, got {prefill_batch:?}"
         );
         assert!(
             prefill_batch
                 .iter()
                 .all(|(_, kind)| *kind != OperationType::SequenceDecode),
-            "idle-slot text prefill must not mix with decode, got {prefill_batch:?}"
+            "prefill service should retain its own execution lane, got {prefill_batch:?}"
         );
     }
 
@@ -684,6 +690,228 @@ fn pipeline_depth_is_token_identical() {
             "req {id:?} token count differs by depth"
         );
         assert_eq!(d1[id].reason, d2[id].reason);
+    }
+}
+
+#[test]
+fn ready_completion_refills_the_pipeline_before_resolving_the_next_batch() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{Batch, EngineCaps, ExecutionResult};
+
+    struct Recording {
+        inner: SimExecutor,
+        in_flight_before_submit: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+
+        fn can_submit(&self) -> bool {
+            self.inner.can_submit()
+        }
+
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            self.in_flight_before_submit
+                .lock()
+                .unwrap()
+                .push(self.inner.in_flight());
+            self.inner.submit(batch)
+        }
+
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+            self.inner.poll()
+        }
+
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+            self.inner.next_result()
+        }
+
+        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(operation)
+        }
+
+        fn control_wait(
+            &mut self,
+            operation: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(operation, targets)
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(2);
+    sim.set_text_len(8);
+    let in_flight_before_submit = Arc::new(Mutex::new(Vec::new()));
+    let executor = Recording {
+        inner: SimExecutor::new(Box::new(sim)),
+        in_flight_before_submit: in_flight_before_submit.clone(),
+    };
+    let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let mut sampling = SamplingParams::default();
+    sampling.ignore_eos = true;
+    let _events = scheduler.submit_for_test(generation_request(
+        RequestId(1),
+        text_context(vec![1, 2, 3]),
+        sampling,
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        8,
+    ));
+
+    assert!(scheduler.step());
+    thread::sleep(Duration::from_millis(20));
+    assert!(scheduler.step());
+
+    let observed = in_flight_before_submit.lock().unwrap();
+    assert!(
+        observed.len() >= 3,
+        "expected initial fill plus one replacement, got {observed:?}"
+    );
+    assert_eq!(&observed[..3], &[0, 1, 1]);
+}
+
+#[test]
+fn image_context_decode_pipeline_preserves_natural_eos_with_ordered_successors() {
+    use std::sync::{Arc, Mutex};
+    use uniserve_worker_wire::{
+        Batch, EngineCaps, ExecutionResult, Operation, SequenceInput, TokenSource,
+    };
+
+    type OperationLog = Arc<Mutex<Vec<(OperationType, u64, TokenSource, usize)>>>;
+
+    struct Recording {
+        inner: SimExecutor,
+        operations: OperationLog,
+    }
+
+    impl Executor for Recording {
+        fn caps(&self) -> EngineCaps {
+            self.inner.caps()
+        }
+
+        fn pipeline_depth(&self) -> usize {
+            self.inner.pipeline_depth()
+        }
+
+        fn in_flight(&self) -> usize {
+            self.inner.in_flight()
+        }
+
+        fn submit(&mut self, batch: Batch) -> anyhow::Result<()> {
+            let in_flight = self.inner.in_flight();
+            for envelope in &batch.operations {
+                let source = match &envelope.operation {
+                    Operation::Sequence(sequence) => match &sequence.input {
+                        SequenceInput::Tokens(tokens) => tokens.source,
+                        SequenceInput::PublishedLogits(_) => TokenSource::Wire,
+                    },
+                    _ => TokenSource::Wire,
+                };
+                self.operations.lock().unwrap().push((
+                    envelope.operation_type(),
+                    envelope.base_version,
+                    source,
+                    in_flight,
+                ));
+            }
+            self.inner.submit(batch)
+        }
+
+        fn poll(&mut self) -> anyhow::Result<Option<ExecutionResult>> {
+            self.inner.poll()
+        }
+
+        fn next_result(&mut self) -> anyhow::Result<ExecutionResult> {
+            self.inner.next_result()
+        }
+
+        fn control(&mut self, operation: ControlOp) -> anyhow::Result<u64> {
+            self.inner.control(operation)
+        }
+
+        fn control_wait(
+            &mut self,
+            operation: ControlOp,
+            targets: Option<&[u32]>,
+        ) -> anyhow::Result<Vec<ControlAck>> {
+            self.inner.control_wait(operation, targets)
+        }
+
+        fn shutdown(&mut self) {
+            self.inner.shutdown();
+        }
+    }
+
+    let mut sim = SimEngine::new();
+    sim.set_pipeline_depth(2);
+    sim.set_text_len(8);
+    let operations = Arc::new(Mutex::new(Vec::new()));
+    let executor = Recording {
+        inner: SimExecutor::new(Box::new(sim)),
+        operations: operations.clone(),
+    };
+    let mut scheduler = Scheduler::new(Box::new(executor), ctrl(), 32);
+    let mut events = scheduler.submit_for_test(generation_request(
+        RequestId(1),
+        context_with_image(vec![1, 2], vec![3, 4], 0xD3C0DE, 4, 1),
+        SamplingParams::default(),
+        ImageParams::default(),
+        GenerationConstraint::UndOnly,
+        16,
+    ));
+
+    let mut finish_reason = None;
+    let mut text_tokens = 0;
+    for _ in 0..256 {
+        scheduler.step();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                GenEvent::TextToken { .. } => text_tokens += 1,
+                GenEvent::Finished { reason, .. } => finish_reason = Some(reason),
+                _ => {}
+            }
+        }
+        if finish_reason.is_some() {
+            break;
+        }
+    }
+
+    assert_eq!(finish_reason, Some(FinishReason::Eos));
+    assert_eq!(text_tokens, 8);
+    let operations = operations.lock().unwrap();
+    assert!(operations.len() >= 2);
+    assert!(
+        operations
+            .iter()
+            .filter(|(kind, _, _, _)| *kind == OperationType::SequenceDecode)
+            .all(|(_, _, source, _)| *source == TokenSource::LastSampled),
+        "eligible decode should retain the worker-local relay across host commits"
+    );
+    assert!(
+        operations
+            .iter()
+            .any(|(kind, _, source, in_flight)| *kind == OperationType::SequenceDecode
+                && *source == TokenSource::LastSampled
+                && *in_flight > 0),
+        "image-context decode should project a worker-local successor"
+    );
+    for pair in operations.windows(2) {
+        assert_eq!(pair[1].1, pair[0].1 + 1);
     }
 }
 

@@ -43,7 +43,7 @@ Capacity and scheduling settings are declared explicitly on both sides of every 
 
 | Setting | UniServe | SGLang | vLLM-Omni |
 | --- | --- | --- | --- |
-| Maximum concurrent running requests | `--max-running-requests 32` | `--max-running-requests 32` | `--max-num-seqs 32` (BAGEL: per stage in the deploy config) |
+| Maximum concurrent running requests | `--max-running-requests 128` | `--max-running-requests 128` | `--max-num-seqs 32` (BAGEL: per stage in the deploy config) |
 | Per-step batched token budget | `--max-num-batched-tokens`: 16384 text, 8192 multimodal | `--max-prefill-tokens 16384`, `--chunked-prefill-size 16384` | BAGEL: `max_num_batched_tokens: 8192` per stage |
 | Static memory fraction | `--mem-fraction-static 0.70` | `--mem-fraction-static 0.70` | BAGEL: `gpu_memory_utilization: 0.45` on the Thinker stage |
 | KV page size | `--page-size 64` | `--page-size 64` | Backend-selected |
@@ -51,11 +51,11 @@ Capacity and scheduling settings are declared explicitly on both sides of every 
 | KV cache dtype | `--kv-cache-dtype bfloat16` | `--kv-cache-dtype bfloat16` | Not exposed for omni stages |
 | Prefix cache | Enabled | Radix cache enabled | BAGEL: enabled on the Thinker stage |
 
-32 is the matrix's maximum offered client concurrency and also the measured request count of every multimodal point, so no server admits fewer requests than its load case offers. The budget of 16384 is the value SGLang derives automatically for this GPU class, so both text servers run at the reference's own operating point.
+The text capacity of 128 preserves the complete open-loop arrival burst without imposing server admission backpressure, while 32 is the maximum offered client concurrency and measured request count of every multimodal point. The budget of 16384 is the value SGLang derives automatically for this GPU class, so both text servers run at the reference's own operating point.
 
 The multimodal budget of 8192 is set by the vLLM-Omni BAGEL stages, which admit a multimodal item whole rather than across steps. The declared modality limits restrict those stages to the image-to-text input the matrix actually sends, so the binding item is the 4900-token vision encoding of one input image rather than a larger editing item the model also supports. UniServe applies the same budget as a per-step scheduling budget over planned token work across its separately declared encoder, decoder, and flow routes.
 
-On both text servers the static memory fraction bounds long-lived device memory as a share of the device total and leaves the remainder for transient work. UniServe counts resident weights, every KV pool, and its captured graph executables inside that share; SGLang counts weights and its KV pool. Both therefore size KV capacity from the same declared share of the same device, and both land far above the residency 32 concurrent ShareGPT requests occupy, so the accounting difference does not bind at any point in this matrix.
+On both text servers the static memory fraction bounds long-lived device memory as a share of the device total and leaves the remainder for transient work. UniServe counts resident weights, every KV pool, and its captured graph executables inside that share; SGLang counts weights and its KV pool. Both therefore size KV capacity from the same declared share of the same device, and both land above the peak resident ShareGPT request count, so the accounting difference does not bind at any point in this matrix.
 
 UniServe and SGLang select their own attention backends from their own capability checks, and the SenseNova reference does the same, so those servers use the kernel each runtime considers best for the model and device. The BAGEL reference pins Triton attention for its language model and torch SDPA for its vision encoder: the CUTLASS flash-attention kernels it would otherwise select fail to compile on this accelerator, so the pins are what make the reference runnable rather than a tuning choice.
 

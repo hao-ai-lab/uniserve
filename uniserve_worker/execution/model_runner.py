@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import torch
 from torch import nn
@@ -34,6 +34,7 @@ from uniserve_worker.forward import (
     TokenRow,
     TokenSegments,
     TowerInput,
+    packed_tensor_views,
 )
 from uniserve_worker.foundation.errors import (
     ComputeError,
@@ -49,6 +50,10 @@ from uniserve_worker.runtime.execution_trace import (
     OperationTrace,
 )
 from uniserve_worker.runtime.graph_store import GraphExecutionError, GraphStore
+from uniserve_worker.runtime.host_staging import (
+    TensorStagingSlot,
+    pack_integer_tensors,
+)
 
 from ._forward_plan import ForwardPlan, OutputSlot
 
@@ -68,6 +73,8 @@ class RunObservation:
     path: RunPath
     model_forward_calls: int
     duration_us: int
+    graph_unpadded_tokens: int
+    graph_padded_tokens: int
 
 
 class ModelRunner:
@@ -97,6 +104,7 @@ class ModelRunner:
         try:
             batch = _stage(plan)
         except Exception as error:
+            _mark_staging_submitted(plan)
             self.trace.emit(
                 ExecutionPhase.ROUTE_EXECUTION,
                 operations,
@@ -109,6 +117,7 @@ class ModelRunner:
             if input_failure is error:
                 raise
             raise input_failure from error
+        _mark_staging_submitted(plan)
         calls = 0
 
         def invoke(value: ForwardBatch) -> ForwardOutput:
@@ -135,12 +144,14 @@ class ModelRunner:
                 row_kind_counts=counts,
             )
             with torch.inference_mode():
-                output, graph_path = self.graph_store.execute(
+                graph_run = self.graph_store.execute(
                     plan.graph_key,
                     batch,
                     invoke,
                     eligible=plan.graph_eligible,
                 )
+                output = graph_run.output
+                graph_path = graph_run.path
         except Exception as error:
             self.trace.emit(
                 ExecutionPhase.FORWARD_COMPLETION,
@@ -199,6 +210,14 @@ class ModelRunner:
             path=path,
             model_forward_calls=calls,
             duration_us=duration_us,
+            graph_unpadded_tokens=(
+                graph_run.row_count if path is not RunPath.EAGER else 0
+            ),
+            graph_padded_tokens=(
+                graph_run.padded_row_count - graph_run.row_count
+                if path is not RunPath.EAGER
+                else 0
+            ),
         )
         self.trace.emit(
             ExecutionPhase.FORWARD_COMPLETION,
@@ -291,7 +310,7 @@ def _enrich(error: _WorkerFailure, plan: ForwardPlan, phase: str) -> _WorkerFail
 
 def _stage(plan: ForwardPlan) -> ForwardBatch:
     device = torch.device(plan.device)
-    rows = tuple(_stage_row(row, device) for row in plan.rows)
+    rows = _stage_rows(plan.rows, device, plan.staging_slot)
     attention = plan.context.attention
     staged_attention: AttnPlan
     if isinstance(attention, NoAttention):
@@ -335,6 +354,80 @@ def _stage(plan: ForwardPlan) -> ForwardBatch:
         rows=rows,
         context=replace(plan.context, attention=staged_attention),
     )
+
+
+def _stage_rows(
+    rows: tuple[ForwardRow, ...],
+    device: torch.device,
+    slot: TensorStagingSlot | None,
+) -> tuple[ForwardRow, ...]:
+    if rows and all(isinstance(row, TokenRow) for row in rows):
+        token_rows = tuple(row for row in rows if isinstance(row, TokenRow))
+        if all(isinstance(row.inputs, TokenIds) for row in token_rows):
+            inputs = _pack_to_device(
+                tuple(
+                    row.inputs.values
+                    for row in token_rows
+                    if isinstance(row.inputs, TokenIds)
+                ),
+                device,
+                slot=slot,
+                name="token_ids",
+            )
+            positions = _pack_to_device(
+                tuple(row.positions for row in token_rows),
+                device,
+                slot=slot,
+                name="token_positions",
+            )
+            if inputs is not None and positions is not None:
+                staged: list[ForwardRow] = []
+                input_offset = 0
+                position_offset = 0
+                for row in token_rows:
+                    input_count = int(cast(TokenIds, row.inputs).values.numel())
+                    position_count = int(row.positions.numel())
+                    staged.append(
+                        replace(
+                            row,
+                            inputs=TokenIds(inputs[input_offset : input_offset + input_count]),
+                            positions=positions[
+                                position_offset : position_offset + position_count
+                            ],
+                        )
+                    )
+                    input_offset += input_count
+                    position_offset += position_count
+                return tuple(staged)
+    return tuple(_stage_row(row, device) for row in rows)
+
+
+def _pack_to_device(
+    values: tuple[torch.Tensor, ...],
+    device: torch.device,
+    *,
+    slot: TensorStagingSlot | None,
+    name: str,
+) -> torch.Tensor | None:
+    if not values:
+        return None
+    flattened = tuple(value.reshape(-1) for value in values)
+    if all(value.device == device for value in flattened):
+        packed = packed_tensor_views(flattened)
+        if packed is not None:
+            return packed
+    return pack_integer_tensors(
+        flattened,
+        device=device,
+        slot=slot,
+        name=name,
+    )
+
+
+def _mark_staging_submitted(plan: ForwardPlan) -> None:
+    slot = plan.staging_slot
+    if slot is not None:
+        slot.stager.mark_submitted(slot, plan.device)
 
 
 def _stage_row(row: ForwardRow, device: torch.device) -> ForwardRow:

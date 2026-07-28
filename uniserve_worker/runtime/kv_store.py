@@ -12,7 +12,13 @@ from ..backends.paged_kv_math import paged_kv_write
 from ..batch import Admission, KvLeaseDelta, PublishedKv
 from ..foundation.errors import invalid_descriptor
 from ..foundation.sizing import bucketed_page_count, ceil_div
-from .host_staging import copy_cpu_to_device, cpu_int_staging_buffer, fill_cpu_ints, is_pinned
+from .host_staging import (
+    TensorStagingSlot,
+    copy_cpu_to_device,
+    cpu_int_staging_buffer,
+    fill_cpu_ints,
+    is_pinned,
+)
 from .kv_pool import PagedKVPool
 from .transfer import Locator, Transport
 
@@ -117,6 +123,23 @@ class KvBatchView:
     def base_lens(self) -> tuple[int, ...]:
         return self._base_lens
 
+    def with_synthetic_row(
+        self,
+        block_ids: Sequence[int],
+        *,
+        base_len: int,
+        query_len: int,
+    ) -> KvBatchView:
+        """Return a view with one non-session row over explicit pool storage."""
+        if self._query_lens is None:
+            raise invalid_descriptor("synthetic KV rows require declared query lengths")
+        return KvBatchView(
+            self._pool,
+            (*self._block_ids, tuple(int(value) for value in block_ids)),
+            (*self._base_lens, int(base_len)),
+            (*self._query_lens, int(query_len)),
+        )
+
     def layer_kv(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self._pool.layer_cache(layer)
 
@@ -194,7 +217,12 @@ class KvBatchView:
         del layer, key, value, page_ids, page_offsets, token_indices
         raise RuntimeError("packed attention requires a packed KV transaction view")
 
-    def block_table(self, device: torch.device) -> torch.Tensor:
+    def block_table(
+        self,
+        device: torch.device,
+        *,
+        slot: TensorStagingSlot | None = None,
+    ) -> torch.Tensor:
         target = torch.device(device)
         cached = self._block_tables.get(target)
         if cached is not None:
@@ -204,6 +232,7 @@ class KvBatchView:
             row_count * self._block_table_width,
             dtype=torch.int32,
             pin=target.type == "cuda",
+            slot=slot,
             name="kv_block_table",
         )
         offset = 0
@@ -217,13 +246,18 @@ class KvBatchView:
             cpu,
             device=target,
             non_blocking=target.type == "cuda" and is_pinned(cpu),
-            slot=None,
+            slot=slot,
             name="kv_block_table",
         ).view(row_count, self._block_table_width)
         self._block_tables[target] = result
         return result
 
-    def cache_seqlens(self, device: torch.device) -> torch.Tensor:
+    def cache_seqlens(
+        self,
+        device: torch.device,
+        *,
+        slot: TensorStagingSlot | None = None,
+    ) -> torch.Tensor:
         target = torch.device(device)
         cached = self._cache_lengths.get(target)
         if cached is not None:
@@ -232,6 +266,7 @@ class KvBatchView:
             len(self._base_lens),
             dtype=torch.int32,
             pin=target.type == "cuda",
+            slot=slot,
             name="kv_cache_lengths",
         )
         fill_cpu_ints(cpu, self._base_lens)
@@ -239,7 +274,7 @@ class KvBatchView:
             cpu,
             device=target,
             non_blocking=target.type == "cuda" and is_pinned(cpu),
-            slot=None,
+            slot=slot,
             name="kv_cache_lengths",
         )
         self._cache_lengths[target] = result
@@ -490,13 +525,8 @@ class _PackedKvView:
 class KvStore:
     """Own committed block leases, prefix boundaries, and physical lengths."""
 
-    def __init__(
-        self,
-        pool: PagedKVPool | None = None,
-        scratch: PagedKVPool | None = None,
-    ) -> None:
+    def __init__(self, pool: PagedKVPool | None = None) -> None:
         self.pool = pool
-        self.scratch_pool = scratch
         self._entries: dict[int, KvEntry] = {}
         self._branches: dict[tuple[int, int, str], KvEntry] = {}
         self._holders: dict[int, set[int]] = {}
@@ -509,16 +539,6 @@ class KvStore:
                 raise RuntimeError("KV store is already bound to a physical pool")
             self.pool = pool
 
-    def bind_scratch_pool(self, pool: PagedKVPool) -> None:
-        with self._lock:
-            if self.scratch_pool is not None and self.scratch_pool is not pool:
-                raise RuntimeError("KV store is already bound to a scratch pool")
-            if not callable(getattr(pool, "allocate_blocks", None)) or not callable(
-                getattr(pool, "release_blocks", None)
-            ):
-                raise TypeError("scratch KV pool must own block allocation")
-            self.scratch_pool = pool
-
     def resident_block_count(self) -> int:
         """Return the number of distinct host-leased blocks with live holders."""
 
@@ -526,13 +546,13 @@ class KvStore:
             return sum(bool(holders) for holders in self._holders.values())
 
     def scratch_token_count(self) -> int:
-        """Return physically allocated scratch capacity in token slots."""
+        """Return physically allocated branch capacity in token slots."""
 
         with self._lock:
             block_ids = {
                 block_id for entry in self._branches.values() for block_id in entry.block_ids
             }
-            block_size = 0 if self.scratch_pool is None else int(self.scratch_pool.block_size)
+            block_size = 0 if self.pool is None else int(self.pool.block_size)
             return len(block_ids) * block_size
 
     def admit(self, admission: Admission) -> None:
@@ -616,16 +636,10 @@ class KvStore:
             query_lens,
         )
 
-    def packed_view(
-        self,
-        rows: Sequence[tuple[KvEntry, int, bool]],
-        *,
-        scratch: bool,
-    ) -> _PackedKvView:
-        pool = self.scratch_pool if scratch else self.pool
-        if pool is None:
+    def packed_view(self, rows: Sequence[tuple[KvEntry, int, bool]]) -> _PackedKvView:
+        if self.pool is None:
             raise RuntimeError("packed KV execution requires its declared physical pool")
-        return _PackedKvView(pool, rows)
+        return _PackedKvView(self.pool, rows)
 
     def scratch_entry(
         self,
@@ -638,9 +652,9 @@ class KvStore:
     ) -> tuple[KvEntry, bool]:
         """Return one generation-scoped branch prefix, provisioning it atomically."""
 
-        pool = self.scratch_pool
+        pool = self.pool
         if pool is None:
-            raise RuntimeError("flow execution requires a scratch KV pool")
+            raise RuntimeError("branch KV execution requires a physical pool")
         key = (int(session_id), int(generation), str(branch))
         with self._lock:
             existing = self._branches.get(key)
@@ -653,45 +667,22 @@ class KvStore:
             try:
                 self._ensure_scratch_capacity(entry, max(prefix, int(capacity_tokens)))
                 if copy_conditioning and prefix:
-                    self._copy_span(
-                        self.pool,
-                        source.block_ids,
-                        pool,
-                        entry.block_ids,
-                        start=0,
-                        length=prefix,
-                    )
+                    pages = ceil_div(prefix, pool.block_size)
+                    pool.copy_pages(source.block_ids[:pages], entry.block_ids[:pages])
             except BaseException:
                 self._release_scratch(entry.block_ids)
                 raise
             self._branches[key] = entry
             return entry, True
 
-    def advance_entry(self, entry: KvEntry, tokens: int, *, scratch: bool) -> None:
-        pool = self.scratch_pool if scratch else self.pool
+    def advance_entry(self, entry: KvEntry, tokens: int) -> None:
+        pool = self.pool
         if pool is None:
             raise RuntimeError("KV advance requires a physical pool")
         end = entry.length + int(tokens)
         if end > len(entry.block_ids) * pool.block_size:
             raise invalid_descriptor("KV advance exceeds its block capacity")
         entry.length = end
-
-    def promote_scratch(self, session_id: int, source: KvEntry, tokens: int) -> None:
-        if self.pool is None or self.scratch_pool is None:
-            raise RuntimeError("KV promotion requires request and scratch pools")
-        target = self.get(session_id)
-        count = int(tokens)
-        self.validate_write(session_id, target.length, target.length + count)
-        self._copy_span(
-            self.scratch_pool,
-            source.block_ids,
-            self.pool,
-            target.block_ids,
-            start=source.length,
-            target_start=target.length,
-            length=count,
-        )
-        target.length += count
 
     def release_generation(self, session_id: int, generation: int) -> None:
         with self._lock:
@@ -912,8 +903,8 @@ class KvStore:
                         length=branch.length,
                         block_count=len(branch.block_ids),
                         pages=self._require_pages(
-                            self._snapshot_pages(self.scratch_pool, branch.block_ids),
-                            "scratch KV",
+                            self._snapshot_pages(self.pool, branch.block_ids),
+                            "branch KV",
                         ),
                     )
                     for key, branch in sorted(self._branches.items())
@@ -967,8 +958,8 @@ class KvStore:
                 if state.length > len(state.block_ids) * self.pool.block_size:
                     raise invalid_descriptor("KV snapshot length exceeds its block capacity")
                 self.pool.validate_block_ids(state.block_ids)
-                if any(value >= self.pool.schedulable_num_blocks for value in state.block_ids):
-                    raise invalid_descriptor("KV snapshot uses a reserved physical block")
+                if any(value >= self.pool.leasable_num_blocks for value in state.block_ids):
+                    raise invalid_descriptor("KV snapshot uses a block outside the leased range")
                 if state.block_ids:
                     pages = self._require_pages(state.pages, "request KV")
                     self._validate_page_state(self.pool, pages, len(state.block_ids))
@@ -986,17 +977,17 @@ class KvStore:
             for branch in state.branches:
                 key = (branch.generation, branch.branch)
                 if key in seen_branches:
-                    raise invalid_descriptor("KV snapshot repeats a scratch branch")
+                    raise invalid_descriptor("KV snapshot repeats a branch")
                 seen_branches.add(key)
                 if branch.generation < 0 or branch.length < 0 or branch.block_count < 1:
-                    raise invalid_descriptor("KV snapshot scratch branch is invalid")
+                    raise invalid_descriptor("KV snapshot branch is invalid")
                 if not branch.branch:
-                    raise invalid_descriptor("KV snapshot scratch branch name is empty")
-                if self.scratch_pool is None:
-                    raise invalid_descriptor("KV snapshot requires an absent scratch pool")
-                if branch.length > branch.block_count * self.scratch_pool.block_size:
-                    raise invalid_descriptor("KV snapshot scratch length exceeds capacity")
-                self._validate_page_state(self.scratch_pool, branch.pages, branch.block_count)
+                    raise invalid_descriptor("KV snapshot branch name is empty")
+                if self.pool is None:
+                    raise invalid_descriptor("KV snapshot requires an absent physical pool")
+                if branch.length > branch.block_count * self.pool.block_size:
+                    raise invalid_descriptor("KV snapshot branch length exceeds capacity")
+                self._validate_page_state(self.pool, branch.pages, branch.block_count)
 
     def _install_committed(
         self,
@@ -1038,19 +1029,19 @@ class KvStore:
 
         for state in states:
             for branch in state.branches:
-                pool = self.scratch_pool
+                pool = self.pool
                 if pool is None:
-                    raise RuntimeError("validated scratch KV pool disappeared")
-                block_ids = tuple(getattr(pool, "allocate_blocks")(branch.block_count))
+                    raise RuntimeError("validated physical KV pool disappeared")
+                block_ids = tuple(pool.allocate_branch_blocks(branch.block_count))
                 if len(block_ids) != branch.block_count:
                     if block_ids:
-                        getattr(pool, "release_blocks")(block_ids)
-                    raise RuntimeError("scratch KV allocator returned an incomplete lease")
+                        pool.release_branch_blocks(block_ids)
+                    raise RuntimeError("branch KV allocator returned an incomplete lease")
                 try:
                     for index, block_id in enumerate(block_ids):
                         self._copy_page_to_pool(pool, block_id, branch.pages, index)
                 except BaseException:
-                    getattr(pool, "release_blocks")(block_ids)
+                    pool.release_branch_blocks(block_ids)
                     raise
                 self._branches[(state.session_id, branch.generation, branch.branch)] = KvEntry(
                     block_ids=list(block_ids),
@@ -1205,59 +1196,28 @@ class KvStore:
                     self._branches[key] = KvEntry(list(blocks), length=length)
 
     def _ensure_scratch_capacity(self, entry: KvEntry, tokens: int) -> None:
-        pool = self.scratch_pool
+        pool = self.pool
         if pool is None:
-            raise RuntimeError("scratch KV pool is not bound")
+            raise RuntimeError("branch KV capacity requires a physical pool")
         required = ceil_div(max(0, int(tokens)), pool.block_size)
         missing = required - len(entry.block_ids)
         if missing > 0:
-            allocated = getattr(pool, "allocate_blocks")(missing)
+            allocated = pool.allocate_branch_blocks(missing)
             if len(allocated) != missing:
                 if allocated:
-                    getattr(pool, "release_blocks")(allocated)
-                raise RuntimeError("scratch KV allocator returned an incomplete lease")
+                    pool.release_branch_blocks(allocated)
+                raise RuntimeError("branch KV allocator returned an incomplete lease")
             entry.block_ids.extend(int(value) for value in allocated)
 
     def _release_scratch(self, blocks: Sequence[int]) -> None:
-        if blocks and self.scratch_pool is not None:
-            getattr(self.scratch_pool, "release_blocks")(tuple(int(value) for value in blocks))
-
-    @staticmethod
-    def _copy_span(
-        source_pool: PagedKVPool | None,
-        source_blocks: Sequence[int],
-        target_pool: PagedKVPool,
-        target_blocks: Sequence[int],
-        *,
-        start: int,
-        length: int,
-        target_start: int | None = None,
-    ) -> None:
-        if source_pool is None:
-            raise RuntimeError("KV copy source pool is absent")
-        destination = int(start) if target_start is None else int(target_start)
-        for layer in range(source_pool.num_layers):
-            key, value = source_pool.read(
-                layer,
-                list(source_blocks),
-                start=int(start),
-                length=int(length),
-            )
-            if key is None or value is None:
-                raise RuntimeError("KV copy source span is incomplete")
-            target_pool.write(
-                layer,
-                list(target_blocks),
-                start=destination,
-                k=key.to(target_pool.k.device),
-                v=value.to(target_pool.v.device),
-            )
+        if blocks and self.pool is not None:
+            self.pool.release_branch_blocks(tuple(int(value) for value in blocks))
 
     def _validate_blocks(self, session_id: int, blocks: Sequence[int], boundary: int) -> None:
         if len(set(blocks)) != len(blocks):
             raise invalid_descriptor(f"session {session_id} KV lease repeats a block")
         if self.pool is not None and any(
-            value < 0 or value >= self.pool.schedulable_num_blocks for value in blocks
+            value < 0 or value >= self.pool.leasable_num_blocks for value in blocks
         ):
             raise invalid_descriptor(f"session {session_id} KV lease is outside the pool")
         block_size = 0 if self.pool is None else self.pool.block_size
@@ -1305,14 +1265,9 @@ class KvTxn:
             raise RuntimeError("KV view includes a session outside this step")
         return self._store.view(session_ids, query_lens=query_lens)
 
-    def packed_view(
-        self,
-        rows: Sequence[tuple[KvEntry, int, bool]],
-        *,
-        scratch: bool,
-    ) -> _PackedKvView:
+    def packed_view(self, rows: Sequence[tuple[KvEntry, int, bool]]) -> _PackedKvView:
         self._require_open()
-        return self._store.packed_view(rows, scratch=scratch)
+        return self._store.packed_view(rows)
 
     def scratch_entry(
         self,
@@ -1334,21 +1289,15 @@ class KvTxn:
             copy_conditioning=copy_conditioning,
         )
 
-    def advance_entry(self, entry: KvEntry, tokens: int, *, scratch: bool) -> None:
+    def advance_entry(self, entry: KvEntry, tokens: int) -> None:
         self._require_open()
-        self._store.advance_entry(entry, tokens, scratch=scratch)
+        self._store.advance_entry(entry, tokens)
 
     def advance(self, session_id: int, tokens: int) -> None:
         self._require_open()
         if int(session_id) not in self._session_ids:
             raise RuntimeError("KV advance targets a session outside this step")
         self._store.advance(int(session_id), int(tokens))
-
-    def promote_scratch(self, session_id: int, source: KvEntry, tokens: int) -> None:
-        self._require_open()
-        if int(session_id) not in self._session_ids:
-            raise RuntimeError("KV promotion targets a session outside this step")
-        self._store.promote_scratch(session_id, source, tokens)
 
     def release_generation(self, session_id: int, generation: int) -> None:
         self._require_open()
